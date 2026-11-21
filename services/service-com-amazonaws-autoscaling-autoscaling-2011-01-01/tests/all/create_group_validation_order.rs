@@ -65,9 +65,11 @@ const VALIDATION_ERROR: &str = "ValidationError";
 const ALREADY_EXISTS: &str = "AlreadyExists";
 
 /// The sentence Amazon EC2 — the service that holds launch templates — words for a launch
-/// template NAME the account holds no template under, as Auto Scaling surfaces it.
-const ABSENT_TEMPLATE_NAME_MESSAGE: &str =
-    "At least one of the launch templates specified in the request does not exist.";
+/// template NAME the account holds no template under, as Auto Scaling surfaces it: fixed text
+/// around the one name the request stated.
+fn absent_template_name_message() -> String {
+    format!("The specified launch template, with template name {ABSENT_TEMPLATE_NAME}, does not exist.")
+}
 
 /// The launch source the second create names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,18 +209,21 @@ fn launch_source(source: Source, held: &HeldTemplate) -> Vec<(String, String)> {
 ///
 /// Each sentence is written out here rather than taken from the implementation — a test that
 /// re-used the implementation's own literal would assert nothing. The launch-template halves
-/// are Amazon EC2's own wording for the half that did not resolve (its
-/// `InvalidLaunchTemplateId.Malformed` sentence for an id, its "does not exist" sentence for a
-/// name, and its version-resolution sentence for a version), and the last is Auto Scaling's
-/// own sentence for a group name already taken.
+/// are Amazon EC2's own wording for the half that did not resolve (its "does not exist"
+/// sentence naming the id, the same sentence naming the name, and its version-resolution
+/// sentence for a version), and the last is Auto Scaling's own sentence for a group name
+/// already taken.
 fn expected_refusal(source: Source, held: &HeldTemplate) -> (&'static str, String) {
     match source {
         Source::AbsentTemplateId | Source::AbsentPolicyTemplateId => (
             VALIDATION_ERROR,
-            format!("Malformed launch template Id: {ABSENT_TEMPLATE_ID}"),
+            format!(
+                "The specified launch template, with template ID {ABSENT_TEMPLATE_ID}, does \
+                 not exist."
+            ),
         ),
         Source::AbsentTemplateName | Source::AbsentOverrideTemplateName => {
-            (VALIDATION_ERROR, ABSENT_TEMPLATE_NAME_MESSAGE.to_string())
+            (VALIDATION_ERROR, absent_template_name_message())
         }
         Source::UnmintedVersion => (
             VALIDATION_ERROR,

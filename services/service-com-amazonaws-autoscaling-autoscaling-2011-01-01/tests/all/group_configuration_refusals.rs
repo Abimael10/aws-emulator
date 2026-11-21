@@ -465,13 +465,12 @@ async fn a_group_launches_only_from_a_launch_template_the_account_holds() {
         );
         let answered = message(&body);
         // The sentence is Amazon EC2's own for the half the request stated, surfaced by Auto
-        // Scaling: an id it holds no template under is not an id of a launch template, and a
-        // NAME it holds none under is reported without quoting the name back.
+        // Scaling: the launch template the reference names does not exist, named by the
+        // identifier the request carried.
         let expected = if member.ends_with("LaunchTemplateId") {
-            format!("Malformed launch template Id: {value}")
+            format!("The specified launch template, with template ID {value}, does not exist.")
         } else {
-            "At least one of the launch templates specified in the request does not exist."
-                .to_string()
+            format!("The specified launch template, with template name {value}, does not exist.")
         };
         assert_eq!(
             answered, expected,

@@ -20,9 +20,9 @@
 //! One of those resolutions serves a second caller, and so is the one rule here that is not
 //! about a request: a launch template stays Amazon EC2's resource and the client's to delete
 //! AFTER the group was configured against it, so the SAME reference is resolved again at the
-//! instant of each launch ([`unresolved_launch_template_launch_failure`]) — one resolution,
-//! worded for the caller that asks, instead of two that could disagree about whether a group
-//! can launch from what it points at.
+//! instant of each launch ([`unresolved_launch_template_launch_failure`]) — one resolution
+//! with one wording, instead of two that could disagree about whether a group can launch from
+//! what it points at or about how a reference resolving to nothing is reported.
 //!
 //! LOCKING. The one pass that resolves a launch template takes Amazon EC2's store lock and
 //! releases it before answering; the zone catalog needs no lock at all. The callers in
@@ -239,7 +239,9 @@ pub fn launch_source_error<E>(
 /// halves of the specification it was given ([`super::ec2_instances`]). A specification that
 /// resolves to nothing names a template the group could never launch from, so the request is
 /// refused instead of stored: a group created against it could launch nothing, and every read
-/// of it would advertise a template Amazon EC2 does not have.
+/// of it would advertise a template Amazon EC2 does not have. The sentence is Amazon EC2's own
+/// for the half of the reference that did not resolve ([`UnresolvedReference`]), which is what
+/// a caller naming the same template against that service is told.
 ///
 /// Every specification the launch source carries is resolved — the group's own
 /// `LaunchTemplate`, the launch template of its `MixedInstancesPolicy` and the one each
@@ -255,7 +257,7 @@ pub fn unresolvable_launch_template_error<Eng: Send + Sync + 'static, E>(
     mixed_instances_policy: Option<&MixedInstancesPolicy>,
 ) -> Option<Scaffolded<E>> {
     first_unresolved(engine, launch_template, mixed_instances_policy)
-        .map(UnresolvedReference::refusal)
+        .map(UnresolvedReference::message)
         .map(Scaffolded::validation_error)
 }
 
@@ -281,7 +283,7 @@ pub fn unresolved_launch_template_launch_failure<Eng: Send + Sync + 'static>(
     mixed_instances_policy: Option<&MixedInstancesPolicy>,
 ) -> Option<String> {
     first_unresolved(engine, launch_template, mixed_instances_policy)
-        .map(UnresolvedReference::launch_failure)
+        .map(UnresolvedReference::message)
 }
 
 /// The first launch-template reference of a launch source the account's own Amazon EC2 store
@@ -291,8 +293,8 @@ pub fn unresolved_launch_template_launch_failure<Eng: Send + Sync + 'static>(
 /// THE ONE resolution, shared by the refusal a request that CONFIGURES the group is answered
 /// ([`unresolvable_launch_template_error`]) and the failed activity a LAUNCH from an
 /// already-stored configuration records ([`unresolved_launch_template_launch_failure`]), so
-/// the two cannot disagree about which references resolve — only about how each words the
-/// half that did not ([`UnresolvedReference`]). EC2's store lock is taken for the one pass
+/// the two cannot disagree about which references resolve, nor about how the half that did
+/// not is worded ([`UnresolvedReference`]). EC2's store lock is taken for the one pass
 /// that answers this and released before the answer is returned.
 fn first_unresolved<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -318,11 +320,10 @@ fn first_unresolved<Eng: Send + Sync + 'static>(
 /// answer for.
 ///
 /// A group launches from ONE VERSION of one template, so either half can stop resolving, and
-/// the two callers of the resolution word the halves differently: a request that CONFIGURES a
-/// group is told the id it sent is not one of a launch template, while a LAUNCH naming a
-/// template the account no longer holds is answered that this template does not exist. The
-/// VERSION half is one sentence for both, Amazon EC2's own for a version a template does not
-/// hold, so it travels already worded.
+/// each half carries ONE sentence — Amazon EC2's own for the half it names — whoever reads the
+/// reference: the request that CONFIGURES a group against it and the LAUNCH that reads the
+/// stored configuration are both told that the launch template, or the version of it, the
+/// reference names does not exist.
 #[derive(Debug, Clone)]
 enum UnresolvedReference {
     /// The account holds no launch template under the half the specification stated.
@@ -332,18 +333,11 @@ enum UnresolvedReference {
 }
 
 impl UnresolvedReference {
-    /// What AWS answers a REQUEST whose launch source carries this reference.
-    fn refusal(self) -> String {
+    /// The sentence this unresolved reference is reported with — to the caller whose request
+    /// carries it, and in the activity of a launch that read it off a stored configuration.
+    fn message(self) -> String {
         match self {
-            Self::Template(template) => template.absent_template_refusal(),
-            Self::Version(message) => message,
-        }
-    }
-
-    /// What a LAUNCH that read this reference reports as the reason it placed nothing.
-    fn launch_failure(self) -> String {
-        match self {
-            Self::Template(template) => template.absent_template_launch_failure(),
+            Self::Template(template) => template.absent_template_message(),
             Self::Version(message) => message,
         }
     }
@@ -459,38 +453,24 @@ impl TemplateIdentity {
         }
     }
 
-    /// What AWS answers a request whose launch source names a template the account does not
-    /// hold: the sentence Amazon EC2 — the service that holds launch templates, and the one
-    /// Amazon EC2 Auto Scaling resolves the specification against — words for the half the
-    /// request stated, surfaced as this service's own refusal.
-    ///
-    /// An ID the account holds no template under is not an id of a launch template at all,
-    /// which is the sentence Amazon EC2 states for an id it cannot read
-    /// (`Malformed launch template Id: <id>`, its `invalid_launch_template_id_malformed`, whose
-    /// own documentation names this service as the one that surfaces it); a NAME it holds none
-    /// under is the sentence Amazon EC2 states for that (its
-    /// `invalid_launch_template_name_not_found`), which names no value because a request names
-    /// one name and the service does not repeat it back.
-    fn absent_template_refusal(&self) -> String {
-        match self {
-            Self::Id(id) => format!("Malformed launch template Id: {id}"),
-            Self::Name(_) => ec2::LAUNCH_TEMPLATES_NOT_FOUND_MESSAGE.to_string(),
-        }
-    }
-
-    /// What a LAUNCH from a launch source naming a template the account does not hold reports
-    /// as the reason it placed nothing: the sentence that names the half of the reference the
-    /// launch source stated, worded by the service that owns launch templates, since the
-    /// launch this group makes IS a launch against that service.
+    /// What a reference naming a template the account does not hold is reported with: the
+    /// sentence that names the half of the reference the launch source stated, worded by the
+    /// service that owns launch templates, since the template Amazon EC2 Auto Scaling resolves
+    /// IS that service's resource.
     ///
     /// The two halves are one sentence family — "the specified launch template, with template
     /// ID <id>, does not exist" ([`ec2::specified_launch_template_id_not_found_message`]) and
     /// "… with template name <name> …"
     /// ([`ec2::specified_launch_template_name_not_found_message`]) — whose fixed text differs
-    /// only in which half it names and whose one variable part is the identifier the group's
-    /// own specification carries, so the activity carries what a client's own launch naming
-    /// the same template would have been told.
-    fn absent_template_launch_failure(&self) -> String {
+    /// only in which half it names and whose one variable part is the identifier the
+    /// specification carries.
+    ///
+    /// THE ONE wording for a reference that resolves to no template, whether it is read when a
+    /// group is CONFIGURED against it — the create, the update and the refresh that states a
+    /// desired configuration — or when an instance is LAUNCHED from an already-stored
+    /// configuration: the reference resolves to nothing in both cases, so the caller and the
+    /// scaling activity are told the same thing about it.
+    fn absent_template_message(&self) -> String {
         match self {
             Self::Id(id) => ec2::specified_launch_template_id_not_found_message(id),
             Self::Name(name) => ec2::specified_launch_template_name_not_found_message(name),
@@ -808,7 +788,7 @@ mod tests {
         for (case, specification, expected) in rows {
             let identity = TemplateIdentity::of(specification)
                 .unwrap_or_else(|| panic!("case {case:?}: the specification names a template"));
-            let reported = identity.absent_template_launch_failure();
+            let reported = identity.absent_template_message();
             assert_eq!(
                 &reported, expected,
                 "case {case:?}: expected the sentence naming the half the reference stated, \

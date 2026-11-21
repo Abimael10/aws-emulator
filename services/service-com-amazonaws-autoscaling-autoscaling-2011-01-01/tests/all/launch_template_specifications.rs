@@ -239,14 +239,16 @@ async fn a_group_reports_both_halves_of_the_launch_template_it_resolves() {
                 "case {case:?}: expected ValidationError, got {body}"
             );
             // The sentence is Amazon EC2's own for the half the request stated, surfaced by
-            // Auto Scaling: an id the account holds no template under is not an id of a
-            // launch template at all, and a NAME it holds none under is reported without the
-            // name being quoted back.
+            // Auto Scaling: the template the reference names does not exist, named by the
+            // identifier the request carried — the id when it stated the id, the name when it
+            // stated the name.
             let expected = match row.named {
-                Named::AbsentId => format!("Malformed launch template Id: {value}"),
-                _ => "At least one of the launch templates specified in the request does not \
-                      exist."
-                    .to_string(),
+                Named::AbsentId => format!(
+                    "The specified launch template, with template ID {value}, does not exist."
+                ),
+                _ => format!(
+                    "The specified launch template, with template name {value}, does not exist."
+                ),
             };
             assert_eq!(
                 tag_value(&body, "Message"),
