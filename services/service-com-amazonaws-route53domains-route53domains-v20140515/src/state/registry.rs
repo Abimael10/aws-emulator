@@ -21,7 +21,7 @@
 //!   stable table here: the same name always costs the same, and two names under one TLD
 //!   cost the same.
 
-use crate::ops::types::PriceWithCurrency;
+use crate::ops::types::{DomainPrice, PriceWithCurrency};
 use std::collections::BTreeSet;
 
 // ---------------------------------------------------------------------------
@@ -112,16 +112,41 @@ pub fn standard_registration_rate(tld: &str) -> f64 {
         .map_or(DEFAULT_STANDARD_REGISTRATION_RATE, |(_, rate)| *rate)
 }
 
+/// What an owner change costs at this registrar, in [`CURRENCY_USD`].
+///
+/// A price record carries an "Owner change" price beside the registration, transfer,
+/// renewal and restoration prices (`ListPrices`'s own documentation lists the five).
+/// Handing a registration to a new owner buys no registration year from the registry, and
+/// this registrar's published price list charges nothing for the change itself, so the
+/// amount is the same for every TLD.
+pub const CHANGE_OWNERSHIP_RATE: f64 = 0.00;
+
+/// What restoring an expired registration costs, in [`CURRENCY_USD`].
+///
+/// The restoration price is the fee for pulling a registration back out of the registry's
+/// redemption period, which is registrar work rather than another registration year: this
+/// registrar's published price list states one flat fee for it, the same for every TLD.
+pub const RESTORATION_RATE: f64 = 40.00;
+
+/// `amount` as a modelled `PriceWithCurrency` at a TLD's regular rate.
+///
+/// The ONE place a price this registrar quotes is built: `Price` carries the amount,
+/// `Currency` the code every quote is denominated in ([`CURRENCY_USD`]), and `PriceType`
+/// is `STANDARD` — the regular rate for a TLD, not an individual name's registry premium.
+fn standard_price(amount: f64) -> PriceWithCurrency {
+    PriceWithCurrency {
+        price: amount,
+        currency: CURRENCY_USD.to_string(),
+        price_type: Some(PRICE_TYPE_STANDARD.to_string()),
+    }
+}
+
 /// What a standard registration under `tld` costs, as the modelled `PriceWithCurrency`.
 ///
 /// `PriceType` is `STANDARD`: this is the regular rate for the TLD, not an individual
 /// name's registry premium.
 pub fn standard_registration_price(tld: &str) -> PriceWithCurrency {
-    PriceWithCurrency {
-        price: standard_registration_rate(tld),
-        currency: CURRENCY_USD.to_string(),
-        price_type: Some(PRICE_TYPE_STANDARD.to_string()),
-    }
+    standard_price(standard_registration_rate(tld))
 }
 
 /// What a transfer of a name under `tld` in to this registrar costs, as the modelled
@@ -132,11 +157,68 @@ pub fn standard_registration_price(tld: &str) -> PriceWithCurrency {
 /// is why both come from [`standard_registration_rate`]. `PriceType` is `STANDARD`: this
 /// is the regular rate for the TLD, not an individual name's registry premium.
 pub fn standard_transfer_price(tld: &str) -> PriceWithCurrency {
-    PriceWithCurrency {
-        price: standard_registration_rate(tld),
-        currency: CURRENCY_USD.to_string(),
-        price_type: Some(PRICE_TYPE_STANDARD.to_string()),
+    standard_price(standard_registration_rate(tld))
+}
+
+/// What renewing a name under `tld` for a year costs, as the modelled
+/// `PriceWithCurrency`.
+///
+/// A renewal buys exactly what a registration buys — one more year of the registration —
+/// so it costs the TLD's standard yearly rate, the same amount as the registration did.
+pub fn standard_renewal_price(tld: &str) -> PriceWithCurrency {
+    standard_price(standard_registration_rate(tld))
+}
+
+/// What an owner change costs, as the modelled `PriceWithCurrency`.
+///
+/// [`CHANGE_OWNERSHIP_RATE`] belongs to the registrar rather than to the TLD, so this
+/// takes no TLD.
+pub fn change_ownership_price() -> PriceWithCurrency {
+    standard_price(CHANGE_OWNERSHIP_RATE)
+}
+
+/// What restoring an expired registration costs, as the modelled `PriceWithCurrency`.
+///
+/// [`RESTORATION_RATE`] belongs to the registrar rather than to the TLD, so this takes no
+/// TLD.
+pub fn restoration_price() -> PriceWithCurrency {
+    standard_price(RESTORATION_RATE)
+}
+
+/// Every price of a name under `tld`, reported under `name`, as the modelled
+/// `DomainPrice`.
+///
+/// One rule for every surface that quotes prices: the five prices a `DomainPrice` carries
+/// are derived from the TLD's standard yearly rate — registration, transfer and renewal
+/// each buy one year at that rate — plus the registrar's own owner-change and restoration
+/// fees. `name` is what `DomainPrice$Name` reports the prices apply to ("The TLD or domain
+/// name that the prices apply to"): the TLD when a caller asks about a TLD, and the domain
+/// name when it asks about one name.
+pub fn price_record(name: &str, tld: &str) -> DomainPrice {
+    DomainPrice {
+        name: Some(name.to_string()),
+        registration_price: Some(standard_registration_price(tld)),
+        transfer_price: Some(standard_transfer_price(tld)),
+        renewal_price: Some(standard_renewal_price(tld)),
+        change_ownership_price: Some(change_ownership_price()),
+        restoration_price: Some(restoration_price()),
     }
+}
+
+/// Every TLD this registrar publishes a price for, in ascending TLD order.
+///
+/// The keys of [`STANDARD_REGISTRATION_RATES`], which IS this registrar's published price
+/// list: a caller that asks for the prices of all the TLDs the registrar supports is
+/// asking for that list. A name under a TLD outside it is still registrable — it takes
+/// [`DEFAULT_STANDARD_REGISTRATION_RATE`] — but the registrar publishes no price list row
+/// for it.
+pub fn priced_tlds() -> Vec<&'static str> {
+    let mut tlds: Vec<&'static str> = STANDARD_REGISTRATION_RATES
+        .iter()
+        .map(|(tld, _)| *tld)
+        .collect();
+    tlds.sort_unstable();
+    tlds
 }
 
 // ---------------------------------------------------------------------------

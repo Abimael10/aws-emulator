@@ -1296,3 +1296,336 @@ async fn a_name_the_registry_cannot_answer_for_is_refused_by_the_suggestions_too
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// The rule: a TLD's price row is derived from that TLD's standard rate
+// ---------------------------------------------------------------------------
+
+/// What an owner change costs at this registrar, in USD. Source: `CHANGE_OWNERSHIP_RATE`
+/// in `src/state/registry.rs` — handing a registration to a new owner buys no
+/// registration year, so the published list charges nothing for it.
+const CHANGE_OWNERSHIP: f64 = 0.00;
+
+/// What restoring an expired registration costs, in USD. Source: `RESTORATION_RATE` in
+/// `src/state/registry.rs` — one flat registrar fee, the same for every TLD.
+const RESTORATION: f64 = 40.00;
+
+/// `ListPrices` with `request`, asserting a 200 and returning its `Prices` rows and its
+/// `NextPageMarker`.
+async fn list_prices(
+    emulator: &Emulator,
+    case: &str,
+    request: &Value,
+) -> (Vec<Value>, Option<String>) {
+    let (status, body) = emulator.call("ListPrices", request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ListPrices to answer 200, got {status} {body}"
+    );
+    let rows = body["Prices"].as_array().cloned().unwrap_or_default();
+    let marker = body["NextPageMarker"].as_str().map(str::to_string);
+    (rows, marker)
+}
+
+/// The `Name` of every row of a price page, in the order the page reported them.
+fn priced_names(rows: &[Value]) -> Vec<String> {
+    rows.iter()
+        .map(|row| row["Name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Assert that `row` is the price row of `name`, a TLD whose standard yearly rate is
+/// `rate`: registration, transfer and renewal each buy one year at that rate, an owner
+/// change costs [`CHANGE_OWNERSHIP`] and a restoration [`RESTORATION`], and every one of
+/// the five is quoted in the required `Currency` at `PriceType` `STANDARD`.
+fn assert_price_row(row: &Value, case: &str, name: &str, rate: f64) {
+    assert_eq!(
+        row["Name"].as_str(),
+        Some(name),
+        "case {case:?}: Name reports the TLD the prices apply to, got {row}"
+    );
+    for (member, expected) in [
+        ("RegistrationPrice", rate),
+        ("TransferPrice", rate),
+        ("RenewalPrice", rate),
+        ("ChangeOwnershipPrice", CHANGE_OWNERSHIP),
+        ("RestorationPrice", RESTORATION),
+    ] {
+        let price = &row[member];
+        assert_eq!(
+            price["Price"].as_f64(),
+            Some(expected),
+            "case {case:?}: expected {member} {expected}, got {price}"
+        );
+        assert!(
+            price["Price"].as_f64().is_some_and(|value| value >= 0.0),
+            "case {case:?}: {member}'s Price is @range(min: 0), got {price}"
+        );
+        assert_eq!(
+            price["Currency"].as_str(),
+            Some("USD"),
+            "case {case:?}: {member} carries the required Currency member, got {price}"
+        );
+        assert_eq!(
+            price["PriceType"].as_str(),
+            Some("STANDARD"),
+            "case {case:?}: a regular TLD rate is PriceType STANDARD, got {price}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_price_row_of_one_tld_is_derived_from_that_tlds_standard_rate() {
+    // Rows differ along the TLD — generic, country-code, two-label suffix, and one the
+    // published table does not list, which takes the stated default rate — and, for each
+    // of them, along the FORM the caller writes it in: bare, with the leading dot the
+    // `Tld` member's own example uses, and upper-cased, since a TLD is not case
+    // sensitive.
+    let emulator = Emulator::new();
+
+    for (tld, rate) in EXPECTED_RATES {
+        for requested in [(*tld).to_string(), format!(".{tld}"), tld.to_uppercase()] {
+            let (rows, marker) =
+                list_prices(&emulator, &requested, &json!({ "Tld": requested })).await;
+            assert_eq!(
+                rows.len(),
+                1,
+                "case {requested:?}: a request for one TLD prices exactly that TLD, got {rows:?}"
+            );
+            assert_price_row(&rows[0], &requested, tld, *rate);
+            assert!(
+                marker.is_none(),
+                "case {requested:?}: one TLD is one page, so no NextPageMarker, got {marker:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_tld_no_registry_delegates_is_refused_in_the_same_words_as_every_other_surface() {
+    // A TLD a registrar cannot offer names under is the one condition `UnsupportedTLD`
+    // names, and it is the same condition whichever member the TLD arrived in: each row
+    // is asked of `ListPrices` as a `Tld` and of `CheckDomainAvailability` as the suffix
+    // of a `DomainName`, and both answers have to agree. Rows differ along why the value
+    // is not a suffix a registry delegates: an unassigned label, two labels reserved by
+    // RFC 2606, and a value that is a whole domain name rather than a suffix.
+    let cases = ["doesnotexisttld", "zzz", "invalid", "test", "example.com"];
+    let emulator = Emulator::new();
+
+    for tld in cases {
+        let (status, body) = emulator.call("ListPrices", &json!({ "Tld": tld })).await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "UnsupportedTLD".to_string()),
+            "case {tld:?}: a TLD no registry delegates is refused as unsupported, got \
+             {status} {body}"
+        );
+        let expected = format!("The {tld} TLD is not supported");
+        assert_eq!(
+            body["message"].as_str(),
+            Some(expected.as_str()),
+            "case {tld:?}: expected {expected:?}, got {body}"
+        );
+
+        let name = format!("sim-probe-prices.{tld}");
+        let (availability_status, availability) = emulator
+            .call("CheckDomainAvailability", &json!({ "DomainName": name }))
+            .await;
+        assert_eq!(
+            (
+                availability_status,
+                error_code(&availability),
+                availability["message"].as_str()
+            ),
+            (400, "UnsupportedTLD".to_string(), Some(expected.as_str())),
+            "case {tld:?}: every surface that resolves this TLD refuses it identically, \
+             got {availability_status} {availability}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_whole_price_list_comes_back_in_tld_order_and_agrees_with_the_other_surfaces() {
+    // An unqualified request returns the registrar's published list: "If a Tld value is
+    // not provided, a list of prices for all TLDs supported by Route 53 is returned."
+    let emulator = Emulator::new();
+    let (rows, marker) = list_prices(&emulator, "all TLDs", &json!({})).await;
+    let names = priced_names(&rows);
+
+    assert!(
+        rows.len() > 1,
+        "the published price list carries more than one TLD, got {names:?}"
+    );
+    assert!(
+        marker.is_none(),
+        "the whole list is one page, so no NextPageMarker, got {marker:?}"
+    );
+    let mut sorted = names.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        sorted, names,
+        "the list is in ascending TLD order with no TLD listed twice, got {names:?}"
+    );
+
+    // Every row is the SAME row a request for that one TLD answers with, and its
+    // registration price is the one `CheckDomainAvailability` quotes for a name under
+    // that TLD: one price rule, every surface.
+    for row in &rows {
+        let tld = row["Name"].as_str().unwrap_or_default().to_string();
+        let (one, _) = list_prices(&emulator, &tld, &json!({ "Tld": tld })).await;
+        assert_eq!(
+            one.first(),
+            Some(row),
+            "case {tld:?}: the list's row and the one-TLD row are the same prices"
+        );
+
+        let name = format!("sim-probe-prices.{tld}");
+        let body = check(&emulator, &name).await;
+        assert_eq!(
+            body["Price"], row["RegistrationPrice"],
+            "case {tld:?}: an available name is priced at the registration price its TLD \
+             is listed at, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_page_of_the_price_list_walks_the_whole_list_by_marker() {
+    // The marker walk reaches every row exactly once whatever the page size, so the rows
+    // differ along `MaxItems`: one row at a time, a size that does not divide the list,
+    // and the published maximum, which is larger than the whole list.
+    let emulator = Emulator::new();
+    let (all, _) = list_prices(&emulator, "all TLDs", &json!({})).await;
+    let expected = priced_names(&all);
+
+    for max_items in [1_usize, 7, 1000] {
+        let case = format!("MaxItems {max_items}");
+        let mut collected: Vec<String> = Vec::new();
+        let mut marker: Option<String> = None;
+        // Each page makes progress, so the walk cannot take more pages than there are
+        // rows; a walk that exceeds that bound is a marker that does not advance.
+        for _ in 0..=expected.len() {
+            let mut request = json!({ "MaxItems": max_items });
+            if let Some(marker) = marker.as_deref() {
+                request["Marker"] = json!(marker);
+            }
+            let (page, next) = list_prices(&emulator, &case, &request).await;
+            let names = priced_names(&page);
+            assert!(
+                !names.is_empty(),
+                "case {case:?}: a page of the list is never empty, got {page:?}"
+            );
+            assert!(
+                names.len() <= max_items,
+                "case {case:?}: a page holds at most MaxItems rows, got {names:?}"
+            );
+            match next.as_deref() {
+                Some(next) => {
+                    assert_eq!(
+                        names.len(),
+                        max_items,
+                        "case {case:?}: a page that is not the last is full, got {names:?}"
+                    );
+                    assert_eq!(
+                        Some(next),
+                        names.last().map(String::as_str),
+                        "case {case:?}: NextPageMarker is the last row of the page, got \
+                         {names:?}"
+                    );
+                }
+                None => assert!(
+                    names.len() <= max_items,
+                    "case {case:?}: the last page holds what is left, got {names:?}"
+                ),
+            }
+            collected.extend(names);
+            marker = next;
+            if marker.is_none() {
+                break;
+            }
+        }
+        assert!(
+            marker.is_none(),
+            "case {case:?}: the walk ended with a marker still outstanding ({marker:?})"
+        );
+        assert_eq!(
+            collected, expected,
+            "case {case:?}: the pages together are the whole list, in order"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_page_size_or_marker_the_list_cannot_serve_is_refused() {
+    // A page of no rows could never walk the list, so the handler's lower bound on
+    // `MaxItems` is 1; the upper bound is the model's `@range(max: 1000)`
+    // (`smithy_query(query="shape",shape="ListPricesPageMaxItems")`), refused one past it
+    // by the boundary validator in this service's validation envelope. A `Marker` that no
+    // page of this list ever reported names no row to resume from.
+    let emulator = Emulator::new();
+
+    // (case, request, the message the refusal carries)
+    let cases: [(&str, Value, String); 5] = [
+        (
+            "a page of no rows",
+            json!({ "MaxItems": 0 }),
+            "Value '0' at 'maxItems' failed to satisfy constraint: Member must have value \
+             greater than or equal to 1"
+                .to_string(),
+        ),
+        (
+            "a negative page",
+            json!({ "MaxItems": -3 }),
+            "Value '-3' at 'maxItems' failed to satisfy constraint: Member must have value \
+             greater than or equal to 1"
+                .to_string(),
+        ),
+        (
+            "one past the published maximum",
+            json!({ "MaxItems": 1001 }),
+            one_violation(
+                "Value '1001' at 'maxItems' failed to satisfy constraint: Member must have \
+                 value less than or equal to 1000",
+            ),
+        ),
+        (
+            "a marker no page reported",
+            json!({ "Marker": "not-a-tld-of-this-list" }),
+            "Value 'not-a-tld-of-this-list' at 'marker' failed to satisfy constraint: Member \
+             must be the NextPageMarker of a previous ListPrices response"
+                .to_string(),
+        ),
+        (
+            "a marker that is a TLD outside the published list",
+            json!({ "Marker": "shop" }),
+            "Value 'shop' at 'marker' failed to satisfy constraint: Member must be the \
+             NextPageMarker of a previous ListPrices response"
+                .to_string(),
+        ),
+    ];
+
+    for (case, request, message) in cases {
+        let (status, body) = emulator.call("ListPrices", &request).await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "InvalidInput".to_string()),
+            "case {case:?}: expected 400 InvalidInput, got {status} {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(message.as_str()),
+            "case {case:?}: expected {message:?}, got {body}"
+        );
+    }
+
+    // Both ends of the page sizes the handler serves are accepted.
+    for max_items in [1_i64, 1000] {
+        let case = format!("MaxItems {max_items}");
+        let (rows, _) = list_prices(&emulator, &case, &json!({ "MaxItems": max_items })).await;
+        assert!(
+            !rows.is_empty(),
+            "case {case:?}: a page size inside the bounds is served, got {rows:?}"
+        );
+    }
+}

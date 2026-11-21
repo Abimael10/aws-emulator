@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPrices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPrices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The registrar's published price list: one `DomainPrice` per TLD it publishes a price
+//! for, or just the requested TLD's row. Every row is derived from that TLD's standard
+//! yearly rate by the one rule in [`crate::state::price_record`], so the registration
+//! price here and the one `CheckDomainAvailability` quotes for a name under the same TLD
+//! are the same amount.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPrices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `Tld` that is not a suffix a registry delegates names under is refused with the
+//! modelled `UnsupportedTLD`, the same answer every other surface that takes a TLD gives
+//! for it.
+//!
+//! This operation is a pure read: it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +126,22 @@ impl From<ListPricesErrorModeled> for ListPricesError {
     }
 }
 
+/// This operation's `InvalidInput`: a problem with the request that is not the TLD.
+fn invalid_input(message: impl Into<String>) -> ListPricesError {
+    ListPricesErrorModeled::InvalidInput(InvalidInput {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// How this operation refuses a `Tld` the registrar does not offer names under.
+fn unsupported_tld(tld: &str) -> ListPricesError {
+    ListPricesErrorModeled::UnsupportedTLD(UnsupportedTLD {
+        message: Some(crate::state::unsupported_tld_name_message(tld)),
+    })
+    .into()
+}
+
 /// The `ListPrices` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +178,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPrices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPricesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPrices"))
+        // `ctx` carries request metadata only, and the price list is the REGISTRAR's
+        // rather than this account's, so neither is read here.
+        let _ = (ctx, &self.engine);
+
+        // "If a Tld value is not provided, a list of prices for all TLDs supported by
+        // Route 53 is returned."
+        if let Some(requested) = input.tld.as_deref() {
+            let tld =
+                crate::state::resolve_tld(requested).ok_or_else(|| unsupported_tld(requested))?;
+            // `Marker` and `MaxItems` are "[u]sed only for all TLDs. If you specify a TLD,
+            // don't specify a Marker" — so neither selects anything here, and
+            // `NextPageMarker` is left off for the same reason: one TLD is one row, and
+            // there is no further page to walk to.
+            return Ok(ListPricesOutput {
+                prices: Some(vec![crate::state::price_record(&tld, &tld)]),
+                next_page_marker: None,
+            });
+        }
+
+        // The model bounds `MaxItems` ABOVE only (`@range(max: 1000)`, enforced by the
+        // boundary validator) and says nothing below, so the lower bound is this
+        // handler's: a page of zero prices could never make progress through the list, so
+        // a caller that asks for one is refused rather than left paginating forever.
+        if input.max_items.is_some_and(|requested| requested < 1) {
+            return Err(invalid_input(format!(
+                "Value '{}' at 'maxItems' failed to satisfy constraint: Member must have value \
+                 greater than or equal to 1",
+                input.max_items.unwrap_or_default()
+            )));
+        }
+        let tlds = crate::state::priced_tlds();
+        // `MaxItems` has no documented default, and the model's own cap is above the
+        // number of TLDs the registrar publishes a price for, so an unqualified request
+        // gets the whole price list in one page.
+        let max_items = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(tlds.len());
+
+        // The marker is the TLD of the last row of the page just returned, so the next
+        // page starts immediately after it.
+        let marker = input.marker.as_deref().filter(|value| !value.is_empty());
+        let start = match marker {
+            None => 0,
+            Some(marker) => {
+                let lowered = marker.to_ascii_lowercase();
+                let position = tlds
+                    .iter()
+                    .position(|tld| *tld == lowered.as_str())
+                    .ok_or_else(|| {
+                        invalid_input(format!(
+                            "Value '{marker}' at 'marker' failed to satisfy constraint: Member \
+                             must be the NextPageMarker of a previous ListPrices response"
+                        ))
+                    })?;
+                position + 1
+            }
+        };
+
+        let page: Vec<DomainPrice> = tlds[start..]
+            .iter()
+            .take(max_items)
+            .map(|tld| crate::state::price_record(tld, tld))
+            .collect();
+        // Omitted on the last page: "If there are more prices than you specified for
+        // MaxItems in the request, submit another request and include the value of
+        // NextPageMarker in the value of Marker."
+        let next_page_marker = if start + page.len() < tlds.len() {
+            page.last().and_then(|price| price.name.clone())
+        } else {
+            None
+        };
+
+        Ok(ListPricesOutput {
+            prices: Some(page),
+            next_page_marker,
+        })
     }
 }

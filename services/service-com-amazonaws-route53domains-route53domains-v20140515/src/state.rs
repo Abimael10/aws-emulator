@@ -21,11 +21,12 @@
 
 mod registry;
 pub use registry::{
-    seeded_registrations, standard_registration_price, standard_registration_rate,
+    change_ownership_price, price_record, priced_tlds, restoration_price, seeded_registrations,
+    standard_registration_price, standard_registration_rate, standard_renewal_price,
     standard_transfer_price, unavailable_domain_message, Transferability, AVAILABILITY_AVAILABLE,
-    AVAILABILITY_UNAVAILABLE, CURRENCY_USD, DEFAULT_STANDARD_REGISTRATION_RATE,
-    PRICE_TYPE_STANDARD, STANDARD_REGISTRATION_RATES, TRANSFERABLE_DOMAIN_IN_OWN_ACCOUNT,
-    TRANSFERABLE_UNTRANSFERABLE,
+    AVAILABILITY_UNAVAILABLE, CHANGE_OWNERSHIP_RATE, CURRENCY_USD,
+    DEFAULT_STANDARD_REGISTRATION_RATE, PRICE_TYPE_STANDARD, RESTORATION_RATE,
+    STANDARD_REGISTRATION_RATES, TRANSFERABLE_DOMAIN_IN_OWN_ACCOUNT, TRANSFERABLE_UNTRANSFERABLE,
 };
 
 mod suggestions;
@@ -397,6 +398,23 @@ pub fn resolve_domain_name(raw: &str) -> Result<String, DomainNameError> {
     Ok(name)
 }
 
+/// Resolve a request's `Tld` to the suffix this registrar's price list is keyed by.
+///
+/// The same rule [`resolve_domain_name`] applies to the suffix of a domain name, applied
+/// to a member that carries nothing BUT a suffix:
+///
+/// * a TLD is not case sensitive, so the value is lower-cased;
+/// * a leading `.` is part of how the `Tld` member's own documentation writes an example
+///   of one (".net"), so one is accepted and dropped;
+/// * what is left has to be a suffix a registry delegates names under — see
+///   [`is_public_suffix`] — which is exactly what makes it a TLD a registrar can offer
+///   names under. Anything else answers `None`, the condition the model's `UnsupportedTLD`
+///   names: "Amazon Route 53 does not support this top-level domain (TLD)".
+pub fn resolve_tld(raw: &str) -> Option<String> {
+    let tld = raw.strip_prefix('.').unwrap_or(raw).to_ascii_lowercase();
+    is_public_suffix(&tld).then_some(tld)
+}
+
 /// A problem with the REQUEST, in the envelope this service reports one in: the fixed
 /// "Invalid request. Problems: " followed by the problem itself.
 ///
@@ -445,7 +463,17 @@ pub fn invalid_domain_name_message(raw: &str) -> String {
 /// lower-cased, the way every other use of a domain name in this crate is, because
 /// domain names are not case sensitive.
 pub fn unsupported_tld_message(raw: &str) -> String {
-    format!("The {} TLD is not supported", tld_of(raw).to_ascii_lowercase())
+    unsupported_tld_name_message(tld_of(raw))
+}
+
+/// The message an `UnsupportedTLD` refusal of a member that names a TLD rather than a
+/// whole domain name carries.
+///
+/// The same sentence [`unsupported_tld_message`] states — that refusal says the same thing
+/// whichever member the TLD reached this service through — with the TLD taken straight
+/// from the member instead of out of a domain name.
+pub fn unsupported_tld_name_message(tld: &str) -> String {
+    format!("The {} TLD is not supported", tld.to_ascii_lowercase())
 }
 
 /// The message the `InvalidInput` refusal of a domain this account does not hold carries.
