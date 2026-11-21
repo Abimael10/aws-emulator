@@ -2441,10 +2441,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // "The operating system that your tasks in the service run on", derived from the
         // revision's `runtimePlatform` and reported in its display spelling.
         let platform_family = fargate.then(|| os_family_display(&os_family));
-        // "If one isn't specified, the LATEST platform version is used": the SERVICE
-        // reports the version it asks for, which is that alias when it named none, while
-        // its DEPLOYMENT reports the version that alias resolves to for its operating
-        // system — the version the tasks of the rollout actually run.
+        // "If one isn't specified, the LATEST platform version is used": a service the ECS
+        // scheduler places the tasks of reports the version it ASKS for, which is that alias
+        // when it named none, while its DEPLOYMENT reports the version that alias resolves
+        // to for its operating system — the version the tasks of the rollout actually run.
+        // A service whose tasks come from a task set has no rollout of its own to report
+        // that through, and reports the resolved version itself: the version its task sets
+        // run ([`Self::task_set_view`] resolves the same alias the same way).
         let requested_platform_version = fargate.then(|| {
             service
                 .platform_version
@@ -2454,6 +2457,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let deployment_platform_version = requested_platform_version
             .as_deref()
             .map(|requested| resolved_platform_version(requested, &os_family));
+        let service_platform_version = if scheduler_owned {
+            requested_platform_version
+        } else {
+            deployment_platform_version.clone()
+        };
         let service_tasks = self.service_tasks(service);
         // When each of the service's deployments started, newest first: the primary one
         // and the ones it is still replacing.
@@ -2573,7 +2581,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             pending_count: tally.pending,
             launch_type,
             capacity_provider_strategy,
-            platform_version: requested_platform_version,
+            platform_version: service_platform_version,
             platform_family,
             task_definition: service.task_definition_arn.clone(),
             deployment_configuration: Some(service.deployment_configuration.clone()),

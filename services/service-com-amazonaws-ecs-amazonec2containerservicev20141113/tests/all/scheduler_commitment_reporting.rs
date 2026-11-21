@@ -310,8 +310,11 @@ struct RebalancingRow {
 /// specified for AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED. For
 /// update service requests, when no value is specified ... Amazon ECS defaults to the
 /// existing service's AvailabilityZoneRebalancing value. If the service never had an
-/// AvailabilityZoneRebalancing value set, Amazon ECS treats this as DISABLED." The rows span
-/// which of the two calls names a value, and each value of the enum
+/// AvailabilityZoneRebalancing value set, Amazon ECS treats this as DISABLED." Every service
+/// this API creates leaves its create carrying one of the two values, so "the existing
+/// service's value" is what an update that names none keeps — the closing sentence reads a
+/// service that carries no value at all. The rows span which of the two calls names a value,
+/// and each value of the enum
 /// (`smithy_query(query="shape", shape="AvailabilityZoneRebalancing")` = [ENABLED,
 /// DISABLED]).
 #[tokio::test]
@@ -322,7 +325,7 @@ async fn availability_zone_rebalancing_defaults_on_a_create_and_resolves_on_an_u
             created_with: None,
             updated_with: None,
             expect_created: "ENABLED",
-            expect_updated: "DISABLED",
+            expect_updated: "ENABLED",
         },
         RebalancingRow {
             case: "the create sets it and the update names none",
@@ -395,6 +398,34 @@ async fn availability_zone_rebalancing_defaults_on_a_create_and_resolves_on_an_u
             string(&read, "availabilityZoneRebalancing", case),
             row.expect_updated,
             "case {case:?}: the read must report what the update left, got {read}"
+        );
+        // A SECOND update that names nothing changes nothing either: the value a service
+        // carries is the one the next update defaults to, however many updates it has seen.
+        let repeated = ok(
+            &router,
+            "UpdateService",
+            json!({ "cluster": cluster, "service": service_name, "desiredCount": 0 }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            string(&repeated["service"], "availabilityZoneRebalancing", case),
+            row.expect_updated,
+            "case {case:?}: a repeated update keeps the service's value, got {repeated}"
+        );
+        // And the last copy of the record a client gets reports the same value: deleting a
+        // service changes none of its configuration.
+        let deleted = ok(
+            &router,
+            "DeleteService",
+            json!({ "cluster": cluster, "service": service_name }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            string(&deleted["service"], "availabilityZoneRebalancing", case),
+            row.expect_updated,
+            "case {case:?}: the deleted record reports the same value, got {deleted}"
         );
     }
 }

@@ -19,6 +19,11 @@
 //! 3. `DeleteService` KEEPS the record: "Services in the DRAINING or INACTIVE status can
 //!    still be viewed with the DescribeServices API operation", and `UpdateService`
 //!    refuses a service that is not `ACTIVE`.
+//! 4. `Service$platformVersion` is the version the service's tasks are placed with: the
+//!    version a service the ECS scheduler places ASKED for (the `LATEST` alias when it
+//!    named none), and for a service whose tasks come from a task set the concrete version
+//!    those tasks RUN. The ARN a task set names its service by follows which of the two
+//!    created it.
 //!
 //! Every case goes through the shared wire harness in [`crate::ecs_wire`], the same front
 //! door a client uses, so nothing reaches into the state struct and a response that is
@@ -30,8 +35,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    caller_principal, count, list, ok, refused, register_capacity, register_definition, service,
-    string, ACCOUNT, SIGNED_REGION,
+    awsvpc_network_configuration, caller_principal, count, list, ok, refused,
+    register_capacity, register_definition, service, string, ACCOUNT, SIGNED_REGION,
 };
 
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to
@@ -766,4 +771,301 @@ async fn a_deleted_service_stays_describable_as_inactive_and_refuses_updates() {
     for (case, request, expected) in refusals {
         refused(&router, "DeleteService", request, expected, case).await;
     }
+}
+
+/// The task-level `cpu` and `memory` a Fargate-compatible revision declares (each member's
+/// own doc: "This field is required for Fargate"), at a legal Fargate size.
+const FARGATE_CPU: &str = "256";
+const FARGATE_MEMORY: &str = "512";
+
+/// The same pair for a WINDOWS revision, which Fargate runs at one vCPU or more: the
+/// `cpu` doc's Windows note, as the smallest Fargate size published for a Windows container.
+const WINDOWS_FARGATE_CPU: &str = "1024";
+const WINDOWS_FARGATE_MEMORY: &str = "2048";
+
+/// One row of the platform-version table: how the service's tasks are deployed, the
+/// operating system its revision declares, the `platformVersion` the create asks for, and
+/// the version the stored service must then report.
+struct TaskSetPlatformRow {
+    case: &'static str,
+    /// The service's name, which is also the family of the revision registered for it.
+    name: &'static str,
+    /// `deploymentController.type`: `ECS`, whose own scheduler places the service's tasks,
+    /// or `CODE_DEPLOY`, which deploys them through the task set Amazon ECS mints.
+    controller: &'static str,
+    /// The `RuntimePlatform$operatingSystemFamily` the revision declares.
+    os_family: &'static str,
+    /// The `platformVersion` the create names, or `None` when it names none.
+    requested: Option<&'static str>,
+    /// The `platformVersion` the service must report, and the one its task set runs.
+    expect: &'static str,
+}
+
+/// Register one Fargate-capable `awsvpc` revision of `family` on the operating system
+/// `os_family`, whose container declares the port a load-balancer binding names.
+async fn register_bound_fargate_definition(
+    router: &MultiServiceRouter,
+    family: &str,
+    os_family: &str,
+    case: &str,
+) {
+    let mut web = crate::task_lifecycle::container("web", "public.ecr.aws/nginx/nginx:latest");
+    web["portMappings"] = json!([{ "containerPort": 80, "protocol": "tcp" }]);
+    let (cpu, memory) = if os_family.starts_with("WINDOWS") {
+        (WINDOWS_FARGATE_CPU, WINDOWS_FARGATE_MEMORY)
+    } else {
+        (FARGATE_CPU, FARGATE_MEMORY)
+    };
+    ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": family,
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": cpu,
+            "memory": memory,
+            "runtimePlatform": {
+                "cpuArchitecture": "X86_64",
+                "operatingSystemFamily": os_family,
+            },
+            "containerDefinitions": [web],
+        }),
+        case,
+    )
+    .await;
+}
+
+/// The task sets a service reports, as `(status, platformVersion, serviceArn)` triples in
+/// the order the service reports them.
+fn task_set_views(service: &Value, case: &str) -> Vec<(String, String, String)> {
+    list(service, "taskSets", case)
+        .iter()
+        .map(|task_set| {
+            (
+                string(task_set, "status", case),
+                string(task_set, "platformVersion", case),
+                string(task_set, "serviceArn", case),
+            )
+        })
+        .collect()
+}
+
+/// `Service$platformVersion` is "The platform version to run your service on ... If one
+/// isn't specified, the LATEST platform version is used": a service the ECS scheduler places
+/// the tasks of reports the version it ASKED for, which is that alias when it named none,
+/// while a service whose tasks come from a task set reports the version those tasks RUN —
+/// the concrete version the alias resolves to for their operating system, which is the
+/// version its task set reports.
+///
+/// The rows span the deployment controller, the operating system family the revision
+/// declares (and so which published version `LATEST` resolves to — `1.4.0` for Linux and
+/// `1.0.0` for Windows, from the `platformVersion` doc's "Fargate platform versions" page)
+/// and what the create asks for: nothing, the `LATEST` alias outright, or a published
+/// version by name.
+#[tokio::test]
+async fn a_service_deploying_through_a_task_set_reports_the_version_its_tasks_run() {
+    // BOTH stores: a CodeDeploy-controlled service requires a load-balancer binding, and a
+    // binding names a target group the Elastic Load Balancing v2 service has to hold.
+    let router = crate::load_balancer_target_groups::emulator();
+    let cluster = "platformsets";
+    ok(
+        &router,
+        "CreateCluster",
+        json!({ "clusterName": cluster }),
+        "setup",
+    )
+    .await;
+
+    let rows: [TaskSetPlatformRow; 8] = [
+        TaskSetPlatformRow {
+            case: "the ECS scheduler keeps the alias a create named none left",
+            name: "ecsnone",
+            controller: "ECS",
+            os_family: "LINUX",
+            requested: None,
+            expect: "LATEST",
+        },
+        TaskSetPlatformRow {
+            case: "the ECS scheduler keeps the alias a create named outright",
+            name: "ecslatest",
+            controller: "ECS",
+            os_family: "LINUX",
+            requested: Some("LATEST"),
+            expect: "LATEST",
+        },
+        TaskSetPlatformRow {
+            case: "the ECS scheduler keeps a version named by name",
+            name: "ecspinned",
+            controller: "ECS",
+            os_family: "LINUX",
+            requested: Some("1.4.0"),
+            expect: "1.4.0",
+        },
+        TaskSetPlatformRow {
+            case: "a task-set deployment resolves the alias a create named none left",
+            name: "setnone",
+            controller: "CODE_DEPLOY",
+            os_family: "LINUX",
+            requested: None,
+            expect: "1.4.0",
+        },
+        TaskSetPlatformRow {
+            case: "a task-set deployment resolves the alias named outright",
+            name: "setlatest",
+            controller: "CODE_DEPLOY",
+            os_family: "LINUX",
+            requested: Some("LATEST"),
+            expect: "1.4.0",
+        },
+        TaskSetPlatformRow {
+            case: "a task-set deployment keeps a version named by name",
+            name: "setpinned",
+            controller: "CODE_DEPLOY",
+            os_family: "LINUX",
+            requested: Some("1.4.0"),
+            expect: "1.4.0",
+        },
+        TaskSetPlatformRow {
+            case: "a Windows task-set deployment resolves to the Windows version",
+            name: "setwindows",
+            controller: "CODE_DEPLOY",
+            os_family: "WINDOWS_SERVER_2019_CORE",
+            requested: None,
+            expect: "1.0.0",
+        },
+        TaskSetPlatformRow {
+            case: "a Windows task-set deployment keeps that version named by name",
+            name: "setwindowspinned",
+            controller: "CODE_DEPLOY",
+            os_family: "WINDOWS_SERVER_2019_CORE",
+            requested: Some("1.0.0"),
+            expect: "1.0.0",
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        register_bound_fargate_definition(&router, row.name, row.os_family, case).await;
+        let mut request = json!({
+            "cluster": cluster,
+            "serviceName": row.name,
+            "taskDefinition": row.name,
+            "desiredCount": 1,
+            "launchType": "FARGATE",
+            "deploymentController": { "type": row.controller },
+            "networkConfiguration": awsvpc_network_configuration(),
+        });
+        if let Some(version) = row.requested {
+            request["platformVersion"] = json!(version);
+        }
+        let deploys_through_a_task_set = row.controller != "ECS";
+        if deploys_through_a_task_set {
+            // CodeDeploy drives the deployment by shifting traffic between two target
+            // groups, so the service it controls has to be behind a load balancer. An
+            // `awsvpc` revision's tasks register by their own network interface, so the
+            // group is an `ip` one — one per row, since a group serves one service.
+            let target_group = crate::load_balancer_target_groups::create_target_group(
+                &router,
+                &format!("{}-tg", row.name),
+                "ip",
+                case,
+            )
+            .await;
+            request["loadBalancers"] = json!([{
+                "targetGroupArn": target_group,
+                "containerName": "web",
+                "containerPort": 80,
+            }]);
+        }
+        let created = ok(&router, "CreateService", request, case).await;
+        let created = created["service"].clone();
+        let service_arn = string(&created, "serviceArn", case);
+        // ROUND TRIP: the create and the read report the one stored record.
+        let read = describe(&router, cluster, row.name, case).await;
+        for (source, reported) in [("the create", &created), ("the read", &read)] {
+            assert_eq!(
+                string(reported, "platformVersion", case),
+                row.expect,
+                "case {case:?}: expected {source} to report platformVersion {:?}, got \
+                 {reported}",
+                row.expect
+            );
+            let task_sets = task_set_views(reported, case);
+            if !deploys_through_a_task_set {
+                assert!(
+                    task_sets.is_empty(),
+                    "case {case:?}: a service its own scheduler places holds no task set, \
+                     got {reported}"
+                );
+                continue;
+            }
+            // The task set Amazon ECS minted for the service: serving production traffic,
+            // running the version the service reports, and naming the service by the
+            // service's OWN ARN.
+            assert_eq!(
+                task_sets,
+                vec![(
+                    "PRIMARY".to_string(),
+                    row.expect.to_string(),
+                    service_arn.clone(),
+                )],
+                "case {case:?}: unexpected task sets from {source}, got {reported}"
+            );
+        }
+    }
+
+    // The ARN a task set names its service by follows WHO created it, so one service can
+    // report both forms: the `PRIMARY` task set Amazon ECS minted carries the service's own
+    // ARN, and the one a deployment controller creates carries the cluster-less form.
+    let case = "a controller's own task set beside the one Amazon ECS minted";
+    let service_name = "setpinned";
+    let created = ok(
+        &router,
+        "CreateTaskSet",
+        json!({
+            "cluster": cluster,
+            "service": service_name,
+            "taskDefinition": service_name,
+            "launchType": "FARGATE",
+            "platformVersion": "1.4.0",
+            "networkConfiguration": awsvpc_network_configuration(),
+            "scale": { "value": 0.0, "unit": "PERCENT" },
+        }),
+        case,
+    )
+    .await;
+    let controller_task_set_id = string(&created["taskSet"], "id", case);
+    let read = describe(&router, cluster, service_name, case).await;
+    let service_arn = string(&read, "serviceArn", case);
+    let reported = task_set_views(&read, case);
+    assert_eq!(
+        reported.len(),
+        2,
+        "case {case:?}: expected both task sets of the service, got {read}"
+    );
+    assert_eq!(
+        reported[0],
+        (
+            "PRIMARY".to_string(),
+            "1.4.0".to_string(),
+            service_arn.clone(),
+        ),
+        "case {case:?}: the task set Amazon ECS minted names the service by its own ARN, \
+         got {read}"
+    );
+    assert_eq!(
+        reported[1],
+        (
+            "ACTIVE".to_string(),
+            "1.4.0".to_string(),
+            format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:service/{service_name}"),
+        ),
+        "case {case:?}: a controller's own task set names the service by the cluster-less \
+         form, got {read}"
+    );
+    assert!(
+        !controller_task_set_id.is_empty(),
+        "case {case:?}: the created task set carries an id, got {created}"
+    );
 }

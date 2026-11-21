@@ -1217,15 +1217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "For update service requests, when no value is specified for
         // AvailabilityZoneRebalancing, Amazon ECS defaults to the existing service's
-        // AvailabilityZoneRebalancing value. If the service never had an
-        // AvailabilityZoneRebalancing value set, Amazon ECS treats this as DISABLED."
-        let (rebalancing, rebalancing_set) = crate::state::az_rebalancing_after_update(
+        // AvailabilityZoneRebalancing value" — the value the record carries, which every
+        // create resolved ([`crate::state::az_rebalancing_after_update`]).
+        service.availability_zone_rebalancing = crate::state::az_rebalancing_after_update(
             input.availability_zone_rebalancing.as_deref(),
             &service.availability_zone_rebalancing,
-            service.availability_zone_rebalancing_set,
         );
-        service.availability_zone_rebalancing = rebalancing;
-        service.availability_zone_rebalancing_set = rebalancing_set;
         if input.network_configuration.is_some() {
             service.network_configuration =
                 crate::state::defaulted_network_configuration(input.network_configuration.as_ref());

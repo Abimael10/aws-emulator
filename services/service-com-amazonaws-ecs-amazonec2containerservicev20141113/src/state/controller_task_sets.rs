@@ -170,7 +170,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             cluster_name: key.0.clone(),
             cluster_arn: service.cluster_arn.clone(),
             service_name: key.1.clone(),
-            service_arn: task_set_service_arn(region, &key.1),
+            // The task set Amazon ECS mints for a service of its own accord names that
+            // service by the service's OWN ARN, cluster segment and all, while a task set a
+            // deployment controller created names it by the cluster-less form
+            // ([`task_set_service_arn`]). `TaskSet$serviceArn` is documented as nothing more
+            // than "The Amazon Resource Name (ARN) of the service the task set exists in",
+            // so which form each carries is recorded behavior — which is why the ARN a task
+            // set reports is STORED on its own record rather than derived when it is read.
+            service_arn: service.arn.clone(),
             external_id: requested.external_id.clone(),
             status: requested.status.clone(),
             task_definition_arn: definition.arn.clone(),

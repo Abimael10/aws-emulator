@@ -1941,14 +1941,17 @@ pub fn service_arn(region: &str, cluster_name: &str, service_name: &str) -> Stri
     )
 }
 
-/// The ARN a TASK SET reports for the service it exists in:
+/// The ARN a task set a DEPLOYMENT CONTROLLER created reports for the service it exists in:
 /// `arn:aws:ecs:<region>:<account>:service/<name>`.
 ///
 /// Recorded behavior only. `TaskSet$serviceArn` is documented as nothing more than "The
 /// Amazon Resource Name (ARN) of the service the task set exists in", and the recorded
-/// task sets carry the service ARN WITHOUT the cluster qualification their sibling
-/// `taskSetArn` and `clusterArn` carry — which is why a task set stores the ARN it
-/// reports rather than deriving it from the service's own.
+/// task sets of an externally deployed service carry the service ARN WITHOUT the cluster
+/// qualification their sibling `taskSetArn` and `clusterArn` carry — while the task set
+/// Amazon ECS mints for a service itself carries the service's own ARN
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::add_controller_task_set`]).
+/// That is why a task set stores the ARN it reports rather than deriving it from the
+/// service's own.
 pub fn task_set_service_arn(region: &str, service_name: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("service/{service_name}"))
 }

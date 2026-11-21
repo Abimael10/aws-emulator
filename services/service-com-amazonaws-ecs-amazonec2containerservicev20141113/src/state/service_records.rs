@@ -69,19 +69,19 @@ pub struct ServiceRecord {
     pub propagate_tags: String,
     pub enable_ecs_managed_tags: bool,
     pub enable_execute_command: bool,
-    pub availability_zone_rebalancing: String,
-    /// Whether a REQUEST set `availabilityZoneRebalancing` on this service, as opposed to
-    /// the value above being the one a create with no such member defaults to.
+    /// `Service$availabilityZoneRebalancing`, as the last request that stated it left it.
     ///
-    /// `Service$availabilityZoneRebalancing`: "For create service requests, when no value
-    /// is specified for AvailabilityZoneRebalancing, Amazon ECS defaults the value to
-    /// ENABLED. For update service requests, when no value is specified ... Amazon ECS
-    /// defaults to the existing service's AvailabilityZoneRebalancing value. If the service
-    /// never had an AvailabilityZoneRebalancing value SET, Amazon ECS treats this as
-    /// DISABLED" — so the two sentences read one record apart: the create-time default is
-    /// not a value anybody set, and an update that names none resolves such a service to
-    /// `DISABLED` ([`az_rebalancing_after_update`]).
-    pub availability_zone_rebalancing_set: bool,
+    /// The member's doc: "For create service requests, when no value is specified for
+    /// AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED. For update
+    /// service requests, when no value is specified ... Amazon ECS defaults to the existing
+    /// service's AvailabilityZoneRebalancing value. If the service never had an
+    /// AvailabilityZoneRebalancing value set, Amazon ECS treats this as DISABLED." Every
+    /// service this API creates comes out of its create with one of the two enum values —
+    /// the one the create named, else [`AZ_REBALANCING_ENABLED`] — so the value a record
+    /// holds IS "the existing service's value" an update that names none defaults to, and
+    /// the closing sentence covers a service that carries no value at all, which no create
+    /// here leaves behind.
+    pub availability_zone_rebalancing: String,
     pub tags: Vec<Tag>,
     /// `Service$createdBy`: "The principal that created the service" — the authenticated
     /// caller of the request that created it, resolved by [`caller_identity_arn`].

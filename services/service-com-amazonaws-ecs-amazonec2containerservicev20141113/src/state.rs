@@ -2546,32 +2546,26 @@ pub fn standalone_task_tags(
 /// AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED."
 pub const AZ_REBALANCING_ENABLED: &str = "ENABLED";
 
-/// The other value of the `AvailabilityZoneRebalancing` enum, and the one an UPDATE
-/// resolves for a service no request ever set the member on — the member's doc: "If the
-/// service never had an AvailabilityZoneRebalancing value set, Amazon ECS treats this as
-/// DISABLED."
+/// The other value of the `AvailabilityZoneRebalancing` enum, which a service carries when
+/// a request stated it — and the reading the member's doc gives a service that carries no
+/// value at all: "If the service never had an AvailabilityZoneRebalancing value set, Amazon
+/// ECS treats this as DISABLED."
 pub const AZ_REBALANCING_DISABLED: &str = "DISABLED";
 
 /// The `availabilityZoneRebalancing` an UPDATE leaves a service with: the value the request
-/// named, else the value the service was SET to, else [`AZ_REBALANCING_DISABLED`].
+/// named, else the value the service already carries.
 ///
 /// The member's own doc states the update case apart from the create case: "For update
 /// service requests, when no value is specified for AvailabilityZoneRebalancing, Amazon ECS
 /// defaults to the existing service's AvailabilityZoneRebalancing value. If the service
 /// never had an AvailabilityZoneRebalancing value set, Amazon ECS treats this as DISABLED."
-/// So an update is what resolves the service that only ever carried the create-time default
-/// ([`ServiceRecord::availability_zone_rebalancing_set`]), and what it resolves to is what
-/// the service reports from then on.
-pub fn az_rebalancing_after_update(
-    requested: Option<&str>,
-    stored: &str,
-    was_set: bool,
-) -> (String, bool) {
-    match requested {
-        Some(requested) => (requested.to_string(), true),
-        None if was_set => (stored.to_string(), true),
-        None => (AZ_REBALANCING_DISABLED.to_string(), false),
-    }
+/// Both sentences read off the ONE value the service carries: an update that names none
+/// keeps it, whether a request stated it or the create defaulted it to
+/// [`AZ_REBALANCING_ENABLED`], and the closing sentence is about a service carrying no value
+/// at all — which this API's creates never leave behind, since every one of them resolves
+/// the member.
+pub fn az_rebalancing_after_update(requested: Option<&str>, stored: &str) -> String {
+    requested.unwrap_or(stored).to_string()
 }
 
 /// `maximumPercent` of a `REPLICA` service's deployment configuration when the request

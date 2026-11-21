@@ -1193,15 +1193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             enable_ecs_managed_tags: input.enable_ecs_managed_tags,
             enable_execute_command: input.enable_execute_command,
             // "For create service requests, when no value is specified for
-            // AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED."
+            // AvailabilityZoneRebalancing, Amazon ECS defaults the value to ENABLED." The
+            // created service carries that value as its own, so an update that names none
+            // keeps it ([`crate::state::az_rebalancing_after_update`]).
             availability_zone_rebalancing: input
                 .availability_zone_rebalancing
                 .clone()
                 .unwrap_or_else(|| crate::state::AZ_REBALANCING_ENABLED.to_string()),
-            // ... and that default is not a value the client SET: the member's doc reads
-            // the two apart, and an update of a service that only ever carried the default
-            // resolves it the other way ([`crate::state::az_rebalancing_after_update`]).
-            availability_zone_rebalancing_set: input.availability_zone_rebalancing.is_some(),
             tags: input.tags.clone().unwrap_or_default(),
             // "The principal that created the service": the authenticated caller, the
             // identity every request to this emulator signs as.
