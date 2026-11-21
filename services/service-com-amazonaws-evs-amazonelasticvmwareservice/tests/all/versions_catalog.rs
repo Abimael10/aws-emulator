@@ -42,22 +42,35 @@
 //! The rows differ along what the rule generalises over: which VCF version is reported,
 //! which EC2 instance type, whether a host names an ESX version or leaves it to the
 //! catalogue, how many times the catalogue is read, and what the account holds when it is
-//! read.
+//! read. The completeness of the catalogue is checked against the `VcfVersion` enum values
+//! this crate generates FROM the model, and against `CreateEnvironment` itself: a version
+//! the create operation serves is one the catalogue describes, and a string the model does
+//! not declare is refused there and absent here.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_evs_amazonelasticvmwareservice::ops::types::VCF_VERSION_VALUES;
 use service_com_amazonaws_evs_amazonelasticvmwareservice::state as evs;
 
-use crate::environment_lifecycle::{call, emulator, error_type, vlans_with_prefix, Emulator};
+use crate::environment_lifecycle::{
+    call, emulator, error_type, settle, vlans_with_prefix, Emulator,
+};
 
 /// Every `VcfVersion` value the model declares, written out here rather than read from
 /// the service, so this suite cannot drift along with the handler it checks.
 ///
 /// Source: `smithy_query(query="shape", shape="VcfVersion")` — `VCF-5.2.1`, `VCF-5.2.2`,
-/// `SELF_DEPLOYED`.
+/// `SELF_DEPLOYED`. [`the_catalogue_covers_every_vcf_version_the_model_declares`] holds
+/// this list to the enum values this crate generates FROM that model, so a model that
+/// gains or loses a value cannot leave the list — or the catalogue — behind.
 const VCF_VERSIONS: [&str; 3] = ["VCF-5.2.1", "VCF-5.2.2", "SELF_DEPLOYED"];
+
+/// A string that names no declared `VcfVersion`: the negative row of the table in
+/// [`no_version_create_environment_serves_is_missing_from_the_catalogue`], which is what
+/// keeps the agreement between the catalogue and `CreateEnvironment` from being vacuous.
+const UNDECLARED_VCF_VERSION: &str = "VCF-9.9.9";
 
 /// A `hostName` holds letters, digits and hyphens only (`smithy_query(query="shape",
 /// shape="HostName")` reports the pattern `^([a-zA-Z0-9\-]*)$`), so a VCF version worked
@@ -204,8 +217,10 @@ async fn deployed_environment(router: &Emulator, case: &str, vcf_version: &str) 
         .unwrap_or_else(|| panic!("case {case:?}: no environmentId in {body}"))
         .to_string();
     // The environment is CREATING until the move to CREATED the clock owes it comes due,
-    // and a host can only be added to a deployed environment.
-    std::thread::sleep(std::time::Duration::from_millis(900));
+    // and a host can only be added to a deployed environment. The transition is applied
+    // against an instant past its due one rather than waited for, so this suite's rows
+    // cost no wall-clock time.
+    settle(router);
     environment
 }
 
@@ -670,4 +685,137 @@ async fn the_catalogue_is_a_read_that_answers_the_same_whatever_the_account_hold
         "case \"the account's own resources\": what the account holds must not change the \
          catalogue, got {after}"
     );
+}
+
+#[tokio::test]
+async fn the_catalogue_covers_every_vcf_version_the_model_declares() {
+    let router = emulator();
+    let body = get_versions(&router).await;
+    let versions = reported_versions("every declared VcfVersion", &body);
+    let reported: BTreeSet<&str> = versions
+        .iter()
+        .map(|version| version.vcf_version.as_str())
+        .collect();
+
+    // The expectation here is the `VcfVersion` enum values this crate GENERATES from the
+    // Smithy model, not a list written out in a test: the catalogue is complete with
+    // respect to the model, so a declared value it omits fails this row whichever value
+    // that is, and a model that gains or loses a value moves the expectation with it.
+    let declared: BTreeSet<&str> = VCF_VERSION_VALUES.iter().copied().collect();
+    assert_eq!(
+        reported, declared,
+        "case \"every declared VcfVersion\": the catalogue must report one entry per \
+         declared VcfVersion, expected {declared:?}, got {reported:?}"
+    );
+
+    // …and the list this suite writes out is that same set, so the rows above cover every
+    // declared value too.
+    let written_out: BTreeSet<&str> = VCF_VERSIONS.iter().copied().collect();
+    assert_eq!(
+        written_out, declared,
+        "case \"this suite's own list of versions\": expected the declared values \
+         {declared:?}, got {written_out:?}"
+    );
+
+    // A string the model does not declare is no part of the catalogue: the set is the
+    // declared values, not a superset of them.
+    assert!(
+        !reported.contains(UNDECLARED_VCF_VERSION),
+        "case \"an undeclared VcfVersion\": the catalogue must not report \
+         {UNDECLARED_VCF_VERSION:?}, got {reported:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_version_create_environment_serves_is_missing_from_the_catalogue() {
+    let router = emulator();
+    let catalogue = get_versions(&router).await;
+    let reported: Vec<String> = reported_versions("the versions the create operation takes", &catalogue)
+        .iter()
+        .map(|version| version.vcf_version.clone())
+        .collect();
+
+    // `GetVersions` is the discovery call for what `CreateEnvironment` takes, so the two
+    // agree in BOTH directions: a version the create operation serves is described by the
+    // catalogue, and a version it refuses is absent from it. The rows differ along the one
+    // thing the rule generalises over — which `VcfVersion` the request names — with the
+    // undeclared string as the row that would pass vacuously if the catalogue simply
+    // reported everything.
+    let rows: Vec<(&str, bool)> = VCF_VERSION_VALUES
+        .iter()
+        .map(|vcf_version| (*vcf_version, true))
+        .chain(std::iter::once((UNDECLARED_VCF_VERSION, false)))
+        .collect();
+
+    for (vcf_version, declared) in rows {
+        let case = vcf_version;
+        let (vpc_id, subnet_id) = router.fresh_network();
+        // Only the five `@required` members: the mode in which the caller installs VCF
+        // itself does not use the install parameters, so a request carrying none of them
+        // is served whatever version it names and the rows differ along the version alone.
+        let request = json!({
+            "vpcId": vpc_id,
+            "serviceAccessSubnetId": subnet_id,
+            "vcfVersion": vcf_version,
+            "termsAccepted": true,
+            "initialVlans": vlans_with_prefix(24),
+        });
+        let (status, body) = call(&router, "CreateEnvironment", &request).await;
+
+        if !declared {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a value outside the enumerated set must be refused, got \
+                 {status} {body}"
+            );
+            assert!(
+                error_type(&body).contains("ValidationException"),
+                "case {case:?}: expected a ValidationException, got {}",
+                error_type(&body)
+            );
+            assert!(
+                !reported.iter().any(|version| version == vcf_version),
+                "case {case:?}: a version CreateEnvironment refuses must not be in the \
+                 catalogue, got {reported:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a declared VcfVersion must be accepted, got {status} ({}) {body}",
+            error_type(&body)
+        );
+        let environment_id = body["environment"]["environmentId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no environmentId in {body}"))
+            .to_string();
+
+        // The round trip: the stored environment reports the version it was created at…
+        let (status, got) = call(
+            &router,
+            "GetEnvironment",
+            &json!({ "environmentId": environment_id }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from the read-back, got {status} ({}) {got}",
+            error_type(&got)
+        );
+        assert_eq!(
+            got["environment"]["vcfVersion"],
+            json!(vcf_version),
+            "case {case:?}: the stored environment must report the version it was created \
+             at, got {}",
+            got["environment"]["vcfVersion"]
+        );
+
+        // …and the catalogue describes that very version.
+        assert!(
+            reported.iter().any(|version| version == vcf_version),
+            "case {case:?}: a version CreateEnvironment serves must appear in the \
+             catalogue, got {reported:?}"
+        );
+    }
 }
