@@ -171,6 +171,11 @@ mod aws_sns;
 /// `awsQuery` too, and it is what a handler that chains roles assumes one through.
 mod aws_sts;
 
+/// The IDENTITY half of it, for the same reason: that service's model declares `awsQuery`
+/// too, and it is what a handler reads the role it runs as and the documents in force on that
+/// role through, and what one administering an identity writes them through.
+mod aws_iam;
+
 /// The Amazon RDS half of it, for the same reason: that service's model declares `awsQuery`
 /// too, and it is what a handler holding a database credential puts a new one in force
 /// through, and what one driving a database's Amazon S3 export and its role associations

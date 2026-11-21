@@ -181,6 +181,11 @@ pub enum Protocol {
     /// assumes another role through, built by the client this crate holds for it
     /// ([`super::aws_sts`]).
     StsQuery,
+    /// The IDENTITY service's `awsQuery`: the same binding, for the service a handler reads
+    /// the role it runs as and the documents in force on that role through — and administers
+    /// an identity through — built by the client this crate holds for it
+    /// ([`super::aws_iam`]).
+    IamQuery,
     /// Amazon RDS's `awsQuery`: the same binding, for the service a handler reads a database
     /// through, puts a new master credential in force on, and drives that database's Amazon S3
     /// export and its role associations through, built by the client this crate holds for it
@@ -210,6 +215,7 @@ impl Api {
             | Protocol::CloudFrontRest
             | Protocol::SnsQuery
             | Protocol::StsQuery
+            | Protocol::IamQuery
             | Protocol::RdsQuery
             | Protocol::CloudFormationQuery => "application/json".to_string(),
         }
@@ -287,6 +293,29 @@ pub const APIS: &[Api] = &[
         // The answer of such a call is read by that client out of the XML the service sent,
         // and the document this seam hands the guest is built from the output members it
         // reported ([`super::aws_sts`]); none of them carries bytes.
+        answer_model: None,
+    },
+    // `services/service-com-amazonaws-iam-awsidentitymanagementv20100508/smithy-model/
+    // com-amazonaws-iam-awsidentitymanagementv20100508.json`: awsQuery, sigv4Name `iam`,
+    // endpointPrefix `iam`, sdkId `IAM`. Its operations carry their input as the parameters of
+    // a form-encoded `Action` and answer an XML document, so the request is built by
+    // [`super::aws_iam`].
+    //
+    // WHAT A FUNCTION MAY DO is this service's to answer: the execution role a function runs
+    // as is an IAM role, and the documents embedded in and attached to it are what every
+    // service judges the function's own calls against. So a handler that reports the identity
+    // it runs as, that checks what that identity is allowed to do, or that PROVISIONS an
+    // identity for a workload reaches this service — and until it can, a call it is allowed to
+    // make and a call its role explicitly denies come back indistinguishable.
+    Api {
+        sdk_token: "iam",
+        signing_name: "iam",
+        endpoint_prefix: "iam",
+        model: Some(IAM_MODEL),
+        protocol: Protocol::IamQuery,
+        // The answer of such a call is read by that client out of the XML the service sent,
+        // and the document this seam hands the guest is built from the output members it
+        // reported ([`super::aws_iam`]); none of them carries bytes.
         answer_model: None,
     },
     // `services/service-com-amazonaws-eventbridge-awsevents/smithy-model/
@@ -1215,6 +1244,10 @@ pub(super) const SNS_MODEL: &str = include_str!(
 pub(super) const STS_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-sts-awssecuritytokenservicev20110615/smithy-model/\
      com-amazonaws-sts-awssecuritytokenservicev20110615.json"
+);
+pub(super) const IAM_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-iam-awsidentitymanagementv20100508/smithy-model/\
+     com-amazonaws-iam-awsidentitymanagementv20100508.json"
 );
 pub(super) const EVENTBRIDGE_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-eventbridge-awsevents/smithy-model/\
@@ -2205,6 +2238,19 @@ impl AwsAccess {
                 )
                 .await
             }
+            // IAM is reached at ONE endpoint whatever Region the client the guest built
+            // names, so the Region is not threaded into this call
+            // ([`super::aws_iam::SIGNING_REGION`]).
+            Protocol::IamQuery => {
+                super::aws_iam::call(
+                    &self.callback,
+                    self.identity.as_ref(),
+                    operation,
+                    body,
+                    self.trace_header.as_deref(),
+                )
+                .await
+            }
             Protocol::RdsQuery => {
                 super::aws_rds::call(
                     &self.callback,
@@ -2518,6 +2564,7 @@ async fn sent(
         | Protocol::CloudFrontRest
         | Protocol::SnsQuery
         | Protocol::StsQuery
+        | Protocol::IamQuery
         | Protocol::RdsQuery
         | Protocol::CloudFormationQuery => {
             return Err(Sent::NotMade(format!(
@@ -2911,6 +2958,14 @@ mod tests {
                     api.signing_name, "sts",
                     "case {:?}: expected the token service's own signing name on its protocol \
                      entry",
+                    api.sdk_token
+                ),
+                // The identity service's `awsQuery`, the same way, in
+                // `super::super::aws_iam`.
+                super::Protocol::IamQuery => assert_eq!(
+                    api.signing_name, "iam",
+                    "case {:?}: expected the identity service's own signing name on its \
+                     protocol entry",
                     api.sdk_token
                 ),
                 // Amazon RDS's `awsQuery`, the same way, in `super::super::aws_rds`.

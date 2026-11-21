@@ -66,6 +66,7 @@ const MUST_REACH: &[&str] = &[
     "cognito-idp",
     "dynamodb",
     "events",
+    "iam",
     "kinesis",
     "logs",
     "opensearch",
