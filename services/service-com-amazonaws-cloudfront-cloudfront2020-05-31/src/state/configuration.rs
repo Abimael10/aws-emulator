@@ -320,6 +320,17 @@ impl BehaviorLists<'_> {
     }
 }
 
+/// The sentence CloudFront refuses a configuration whose alternate domain names no
+/// certificate it names can serve with: the whole text is fixed — it names neither the
+/// alternate domain names the configuration declared nor the certificate members it
+/// stated — so every such configuration is refused with the one sentence, which points at
+/// the alternate-domain-name requirements rather than restating them. Recorded behaviour.
+pub const INVALID_VIEWER_CERTIFICATE_MESSAGE: &str =
+    "To add an alternate domain name (CNAME) to a CloudFront distribution, you must attach \
+     a trusted certificate that validates your authorization to use the domain name. For \
+     more details, see: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/\
+     CNAMEs.html#alternate-domain-names-requirements";
+
 /// The `InvalidViewerCertificate` message for a configuration whose alternate domain
 /// names no certificate IT names can serve, or `None` when the two agree.
 ///
@@ -338,7 +349,7 @@ impl BehaviorLists<'_> {
 /// distribution ever carries an alias its certificate does not cover: the condition is a
 /// property of the submitted configuration alone, which is why it lives here beside
 /// [`config_quantity_mismatch`] rather than in one handler.
-pub fn alias_certificate_mismatch(config: &DistributionConfig) -> Option<String> {
+pub fn alias_certificate_mismatch(config: &DistributionConfig) -> Option<&'static str> {
     let aliases: &[String] = config
         .aliases
         .as_ref()
@@ -351,28 +362,18 @@ pub fn alias_certificate_mismatch(config: &DistributionConfig) -> Option<String>
     let (acm, iam) = custom_certificate_members(certificate);
     let default = certificate
         .is_none_or(|certificate| certificate.cloud_front_default_certificate == Some(true));
-    let aliases = aliases.join(", ");
-    match (acm, iam) {
-        (false, false) => Some(format!(
-            "This distribution states the alternate domain names [{aliases}] and no viewer \
-             certificate that covers them: a distribution with an alternate domain name has \
-             to name one of ViewerCertificate.ACMCertificateArn or \
-             ViewerCertificate.IAMCertificateId, since CloudFront's default certificate \
-             validates no domain name of yours"
-        )),
-        (true, true) => Some(format!(
-            "This distribution states the alternate domain names [{aliases}] with both \
-             ViewerCertificate.ACMCertificateArn and ViewerCertificate.IAMCertificateId: \
-             exactly one of them names the certificate that covers them"
-        )),
-        _ if default => Some(format!(
-            "This distribution states the alternate domain names [{aliases}] with \
-             ViewerCertificate.CloudFrontDefaultCertificate set: the default certificate \
-             serves only the distribution's own CloudFront domain name, so it cannot be \
-             combined with a custom certificate for an alternate domain name"
-        )),
-        _ => None,
+    // Exactly ONE custom certificate, and CloudFront's own certificate not stated beside
+    // it: the configuration a distribution with an alternate domain name is created under.
+    // Anything else — no custom certificate at all (the default certificate, by itself or
+    // by omission), both custom members at once, or a custom member beside the default one
+    // — names no single certificate that validates the authorization to serve the name,
+    // and every one of them is refused with the ONE sentence the service states for the
+    // class ([`INVALID_VIEWER_CERTIFICATE_MESSAGE`]): it carries no part of the request, so
+    // it cannot describe which of the forms was submitted.
+    if (acm != iam) && !default {
+        return None;
     }
+    Some(INVALID_VIEWER_CERTIFICATE_MESSAGE)
 }
 
 /// The `InvalidLambdaFunctionAssociation` message for a configuration carrying a

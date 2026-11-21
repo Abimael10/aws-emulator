@@ -541,7 +541,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     UpdateDistributionWithStagingConfigErrorModeled::InvalidViewerCertificate(
                         InvalidViewerCertificate {
-                            message: Some(message),
+                            message: Some(message.to_string()),
                         },
                     )
                     .into(),

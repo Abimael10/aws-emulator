@@ -1478,7 +1478,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         // so a configuration whose aliases and viewer certificate disagree is refused
         // before any distribution exists to carry the alias.
         if let Some(message) = alias_certificate_mismatch(&config) {
-            return Err(CreateRefusal::InvalidViewerCertificate(message));
+            return Err(CreateRefusal::InvalidViewerCertificate(message.to_string()));
         }
 
         // A CloudFront function runs on a VIEWER event, so a configuration whose function
