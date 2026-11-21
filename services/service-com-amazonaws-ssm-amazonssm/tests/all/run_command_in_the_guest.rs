@@ -206,12 +206,15 @@ async fn an_invocation_reports_what_the_guest_ran() {
             response_code: 1,
             output: "",
         },
+        // A program the guest does not have is where the shell's own command search ends with
+        // nothing, and a shell says so: the diagnostic naming that command reaches the
+        // guest's console, which is the one stream this invocation reports.
         ScriptCase {
             case: "a script naming a program the guest does not have",
             commands: vec!["/usr/bin/definitely-not-installed --now"],
             status: "Failed",
             response_code: COULD_NOT_RUN,
-            output: "",
+            output: "sh: /usr/bin/definitely-not-installed: command not found\n",
         },
         ScriptCase {
             case: "a script that writes the machine's storage and reads it back",

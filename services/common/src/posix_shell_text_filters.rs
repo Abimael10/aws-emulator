@@ -21,6 +21,23 @@
 //! * `cut -c LIST` / `-f LIST [-d DELIM]` — "select portions of each line of a file", the
 //!   characters or the delimited fields the list names, one output line per input line;
 //! * `head -n COUNT` — "the first COUNT lines of each file", ten lines when no count is given;
+//! * `tail -n COUNT` — "the last COUNT lines of each file", ten lines when no count is given,
+//!   which is the other end of the same selection `head` makes;
+//! * `sort [-r] [-u] [-n] [-f] [-b]` — "write sorted concatenation of all FILE(s)": the lines
+//!   of its input in order, "reverse[d]" by `-r`, with "only the first of an equal run" kept by
+//!   `-u`, compared "according to string numerical value" by `-n`, with "lower case folded to
+//!   upper case" by `-f` and with leading blanks ignored by `-b`. The order with no option at
+//!   all is the byte order of the lines, which is the collating sequence of the C locale an
+//!   image's own `sort` uses when nothing else is published to it;
+//! * `uniq [-c] [-d] [-u] [-i]` — "filter adjacent matching lines": one line per run of equal
+//!   ADJACENT lines, each "prefix[ed] with the number of occurrences" by `-c`, narrowed to the
+//!   runs that repeat by `-d` or to the lines that do not by `-u`, and compared without regard
+//!   to case by `-i`;
+//! * `tr [-d] [-s] SET1 [SET2]` — "translate, squeeze, and/or delete characters from standard
+//!   input": each character SET1 names written as the one at its position in SET2, "delete[d]"
+//!   by `-d` and with repeats of the characters a set names "replace[d] … with a single
+//!   occurrence" by `-s`. A set is written as the utility writes one: its literal characters, a
+//!   `a-z` range, the `\n`/`\t`/`\r`/`\\` escapes, and the `[:class:]` character classes;
 //! * `sha256sum` / `sha512sum` — the digest of its input, written as the lowercase hexadecimal
 //!   digest, two spaces and the name of what was read (`-` for standard input);
 //! * `base64` / `base64 -d` — "Base64 encode or decode FILE, or standard input, to standard
@@ -40,8 +57,9 @@
 //!   expressions") and as a literal string under `-F` ("interpret PATTERNS as fixed strings").
 //!
 //! The option spellings and the output forms above are each utility's own, from the GNU
-//! coreutils manual (`wc`, `cut`, `head`, `sha2 utilities`, `base64`) — which is what the images
-//! these sessions stand for carry — and POSIX for `wc`, `cut` and `head`.
+//! coreutils manual (`wc`, `cut`, `head`, `tail`, `sort`, `uniq`, `tr`, `sha2 utilities`,
+//! `base64`) — which is what the images these sessions stand for carry — and POSIX for `wc`,
+//! `cut`, `head`, `tail`, `sort`, `uniq` and `tr`.
 //!
 //! # What is NOT performed
 //!
@@ -58,6 +76,14 @@
 //!   as though that escape meant what an extended expression means by it; nor is one asking
 //!   for the lines AROUND a match, for the files rather than the lines, or for a walk of a
 //!   directory, none of which follows from one input either;
+//! * a `sort` asked to compare by a KEY of each line (`-k`, with its own field separator) or
+//!   to check an order rather than write one (`-c`) is not performed, nor is one asked for an
+//!   order this module computes nothing for (a human-readable, version or random order): each
+//!   of those is a comparison beyond the line's own bytes and its numeric value;
+//! * a `tr` asked for the COMPLEMENT of a set (`-c`), for a truncated SET2 (`-t`), or carrying
+//!   a set this module does not read (an escape or a class outside the ones above, a `[:class:]`
+//!   in SET2 that is not `[:lower:]` or `[:upper:]`, which is the only place the utility itself
+//!   admits one) is not performed either;
 //! * every other utility, option and operand form answers as a command the session could not
 //!   run ([`Filter::read`] answering `None`), which is the fail-closed default the session's
 //!   own catalog keeps.
@@ -75,8 +101,23 @@ use ::sha2::Digest;
 
 /// The utilities this module performs, as the names a command line invokes them by. A session
 /// hands a command whose name is one of these to [`Filter::read`].
-pub const TEXT_FILTER_COMMANDS: &[&str] =
-    &["wc", "cut", "head", "sha256sum", "sha512sum", "base64", GREP_COMMAND];
+pub const TEXT_FILTER_COMMANDS: &[&str] = &[
+    "wc",
+    "cut",
+    "head",
+    "tail",
+    "sort",
+    "uniq",
+    TRANSLATE_COMMAND,
+    "sha256sum",
+    "sha512sum",
+    "base64",
+    GREP_COMMAND,
+];
+
+/// The utility of [`TEXT_FILTER_COMMANDS`] whose operands are the character SETS it works
+/// over rather than a file: "tr … reads from standard input", so it never names one.
+const TRANSLATE_COMMAND: &str = "tr";
 
 /// The utility of [`TEXT_FILTER_COMMANDS`] whose STATUS is the selection it made, which is
 /// the one a program's `if` branches on.
@@ -154,6 +195,47 @@ struct GrepWork {
     line_number: bool,
 }
 
+/// How one `sort` invocation compares the lines of its input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SortWork {
+    /// `-r`/`--reverse`: "reverse the result of comparisons".
+    reverse: bool,
+    /// `-u`/`--unique`: "output only the first of an equal run".
+    unique: bool,
+    /// `-n`/`--numeric-sort`: "compare according to string numerical value".
+    numeric: bool,
+    /// `-f`/`--ignore-case`: "fold lower case to upper case characters".
+    fold_case: bool,
+    /// `-b`/`--ignore-leading-blanks`: "ignore leading blanks".
+    ignore_blanks: bool,
+}
+
+/// What one `uniq` invocation writes about the runs of adjacent equal lines it found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UniqWork {
+    /// `-c`/`--count`: "prefix lines by the number of occurrences".
+    count: bool,
+    /// `-d`/`--repeated`: "only print duplicate lines, one for each group".
+    repeated: bool,
+    /// `-u`/`--unique`: "only print unique lines".
+    unique: bool,
+    /// `-i`/`--ignore-case`: "ignore differences in case when comparing".
+    ignore_case: bool,
+}
+
+/// What one `tr` invocation does to each character of its input, in the order the utility
+/// does it: a translation, a deletion, and then a squeeze of the repeats a set names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranslateWork {
+    /// The characters SET1 names and the one each is written as, which is the character at
+    /// the same position of SET2 — `None` for an invocation that translates nothing.
+    translate: Option<(Vec<char>, Vec<char>)>,
+    /// `-d SET1`: the characters "delete[d]" rather than written.
+    delete: Option<Vec<char>>,
+    /// `-s SET`: the characters whose repeats are "replace[d] … with a single occurrence".
+    squeeze: Option<Vec<char>>,
+}
+
 /// The work one invocation of a text filter performs over ONE input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Work {
@@ -163,6 +245,14 @@ enum Work {
     Cut(Portion),
     /// `head`, keeping the first lines.
     Head(usize),
+    /// `tail`, keeping the last lines.
+    Tail(usize),
+    /// `sort`, writing the lines of its input in order.
+    Sort(SortWork),
+    /// `uniq`, writing one line per run of adjacent equal lines.
+    Uniq(UniqWork),
+    /// `tr`, writing each character of its input as the sets say.
+    Translate(TranslateWork),
     /// `sha256sum` / `sha512sum`.
     Digest(Digester),
     /// `base64`, encoding or decoding.
@@ -204,7 +294,8 @@ pub struct Filter {
 }
 
 /// How many lines `head` writes when the invocation names no count: "head will print the first
-/// 10 lines".
+/// 10 lines". `tail` defaults to the same count, written from the other end: "print the last 10
+/// lines".
 const DEFAULT_HEAD_LINES: usize = 10;
 
 /// The delimiter `cut -f` takes when the invocation names none: "the default is TAB".
@@ -258,6 +349,14 @@ impl Filter {
         if name == GREP_COMMAND {
             return grep_filter(&options, &operands);
         }
+        // So does `tr`, whose operands are the character SETS it works over: it reads standard
+        // input and never a file.
+        if name == TRANSLATE_COMMAND {
+            return Some(Self {
+                work: Work::Translate(translate_work(&options, &operands)?),
+                file: None,
+            });
+        }
         // ONE input at a time: several files make an output this module does not write (see the
         // module docs), and `-` is the spelling for the standard input it would read anyway.
         let file = match operands.len() {
@@ -272,6 +371,9 @@ impl Filter {
             "wc" => Work::Count(count_of(&options)?),
             "cut" => Work::Cut(portion_of(&options)?),
             "head" => Work::Head(head_lines(&options)?),
+            "tail" => Work::Tail(head_lines(&options)?),
+            "sort" => Work::Sort(sort_work(&options)?),
+            "uniq" => Work::Uniq(uniq_work(&options)?),
             "sha256sum" => Work::Digest(Digester::Sha256),
             "sha512sum" => Work::Digest(Digester::Sha512),
             "base64" => Work::Base64(base64_work(&options)?),
@@ -305,6 +407,10 @@ impl Filter {
             }
             Work::Cut(portion) => Selection::wrote(cut_lines(portion, input)),
             Work::Head(lines) => Selection::wrote(head_of(*lines, input)),
+            Work::Tail(lines) => Selection::wrote(tail_of(*lines, input)),
+            Work::Sort(work) => Selection::wrote(sorted(*work, input)),
+            Work::Uniq(work) => Selection::wrote(uniq_lines(*work, input)),
+            Work::Translate(work) => Selection::wrote(translated(work, input)),
             Work::Digest(digester) => {
                 Selection::wrote(format!("{}  {label}\n", digest_of(*digester, input)))
             }
@@ -320,8 +426,8 @@ fn value_taking_options(name: &str) -> &'static [&'static str] {
     match name {
         // `cut`'s lists and its delimiter.
         "cut" => &["-c", "-f", "-d"],
-        // `head`'s line count.
-        "head" => &["-n"],
+        // `head`'s and `tail`'s line count.
+        "head" | "tail" => &["-n"],
         // `base64`'s wrapping width.
         "base64" => &["-w", "--wrap"],
         // `grep`'s pattern, for the invocation that names it with an option rather than as its
@@ -409,13 +515,20 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty())
 }
 
-/// How many lines a `head` invocation keeps, or `None` for an option form this module does not
-/// perform.
+/// How many lines a `head` or `tail` invocation keeps, or `None` for an option form this
+/// module does not perform.
+///
+/// A count written with a SIGN is not read as a count: `-n +COUNT` means "begin at line
+/// COUNT" to `tail` and "all but the last COUNT" to `head`, neither of which is the count of
+/// the lines kept.
 fn head_lines(options: &[String]) -> Option<usize> {
     let mut lines = None;
     for option in options {
-        let written = non_empty(option.strip_prefix("-n"))?;
-        lines = Some(written.trim().parse::<usize>().ok()?);
+        let written = non_empty(option.strip_prefix("-n"))?.trim();
+        if written.starts_with('+') || written.starts_with('-') {
+            return None;
+        }
+        lines = Some(written.parse::<usize>().ok()?);
     }
     Some(lines.unwrap_or(DEFAULT_HEAD_LINES))
 }
@@ -861,6 +974,471 @@ fn head_of(lines: usize, input: &str) -> String {
     written
 }
 
+/// The last `lines` lines of `input`, each with the newline it carried.
+fn tail_of(lines: usize, input: &str) -> String {
+    let mut written = String::new();
+    let ends_with_newline = input.ends_with('\n');
+    let held = lines_of(input);
+    let skipped = held.len().saturating_sub(lines);
+    let kept = held.len().saturating_sub(skipped);
+    for (index, line) in held.iter().skip(skipped).enumerate() {
+        written.push_str(line);
+        // The last line keeps a newline only if the input's own last line did.
+        if index + 1 < kept || ends_with_newline {
+            written.push('\n');
+        }
+    }
+    written
+}
+
+/// How a `sort` invocation's options say its lines are compared, or `None` for an option form
+/// this module does not perform (see the module docs).
+fn sort_work(options: &[String]) -> Option<SortWork> {
+    let mut work = SortWork {
+        reverse: false,
+        unique: false,
+        numeric: false,
+        fold_case: false,
+        ignore_blanks: false,
+    };
+    for option in options {
+        if let Some(name) = option.strip_prefix("--") {
+            match name {
+                "reverse" => work.reverse = true,
+                "unique" => work.unique = true,
+                "numeric-sort" => work.numeric = true,
+                "ignore-case" => work.fold_case = true,
+                "ignore-leading-blanks" => work.ignore_blanks = true,
+                _ => return None,
+            }
+            continue;
+        }
+        // Several valueless flags written as one word, as `-nr` is.
+        for flag in option.strip_prefix('-')?.chars() {
+            match flag {
+                'r' => work.reverse = true,
+                'u' => work.unique = true,
+                'n' => work.numeric = true,
+                'f' => work.fold_case = true,
+                'b' => work.ignore_blanks = true,
+                _ => return None,
+            }
+        }
+    }
+    Some(work)
+}
+
+/// The lines of `input` in the order `work` compares them in, each ended by a newline — the
+/// utility writes a sorted FILE, so its last line is terminated whether or not the input's
+/// was.
+fn sorted(work: SortWork, input: &str) -> String {
+    let mut lines = lines_of(input);
+    if work.unique {
+        // "Output only the first of an equal run": the run is what the COMPARISON made equal,
+        // so the last-resort comparison below is not applied — a line it would have ordered
+        // after an equal one is a line this invocation does not write at all.
+        lines.sort_by(|left, right| sort_ordering(work, left, right));
+        lines.dedup_by(|left, right| {
+            sort_ordering(work, left, right) == ::std::cmp::Ordering::Equal
+        });
+    } else {
+        // Lines the comparison makes equal are then compared as the bytes they are, which is
+        // the utility's own last-resort comparison and what makes one input one order.
+        lines.sort_by(|left, right| {
+            sort_ordering(work, left, right)
+                .then_with(|| reversed(work, left.as_bytes().cmp(right.as_bytes())))
+        });
+    }
+    let mut written = String::new();
+    for line in lines {
+        written.push_str(line);
+        written.push('\n');
+    }
+    written
+}
+
+/// How `work` orders `left` against `right`: the comparison its options ask for, reversed
+/// where the invocation asked for the reverse.
+fn sort_ordering(work: SortWork, left: &str, right: &str) -> ::std::cmp::Ordering {
+    let left_key = sort_key(work, left);
+    let right_key = sort_key(work, right);
+    let ordering = if work.numeric {
+        // "Compare according to string numerical value", which is the value the line begins
+        // with.
+        numeric_value(&left_key).total_cmp(&numeric_value(&right_key))
+    } else {
+        left_key.as_bytes().cmp(right_key.as_bytes())
+    };
+    reversed(work, ordering)
+}
+
+/// `ordering` as `-r` ("reverse the result of comparisons") leaves it.
+fn reversed(work: SortWork, ordering: ::std::cmp::Ordering) -> ::std::cmp::Ordering {
+    if work.reverse {
+        return ordering.reverse();
+    }
+    ordering
+}
+
+/// The part of `line` a comparison reads: the whole line, without the leading blanks `-b`
+/// ignores and folded to upper case where `-f` folds it ("fold lower case to upper case
+/// characters", which is the direction the utility folds in).
+fn sort_key(work: SortWork, line: &str) -> ::std::borrow::Cow<'_, str> {
+    let held = if work.ignore_blanks {
+        line.trim_start_matches([' ', '\t'])
+    } else {
+        line
+    };
+    if work.fold_case {
+        return ::std::borrow::Cow::Owned(held.to_uppercase());
+    }
+    ::std::borrow::Cow::Borrowed(held)
+}
+
+/// The numeric value `text` BEGINS with — leading blanks, an optional sign, digits and one
+/// decimal point — and zero for text that begins with no number at all, which is the value
+/// the utility compares such a line by.
+fn numeric_value(text: &str) -> f64 {
+    let held = text.trim_start();
+    let mut end = 0;
+    let mut point = false;
+    for (index, character) in held.char_indices() {
+        let read = match character {
+            '-' | '+' => index == 0,
+            '.' => !::std::mem::replace(&mut point, true),
+            digit => digit.is_ascii_digit(),
+        };
+        if !read {
+            break;
+        }
+        end = index.saturating_add(character.len_utf8());
+    }
+    held.get(..end)
+        .and_then(|number| number.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// What a `uniq` invocation's options ask for, or `None` for an option form this module does
+/// not perform.
+fn uniq_work(options: &[String]) -> Option<UniqWork> {
+    let mut work = UniqWork {
+        count: false,
+        repeated: false,
+        unique: false,
+        ignore_case: false,
+    };
+    for option in options {
+        if let Some(name) = option.strip_prefix("--") {
+            match name {
+                "count" => work.count = true,
+                "repeated" => work.repeated = true,
+                "unique" => work.unique = true,
+                "ignore-case" => work.ignore_case = true,
+                _ => return None,
+            }
+            continue;
+        }
+        for flag in option.strip_prefix('-')?.chars() {
+            match flag {
+                'c' => work.count = true,
+                'd' => work.repeated = true,
+                'u' => work.unique = true,
+                'i' => work.ignore_case = true,
+                _ => return None,
+            }
+        }
+    }
+    Some(work)
+}
+
+/// The width `uniq -c` writes the number of occurrences in before the line itself, which is
+/// the field the utility writes it in, followed by one space.
+const UNIQ_COUNT_WIDTH: usize = 7;
+
+/// One line per RUN of adjacent equal lines of `input` — "filter adjacent matching lines".
+///
+/// WHICH runs are written is what the options narrow: every run by default, the ones that
+/// repeat under `-d`, the lines that do not repeat under `-u`, and none at all under both,
+/// since no line is both repeated and unique. `-c` writes the number of occurrences before
+/// each line it writes.
+fn uniq_lines(work: UniqWork, input: &str) -> String {
+    let mut runs: Vec<(&str, usize)> = Vec::new();
+    for line in lines_of(input) {
+        match runs.last_mut() {
+            Some((held, count)) if uniq_equal(work, held, line) => {
+                *count = count.saturating_add(1);
+            }
+            _ => runs.push((line, 1)),
+        }
+    }
+    let mut written = String::new();
+    for (line, count) in runs {
+        let repeated = count > 1;
+        let wanted = match (work.repeated, work.unique) {
+            (true, true) => false,
+            (true, false) => repeated,
+            (false, true) => !repeated,
+            (false, false) => true,
+        };
+        if !wanted {
+            continue;
+        }
+        if work.count {
+            written.push_str(&format!(
+                "{count:>width$} {line}\n",
+                width = UNIQ_COUNT_WIDTH
+            ));
+            continue;
+        }
+        written.push_str(line);
+        written.push('\n');
+    }
+    written
+}
+
+/// Whether `uniq` reads `left` and `right` as the same line: the same characters, folded
+/// where `-i` ("ignore differences in case when comparing") folds them.
+fn uniq_equal(work: UniqWork, left: &str, right: &str) -> bool {
+    if work.ignore_case {
+        // Folded character by character, so a long line costs no allocation.
+        return left
+            .chars()
+            .flat_map(char::to_uppercase)
+            .eq(right.chars().flat_map(char::to_uppercase));
+    }
+    left == right
+}
+
+/// How many characters one `tr` SET may expand to. CHOSEN, not a `tr` limit: a set is
+/// caller-supplied text and a range in it expands to every character between its ends, so
+/// what expanding one may cost this process is bounded here — a set past it is one this
+/// module does not perform.
+const MAX_SET_CHARACTERS: usize = 64 * 1024;
+
+/// The two classes a translation's SET2 may name, which are the only ones the utility itself
+/// admits there: "when translating, the only character classes that may appear in SET2 are
+/// `upper` and `lower`".
+const CASE_CLASSES: [&str; 2] = ["lower", "upper"];
+
+/// What a `tr` invocation does, or `None` for an option or operand form this module does not
+/// perform (see the module docs).
+///
+/// WHICH operand is which is the utility's own usage: `tr SET1 SET2` translates, `tr -d SET1`
+/// deletes, `tr -s SET` squeezes, `tr -s SET1 SET2` translates and then squeezes SET2, and
+/// `tr -d SET1 SET2` deletes SET1 and squeezes SET2 — the one form that takes two sets with
+/// `-d`.
+fn translate_work(options: &[String], operands: &[String]) -> Option<TranslateWork> {
+    let mut delete = false;
+    let mut squeeze = false;
+    for option in options {
+        if let Some(name) = option.strip_prefix("--") {
+            match name {
+                "delete" => delete = true,
+                "squeeze-repeats" => squeeze = true,
+                _ => return None,
+            }
+            continue;
+        }
+        for flag in option.strip_prefix('-')?.chars() {
+            match flag {
+                'd' => delete = true,
+                's' => squeeze = true,
+                _ => return None,
+            }
+        }
+    }
+    // Every form names SET1; a second operand is SET2 of a TRANSLATION only where the
+    // invocation translates, and the set whose repeats are squeezed otherwise.
+    let translating = !delete && operands.len() == 2;
+    let first = expanded_set(operands.first()?, false)?;
+    let second = match operands.get(1) {
+        Some(written) => Some(expanded_set(written, translating)?),
+        None => None,
+    };
+    if operands.len() > 2 {
+        return None;
+    }
+    let work = match (delete, squeeze, second) {
+        (false, false, Some(second)) => TranslateWork {
+            translate: Some(mapping(first, second)?),
+            delete: None,
+            squeeze: None,
+        },
+        (false, true, None) => TranslateWork {
+            translate: None,
+            delete: None,
+            squeeze: Some(first),
+        },
+        (false, true, Some(second)) => TranslateWork {
+            translate: Some(mapping(first, second.clone())?),
+            delete: None,
+            squeeze: Some(second),
+        },
+        (true, false, None) => TranslateWork {
+            translate: None,
+            delete: Some(first),
+            squeeze: None,
+        },
+        (true, true, Some(second)) => TranslateWork {
+            translate: None,
+            delete: Some(first),
+            squeeze: Some(second),
+        },
+        // A translation needs two sets and a deletion alone takes one: every other
+        // combination names more or fewer sets than the work it asked for.
+        _ => return None,
+    };
+    Some(work)
+}
+
+/// SET1 and the character each of its own is written as: the one at the same position of
+/// SET2, which is "extended by repeating its last character" where SET2 is the shorter of
+/// the two (the utility's own default), while the characters of a longer SET2 past SET1's end
+/// translate nothing. `None` for an empty SET2, which translates nothing at all.
+fn mapping(from: Vec<char>, to: Vec<char>) -> Option<(Vec<char>, Vec<char>)> {
+    let last = *to.last()?;
+    let mut written = to;
+    written.truncate(from.len());
+    while written.len() < from.len() {
+        written.push(last);
+    }
+    Some((from, written))
+}
+
+/// The characters `written` names, in the order it names them: its literal characters, a
+/// `a-z` range as every character from one end through the other, the escapes a set is
+/// written with, and the `[:class:]` character classes.
+///
+/// `in_set2` says this is the SET2 of a translation, where only the case classes are read
+/// ([`CASE_CLASSES`]). `None` is a set this module does not read — an escape or a class
+/// outside those, a range whose end is before its start, or an expansion past
+/// [`MAX_SET_CHARACTERS`].
+fn expanded_set(written: &str, in_set2: bool) -> Option<Vec<char>> {
+    let held: Vec<char> = written.chars().collect();
+    let mut characters: Vec<char> = Vec::new();
+    let mut index = 0;
+    while let Some(character) = held.get(index).copied() {
+        if characters.len() > MAX_SET_CHARACTERS {
+            return None;
+        }
+        // `[:class:]`, which stands for the characters of that class.
+        if character == '[' && held.get(index + 1) == Some(&':') {
+            let mut end = index + 2;
+            while end + 1 < held.len()
+                && !(held.get(end) == Some(&':') && held.get(end + 1) == Some(&']'))
+            {
+                end += 1;
+            }
+            if end + 1 >= held.len() {
+                return None;
+            }
+            let name: String = held.get(index + 2..end)?.iter().collect();
+            characters.extend(character_class(&name, in_set2)?);
+            index = end + 2;
+            continue;
+        }
+        if character == '\\' {
+            let escaped = *held.get(index + 1)?;
+            characters.push(match escaped {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                '\\' => '\\',
+                // Every other escape is one this module does not read, rather than one it
+                // reads as the character after the backslash.
+                _ => return None,
+            });
+            index += 2;
+            continue;
+        }
+        // `FIRST-LAST`: every character from one end through the other. A `-` with no
+        // character after it is the literal the utility reads it as.
+        if held.get(index + 1) == Some(&'-') {
+            if let Some(last) = held.get(index + 2).copied() {
+                if last < character {
+                    return None;
+                }
+                for value in character as u32..=last as u32 {
+                    characters.push(char::from_u32(value)?);
+                }
+                index += 3;
+                continue;
+            }
+        }
+        characters.push(character);
+        index += 1;
+    }
+    (characters.len() <= MAX_SET_CHARACTERS).then_some(characters)
+}
+
+/// The characters of the `[:class:]` `name` names, in the order the class holds them, or
+/// `None` for a class this module does not expand — and for any class but a case one in the
+/// SET2 of a translation.
+///
+/// The members are the class's own in the C locale, which is what an image's utilities read
+/// a set against when nothing else is published to them.
+fn character_class(name: &str, in_set2: bool) -> Option<Vec<char>> {
+    if in_set2 && !CASE_CLASSES.contains(&name) {
+        return None;
+    }
+    let characters: Vec<char> = match name {
+        "lower" => ('a'..='z').collect(),
+        "upper" => ('A'..='Z').collect(),
+        "digit" => ('0'..='9').collect(),
+        "alpha" => ('A'..='Z').chain('a'..='z').collect(),
+        "alnum" => ('0'..='9').chain('A'..='Z').chain('a'..='z').collect(),
+        // "All horizontal or vertical whitespace", in the order the C locale holds it.
+        "space" => vec!['\t', '\n', '\u{b}', '\u{c}', '\r', ' '],
+        // "All horizontal whitespace".
+        "blank" => vec!['\t', ' '],
+        // "All punctuation characters": the printable characters that are neither
+        // alphanumeric nor the space.
+        "punct" => (0x21_u8..=0x7e)
+            .map(char::from)
+            .filter(|character| !character.is_ascii_alphanumeric())
+            .collect(),
+        _ => return None,
+    };
+    Some(characters)
+}
+
+/// What `tr` writes for `input`: each of its characters translated, deleted and squeezed, in
+/// the order the utility does those — "copy the standard input to the standard output with
+/// substitution or deletion of selected characters".
+fn translated(work: &TranslateWork, input: &str) -> String {
+    let mut written = String::new();
+    let mut last: Option<char> = None;
+    for character in input.chars() {
+        if work
+            .delete
+            .as_ref()
+            .is_some_and(|set| set.contains(&character))
+        {
+            continue;
+        }
+        let character = match &work.translate {
+            Some((from, to)) => match from.iter().position(|held| *held == character) {
+                Some(index) => *to.get(index).unwrap_or(&character),
+                None => character,
+            },
+            None => character,
+        };
+        // "Replace each sequence of a repeated character that is listed in the last specified
+        // SET with a single occurrence of that character."
+        if last == Some(character)
+            && work
+                .squeeze
+                .as_ref()
+                .is_some_and(|set| set.contains(&character))
+        {
+            continue;
+        }
+        written.push(character);
+        last = Some(character);
+    }
+    written
+}
+
 /// The lowercase hexadecimal digest of `input`.
 fn digest_of(digester: Digester, input: &str) -> String {
     match digester {
@@ -1201,9 +1779,32 @@ mod tests {
             ("an option whose value was never written", "cut", words(&["-c"])),
             ("head with a count that is not one", "head", words(&["-n", "two"])),
             ("head with an option it has none of", "head", words(&["-c", "2"])),
+            ("tail with a count that is not one", "tail", words(&["-n", "two"])),
+            // `-n +COUNT` is a POSITION, not a count of the lines kept.
+            ("tail from a position rather than a count", "tail", words(&["-n", "+2"])),
+            ("sort with an option it has none of", "sort", words(&["-k2"])),
+            ("sort checking an order rather than writing one", "sort", words(&["-c"])),
+            ("uniq with an option it has none of", "uniq", words(&["-w3"])),
+            ("tr with no set at all", "tr", words(&[])),
+            ("tr translating with one set", "tr", words(&["a-z"])),
+            ("tr deleting two sets", "tr", words(&["-d", "a", "b"])),
+            ("tr with more sets than any form takes", "tr", words(&["a", "b", "c"])),
+            ("tr complementing a set", "tr", words(&["-c", "a-z", "A-Z"])),
+            ("tr with a reversed range", "tr", words(&["z-a", "A-Z"])),
+            ("tr with an escape it does not read", "tr", words(&[r"\d", "x"])),
+            (
+                // "When translating, the only character classes that may appear in SET2 are
+                // `upper` and `lower`."
+                "tr translating into a class the utility admits nowhere",
+                "tr",
+                words(&["[:space:]", "[:digit:]"]),
+            ),
+            ("tr with an unterminated class", "tr", words(&["[:upper", "x"])),
             ("base64 with an option it has none of", "base64", words(&["-x"])),
             ("base64 with a width that is not one", "base64", words(&["-w", "wide"])),
-            ("a utility this module has none of", "tail", words(&["-n1"])),
+            // A LANGUAGE rather than a filter: its output follows from a program, which is
+            // not one input.
+            ("a utility this module has none of", "awk", words(&["{print}"])),
         ];
         for (case, name, arguments) in rows {
             let read = Filter::read(name, &arguments);
@@ -1534,6 +2135,332 @@ mod tests {
                 read.is_none(),
                 "case {case:?}: expected grep {arguments:?} not to be performed, got {read:?}"
             );
+        }
+    }
+
+    /// RULE: a standard text utility of an image's own coreutils whose output follows from ONE
+    /// input writes what it computed over that input, in the output form its own utility is
+    /// specified to write — so a command line that pipes one into another comes to what those
+    /// computations come to.
+    ///
+    /// The rows differ along what the rule generalises over: which utility is invoked
+    /// (`sort`, `uniq`, `tail`, `tr`), which option it carries and how it is written (a flag,
+    /// a cluster, a long name, a value glued to its option or the word after it), what the
+    /// input holds (ordered and unordered lines, equal lines, numbers, mixed case, leading
+    /// blanks, characters outside ASCII, a last line with no newline, no input at all) and
+    /// which set form a translation names (literal characters, a range, a class, an escape).
+    #[test]
+    fn the_coreutils_text_utilities_write_what_they_computed() {
+        /// One row: the case, the utility, its arguments, its input, and what it writes.
+        type Row = (
+            &'static str,
+            &'static str,
+            Vec<String>,
+            &'static str,
+            &'static str,
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "sort writes the lines in order",
+                "sort",
+                words(&[]),
+                "pear\napple\nfig\n",
+                "apple\nfig\npear\n",
+            ),
+            (
+                "sort with no option compares the lines as the bytes they are",
+                "sort",
+                words(&[]),
+                "10\n9\n100\n",
+                "10\n100\n9\n",
+            ),
+            (
+                "sort -n compares according to numerical value",
+                "sort",
+                words(&["-n"]),
+                "10\n9\n100\n",
+                "9\n10\n100\n",
+            ),
+            (
+                "sort -n reads a signed and a fractional value",
+                "sort",
+                words(&["--numeric-sort"]),
+                "1.5\n-2\n1.25\n",
+                "-2\n1.25\n1.5\n",
+            ),
+            (
+                "sort -n gives a line beginning with no number the value zero",
+                "sort",
+                words(&["-n"]),
+                "3\nnot-a-number\n-1\n",
+                "-1\nnot-a-number\n3\n",
+            ),
+            (
+                "sort -r reverses the result of the comparison",
+                "sort",
+                words(&["-r"]),
+                "apple\npear\nfig\n",
+                "pear\nfig\napple\n",
+            ),
+            (
+                "sort -nr as one cluster",
+                "sort",
+                words(&["-nr"]),
+                "2\n10\n",
+                "10\n2\n",
+            ),
+            (
+                "sort -u keeps only the first of an equal run",
+                "sort",
+                words(&["-u"]),
+                "b\na\nb\na\n",
+                "a\nb\n",
+            ),
+            (
+                "sort -u reads the run from the comparison it was asked for",
+                "sort",
+                words(&["-fu"]),
+                "a\nA\n",
+                "a\n",
+            ),
+            (
+                "sort -f folds lower case to upper case",
+                "sort",
+                words(&["-f"]),
+                "b\nA\na\nB\n",
+                "A\na\nB\nb\n",
+            ),
+            (
+                "sort -b ignores the leading blanks but writes the line as it read it",
+                "sort",
+                words(&["-b"]),
+                "  pear\napple\n",
+                "apple\n  pear\n",
+            ),
+            (
+                "sort ends its last line whether or not the input's was ended",
+                "sort",
+                words(&[]),
+                "pear\napple",
+                "apple\npear\n",
+            ),
+            ("sort of no input at all writes nothing", "sort", words(&[]), "", ""),
+            (
+                "uniq writes one line per run of adjacent equal lines",
+                "uniq",
+                words(&[]),
+                "a\na\nb\na\n",
+                "a\nb\na\n",
+            ),
+            (
+                "uniq -c prefixes each line with the number of occurrences",
+                "uniq",
+                words(&["-c"]),
+                "a\na\nb\n",
+                "      2 a\n      1 b\n",
+            ),
+            (
+                "uniq -d writes only the runs that repeat",
+                "uniq",
+                words(&["-d"]),
+                "a\na\nb\n",
+                "a\n",
+            ),
+            (
+                "uniq -u writes only the lines that do not repeat",
+                "uniq",
+                words(&["--unique"]),
+                "a\na\nb\n",
+                "b\n",
+            ),
+            (
+                "uniq -d and -u together write nothing, since no line is both",
+                "uniq",
+                words(&["-du"]),
+                "a\na\nb\n",
+                "",
+            ),
+            (
+                "uniq -i ignores differences in case when comparing",
+                "uniq",
+                words(&["-i"]),
+                "a\nA\nb\n",
+                "a\nb\n",
+            ),
+            (
+                "tail keeps the last ten lines by default",
+                "tail",
+                words(&[]),
+                "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n",
+                "2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n",
+            ),
+            (
+                "tail -n keeps the count it names",
+                "tail",
+                words(&["-n", "1"]),
+                "1\n2\n3\n",
+                "3\n",
+            ),
+            (
+                "tail -n glued to its option, over fewer lines than it asks for",
+                "tail",
+                words(&["-n5"]),
+                "1\n2\n",
+                "1\n2\n",
+            ),
+            (
+                "tail keeps a last line with no newline as it was",
+                "tail",
+                words(&["-n2"]),
+                "1\n2\n3",
+                "2\n3",
+            ),
+            (
+                "tr writes each character of SET1 as the one at its position in SET2",
+                "tr",
+                words(&["abc", "xyz"]),
+                "cab\n",
+                "zxy\n",
+            ),
+            (
+                "tr extends a shorter SET2 by repeating its last character",
+                "tr",
+                words(&["abc", "x"]),
+                "cab\n",
+                "xxx\n",
+            ),
+            (
+                "tr translates a RANGE of characters",
+                "tr",
+                words(&["a-z", "A-Z"]),
+                "héllo world\n",
+                "HéLLO WORLD\n",
+            ),
+            (
+                "tr translates one character CLASS into the other",
+                "tr",
+                words(&["[:lower:]", "[:upper:]"]),
+                "abc\n",
+                "ABC\n",
+            ),
+            (
+                "tr -d deletes the characters its set names",
+                "tr",
+                words(&["-d", "[:digit:]"]),
+                "a1b22c\n",
+                "abc\n",
+            ),
+            (
+                "tr -s replaces a repeated character with a single occurrence",
+                "tr",
+                words(&["-s", " "]),
+                "a   b  c\n",
+                "a b c\n",
+            ),
+            (
+                "tr -s squeezes SET2 after translating into it",
+                "tr",
+                words(&["-s", "a-z", "A-Z"]),
+                "aab\n",
+                "AB\n",
+            ),
+            (
+                "tr -d and -s delete the one set and squeeze the other",
+                "tr",
+                words(&["-d", "-s", "a", "b"]),
+                "aabb\n",
+                "b\n",
+            ),
+            (
+                "tr reads the escape a set is written with",
+                "tr",
+                words(&[r"\n", " "]),
+                "a\nb\n",
+                "a b ",
+            ),
+        ];
+        for (case, name, arguments, input, expected) in rows {
+            let filter = Filter::read(name, &arguments).unwrap_or_else(|| {
+                panic!("case {case:?}: expected {name} {arguments:?} to be a performed form")
+            });
+            let performed = filter
+                .perform(STANDARD_INPUT_LABEL, input)
+                .unwrap_or_else(|refusal| {
+                    panic!("case {case:?}: expected an output, got the refusal {refusal:?}")
+                });
+            assert_eq!(
+                performed.written, expected,
+                "case {case:?}: expected {expected:?} written, got {:?}",
+                performed.written
+            );
+        }
+    }
+
+    /// The seed the generated inputs of the invariant below are built from. Fixed, so a
+    /// failure names the one input that broke the invariant and is reproducible from this
+    /// file alone.
+    const SORT_SEED: u64 = 0x5DEE_CE66_D11D_2000;
+
+    /// How many generated inputs the invariant below is checked over. Bounded: nothing is
+    /// written anywhere, so the cost of a case is its own comparison.
+    const SORT_CASES: usize = 64;
+
+    /// RULE's invariant half: whatever `sort` is asked to compare by, what it writes is the
+    /// lines it READ, each of them once over, in an order no two neighbours break.
+    ///
+    /// Checked over generated inputs rather than a table: the invariant is about every input,
+    /// and the orders (`-n`, `-f`, `-b`, `-r`) are what it has to hold under.
+    #[test]
+    fn sort_writes_its_own_lines_in_an_order_no_neighbours_break() {
+        // A small linear congruential generator, so the inputs are varied and the file alone
+        // reproduces them (the constants are Numerical Recipes').
+        let mut state = SORT_SEED;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(1_664_525)
+                .wrapping_add(1_013_904_223);
+            (state >> 16) as usize
+        };
+        let shapes: [&[&str]; 4] = [&[], &["-n"], &["-f", "-b"], &["-nr"]];
+        for case in 0..SORT_CASES {
+            let arguments = words(shapes[case % shapes.len()]);
+            let lines: Vec<String> = (0..(next() % 8 + 1))
+                .map(|_| match next() % 4 {
+                    0 => format!("{}", next() % 100),
+                    1 => format!("  {}", next() % 10),
+                    2 => format!("Line{}", next() % 5),
+                    _ => format!("line{}", next() % 5),
+                })
+                .collect();
+            let input = format!("{}\n", lines.join("\n"));
+            let filter = Filter::read("sort", &arguments)
+                .unwrap_or_else(|| panic!("case {case}: expected sort {arguments:?} performed"));
+            let written = filter
+                .perform(STANDARD_INPUT_LABEL, &input)
+                .unwrap_or_else(|refusal| panic!("case {case}: refused with {refusal:?}"))
+                .written;
+            let answered: Vec<&str> = lines_of(&written);
+            let mut held = lines.clone();
+            held.sort();
+            let mut came_back: Vec<String> = answered.iter().map(|line| (*line).to_string()).collect();
+            came_back.sort();
+            assert_eq!(
+                came_back, held,
+                "case {case} (seed {SORT_SEED:#x}, sort {arguments:?}): expected the lines of \
+                 {input:?} back, got {written:?}"
+            );
+            let work = sort_work(&arguments)
+                .unwrap_or_else(|| panic!("case {case}: expected sort {arguments:?} performed"));
+            for pair in answered.windows(2) {
+                let ordering = sort_ordering(work, pair[0], pair[1]);
+                assert!(
+                    ordering != ::std::cmp::Ordering::Greater,
+                    "case {case} (seed {SORT_SEED:#x}, sort {arguments:?}): {:?} must not come \
+                     before {:?} in {written:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
         }
     }
 }

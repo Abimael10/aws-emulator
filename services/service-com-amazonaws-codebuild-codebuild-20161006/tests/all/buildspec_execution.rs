@@ -96,7 +96,7 @@ async fn a_builds_status_is_what_its_buildspec_commands_answered() {
         ),
         (
             "a pipeline whose last command the environment has no program for",
-            buildspec_for("build", &["echo hello | tr a-z A-Z"]),
+            buildspec_for("build", &["echo hello | jq -r ."]),
             "FAILED",
             Some("BUILD"),
         ),

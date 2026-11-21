@@ -809,8 +809,9 @@ async fn the_guests_lookup_client_reads_the_same_dns() {
     .await;
     assert_eq!(
         (written.as_str(), code),
-        ("", COULD_NOT_RUN),
+        ("sh: nslookup: command not found\n", COULD_NOT_RUN),
         "case \"a setting the lookup client has no reading for\": expected the status a shell \
-         answers for a command it could not run and no output, got {written:?} with {code}"
+         answers for a command it could not run, and the diagnostic it writes for one, got \
+         {written:?} with {code}"
     );
 }

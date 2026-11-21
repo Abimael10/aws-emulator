@@ -382,7 +382,9 @@ async fn a_shell_token_grants_the_microvms_own_shell() {
             "a command this MicroVM has no program for",
             "systemctl restart nginx",
             127,
-            vec![],
+            // The shell's own diagnostic for a command its search resolved nothing for,
+            // which a terminal shows beside what a program wrote to standard output.
+            vec!["sh: systemctl: command not found"],
         ),
         (
             "a file written to the MicroVM's disk",

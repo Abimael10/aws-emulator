@@ -4,18 +4,21 @@
 //! own utilities.
 //!
 //! A command line names two kinds of command: the shell's own utilities, which the shared
-//! session performs (`service_common::posix_shell_session::BUILT_IN_COMMANDS` and
-//! `VOLUME_COMMANDS`), and the programs the environment it runs in has installed — which
-//! ones those are is the environment's fact, not the shell's. A code interpreter sandbox is
-//! an environment with a filesystem of its own, so the programs it provides are the
-//! READ-ONLY utilities that report on that filesystem, and these are they.
+//! session performs (`service_common::posix_shell_session::BUILT_IN_COMMANDS`,
+//! `VOLUME_COMMANDS` and the text filters of
+//! `service_common::posix_shell_text_filters`), and the programs the environment it runs in
+//! has installed — which ones those are is the environment's fact, not the shell's. A code
+//! interpreter sandbox is an environment with a filesystem of its own, so the programs it
+//! provides are the READ-ONLY utilities that report on that filesystem, and these are they.
 //!
 //! Every one of them computes its answer from the session's own tree, through the files the
-//! shared session hands it (`ProgramFiles`): there is no host process to start, no host
-//! `PATH` to resolve against and no host file to open here, and a path is a key of that one
-//! in-memory tree. A name this module provides no program for is answered as the shell
-//! answers a command it could not run, so nothing is invented for a utility the environment
-//! does not have.
+//! shared session hands it (`ProgramFiles`), or from the standard input the shared session
+//! hands it for a call that names no path: there is no host process to start, no host `PATH`
+//! to resolve against and no host file to open here, and a path is a key of that one
+//! in-memory tree. A name this module provides no program for, and an invocation of one it
+//! performs nothing of, fall back to the shell's own catalogs — and a name neither holds is
+//! answered as the shell answers a command it could not run, so nothing is invented for a
+//! utility the environment does not have.
 
 use ::service_common::posix_shell_session::{EnvironmentPrograms, ProgramFiles, ProgramOutcome};
 
@@ -23,7 +26,9 @@ use ::service_common::posix_shell_session::{EnvironmentPrograms, ProgramFiles, P
 ///
 /// Each one REPORTS on the session's filesystem and changes nothing: `ls` lists a directory,
 /// `cat`'s neighbours `head`, `tail` and `wc` read part of a file or count what is in it, and
-/// `pwd` names the directory the program runs in.
+/// `pwd` names the directory the program runs in. The three that READ an input read the one
+/// the call gives them — the files it names, or standard input when it names none — so each of
+/// them is a stage a command line can pipe into.
 pub const SANDBOX_PROGRAMS: &[&str] = &["ls", "head", "tail", "wc", "pwd"];
 
 /// The status a utility answers when it "could not access" the path it was given, which is
@@ -63,6 +68,40 @@ impl EnvironmentPrograms for SandboxPrograms {
             // it could not run.
             _ => None,
         }
+    }
+
+    /// The utilities that READ their input compute over the one the call gives them: the
+    /// files it names, and STANDARD INPUT — the stage before them in a pipeline, or the file
+    /// one was redirected from — when it names none, which is the input the utility reads for
+    /// a call with no path operand.
+    ///
+    /// An invocation with neither is one this environment performs nothing of: there is no
+    /// terminal behind standard input here, so nothing was read and the shell reports a
+    /// command that did not run rather than one that read nothing.
+    fn run_with_input(
+        &self,
+        name: &str,
+        arguments: &[String],
+        standard_input: Option<&str>,
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramOutcome> {
+        if !matches!(name, "head" | "tail" | "wc") {
+            return self.run(name, arguments, files);
+        }
+        let (wanted, named) = call_of(arguments);
+        if !named.is_empty() {
+            return self.run(name, arguments, files);
+        }
+        let read = standard_input?;
+        let wanted = wanted.unwrap_or(DEFAULT_LINE_COUNT);
+        let output = match name {
+            "head" => taken_lines(read, wanted, true),
+            "tail" => taken_lines(read, wanted, false),
+            // The counts alone: the utility names no file for an input it read from
+            // standard input.
+            _ => vec![counts_of(arguments, read, None)],
+        };
+        Some(ProgramOutcome { status: 0, output })
     }
 }
 
@@ -149,27 +188,31 @@ fn read_lines(
             status = CANNOT_ACCESS;
             continue;
         };
-        let lines: Vec<&str> = contents.strip_suffix('\n').unwrap_or(&contents).lines().collect();
-        let taken: Vec<&str> = if from_the_start {
-            lines.iter().take(wanted).copied().collect()
-        } else {
-            lines
-                .iter()
-                .skip(lines.len().saturating_sub(wanted))
-                .copied()
-                .collect()
-        };
-        output.extend(taken.into_iter().map(str::to_string));
+        output.extend(taken_lines(&contents, wanted, from_the_start));
     }
     ProgramOutcome { status, output }
+}
+
+/// The first (or last) `wanted` lines of `text`, as the lines `head` and `tail` write.
+fn taken_lines(text: &str, wanted: usize, from_the_start: bool) -> Vec<String> {
+    let lines: Vec<&str> = text.strip_suffix('\n').unwrap_or(text).lines().collect();
+    if from_the_start {
+        return lines
+            .iter()
+            .take(wanted)
+            .map(|line| (*line).to_string())
+            .collect();
+    }
+    lines
+        .iter()
+        .skip(lines.len().saturating_sub(wanted))
+        .map(|line| (*line).to_string())
+        .collect()
 }
 
 /// `wc`: the lines, words and bytes of each file named, as the utility writes them — and
 /// only the one a `-l`, `-w` or `-c` option asks for.
 fn count(arguments: &[String], files: &mut dyn ProgramFiles) -> ProgramOutcome {
-    let lines_only = arguments.iter().any(|argument| argument == "-l");
-    let words_only = arguments.iter().any(|argument| argument == "-w");
-    let bytes_only = arguments.iter().any(|argument| argument == "-c");
     let mut output: Vec<String> = Vec::new();
     let mut status = 0;
     for path in operands(arguments) {
@@ -180,16 +223,26 @@ fn count(arguments: &[String], files: &mut dyn ProgramFiles) -> ProgramOutcome {
             status = CANNOT_ACCESS;
             continue;
         };
-        let lines = contents.lines().count();
-        let words = contents.split_whitespace().count();
-        let bytes = contents.len();
-        let counted = match (lines_only, words_only, bytes_only) {
-            (true, false, false) => format!("{lines} {path}"),
-            (false, true, false) => format!("{words} {path}"),
-            (false, false, true) => format!("{bytes} {path}"),
-            _ => format!("{lines} {words} {bytes} {path}"),
-        };
-        output.push(counted);
+        output.push(counts_of(arguments, &contents, Some(path)));
     }
     ProgramOutcome { status, output }
+}
+
+/// The counts `wc` writes for `text`: the one a `-l`, `-w` or `-c` option asks for, or all
+/// three, followed by the name of what was read when the call named a path — and by nothing
+/// for an input read from standard input, which is the form the utility writes for one.
+fn counts_of(arguments: &[String], text: &str, path: Option<&str>) -> String {
+    let lines_only = arguments.iter().any(|argument| argument == "-l");
+    let words_only = arguments.iter().any(|argument| argument == "-w");
+    let bytes_only = arguments.iter().any(|argument| argument == "-c");
+    let lines = text.lines().count();
+    let words = text.split_whitespace().count();
+    let bytes = text.len();
+    let named = path.map(|path| format!(" {path}")).unwrap_or_default();
+    match (lines_only, words_only, bytes_only) {
+        (true, false, false) => format!("{lines}{named}"),
+        (false, true, false) => format!("{words}{named}"),
+        (false, false, true) => format!("{bytes}{named}"),
+        _ => format!("{lines} {words} {bytes}{named}"),
+    }
 }
