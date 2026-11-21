@@ -248,9 +248,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if is_downgrade {
+            // The tier the subscription reports moves at the instant AWS publishes for it —
+            // "the current tier remains unchanged until the end of the billing cycle
+            // (calendar month)" — so the date the change reports IS the instant this store
+            // applies it at.
+            let effective = crate::state::end_of_billing_period(now);
             record.scheduled_change = Some(crate::state::ScheduledChangeRecord {
                 change_type: crate::state::ChangeType::Downgrade,
-                effective_date: Some(crate::state::end_of_billing_period(now)),
+                effective_date: Some(effective),
+                due_at: effective,
                 plan_tier: Some(plan_tier),
                 usage_level,
             });

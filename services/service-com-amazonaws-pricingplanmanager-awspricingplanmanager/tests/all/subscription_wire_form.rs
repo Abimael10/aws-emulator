@@ -26,6 +26,7 @@
 //! the two publishers those tables do not read, so neither form can depend on which
 //! operation published it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -171,6 +172,11 @@ pub(crate) async fn call(
 }
 
 /// A minimal valid `CreateSubscription` request.
+///
+/// The resources it names are DISTINCT on every call: a resource is covered by at most one
+/// subscription, so two subscriptions can only ever exist side by side over resources of
+/// their own. A caller that wants the SAME request twice — an idempotent replay — sends the
+/// body this returned a second time rather than building another one.
 pub(crate) fn create_body(
     family: &str,
     tier: &str,
@@ -178,8 +184,11 @@ pub(crate) fn create_body(
     usage_level: Option<&str>,
     approval: Option<&str>,
 ) -> Value {
+    let subscription = NEXT_SUBSCRIPTION.fetch_add(1, Ordering::Relaxed);
     let resource_arns: Vec<String> = (0..resources)
-        .map(|index| format!("arn:aws:cloudfront::{ACCOUNT}:distribution/E{index}"))
+        .map(|index| {
+            format!("arn:aws:cloudfront::{ACCOUNT}:distribution/E{subscription}X{index}")
+        })
         .collect();
     let mut body = json!({
         "planFamily": family,
@@ -194,6 +203,10 @@ pub(crate) fn create_body(
     }
     body
 }
+
+/// How many `CreateSubscription` bodies this harness has built, which is what makes each
+/// one's resources its own.
+static NEXT_SUBSCRIPTION: AtomicU64 = AtomicU64::new(0);
 
 /// Create one subscription, asserting only that it succeeded.
 pub(crate) async fn create(router: &MultiServiceRouter, body: Value) -> Answer {

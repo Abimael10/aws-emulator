@@ -359,9 +359,11 @@ async fn only_an_offered_plan_can_be_subscribed_to() {
 /// bounds of that ladder.
 #[tokio::test]
 async fn every_offered_plan_and_tier_is_accepted() {
-    let router = router();
     for family in ["CloudFront", "Route53"] {
         for tier in PLAN_TIERS_ASCENDING {
+            // An account of its own per row: a resource is covered by at most one
+            // subscription, so rows naming the same resources are independent accounts.
+            let router = router();
             let case = format!("{family}/{tier}");
             let created = create(
                 &router,
@@ -403,8 +405,10 @@ async fn an_update_to_an_unsold_tier_is_refused() {
         ("Route 53, a tier nothing sells", "Route53", "FREE", "ENTERPRISE", "R53_FRP"),
     ];
 
-    let router = router();
     for (case, family, from, to, plan) in rows {
+        // An account of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts.
+        let router = router();
         let created = create(&router, case, family, from, &[hosted_zone("Z1")]).await;
         let arn = created.string("arn");
         let etag = created.etag(case);
@@ -837,8 +841,10 @@ async fn resources_are_associated_and_disassociated_in_the_store() {
         },
     ];
 
-    let router = router();
     for case in &cases {
+        // An account of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts.
+        let router = router();
         let label = case.label;
         let created = create(&router, label, case.family, "PRO", &case.initial).await;
         let arn = created.string("arn");
@@ -946,8 +952,9 @@ async fn an_association_needs_an_active_subscription_with_nothing_pending() {
     let held_arn = held.string("arn");
     let held_etag = held.etag("pending approval");
 
-    // Carrying a scheduled change: an active subscription downgraded.
-    let active = create(&router, "pending change", "Route53", "PREMIUM", &[hosted_zone("Z1")]).await;
+    // Carrying a scheduled change: an active subscription downgraded. Over a resource of
+    // its own, because the subscription above covers the one it was created with.
+    let active = create(&router, "pending change", "Route53", "PREMIUM", &[hosted_zone("Z3")]).await;
     let active_arn = active.string("arn");
     let downgraded = call(
         &router,
@@ -963,13 +970,14 @@ async fn an_association_needs_an_active_subscription_with_nothing_pending() {
     );
     let pending_etag = downgraded.etag("pending change");
 
-    for (case, arn, etag, status, code) in [
+    for (case, arn, etag, status, code, covered) in [
         (
             "pending approval",
             held_arn,
             held_etag,
             400,
             VALIDATION_EXCEPTION,
+            hosted_zone("Z1"),
         ),
         (
             "pending change",
@@ -977,6 +985,7 @@ async fn an_association_needs_an_active_subscription_with_nothing_pending() {
             pending_etag,
             409,
             "ConflictException",
+            hosted_zone("Z3"),
         ),
     ] {
         let refused = call(
@@ -1000,7 +1009,7 @@ async fn an_association_needs_an_active_subscription_with_nothing_pending() {
         let fetched = call(&router, "GetSubscription", json!({"arn": arn}), None).await;
         assert_eq!(
             fetched.resources(case),
-            vec![hosted_zone("Z1")],
+            vec![covered],
             "case {case:?}: a refused association must not change the set"
         );
     }
@@ -1157,8 +1166,9 @@ async fn a_pending_change_is_cancelled_outside_the_processing_window() {
 }
 
 /// Write `effective` onto the pending change of the subscription `arn` names, in the store
-/// the handlers read. The one way this suite names an instant: a case that depends on how
-/// far off a change is sets that instant rather than waiting for the clock to reach it.
+/// the handlers read: both the date the change REPORTS and the instant the store applies it
+/// at. The one way this suite names an instant: a case that depends on how far off a change
+/// is sets that instant rather than waiting for the clock to reach it.
 fn set_effective_date(
     engine: &Arc<engine::InMemoryEngine>,
     arn: &str,
@@ -1175,6 +1185,7 @@ fn set_effective_date(
         .as_mut()
         .expect("the pending change is stored");
     change.effective_date = Some(effective);
+    change.due_at = effective;
 }
 
 // ---------------------------------------------------------------------------

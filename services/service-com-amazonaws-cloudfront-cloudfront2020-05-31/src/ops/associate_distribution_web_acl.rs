@@ -181,9 +181,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // web ACLs — and it is resolved BEFORE this service's store is locked, so the two
         // stores are never held at the same time. The answer decides nothing until the
         // sequence below reaches the argument, so a request that fails an earlier condition
-        // still earns that condition's refusal.
+        // still earns that condition's refusal. Whether a flat-rate pricing plan is bought
+        // over this distribution is read the same way, off the SELLING service's own
+        // record.
         let web_acl_arn = input.web_acl_arn.trim();
         let web_acl_resolves = crate::service::web_acl::associable(&*self.engine, web_acl_arn);
+        let covered_by_a_pricing_plan =
+            crate::state::distribution_covered_by_a_pricing_plan(&*self.engine, &input.id);
 
         let now = SystemTime::now();
         let mut store = state.lock();
@@ -256,6 +260,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !web_acl_resolves {
             return Err(AssociateDistributionWebACLErrorModeled::InvalidArgument(
                 crate::state::invalid_web_acl(),
+            )
+            .into());
+        }
+
+        // A distribution a flat-rate pricing plan is bought over keeps the web ACL in front
+        // of it: the plan is sold over that pair, so for as long as a subscription covers
+        // the distribution an association that would REPLACE the one it carries is refused
+        // and the configuration is left exactly as it was. Associating the web ACL the
+        // distribution already runs under changes nothing and is still served
+        // (`crate::state::pricing_plan_subscription`).
+        if let Some(message) = crate::state::web_acl_held_by_a_pricing_plan(
+            covered_by_a_pricing_plan,
+            config.web_acl_id.as_deref(),
+            Some(web_acl_arn),
+        ) {
+            return Err(AssociateDistributionWebACLErrorModeled::InvalidArgument(
+                InvalidArgument {
+                    message: Some(message.to_string()),
+                },
             )
             .into());
         }

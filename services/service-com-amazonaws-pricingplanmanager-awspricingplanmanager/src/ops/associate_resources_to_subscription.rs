@@ -213,6 +213,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        // A resource is on at most ONE pricing plan, so a subscription takes a resource on
+        // only while no other subscription covers it — the same rule `CreateSubscription`
+        // mints under. Weighed under a guard of its own, taken after the record's own state
+        // has admitted the change and released before the gate below asks another service.
+        {
+            let store = state.lock();
+            if let Some(taken) = crate::state::resource_in_another_subscription(
+                store.subscriptions.values(),
+                &resource_arns,
+                Some(&arn),
+            ) {
+                return Err(refused(
+                    crate::state::ResourceChangeRefusal::UsedByAnotherSubscription(
+                        taken.resource_arn,
+                    ),
+                    &arn,
+                ));
+            }
+        }
+
         // Whether a resource may join this subscription's PLAN is the other question, and
         // it is asked of the set the subscription WOULD cover: a distribution being added
         // is eligible when a web ACL the subscription already covers fronts it, exactly as

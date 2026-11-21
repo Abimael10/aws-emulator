@@ -233,10 +233,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = crate::state::now();
         let region = crate::state::request_region(ctx);
 
+        // The members that say WHICH subscription this request asks for, which is what a
+        // replayed `clientToken` is weighed against ([`crate::state::subscription_identity`]).
+        let requested = crate::state::SubscriptionIdentity {
+            plan_family: &plan_family,
+            plan_tier: &plan_tier,
+            usage_level: usage_level.as_deref(),
+            resource_arns: &resource_arns,
+            approval_mode,
+        };
+
         // An `@idempotencyToken` replay answers with the subscription the first call
-        // created, so the same token never yields a second subscription. The guard is
-        // taken and DROPPED here: the eligibility gate below asks another service, and no
-        // lock of this store may be held across that call.
+        // created, so the same token never yields a second subscription — but only when it
+        // IS a replay of that call: a token reused for a request asking for a different
+        // subscription is the modelled conflict, because answering it with the stored one
+        // would hand the caller a subscription it did not ask for. Neither path writes
+        // anything. The guard is taken and DROPPED here: the eligibility gate below asks
+        // another service, and no lock of this store may be held across that call.
         {
             let mut store = state.lock();
             store.apply_due_changes(now);
@@ -245,6 +258,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|token| store.idempotency.get(token))
                 .and_then(|arn| store.subscriptions.get(arn))
             {
+                if !requested.matches(existing) {
+                    return Err(CreateSubscriptionErrorModeled::ConflictException(
+                        crate::state::client_token_parameters_differ(&existing.arn),
+                    )
+                    .into());
+                }
                 return Ok(CreateSubscriptionOutput {
                     subscription: existing.to_subscription(),
                     e_tag: existing.etag(),
@@ -283,6 +302,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // Up to the clock first, exactly as the read above was: a change that fell due while
+        // the eligibility gate ran has happened, with or without this call — so a
+        // subscription whose cancellation has taken effect neither fills the account's quota
+        // nor covers its resources any more.
+        store.apply_due_changes(crate::state::now());
 
         // The account holds a bounded number of subscriptions, which is what the
         // modelled 402 reports: "You have reached the maximum number of subscriptions
@@ -296,6 +320,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::MAX_SUBSCRIPTIONS
                     ),
                 },
+            )
+            .into());
+        }
+
+        // A resource is on at most ONE pricing plan, so a subscription is sold over a
+        // resource only while no other subscription covers it — "the specified resource
+        // might already be associated with another subscription". The scan is over the
+        // stored sets, so it holds for every resource kind and every plan family, and it
+        // runs before anything is minted: a refused call leaves no subscription behind.
+        if let Some(taken) = crate::state::resource_in_another_subscription(
+            store.subscriptions.values(),
+            &resource_arns,
+            None,
+        ) {
+            return Err(CreateSubscriptionErrorModeled::ValidationException(
+                crate::state::resource_already_subscribed(&taken.resource_arn),
             )
             .into());
         }
@@ -324,6 +364,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             updated_at: now,
             client_token,
+            approval_mode,
             revision: crate::state::FIRST_REVISION,
             sync_completes_at: None,
         };

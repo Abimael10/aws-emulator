@@ -297,6 +297,12 @@ async fn a_cloudfront_subscription_needs_each_distribution_fronted_by_a_named_we
     let other_acl = create_web_acl(&router, "setup", "subscription-gate-other-acl").await;
     let (fronted_id, fronted) = create_distribution(&router, "setup", "subscription-fronted").await;
     associate_web_acl(&router, "setup", &fronted_id, &protecting).await;
+    // A second fronted pair, for the other row that is ACCEPTED: a resource is covered by at
+    // most one subscription, so no two accepted rows may name the same one.
+    let second_protecting = create_web_acl(&router, "setup", "subscription-gate-acl-2").await;
+    let (second_fronted_id, second_fronted) =
+        create_distribution(&router, "setup", "subscription-fronted-2").await;
+    associate_web_acl(&router, "setup", &second_fronted_id, &second_protecting).await;
     let (_, bare) = create_distribution(&router, "setup", "subscription-bare").await;
     let (_, second_bare) =
         create_distribution(&router, "setup", "subscription-second-bare").await;
@@ -305,6 +311,7 @@ async fn a_cloudfront_subscription_needs_each_distribution_fronted_by_a_named_we
     // documents none: "You can also include other supported resources, such as Amazon
     // Route 53 hosted zones and CloudFront KeyValueStores."
     let hosted_zone = format!("arn:aws:route53::{ACCOUNT}:hostedzone/Z1EXAMPLE1EXAMPLE");
+    let second_hosted_zone = format!("arn:aws:route53::{ACCOUNT}:hostedzone/Z2EXAMPLE2EXAMPLE");
 
     let rows = vec![
         Row {
@@ -316,7 +323,11 @@ async fn a_cloudfront_subscription_needs_each_distribution_fronted_by_a_named_we
         Row {
             case: "the pair, plus another supported resource",
             family: CLOUDFRONT_FAMILY,
-            resources: vec![fronted.clone(), protecting.clone(), hosted_zone.clone()],
+            resources: vec![
+                second_fronted.clone(),
+                second_protecting.clone(),
+                hosted_zone.clone(),
+            ],
             expected: Expected::Accepted,
         },
         Row {
@@ -358,7 +369,7 @@ async fn a_cloudfront_subscription_needs_each_distribution_fronted_by_a_named_we
         Row {
             case: "another plan family, which carries no such prerequisite",
             family: ROUTE53_FAMILY,
-            resources: vec![hosted_zone.clone(), bare.clone()],
+            resources: vec![second_hosted_zone.clone(), bare.clone()],
             expected: Expected::Accepted,
         },
     ];

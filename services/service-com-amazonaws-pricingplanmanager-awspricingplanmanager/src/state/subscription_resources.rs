@@ -139,6 +139,9 @@ pub enum ResourceChangeRefusal {
     /// The request named a resource the subscription already covers, so there is nothing
     /// of that name to add.
     AlreadyAssociated(String),
+    /// The request named a resource ANOTHER subscription already covers, so this one cannot
+    /// take it on.
+    UsedByAnotherSubscription(String),
     /// The request named resources the subscription's plan family requires it keep.
     Required(Vec<String>),
     /// The change would leave the subscription covering no resource at all.
@@ -193,6 +196,19 @@ impl ResourceChangeRefusal {
                     message: format!(
                         "Cannot add {resource} to subscription {arn}: the resource is \
                          already associated with this subscription."
+                    ),
+                    resource_id: Some(resource),
+                })
+            }
+            // The same rule `CreateSubscription` refuses a request under
+            // ([`resource_already_subscribed`]), stated for the operation that would add
+            // the resource to a subscription it is not on: the tail is the rule itself, so
+            // it is worded as AWS words it there.
+            Self::UsedByAnotherSubscription(resource) => {
+                ResourceChangeError::Validation(ValidationException {
+                    message: format!(
+                        "Cannot add {resource} to subscription {arn}: resource must belong \
+                         to your account and not be used in another subscription."
                     ),
                     resource_id: Some(resource),
                 })
@@ -328,6 +344,77 @@ pub fn plan_resource_addition(
     Ok(covering)
 }
 
+/// A resource some stored subscription already covers, and the subscription covering it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoveredResource {
+    /// The resource, as the request naming it spelled it.
+    pub resource_arn: String,
+    /// The ARN of the subscription that covers it.
+    pub subscription_arn: String,
+}
+
+/// The first resource in `requested` that a subscription other than `subscription` already
+/// covers, or `None` when no stored subscription covers any of them.
+///
+/// A resource is on at most ONE pricing plan: the business-rule failure this service models
+/// is documented "the specified resource might already be associated with another
+/// subscription" (`smithy_query(query="shape", shape="ValidationException")`), so a
+/// subscription may be sold over a resource only while no other subscription covers it. A
+/// stored subscription covers exactly the resources its own `resourceArns` names, whatever
+/// status it is in and whatever change is pending on it — a subscription whose cancellation
+/// has not taken effect yet is still the one covering them — so the question is answered
+/// from the stored sets alone.
+///
+/// `subscription`, when given, is the subscription the request is ABOUT, which is never
+/// "another" one: a request that names a resource its own subscription already covers is a
+/// different refusal ([`ResourceChangeRefusal::AlreadyAssociated`]).
+///
+/// The answer is the FIRST resource the request named that is taken, in the request's own
+/// order, so a caller reading the refusal sees its own list's first offending entry.
+pub fn resource_in_another_subscription<'store>(
+    stored: impl IntoIterator<Item = &'store SubscriptionRecord>,
+    requested: &[String],
+    subscription: Option<&str>,
+) -> Option<CoveredResource> {
+    let mut found: Option<(usize, CoveredResource)> = None;
+    for record in stored {
+        if subscription == Some(record.arn.as_str()) {
+            continue;
+        }
+        for (position, resource) in requested.iter().enumerate() {
+            let covered = record.resource_arns.iter().any(|held| held == resource);
+            if covered && found.as_ref().is_none_or(|(at, _)| position < *at) {
+                found = Some((
+                    position,
+                    CoveredResource {
+                        resource_arn: resource.clone(),
+                        subscription_arn: record.arn.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    found.map(|(_position, covered)| covered)
+}
+
+/// How `CreateSubscription` states a resource another subscription already covers: the
+/// modelled `ValidationException` (HTTP 400, "The request failed a business rule
+/// validation").
+///
+/// The fixed text states the rule the request broke; the only variable part is the
+/// offending resource ARN THE REQUEST named, so a caller can match it against the list it
+/// sent. `resourceId` is "the identifier of the resource that failed validation", which is
+/// that same resource. Recorded behaviour.
+pub fn resource_already_subscribed(resource_arn: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Cannot create subscription with {resource_arn}: resource must belong to your \
+             account and not be used in another subscription."
+        ),
+        resource_id: Some(resource_arn.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,12 +440,14 @@ mod tests {
             scheduled_change: scheduled.then(|| super::super::ScheduledChangeRecord {
                 change_type: super::super::ChangeType::Cancellation,
                 effective_date: Some(super::super::end_of_billing_period(now)),
+                due_at: super::super::cancellation_due(now),
                 plan_tier: None,
                 usage_level: None,
             }),
             created_at: now,
             updated_at: now,
             client_token: None,
+            approval_mode: super::super::ApprovalMode::Immediate,
             revision: super::super::FIRST_REVISION,
             sync_completes_at: None,
         }
@@ -777,6 +866,121 @@ mod tests {
                 actual, expected,
                 "case {:?}: expected {expected:?}, got {actual:?}",
                 case.label
+            );
+        }
+    }
+
+    /// A stored subscription under `arn` covering `resources`.
+    fn covering(arn: &str, resources: &[&str]) -> SubscriptionRecord {
+        let mut stored = record("CloudFront", resources, Status::Active, false);
+        stored.arn = arn.to_string();
+        stored
+    }
+
+    /// RULE: a resource is covered by at most one subscription, so the resources a request
+    /// names are weighed against every stored subscription's own set — whatever status it
+    /// is in — and the first resource the request named that is taken is the answer.
+    ///
+    /// The rows differ along which stored subscription holds the resource, the kind of
+    /// resource, where in the request's list it sits, how many are taken, and whether the
+    /// subscription holding it is the one the request is about.
+    #[test]
+    fn a_resource_is_covered_by_at_most_one_subscription() {
+        const FIRST: &str = "arn:aws:pricingplanmanager::000000000000:subscription/sub_first";
+        const SECOND: &str = "arn:aws:pricingplanmanager::000000000000:subscription/sub_second";
+        let mut pending = covering(SECOND, &[HOSTED_ZONE]);
+        pending.status = Status::PendingApproval;
+        let stored = vec![covering(FIRST, &[DISTRIBUTION, WEB_ACL]), pending];
+
+        // (case, the resources the request names, the subscription it is about, the
+        //  resource and the holder it is refused for)
+        type Row<'a> = (
+            &'a str,
+            &'a [&'a str],
+            Option<&'a str>,
+            Option<(&'a str, &'a str)>,
+        );
+        let rows: &[Row<'_>] = &[
+            (
+                "a resource no subscription covers",
+                &[SECOND_DISTRIBUTION, KEY_VALUE_STORE],
+                None,
+                None,
+            ),
+            (
+                "the distribution an active subscription covers",
+                &[DISTRIBUTION, SECOND_DISTRIBUTION],
+                None,
+                Some((DISTRIBUTION, FIRST)),
+            ),
+            (
+                "a web ACL an active subscription covers",
+                &[SECOND_DISTRIBUTION, WEB_ACL],
+                None,
+                Some((WEB_ACL, FIRST)),
+            ),
+            (
+                "a resource a subscription waiting for approval covers",
+                &[HOSTED_ZONE],
+                None,
+                Some((HOSTED_ZONE, SECOND)),
+            ),
+            (
+                "two taken resources: the first the request named answers",
+                &[WEB_ACL, HOSTED_ZONE],
+                None,
+                Some((WEB_ACL, FIRST)),
+            ),
+            (
+                "the holder is the subscription the request is about",
+                &[DISTRIBUTION, WEB_ACL],
+                Some(FIRST),
+                None,
+            ),
+            (
+                "another subscription still holds it",
+                &[DISTRIBUTION, HOSTED_ZONE],
+                Some(FIRST),
+                Some((HOSTED_ZONE, SECOND)),
+            ),
+            ("no resources at all", &[], None, None),
+        ];
+
+        for (case, requested, subscription, expected) in rows {
+            let requested: Vec<String> =
+                requested.iter().map(|arn| (*arn).to_string()).collect();
+            let actual = resource_in_another_subscription(&stored, &requested, *subscription);
+            let expected = expected.map(|(resource, holder)| CoveredResource {
+                resource_arn: resource.to_string(),
+                subscription_arn: holder.to_string(),
+            });
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the refusal states the fixed text and the offending resource ARN the request
+    /// named, and names that resource as the one that failed validation.
+    #[test]
+    fn the_refusal_names_the_resource_the_request_asked_for() {
+        for resource in [DISTRIBUTION, WEB_ACL, HOSTED_ZONE] {
+            let refusal = resource_already_subscribed(resource);
+            assert_eq!(
+                refusal.message,
+                format!(
+                    "Cannot create subscription with {resource}: resource must belong to \
+                     your account and not be used in another subscription."
+                ),
+                "case {resource:?}: got {:?}",
+                refusal.message
+            );
+            assert_eq!(
+                refusal.resource_id.as_deref(),
+                Some(resource),
+                "case {resource:?}: got {:?}",
+                refusal.resource_id
             );
         }
     }

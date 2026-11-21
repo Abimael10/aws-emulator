@@ -313,9 +313,11 @@ async fn if_match_is_enforced_by_every_mutating_operation() {
     // Each stale value is a token the service never issued for this record.
     let stale_tags = ["", "0", "deadbeefdeadbeefdeadbeefdeadbeef"];
 
-    let router = router();
     for case in &cases {
         for stale in &stale_tags {
+            // An account of its own per probe: a resource is covered by at most one
+            // subscription, and every probe adds the same resource to a subject of its own.
+            let router = router();
             let created = create(
                 &router,
                 create_body("CloudFront", "BUSINESS", 1, case.approval),
@@ -1079,13 +1081,13 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
 }
 
 /// A scheduled change that has become due is materialised before the next answer: the
-/// change happens at its effective instant whether or not anybody calls.
+/// change happens at the instant it is owed at whether or not anybody calls.
 ///
-/// The effective instant is a month out, so the test backdates the one the handler
-/// stored — the store the handlers read is the engine's, which this test holds — and
-/// then asks over HTTP.
+/// The instant is the service's own, so the test backdates the one the handler stored —
+/// the store the handlers read is the engine's, which this test holds — and then asks over
+/// HTTP.
 #[tokio::test]
-async fn a_change_whose_effective_date_has_passed_is_applied_before_the_next_answer() {
+async fn a_change_whose_due_instant_has_passed_is_applied_before_the_next_answer() {
     struct Case {
         /// How the pending change is created.
         operation: &'static str,
@@ -1138,7 +1140,7 @@ async fn a_change_whose_effective_date_has_passed_is_applied_before_the_next_ans
             scheduled.body
         );
 
-        // Move the stored effective instant into the past: the clock now owes the change.
+        // Move the stored due instant into the past: the clock now owes the change.
         {
             let state = engine.state::<ServiceState>();
             let mut store = state.lock();
@@ -1150,7 +1152,7 @@ async fn a_change_whose_effective_date_has_passed_is_applied_before_the_next_ans
                 .scheduled_change
                 .as_mut()
                 .expect("the pending change is stored");
-            change.effective_date = Some(aws_smithy_types::DateTime::from_secs(1_600_000_000));
+            change.due_at = aws_smithy_types::DateTime::from_secs(1_600_000_000);
         }
 
         let fetched = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
@@ -1198,9 +1200,15 @@ async fn a_change_whose_effective_date_has_passed_is_applied_before_the_next_ans
 #[tokio::test]
 async fn creating_past_the_subscription_quota_is_refused() {
     let router = router();
+    // The body the FIRST create sent is kept: a replay is the same request sent again,
+    // and each body names resources of its own.
+    let mut first_body = Value::Null;
     for index in 0..MAX_SUBSCRIPTIONS {
         let mut body = create_body("CloudFront", "PRO", 1, Some("IMMEDIATE"));
         body["clientToken"] = json!(format!("token-{index}"));
+        if index == 0 {
+            first_body = body.clone();
+        }
         let answer = call(&router, "CreateSubscription", body, None).await;
         assert_eq!(
             answer.status, 200,
@@ -1230,10 +1238,9 @@ async fn creating_past_the_subscription_quota_is_refused() {
         refused.body
     );
 
-    // A replay at the bound is not a new subscription, so it is still served.
-    let mut replay = create_body("CloudFront", "PRO", 1, Some("IMMEDIATE"));
-    replay["clientToken"] = json!("token-0");
-    let replayed = call(&router, "CreateSubscription", replay, None).await;
+    // A replay at the bound is not a new subscription, so it is still served: the same
+    // request the first create made, sent again under its own token.
+    let replayed = call(&router, "CreateSubscription", first_body, None).await;
     assert_eq!(
         replayed.status, 200,
         "case replay-at-quota: an idempotent replay creates nothing and must be served, \
@@ -1473,8 +1480,10 @@ async fn associated_resources_join_the_subscription_and_read_back() {
         },
     ];
 
-    let router = router();
     for case in &cases {
+        // A router of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts rather than one.
+        let router = router();
         let label = case.label;
         let created = create(
             &router,
@@ -1605,8 +1614,10 @@ async fn a_resource_the_tier_does_not_cover_is_refused_on_create_and_on_associat
         // the rows above are every tier this plan offers.
     ];
 
-    let router = router();
     for case in &cases {
+        // A router of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts rather than one.
+        let router = router();
         let label = case.label;
         let refused_message = format!(
             "{NOT_ELIGIBLE_PREFIX}{}.",
@@ -1664,7 +1675,9 @@ async fn a_resource_the_tier_does_not_cover_is_refused_on_create_and_on_associat
         }
 
         // (2) added to a subscription already in service: a refused call leaves the
-        // resources it covers exactly as they were.
+        // resources it covers exactly as they were. In an account of its own, because the
+        // create above may have taken the resources this probe adds.
+        let router = super::subscription_wire_form::router();
         let held = vec![distribution("E1TIER"), web_acl("acl-tier")];
         let created = create(
             &router,
@@ -1737,8 +1750,10 @@ async fn an_association_past_the_modelled_resource_bound_is_refused() {
         ("far past the bound", 5, MAX_SUBSCRIPTION_RESOURCES, false),
     ];
 
-    let router = router();
     for (case, initial, adding, admitted) in rows {
+        // A router of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts rather than one.
+        let router = router();
         let held: Vec<String> = (0..initial)
             .map(|index| hosted_zone(&format!("Z{index}HELD")))
             .collect();
@@ -1924,11 +1939,13 @@ async fn resources_join_only_an_active_subscription_with_no_pending_change() {
     );
 
     // (c) a subscription with a change SCHEDULED on it: the conflict every mutator of this
-    // service answers.
+    // service answers. Over resources of its own, because the subscription above covers the
+    // ones it was created with.
     let case = "a subscription with a scheduled downgrade";
+    let scheduled_held = vec![distribution("E2STATE"), web_acl("acl-state-scheduled")];
     let created = create(
         &router,
-        create_body_naming("CloudFront", "PREMIUM", &held, Some("IMMEDIATE")),
+        create_body_naming("CloudFront", "PREMIUM", &scheduled_held, Some("IMMEDIATE")),
     )
     .await;
     let arn = created.string("arn");
@@ -1974,7 +1991,6 @@ async fn resources_join_only_an_active_subscription_with_no_pending_change() {
 /// alone — the mirror of a removal naming a resource the subscription does not cover.
 #[tokio::test]
 async fn adding_a_resource_the_subscription_already_covers_is_refused() {
-    let router = router();
     let dist = distribution("E1COVERED");
     let acl = web_acl("acl-covered");
     let zone = hosted_zone("Z1COVERED");
@@ -1993,6 +2009,9 @@ async fn adding_a_resource_the_subscription_already_covers_is_refused() {
     ];
 
     for (case, named, offending) in rows {
+        // A router of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts rather than one.
+        let router = router();
         let created = create(
             &router,
             create_body_naming("CloudFront", "PRO", &held, Some("IMMEDIATE")),
@@ -2092,8 +2111,10 @@ async fn the_resource_and_change_operations_are_served() {
         },
     ];
 
-    let router = router();
     for case in &cases {
+        // A router of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts rather than one.
+        let router = router();
         let operation = case.operation;
         let created = create(
             &router,
@@ -2135,13 +2156,16 @@ async fn the_resource_and_change_operations_are_served() {
 // ---------------------------------------------------------------------------
 
 /// The ARN of a CloudFront distribution: `arn:aws:cloudfront::<account>:distribution/<id>`.
-fn distribution(id: &str) -> String {
+///
+/// Visible to the sibling suites of this test crate, so the ARN forms the owning services
+/// mint are written once.
+pub(crate) fn distribution(id: &str) -> String {
     format!("arn:aws:cloudfront::{ACCOUNT}:distribution/{id}")
 }
 
 /// The ARN of a CLOUDFRONT-scope WAF web ACL:
 /// `arn:aws:wafv2:<region>:<account>:global/webacl/<name>/<id>`.
-fn web_acl(name: &str) -> String {
+pub(crate) fn web_acl(name: &str) -> String {
     format!(
         "arn:aws:wafv2:{REGION}:{ACCOUNT}:global/webacl/{name}/11111111-2222-3333-4444-555555555555"
     )
@@ -2149,21 +2173,21 @@ fn web_acl(name: &str) -> String {
 
 /// The ARN of a Route 53 hosted zone, one of the other resources a subscription may also
 /// cover ("such as Amazon Route 53 hosted zones, and CloudFront KeyValueStores").
-fn hosted_zone(id: &str) -> String {
+pub(crate) fn hosted_zone(id: &str) -> String {
     format!("arn:aws:route53:::hostedzone/{id}")
 }
 
 /// The ARN of a CloudFront KeyValueStore, the other resource that doc names.
-fn key_value_store(name: &str) -> String {
+pub(crate) fn key_value_store(name: &str) -> String {
     format!("arn:aws:cloudfront::{ACCOUNT}:key-value-store/{name}")
 }
 
 /// A `CreateSubscription` body naming `resources` exactly.
 ///
 /// The harness's own body builder with its generated resource list replaced, so the crate
-/// keeps ONE `CreateSubscription` body builder and this suite only says which resources it
+/// keeps ONE `CreateSubscription` body builder and a suite only says which resources it
 /// wants named.
-fn create_body_naming(
+pub(crate) fn create_body_naming(
     family: &str,
     tier: &str,
     resources: &[String],
@@ -2266,8 +2290,10 @@ async fn disassociating_optional_resources_leaves_the_rest_of_the_set() {
         },
     ];
 
-    let router = router();
     for case in &cases {
+        // A router of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts rather than one.
+        let router = router();
         let label = case.label;
         let created = create(
             &router,
@@ -2513,8 +2539,10 @@ async fn a_removal_the_rule_forbids_is_refused_and_changes_nothing() {
         },
     ];
 
-    let router = router();
     for case in &cases {
+        // A router of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts rather than one.
+        let router = router();
         let label = case.label;
         let created = create(
             &router,
@@ -2833,8 +2861,10 @@ async fn a_resource_change_is_refused_while_another_change_is_pending() {
         unchanged.body
     );
 
-    // (b) a change of its own is still being applied.
+    // (b) a change of its own is still being applied. On a router of its own, because the
+    // subscription in (a) covers the resources it was created with.
     let case = "a change still being applied";
+    let router = super::subscription_wire_form::router();
     let held = vec![dist.clone(), acl.clone(), zone.clone(), kvs.clone()];
     let created = create(
         &router,
@@ -2991,7 +3021,8 @@ async fn a_pending_change_is_cancelled_and_the_subscription_is_as_it_was() {
                 .scheduled_change
                 .as_mut()
                 .expect("the pending change is stored");
-            change.effective_date = parse_date_time("2099-01-01T00:00:00Z");
+            change.due_at = parse_date_time("2099-01-01T00:00:00Z")
+                .expect("the instant is a representable date-time");
         }
 
         let cancelled = call(

@@ -30,6 +30,17 @@
 //!    and a `planTier` the resolved plan does not sell is
 //!    `Invalid plan tier "<planTier>" for the plan "<plan code>"` — both decided before
 //!    anything is stored, so a refused create leaves no subscription behind.
+//! 6. A `clientToken` is a safe-retry handle on ONE request: replayed with the same
+//!    parameters it answers with the subscription it minted, and replayed with different
+//!    parameters it is HTTP 409 `ConflictException` with `The clientToken matches a previous
+//!    request but the request parameters differ. Reuse a clientToken only for an identical
+//!    request.`, naming that subscription in `resourceId` — and neither path writes.
+//! 7. A resource is covered by at most one subscription: a create naming a resource another
+//!    subscription already covers is HTTP 400 `ValidationException` with `Cannot create
+//!    subscription with <arn>: resource must belong to your account and not be used in
+//!    another subscription.`, stores nothing, and is admitted once nothing covers the
+//!    resource any more — and the operation that would ADD a resource to a subscription is
+//!    held to the same rule, stated in its own terms.
 //!
 //! The HTTP harness is `subscription_wire_form`'s, so this file adds no second copy of it.
 
@@ -41,6 +52,9 @@ use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
     ROUTE_53_PLAN_CODE,
 };
 
+use super::subscription_lifecycle::{
+    create_body_naming, distribution, hosted_zone, key_value_store, web_acl,
+};
 use super::subscription_wire_form::{call, create, create_body, router, Answer};
 
 /// The canonical account id every emulated ARN carries.
@@ -349,9 +363,11 @@ async fn a_stale_if_match_is_a_validation_failure_that_echoes_the_tag() {
     let long_tag = "e".repeat(64);
     let stale_tags = ["", "0", "4096", "stale-etag", long_tag.as_str()];
 
-    let router = router();
     for operation in ARN_OPERATIONS.iter().filter(|op| op.if_match.is_some()) {
         for stale in &stale_tags {
+            // An account of its own per probe: a resource is covered by at most one
+            // subscription, and the association probe adds the same resource every time.
+            let router = router();
             let case = format!("{}/{stale:?}", operation.name);
             let created = create(
                 &router,
@@ -680,4 +696,616 @@ async fn a_plan_the_service_does_not_offer_is_refused() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 6 — a clientToken is a handle on ONE request
+// ---------------------------------------------------------------------------
+
+/// The modelled business-rule refusal and the modelled conflict.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+const CONFLICT_EXCEPTION: &str = "ConflictException";
+
+/// The whole sentence a `clientToken` replayed with different parameters is refused with:
+/// fixed text, carrying no value from the request and none from the store.
+const TOKEN_PARAMETERS_DIFFER: &str =
+    "The clientToken matches a previous request but the request parameters differ. Reuse a \
+     clientToken only for an identical request.";
+
+/// What a replay must earn.
+enum Replay {
+    /// The same request: the subscription the token minted, unchanged.
+    Original,
+    /// A different request under a token already used: the modelled conflict.
+    Conflict,
+}
+
+/// A `clientToken` names ONE request: a replay carrying the same parameters is answered
+/// with the subscription that token minted, and a replay carrying different parameters is
+/// the modelled `ConflictException` (409) naming that subscription — with nothing written
+/// either way.
+///
+/// The rows differ along which identifying member the replay changes — the plan family, the
+/// tier, the usage level, the approval mode, and the resource list by count, by membership,
+/// by order and by repetition — because the rule is about every member that says which
+/// subscription a request asks for, not about the one the recorded call changed.
+#[tokio::test]
+async fn a_client_token_replayed_with_other_parameters_is_the_modelled_conflict() {
+    // (case, how the replay differs from the first request, what it must earn)
+    type Row = (&'static str, fn(Value) -> Value, Replay);
+    let rows: &[Row] = &[
+        ("the identical request", |body| body, Replay::Original),
+        (
+            "the same resources in the other order",
+            |mut body| {
+                let mut resources = resource_arns(&body);
+                resources.reverse();
+                body["resourceArns"] = json!(resources);
+                body
+            },
+            Replay::Original,
+        ),
+        (
+            "the same resources, one of them named twice",
+            |mut body| {
+                let mut resources = resource_arns(&body);
+                resources.push(resources[0].clone());
+                body["resourceArns"] = json!(resources);
+                body
+            },
+            Replay::Original,
+        ),
+        (
+            "another plan tier",
+            |mut body| {
+                body["planTier"] = json!("BUSINESS");
+                body
+            },
+            Replay::Conflict,
+        ),
+        (
+            "another plan family",
+            |mut body| {
+                body["planFamily"] = json!("Route53");
+                body
+            },
+            Replay::Conflict,
+        ),
+        (
+            "a usage level the first request did not state",
+            |mut body| {
+                body["usageLevel"] = json!("DEFAULT");
+                body
+            },
+            Replay::Conflict,
+        ),
+        (
+            "another approval mode",
+            |mut body| {
+                body["approvalMode"] = json!("MANUAL");
+                body
+            },
+            Replay::Conflict,
+        ),
+        (
+            "one resource more",
+            |mut body| {
+                let mut resources = resource_arns(&body);
+                resources.push(hosted_zone("Z9TOKEN"));
+                body["resourceArns"] = json!(resources);
+                body
+            },
+            Replay::Conflict,
+        ),
+        (
+            "one resource fewer",
+            |mut body| {
+                let mut resources = resource_arns(&body);
+                resources.pop();
+                body["resourceArns"] = json!(resources);
+                body
+            },
+            Replay::Conflict,
+        ),
+        (
+            "another resource in place of one",
+            |mut body| {
+                let mut resources = resource_arns(&body);
+                let last = resources.len() - 1;
+                resources[last] = key_value_store("kvs-token");
+                body["resourceArns"] = json!(resources);
+                body
+            },
+            Replay::Conflict,
+        ),
+    ];
+
+    for (case, differ, expected) in rows {
+        // An account of its own per row: a resource is covered by at most one subscription.
+        let router = router();
+        let mut first = create_body("CloudFront", "PRO", 2, None, Some("IMMEDIATE"));
+        first["clientToken"] = json!("retry-token");
+        let created = create(&router, first.clone()).await;
+        let arn = created.string("arn");
+        let etag = created.require_etag(case);
+
+        let replayed = call(&router, "CreateSubscription", differ(first.clone()), None).await;
+        match expected {
+            Replay::Original => {
+                assert_eq!(
+                    replayed.status, 200,
+                    "case {case:?}: the same request must be served, got {} {:?}",
+                    replayed.status, replayed.body
+                );
+                assert_eq!(
+                    replayed.body, created.body,
+                    "case {case:?}: a replay must answer the subscription the token minted, \
+                     got {:?}",
+                    replayed.body
+                );
+                assert_eq!(
+                    replayed.require_etag(case),
+                    etag,
+                    "case {case:?}: a replay creates nothing, so the token does not move"
+                );
+            }
+            Replay::Conflict => {
+                assert_eq!(
+                    replayed.status, 409,
+                    "case {case:?}: expected the call to be refused 409, got {} {:?}",
+                    replayed.status, replayed.body
+                );
+                assert_eq!(
+                    replayed.error_code.as_deref(),
+                    Some(CONFLICT_EXCEPTION),
+                    "case {case:?}: unexpected error code for {:?}",
+                    replayed.body
+                );
+                assert_eq!(
+                    replayed.message(case),
+                    TOKEN_PARAMETERS_DIFFER,
+                    "case {case:?}: unexpected message for {:?}",
+                    replayed.body
+                );
+                assert_eq!(
+                    replayed.body.get("resourceId").and_then(Value::as_str),
+                    Some(arn.as_str()),
+                    "case {case:?}: the conflict must name the subscription the token \
+                     stands for, got {:?}",
+                    replayed.body
+                );
+            }
+        }
+
+        // Inert either way: the account still holds exactly the one subscription, with the
+        // parameters it was created with and the token it was created under.
+        let listed = call(&router, "ListSubscriptions", json!({}), None).await;
+        assert_eq!(
+            listed.body["subscriptionSummaries"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or_default(),
+            1,
+            "case {case:?}: no replay may mint a second subscription, got {:?}",
+            listed.body
+        );
+        let read = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+        assert_eq!(
+            read.body, created.body,
+            "case {case:?}: no replay may change the stored subscription, got {:?}",
+            read.body
+        );
+        assert_eq!(
+            read.require_etag(case),
+            etag,
+            "case {case:?}: no replay may move the subscription's entity tag"
+        );
+    }
+}
+
+/// The `resourceArns` a request body names.
+fn resource_arns(body: &Value) -> Vec<String> {
+    body["resourceArns"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the body names resourceArns: {body:?}"))
+        .iter()
+        .map(|arn| arn.as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Rule 7 — one subscription per resource
+// ---------------------------------------------------------------------------
+
+/// A create naming a resource another subscription already covers is refused with the
+/// modelled `ValidationException` (400) naming that resource, and stores nothing.
+///
+/// The rows differ along what the rule generalises over: which resource of the holder's set
+/// is named again, the vendor and resource type of that resource, where in the new
+/// request's list it sits, how many of the named resources are taken, the plan families of
+/// the holder and of the new request, and the holder's own status.
+#[tokio::test]
+async fn a_resource_another_subscription_covers_cannot_be_subscribed_again() {
+    let dist = distribution("E1HELD");
+    let acl = web_acl("acl-held");
+    let zone = hosted_zone("Z1HELD");
+    let kvs = key_value_store("kvs-held");
+    let free_dist = distribution("E2FREE");
+    let free_acl = web_acl("acl-free");
+
+    // (case, the holder's family/tier/approval and set, the family and set the new request
+    //  names, the resource the refusal must name — `None` for a request that is admitted)
+    struct Row {
+        case: &'static str,
+        holder: Vec<String>,
+        holder_approval: Option<&'static str>,
+        family: &'static str,
+        named: Vec<String>,
+        offending: Option<String>,
+    }
+
+    let rows = vec![
+        Row {
+            case: "the distribution the holder covers, named first",
+            holder: vec![dist.clone(), acl.clone(), zone.clone(), kvs.clone()],
+            holder_approval: Some("IMMEDIATE"),
+            family: "CloudFront",
+            named: vec![dist.clone(), free_acl.clone()],
+            offending: Some(dist.clone()),
+        },
+        Row {
+            case: "the web ACL the holder covers, named last",
+            holder: vec![dist.clone(), acl.clone(), zone.clone(), kvs.clone()],
+            holder_approval: Some("IMMEDIATE"),
+            family: "CloudFront",
+            named: vec![free_dist.clone(), acl.clone()],
+            offending: Some(acl.clone()),
+        },
+        Row {
+            case: "a hosted zone the holder covers, of another plan family",
+            holder: vec![dist.clone(), acl.clone(), zone.clone(), kvs.clone()],
+            holder_approval: Some("IMMEDIATE"),
+            family: "Route53",
+            named: vec![hosted_zone("Z2FREE"), zone.clone()],
+            offending: Some(zone.clone()),
+        },
+        Row {
+            case: "a KeyValueStore the holder covers",
+            holder: vec![dist.clone(), acl.clone(), zone.clone(), kvs.clone()],
+            holder_approval: Some("IMMEDIATE"),
+            family: "Route53",
+            named: vec![kvs.clone()],
+            offending: Some(kvs.clone()),
+        },
+        Row {
+            case: "two taken resources: the first the request named is refused",
+            holder: vec![dist.clone(), acl.clone(), zone.clone(), kvs.clone()],
+            holder_approval: Some("IMMEDIATE"),
+            family: "CloudFront",
+            named: vec![acl.clone(), dist.clone()],
+            offending: Some(acl.clone()),
+        },
+        Row {
+            case: "a holder that is still waiting for approval",
+            holder: vec![dist.clone(), acl.clone()],
+            holder_approval: Some("MANUAL"),
+            family: "CloudFront",
+            named: vec![dist.clone(), free_acl.clone()],
+            offending: Some(dist.clone()),
+        },
+        Row {
+            case: "resources no subscription covers",
+            holder: vec![dist.clone(), acl.clone(), zone.clone(), kvs.clone()],
+            holder_approval: Some("IMMEDIATE"),
+            family: "CloudFront",
+            named: vec![free_dist.clone(), free_acl.clone()],
+            offending: None,
+        },
+    ];
+
+    for row in &rows {
+        // An account of its own per row, so each row's holder is the only subscription in
+        // it when the second create is made.
+        let router = router();
+        let case = row.case;
+        let held = create(
+            &router,
+            create_body_naming("CloudFront", "PREMIUM", &row.holder, row.holder_approval),
+        )
+        .await;
+        let holder_arn = held.string("arn");
+
+        let answered = call(
+            &router,
+            "CreateSubscription",
+            create_body_naming(row.family, "FREE", &row.named, Some("IMMEDIATE")),
+            None,
+        )
+        .await;
+        match row.offending.as_deref() {
+            Some(offending) => {
+                assert_eq!(
+                    answered.status, 400,
+                    "case {case:?}: expected the call to be refused 400, got {} {:?}",
+                    answered.status, answered.body
+                );
+                assert_eq!(
+                    answered.error_code.as_deref(),
+                    Some(VALIDATION_EXCEPTION),
+                    "case {case:?}: unexpected error code for {:?}",
+                    answered.body
+                );
+                assert_eq!(
+                    answered.message(case),
+                    format!(
+                        "Cannot create subscription with {offending}: resource must belong \
+                         to your account and not be used in another subscription."
+                    ),
+                    "case {case:?}: unexpected message for {:?}",
+                    answered.body
+                );
+                assert_eq!(
+                    answered.body.get("resourceId").and_then(Value::as_str),
+                    Some(offending),
+                    "case {case:?}: the refusal must name the offending resource, got {:?}",
+                    answered.body
+                );
+                // The refusal stores nothing: the holder is still the only subscription in
+                // the account, and still covers exactly what it covered.
+                let listed = call(&router, "ListSubscriptions", json!({}), None).await;
+                let summaries = listed.body["subscriptionSummaries"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                assert_eq!(
+                    summaries.len(),
+                    1,
+                    "case {case:?}: a refused create must mint no subscription, got {:?}",
+                    listed.body
+                );
+                assert_eq!(
+                    summaries[0]["resourceArns"],
+                    json!(row.holder),
+                    "case {case:?}: the holder must keep its resources, got {:?}",
+                    summaries[0]
+                );
+            }
+            None => {
+                assert_eq!(
+                    answered.status, 200,
+                    "case {case:?}: a create over free resources must succeed, got {} {:?}",
+                    answered.status, answered.body
+                );
+                assert_eq!(
+                    answered.body["resourceArns"],
+                    json!(row.named),
+                    "case {case:?}: the created subscription must cover what it named, got {:?}",
+                    answered.body
+                );
+            }
+        }
+        assert!(
+            !holder_arn.is_empty(),
+            "case {case:?}: the holder must have been created"
+        );
+    }
+}
+
+/// A resource another subscription covers cannot be ADDED to a second subscription either:
+/// the same rule, stated by the operation that would add it, with both subscriptions left
+/// exactly as they were.
+///
+/// The rows differ along the kind of the taken resource, where in the request's list it
+/// sits, and whether every named resource is taken or only one of them.
+#[tokio::test]
+async fn a_resource_another_subscription_covers_cannot_be_added_to_a_second_one() {
+    let taken_zone = hosted_zone("Z1TAKEN");
+    let taken_store = key_value_store("kvs-taken");
+    let free_zone = hosted_zone("Z2FREE");
+
+    // (case, the resources the request adds, the one the refusal must name — `None` for a
+    //  request that is admitted)
+    let rows: [(&str, Vec<String>, Option<String>); 4] = [
+        (
+            "a hosted zone the other subscription covers",
+            vec![taken_zone.clone()],
+            Some(taken_zone.clone()),
+        ),
+        (
+            "a KeyValueStore the other subscription covers",
+            vec![taken_store.clone()],
+            Some(taken_store.clone()),
+        ),
+        (
+            "a taken resource named behind a free one",
+            vec![free_zone.clone(), taken_zone.clone()],
+            Some(taken_zone.clone()),
+        ),
+        ("a resource nothing covers", vec![free_zone.clone()], None),
+    ];
+
+    for (case, named, offending) in rows {
+        // An account of its own per row: each row decides what its two subscriptions cover.
+        let router = router();
+        let holder_resources = vec![taken_zone.clone(), taken_store.clone()];
+        let holder = create(
+            &router,
+            create_body_naming("Route53", "PRO", &holder_resources, Some("IMMEDIATE")),
+        )
+        .await;
+        let holder_arn = holder.string("arn");
+
+        let subject_resources = vec![distribution("E1ADDS"), web_acl("acl-adds")];
+        let subject = create(
+            &router,
+            create_body_naming("CloudFront", "PRO", &subject_resources, Some("IMMEDIATE")),
+        )
+        .await;
+        let subject_arn = subject.string("arn");
+        let subject_etag = subject.require_etag(case);
+
+        let answered = call(
+            &router,
+            "AssociateResourcesToSubscription",
+            json!({"arn": subject_arn.clone(), "resourceArns": named}),
+            Some(&subject_etag),
+        )
+        .await;
+        match offending.as_deref() {
+            Some(offending) => {
+                assert_eq!(
+                    answered.status, 400,
+                    "case {case:?}: expected the call to be refused 400, got {} {:?}",
+                    answered.status, answered.body
+                );
+                assert_eq!(
+                    answered.error_code.as_deref(),
+                    Some(VALIDATION_EXCEPTION),
+                    "case {case:?}: unexpected error code for {:?}",
+                    answered.body
+                );
+                assert_eq!(
+                    answered.message(case),
+                    format!(
+                        "Cannot add {offending} to subscription {subject_arn}: resource \
+                         must belong to your account and not be used in another \
+                         subscription."
+                    ),
+                    "case {case:?}: unexpected message for {:?}",
+                    answered.body
+                );
+                assert_eq!(
+                    answered.body.get("resourceId").and_then(Value::as_str),
+                    Some(offending),
+                    "case {case:?}: the refusal must name the offending resource, got {:?}",
+                    answered.body
+                );
+                // Both subscriptions are left exactly as they were.
+                let subject_read = call(
+                    &router,
+                    "GetSubscription",
+                    json!({"arn": subject_arn.clone()}),
+                    None,
+                )
+                .await;
+                assert_eq!(
+                    subject_read.body, subject.body,
+                    "case {case:?}: a refused association must change nothing, got {:?}",
+                    subject_read.body
+                );
+                assert_eq!(
+                    subject_read.require_etag(case),
+                    subject_etag,
+                    "case {case:?}: a refused association must not mint a new ETag"
+                );
+                let holder_read =
+                    call(&router, "GetSubscription", json!({"arn": holder_arn}), None).await;
+                assert_eq!(
+                    holder_read.body["resourceArns"],
+                    json!(holder_resources),
+                    "case {case:?}: the subscription covering the resource must keep it, \
+                     got {:?}",
+                    holder_read.body
+                );
+            }
+            None => {
+                assert_eq!(
+                    answered.status, 200,
+                    "case {case:?}: adding a resource nothing covers must succeed, got {} \
+                     {:?}",
+                    answered.status, answered.body
+                );
+                let expected: Vec<String> = subject_resources
+                    .iter()
+                    .chain(named.iter())
+                    .cloned()
+                    .collect();
+                assert_eq!(
+                    answered.body["resourceArns"],
+                    json!(expected),
+                    "case {case:?}: expected the subscription to cover {expected:?}, got {:?}",
+                    answered.body["resourceArns"]
+                );
+            }
+        }
+    }
+}
+
+/// The gate is STATE-DEPENDENT: the very create that was refused is admitted once nothing
+/// covers the resources any more — the holder's cancellation takes effect on the clock, and
+/// the resources it covered are free again.
+#[tokio::test]
+async fn the_same_create_is_admitted_once_the_covering_subscription_is_gone() {
+    let router = router();
+    let case = "cancel the holder, then subscribe over its resources";
+    let resources = vec![distribution("E1FREED"), web_acl("acl-freed")];
+
+    let held = create(
+        &router,
+        create_body_naming("CloudFront", "PRO", &resources, Some("IMMEDIATE")),
+    )
+    .await;
+    let holder_arn = held.string("arn");
+
+    let request = create_body_naming("CloudFront", "FREE", &resources, Some("IMMEDIATE"));
+    let refused = call(&router, "CreateSubscription", request.clone(), None).await;
+    assert_eq!(
+        (refused.status, refused.error_code.as_deref()),
+        (400, Some(VALIDATION_EXCEPTION)),
+        "case {case:?}: while the holder covers them the create must be refused, got {} {:?}",
+        refused.status,
+        refused.body
+    );
+
+    // Cancelling is scheduled, so the holder is still the one covering the resources until
+    // the change the clock owes has taken effect.
+    let cancelled = call(
+        &router,
+        "CancelSubscription",
+        json!({"arn": holder_arn.clone()}),
+        Some(&held.require_etag(case)),
+    )
+    .await;
+    assert_eq!(
+        cancelled.status, 200,
+        "case {case:?}: the cancellation must be scheduled, got {} {:?}",
+        cancelled.status, cancelled.body
+    );
+
+    // Wait for the CONDITION — the cancellation having taken effect, which the reader
+    // reports by no longer finding the subscription — rather than for a time.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let read = call(
+            &router,
+            "GetSubscription",
+            json!({"arn": holder_arn.clone()}),
+            None,
+        )
+        .await;
+        if read.status == 404 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the scheduled cancellation must take effect on the clock; the \
+             subscription still reads {:?}",
+            read.body
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let admitted = call(&router, "CreateSubscription", request, None).await;
+    assert_eq!(
+        admitted.status, 200,
+        "case {case:?}: once nothing covers the resources the same create must succeed, \
+         got {} {:?}",
+        admitted.status, admitted.body
+    );
+    assert_eq!(
+        admitted.body["resourceArns"],
+        json!(resources),
+        "case {case:?}: the new subscription must cover the resources it named, got {:?}",
+        admitted.body
+    );
 }

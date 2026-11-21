@@ -80,6 +80,12 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # let through is answered 403 at the edge, with no origin request made. It also holds the one
 # reading of the ADDRESS a viewer request came from, which a real-time log record reports.
 service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
+# WHETHER a flat-rate pricing plan is bought over a distribution: such a plan is sold over a
+# distribution and the web ACL in front of it, so the protection has to stay in place while
+# the subscription does, and a write that would take the web ACL off is refused. Which
+# resources a subscription covers is the selling service's own record, read over the shared
+# engine (`state::pricing_plan_subscription`).
+service-com-amazonaws-pricingplanmanager-awspricingplanmanager = { workspace = true }
 # The Kinesis data stream a cache behaviour's real-time log configuration delivers each served
 # viewer request's log record to (`service::edge::realtime_logs`), written over the emulator's
 # own in-process transport. Only the generated client is needed — the emulator supplies the

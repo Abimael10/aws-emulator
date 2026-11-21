@@ -78,7 +78,6 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 /// distribution whose web ACL association nothing here can report.
 #[tokio::test]
 async fn a_subscription_is_created_where_no_owning_service_can_be_asked() {
-    let router = router();
     let distribution = format!("arn:aws:cloudfront::{ACCOUNT}:distribution/E1EXAMPLE1EXAMPLE");
     let second = format!("arn:aws:cloudfront::{ACCOUNT}:distribution/E2EXAMPLE2EXAMPLE");
     let web_acl = format!(
@@ -131,6 +130,9 @@ async fn a_subscription_is_created_where_no_owning_service_can_be_asked() {
     ];
 
     for (case, family, tier, resources) in &rows {
+        // A router of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts rather than one.
+        let router = router();
         let (status, created) = call(
             &router,
             "CreateSubscription",

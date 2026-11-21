@@ -421,6 +421,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let now = SystemTime::now();
+        // Whether a flat-rate pricing plan is bought over this distribution is the SELLING
+        // service's own record, so it is read BEFORE this service's store is locked — the
+        // two stores are never held at the same time. The answer decides nothing until the
+        // sequence below reaches it, so an update that fails an earlier condition still
+        // earns that condition's refusal.
+        let covered_by_a_pricing_plan =
+            crate::state::distribution_covered_by_a_pricing_plan(&*self.engine, &input.id);
         // The stored record first, under a lock taken and released for that read alone: an
         // update the store holds no distribution for is answered before anything of another
         // service's records is read for it. The PRECONDITION is not evaluated here — it says
@@ -734,6 +741,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(UpdateDistributionErrorModeled::IllegalUpdate(
                     crate::state::illegal_update_missing_price_class(),
                 )
+                .into());
+            }
+
+            // A distribution a flat-rate pricing plan is bought over keeps the web ACL in
+            // front of it: the plan is sold over that pair, so an update that would clear
+            // the association or point it at another web ACL is refused for as long as a
+            // subscription covers the distribution, and nothing is stored. The stored
+            // association is read under this same guard, so the value the rule is applied
+            // to is the one the write would replace
+            // (`crate::state::pricing_plan_subscription`).
+            if let Some(message) = crate::state::web_acl_held_by_a_pricing_plan(
+                covered_by_a_pricing_plan,
+                store
+                    .distribution(&input.id)
+                    .and_then(|stored| stored.config.web_acl_id.as_deref()),
+                input.distribution_config.web_acl_id.as_deref(),
+            ) {
+                return Err(UpdateDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                    message: Some(message.to_string()),
+                })
                 .into());
             }
 

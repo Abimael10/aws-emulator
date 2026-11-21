@@ -4390,3 +4390,10 @@ pub use pagination_markers::*;
 mod viewer_certificate;
 pub use viewer_certificate::*;
 
+/// Whether a flat-rate PRICING PLAN subscription covers a distribution, which is what
+/// decides whether a write may take that distribution's web ACL off. A SUBMODULE for the
+/// same reason [`functions`] is one; `pub use` keeps every name reachable as
+/// `crate::state::<name>`.
+mod pricing_plan_subscription;
+pub use pricing_plan_subscription::*;
+

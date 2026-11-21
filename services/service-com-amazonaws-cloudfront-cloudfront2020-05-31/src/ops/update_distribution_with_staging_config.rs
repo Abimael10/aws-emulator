@@ -398,6 +398,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let now = SystemTime::now();
+        // Whether a flat-rate pricing plan is bought over the primary distribution is the
+        // SELLING service's own record, read BEFORE this service's store is locked, so the
+        // two stores are never held at the same time. It decides nothing until the sequence
+        // below reaches it.
+        let covered_by_a_pricing_plan =
+            crate::state::distribution_covered_by_a_pricing_plan(&*self.engine, &input.id);
         // EVERYTHING THIS REQUEST READS AND WRITES OF THE STORE IS WEIGHED UNDER ONE GUARD,
         // which is released as the block ends: the grant that follows the standard logging
         // the promoted configuration enables awaits, and a guard held across an await would
@@ -541,6 +547,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     UpdateDistributionWithStagingConfigErrorModeled::InvalidViewerCertificate(
                         InvalidViewerCertificate {
+                            message: Some(message.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // A distribution a flat-rate pricing plan is bought over keeps the web ACL in
+            // front of it, so a promotion whose configuration would clear the primary's
+            // association or point it at another web ACL is refused for as long as a
+            // subscription covers the primary, and nothing is stored
+            // (`crate::state::pricing_plan_subscription`).
+            if let Some(message) = crate::state::web_acl_held_by_a_pricing_plan(
+                covered_by_a_pricing_plan,
+                primary_config.web_acl_id.as_deref(),
+                promoted.web_acl_id.as_deref(),
+            ) {
+                return Err(
+                    UpdateDistributionWithStagingConfigErrorModeled::InvalidArgument(
+                        InvalidArgument {
                             message: Some(message.to_string()),
                         },
                     )

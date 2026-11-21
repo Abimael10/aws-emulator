@@ -153,6 +153,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
+
+        // Whether a flat-rate pricing plan is bought over this distribution is the SELLING
+        // service's own record, read BEFORE this service's store is locked, so the two
+        // stores are never held at the same time. It decides nothing until the sequence
+        // below reaches it.
+        let covered_by_a_pricing_plan =
+            crate::state::distribution_covered_by_a_pricing_plan(&*self.engine, &input.id);
+
         let now = SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
@@ -214,6 +222,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // distribution", and an EMPTY value is what names no association — so clearing
         // that one member is the whole of the disassociation. Every other member the
         // distribution runs under is carried over untouched.
+        //
+        // A distribution a flat-rate pricing plan is bought over keeps the web ACL in front
+        // of it, though: the plan is sold over that pair, so for as long as a subscription
+        // covers the distribution the removal is refused and the configuration is left
+        // exactly as it was (`crate::state::pricing_plan_subscription`).
+        if let Some(message) = crate::state::web_acl_held_by_a_pricing_plan(
+            covered_by_a_pricing_plan,
+            config.web_acl_id.as_deref(),
+            Some(""),
+        ) {
+            return Err(
+                DisassociateDistributionWebACLErrorModeled::InvalidArgument(InvalidArgument {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
         config.web_acl_id = Some(String::new());
 
         // Stored through the one configuration-mutating path, so this call versions and

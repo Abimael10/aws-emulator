@@ -31,6 +31,11 @@ pub mod plan_catalog;
 /// a rule about this service's own record, shared by every operation that changes the set.
 pub mod subscription_resources;
 
+/// Which members of a `CreateSubscription` request say WHICH subscription it asks for, so
+/// a `clientToken` replay of the same request can be told from a request for a different
+/// one.
+pub mod subscription_identity;
+
 pub use resource_eligibility::{
     ineligible_resources, ineligible_resources_message, CLOUDFRONT_PLAN_FAMILY,
 };
@@ -42,9 +47,11 @@ pub use plan_catalog::{
 
 pub use subscription_resources::{
     is_required_resource, plan_resource_addition, plan_resource_removal,
-    required_resources_message, ResourceChangeError, ResourceChangeRefusal,
-    RESOURCE_CHANGE_STATUS,
+    required_resources_message, resource_already_subscribed, resource_in_another_subscription,
+    CoveredResource, ResourceChangeError, ResourceChangeRefusal, RESOURCE_CHANGE_STATUS,
 };
+
+pub use subscription_identity::{client_token_parameters_differ, SubscriptionIdentity};
 
 /// The region an unsigned request is served in. A signed request carries its own
 /// region in the SigV4 credential scope; see [`request_region`].
@@ -188,6 +195,12 @@ pub struct ScheduledChangeRecord {
     pub change_type: ChangeType,
     /// When the change takes effect.
     pub effective_date: Option<DateTime>,
+    /// The instant this store APPLIES the change at:
+    /// [`ComAmazonawsPricingplanmanagerAwspricingplanmanagerState::apply_due_changes`]
+    /// materialises it once the clock has reached this, with or without a caller. Never on
+    /// the wire — the date a caller reads is [`Self::effective_date`], which for a
+    /// cancellation is not the same instant ([`CANCELLATION_SPAN_MILLIS`]).
+    pub due_at: DateTime,
     /// For a downgrade, the tier the subscription will move to.
     pub plan_tier: Option<String>,
     /// For a downgrade, the usage level after the change takes effect.
@@ -204,6 +217,30 @@ impl ScheduledChangeRecord {
             usage_level: self.usage_level.clone(),
         }
     }
+}
+
+/// How long a scheduled CANCELLATION stays pending before this store has applied it.
+///
+/// A cancellation is scheduled "to take effect at the end of the current billing period",
+/// which is the date it REPORTS ([`end_of_billing_period`]) — but what it does at that
+/// instant is end the subscription: the record goes away, its `clientToken` is released and
+/// the resources it covered are free for another subscription. That is a transition a
+/// caller waits for, and no caller can wait a calendar month for it, so the instant this
+/// store applies it at is this span after the call that scheduled it: the emulator's own
+/// choice, like every other transition it owes. It is never zero, so a caller that reads
+/// straight after cancelling still sees the subscription active with the change pending.
+///
+/// A DOWNGRADE is not owed this way: what it does at its effective instant is report a
+/// lower tier, and that instant is one AWS publishes — "Downgrades are scheduled and the
+/// current tier remains unchanged until the end of the billing cycle (calendar month)"
+/// (`smithy_query(query="doc", shape="UpdateSubscription")`) — so it keeps the documented
+/// value and is applied at the date it reports.
+pub const CANCELLATION_SPAN_MILLIS: i64 = 3_000;
+
+/// The instant a cancellation scheduled at `now` is applied at
+/// ([`CANCELLATION_SPAN_MILLIS`]).
+pub fn cancellation_due(now: DateTime) -> DateTime {
+    instant_after_millis(now, CANCELLATION_SPAN_MILLIS)
 }
 
 /// A subscription, as stored. Every member of the modelled `Subscription` and
@@ -235,6 +272,12 @@ pub struct SubscriptionRecord {
     /// drops its entry from the idempotency map, which keeps that map bounded by the
     /// number of live subscriptions rather than by the number of calls ever made.
     pub client_token: Option<String>,
+    /// The approval mode the `CreateSubscription` call that minted this subscription asked
+    /// for, after that operation's own default was applied. Never on the wire: it is held
+    /// because it is one of the members that say WHICH subscription a request asks for, so
+    /// a replay of this record's `clientToken` can be told apart from a request for a
+    /// different subscription ([`subscription_identity`]).
+    pub approval_mode: ApprovalMode,
     /// This record's revision: how many times the record has been written, counting the
     /// writes the `CreateSubscription` call itself made. It IS the concurrency token
     /// [`Self::etag`] publishes, so only a write moves it.
@@ -516,12 +559,12 @@ impl ComAmazonawsPricingplanmanagerAwspricingplanmanagerState {
         Ok(record)
     }
 
-    /// Apply every scheduled change whose effective instant has already passed.
+    /// Apply every scheduled change this store is owed at an instant `now` has reached.
     ///
-    /// A `ScheduledChange` takes effect at the end of the billing period on its own —
-    /// "the cancellation is scheduled to take effect at the end of the current billing
-    /// period", "the current tier remains unchanged until the end of the billing cycle" —
-    /// so by the time `now` is past that instant the change has happened whether or not
+    /// A `ScheduledChange` takes effect on its own — "the cancellation is scheduled to take
+    /// effect at the end of the current billing period", "the current tier remains unchanged
+    /// until the end of the billing cycle" — so by the time `now` is past the instant it is
+    /// owed at ([`ScheduledChangeRecord::due_at`]) the change has happened whether or not
     /// anybody called. Every operation, reporting or mutating, brings the store up to
     /// the clock before it answers, which is why a read may write here: it only
     /// materialises what the clock already made due, and it is a no-op for a store with
@@ -546,12 +589,11 @@ impl ComAmazonawsPricingplanmanagerAwspricingplanmanagerState {
             let Some(change) = record.scheduled_change.as_ref() else {
                 continue;
             };
-            // A change the billing system has not dated yet is not due; its
-            // `effectiveDate` "is populated after the change is confirmed".
-            let Some(effective) = change.effective_date else {
-                continue;
-            };
-            if instant_key(effective) > instant_key(now) {
+            // The instant the change is APPLIED at is the stored one: the date a downgrade
+            // reports, and for a cancellation the span this store owes that transition at
+            // ([`CANCELLATION_SPAN_MILLIS`]) rather than the end-of-billing-period date it
+            // reports, which no caller can wait for.
+            if instant_key(change.due_at) > instant_key(now) {
                 continue;
             }
             match change.change_type {
