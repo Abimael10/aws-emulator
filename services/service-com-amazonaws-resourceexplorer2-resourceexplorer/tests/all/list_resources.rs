@@ -1479,6 +1479,206 @@ async fn a_query_changes_nothing_a_later_caller_sees() {
     );
 }
 
+/// A Region's default-view ASSOCIATION, and nothing else, decides which view a
+/// `ListResources` request that names none is served through: the view the Region
+/// associates while it associates one, and no view at all while it associates none —
+/// which is a 200 over that Region's index naming no `ViewArn`, never a refusal.
+/// `ViewArn` is an optional input member, so what the listing is scoped by is a property
+/// of the Region it reads, and the association is state a caller moves back and forth.
+///
+/// The rows span the association state (associated, cleared, associated to another view,
+/// cleared again, associated to the view the Region was turned on with, cleared a third
+/// time) and the scope the associated view carries (unfiltered, and one whose own filter
+/// string selects a single resource type). Each row is read back through `GetDefaultView`
+/// too, so the association the listing used is the association the service reports.
+#[tokio::test]
+async fn the_default_view_association_decides_the_view_a_viewless_listing_uses() {
+    let fixture = Fixture::new().await;
+
+    // A view whose own filter string selects ONE resource type: what tells a listing
+    // scoped by the associated view apart from one scoped by nothing at all, since the
+    // fixture's default view is unfiltered.
+    let indexes_only = fixture
+        .emulator
+        .create_view(
+            REGION,
+            json!({
+                "ViewName": "indexes-only",
+                "Filters": { "FilterString": "resourcetype:resource-explorer-2:index" },
+            }),
+        )
+        .await;
+    // Creating it put it in the Region's index, so an unscoped listing reports it too.
+    let mut every = fixture.every_arn();
+    every.insert(indexes_only.clone());
+
+    // (case, the view the Region associates — `None` for no association at all, the ARNs
+    // a listing that names no view must then report)
+    let rows: Vec<(&str, Option<&String>, BTreeSet<String>)> = vec![
+        (
+            "the unfiltered view the fixture associated",
+            Some(&fixture.default_view),
+            every.clone(),
+        ),
+        ("that association cleared", None, every.clone()),
+        (
+            "a view of its own scope associated",
+            Some(&indexes_only),
+            set(&[&fixture.index]),
+        ),
+        ("cleared again", None, every.clone()),
+        (
+            "the view the Region was turned on with associated",
+            Some(&fixture.turn_on_view),
+            every.clone(),
+        ),
+        ("cleared a third time", None, every.clone()),
+    ];
+
+    for (case, associated, expected) in rows {
+        match associated {
+            Some(view_arn) => fixture.emulator.set_default_view(REGION, view_arn).await,
+            None => {
+                fixture
+                    .emulator
+                    .explorer(REGION, "DisassociateDefaultView", json!({}))
+                    .await
+                    .ok(&format!("{case}: clear the Region's default view"));
+            }
+        }
+
+        let reported = fixture
+            .emulator
+            .explorer(REGION, "GetDefaultView", json!({}))
+            .await;
+        assert_eq!(
+            reported.ok(case).get("ViewArn").and_then(Value::as_str),
+            associated.map(String::as_str),
+            "case {case:?}: GetDefaultView must report the association in force, got {}",
+            reported.body
+        );
+
+        let answer = fixture
+            .emulator
+            .explorer(REGION, "ListResources", json!({}))
+            .await;
+        assert_eq!(
+            answer.arns(case),
+            expected,
+            "case {case:?}: expected the listing the association in force scopes, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.ok(case).get("ViewArn").and_then(Value::as_str),
+            associated.map(String::as_str),
+            "case {case:?}: the answer names the view it used, and none where it used \
+             none, got {}",
+            answer.body
+        );
+    }
+}
+
+/// A listing that names no view is answered per REGION and is a pure read: the Region the
+/// request was signed for decides which index it reports and whether any default view is
+/// in force, a Region keeps its own association when another Region's is cleared, and the
+/// call associates no default view as a side effect. A view the request NAMES is read in
+/// its OWN Region whatever Region the request was signed for, and its ARN is echoed.
+///
+/// The rows span the Region the request is signed for: one whose association was cleared
+/// and one that kept its own. What the same file already owns is not repeated here — a
+/// Region with no index at all and a view named explicitly in the Region's own
+/// association-free state are rows of [`a_listing_with_no_view_reports_the_regions_index`],
+/// a second read of an unchanged index is
+/// [`a_query_changes_nothing_a_later_caller_sees`], and a named ARN that resolves to no
+/// view is [`a_named_view_that_cannot_be_resolved_is_unauthorized`].
+#[tokio::test]
+async fn a_viewless_listing_is_answered_per_region_and_associates_nothing() {
+    let fixture = Fixture::new().await;
+    fixture
+        .emulator
+        .explorer(REGION, "DisassociateDefaultView", json!({}))
+        .await
+        .ok("clear the Region's default view");
+    let abroad = set(&[
+        &fixture.foreign_index,
+        &fixture.foreign_turn_on_view,
+        &fixture.foreign_view,
+        &fixture.foreign_queue,
+    ]);
+
+    // (case, the Region the request is signed for, the ViewArn the answer must name, the
+    // ARNs it must report)
+    let regions: Vec<(&str, &str, Option<&String>, BTreeSet<String>)> = vec![
+        (
+            "the Region whose association was cleared",
+            REGION,
+            None,
+            fixture.every_arn(),
+        ),
+        (
+            "a Region that kept its own association",
+            OTHER_REGION,
+            Some(&fixture.foreign_view),
+            abroad.clone(),
+        ),
+    ];
+    for (case, region, view_arn, expected) in regions {
+        let answer = fixture
+            .emulator
+            .explorer(region, "ListResources", json!({}))
+            .await;
+        assert_eq!(
+            answer.arns(case),
+            expected,
+            "case {case:?}: expected the index of the Region the request names, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.ok(case).get("ViewArn").and_then(Value::as_str),
+            view_arn.map(String::as_str),
+            "case {case:?}: the answer names the view it used, and none where it used \
+             none, got {}",
+            answer.body
+        );
+    }
+
+    // Nothing about the listing associated a default view: the Region still has none, so a
+    // later caller is answered the same way rather than through a view this read wrote.
+    let case = "the association after the listing";
+    let reported = fixture
+        .emulator
+        .explorer(REGION, "GetDefaultView", json!({}))
+        .await;
+    assert_eq!(
+        reported.ok(case).get("ViewArn"),
+        None,
+        "case {case:?}: a listing must associate no default view, got {}",
+        reported.body
+    );
+
+    // A view of ANOTHER Region, named by a request signed for a Region that associates
+    // none: the listing is the named view's own Region's index, and its ARN is echoed —
+    // which is what says the Region the request was signed for governs only the
+    // association, not the index a named view reads.
+    let case = "a view of another Region, named explicitly";
+    let answer = fixture
+        .emulator
+        .list_through(REGION, &fixture.foreign_view, "")
+        .await;
+    assert_eq!(
+        answer.arns(case),
+        abroad,
+        "case {case:?}: expected the index of the named view's Region, got {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.ok(case)["ViewArn"].as_str(),
+        Some(fixture.foreign_view.as_str()),
+        "case {case:?}: the answer echoes the view the request named, got {}",
+        answer.body
+    );
+}
+
 // =====================================================================================
 // The wire FORM of what a query answers: the shapes an SDK client deserializes
 // =====================================================================================

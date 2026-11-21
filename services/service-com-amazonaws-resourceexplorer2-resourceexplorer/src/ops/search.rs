@@ -14,6 +14,14 @@
 //! this operation reports includes the resources the services in `crate::state::owners`
 //! hold in that Region, read from their own records.
 //!
+//! A request that names NO view uses the Region's default view, and a Region that has no
+//! default view leaves this search with no view to scope it — which it refuses with the
+//! 401 `ViewArn` documents, because every search query "must use a view". That is
+//! DELIBERATELY not what `ListResources` does with the same state: the recorded behaviour
+//! of that operation is a 200 over the Region's index (see its handler's header), and
+//! nothing recorded says the same of this one, so the documented refusal stands here
+//! until it does.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
