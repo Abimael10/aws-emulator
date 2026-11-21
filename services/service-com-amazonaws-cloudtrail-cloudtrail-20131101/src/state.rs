@@ -2127,6 +2127,11 @@ pub mod advanced_event_selectors;
 /// same reason [`channels`] is: both operations that configure a trail apply it.
 pub mod referenced_resources;
 
+/// The resource-policy surface's own cross-service seam: the stored policy document going to
+/// the service that enforces it. In its own module for the same reason [`channels`] is: both
+/// operations that WRITE such a document drive it.
+pub mod resource_policies;
+
 /// How a dashboard widget's `QueryStatement` is read, how many widgets one request may
 /// carry, and the sentence a statement CloudTrail Lake cannot run is refused with. In
 /// its own module beside the registry it guards, for the same reason [`channels`] is:
@@ -3409,6 +3414,11 @@ pub struct PolicyResource {
     /// The canonical ARN of the resource, which is the registry key its policy is
     /// stored under and the ARN the operation reports back.
     pub arn: String,
+    /// Which kind of CloudTrail resource that ARN named, so an operation that has to do
+    /// something per kind — a channel's policy is also what its DATA PLANE holds a
+    /// request's `externalId` to — reads it off the resolution rather than parsing the
+    /// ARN a second time.
+    pub kind: ResourceKind,
     /// Whether the resource can take a policy WRITE. A resource another operation is
     /// modifying — an event data store on its way out — is what `ConflictException`
     /// ("the specified resource is not ready for an operation … because another
@@ -3493,6 +3503,7 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
 
         Ok(PolicyResource {
             arn: parsed.canonical(),
+            kind: parsed.kind,
             ready,
         })
     }

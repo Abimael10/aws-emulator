@@ -129,13 +129,19 @@
 /// statement undecided (see the module
 /// docs). Each of them may be written under a set qualifier; see [`split_set_qualifier`].
 const STRING_OPERATORS: &[&str] = &[
-    "StringEquals",
+    STRING_EQUALS_OPERATOR,
     "StringNotEquals",
     "StringEqualsIgnoreCase",
     "StringNotEqualsIgnoreCase",
     "StringLike",
     "StringNotLike",
 ];
+
+/// IAM's string EQUALITY operator, the one spelling this evaluator decides it under.
+///
+/// Named so the catalog above and the comparison [`clause_holds`] performs carry one
+/// spelling of it rather than two.
+pub(crate) const STRING_EQUALS_OPERATOR: &str = "StringEquals";
 
 /// IAM's existence operator: "`Null` — check if a condition key is present at the time of
 /// authorization", where `true` holds when the request carries NO value for the key and
@@ -625,6 +631,77 @@ fn names_condition_key(statement: &::serde_json::Value, key: &str) -> bool {
                     .is_some_and(|keys| keys.keys().any(|named| named.eq_ignore_ascii_case(key)))
             })
         })
+}
+
+/// Whether a request carrying `value` for condition key `key` satisfies the grants of
+/// `document` that condition on that key, for `action`.
+///
+/// The companion of [`grant_turns_on_condition_key`], which answers WHETHER a grant turns on
+/// a key: this answers whether what the request carries for it SATISFIES those grants, for a
+/// surface whose own input member is "conditionally required when the resource's policy
+/// includes" the key and which therefore has to hold that member to the document. `value` is
+/// `None` for a request carrying nothing for the key, which is exactly the case IAM's
+/// `…IfExists`, `ForAllValues:` and `Null` readings turn on.
+///
+/// The clause is DECIDED, not enumerated: every grant of `action` whose `Condition` names
+/// the key is evaluated through this module's own clause reading ([`conditions_hold`]) over a
+/// request that carries `value` for the key and DECLARES the key modelled, so a pattern, a
+/// case-insensitive comparison, a set qualifier, an `IfExists` spelling and an existence
+/// assertion each decide the way this evaluator decides them everywhere else. `true` when at
+/// least one such grant is satisfiable — a document is satisfied by any one of its grants —
+/// and `true` as well when no grant of the action conditions on the key at all, which is the
+/// document that asks nothing of it. A grant whose OTHER clauses this evaluator cannot decide
+/// is not what withholds the answer here: only a clause it decides to be FALSE is.
+///
+/// The `Principal` and `Resource` elements are NOT read: the question is what the document
+/// attached to one resource asks of this key, not whether a particular principal is granted —
+/// which is [`resource_decision`], and which a caller asks alongside this where the grant
+/// itself is in question.
+#[must_use]
+pub fn key_value_satisfies_grants(
+    document: &str,
+    action: &str,
+    key: &str,
+    value: Option<&str>,
+) -> bool {
+    let prepared = PreparedDocument::read(document);
+    let context: Vec<(String, String)> = value
+        .map(|carried| vec![(key.to_string(), carried.to_string())])
+        .unwrap_or_default();
+    let published = [key];
+    // The resource is not part of this question (see the docs): the statements are selected
+    // by their action element and judged on their condition alone.
+    let request = Request::new(action, "", &[])
+        .with_context(&context)
+        .with_published_keys(&published);
+    let mut conditioned = false;
+    for statement in statements(&prepared) {
+        let grants = statement["Effect"]
+            .as_str()
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("Allow");
+        if !grants || !names_action(statement, action) || !names_condition_key(statement, key) {
+            continue;
+        }
+        conditioned = true;
+        if conditions_hold(statement, &request, &mut RequiredKeys::unreported()) != Some(false) {
+            return true;
+        }
+    }
+    !conditioned
+}
+
+/// Whether this evaluator decides a COMPARISON written under `operator` at all — the
+/// operator catalogs above, the existence operator excluded (it compares no value; see
+/// [`NULL_OPERATOR`]). An operator outside them leaves its clause undecided, which is what
+/// [`conditions_hold`] reads fail-closed in both directions.
+fn decides_comparison(operator: &str) -> bool {
+    operator == BOOL_OPERATOR
+        || STRING_OPERATORS.contains(&operator)
+        || ARN_OPERATORS.contains(&operator)
+        || NUMERIC_OPERATORS.contains(&operator)
+        || DATE_OPERATORS.contains(&operator)
+        || IP_ADDRESS_OPERATORS.contains(&operator)
 }
 
 /// The spellings a policy's `Principal`/`NotPrincipal` element names a whole ACCOUNT by:
@@ -1441,12 +1518,7 @@ fn conditions_hold(
         let implemented = if existence {
             !absence_holds
         } else {
-            operator == BOOL_OPERATOR
-                || STRING_OPERATORS.contains(&operator)
-                || ARN_OPERATORS.contains(&operator)
-                || NUMERIC_OPERATORS.contains(&operator)
-                || DATE_OPERATORS.contains(&operator)
-                || IP_ADDRESS_OPERATORS.contains(&operator)
+            decides_comparison(operator)
         };
         for (key, expected) in keys {
             let actual: Vec<&str> = request
@@ -2979,6 +3051,189 @@ mod tests {
                 assert!(
                     !turns_on,
                     "case {case:?}: expected the grant not to turn on {other:?}, got {turns_on}"
+                );
+            }
+        }
+    }
+
+    /// RULE: whether a request's value for a condition key satisfies a document's grants is
+    /// decided by the clause itself, through the same reading this evaluator applies
+    /// everywhere: an equality (case-sensitive), a case-insensitive one, a pattern, a set
+    /// qualifier, an `…IfExists` spelling, a negated comparison and a `Null` existence
+    /// assertion each decide their own way, a request carrying no value for the key is the
+    /// case IAM's absence readings turn on, and a document whose grants of the action
+    /// condition on the key not at all asks nothing of it — as do a `Deny` and a grant of
+    /// another action.
+    #[test]
+    fn whether_a_keys_value_satisfies_a_grant_is_decided_by_the_clause() {
+        let key = "sts:ExternalId";
+        let action = "cloudtrail-data:PutAuditEvents";
+        let grant = |condition: &str| {
+            format!(
+                "{{\"Effect\":\"Allow\",\
+                 \"Principal\":{{\"AWS\":\"arn:aws:iam::000000000000:root\"}},\
+                 \"Action\":\"cloudtrail-data:PutAuditEvents\"{condition}}}"
+            )
+        };
+        // (case, the statements of the resource-based document, the values probed and
+        // whether each satisfies the grants)
+        type Probed<'a> = (&'a str, String, Vec<(Option<&'a str>, bool)>);
+        let rows: Vec<Probed<'_>> = vec![
+            (
+                "no statement at all",
+                String::new(),
+                vec![(None, true), (Some("one"), true)],
+            ),
+            (
+                "a grant stating no condition",
+                grant(""),
+                vec![(None, true), (Some("one"), true)],
+            ),
+            (
+                "an equality, which is case-sensitive",
+                grant(",\"Condition\":{\"StringEquals\":{\"sts:ExternalId\":\"one\"}}"),
+                vec![
+                    (None, false),
+                    (Some("one"), true),
+                    (Some("ONE"), false),
+                    (Some("other"), false),
+                ],
+            ),
+            (
+                "two values in one clause, either of which satisfies it",
+                grant(",\"Condition\":{\"StringEquals\":{\"sts:ExternalId\":[\"a\",\"b\"]}}"),
+                vec![
+                    (None, false),
+                    (Some("a"), true),
+                    (Some("b"), true),
+                    (Some("c"), false),
+                ],
+            ),
+            (
+                "the key named in another case",
+                grant(",\"Condition\":{\"StringEquals\":{\"STS:EXTERNALID\":\"cased\"}}"),
+                vec![(None, false), (Some("cased"), true), (Some("other"), false)],
+            ),
+            (
+                "a value stated as a JSON number",
+                grant(",\"Condition\":{\"StringEquals\":{\"sts:ExternalId\":42}}"),
+                vec![(None, false), (Some("42"), true), (Some("4"), false)],
+            ),
+            (
+                "the clause under a ForAnyValue qualifier",
+                grant(
+                    ",\"Condition\":{\"ForAnyValue:StringEquals\":\
+                     {\"sts:ExternalId\":\"any\"}}",
+                ),
+                vec![(None, false), (Some("any"), true), (Some("other"), false)],
+            ),
+            (
+                // "returns true if there are no values in the request".
+                "the clause under a ForAllValues qualifier",
+                grant(
+                    ",\"Condition\":{\"ForAllValues:StringEquals\":\
+                     {\"sts:ExternalId\":\"all\"}}",
+                ),
+                vec![(None, true), (Some("all"), true), (Some("other"), false)],
+            ),
+            (
+                // "if the key is not present … evaluate the condition element as true".
+                "the clause under an IfExists spelling",
+                grant(
+                    ",\"Condition\":{\"StringEqualsIfExists\":\
+                     {\"sts:ExternalId\":\"maybe\"}}",
+                ),
+                vec![(None, true), (Some("maybe"), true), (Some("other"), false)],
+            ),
+            (
+                "a pattern comparison",
+                grant(",\"Condition\":{\"StringLike\":{\"sts:ExternalId\":\"pre*\"}}"),
+                vec![
+                    (None, false),
+                    (Some("pre"), true),
+                    (Some("prefixed"), true),
+                    (Some("other"), false),
+                ],
+            ),
+            (
+                "a case-insensitive equality",
+                grant(
+                    ",\"Condition\":{\"StringEqualsIgnoreCase\":\
+                     {\"sts:ExternalId\":\"Mixed\"}}",
+                ),
+                vec![
+                    (None, false),
+                    (Some("mixed"), true),
+                    (Some("MIXED"), true),
+                    (Some("other"), false),
+                ],
+            ),
+            (
+                // A negated comparison HOLDS on a key the request carries no value for.
+                "a negated comparison",
+                grant(",\"Condition\":{\"StringNotEquals\":{\"sts:ExternalId\":\"nope\"}}"),
+                vec![(None, true), (Some("other"), true), (Some("nope"), false)],
+            ),
+            (
+                "a Null clause asserting the key is present",
+                grant(",\"Condition\":{\"Null\":{\"sts:ExternalId\":\"false\"}}"),
+                vec![(None, false), (Some("anything"), true)],
+            ),
+            (
+                "a Null clause asserting the key is absent",
+                grant(",\"Condition\":{\"Null\":{\"sts:ExternalId\":\"true\"}}"),
+                vec![(None, true), (Some("anything"), false)],
+            ),
+            (
+                // A clause this evaluator cannot decide does not withhold the answer: only
+                // one it decides to be FALSE does.
+                "a comparison this evaluator does not decide",
+                grant(",\"Condition\":{\"BinaryEquals\":{\"sts:ExternalId\":\"QQ==\"}}"),
+                vec![(None, true), (Some("anything"), true)],
+            ),
+            (
+                "a DENY conditioned on the key, which grants nothing",
+                "{\"Effect\":\"Deny\",\"Principal\":\"*\",\
+                 \"Action\":\"cloudtrail-data:PutAuditEvents\",\
+                 \"Condition\":{\"StringEquals\":{\"sts:ExternalId\":\"denied\"}}}"
+                    .to_string(),
+                vec![(None, true), (Some("denied"), true)],
+            ),
+            (
+                "a grant of ANOTHER action conditioned on the key",
+                "{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"cloudtrail:GetChannel\",\
+                 \"Condition\":{\"StringEquals\":{\"sts:ExternalId\":\"other\"}}}"
+                    .to_string(),
+                vec![(None, true), (Some("other"), true)],
+            ),
+            (
+                "two grants, each conditioned on its own value",
+                format!(
+                    "{},{}",
+                    grant(",\"Condition\":{\"StringEquals\":{\"sts:ExternalId\":\"a\"}}"),
+                    grant(",\"Condition\":{\"StringEquals\":{\"sts:ExternalId\":\"b\"}}")
+                ),
+                vec![
+                    (None, false),
+                    (Some("a"), true),
+                    (Some("b"), true),
+                    (Some("c"), false),
+                ],
+            ),
+            (
+                "a document that is not a policy at all",
+                "not a statement".to_string(),
+                vec![(None, true), (Some("anything"), true)],
+            ),
+        ];
+        for (case, text, probes) in rows {
+            let document = identity(&text);
+            for (value, expected) in probes {
+                let satisfied = key_value_satisfies_grants(&document, action, key, value);
+                assert_eq!(
+                    satisfied, expected,
+                    "case {case:?} with {key} {value:?}: expected the grants to be satisfied \
+                     = {expected}, got {satisfied}"
                 );
             }
         }

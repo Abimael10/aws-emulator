@@ -8,7 +8,9 @@
 //! [`crate::service::authorization`]), the channel is then resolved from `channelArn`
 //! (full ARN or ARN suffix), a channel ARN naming another account is
 //! denied before the channel is looked up, the caller's account and the channel's
-//! external-id requirement are checked, the batch is rejected as a whole when it
+//! external-id requirement (stated by the channel's resource policy, which the
+//! CloudTrail control plane's `PutResourcePolicy` / `DeleteResourcePolicy` carry into
+//! this service's registry) are checked, the batch is rejected as a whole when it
 //! repeats an event id, and every event that passes per-event validation is APPENDED to
 //! the channel's ingest log under a freshly minted `eventID` which is then echoed in
 //! `successful`. Events that fail validation are reported per event in `failed`, which
@@ -458,27 +460,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `externalId` is "conditionally required when the channel's resource policy
         // includes an external ID": absent or different is insufficient permission. A
         // channel whose policy includes none ignores whatever the request supplies.
-        if let Some(required) = channel.required_external_id.as_deref() {
-            if input.external_id.as_deref() != Some(required) {
-                record_access(
-                    ctx,
-                    &input.channel_arn,
-                    "ChannelInsufficientPermission",
-                    "externalId is absent or does not match the channel's resource policy",
-                );
-                return Err(
-                    PutAuditEventsErrorModeled::ChannelInsufficientPermission(
-                        ChannelInsufficientPermission {
-                            message: Some(
-                                "The externalId does not match the external ID in the channel's \
-                                 resource policy."
-                                    .to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        if !channel.accepts_external_id(input.external_id.as_deref()) {
+            record_access(
+                ctx,
+                &input.channel_arn,
+                "ChannelInsufficientPermission",
+                "externalId is absent or does not match the channel's resource policy",
+            );
+            return Err(
+                PutAuditEventsErrorModeled::ChannelInsufficientPermission(
+                    ChannelInsufficientPermission {
+                        message: Some(
+                            "The externalId does not match the external ID in the channel's \
+                             resource policy."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
         }
 
         // A repeated event id fails the WHOLE request — checked before anything is

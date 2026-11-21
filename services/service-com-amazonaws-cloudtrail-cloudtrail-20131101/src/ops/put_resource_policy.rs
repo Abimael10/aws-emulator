@@ -8,6 +8,10 @@
 //! `@idempotent`: a second put for the same resource REPLACES the stored policy
 //! rather than conflicting with it — one resource carries one resource-based policy.
 //!
+//! A CHANNEL's policy is also what authorizes the ingest onto it, so attaching one to a
+//! channel states in that channel's data plane which `externalId` a `PutAuditEvents`
+//! request must carry (`crate::state::resource_policies::apply_channel_resource_policy_in_data_plane`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -243,6 +247,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .resource_policies
             .insert(resource.arn.clone(), input.resource_policy.clone());
+
+        // A CHANNEL's policy is also what authorizes the ingest onto it: `externalId` is
+        // conditionally required of a `cloudtrail-data:PutAuditEvents` request when the
+        // channel's resource policy includes an external ID, so attaching or replacing
+        // that policy is what states — or withdraws — that requirement in the channel's
+        // data plane. Written with this store's lock RELEASED (see
+        // `resource_policies::apply_channel_resource_policy_in_data_plane`).
+        drop(store);
+        if resource.kind == crate::state::ResourceKind::Channel {
+            crate::state::resource_policies::apply_channel_resource_policy_in_data_plane(
+                &*self.engine,
+                &resource.arn,
+                Some(&input.resource_policy),
+            );
+        }
 
         Ok(PutResourcePolicyOutput {
             resource_arn: Some(resource.arn),

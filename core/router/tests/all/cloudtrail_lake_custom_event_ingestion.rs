@@ -40,7 +40,7 @@ const CONTROL_PLANE_SIGNING_NAME: &str = "cloudtrail";
 const DATA_PLANE_SIGNING_NAME: &str = "cloudtrail-data";
 
 /// The account every ARN this emulator mints names.
-const ACCOUNT_ID: &str = "000000000000";
+pub(crate) const ACCOUNT_ID: &str = "000000000000";
 
 /// The largest `AuditEventResultEntry$eventID` the model admits (`@length 1..128`).
 const MAX_EVENT_ID_LEN: usize = 128;
@@ -70,7 +70,7 @@ async fn dispatch(
 }
 
 /// One CloudTrail control-plane call, under the dotted `awsJson1_1` target an SDK sends.
-async fn control_plane(
+pub(crate) async fn control_plane(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -98,10 +98,11 @@ async fn control_plane(
 
 /// `cloudtrail-data`'s `PutAuditEvents`: `POST /PutAuditEvents?channelArn=…` with the
 /// batch in the body, signed for the data plane's own signing name.
-async fn put_audit_events(
+pub(crate) async fn put_audit_events(
     router: &MultiServiceRouter,
     region: &str,
     channel_arn: &str,
+    external_id: Option<&str>,
     events: &[(String, String)],
 ) -> (u16, serde_json::Value) {
     let body = serde_json::json!({
@@ -110,10 +111,15 @@ async fn put_audit_events(
             .map(|(id, data)| serde_json::json!({ "id": id, "eventData": data }))
             .collect::<Vec<_>>(),
     });
+    // `externalId` is an optional `httpQuery` member, so a request that states none
+    // carries no such parameter at all.
+    let external_id = external_id
+        .map(|value| format!("&externalId={value}"))
+        .unwrap_or_default();
     let request = http::Request::builder()
         .method("POST")
         .uri(format!(
-            "https://127.0.0.1:9297/PutAuditEvents?channelArn={channel_arn}"
+            "https://127.0.0.1:9297/PutAuditEvents?channelArn={channel_arn}{external_id}"
         ))
         .header("host", "127.0.0.1:9297")
         .header("content-type", "application/json")
@@ -129,7 +135,7 @@ async fn put_audit_events(
 }
 
 /// The error code a `restJson1` body carries in `__type`, empty on a success.
-fn error_code(body: &serde_json::Value) -> String {
+pub(crate) fn error_code(body: &serde_json::Value) -> String {
     body.get("__type")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
@@ -137,7 +143,7 @@ fn error_code(body: &serde_json::Value) -> String {
 }
 
 /// The sentence a refusal carries, under either spelling of the member.
-fn message_of(body: &serde_json::Value) -> String {
+pub(crate) fn message_of(body: &serde_json::Value) -> String {
     for member in ["message", "Message"] {
         if let Some(stated) = body.get(member).and_then(serde_json::Value::as_str) {
             return stated.to_string();
@@ -147,7 +153,7 @@ fn message_of(body: &serde_json::Value) -> String {
 }
 
 /// `(id, eventID)` pairs out of an output member, in the order the response listed them.
-fn entries(body: &serde_json::Value, member: &str, value: &str) -> Vec<(String, String)> {
+pub(crate) fn entries(body: &serde_json::Value, member: &str, value: &str) -> Vec<(String, String)> {
     body.get(member)
         .and_then(serde_json::Value::as_array)
         .map(|items| {
@@ -182,7 +188,7 @@ fn is_modelled_event_id(value: &str) -> bool {
 /// advanced event selector a custom-event store collects under, a Region scope, a
 /// retention period and termination protection — so the table spans both the minimal
 /// create and the documented one.
-async fn create_event_data_store(
+pub(crate) async fn create_event_data_store(
     router: &MultiServiceRouter,
     region: &str,
     name: &str,
@@ -202,7 +208,7 @@ async fn create_event_data_store(
 }
 
 /// Create a `Custom` channel logging to `store_arn`, and answer the ARN it minted.
-async fn create_channel(
+pub(crate) async fn create_channel(
     router: &MultiServiceRouter,
     region: &str,
     name: &str,
@@ -244,7 +250,7 @@ fn payload_of_len(len: usize) -> String {
 }
 
 /// Run `body` against a freshly assembled router, on a thread sized for that assembly.
-fn on_a_router<F>(name: &'static str, body: F)
+pub(crate) fn on_a_router<F>(name: &'static str, body: F)
 where
     F: FnOnce(MultiServiceRouter) + Send + 'static,
 {
@@ -393,7 +399,7 @@ fn a_channel_the_control_plane_created_ingests_audit_events_at_once() {
                     .collect();
                 for (call, events) in [("the first call", batch), ("a later call", &second)] {
                     let (status, reply) =
-                        put_audit_events(&router, region, &channel_arn, events).await;
+                        put_audit_events(&router, region, &channel_arn, None, events).await;
                     assert_eq!(
                         status, 200,
                         "case {case:?} on {call}: PutAuditEvents onto the channel the \
@@ -544,7 +550,8 @@ fn only_a_channel_the_control_plane_does_not_hold_is_refused_as_absent() {
             ];
 
             for (case, channel, region, expected_status, expected_code) in &rows {
-                let (status, reply) = put_audit_events(&router, region, channel, &batch).await;
+                let (status, reply) =
+                    put_audit_events(&router, region, channel, None, &batch).await;
                 assert_eq!(
                     status, *expected_status,
                     "case {case:?}: expected HTTP {expected_status}, got {status} with \

@@ -38,6 +38,20 @@ pub const MAX_RETAINED_BYTES_PER_CHANNEL: usize = 16 * 1024 * 1024;
 /// retention bounds, so the handler and this crate's tests read one definition.
 pub const MAX_EVENT_DATA_BYTES: usize = 1024 * 1024;
 
+/// The IAM condition key a channel's resource policy states an external ID under.
+///
+/// `PutAuditEvents$externalId` is "conditionally required when the channel's resource policy
+/// includes an external ID", and `sts:ExternalId` is the condition key AWS documents that
+/// policy including it as — so a request's `externalId` is the value this key carries when
+/// the channel's policy is evaluated ([`Channel::accepts_external_id`]).
+pub const EXTERNAL_ID_CONDITION_KEY: &str = "sts:ExternalId";
+
+/// The operation a channel's resource policy authorizes, whose `externalId` that policy's
+/// condition narrows. The ACTION is spelled by this service's own namespace statement
+/// ([`crate::service::authorization::action_for`]), so the policy is evaluated against the
+/// same action a grant of this operation is written with.
+const INGEST_OPERATION: &str = "PutAuditEvents";
+
 /// The parts of a CloudTrail Lake channel ARN:
 /// `arn:<partition>:cloudtrail:<region>:<account-id>:channel/<channel-id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,9 +244,19 @@ pub struct Channel {
     /// The account that owns the channel; a caller from another account is refused
     /// with `ChannelInsufficientPermission`.
     pub owner_account_id: String,
-    /// `Some(..)` when the channel's resource policy includes an external id, which a
-    /// request must then match.
-    pub required_external_id: Option<String>,
+    /// The resource-based policy attached to the channel, as the CloudTrail control plane
+    /// stores it — `None` for a channel carrying none.
+    ///
+    /// The document is held rather than anything read out of it, so what it says about a
+    /// request is DECIDED by the shared IAM evaluator rather than summarised here
+    /// ([`Channel::accepts_external_id`]). Written by [`set_channel_resource_policy`], the
+    /// seam the call that attaches, replaces or detaches that policy drives.
+    ///
+    /// Bounded by the control plane that writes it: a `ResourcePolicy` is modelled
+    /// `@length 1..8192` and one channel carries one policy, so this registry holds at most
+    /// that per channel — and the evaluator reads nothing past its own
+    /// `iam_authorization::MAX_POLICY_BYTES` backstop.
+    pub resource_policy: Option<String>,
     /// The channel's event source (`Custom`, a partner source name, ...).
     pub source: String,
     /// Events accepted on this channel, oldest first, bounded by
@@ -255,18 +279,60 @@ impl Channel {
             arn: parsed.arn,
             channel_id: parsed.channel_id,
             owner_account_id: parsed.account_id,
-            required_external_id: None,
+            // A channel is minted with no resource policy attached, so a fresh
+            // registration requires no external id; the policy write is what carries
+            // one ([`set_channel_resource_policy`]).
+            resource_policy: None,
             source: source.into(),
             ingested: VecDeque::new(),
             retained_bytes: 0,
         })
     }
 
-    /// The same channel, with a resource policy that requires `external_id`.
+    /// The same channel, carrying the resource policy AWS documents for a custom
+    /// integration, conditional on `external_id`: the grant of the ingest this channel's
+    /// `externalId` is then held to.
     #[must_use]
     pub fn requiring_external_id(mut self, external_id: impl Into<String>) -> Self {
-        self.required_external_id = Some(external_id.into());
+        let document = ::serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "ChannelPolicy",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": crate::service::authorization::action_for(INGEST_OPERATION),
+                "Resource": self.arn.clone(),
+                "Condition": {
+                    "StringEquals": { EXTERNAL_ID_CONDITION_KEY: external_id.into() },
+                },
+            }],
+        });
+        self.resource_policy = Some(document.to_string());
         self
+    }
+
+    /// Whether the `externalId` a request carried (or did not carry) satisfies this
+    /// channel's resource policy.
+    ///
+    /// `externalId` is "conditionally required when the channel's resource policy includes an
+    /// external ID", so the value the request carries is the value the policy's condition
+    /// over [`EXTERNAL_ID_CONDITION_KEY`] is DECIDED against — by the shared IAM evaluator
+    /// ([`::service_common::iam_authorization::key_value_satisfies_grants`]), which is what
+    /// makes every spelling of that condition decide the way this tree decides it: an
+    /// equality (case-sensitive) admits its own values, a pattern admits what it matches, an
+    /// `…IfExists` clause admits a request carrying nothing, and so on. A channel whose
+    /// policy's grants of the ingest condition on the key not at all — including the channel
+    /// carrying no policy — accepts whatever the request supplies, including nothing.
+    pub fn accepts_external_id(&self, supplied: Option<&str>) -> bool {
+        let Some(document) = self.resource_policy.as_deref() else {
+            return true;
+        };
+        ::service_common::iam_authorization::key_value_satisfies_grants(
+            document,
+            &crate::service::authorization::action_for(INGEST_OPERATION),
+            EXTERNAL_ID_CONDITION_KEY,
+            supplied,
+        )
     }
 
     /// Append an accepted event to the ingest log, evicting the oldest entries until
@@ -387,6 +453,13 @@ impl ComAmazonawsCloudtraildataCloudtraildataserviceState {
 /// Idempotent: an ARN this registry already holds keeps its registration AND its ingest
 /// log, so registering twice never drops events this service accepted.
 ///
+/// What the channel's `externalId` requirement is does NOT come from here: it is stated
+/// by the channel's RESOURCE POLICY, which no create carries (`cloudtrail:CreateChannel`
+/// has no policy member), so the call that attaches, replaces or detaches that policy is
+/// what carries it, through [`set_channel_external_id_requirement`]. A channel this
+/// function has just registered therefore requires none, which is what a channel with no
+/// policy attached requires.
+///
 /// The registry's SIZE is bounded by the control plane that writes it: it mints at most
 /// its own channel quota of channels, each registers once here, and
 /// [`deregister_channel`] releases the registration when the channel is retired — so no
@@ -423,6 +496,44 @@ pub fn register_channel<Eng: Send + Sync + 'static>(
     };
     store.register_channel(channel);
     true
+}
+
+/// Give this service's registration of the channel `arn` the RESOURCE POLICY the control
+/// plane attached to it, so `PutAuditEvents` holds a request's `externalId` to that policy.
+///
+/// `externalId` is "conditionally required when the channel's resource policy includes an
+/// external ID", and a channel's resource-based policy is the CONTROL PLANE's document:
+/// `cloudtrail:PutResourcePolicy` attaches and replaces it and
+/// `cloudtrail:DeleteResourcePolicy` detaches it. Each of those calls is therefore what
+/// carries it here, in the SAME request that writes it — so a caller that just attached a
+/// policy including an external ID must present one on the very next ingest, and one that
+/// just detached it no longer needs to. `policy` is the document now attached, or `None` for
+/// a channel carrying none — the channel that accepts whatever `externalId` a request
+/// carries, including none.
+///
+/// The DOCUMENT is what travels, not a summary of it: what it says about one request is
+/// decided where the request is served ([`Channel::accepts_external_id`]), through the
+/// shared IAM evaluator, so this seam carries no second reading of a policy.
+///
+/// `Some(true)` when this registry held the channel and now carries that policy,
+/// `Some(false)` when it holds no channel under that ARN — a channel this data plane
+/// cannot ingest onto at all, so there is no policy for it to carry — and `None`
+/// when the ARN is not a channel ARN or this store could not be reached.
+///
+/// LOCK ORDER: as [`register_channel`].
+pub fn set_channel_resource_policy<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &str,
+    policy: Option<&str>,
+) -> Option<bool> {
+    let parsed = parse_channel_arn(arn)?;
+    let state = service_state(engine)?;
+    let mut store = state.lock();
+    let Some(channel) = store.channel_mut(&ChannelRef::Arn(parsed)) else {
+        return Some(false);
+    };
+    channel.resource_policy = policy.map(str::to_string);
+    Some(true)
 }
 
 /// Take the channel `arn` back out of this service's registry — the effect

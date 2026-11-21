@@ -9,6 +9,10 @@
 //! policy: the resource survives the detach, so a later put attaches a new one, while
 //! a resource with nothing attached has no policy to delete.
 //!
+//! Detaching a CHANNEL's policy also withdraws the `externalId` that policy required of
+//! a `PutAuditEvents` request in the channel's data plane
+//! (`crate::state::resource_policies::apply_channel_resource_policy_in_data_plane`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -212,6 +216,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
                 .into(),
+            );
+        }
+
+        // A CHANNEL that no longer carries a policy requires no `externalId` of the
+        // `cloudtrail-data:PutAuditEvents` request that ingests onto it: detaching the
+        // policy is what withdraws that requirement in the channel's data plane, the way
+        // attaching one states it. Written with this store's lock RELEASED (see
+        // `resource_policies::apply_channel_resource_policy_in_data_plane`).
+        drop(store);
+        if resource.kind == crate::state::ResourceKind::Channel {
+            crate::state::resource_policies::apply_channel_resource_policy_in_data_plane(
+                &*self.engine,
+                &resource.arn,
+                None,
             );
         }
 
