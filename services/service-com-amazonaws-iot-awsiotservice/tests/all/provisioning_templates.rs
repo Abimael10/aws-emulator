@@ -19,13 +19,22 @@
 //!   another version;
 //! * a body that is not a provisioning template is refused with nothing created, and a
 //!   template or version the account does not hold is `ResourceNotFoundException`
-//!   (404).
+//!   (404);
+//! * `type` names one of the kinds the model's `TemplateType` enum declares, and any
+//!   other value is refused with nothing created;
+//! * the store a caller grows is bounded, and the ceiling never turns a name already
+//!   taken into a limit refusal.
+//!
+//! The tags a template's create carries are the tag plane's business, and are covered with
+//! every other taggable family in `authorizer_registry::resource_tagging`.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_iot_awsiotservice::state::MAX_PROVISIONING_TEMPLATE_VERSIONS;
+use service_com_amazonaws_iot_awsiotservice::state::{
+    MAX_PROVISIONING_TEMPLATES, MAX_PROVISIONING_TEMPLATE_VERSIONS,
+};
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -590,5 +599,182 @@ async fn a_body_that_is_no_template_is_refused_and_the_versions_are_capped() {
         "case a template the account does not hold: expected 404, got {} body {}",
         missing.status,
         missing.text()
+    );
+}
+
+/// A create request for `template_name`, carrying the members every create needs.
+fn create_request(template_name: &str) -> Value {
+    json!({
+        "templateName": template_name,
+        "templateBody": template_body(4),
+        "provisioningRoleArn": PROVISIONING_ROLE,
+    })
+}
+
+/// The values the model's `TemplateType` enum declares
+/// (`smithy_query(query="shape",shape="TemplateType")`).
+///
+/// Written out from the MODEL on purpose, rather than read from the crate's own
+/// `ops::types::TEMPLATE_TYPE_VALUES`: a test that took the implementation's list would
+/// agree with it whatever that list said, and so could not fail. Do not deduplicate the
+/// two — update this one from the model when the model changes.
+const MODELLED_TEMPLATE_TYPES: [&str; 2] = ["FLEET_PROVISIONING", "JITP"];
+
+/// RULE: `type` names one of the kinds of template the model declares; the create stores
+/// the kind it was given and its body as the version in effect, and a value outside the
+/// modelled set is refused with nothing created.
+#[tokio::test]
+async fn the_template_type_is_one_of_the_modelled_values() {
+    let emulator = Emulator::new();
+
+    // Every modelled value — including `JITP`, which this suite's other cases do not
+    // read back through the version reader.
+    for template_type in MODELLED_TEMPLATE_TYPES {
+        let template_name = format!("typed-{}", template_type.to_ascii_lowercase());
+        let body = template_body(5);
+        let created = emulator
+            .create_template(&json!({
+                "templateName": template_name,
+                "templateBody": body,
+                "provisioningRoleArn": PROVISIONING_ROLE,
+                "type": template_type,
+            }))
+            .await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {template_type}: expected 200, got {} body {}",
+            created.status,
+            created.text()
+        );
+
+        let described = emulator.describe_template(&template_name).await.json();
+        assert_eq!(
+            described["type"],
+            json!(template_type),
+            "case {template_type}: the read must report the kind the create was given, got \
+             {described}"
+        );
+        // The body the create carried is version 1 and is the one in effect.
+        let version = emulator.describe_version(&template_name, 1).await;
+        assert_eq!(
+            version.status,
+            200,
+            "case {template_type}: the created body must be readable as version 1, got {} body {}",
+            version.status,
+            version.text()
+        );
+        let read = version.json();
+        assert_eq!(
+            read["templateBody"],
+            json!(body),
+            "case {template_type}: version 1 must carry the body verbatim, got {read}"
+        );
+        assert_eq!(
+            read["isDefaultVersion"],
+            json!(true),
+            "case {template_type}: version 1 is the version in effect, got {read}"
+        );
+    }
+
+    // The rows outside the catalog differ in HOW they miss it: a case variant of a
+    // modelled value, an unknown token, a modelled value with trailing space, and the
+    // empty string.
+    for unknown in ["fleet_provisioning", "JITR", "FLEET_PROVISIONING ", ""] {
+        let template_name = "outside-the-catalog";
+        let refused = emulator
+            .create_template(&json!({
+                "templateName": template_name,
+                "templateBody": template_body(6),
+                "provisioningRoleArn": PROVISIONING_ROLE,
+                "type": unknown,
+            }))
+            .await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case type {unknown:?}: expected 400, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidRequestException",
+            "case type {unknown:?}: got {}",
+            refused.text()
+        );
+        assert_eq!(
+            emulator.describe_template(template_name).await.status,
+            404,
+            "case type {unknown:?}: a refused create must leave no template behind"
+        );
+    }
+}
+
+/// RULE: the store a caller grows is bounded — at the ceiling a create under a fresh
+/// name is refused with the modelled `LimitExceededException` (410) and records nothing,
+/// while a name already taken is still the conflict it is below the ceiling, because
+/// that create would add no record at all.
+#[tokio::test]
+async fn the_provisioning_template_store_is_bounded() {
+    let emulator = Emulator::new();
+    let ceiling = MAX_PROVISIONING_TEMPLATES;
+
+    for index in 0..ceiling {
+        let created = emulator
+            .create_template(&create_request(&format!("bulk-{index}")))
+            .await;
+        assert_eq!(
+            created.status,
+            200,
+            "case template {index} below the ceiling of {ceiling}: expected 200, got {} body {}",
+            created.status,
+            created.text()
+        );
+    }
+
+    let refused = emulator
+        .create_template(&create_request("one-too-many"))
+        .await;
+    assert_eq!(
+        refused.status,
+        410,
+        "case one past the ceiling of {ceiling}: expected 410, got {} body {}",
+        refused.status,
+        refused.text()
+    );
+    assert_eq!(
+        refused.error_code(),
+        "LimitExceededException",
+        "case one past the ceiling of {ceiling}: got {}",
+        refused.text()
+    );
+    let message = refused.error_message();
+    assert!(
+        message.contains(&ceiling.to_string()),
+        "case one past the ceiling: the refusal must name the limit {ceiling}, got {message:?}"
+    );
+    assert_eq!(
+        emulator.describe_template("one-too-many").await.status,
+        404,
+        "case one past the ceiling: a refused create must record nothing"
+    );
+
+    // A name already taken is still a CONFLICT at the ceiling.
+    let conflict = emulator
+        .create_template(&create_request("bulk-0"))
+        .await;
+    assert_eq!(
+        conflict.status,
+        409,
+        "case a taken name at the ceiling: expected 409, got {} body {}",
+        conflict.status,
+        conflict.text()
+    );
+    assert_eq!(
+        conflict.error_code(),
+        "ResourceAlreadyExistsException",
+        "case a taken name at the ceiling: got {}",
+        conflict.text()
     );
 }

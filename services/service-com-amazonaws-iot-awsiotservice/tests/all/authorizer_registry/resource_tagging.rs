@@ -22,7 +22,7 @@
 //! `LimitExceededException` (410) and changes nothing.
 //!
 //! The table spans what that rule generalises over: the resource FAMILY the ARN names
-//! (nine of them, each with its own store, its own identifier form and its own not-found
+//! (ten of them, each with its own store, its own identifier form and its own not-found
 //! sentence), the shape its create takes tags in (a `TagList` whose `Tag$Value` is
 //! optional, the software-package family's `TagMap`, and the raw
 //! `key1=value1&key2=value2` query string `CreateTopicRule` takes), whether a tag carries
@@ -57,6 +57,13 @@ const REGION: &str = "us-east-1";
 const POLICY_DOCUMENT: &str =
     "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
      \"Action\":\"iot:Connect\",\"Resource\":\"*\"}]}";
+
+/// A provisioning template body `CreateProvisioningTemplate` accepts, so the provisioning
+/// template family's row can be created: a JSON document whose `Resources` declare what
+/// provisioning creates.
+const PROVISIONING_TEMPLATE_BODY: &str =
+    "{\"Resources\":{\"thing\":{\"Type\":\"AWS::IoT::Thing\",\
+     \"Properties\":{\"ThingName\":\"device\"}}}}";
 
 /// A SigV4 `Authorization` header whose credential scope names the `iot` signing name and
 /// `REGION`: the scope is how the router picks the claiming service, and how the service
@@ -258,11 +265,11 @@ fn iot_arn(resource: &str) -> String {
 /// The families under test, each with the create that records it, the ARN it is addressed
 /// by, and the not-found sentence its own readers state.
 ///
-/// Nine families, chosen so every tag STORAGE shape this service holds is covered: the
-/// `TagList` families (thing group, thing type, policy, authorizer, command, role alias),
-/// the software-package family's `TagMap` (a package and one of its versions, whose
-/// identity is the pair), and the topic-rule family, whose create carries its tags as the
-/// raw `key1=value1&key2=value2` query string.
+/// Ten families, chosen so every tag STORAGE shape this service holds is covered: the
+/// `TagList` families (thing group, thing type, policy, authorizer, command, role alias,
+/// provisioning template), the software-package family's `TagMap` (a package and one of
+/// its versions, whose identity is the pair), and the topic-rule family, whose create
+/// carries its tags as the raw `key1=value1&key2=value2` query string.
 fn families() -> Vec<Family> {
     vec![
         Family {
@@ -342,6 +349,24 @@ fn families() -> Vec<Family> {
             created: vec![("stage", Some("test"))],
             absent_value: None,
             missing: "Role alias device-credentials not found".to_string(),
+        },
+        Family {
+            label: "provisioning template, whose create stores its first version",
+            setup: vec![Call::new(
+                "POST",
+                "/provisioning-templates".to_string(),
+                Some(json!({
+                    "templateName": "fleet-template",
+                    "templateBody": PROVISIONING_TEMPLATE_BODY,
+                    "provisioningRoleArn":
+                        format!("arn:aws:iam::{ACCOUNT_ID}:role/IoTProvisioningRole"),
+                    "tags": [{ "Key": "stage", "Value": "test" }],
+                })),
+            )],
+            arn: iot_arn("provisioningtemplate/fleet-template"),
+            created: vec![("stage", Some("test"))],
+            absent_value: None,
+            missing: "Unable to find template named fleet-template".to_string(),
         },
         Family {
             label: "software package, whose create takes a TagMap",
