@@ -26,7 +26,7 @@
 use serde_json::{json, Value};
 
 use crate::farm_queue_job::{absent_id, error_code, is_resource_id, string_at, Emulator};
-use crate::fleet::{create_fleet, create_fleet_path, customer_managed, get_fleet_path, ROLE_ARN};
+use crate::fleet::{create_fleet, create_fleet_with_window, get_fleet_path};
 
 /// The worker's own half of the scheduler: `UpdateWorkerSchedule` and the sessions it hands
 /// a worker.
@@ -47,29 +47,16 @@ pub(crate) fn get_worker_path(farm_id: &str, fleet_id: &str, worker_id: &str) ->
 }
 
 /// Create a fleet under `farm_id` whose worker-count window tops out at `max`.
+///
+/// The floor-at-zero case of [`create_fleet_with_window`], which is where the create itself
+/// lives.
 pub(crate) async fn create_fleet_with_max(
     emulator: &Emulator,
     farm_id: &str,
     display_name: &str,
     max: i64,
 ) -> String {
-    let (status, body) = emulator
-        .post(
-            &create_fleet_path(farm_id),
-            json!({
-                "displayName": display_name,
-                "roleArn": ROLE_ARN,
-                "minWorkerCount": 0,
-                "maxWorkerCount": max,
-                "configuration": customer_managed("LINUX", "x86_64", json!({})),
-            }),
-        )
-        .await;
-    assert_eq!(
-        status, 200,
-        "CreateFleet {display_name}: expected 200, got {status} with {body}"
-    );
-    string_at(&body, "fleetId")
+    create_fleet_with_window(emulator, farm_id, display_name, 0, max).await
 }
 
 /// Register a worker with `fleet_id`, carrying `body`, and return the call's result.

@@ -118,6 +118,38 @@ pub(crate) async fn create_fleet(emulator: &Emulator, farm_id: &str, display_nam
     string_at(&body, "fleetId")
 }
 
+/// Create a fleet under `farm_id` whose worker-count window is `min..max`, and return its id.
+///
+/// The ONE create of a fleet with a chosen window in this test target: a suite that stands up
+/// a fleet to move its window, or to fill it with workers, drives the create through here
+/// rather than keeping a copy of the request shape (`create_fleet_with_max` is this with the
+/// floor at zero).
+pub(crate) async fn create_fleet_with_window(
+    emulator: &Emulator,
+    farm_id: &str,
+    display_name: &str,
+    min: i64,
+    max: i64,
+) -> String {
+    let (status, body) = emulator
+        .post(
+            &create_fleet_path(farm_id),
+            json!({
+                "displayName": display_name,
+                "roleArn": ROLE_ARN,
+                "minWorkerCount": min,
+                "maxWorkerCount": max,
+                "configuration": customer_managed("LINUX", "x86_64", json!({})),
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "CreateFleet {display_name}: expected 200, got {status} with {body}"
+    );
+    string_at(&body, "fleetId")
+}
+
 /// The `fleetId`s one `ListFleets` page reports, in the order it reported them, plus the
 /// token the next page starts at.
 pub(crate) fn page_of(body: &Value) -> (Vec<String>, Option<String>) {

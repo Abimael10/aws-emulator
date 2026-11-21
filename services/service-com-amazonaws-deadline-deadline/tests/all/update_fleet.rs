@@ -80,7 +80,15 @@ async fn update_fleet(
 }
 
 /// `GET /2023-10-12/farms/{farmId}/fleets/{fleetId}`, failing the test if it is not served.
-async fn read_fleet(emulator: &Emulator, farm_id: &str, fleet_id: &str, case: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite that reads a fleet back after an update drives it the same
+/// way rather than keeping a second copy of this helper.
+pub(crate) async fn read_fleet(
+    emulator: &Emulator,
+    farm_id: &str,
+    fleet_id: &str,
+    case: &str,
+) -> Value {
     let (status, fleet) = emulator.get(&get_fleet_path(farm_id, fleet_id)).await;
     assert_eq!(
         status, 200,
