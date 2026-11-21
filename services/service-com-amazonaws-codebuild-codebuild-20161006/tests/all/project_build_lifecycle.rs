@@ -49,8 +49,19 @@ pub(crate) fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRo
     router
 }
 
-/// Call one operation and return its HTTP status and decoded body.
+/// Call one operation signed for [`REGION`], and return its HTTP status and decoded body.
 pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+    call_in(router, REGION, operation, body).await
+}
+
+/// As [`call`], signed for `region` — for a suite whose subject is what the Region a request
+/// is signed for decides (an ARN's region field, the ARN a record carries).
+pub(crate) async fn call_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -59,7 +70,7 @@ pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Val
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/20260101/{REGION}/codebuild/\
+                "AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/20260101/{region}/codebuild/\
                  aws4_request, SignedHeaders=host;x-amz-target, Signature=0f0f"
             ),
         )

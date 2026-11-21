@@ -36,7 +36,10 @@ const ANOTHER_ACCOUNT: &str = "210987654321";
 
 /// The `message` an error body carries — the member every error shape this service's own
 /// model declares states its sentence in.
-fn message(body: &Value) -> String {
+///
+/// `pub(crate)` here and on [`project_arn`]: the sibling `crate::list_builds_for_project_refusals`
+/// reads the same two values of a refusal, so the readers are written once.
+pub(crate) fn message(body: &Value) -> String {
     body["message"].as_str().unwrap_or_default().to_string()
 }
 
@@ -52,7 +55,7 @@ fn project_arn_in(partition: &str, region: &str, account: &str, name: &str) -> S
 }
 
 /// A project ARN of this emulator's own account, in `region`.
-fn project_arn(region: &str, name: &str) -> String {
+pub(crate) fn project_arn(region: &str, name: &str) -> String {
     project_arn_in("aws", region, engine::EMULATOR_ACCOUNT_ID, name)
 }
 
