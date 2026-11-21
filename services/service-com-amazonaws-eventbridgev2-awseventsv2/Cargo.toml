@@ -51,6 +51,11 @@ fancy-regex = "0.16"
 # emulator supplies the transport, so the SDK's own HTTPS stack and runtime are
 # left out.
 aws-sdk-sqs = { version = "1", default-features = false }
+# The AWS SDK for Amazon SNS, driven over the same in-process callback: a
+# subscriber whose target is a topic publishes each matching event with
+# `PublishBatch`, the API `SnsParameters` states its values are forwarded to,
+# and a failed delivery is recorded on a topic the same way.
+aws-sdk-sns = { version = "1", default-features = false }
 
 [dev-dependencies]
 # Declares one module per `tests/all/<name>.rs`, so a new suite is picked up by
@@ -64,6 +69,14 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # suite: whether a bus's `KmsKeyIdentifier` names a key that exists is KMS's
 # answer, so the rule can only be asserted with a KMS to ask.
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# Amazon SNS, mounted beside this service in the topic-target suite: a delivery
+# to a topic is asserted where a client sees it, on a queue subscribed to that
+# topic.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# IAM, mounted beside this service in the topic-target suite: what the role a
+# subscriber delivers under may do is IAM's answer, so the rule can only be
+# asserted with an IAM to ask.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # Decodes the rpcv2Cbor error envelope the refusal suite reads a refusal's error
 # code and whole `Message` out of, rather than scanning the body as text.
 aws-smithy-cbor = "0.62.2"
