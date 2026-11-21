@@ -202,6 +202,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // And a permission can only be HELD by a service principal this service grants to —
+        // "at this time, the only valid principal is acm.amazonaws.com"
+        // (`CreatePermissionRequest$Principal`) — so a request naming any other principal is
+        // refused at the front door as well, before the CA is resolved and before anything is
+        // written. The member's modelled constraints admit any text, so the supported set is
+        // this service's own ([`crate::state::SUPPORTED_PERMISSION_PRINCIPALS`]).
+        if !crate::state::grants_to_principal(&input.principal) {
+            return Err(CreatePermissionError::validation(
+                crate::state::UNSUPPORTED_PRINCIPAL_MESSAGE,
+            ));
+        }
+
         let arn = input.certificate_authority_arn;
         if crate::state::parse_certificate_authority_arn(&arn).is_none() {
             return Err(invalid_arn(crate::state::INVALID_ARN_MESSAGE.to_string()));

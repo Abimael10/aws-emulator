@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The action set a grant on a private CA has to name, and what a repeat of a grant does.
+//! The action set a grant on a private CA has to name, WHO it can name, and what a repeat of
+//! a grant does.
 //!
 //! The rules under test:
 //!
 //! 1. `CreatePermission` records a grant only when it names EVERY `ActionType` member; a
 //!    request naming only part of that set is refused with HTTP 400 `ValidationException`
 //!    and the service's fixed sentence, and stores nothing.
-//! 2. `CreatePermission` is idempotent over the (CA, principal, source account) a grant is
+//! 2. `CreatePermission` records a grant only for a service principal this service supports
+//!    — "at this time, the only valid principal is `acm.amazonaws.com`"
+//!    (`CreatePermissionRequest$Principal`) — so a request naming any other `Principal` is
+//!    refused with HTTP 400 `ValidationException` and the service's fixed sentence for it,
+//!    and stores nothing; a request naming a supported one is recorded and listed back.
+//! 3. `CreatePermission` is idempotent over the (CA, principal, source account) a grant is
 //!    keyed by: re-asserting the grant already in effect answers 200 with an empty body and
 //!    leaves the grant exactly as it was, whatever order (and with whatever repeats) the
 //!    request lists the actions in.
-//! 3. `ListPermissions` then reports that grant with every granted action, and derives the
+//! 4. `ListPermissions` then reports that grant with every granted action, and derives the
 //!    policy document's `Action` array from the same set.
 //!
 //! The harness — the router, the signed request and the success/refusal helpers — is the
@@ -22,6 +28,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_acmpca_acmprivateca::ops::types::ACTION_TYPE_VALUES;
 use service_com_amazonaws_acmpca_acmprivateca::state::{
     iam_action, ACTIONS_IN_MODEL_ORDER, INCOMPLETE_PERMISSION_ACTIONS_MESSAGE,
+    SUPPORTED_PERMISSION_PRINCIPALS, UNSUPPORTED_PRINCIPAL_MESSAGE,
 };
 
 use crate::policy_documents::in_reported_order;
@@ -30,6 +37,10 @@ use crate::resource_policy::error_message;
 
 /// The error code a refusal of an incomplete grant carries.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// The sentence Amazon Web Services Private CA refuses a grant to a principal it does not
+/// support with: entirely fixed text, as that service words it.
+const UNSUPPORTED_PRINCIPAL_SENTENCE: &str = "The principal specified is not supported.";
 
 /// One idempotence row: the case, the principal that holds the grant, the account that
 /// assigned it (when the request names one), the actions the grant named and the actions
@@ -141,12 +152,12 @@ async fn a_grant_that_names_less_than_every_action_is_refused_and_stores_nothing
     let arn = certificate_authority(&emulator, "incomplete").await;
 
     // The rows differ along which actions the grant names, how many it names, whether one
-    // is repeated, which principal holds it and whether the request names a source
-    // account: the rule is about the SET of actions and nothing else.
+    // is repeated, and whether the request names a source account: the rule is about the
+    // SET of actions and nothing else.
     let holders: [(&str, Option<&str>); 3] = [
         ("acm.amazonaws.com", None),
         ("acm.amazonaws.com", Some("123456789012")),
-        ("ram.amazonaws.com", Some("210987654321")),
+        ("acm.amazonaws.com", Some("210987654321")),
     ];
 
     for (principal, source_account) in holders {
@@ -219,8 +230,7 @@ async fn re_asserting_the_grant_already_in_effect_is_idempotent() {
     let arn = certificate_authority(&emulator, "idempotent").await;
 
     // The rows differ along the order the request lists the complete set in, whether a
-    // member is repeated inside it, which principal holds the grant and whether the
-    // request names a source account.
+    // member is repeated inside it, and which source account assigned the grant.
     let rows: [RepeatRow; 4] = [
         (
             "the actions in the model's order, no source account",
@@ -254,7 +264,7 @@ async fn re_asserting_the_grant_already_in_effect_is_idempotent() {
         ),
         (
             "the grant was made in reverse order",
-            "ram.amazonaws.com",
+            "acm.amazonaws.com",
             Some("210987654321"),
             &[
                 ACTIONS_IN_MODEL_ORDER[2],
@@ -268,9 +278,9 @@ async fn re_asserting_the_grant_already_in_effect_is_idempotent() {
             ],
         ),
         (
-            "the same principal under another source account",
-            "ram.amazonaws.com",
-            Some("123456789012"),
+            "the same principal under a third source account",
+            "acm.amazonaws.com",
+            Some("999999999999"),
             &[
                 ACTIONS_IN_MODEL_ORDER[1],
                 ACTIONS_IN_MODEL_ORDER[0],
@@ -435,5 +445,271 @@ async fn a_refused_grant_neither_replaces_nor_blocks_the_complete_one() {
         permission["Actions"],
         json!(every_action_in_reported_order()),
         "case \"after\": expected every granted action, got {permission:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 2: WHO a grant can be made to
+// ---------------------------------------------------------------------------
+
+/// The most characters `Principal` carries: `Principal` is len 0..128 with pattern `^[^*]+$`
+/// (`smithy_query(query="operation",operation="CreatePermission")`), so the shortest value the
+/// member admits is one character long, which the table below sits on as `"a"`.
+const PRINCIPAL_MAX_CHARACTERS: usize = 128;
+
+/// The principal a supported grant names: the first of the service's own catalog, read from
+/// it rather than spelled again here.
+fn supported_principal() -> &'static str {
+    SUPPORTED_PERMISSION_PRINCIPALS
+        .first()
+        .copied()
+        .expect("this service supports at least one principal")
+}
+
+/// The principals a grant may NOT name, each with the case that says HOW it misses.
+///
+/// Built AROUND the supported one, so a catalog that grows covers these rows too: every row
+/// is a value the catalog does not hold, which the table below asserts before using it.
+fn unsupported_principals() -> Vec<(String, String)> {
+    let supported = supported_principal();
+    let service = supported
+        .split('.')
+        .next()
+        .expect("a service principal names its service");
+    vec![
+        (
+            "another service's principal".to_string(),
+            "ram.amazonaws.com".to_string(),
+        ),
+        (
+            "the principal of this service itself".to_string(),
+            "acm-pca.amazonaws.com".to_string(),
+        ),
+        (
+            "the supported principal with text ahead of it".to_string(),
+            format!("not-{supported}"),
+        ),
+        (
+            "the supported principal with another domain after it".to_string(),
+            format!("{supported}.cn"),
+        ),
+        (
+            "a prefix of the supported principal".to_string(),
+            supported[..supported.len() - 1].to_string(),
+        ),
+        (
+            "the supported principal in another case".to_string(),
+            supported.to_uppercase(),
+        ),
+        (
+            "the supported principal with a leading space".to_string(),
+            format!(" {supported}"),
+        ),
+        (
+            "the supported principal with a trailing space".to_string(),
+            format!("{supported} "),
+        ),
+        (
+            "the service name without its domain".to_string(),
+            service.to_string(),
+        ),
+        (
+            "an identity ARN rather than a service principal".to_string(),
+            format!("arn:aws:iam::{ACCOUNT}:root"),
+        ),
+        (
+            "a bare account id".to_string(),
+            "123456789012".to_string(),
+        ),
+        (
+            "one character, the shortest value the member admits".to_string(),
+            "a".to_string(),
+        ),
+        (
+            "text at the member's maximum length".to_string(),
+            "p".repeat(PRINCIPAL_MAX_CHARACTERS),
+        ),
+        (
+            "the supported principal padded to the member's maximum".to_string(),
+            format!(
+                "{supported}{}",
+                "x".repeat(PRINCIPAL_MAX_CHARACTERS - supported.len())
+            ),
+        ),
+    ]
+}
+
+/// A grant naming a principal this service does not support is refused with the service's
+/// fixed sentence, and records nothing — however the named principal misses.
+#[tokio::test]
+async fn a_grant_to_an_unsupported_principal_is_refused_and_records_nothing() {
+    let emulator = Emulator::new();
+    let arn = certificate_authority(&emulator, "unsupported-principal").await;
+    let complete: Vec<&str> = ACTIONS_IN_MODEL_ORDER.to_vec();
+
+    // Whether the request names a source account makes no difference to the rule, so every
+    // row is tried both ways.
+    for (case, principal) in unsupported_principals() {
+        for source_account in [None, Some("123456789012")] {
+            let case = format!("{case} / {source_account:?}");
+            assert!(
+                !SUPPORTED_PERMISSION_PRINCIPALS.contains(&principal.as_str()),
+                "case {case:?}: the row must name a principal outside the supported catalog, \
+                 got {principal:?}"
+            );
+            let refusal = emulator
+                .refused(
+                    &case,
+                    "CreatePermission",
+                    &grant(&arn, &principal, source_account, &complete),
+                    VALIDATION_EXCEPTION,
+                )
+                .await;
+            let message = error_message(&refusal, &case);
+            // The sentence as the service words it, pinned here rather than rebuilt from the
+            // constant the handler carries: equality across every row of this table is also
+            // what says the text is FIXED, since a message interpolating anything of the
+            // request could not be the same string for all of them.
+            assert_eq!(
+                message, UNSUPPORTED_PRINCIPAL_SENTENCE,
+                "case {case:?}: expected {UNSUPPORTED_PRINCIPAL_SENTENCE:?}, got {message:?}"
+            );
+            assert_eq!(
+                message, UNSUPPORTED_PRINCIPAL_MESSAGE,
+                "case {case:?}: expected the service's own sentence, got {message:?}"
+            );
+
+            // The refusal is before any write: the CA holds no grant at all.
+            let permissions = all_permissions(&emulator, &case, &arn).await;
+            assert!(
+                permissions.is_empty(),
+                "case {case:?}: a refused grant must record nothing, got {permissions:?}"
+            );
+        }
+    }
+}
+
+/// Every principal the service DOES support is granted to, read back, and revoked — whichever
+/// account assigns the grant. The grant a refused row never made is the only thing a CA of
+/// this service ends up without.
+#[tokio::test]
+async fn a_grant_to_a_supported_principal_is_recorded_and_listed_back() {
+    let emulator = Emulator::new();
+    let arn = certificate_authority(&emulator, "supported-principal").await;
+    let complete: Vec<&str> = ACTIONS_IN_MODEL_ORDER.to_vec();
+
+    // The catalog is the service's own, so a principal added to it is covered here without
+    // this being edited. The rows differ along which account assigns the grant, including a
+    // request that names none.
+    let accounts: [Option<&str>; 3] = [None, Some("123456789012"), Some("210987654321")];
+    let mut recorded = 0usize;
+    for principal in SUPPORTED_PERMISSION_PRINCIPALS {
+        for source_account in accounts {
+            let case = format!("{principal} / {source_account:?}");
+            let answer = emulator
+                .ok(
+                    &case,
+                    "CreatePermission",
+                    &grant(&arn, principal, source_account, &complete),
+                )
+                .await;
+            assert!(
+                answer.as_object().is_none_or(|members| members.is_empty()),
+                "case {case:?}: CreatePermission models no output members, got {answer:?}"
+            );
+            recorded += 1;
+
+            let account = source_account.unwrap_or(ACCOUNT);
+            let permissions = all_permissions(&emulator, &case, &arn).await;
+            assert_eq!(
+                permissions.len(),
+                recorded,
+                "case {case:?}: expected one permission per grant, got {permissions:?}"
+            );
+            let permission = reported(&permissions, principal, account).unwrap_or_else(|| {
+                panic!("case {case:?}: no grant for {principal} / {account} in {permissions:?}")
+            });
+            assert_eq!(
+                permission["Actions"],
+                json!(every_action_in_reported_order()),
+                "case {case:?}: expected every granted action, got {permission:?}"
+            );
+            assert_eq!(
+                permission["CertificateAuthorityArn"],
+                json!(arn),
+                "case {case:?}: expected the grant to name the CA it was made on, \
+                 got {permission:?}"
+            );
+        }
+    }
+
+    // And each one is revocable, which is the other half of a grant that was really recorded.
+    for principal in SUPPORTED_PERMISSION_PRINCIPALS {
+        for source_account in accounts {
+            let case = format!("revoke {principal} / {source_account:?}");
+            let mut body = json!({
+                "CertificateAuthorityArn": arn,
+                "Principal": principal,
+            });
+            if let Some(account) = source_account {
+                body["SourceAccount"] = json!(account);
+            }
+            emulator.ok(&case, "DeletePermission", &body).await;
+        }
+    }
+    let permissions = all_permissions(&emulator, "all revoked", &arn).await;
+    assert!(
+        permissions.is_empty(),
+        "case \"all revoked\": every grant was revoked, got {permissions:?}"
+    );
+}
+
+/// A grant refused for its principal blocks nothing: the supported grant made afterwards is
+/// recorded, and a refusal after it leaves that grant exactly as it was.
+#[tokio::test]
+async fn a_refused_principal_neither_replaces_nor_blocks_a_supported_grant() {
+    let emulator = Emulator::new();
+    let arn = certificate_authority(&emulator, "principal-refused-then-granted").await;
+    let supported = supported_principal();
+    let complete: Vec<&str> = ACTIONS_IN_MODEL_ORDER.to_vec();
+    let (_, unsupported) = unsupported_principals()
+        .into_iter()
+        .next()
+        .expect("the table names at least one unsupported principal");
+
+    emulator
+        .refused(
+            "unsupported first",
+            "CreatePermission",
+            &grant(&arn, &unsupported, None, &complete),
+            VALIDATION_EXCEPTION,
+        )
+        .await;
+    emulator
+        .ok(
+            "supported after the refusal",
+            "CreatePermission",
+            &grant(&arn, supported, None, &complete),
+        )
+        .await;
+    let before = all_permissions(&emulator, "before", &arn).await;
+    assert_eq!(
+        before.len(),
+        1,
+        "case \"before\": expected the one supported grant, got {before:?}"
+    );
+
+    emulator
+        .refused(
+            "unsupported after the grant",
+            "CreatePermission",
+            &grant(&arn, &unsupported, None, &complete),
+            VALIDATION_EXCEPTION,
+        )
+        .await;
+    let after = all_permissions(&emulator, "after", &arn).await;
+    assert_eq!(
+        after, before,
+        "case \"unsupported after the grant\": the grant in effect must stand, got {after:?}"
     );
 }

@@ -16,6 +16,19 @@ use super::*;
 /// Each entry also carries the SHAPE that service's SDK words the diagnostic in
 /// ([`SdkDiagnostic`]), which is the SDK's and cannot be derived from the service.
 pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
+    // Amazon Web Services Private CA's SDK names it `AWSACMPCA` — the name that service's own
+    // SDK client carries, which is neither its signing name (`acm-pca`) nor its `sdkId` (`ACM
+    // PCA`, `smithy_query(query="service_info")` on that service's model). The shape is the
+    // PROXIED one, naming the error code and closing with the proxy the call was made through,
+    // as the recorded `ResourceStatusReason` of an `AWS::ACMPCA::Permission` whose declared
+    // principal that service does not grant to carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check
+    // `acm-pca__cloudformation.deploy-cfn-acmpca-permission-invalid-principal-rejected`, whose
+    // reason quotes `<the service's sentence> (Service: AWSACMPCA; Status Code: 400; Error
+    // Code: ValidationException; Request ID: …; Proxy: null)`). The four resource types this
+    // emulator provisions over this signing name are all that service's
+    // ([`crate::state::provisioner::create_ca_permission`] and the arms beside it).
+    ("acm-pca", "AWSACMPCA", SdkDiagnostic::Proxied),
     // Amazon API Gateway's SDK names it `ApiGateway` — that model's own
     // `awsService.cloudFormationName`, which is also the name its SDK client carries
     // (`smithy_query(query="service_info")` on that service's model: `sdkId: "API Gateway"`,

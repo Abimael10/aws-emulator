@@ -2939,6 +2939,17 @@ impl Provisioner {
         if matches!(self, Self::CodePipelinePipeline) && code == CODEPIPELINE_INVALID_STRUCTURE {
             return super::provisioning::HANDLER_ERROR_SERVICE_FAILED;
         }
+        // The `AWS::ACMPCA::Permission` provider maps none of Amazon Web Services Private CA's
+        // validation refusals either — a grant naming a principal that service does not grant
+        // to is one — so the plugin reports it under the same class for a service that failed.
+        // Recorded behaviour, read from the reason of the failed resource of a stack declaring
+        // such a grant (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+        // `acm-pca__cloudformation.deploy-cfn-acmpca-permission-invalid-principal-rejected`,
+        // whose reason closes `HandlerErrorCode: GeneralServiceException`), and decided — as
+        // everywhere here — by the CODE that service answered rather than by its message.
+        if matches!(self, Self::AcmPcaPermission) && code == ACMPCA_VALIDATION_EXCEPTION {
+            return super::provisioning::HANDLER_ERROR_SERVICE_FAILED;
+        }
         let references_another_resource = match self {
             // A record set is written INSIDE a hosted zone its declaration names
             // (`HostedZoneId`/`HostedZoneName`), and the record set itself is the resource

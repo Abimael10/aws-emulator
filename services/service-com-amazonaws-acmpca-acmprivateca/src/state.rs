@@ -668,6 +668,35 @@ pub fn grants_every_action(actions: &[String]) -> bool {
         .all(|action| granted.contains(action))
 }
 
+/// Every Amazon Web Services service principal a permission on a private CA can be granted
+/// to: "At this time, the only valid principal is `acm.amazonaws.com`"
+/// (`CreatePermissionRequest$Principal` docs, which `DeletePermissionRequest$Principal`
+/// repeats for the revocation of one). The CATALOG, so a principal this service starts
+/// supporting is added here rather than wherever a grant is judged.
+///
+/// A permission exists so that Certificate Manager can renew the private certificates a CA
+/// issued, which is why that one service principal is what a grant can name: the model
+/// constrains only the SHAPE of the member (`Principal`, len 0..128, pattern `^[^*]+$`), so
+/// the supported-principal rule is this service's own.
+pub const SUPPORTED_PERMISSION_PRINCIPALS: &[&str] = &["acm.amazonaws.com"];
+
+/// Whether a permission on a private CA can be granted to `principal`, which is whether it is
+/// one of the principals this service supports ([`SUPPORTED_PERMISSION_PRINCIPALS`]).
+///
+/// Compared VERBATIM: a service principal is one exact name, so text that merely contains or
+/// extends a supported one — another domain, another case, surrounding space — names a
+/// different principal, and that one is not supported.
+pub fn grants_to_principal(principal: &str) -> bool {
+    SUPPORTED_PERMISSION_PRINCIPALS.contains(&principal)
+}
+
+/// What Amazon Web Services Private CA answers a grant naming a principal it does not support
+/// ([`grants_to_principal`]).
+///
+/// Entirely fixed text, naming nothing of the request: a refused principal is never echoed
+/// back.
+pub const UNSUPPORTED_PRINCIPAL_MESSAGE: &str = "The principal specified is not supported.";
+
 /// The `ActionType` members a grant names, in the order a `Permission` REPORTS them:
 /// sorted, which is independent of the order `CreatePermission` received them.
 ///

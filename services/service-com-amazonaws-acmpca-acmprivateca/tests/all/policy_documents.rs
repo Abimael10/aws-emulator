@@ -38,6 +38,10 @@ use crate::private_ca_lifecycle::{
 /// (`ActionList`, len 1..3).
 const ACTIONS: [&str; 3] = ["IssueCertificate", "GetCertificate", "ListPermissions"];
 
+/// The one service principal a permission can be granted to: "at this time, the only valid
+/// principal is acm.amazonaws.com" (`CreatePermissionRequest$Principal`).
+const PRINCIPAL: &str = "acm.amazonaws.com";
+
 /// This service's action namespace, from `smithy_query(query="service_info")`:
 /// `awsService.arnNamespace` is `acm-pca`, which is the prefix an IAM action of this
 /// service carries.
@@ -168,56 +172,57 @@ async fn a_listed_permission_reports_the_policy_its_grant_expresses() {
     let other_arn = certificate_authority(&emulator, "policy-grants-other").await;
 
     // The rows differ along what the rule generalises over: the order a grant lists the
-    // actions in, which principal holds it, which account assigned it and which CA it was
-    // made on. Every grant names every action, which is what `CreatePermission` records
-    // ([`permission_action_set`] covers the refusal of a grant that does not).
+    // actions in, which account assigned it and which CA it was made on. Every grant names
+    // every action, which is what `CreatePermission` records ([`permission_action_set`]
+    // covers the refusal of a grant that does not), and every grant is held by the one
+    // principal this service grants to.
     let rows: [GrantRow; 7] = [
         (
             "every action, in the order the model declares them",
             &arn,
-            "acm.amazonaws.com",
+            PRINCIPAL,
             None,
             &ACTIONS,
         ),
         (
             "every action, reversed",
             &arn,
-            "ram.amazonaws.com",
+            PRINCIPAL,
             Some("123456789012"),
             &[ACTIONS[2], ACTIONS[1], ACTIONS[0]],
         ),
         (
             "every action, already in reported order",
             &arn,
-            "acm.amazonaws.com",
+            PRINCIPAL,
             Some("210987654321"),
             &[ACTIONS[1], ACTIONS[0], ACTIONS[2]],
         ),
         (
-            "every action, another holder of the same CA",
+            "every action, a fourth account on the same CA",
             &arn,
-            "acm-pca.amazonaws.com",
-            Some("123456789012"),
+            PRINCIPAL,
+            Some("111111111111"),
             &[ACTIONS[2], ACTIONS[0], ACTIONS[1]],
         ),
         (
-            "every action, a holder with no source account",
+            "every action, a fifth account on the same CA",
             &arn,
-            "s3.amazonaws.com",
-            None,
+            PRINCIPAL,
+            Some("222222222222"),
             &[ACTIONS[1], ACTIONS[2], ACTIONS[0]],
         ),
         (
-            "every action, the same holder under a third account",
+            "every action, the same holder under a sixth account",
             &arn,
-            "acm.amazonaws.com",
+            PRINCIPAL,
             Some("999999999999"),
             &[ACTIONS[2], ACTIONS[1], ACTIONS[0]],
         ),
         (
             "a grant on another CA",
             &other_arn,
-            "acm.amazonaws.com",
+            PRINCIPAL,
             None,
             &ACTIONS,
         ),
@@ -330,14 +335,14 @@ async fn the_reported_policy_follows_the_grant_it_belongs_to() {
     let emulator = Emulator::new();
     let arn = certificate_authority(&emulator, "policy-follows").await;
 
-    // Each grant names every action — what differs is the holder and the account that
-    // assigned it, which is what the document a grant expresses is read off.
+    // Each grant names every action — what differs is the account that assigned it, which is
+    // what the document a grant expresses is read off beside the holder.
     let holders: [(&str, &str, &[&str]); 3] = [
-        ("acm.amazonaws.com", "123456789012", &ACTIONS),
-        ("ram.amazonaws.com", "210987654321", &ACTIONS),
+        (PRINCIPAL, "123456789012", &ACTIONS),
+        (PRINCIPAL, "210987654321", &ACTIONS),
         (
-            "acm.amazonaws.com",
-            "210987654321",
+            PRINCIPAL,
+            "999999999999",
             &[ACTIONS[1], ACTIONS[2], ACTIONS[0]],
         ),
     ];
@@ -374,8 +379,9 @@ async fn the_reported_policy_follows_the_grant_it_belongs_to() {
         }
     }
 
-    // Revoked, and the account's grant given to another holder: the reported document is
-    // the one the CURRENT grant expresses, and the revoked grant's is reported by nobody.
+    // Revoked, and the same holder granted from another account instead: the reported
+    // document is the one the CURRENT grant expresses, and the revoked grant's is reported by
+    // nobody.
     let (principal, account, _) = holders[1];
     emulator
         .ok(
@@ -388,12 +394,12 @@ async fn the_reported_policy_follows_the_grant_it_belongs_to() {
             }),
         )
         .await;
-    let new_holder = "sns.amazonaws.com";
+    let new_account = "333333333333";
     emulator
         .ok(
             "granted again",
             "CreatePermission",
-            &grant(&arn, new_holder, Some(account), &ACTIONS),
+            &grant(&arn, principal, Some(new_account), &ACTIONS),
         )
         .await;
     let permissions = all_permissions(&emulator, "granted again", &arn).await;
@@ -401,7 +407,7 @@ async fn the_reported_policy_follows_the_grant_it_belongs_to() {
         reported(&permissions, principal, account).is_none(),
         "case \"granted again\": the revoked grant must be gone, got {permissions:?}"
     );
-    let policy = reported(&permissions, new_holder, account)
+    let policy = reported(&permissions, principal, new_account)
         .and_then(|permission| permission.get("Policy"))
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("case \"granted again\": no Policy in {permissions:?}"))
@@ -418,8 +424,14 @@ async fn the_reported_policy_follows_the_grant_it_belongs_to() {
     );
     assert_eq!(
         document["Statement"][0]["Principal"],
-        json!({"Service": new_holder}),
-        "case \"granted again\": expected the new holder as the principal, got {document:?}"
+        json!({"Service": principal}),
+        "case \"granted again\": expected the holder as the principal, got {document:?}"
+    );
+    assert_eq!(
+        document["Statement"][0]["Condition"],
+        json!({"StringEquals": {"aws:SourceAccount": new_account}}),
+        "case \"granted again\": expected the new assigning account as the condition, \
+         got {document:?}"
     );
     assert_ne!(
         policy, documents[1],

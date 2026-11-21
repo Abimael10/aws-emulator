@@ -388,6 +388,13 @@ pub(crate) const ACMPCA_PERMISSION_IDENTITY_MEMBERS: &[(&str, &str)] = &[
 pub(crate) const ACMPCA_PERMISSION_GRANT_MEMBERS: &[(&str, &str)] =
     &[("Actions", "Actions"), ("SourceAccount", "SourceAccount")];
 
+/// The error CODE Amazon Web Services Private CA refuses a request it will not act on with,
+/// which is what it answers a grant naming a principal it does not grant to.
+///
+/// Read by [`crate::state::provisioner::Provisioner::handler_error_class`], where the class
+/// the `AWS::ACMPCA::Permission` provider reports such a refusal under is recorded.
+pub(crate) const ACMPCA_VALIDATION_EXCEPTION: &str = "ValidationException";
+
 /// Grant the permission an `AWS::ACMPCA::Permission` declares, so a client that deployed the
 /// stack reads it back from `ListPermissions` on the CA — and can revoke it — rather than
 /// finding a CA that holds nothing.

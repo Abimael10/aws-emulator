@@ -33,6 +33,11 @@ fn ceil_to_millisecond(seconds: f64) -> f64 {
 /// `permission_action_set`.
 const ACTIONS: [&str; 3] = ["IssueCertificate", "GetCertificate", "ListPermissions"];
 
+/// The one service principal a permission can be granted to: "at this time, the only valid
+/// principal is acm.amazonaws.com" (`CreatePermissionRequest$Principal`). The refusal of a
+/// grant naming any other principal is covered by `permission_action_set`.
+const PRINCIPAL: &str = "acm.amazonaws.com";
+
 /// Create a private CA and return its ARN.
 async fn certificate_authority(emulator: &Emulator, case: &str) -> String {
     let created = emulator
@@ -112,31 +117,32 @@ async fn a_granted_permission_is_listed_back_as_it_was_granted() {
     let other_arn = certificate_authority(&emulator, "granted-other").await;
 
     // The rows differ along what the rule generalises over: the order a grant lists the
-    // actions in, whether the request names a source account, and which (principal,
-    // source account) pair identifies the grant.
+    // actions in, whether the request names a source account, and which source account the
+    // grant is identified by beside the principal — the one principal this service grants a
+    // permission to, which every grant it records is held by.
     let rows: [(&str, &str, Option<&str>, &[&str]); 4] = [
         (
             "the model's order, no source account",
-            "acm.amazonaws.com",
+            PRINCIPAL,
             None,
             &ACTIONS,
         ),
         (
             "another order, an explicit source account",
-            "acm.amazonaws.com",
+            PRINCIPAL,
             Some("123456789012"),
             &[ACTIONS[1], ACTIONS[2], ACTIONS[0]],
         ),
         (
             "every action, in the order the request named them",
-            "ram.amazonaws.com",
+            PRINCIPAL,
             Some("210987654321"),
             &[ACTIONS[2], ACTIONS[0], ACTIONS[1]],
         ),
         (
-            "the same principal under another source account",
-            "ram.amazonaws.com",
-            Some("123456789012"),
+            "the same holder under a third source account",
+            PRINCIPAL,
+            Some("999999999999"),
             &[ACTIONS[2], ACTIONS[1], ACTIONS[0]],
         ),
     ];
@@ -259,7 +265,7 @@ async fn a_grant_is_accepted_before_and_after_creation_settles() {
         .ok(
             "while creating",
             "CreatePermission",
-            &grant(&arn, "acm.amazonaws.com", None, &ACTIONS),
+            &grant(&arn, PRINCIPAL, None, &ACTIONS),
         )
         .await;
 
@@ -268,7 +274,7 @@ async fn a_grant_is_accepted_before_and_after_creation_settles() {
         .ok(
             "after settling",
             "CreatePermission",
-            &grant(&arn, "ram.amazonaws.com", None, &ACTIONS),
+            &grant(&arn, PRINCIPAL, Some("210987654321"), &ACTIONS),
         )
         .await;
 
@@ -298,27 +304,27 @@ async fn a_repeated_grant_succeeds_and_changes_nothing() {
     let emulator = Emulator::new();
     let arn = certificate_authority(&emulator, "repeated").await;
 
-    // The rows differ along whether the request names a source account, which (principal,
-    // source account) pair identifies the grant, and the order the repeat lists the
+    // The rows differ along whether the request names a source account, which source account
+    // the grant is identified by beside the principal, and the order the repeat lists the
     // actions in — the grant is the SET of actions, so a reordered repeat is the same ask.
     let rows: [RepeatRow; 3] = [
         (
             "no source account",
-            "acm.amazonaws.com",
+            PRINCIPAL,
             None,
             &ACTIONS,
             &ACTIONS,
         ),
         (
             "an explicit source account, the repeat reordered",
-            "acm.amazonaws.com",
+            PRINCIPAL,
             Some("123456789012"),
             &ACTIONS,
             &[ACTIONS[2], ACTIONS[1], ACTIONS[0]],
         ),
         (
-            "another principal",
-            "ram.amazonaws.com",
+            "another source account",
+            PRINCIPAL,
             Some("210987654321"),
             &[ACTIONS[1], ACTIONS[0], ACTIONS[2]],
             &ACTIONS,
@@ -373,7 +379,8 @@ async fn permissions_are_paged_and_resumed_in_one_order() {
     let arn = certificate_authority(&emulator, "paged").await;
 
     // Seven grants, so no published page-size bound divides the count evenly. Each names
-    // every action, which is what a grant records; what identifies them is the principal.
+    // every action, which is what a grant records, and each is held by the one principal this
+    // service grants to; what tells them apart is the account that assigned them.
     let granted = 7usize;
     for index in 0..granted {
         emulator
@@ -382,8 +389,8 @@ async fn permissions_are_paged_and_resumed_in_one_order() {
                 "CreatePermission",
                 &grant(
                     &arn,
-                    &format!("principal-{index}.amazonaws.com"),
-                    None,
+                    PRINCIPAL,
+                    Some(&format!("{:012}", index + 1)),
                     &ACTIONS,
                 ),
             )
@@ -410,7 +417,7 @@ async fn permissions_are_paged_and_resumed_in_one_order() {
                 items.len()
             );
             for item in &items {
-                seen.push(string(item, "Principal", &case));
+                seen.push(string(item, "SourceAccount", &case));
             }
             token = page
                 .get("NextToken")
@@ -577,38 +584,35 @@ fn revoke(arn: &str, principal: &str, source_account: Option<&str>) -> Value {
 async fn a_revocation_removes_exactly_the_grant_it_names() {
     let emulator = Emulator::new();
     let arn = certificate_authority(&emulator, "revoked").await;
-    let long_principal = "p".repeat(128);
 
-    // The rows differ along what the rule generalises over: the order the grant listed
-    // the actions in, whether the request names a source account, and which (principal,
-    // source account) pair identifies it — including one principal held under two
-    // accounts, so a revocation that ignored the account would take the wrong grant.
-    // `Principal` is len 0..128
-    // (`smithy_query(query="operation",operation="DeletePermission")`), so the last row
-    // sits on that upper bound.
+    // The rows differ along what the rule generalises over: the order the grant listed the
+    // actions in, whether the request names a source account, and which source account
+    // identifies it beside the principal — the one principal this service grants to, held
+    // under four accounts, so a revocation that ignored the account would take the wrong
+    // grant.
     let rows: Vec<(&str, &str, Option<&str>, Vec<&str>)> = vec![
         (
             "the model's order, no source account",
-            "acm.amazonaws.com",
+            PRINCIPAL,
             None,
             ACTIONS.to_vec(),
         ),
         (
             "the same principal, an explicit source account",
-            "acm.amazonaws.com",
+            PRINCIPAL,
             Some("123456789012"),
             vec![ACTIONS[1], ACTIONS[0], ACTIONS[2]],
         ),
         (
-            "another principal, the actions reversed",
-            "ram.amazonaws.com",
+            "another source account, the actions reversed",
+            PRINCIPAL,
             Some("210987654321"),
             vec![ACTIONS[2], ACTIONS[1], ACTIONS[0]],
         ),
         (
-            "a principal at the modelled length bound",
-            long_principal.as_str(),
-            None,
+            "a third source account",
+            PRINCIPAL,
+            Some("999999999999"),
             ACTIONS.to_vec(),
         ),
     ];

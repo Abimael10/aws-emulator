@@ -376,31 +376,36 @@ async fn a_stack_deploys_a_private_ca_beside_a_permission_over_it() {
 
     // `AWS::ACMPCA::Permission`'s own published properties: the CA the permission is over,
     // the service principal it is granted to and the actions it covers (the resource
-    // reference's AWS::ACMPCA::Permission page).
-    let permission = |principal: &str| {
+    // reference's AWS::ACMPCA::Permission page). The holder is the one principal that service
+    // grants a permission to (`CreatePermissionRequest$Principal`), so what a second grant of
+    // one stack differs in is the CA it is made over.
+    let permission = |certificate_authority: &str, principal: &str| {
         json!({
             "Type": "AWS::ACMPCA::Permission",
             "Properties": {
-                "CertificateAuthorityArn": { "Ref": "Ca" },
+                "CertificateAuthorityArn": { "Ref": certificate_authority },
                 "Principal": principal,
                 "Actions": ["IssueCertificate", "GetCertificate", "ListPermissions"]
             }
         })
     };
-    let certificate_authority = json!({
-        "Type": "AWS::ACMPCA::CertificateAuthority",
-        "Properties": {
-            "Type": "ROOT",
-            "KeyAlgorithm": "RSA_2048",
-            "SigningAlgorithm": "SHA256WITHRSA",
-            "Subject": { "CommonName": "root.example-widgets.internal" }
-        }
-    });
+    let root_authority = |common_name: &str| {
+        json!({
+            "Type": "AWS::ACMPCA::CertificateAuthority",
+            "Properties": {
+                "Type": "ROOT",
+                "KeyAlgorithm": "RSA_2048",
+                "SigningAlgorithm": "SHA256WITHRSA",
+                "Subject": { "CommonName": common_name }
+            }
+        })
+    };
+    let certificate_authority = root_authority("root.example-widgets.internal");
     let mut resources = Map::new();
     resources.insert("Ca".to_string(), certificate_authority.clone());
     resources.insert(
         "AcmPermission".to_string(),
-        permission("acm.amazonaws.com"),
+        permission("Ca", "acm.amazonaws.com"),
     );
     let template = json!({ "Resources": Value::Object(resources) }).to_string();
 
@@ -481,16 +486,23 @@ async fn a_stack_deploys_a_private_ca_beside_a_permission_over_it() {
     );
 
     // `UpdateStack` is held to the same catalogue: a body declaring one more resource of a
-    // published type of this namespace is admitted and deployed.
+    // published type of this namespace is admitted and deployed. The added grant is made over
+    // a second CA the same update declares, because a grant is addressed by the
+    // CA-and-principal pair and the one principal that service grants to already holds one on
+    // the first CA.
     let mut updated = Map::new();
     updated.insert("Ca".to_string(), certificate_authority);
     updated.insert(
         "AcmPermission".to_string(),
-        permission("acm.amazonaws.com"),
+        permission("Ca", "acm.amazonaws.com"),
+    );
+    updated.insert(
+        "SecondCa".to_string(),
+        root_authority("second.example-widgets.internal"),
     );
     updated.insert(
         "SecondPermission".to_string(),
-        permission("ecs.amazonaws.com"),
+        permission("SecondCa", "acm.amazonaws.com"),
     );
     let updated = json!({ "Resources": Value::Object(updated) }).to_string();
     let (status, answer) = cloudformation(
