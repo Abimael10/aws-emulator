@@ -34,19 +34,31 @@ use crate::inference_deployment_lifecycle::{
 };
 use crate::model_card_governance::{content_with_description, create_body as model_card_body};
 
+/// The `ValidationException` envelope around every clause a value failed, as the service
+/// words it: one clause per constraint the value is outside of, counted in the opening
+/// sentence. Shared with the suites that assert a refusal's wording.
+pub(crate) fn violations(clauses: &[String]) -> String {
+    let noun = if clauses.len() == 1 { "error" } else { "errors" };
+    format!(
+        "{} validation {noun} detected: {}",
+        clauses.len(),
+        clauses.join("; ")
+    )
+}
+
 /// The `ValidationException` envelope around exactly one clause, as the framework writes
 /// it.
 fn one_violation(clause: &str) -> String {
-    format!("1 validation error detected: {clause}")
+    violations(&[clause.to_string()])
 }
 
 /// One constraint clause: the value echoed, the member path, and the requirement.
-fn clause(value: &str, path: &str, requirement: &str) -> String {
+pub(crate) fn clause(value: &str, path: &str, requirement: &str) -> String {
     format!("Value '{value}' at '{path}' failed to satisfy constraint: {requirement}")
 }
 
 /// The requirement a `@pattern` violation states, for the expression the service reports.
-fn pattern_requirement(reported: &str) -> String {
+pub(crate) fn pattern_requirement(reported: &str) -> String {
     format!("Member must satisfy regular expression pattern: {reported}")
 }
 
