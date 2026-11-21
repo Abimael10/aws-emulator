@@ -30,10 +30,10 @@ use crate::vault_and_backup_job::{
 
 /// The sentence this service states for "the ARN a tagging call carries names
 /// no resource of this account" — fixed text.
-const NOT_FOUND: &str = "Cannot find resource";
+pub(crate) const NOT_FOUND: &str = "Cannot find resource";
 
 /// `POST /tags/{ResourceArn}`, as the model binds the write.
-async fn tag_resource(
+pub(crate) async fn tag_resource(
     router: &MultiServiceRouter,
     resource_arn: &str,
     tags: Value,
@@ -48,7 +48,7 @@ async fn tag_resource(
 }
 
 /// `GET /tags/{ResourceArn}{query}`, as the model binds the read.
-async fn list_tags(router: &MultiServiceRouter, resource_arn: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, resource_arn: &str, query: &str) -> (u16, Value) {
     call(
         router,
         "GET",
