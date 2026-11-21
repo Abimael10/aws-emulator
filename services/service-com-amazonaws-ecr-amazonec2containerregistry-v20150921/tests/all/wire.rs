@@ -64,8 +64,9 @@ pub const REGISTRY_ID: &str = "000000000000";
 ///
 /// It is the host every repository of that registry is addressed under ON AWS, so it is the
 /// spelling a client's own reference may be written in, which a pull reads back — and never
-/// the authority this registry PUBLISHES for a repository ([`published_repository_uri`]),
-/// because no listener of this emulator answers for a name AWS serves.
+/// the authority this registry PUBLISHES for a repository, which carries the same layout over
+/// the zone this emulator answers in ([`published_registry_authority`]), because no listener
+/// of this emulator answers for a name AWS serves.
 pub fn registry_host_in(region: &str) -> String {
     let suffix = match region {
         region if region.starts_with("cn-") => "amazonaws.com.cn",
@@ -79,17 +80,40 @@ pub fn registry_host_in(region: &str) -> String {
     format!("{REGISTRY_ID}.dkr.ecr.{region}.{suffix}")
 }
 
-/// The URI Amazon ECR reports for the repository `name` to a call made through this harness
-/// (`Repository$repositoryUri`: "The URI for the repository. You can use this URI for
-/// container image `push` and `pull` operations"): the endpoint this emulator answers the
-/// caller's registry requests at ([`ANNOUNCED_REGISTRY_ENDPOINT`]) followed by the
-/// repository's name as the path.
+/// The DNS zone a name this registry ANNOUNCES is served in to a call made through this
+/// harness: the zone of the address this emulator is served at ([`SERVED_URL_BASE`]), which is
+/// an IP address and therefore names the loopback zone RFC 6761 reserves for that interface.
+/// Spelled out here rather than imported so a wrong zone in the implementation fails these
+/// tests.
+pub const ANNOUNCED_REGISTRY_ZONE: &str = "localhost";
+
+/// The authority Amazon ECR publishes for this account's registry in `region` to a call made
+/// through this harness: the registry host layout AWS publishes
+/// (`<registryId>.dkr.ecr.<region>.<zone>`, `AuthorizationData$proxyEndpoint`: "The Amazon ECR
+/// registry URL format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`") over the
+/// zone this emulator answers in ([`ANNOUNCED_REGISTRY_ZONE`]), carrying the port this
+/// emulator is reached on ([`ANNOUNCED_REGISTRY_ENDPOINT`]).
 ///
-/// The value is an ADDRESS a container client dials, so it is published on an endpoint this
-/// emulator answers on; which registry holds the repository is reported beside it, in
-/// `registryId` and the ARN, so the Region the call was signed for does not move it.
-pub fn published_repository_uri(name: &str) -> String {
-    format!("{ANNOUNCED_REGISTRY_ENDPOINT}/{name}")
+/// Spelled out here rather than imported so a wrong composition in the implementation fails
+/// these tests.
+pub fn published_registry_authority(region: &str) -> String {
+    let port = ANNOUNCED_REGISTRY_ENDPOINT
+        .rsplit_once(':')
+        .map_or("", |(_host, port)| port);
+    format!("{REGISTRY_ID}.dkr.ecr.{region}.{ANNOUNCED_REGISTRY_ZONE}:{port}")
+}
+
+/// The URI Amazon ECR reports for the repository `name` of the registry in `region` to a call
+/// made through this harness (`Repository$repositoryUri`: "The URI for the repository. You can
+/// use this URI for container image `push` and `pull` operations"): the authority that registry
+/// is published at ([`published_registry_authority`]) followed by the repository's name as the
+/// path.
+///
+/// The value is read BOTH ways — a client parses the authority for the account and the Region
+/// that hold the repository, and dials it to move image bytes — so the authority carries the
+/// registry host layout over a zone and port this emulator answers at.
+pub fn published_repository_uri(region: &str, name: &str) -> String {
+    format!("{}/{name}", published_registry_authority(region))
 }
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").

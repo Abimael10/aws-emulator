@@ -3,9 +3,8 @@
 //! The registry address this service reports for a repository and for a `docker login`,
 //! driven end to end over the wire.
 //!
-//! Both values are addresses a container client DIALS, so both are published on an endpoint
-//! THIS emulator answers registry requests on, and the endpoint the call arrived on decides
-//! each of them:
+//! Both values are addresses a container client reaches this registry by, and the endpoint
+//! the call arrived on decides each of them:
 //!
 //! * `AuthorizationData$proxyEndpoint` ("The registry URL to use for this authorization
 //!   token in a `docker login` command") is a URL a client DIALS as it is handed over, so it
@@ -16,12 +15,13 @@
 //!   nowhere either; the endpoint the caller is already talking to is the one address it can
 //!   reach. This suite is what varies that endpoint.
 //! * `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
-//!   container image `push` and `pull` operations") is the address a client pushes and pulls
-//!   at, so it is that same endpoint with the repository's own name as the path — never the
-//!   host AWS publishes for the registry, which nothing here answers on. Which registry
-//!   HOLDS the repository is reported beside it, by the members that carry that identity
-//!   (`registryId` and the ARN), and those are labels off the stored record that no reader's
-//!   endpoint moves.
+//!   container image `push` and `pull` operations") is PARSED as well as dialled, so it
+//!   carries the registry host layout Amazon ECR publishes — the owning account's id, the
+//!   `dkr` and `ecr` labels and the registry's Region — over the ZONE of that same endpoint
+//!   and its port, with the repository's own name as the path: never the zone AWS serves its
+//!   own registries in, which nothing here answers on. Which registry HOLDS the repository is
+//!   reported beside it by the members that carry that identity (`registryId` and the ARN),
+//!   and those are labels off the stored record that no reader's endpoint moves.
 //!
 //! The class the rule generalises over is the endpoint the call arrived on crossed with the
 //! repository name and the operation reporting it, so the rows span the endpoint forms a
@@ -55,13 +55,19 @@ use crate::wire::{
 };
 
 /// One endpoint a caller reaches this emulator on: where the endpoint travels (the `Host`
-/// header, the request URI's authority, or neither) and the address the registry URL a
-/// `docker login` of that call is pointed at is built on, port included.
+/// header, the request URI's authority, or neither), the address the registry URL a
+/// `docker login` of that call is pointed at is built on, port included, and the authority
+/// this registry publishes a repository at to such a call.
 struct Endpoint {
     case: &'static str,
     host: Option<String>,
     uri_authority: Option<&'static str>,
     announced_endpoint: String,
+    /// The registry authority a repository's URI carries to this call: the registry host
+    /// layout over the zone of [`Endpoint::announced_endpoint`] and its port. Spelled out per
+    /// row rather than derived, so the zone this emulator announces in is asserted and not
+    /// recomputed from the implementation's own reading.
+    announced_registry_authority: String,
 }
 
 impl Endpoint {
@@ -70,12 +76,19 @@ impl Endpoint {
         format!("https://{}", self.announced_endpoint)
     }
 
-    /// The URI the repository `name` is reported at to such a call: the endpoint this
-    /// emulator answers that caller's registry requests at, followed by the repository's own
-    /// name as the path.
+    /// The URI the repository `name` is reported at to such a call: the registry authority
+    /// this emulator publishes to that caller, followed by the repository's own name as the
+    /// path.
     fn repository_uri(&self, name: &str) -> String {
-        format!("{}/{name}", self.announced_endpoint)
+        format!("{}/{name}", self.announced_registry_authority)
     }
+}
+
+/// The authority this registry publishes to a caller reached at an endpoint whose zone is
+/// `zone` and whose port is `port`: `<registryId>.dkr.ecr.<region>.<zone>:<port>` for the
+/// Region every call of this suite is signed for.
+fn registry_authority(zone: &str, port: &str) -> String {
+    format!("{REGISTRY_ID}.dkr.ecr.{REGION}.{zone}:{port}")
 }
 
 /// The endpoints the table drives, spanning the forms a caller reaches this emulator by.
@@ -89,24 +102,49 @@ fn endpoints() -> Vec<Endpoint> {
             // this process, so this caller is reported the address this emulator is served
             // at instead.
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
+            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "the emulator's own socket",
             host: Some("127.0.0.1:9297".to_string()),
             uri_authority: None,
             announced_endpoint: "127.0.0.1:9297".to_string(),
+            // An address names no zone and names the interface the loopback zone resolves
+            // to, so a name announced for it is announced in that zone.
+            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "a loopback name with another port",
             host: Some("localhost:39355".to_string()),
             uri_authority: None,
             announced_endpoint: "localhost:39355".to_string(),
+            announced_registry_authority: registry_authority("localhost", "39355"),
         },
         Endpoint {
             case: "an endpoint carried only on the request URI",
             host: None,
             uri_authority: Some("127.0.0.1:8443"),
             announced_endpoint: "127.0.0.1:8443".to_string(),
+            announced_registry_authority: registry_authority("localhost", "8443"),
+        },
+        Endpoint {
+            case: "the registry authority this emulator itself announced",
+            host: Some(registry_authority("localhost", "9297")),
+            uri_authority: None,
+            // A host that names THIS registry is one this plane answers on, so the caller is
+            // reported the very value it dialled rather than a second host composed on it.
+            announced_endpoint: registry_authority("localhost", "9297"),
+            announced_registry_authority: registry_authority("localhost", "9297"),
+        },
+        Endpoint {
+            case: "the registry authority this emulator announced for another Region",
+            host: Some(format!("{REGISTRY_ID}.dkr.ecr.us-east-1.localhost:39355")),
+            uri_authority: None,
+            announced_endpoint: format!("{REGISTRY_ID}.dkr.ecr.us-east-1.localhost:39355"),
+            // The Region of the authority is the REGISTRY's, read off the stored record, so
+            // the Region the caller happened to dial does not move it; its zone and port are
+            // the ones that caller reaches this emulator at.
+            announced_registry_authority: registry_authority("localhost", "39355"),
         },
         Endpoint {
             case: "this service's control-plane endpoint host, which names a service",
@@ -115,6 +153,7 @@ fn endpoints() -> Vec<Endpoint> {
             // No registry client can use a host that routes to a service, so the address
             // this emulator is served at is reported instead.
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
+            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "a host of THIS service an operator serves the emulator at",
@@ -124,6 +163,8 @@ fn endpoints() -> Vec<Endpoint> {
             // registry plane, so the caller is reported the address it is already talking
             // to rather than one it may not reach.
             announced_endpoint: "ecr.localhost:39355".to_string(),
+            // That host is a NAME, so it is the zone a name announced for it sits in.
+            announced_registry_authority: registry_authority("ecr.localhost", "39355"),
         },
         Endpoint {
             case: "a host of ANOTHER service the emulator serves",
@@ -132,12 +173,14 @@ fn endpoints() -> Vec<Endpoint> {
             // That host routes to the service its first label names, so no registry
             // request addressed to it reaches this plane: the served address is reported.
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
+            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "a Host that is no endpoint at all",
             host: Some("elsewhere.example.com/registry".to_string()),
             uri_authority: None,
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
+            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "a registry host in the China partition's zone",
@@ -146,12 +189,14 @@ fn endpoints() -> Vec<Endpoint> {
             // Another zone AWS publishes its own endpoints in, and so another host this
             // emulator does not answer on.
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
+            announced_registry_authority: registry_authority("localhost", "9297"),
         },
         Endpoint {
             case: "this service's dual-stack endpoint host",
             host: Some(format!("api.ecr.{REGION}.api.aws")),
             uri_authority: None,
             announced_endpoint: ANNOUNCED_REGISTRY_ENDPOINT.to_string(),
+            announced_registry_authority: registry_authority("localhost", "9297"),
         },
     ]
 }
@@ -289,9 +334,9 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
             assert_eq!(
-                authority, endpoint.announced_endpoint,
-                "case {case:?}: expected the host of {created_uri:?} to be the endpoint this \
-                 emulator answers this caller at, got {authority:?}"
+                authority, endpoint.announced_registry_authority,
+                "case {case:?}: expected the host of {created_uri:?} to be the registry \
+                 authority this emulator publishes to this caller, got {authority:?}"
             );
             assert_ne!(
                 authority,
