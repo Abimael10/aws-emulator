@@ -273,6 +273,10 @@ async fn the_already_shared_refusal_states_the_directory_and_the_account() {
 }
 
 /// RULE: a resize past the per-directory ceiling states the ceiling, not the request.
+///
+/// Asserted over the DIAGNOSTIC the service worded ([`stated`]) rather than the whole
+/// `Message`: the request-id suffix that message ends with is a per-run value, so a digit of
+/// the requested number appearing inside it says nothing about the sentence.
 #[tokio::test]
 async fn the_domain_controller_quota_refusal_states_the_ceiling_only() {
     let router = service();
@@ -304,8 +308,9 @@ async fn the_domain_controller_quota_refusal_states_the_ceiling_only() {
             "case {case:?}: unexpected diagnostic"
         );
         assert!(
-            !message.contains(&desired.to_string()),
-            "case {case:?}: expected the requested number to be absent, got {message:?}"
+            !stated(&message).contains(&desired.to_string()),
+            "case {case:?}: expected the requested number to be absent from the diagnostic, \
+             got {message:?}"
         );
     }
 }

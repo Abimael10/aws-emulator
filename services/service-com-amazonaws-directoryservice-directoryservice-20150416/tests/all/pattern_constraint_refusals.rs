@@ -35,6 +35,12 @@
 //! pair (the account `UserName` below), and with an end the model leaves open spelled out
 //! where it does not (the administrator `Password`, whose model text anchors its start and
 //! closes on an inner anchor).
+//!
+//! The last case is about the CLASS rather than the clause: a constraint the request breaks
+//! is answered by the request layer in the protocol-level `ValidationException` envelope,
+//! while a refusal a HANDLER returns is one of that operation's own modelled Directory
+//! Service errors — two answers a client branches on differently, so neither may be sent in
+//! the other's envelope.
 
 use serde_json::{json, Value};
 
@@ -93,11 +99,16 @@ fn sized_password(characters: usize) -> String {
     format!("{fixed}{}", "a".repeat(characters.saturating_sub(fixed.len())))
 }
 
+/// The envelope a refusal of the request-constraint class opens with, counting the clauses
+/// it carries — one, for every row of this suite. THE one place this suite spells it, so a
+/// clause it builds in full and a clause it only recognises by its opening cannot disagree.
+const ONE_CLAUSE_COUNTED: &str = "1 validation error detected: ";
+
 /// The whole clause the boundary states for a `@sensitive` member outside its `@pattern`:
 /// the member, the requirement, and no value at all.
 fn withheld_clause(member: &str, pattern: &str) -> String {
     format!(
-        "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
+        "{ONE_CLAUSE_COUNTED}Value at '{member}' failed to satisfy constraint: \
          Member must satisfy regular expression pattern: {pattern}"
     )
 }
@@ -105,7 +116,7 @@ fn withheld_clause(member: &str, pattern: &str) -> String {
 /// The whole clause the boundary states for a member whose value it may quote.
 fn quoted_clause(value: &str, member: &str, pattern: &str) -> String {
     format!(
-        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+        "{ONE_CLAUSE_COUNTED}Value '{value}' at '{member}' failed to satisfy \
          constraint: Member must satisfy regular expression pattern: {pattern}"
     )
 }
@@ -325,6 +336,201 @@ async fn a_user_name_outside_its_pattern_is_refused_by_the_boundary() {
             wire_type.contains("EntityDoesNotExistException"),
             "case {case:?}: expected the resolution failure rather than a constraint refusal, \
              got {parsed}"
+        );
+    }
+}
+
+/// The error class the request-constraint layer refuses a request with, which is not one of
+/// any operation's modelled errors: the protocol-level one an SDK's generic input-validation
+/// code handles.
+const CONSTRAINT_CLASS: &str = "ValidationException";
+
+/// The member a refusal of the constraint class states its diagnostic in: the lower-case
+/// `message` of the framework's constraint envelope.
+const CONSTRAINT_MESSAGE_MEMBER: &str = "message";
+
+/// The members a refusal of one of this service's MODELLED errors states instead: every
+/// error shape Directory Service declares carries them, and the constraint envelope carries
+/// neither.
+const MODELLED_MEMBERS: [&str; 2] = ["Message", "RequestId"];
+
+/// A `Password` the modelled expression does not admit: two of Active Directory's four
+/// character classes, where the alternation counts three.
+const PASSWORD_OUTSIDE_THE_PATTERN: &str = "sim2real99pass";
+
+/// A `Password` the modelled expression ADMITS — three classes, inside the length clause —
+/// which the directory's own administrator-password policy still refuses, because it carries
+/// the name of the account it would be the password of. That clause is about a WORD rather
+/// than a character grammar, so no `@pattern` can state it and only the handler can refuse
+/// it: the other side of the class split below.
+const PASSWORD_NAMING_THE_ADMINISTRATOR: &str = "Sim2Admin-Pw1";
+
+/// A `UserName` outside its member's expression, whose look-ahead forbids a pipe.
+const USER_NAME_OUTSIDE_THE_PATTERN: &str = "corp|admin";
+
+/// A `DirectoryId` outside the `@pattern` the model declares for it
+/// (`^d-[0-9a-f]{10}$`) — an expression the boundary validator's own engine DOES compile, so
+/// the row it drives is refused by the walk that applies an expression rather than by the
+/// layer that stands in for the ones it cannot.
+const DIRECTORY_ID_OUTSIDE_THE_PATTERN: &str = "d-not-a-hex";
+
+/// RULE: the two refusals a request can get are two different ANSWERS, each in its own
+/// envelope. A constraint the REQUEST breaks is answered by the request layer, before any
+/// handler runs, as the protocol-level `ValidationException`: HTTP 400 whose diagnostic is
+/// the counted clause in the constraint envelope's lower-case `message`, carrying none of the
+/// members a modelled Directory Service fault carries. A refusal a HANDLER returns — here the
+/// half of the administrator-password policy no expression can state, and a directory that
+/// does not exist — is one of that operation's own MODELLED errors instead, with `Message` and
+/// `RequestId` and no constraint clause at all. So a client branching on the class and one
+/// reading the diagnostic each get what they branch on: a broken `@pattern` is never reported
+/// as a service fault, and a service fault is never reported as a constraint violation.
+#[tokio::test]
+async fn a_broken_constraint_and_a_handler_refusal_carry_different_envelopes() {
+    let router = service();
+
+    let mut weak_simple = minimal_create("envelope0.simple.example.com");
+    weak_simple["Password"] = json!(PASSWORD_OUTSIDE_THE_PATTERN);
+    let mut weak_managed = minimal_microsoft_ad("envelope0.managed.example.com");
+    weak_managed["Password"] = json!(PASSWORD_OUTSIDE_THE_PATTERN);
+
+    // One row per way a request can break a declared expression: the `@sensitive`
+    // administrator password of BOTH creates that declare it (an expression written with
+    // look-around), a member whose value a clause may quote, and a member whose expression
+    // the boundary's own engine compiles — one class, so one envelope, whichever layer
+    // applied the expression.
+    let broken_constraints: Vec<(&str, &str, Value, &str)> = vec![
+        (
+            "CreateDirectory: the administrator password",
+            "CreateDirectory",
+            weak_simple,
+            "password",
+        ),
+        (
+            "CreateMicrosoftAD: the administrator password",
+            "CreateMicrosoftAD",
+            weak_managed,
+            "password",
+        ),
+        (
+            "ResetUserPassword: the account name",
+            "ResetUserPassword",
+            json!({
+                "DirectoryId": ABSENT_DIRECTORY_ID,
+                "UserName": USER_NAME_OUTSIDE_THE_PATTERN,
+                "NewPassword": GOOD_NEW_PASSWORD,
+            }),
+            "userName",
+        ),
+        (
+            "DeleteDirectory: the directory id",
+            "DeleteDirectory",
+            json!({ "DirectoryId": DIRECTORY_ID_OUTSIDE_THE_PATTERN }),
+            "directoryId",
+        ),
+    ];
+
+    for (case, operation, body, member) in broken_constraints {
+        let (status, parsed) = call(&router, operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the request to be refused, got {status} with {parsed}"
+        );
+        assert_eq!(
+            parsed["__type"],
+            json!(CONSTRAINT_CLASS),
+            "case {case:?}: expected the request layer's class rather than a modelled fault, \
+             got {parsed}"
+        );
+        let stated = parsed[CONSTRAINT_MESSAGE_MEMBER].as_str().unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected the constraint envelope's {CONSTRAINT_MESSAGE_MEMBER} \
+                 member, got {parsed}"
+            )
+        });
+        let clause = format!("at '{member}' failed to satisfy constraint: ");
+        assert!(
+            stated.starts_with(ONE_CLAUSE_COUNTED) && stated.contains(&clause),
+            "case {case:?}: expected a counted clause naming {member:?}, got {stated:?}"
+        );
+        for absent in MODELLED_MEMBERS {
+            assert!(
+                parsed[absent].is_null(),
+                "case {case:?}: expected no modelled {absent} member on a constraint refusal, \
+                 got {parsed}"
+            );
+        }
+        // The administrator password is `@sensitive`: no part of the answer reports it back.
+        assert!(
+            !parsed.to_string().contains(PASSWORD_OUTSIDE_THE_PATTERN),
+            "case {case:?}: expected the password not to be echoed, got {parsed}"
+        );
+    }
+
+    let mut named_simple = minimal_create("envelope1.simple.example.com");
+    named_simple["Password"] = json!(PASSWORD_NAMING_THE_ADMINISTRATOR);
+    let mut named_managed = minimal_microsoft_ad("envelope1.managed.example.com");
+    named_managed["Password"] = json!(PASSWORD_NAMING_THE_ADMINISTRATOR);
+
+    // One row per handler refusal of a request whose every declared expression is satisfied:
+    // the policy clause no expression states, on BOTH creates that apply it, and a directory
+    // the account does not hold — two different modelled error shapes, one envelope.
+    let handler_refusals: Vec<(&str, &str, Value, &str)> = vec![
+        (
+            "CreateDirectory: a password naming the administrator account",
+            "CreateDirectory",
+            named_simple,
+            "InvalidParameterException",
+        ),
+        (
+            "CreateMicrosoftAD: a password naming the administrator account",
+            "CreateMicrosoftAD",
+            named_managed,
+            "InvalidParameterException",
+        ),
+        (
+            "ResetUserPassword: a directory the account does not hold",
+            "ResetUserPassword",
+            json!({
+                "DirectoryId": ABSENT_DIRECTORY_ID,
+                "UserName": "Administrator",
+                "NewPassword": GOOD_NEW_PASSWORD,
+            }),
+            "EntityDoesNotExistException",
+        ),
+    ];
+
+    for (case, operation, body, modelled) in handler_refusals {
+        let (status, parsed) = call(&router, operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the request to be refused, got {status} with {parsed}"
+        );
+        let wire_type = parsed["__type"].as_str().unwrap_or_default();
+        assert!(
+            wire_type.contains(modelled),
+            "case {case:?}: expected the modelled {modelled}, got {parsed}"
+        );
+        for stated_member in MODELLED_MEMBERS {
+            assert!(
+                parsed[stated_member].is_string(),
+                "case {case:?}: expected the modelled {stated_member} member, got {parsed}"
+            );
+        }
+        assert!(
+            parsed[CONSTRAINT_MESSAGE_MEMBER].is_null(),
+            "case {case:?}: expected no {CONSTRAINT_MESSAGE_MEMBER} member of the constraint \
+             envelope on a modelled refusal, got {parsed}"
+        );
+        let stated = parsed["Message"].as_str().unwrap_or_default();
+        assert!(
+            !stated.contains(ONE_CLAUSE_COUNTED.trim_end_matches(' ')),
+            "case {case:?}: expected the service's own sentence rather than a counted \
+             constraint clause, got {stated:?}"
+        );
+        // The password is `@sensitive` whichever layer refuses the request.
+        assert!(
+            !parsed.to_string().contains(PASSWORD_NAMING_THE_ADMINISTRATOR),
+            "case {case:?}: expected the password not to be echoed, got {parsed}"
         );
     }
 }
