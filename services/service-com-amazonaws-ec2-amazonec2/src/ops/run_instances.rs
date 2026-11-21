@@ -29,6 +29,13 @@
 //! encryption and delete-on-termination define the volume, and the AMI's own mapping answers
 //! the members the launch left out ([`crate::state::ComAmazonawsEc2Amazonec2State::launch_root_block_device`]
 //! is where the two are read into one device, the Region's EBS encryption default included).
+//! An entry that names a `KmsKeyId` without asking for encryption names a volume that cannot
+//! be created, so the launch is refused the parameter-dependency error before anything else;
+//! an entry whose key KMS will not produce a data key under launches the instance and leaves
+//! it the termination the clock owes it instead of `running`
+//! ([`crate::state::launch_volume_encryption_keys`] is where the keys of one launch are read,
+//! and [`crate::state::ComAmazonawsEc2Amazonec2State::withdraw_launch_under_unusable_volume_key`]
+//! is what the refusal leaves behind).
 //! Hibernation is admitted against THAT volume: "set to true to enable your instance for
 //! hibernation" is valid "only if the instance meets the hibernation prerequisites", of which
 //! an encrypted root volume is one, so a launch asking for it over a root device that would
@@ -632,6 +639,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  {MAX_SECURITY_GROUPS_PER_INSTANCE} security groups, not {named_groups}"
             )));
         }
+        // "If KmsKeyId is specified, the encrypted state must be true" — the rule the same
+        // pair of members carries wherever a volume is created
+        // (`CreateVolumeRequest$KmsKeyId`): a key names HOW a volume is encrypted, so an
+        // entry naming one without asking for encryption names a volume Amazon EC2 cannot
+        // create, and the half the request left out is what it got wrong — EC2's parameter
+        // DEPENDENCY refusal rather than a bad value. Asked of EVERY `BlockDeviceMappings`
+        // entry of the RESOLVED launch, so a mapping that reached the launch from its launch
+        // template is held to it exactly as one the request spelled out is, and asked HERE,
+        // with the rest of the parameter validation and before the DryRun arm: a request
+        // whose parameters cannot hold together is refused for that whether or not it was
+        // only a probe.
+        for mapping in input.block_device_mappings.iter().flatten() {
+            let Some(ebs) = mapping.ebs.as_ref() else {
+                continue;
+            };
+            if ebs
+                .kms_key_id
+                .as_deref()
+                .is_some_and(|key_id| !key_id.is_empty())
+                && ebs.encrypted != Some(true)
+            {
+                return Err(Scaffolded::invalid_parameter_dependency(
+                    "KmsKeyId", "Encrypted",
+                ));
+            }
+        }
 
         // "The name or Amazon Resource Name (ARN) of an IAM instance profile"
         // (`RunInstancesRequest$IamInstanceProfile`): a launch that names one gives every
@@ -676,6 +709,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?,
         };
 
+        // The AMI this launch runs from and the ROOT BLOCK DEVICE every instance of it would
+        // be created with, read under a guard of this store that is taken, read and GIVEN
+        // BACK here — because the keys that device names are asked of the service that owns
+        // them straight after, and no lock of this store is ever held while another service
+        // is called.
+        //
+        // These two reads therefore happen under their own guard, which materialises the
+        // transitions the clock owes before reading exactly as the main guard below does — a
+        // recycled AMI past its retention period and a `pending` AMI a copy produced are among
+        // those moves, so the image this launch resolves is the image a describe would report
+        // at this instant either way.
+        //
+        // The parameter an `ImageId` of the `resolve:ssm:` form names is resolved in the same
+        // read: "the Systems Manager parameter will resolve to an AMI ID on launch". The
+        // mapping is the image catalogue's own
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`]),
+        // the one place this emulator records which AMI a parameter names, so the launch runs
+        // from the image `DescribeImages` reports under that parameter and the instance
+        // reports THAT id — not the parameter it was asked for. A parameter the account can
+        // see no image under names no AMI, which is the launch's `InvalidAMIID.NotFound`: the
+        // value is well formed and there is simply no image behind it — and the value that
+        // refusal names the caller back is cut to the same bound every echoed id of this crate
+        // is ([`crate::state::echoed_resource_id`]), a parameter name carrying no modelled
+        // length of its own.
+        //
+        // "The block device mapping, which defines the EBS volumes and instance store volumes
+        // to attach to the instance at launch" (`RunInstancesRequest$BlockDeviceMappings`):
+        // the root device every instance of this launch is created with is the AMI's own with
+        // the launch's entry for that device overlaid, read through the ONE resolution of it —
+        // so the volume stored below, the prerequisite asked of it and the key asked about are
+        // the same device.
+        let (image_id, root_block_device) = {
+            let state = require_service_state(&*self.engine)?;
+            let mut store = state.lock();
+            store.materialize_due_transitions();
+            let image_id = match image_alias {
+                Some(parameter) => {
+                    match store
+                        .public_ssm_parameter_image_ids(::engine::emulator_account_id())
+                        .remove(&parameter)
+                    {
+                        Some(resolved) => resolved,
+                        None => {
+                            return Err(invalid_ami_id_not_found(&echoed_resource_id(&image_id)));
+                        }
+                    }
+                }
+                None => image_id,
+            };
+            let root_block_device = store
+                .launch_root_block_device(
+                    Some(&image_id),
+                    input.block_device_mappings.as_deref().unwrap_or_default(),
+                    &region,
+                )
+                .map(|(_, ebs)| ebs);
+            (image_id, root_block_device)
+        };
+
+        // WHETHER THE VOLUMES THIS LAUNCH WOULD CREATE CAN EXIST AT ALL under the keys they
+        // name, asked of the service that owns those keys and asked BEFORE this store's guard
+        // is taken, because the ask is a call into another service: "Amazon EBS … requests a
+        // data key from KMS" for an encrypted volume, so a key that will not produce one —
+        // disabled, pending deletion, in a state KMS will not use, or naming no key of the
+        // account — leaves the instance with no root volume to boot from. The launch is still
+        // ACCEPTED and answers the `pending` instances it minted: what the key refuses is
+        // those instances coming up, which is recorded as the termination the clock then owes
+        // each of them ([`crate::state::ComAmazonawsEc2Amazonec2State::withdraw_launch_under_unusable_volume_key`]).
+        // A key that will serve, and an emulator with no KMS to ask, leave every instance on
+        // the ordinary path to `running`.
+        //
+        // A `DryRun` probe asks nothing of KMS: it is answered below without creating
+        // anything, and a data key is requested for volumes that are really being created.
+        let mut volume_key_refusal = None;
+        if input.dry_run != Some(true) {
+            for key_id in crate::state::launch_volume_encryption_keys(
+                root_block_device.as_ref(),
+                input.block_device_mappings.as_deref().unwrap_or_default(),
+            ) {
+                volume_key_refusal = crate::state::volume_key_refusal(ctx, &region, &key_id).await;
+                if volume_key_refusal.is_some() {
+                    break;
+                }
+            }
+        }
+
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
         store.materialize_due_transitions();
@@ -710,31 +829,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The parameter an `ImageId` of the `resolve:ssm:` form names, resolved: "the Systems
-        // Manager parameter will resolve to an AMI ID on launch". The mapping is the image
-        // catalogue's own ([`crate::state::ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`]),
-        // the one place this emulator records which AMI a parameter names, so the launch runs
-        // from the image `DescribeImages` reports under that parameter and the instance
-        // reports THAT id — not the parameter it was asked for. A parameter the account can
-        // see no image under names no AMI, which is the launch's `InvalidAMIID.NotFound`: the
-        // value is well formed and there is simply no image behind it — and the value that
-        // refusal names the caller back is cut to the same bound every echoed id of this crate
-        // is ([`crate::state::echoed_resource_id`]), a parameter name carrying no modelled
-        // length of its own.
-        let image_id = match image_alias {
-            Some(parameter) => {
-                match store
-                    .public_ssm_parameter_image_ids(::engine::emulator_account_id())
-                    .remove(&parameter)
-                {
-                    Some(resolved) => resolved,
-                    None => {
-                        return Err(invalid_ami_id_not_found(&echoed_resource_id(&image_id)));
-                    }
-                }
-            }
-            None => image_id,
-        };
+        // The parameter an `ImageId` of the `resolve:ssm:` form names was resolved above, with
+        // the root block device this launch creates, under the guard that was given back
+        // before the volumes' keys were asked about.
 
         // "The ID of the subnet to launch the instance into" (`RunInstancesRequest$SubnetId`)
         // — and a subnet belongs to ONE Availability Zone, so a launch that named a subnet
@@ -907,19 +1004,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(capacity_reservation_id.to_string())
             }
         };
-        // "The block device mapping, which defines the EBS volumes and instance store
-        // volumes to attach to the instance at launch"
-        // (`RunInstancesRequest$BlockDeviceMappings`): the root device every instance of this
-        // launch is created with is the AMI's own with the launch's entry for that device
-        // overlaid, read through the ONE resolution of it — so the volume stored below and
-        // the prerequisite asked of it here are the same device.
-        let root_block_device = store
-            .launch_root_block_device(
-                Some(&image_id),
-                input.block_device_mappings.as_deref().unwrap_or_default(),
-                &region,
-            )
-            .map(|(_, ebs)| ebs);
         // "Set to true to enable your instance for hibernation"
         // (`HibernationOptionsRequest$Configured`) — and hibernation has prerequisites: the
         // instance writes its memory to its root volume, so "the root volume must be an
@@ -1514,6 +1598,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          '{instance_id}' was not stored"
                     )));
                 }
+            }
+            // And the instance is taken back where the key its volumes are to be encrypted
+            // under refused their data key, asked of the service that owns that key above:
+            // the instance exists and is `pending`, with the clock owing it `terminated`
+            // under the state reason that says why instead of `running`.
+            if let Some(refusal) = volume_key_refusal.as_ref() {
+                store.withdraw_launch_under_unusable_volume_key(&instance_id, refusal);
             }
         }
 

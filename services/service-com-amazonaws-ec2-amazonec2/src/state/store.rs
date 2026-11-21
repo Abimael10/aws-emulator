@@ -435,12 +435,21 @@ impl InstanceStateName {
     }
 }
 
-/// A state change the CLOCK owes an instance: the state it moves to, and the
-/// instant from which that move is due.
+/// A state change the CLOCK owes an instance: the state it moves to, the
+/// instant from which that move is due, and the reason it is made for.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
     pub to: InstanceStateName,
     pub due_at: Instant,
+    /// The `StateReason` code and message this move records when it is applied, for a move
+    /// made for a reason of its own — and `None` for one that changes no reason, which is
+    /// every move a caller asked for (those record their reason when the call is served,
+    /// since the caller is told the instance is on its way).
+    ///
+    /// Carried with the move rather than written when the move is SCHEDULED, because the
+    /// reason is the reason for the transition: an instance still in its previous state
+    /// reports the reason of the transition that put it there, not of the one it is owed.
+    pub reason: Option<(String, String)>,
 }
 
 impl PendingTransition {
@@ -449,7 +458,15 @@ impl PendingTransition {
         Self {
             to,
             due_at: Instant::now() + TRANSITION_DELAY,
+            reason: None,
         }
+    }
+
+    /// The same transition, recording the `StateReason` `(code, message)` when it is applied.
+    #[must_use]
+    pub fn reporting(mut self, code: String, message: String) -> Self {
+        self.reason = Some((code, message));
+        self
     }
 
     /// A transition to `to`, due [`TRANSITION_DELAY`] after `started_at` — the instant the
@@ -471,6 +488,7 @@ impl PendingTransition {
         Self {
             to,
             due_at: due_instant(TRANSITION_DELAY.saturating_sub(elapsed)),
+            reason: None,
         }
     }
 }

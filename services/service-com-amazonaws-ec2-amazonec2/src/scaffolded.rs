@@ -543,6 +543,22 @@ impl<E> Scaffolded<E> {
         Self::service_error("InvalidParameterCombination", 400, message)
     }
 
+    /// `InvalidParameterDependency` (HTTP 400): the request gave `dependent`, which only
+    /// has a meaning together with `required`, and did not set `required`.
+    ///
+    /// A DIFFERENT failure from [`Self::invalid_parameter_combination`], which is for two
+    /// parameters that each stand alone and cannot be given together: here one parameter
+    /// DEPENDS on the other, so what the request got wrong is the half it left out, and EC2
+    /// answers the dependency code for it. Both parameters are named with the member names
+    /// the model declares, so the sentence reads as the API documents the pair.
+    pub fn invalid_parameter_dependency(dependent: &str, required: &str) -> Self {
+        Self::service_error(
+            "InvalidParameterDependency",
+            400,
+            format!("The parameter {dependent} requires the parameter {required} to be set."),
+        )
+    }
+
     /// `MissingParameter` (HTTP 400): a parameter the operation needs was not given.
     /// Distinct from a modelled `@required` member, which the boundary validator
     /// refuses before a handler runs.

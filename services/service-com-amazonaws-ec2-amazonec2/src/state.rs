@@ -3089,6 +3089,11 @@ mod volumes;
 /// re-exported below, so a handler reaches it as `crate::state::volume_key_refusal` like any
 /// other primitive of this module.
 mod volume_encryption;
+/// The keys the volumes of a LAUNCH are to be encrypted under, and the instance Amazon EC2
+/// takes back when one of them will not serve. Everything it declares is re-exported below,
+/// so a handler reaches it as `crate::state::launch_volume_encryption_keys` like any other
+/// primitive of this module.
+mod launch_volume_keys;
 /// The event an EBS volume's create OUTCOME is published as, onto the account's default
 /// EventBridge bus. Everything it declares is re-exported below, so a handler reaches it as
 /// `crate::state::VolumeNotification` like any other primitive of this module.
@@ -3152,6 +3157,7 @@ pub use outpost_lags::*;
 pub use service_link_virtual_interfaces::*;
 pub use tag_descriptions::*;
 pub use volume_encryption::*;
+pub use launch_volume_keys::*;
 pub use volume_notifications::*;
 pub use volumes::*;
 pub use import_image_tasks_and_verified_access::*;

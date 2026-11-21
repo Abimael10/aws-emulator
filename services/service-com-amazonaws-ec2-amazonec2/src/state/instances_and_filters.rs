@@ -499,10 +499,16 @@ impl ComAmazonawsEc2Amazonec2State {
                 .pending_transition
                 .as_ref()
                 .filter(|pending| now >= pending.due_at)
-                .map(|pending| pending.to);
-            if let Some(state) = due {
+                .map(|pending| (pending.to, pending.reason.clone()));
+            if let Some((state, reason)) = due {
                 instance.state = state;
                 instance.pending_transition = None;
+                // The reason the move was made FOR, where the move carried one: it is the
+                // reason for the transition that has just happened, so it is recorded as that
+                // transition is applied rather than while the instance was still on its way.
+                if let Some(reason) = reason {
+                    instance.state_reason = Some(reason);
+                }
                 // A completed termination releases the instance's primary private address:
                 // the interface that held it goes at this same instant (below), so EC2 has
                 // freed the address for reuse and a later launch may be given it.

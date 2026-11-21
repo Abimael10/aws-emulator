@@ -605,6 +605,9 @@ pub fn finish_starting<Eng: Send + Sync + 'static>(
         instance.pending_transition = Some(ec2::PendingTransition {
             to: ec2::InstanceStateName::Running,
             due_at: ::std::time::Instant::now() + remaining,
+            // Coming into service is the ordinary end of a launch, so the move records no
+            // state reason of its own.
+            reason: None,
         });
         // The guest comes up with it: its first boot is what runs the user-data program the
         // wait state exists for, so it is owed at the same instant.
