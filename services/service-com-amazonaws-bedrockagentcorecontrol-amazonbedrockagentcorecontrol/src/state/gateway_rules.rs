@@ -11,10 +11,13 @@
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Action, Condition, CreateGatewayRuleOutput, GetGatewayRuleOutput, SystemManagedBlock,
+    Action, Condition, CreateGatewayRuleOutput, GetGatewayRuleOutput, ResourceNotFoundException,
+    SystemManagedBlock, ValidationException,
 };
 
-use super::timestamp;
+use super::{
+    status_in_prose, timestamp, GatewayRecord, STATUS_READY, VALIDATION_REASON_RESOURCE_CONFLICT,
+};
 
 /// `GatewayRuleStatus` members this service drives. The enum's full value list
 /// is `CREATING | ACTIVE | UPDATING | DELETING`
@@ -31,9 +34,78 @@ pub const GATEWAY_RULE_STATUS_ACTIVE: &str = "ACTIVE";
 /// wait out.
 pub const GATEWAY_RULE_SETTLE_DELAY: Duration = super::GATEWAY_SETTLE_DELAY;
 
-/// The resource noun [`super::resource_not_found`] names for one rule of a
-/// gateway.
-pub const RESOURCE_GATEWAY_RULE: &str = "rule";
+/// How this API spells the gateway-rule resource TYPE in the refusals that name
+/// it, which is the modelled shape's own name and not the lower-case noun the
+/// gateway and target families are reported missing by
+/// ([`super::resource_not_found`]).
+pub const RESOURCE_GATEWAY_RULE: &str = "GatewayRule";
+
+/// The modelled not-found error for one RULE a gateway does not hold: the
+/// resource type, the `ruleId` that was asked for, and that it is not there
+/// ("GatewayRule 7f9b2c41-... not found").
+///
+/// The rule family reports a missing rule in its OWN sentence rather than
+/// through [`super::resource_not_found`]: the sentence names the rule the
+/// request addressed, so a caller that fans a request out over several rule ids
+/// can attribute the failure to one of them. The text around the id is fixed and
+/// `rule_id` is its only variable part — the value the request's `ruleId` path
+/// label carried.
+pub fn gateway_rule_not_found(rule_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("{RESOURCE_GATEWAY_RULE} {rule_id} not found")),
+    }
+}
+
+/// The modelled validation error a write of a gateway's RULES gets while the
+/// gateway that would evaluate them has not reached its terminal status: the
+/// gateway the request named, the status a rule write needs, and the status the
+/// gateway is in ("Gateway my-gateway-abcdefghij is not in READY state. Current
+/// status: Creating").
+///
+/// The sentence is fixed; its variable parts are the identifier the request's
+/// path carried and the gateway's current status, spelled as prose
+/// ([`super::status_in_prose`]) rather than as the wire's enum token. The rule
+/// family words this refusal in its own sentence — neither the one an operation
+/// on the GATEWAY itself is refused in ([`super::gateway_status_conflict`]) nor
+/// the one an operation on its TARGETS is
+/// ([`super::gateway_target_status_conflict`]).
+///
+/// `reason` is [`super::VALIDATION_REASON_RESOURCE_CONFLICT`] and there is no
+/// `fieldList`: nothing is wrong with the request's members, it is the gateway's
+/// state that refuses it.
+pub fn gateway_not_ready_for_rule(gateway_identifier: &str, status: &str) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "Gateway {gateway_identifier} is not in {STATUS_READY} state. Current status: {}",
+            status_in_prose(status)
+        ),
+        reason: VALIDATION_REASON_RESOURCE_CONFLICT.to_string(),
+        field_list: None,
+    }
+}
+
+/// The refusal a write of one gateway's RULES owes when the gateway it addresses
+/// cannot take it, or `None` when it can.
+///
+/// A rule decides how the gateway routes and processes the requests it fronts, so
+/// it is accepted only once that gateway is routable — once the clock has moved
+/// it to [`STATUS_READY`]. Every other lifecycle status is refused: the transient
+/// one the clock still owes a transition out of, and the one a gateway on its way
+/// out reports. The caller is told which status it found and waits that status
+/// out, which is the ordering a client that creates a gateway and then configures
+/// it follows.
+///
+/// `gateway_identifier` is the identifier the request's path carried, which the
+/// refusal names. Shared by every write of a gateway's rules, so they cannot put
+/// different preconditions on the same gateway.
+pub fn refusal_for_gateway_rule_write(
+    gateway_identifier: &str,
+    gateway: &GatewayRecord,
+    now: SystemTime,
+) -> Option<ValidationException> {
+    let status = gateway.status_at(now);
+    (status != STATUS_READY).then(|| gateway_not_ready_for_rule(gateway_identifier, status))
+}
 
 /// How many rules one gateway will hold.
 ///

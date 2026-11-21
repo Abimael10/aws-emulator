@@ -2,7 +2,8 @@
 
 //! @op GetGatewayRule
 //! Implemented: reports the rule the path names off the record `CreateGatewayRule`
-//! stored on the gateway, so a read cannot differ from the create.
+//! stored on the gateway, so a read cannot differ from the create; a `ruleId` the
+//! gateway does not hold is the modelled 404 naming that rule.
 //!
 //! ## Shape of an operation
 //!
@@ -183,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let rule = gateway.rules.get(&input.rule_id).ok_or_else(|| {
             GetGatewayRuleErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_RULE),
+                crate::state::gateway_rule_not_found(&input.rule_id),
             )
         })?;
 

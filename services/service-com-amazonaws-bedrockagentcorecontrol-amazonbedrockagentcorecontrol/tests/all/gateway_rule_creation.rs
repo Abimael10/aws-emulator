@@ -16,7 +16,9 @@
 //! for rules created by automated processes", and no request member carries it, so a rule a
 //! caller created reports none. A request the gateway cannot take as a rule is refused the
 //! modelled error and writes nothing: an identifier no gateway holds is the modelled 404,
-//! and a gateway whose deletion has been accepted takes no further configuration.
+//! and a gateway that has not reached `READY` takes no rule at all
+//! (`tests/all/gateway_rule_state_and_not_found_wording.rs` is that rule's suite), so every
+//! row below waits for the gateway it writes to before it writes one.
 //!
 //! The rows differ along what the rule generalises over: the priority (both published bounds
 //! of `GatewayRulePriority`, `@range 1..1000000`, and values between them), how many
@@ -145,8 +147,18 @@ async fn get_rule(router: &MultiServiceRouter, gateway: &str, rule: &str) -> Ans
     .await
 }
 
-/// Create a gateway and hand back its `gatewayId`.
+/// Create a gateway and hand back its `gatewayId` once the gateway reports `READY` — a
+/// rule write is refused until the gateway is routable, so every row that writes one waits
+/// for that condition first.
 async fn gateway(router: &MultiServiceRouter, name: &str) -> String {
+    let gateway_id = creating_gateway(router, name).await;
+    gateway_ready(router, &gateway_id).await;
+    gateway_id
+}
+
+/// Create a gateway and hand back its `gatewayId` straight away, while the clock still owes
+/// it its transition to `READY`.
+async fn creating_gateway(router: &MultiServiceRouter, name: &str) -> String {
     let created = send(
         router,
         "POST",
@@ -885,9 +897,8 @@ async fn a_read_of_a_rule_nothing_holds_is_the_modelled_404() {
 }
 
 /// The create resolves its gateway first: an identifier no gateway of this account holds is
-/// the modelled 404, a gateway the clock is still creating TAKES the rule (the rule carries
-/// a clock-owed status of its own), and a gateway whose deletion has been accepted takes no
-/// further configuration.
+/// the modelled 404, a gateway the clock is still creating takes NO rule, and a gateway
+/// whose deletion has been accepted takes no further configuration either.
 #[tokio::test]
 async fn the_create_resolves_its_gateway_first() {
     let router = router();
@@ -910,22 +921,34 @@ async fn the_create_resolves_its_gateway_first() {
         missing.body
     );
 
-    let gateway_id = gateway(&router, "createrulecreating").await;
+    let gateway_id = creating_gateway(&router, "createrulecreating").await;
     let creating = create_rule(&router, &gateway_id, &body).await;
     assert_eq!(
-        creating.status, 202,
-        "a gateway the clock is still creating takes a rule, got {} ({})",
-        creating.status, creating.body
+        (creating.status, error_code(&creating.body).as_str()),
+        (400, "ValidationException"),
+        "a gateway the clock is still creating takes no rule, got {} {} ({})",
+        creating.status,
+        error_code(&creating.body),
+        creating.body
     );
-    let stored = get_rule(&router, &gateway_id, &text(&creating.body, "ruleId")).await;
+
+    // Once the gateway is routable the very same request is served, and the rule it wrote
+    // reads back: the refusal above is the gateway's status and nothing else.
+    gateway_ready(&router, &gateway_id).await;
+    let served = create_rule(&router, &gateway_id, &body).await;
+    assert_eq!(
+        served.status, 202,
+        "a READY gateway takes the same rule, got {} ({})",
+        served.status, served.body
+    );
+    let stored = get_rule(&router, &gateway_id, &text(&served.body, "ruleId")).await;
     assert_eq!(
         stored.status, 200,
-        "the rule written on a creating gateway is held, got {} ({})",
+        "the rule written on a READY gateway is held, got {} ({})",
         stored.status, stored.body
     );
 
     // A gateway on its way out takes no further configuration.
-    gateway_ready(&router, &gateway_id).await;
     let deleted = send(&router, "DELETE", &format!("/gateways/{gateway_id}/"), None).await;
     assert_eq!(
         deleted.status, 202,

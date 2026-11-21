@@ -3,7 +3,8 @@
 //! @op CreateGatewayRule
 //! Implemented: creates one rule on the gateway the path names and stores it
 //! there, so the create and every later read of the rule answer from that one
-//! record.
+//! record. The gateway has to have reached READY first: a rule write against a
+//! gateway in any other lifecycle status is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -221,13 +222,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
             )
         })?;
-        // A rule is evaluated BY the gateway, so the gateway has to exist and not
-        // be on its way out. The one precondition every write of a gateway's
-        // configuration puts on it, decided in `crate::state` so the rule create
-        // and the rate-limit writes cannot drift: a gateway the clock is still
-        // moving through a transient status TAKES a rule, because the rule carries
-        // a clock-owed status of its own.
-        if let Some(refusal) = crate::state::refusal_for_gateway(Self::NAME, gateway, now) {
+        // A rule decides how the gateway ROUTES the requests it fronts, so the
+        // gateway has to be routable before it holds one: only a gateway the
+        // clock has moved to READY takes a rule, and one still in a transient
+        // status, or on its way out, is refused with the status the caller has to
+        // wait out. The precondition and its wording are decided in
+        // `crate::state`, so every write of a gateway's rules puts the same one
+        // on it.
+        let refusal =
+            crate::state::refusal_for_gateway_rule_write(&input.gateway_identifier, gateway, now);
+        if let Some(refusal) = refusal {
             return Err(CreateGatewayRuleErrorModeled::ValidationException(refusal).into());
         }
         let gateway_id = gateway.gateway_id.clone();

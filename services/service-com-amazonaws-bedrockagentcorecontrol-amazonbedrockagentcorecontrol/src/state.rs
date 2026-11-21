@@ -1618,9 +1618,11 @@ impl MemoryRecord {
 /// the limits.
 pub mod gateway_rate_limits;
 /// One gateway's rules: the record each is stored as, the clock-owed status it
-/// reports and the envelopes every operation that reports one renders.
-/// Re-exported, so a handler names `crate::state::…` for it exactly as it does
-/// for the gateway that holds the rules.
+/// reports, the envelopes every operation that reports one renders, and the
+/// refusals the family words itself — the gateway status a rule write needs and
+/// the rule a read could not find. Re-exported, so a handler names
+/// `crate::state::…` for it exactly as it does for the gateway that holds the
+/// rules.
 pub mod gateway_rules;
 /// The evaluation dataset: the record a create persists, the examples its
 /// source yields into the DRAFT working copy, the versions published from it,
