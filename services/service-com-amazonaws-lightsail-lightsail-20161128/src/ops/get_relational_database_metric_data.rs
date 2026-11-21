@@ -314,53 +314,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        let start_ms = epoch_millis(input.start_time, "startTime")?;
+        let end_ms = epoch_millis(input.end_time, "endTime")?;
+        let now = crate::state::now_ms();
+
         let metric_name = input.metric_name;
         let database_name = input.relational_database_name;
+        let statistics = input.statistics;
+        let period = i64::from(input.period);
         crate::state::with_state(&*self.engine, |store| {
             // Metrics are reported for a database this account HOLDS: a name no
             // database record answers to earns the service's `DoesNotExist`
             // envelope, not an authoritative-looking empty series.
-            if store.relational_database(&database_name).is_none() {
+            let Some(database) = store.relational_database(&database_name) else {
                 return Err(not_found(&database_name));
-            }
+            };
+            // The series is the store's, not this handler's: a resource's
+            // telemetry is owned by `crate::state`, which cuts the requested
+            // window into one datapoint per `period` window the database has
+            // published a sample in and fills each with the statistics the
+            // request asked for. A window before the database existed, or one
+            // that has not happened, holds no sample and so no datapoint — which
+            // is what the service itself answers for a window it has no data
+            // for.
+            //
+            // What each of those samples MEASURED comes from the same owner: an
+            // amount of the engine's work is zero, because this store observes
+            // none, and an amount of the storage or memory the bundle
+            // provisioned is that provisioned amount
+            // (`crate::state::relational_database_metric_series`).
+            let metric_data = crate::state::relational_database_metric_series(
+                database,
+                crate::state::MetricRead {
+                    metric_name: &metric_name,
+                    unit: published_unit,
+                    period_seconds: period,
+                    start_ms,
+                    end_ms,
+                    now_ms: now,
+                    statistics: &statistics,
+                },
+            );
             Ok(GetRelationalDatabaseMetricDataOutput {
                 // "The name of the metric returned" — the metric whose series
                 // this answer is, which is the one the request named.
                 metric_name: Some(metric_name.clone()),
-                // The datapoints the store holds for that metric over the
-                // requested window: NONE, for every window and every database.
-                //
-                // Every relational database metric is a measurement taken on a
-                // RUNNING database engine — the share of the database's compute
-                // units in use, the connections open to it, the input/output
-                // requests queued against its disk, the storage still free on
-                // it, the memory and swap its engine is using, and the bytes its
-                // interfaces carried
-                // (`GetRelationalDatabaseMetricDataRequest$metricName`). This
-                // emulator runs no database engine and monitors none, so no
-                // observation was ever made in any of the period windows the
-                // request spans, whatever its `period` and whichever
-                // granularity the metric is published at ("All relational
-                // database metric data is available in 1-minute (60 seconds)
-                // granularity", from the modelled `metricName` member).
-                //
-                // An empty `metricData` says exactly that, and is what the
-                // service itself answers for a window it holds no data for — a
-                // window before the database existed, say. A plausible-looking
-                // number per window would be invented telemetry a client could
-                // not tell from a measured one, and would contradict the rest of
-                // this store, where every alarm stays `INSUFFICIENT_DATA`
-                // because no metric of it has data
-                // (`crate::state::ALARM_STATE_INSUFFICIENT_DATA`) and
-                // `GetInstanceMetricData`, `GetContainerServiceMetricData` and
-                // `GetDistributionMetricData` report the same empty series. The
-                // `statistics` the request asked for select members OF a
-                // datapoint, so with no datapoints they have nothing to fill.
-                metric_data: Some(Vec::new()),
+                // "An array of objects that describe the metric data returned."
+                metric_data: Some(metric_data),
             })
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// `at` in epoch milliseconds — the unit this store's clock reads
+/// (`crate::state::now_ms`) — or this operation's refusal when `at` names an
+/// instant too far from the epoch to be one.
+fn epoch_millis(
+    at: ::aws_smithy_types::DateTime,
+    member: &str,
+) -> Result<i64, GetRelationalDatabaseMetricDataError> {
+    at.to_millis().map_err(|_| {
+        invalid(format!(
+            "{member} must name an instant within the range of epoch milliseconds"
+        ))
+    })
 }
 
 /// This operation's 400 refusal for a request the model admits but the service

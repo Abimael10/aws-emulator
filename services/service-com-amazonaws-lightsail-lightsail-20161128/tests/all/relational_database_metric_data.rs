@@ -11,9 +11,11 @@
 //! metric. So for every metric the catalog publishes, asked for in the unit that
 //! metric is published in, over any window at any granularity the model admits,
 //! the answer is HTTP 200 carrying the requested `metricName` and the datapoints
-//! the store has — none, because this emulator runs no database engine and
-//! measures nothing on one — the call writes nothing a later caller can see, a
-//! metric asked for in a unit it is not published in, a window whose end does not
+//! the store has for that window — none for every window these cases read,
+//! which all lie outside the instants the database has been publishing in (the
+//! series over a window it HAS published in is `resource_metric_series.rs`) —
+//! the call writes nothing a later caller can see, a metric asked for in a unit
+//! it is not published in, a window whose end does not
 //! follow its start, or a request naming no statistic is refused with the
 //! modelled 400 `InvalidInputException`, and a name no database record answers to
 //! earns the service's `DoesNotExist` envelope.
@@ -121,9 +123,10 @@ fn metric_data(case: &str, body: &Value) -> Vec<Value> {
 
 /// RULE: every metric the catalog publishes, asked for in the unit it is
 /// published in over a window at any granularity the model admits, is answered
-/// with the requested `metricName` and the observations the store holds for it —
-/// of which there are none, for every metric, every window and every database of
-/// the shared set.
+/// with the requested `metricName` and the observations the store holds for that
+/// window — of which a window lying outside the instants the database has
+/// published in holds none, whichever metric, granularity and database of the
+/// shared set the request names.
 #[tokio::test]
 async fn every_published_metric_answers_its_own_name_and_the_stored_series() {
     // Every metric is walked against every database of the shared set, so the
@@ -172,8 +175,8 @@ async fn every_published_metric_answers_its_own_name_and_the_stored_series() {
             let data = metric_data(&case, &body);
             assert!(
                 data.is_empty(),
-                "case {case}: this emulator runs no database engine and measures nothing on \
-                 one, so the series must carry no datapoints, got {data:?}"
+                "case {case}: the window lies outside the instants the database has published \
+                 in, so the series must carry no datapoints, got {data:?}"
             );
         }
     }

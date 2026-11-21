@@ -269,57 +269,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        let start_ms = epoch_millis(input.start_time, "startTime")?;
+        let end_ms = epoch_millis(input.end_time, "endTime")?;
+        let now = crate::state::now_ms();
+
         let metric_name = input.metric_name;
         let load_balancer_name = input.load_balancer_name;
+        let statistics = input.statistics;
+        let period = i64::from(input.period);
         crate::state::with_state(&*self.engine, |store| {
             // Metrics are reported for a load balancer this account HOLDS in the
             // Region the request is made in: a name no load balancer record of
             // that Region answers to earns the service's `DoesNotExist` envelope,
             // not an authoritative-looking empty series.
-            if store.load_balancer(&region, &load_balancer_name).is_none() {
+            let Some(load_balancer) = store.load_balancer(&region, &load_balancer_name) else {
                 return Err(not_found(&load_balancer_name));
-            }
+            };
+            // The series is the store's, not this handler's: a resource's
+            // telemetry is owned by `crate::state`, which cuts the requested
+            // window into one datapoint per `period` window the load balancer has
+            // published a sample in and fills each with the statistics the
+            // request asked for. A window before the load balancer existed, or
+            // one that has not happened, holds no sample and so no datapoint —
+            // which is what the service itself answers for a window it has no
+            // data for.
+            //
+            // What each of those samples MEASURED is zero, from the same owner:
+            // every load balancer metric is an amount of the traffic it carried
+            // or of the health checks it ran against its targets, and this
+            // emulator serves no request through a load balancer and runs no
+            // health check — which is why every registration stays in the
+            // modelled `initial` state, neither healthy nor unhealthy
+            // (`crate::state::INSTANCE_HEALTH_INITIAL`).
+            let metric_data = crate::state::load_balancer_metric_series(
+                load_balancer,
+                crate::state::MetricRead {
+                    metric_name: &metric_name,
+                    unit: published_unit,
+                    period_seconds: period,
+                    start_ms,
+                    end_ms,
+                    now_ms: now,
+                    statistics: &statistics,
+                },
+            );
             Ok(GetLoadBalancerMetricDataOutput {
                 // "The name of the metric returned" — the metric whose series
                 // this answer is, which is the one the request named.
                 metric_name: Some(metric_name.clone()),
-                // The datapoints the store holds for that metric over the
-                // requested window: NONE, for every window and every load
-                // balancer.
-                //
-                // Every load balancer metric is a measurement of the TRAFFIC a
-                // load balancer carried — the requests it processed, the response
-                // codes it and its target instances generated, the TLS
-                // negotiations that failed, the connections it rejected, how long
-                // a target took to answer — or of the HEALTH CHECKS it ran against
-                // its targets, which is what the healthy and unhealthy host
-                // counts count
-                // (`GetLoadBalancerMetricDataRequest$metricName`). This emulator
-                // serves no request through a load balancer and runs no health
-                // check against a registered instance — which is why every
-                // registration stays in the modelled `initial` state, neither
-                // healthy nor unhealthy
-                // (`crate::state::INSTANCE_HEALTH_INITIAL`) — so no observation of
-                // either kind was ever made in any of the period windows the
-                // request spans, whatever its `period`.
-                //
-                // An empty `metricData` says exactly that, and is what the
-                // service itself answers for a window it holds no data for — a
-                // window before the load balancer existed, say. A
-                // plausible-looking number per window would be invented telemetry
-                // a client could not tell from a measured one, and would
-                // contradict the rest of this store, where every alarm stays
-                // `INSUFFICIENT_DATA` because no metric of it has data
-                // (`crate::state::ALARM_STATE_INSUFFICIENT_DATA`) and
-                // `GetInstanceMetricData`, `GetContainerServiceMetricData` and
-                // `GetDistributionMetricData` report the same empty series. The
-                // `statistics` the request asked for select members OF a
-                // datapoint, so with no datapoints they have nothing to fill.
-                metric_data: Some(Vec::new()),
+                // "An array of objects that describe the metric data returned."
+                metric_data: Some(metric_data),
             })
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// `at` in epoch milliseconds — the unit this store's clock reads
+/// (`crate::state::now_ms`) — or this operation's refusal when `at` names an
+/// instant too far from the epoch to be one.
+fn epoch_millis(
+    at: ::aws_smithy_types::DateTime,
+    member: &str,
+) -> Result<i64, GetLoadBalancerMetricDataError> {
+    at.to_millis().map_err(|_| {
+        invalid(format!(
+            "{member} must name an instant within the range of epoch milliseconds"
+        ))
+    })
 }
 
 /// This operation's 400 refusal for a request the model admits but the service

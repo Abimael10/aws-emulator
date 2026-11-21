@@ -14,8 +14,10 @@
 //! served from, for every metric the catalog publishes, asked for in the unit
 //! that metric is published in, over any window at any granularity the model
 //! admits, the answer is HTTP 200 carrying the requested `metricName` and the
-//! datapoints the store has — none, because this emulator serves no viewer
-//! request through a distribution and measures nothing on one — the call writes
+//! datapoints the store has for that window — none for every window these cases
+//! read, which all lie outside the instants the distribution has been publishing
+//! in (the series over a window it HAS published in is
+//! `resource_metric_series.rs`) — the call writes
 //! nothing a later caller can see, a metric asked for in a unit it is not
 //! published in, a window whose end does not follow its start, or a request
 //! naming no statistic is refused with the modelled 400 `InvalidInputException`,
@@ -286,8 +288,8 @@ async fn every_published_metric_answers_its_own_name_and_the_stored_series() {
         let data = metric_data(&case, &body);
         assert!(
             data.is_empty(),
-            "case {case}: this emulator serves no viewer request through a distribution, so the \
-             series must carry no datapoints, got {data:?}"
+            "case {case}: the window lies outside the instants the distribution has published \
+             in, so the series must carry no datapoints, got {data:?}"
         );
     }
 }

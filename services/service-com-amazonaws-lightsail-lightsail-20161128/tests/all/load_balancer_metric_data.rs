@@ -11,10 +11,12 @@
 //! the observations it holds for that metric. So for every metric the service
 //! publishes, asked for in the unit that metric is published in, over any window
 //! at any granularity the model admits, the answer is HTTP 200 carrying the
-//! requested `metricName` and the datapoints the store has — none, because this
-//! emulator serves no traffic through a load balancer and runs no health check
-//! against a registered instance — the call writes nothing a later caller can
-//! see, a metric asked for in a unit it is not published in, a window whose end
+//! requested `metricName` and the datapoints the store has for that window —
+//! none for every window these cases read, which all lie outside the instants
+//! the load balancer has been publishing in (the series over a window it HAS
+//! published in is `resource_metric_series.rs`) — the call writes nothing a
+//! later caller can see, a metric asked for in a unit it is not published in, a
+//! window whose end
 //! does not follow its start, or a request naming no statistic is refused with
 //! the modelled 400 `InvalidInputException`, and a name no load balancer record
 //! of that Region answers to earns the service's `DoesNotExist` envelope.
@@ -214,8 +216,8 @@ async fn every_published_metric_answers_its_own_name_and_the_stored_series() {
         let data = metric_data(&case, &body);
         assert!(
             data.is_empty(),
-            "case {case}: this emulator carries no traffic through a load balancer and runs no \
-             health check, so the series must carry no datapoints, got {data:?}"
+            "case {case}: the window lies outside the instants the load balancer has published \
+             in, so the series must carry no datapoints, got {data:?}"
         );
     }
 }
@@ -362,8 +364,8 @@ async fn registering_instances_adds_no_host_count_datapoint() {
             let data = metric_data(&case, &body);
             assert!(
                 data.is_empty(),
-                "case {case}: no health check ran, so the series must carry no datapoints, got \
-                 {data:?}"
+                "case {case}: the window lies outside the instants the load balancer has \
+                 published in, so the series must carry no datapoints, got {data:?}"
             );
         }
     }

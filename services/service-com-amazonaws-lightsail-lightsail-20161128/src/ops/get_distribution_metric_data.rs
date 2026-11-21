@@ -312,49 +312,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        let start_ms = epoch_millis(input.start_time, "startTime")?;
+        let end_ms = epoch_millis(input.end_time, "endTime")?;
+        let now = crate::state::now_ms();
+
         let metric_name = input.metric_name;
         let distribution_name = input.distribution_name;
+        let statistics = input.statistics;
+        let period = i64::from(input.period);
         crate::state::with_state(&*self.engine, |store| {
             // Metrics are reported for a distribution this account HOLDS: a name
             // no distribution record answers to earns the service's
             // `DoesNotExist` envelope, not an authoritative-looking empty series.
-            if store.distribution(&distribution_name).is_none() {
+            let Some(distribution) = store.distribution(&distribution_name) else {
                 return Err(not_found(&distribution_name));
-            }
+            };
+            // The series is the store's, not this handler's: a resource's
+            // telemetry is owned by `crate::state`, which cuts the requested
+            // window into one datapoint per `period` window the distribution has
+            // published a sample in and fills each with the statistics the
+            // request asked for. A window before the distribution existed, or one
+            // that has not happened, holds no sample and so no datapoint — which
+            // is what the service itself answers for a window it has no data for.
+            //
+            // What each of those samples MEASURED is zero, from the same owner:
+            // every distribution metric is an amount of the viewer requests the
+            // caching network served, the bytes they moved, or the share of them
+            // answered with an error status, and this emulator serves no viewer
+            // request through a distribution.
+            let metric_data = crate::state::distribution_metric_series(
+                distribution,
+                crate::state::MetricRead {
+                    metric_name: &metric_name,
+                    unit: published_unit,
+                    period_seconds: period,
+                    start_ms,
+                    end_ms,
+                    now_ms: now,
+                    statistics: &statistics,
+                },
+            );
             Ok(GetDistributionMetricDataOutput {
                 // "The name of the metric returned" — the metric whose series
                 // this answer is, which is the one the request named.
                 metric_name: Some(metric_name.clone()),
-                // The datapoints the store holds for that metric over the
-                // requested window: NONE, for every window and every
-                // distribution.
-                //
-                // Every distribution metric is a measurement taken on the viewer
-                // TRAFFIC a caching network served — the requests viewers made,
-                // the bytes downloaded to them and uploaded to the origin, and
-                // the share of those requests answered with a 4xx or a 5xx status
-                // (`GetDistributionMetricDataRequest$metricName`). This emulator
-                // serves no viewer request through a distribution and monitors
-                // none, so no observation was ever made in any of the period
-                // windows the request spans, whatever its `period`.
-                //
-                // An empty `metricData` says exactly that, and is what the
-                // service itself answers for a window it holds no data for — a
-                // window before the distribution existed, say. A
-                // plausible-looking number per window would be invented telemetry
-                // a client could not tell from a measured one, and would
-                // contradict the rest of this store, where every alarm stays
-                // `INSUFFICIENT_DATA` because no metric of it has data
-                // (`crate::state::ALARM_STATE_INSUFFICIENT_DATA`) and
-                // `GetInstanceMetricData` and `GetContainerServiceMetricData`
-                // report the same empty series. The `statistics` the request
-                // asked for select members OF a datapoint, so with no datapoints
-                // they have nothing to fill.
-                metric_data: Some(Vec::new()),
+                // "An array of objects that describe the metric data returned."
+                metric_data: Some(metric_data),
             })
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// `at` in epoch milliseconds — the unit this store's clock reads
+/// (`crate::state::now_ms`) — or this operation's refusal when `at` names an
+/// instant too far from the epoch to be one.
+fn epoch_millis(
+    at: ::aws_smithy_types::DateTime,
+    member: &str,
+) -> Result<i64, GetDistributionMetricDataError> {
+    at.to_millis().map_err(|_| {
+        invalid(format!(
+            "{member} must name an instant within the range of epoch milliseconds"
+        ))
+    })
 }
 
 /// This operation's 400 refusal for a request the model admits but the service

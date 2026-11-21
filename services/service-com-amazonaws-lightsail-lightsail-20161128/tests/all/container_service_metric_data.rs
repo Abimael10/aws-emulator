@@ -11,8 +11,11 @@
 //! and on the observations it holds for that metric. So for every metric the model
 //! publishes, over any window at any granularity the model admits and for any
 //! statistic set, the answer is HTTP 200 carrying the requested `metricName` and
-//! the datapoints the store has — none, because this emulator runs no container
-//! and measures nothing on one — the call writes nothing a later caller can see, a
+//! the datapoints the store has for that window — none for every window these
+//! cases read, which all lie outside the instants the container service has been
+//! publishing in (the series over a window it HAS published in is
+//! `resource_metric_series.rs`) — the call writes nothing a later caller can
+//! see, a
 //! window whose end does not follow its start or a request naming no statistic is
 //! refused with the modelled 400 `InvalidInputException`, and a name no container
 //! service of that region answers to earns the service's `DoesNotExist` envelope.
@@ -317,8 +320,8 @@ async fn every_published_metric_answers_its_own_name_and_the_stored_series() {
             let data = metric_data(&case, &body);
             assert!(
                 data.is_empty(),
-                "case {case}: this emulator runs no container, so the series must carry no \
-                 datapoints, got {data:?}"
+                "case {case}: the window lies outside the instants the container service has \
+                 published in, so the series must carry no datapoints, got {data:?}"
             );
         }
     }

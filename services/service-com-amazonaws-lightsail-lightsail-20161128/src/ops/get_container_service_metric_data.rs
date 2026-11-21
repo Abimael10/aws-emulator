@@ -111,6 +111,35 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Every metric a container service publishes, each with the `unit` its data is
+/// published in.
+///
+/// The list is the modelled `GetContainerServiceMetricDataRequest$metricName`
+/// documentation — "Valid container service metric names are listed below, along
+/// with the most useful statistics to include in your request, and the published
+/// unit value" — and the `unit` of each row is the "published unit" that entry
+/// states: "Unit: The published unit is Percent" for both. Source:
+/// `smithy_query(query="doc",shape="GetContainerServiceMetricDataRequest",member="metricName")`.
+///
+/// It covers every member of the modelled `ContainerServiceMetricName` enum,
+/// which is what this operation's boundary walk admits. This request carries no
+/// `unit` member, so nothing is validated against this list: it is what each
+/// datapoint of the answered series reports as its own `unit`.
+///
+/// It lives beside the one operation that reads it, the way
+/// `super::get_distribution_metric_data::DISTRIBUTION_METRIC_UNITS` does.
+pub const CONTAINER_SERVICE_METRIC_UNITS: &[(&str, &str)] =
+    &[("CPUUtilization", "Percent"), ("MemoryUtilization", "Percent")];
+
+/// The unit the container service metric `metric_name` is published in, or
+/// `None` when this catalog does not know the metric.
+pub fn container_service_metric_unit(metric_name: &str) -> Option<&'static str> {
+    CONTAINER_SERVICE_METRIC_UNITS
+        .iter()
+        .find(|(name, _)| *name == metric_name)
+        .map(|(_, unit)| *unit)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -226,53 +255,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Each metric's own entry states the ONE unit it is published in
+        // ([`CONTAINER_SERVICE_METRIC_UNITS`]), and every datapoint of the
+        // answered series carries it. This request has no `unit` member, so
+        // nothing is refused here.
+        let Some(published_unit) = container_service_metric_unit(&input.metric_name) else {
+            // Unreachable while the catalog covers the modelled
+            // `ContainerServiceMetricName` enum, which the boundary walk
+            // restricts `metricName` to. A metric the model gains and the
+            // catalog does not know yet has no published unit here, so it is
+            // honestly "not written yet" rather than refused or answered.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "GetContainerServiceMetricData for the container service metric {}",
+                input.metric_name
+            )));
+        };
+
+        let start_ms = epoch_millis(input.start_time, "startTime")?;
+        let end_ms = epoch_millis(input.end_time, "endTime")?;
+        let now = crate::state::now_ms();
+
         let metric_name = input.metric_name;
         let service_name = input.service_name;
+        let statistics = input.statistics;
+        let period = i64::from(input.period);
         crate::state::with_state(&*self.engine, |store| {
             // Metrics are reported for a container service this account HOLDS in
             // the region the request is made in: a name no container service
             // record of that region answers to earns the service's `DoesNotExist`
             // envelope, not an authoritative-looking empty series.
-            if store.container_service(&region, &service_name).is_none() {
+            let Some(service) = store.container_service(&region, &service_name) else {
                 return Err(not_found(&service_name));
-            }
+            };
+            // The series is the store's, not this handler's: a resource's
+            // telemetry is owned by `crate::state`, which cuts the requested
+            // window into one datapoint per `period` window the container service
+            // has published a sample in and fills each with the statistics the
+            // request asked for. A window before the container service existed,
+            // or one that has not happened, holds no sample and so no datapoint —
+            // which is what the service itself answers for a window it has no
+            // data for.
+            //
+            // What each of those samples MEASURED is zero, from the same owner:
+            // both metrics are the average share of the compute units and of the
+            // memory in use across the service's nodes, and this emulator runs no
+            // container on any node.
+            let metric_data = crate::state::container_service_metric_series(
+                service,
+                crate::state::MetricRead {
+                    metric_name: &metric_name,
+                    unit: published_unit,
+                    period_seconds: period,
+                    start_ms,
+                    end_ms,
+                    now_ms: now,
+                    statistics: &statistics,
+                },
+            );
             Ok(GetContainerServiceMetricDataOutput {
                 // "The name of the metric returned" — the metric whose series
                 // this answer is, which is the one the request named.
                 metric_name: Some(metric_name.clone()),
-                // The datapoints the store holds for that metric over the
-                // requested window: NONE, for every window and every container
-                // service.
-                //
-                // Both container service metrics are measurements taken on
-                // RUNNING container nodes — `CPUUtilization` is "the average
-                // percentage of compute units that are currently in use across
-                // all nodes of the container service" and `MemoryUtilization`
-                // the same for available memory
-                // (`GetContainerServiceMetricDataRequest$metricName`). This
-                // emulator runs no container and monitors no node, so no
-                // observation was ever made in any of the period windows the
-                // request spans, whatever its `period` and whichever granularity
-                // the metric is published at ("All container service metric data
-                // is available in 5-minute (300 seconds) granularity", from the
-                // modelled `period` member).
-                //
-                // An empty `metricData` says exactly that, and is what the
-                // service itself answers for a window it holds no data for — a
-                // window before the container service existed, say. A
-                // plausible-looking number per window would be invented
-                // telemetry a client could not tell from a measured one, and
-                // would contradict the rest of this store, where every alarm
-                // stays `INSUFFICIENT_DATA` because no metric of it has data
-                // (`crate::state::ALARM_STATE_INSUFFICIENT_DATA`) and
-                // `GetInstanceMetricData` reports the same empty series. The
-                // `statistics` the request asked for select members OF a
-                // datapoint, so with no datapoints they have nothing to fill.
-                metric_data: Some(Vec::new()),
+                // "An array of objects that describe the metric data returned."
+                metric_data: Some(metric_data),
             })
         })
         .ok_or_else(unavailable)?
     }
+}
+
+/// `at` in epoch milliseconds — the unit this store's clock reads
+/// (`crate::state::now_ms`) — or this operation's refusal when `at` names an
+/// instant too far from the epoch to be one.
+fn epoch_millis(
+    at: ::aws_smithy_types::DateTime,
+    member: &str,
+) -> Result<i64, GetContainerServiceMetricDataError> {
+    at.to_millis().map_err(|_| {
+        invalid(format!(
+            "{member} must name an instant within the range of epoch milliseconds"
+        ))
+    })
 }
 
 /// This operation's 400 refusal for a request the model admits but the service
