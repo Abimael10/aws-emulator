@@ -32,6 +32,12 @@
 //! whether the account holds the secret at all, and whether IAM holds the execution role at
 //! all — plus, for the running rows, the environment variable the value is exposed under.
 //!
+//! The last two tables carry that same rule over a container taking SEVERAL `secrets` entries
+//! at once, because each entry is retrieved on its own: the rows there differ along the COUNT
+//! of references one container takes, the form each of them is written with — the secret's ARN
+//! alone against a JSON key with the version positions written out, empty or left off — and
+//! WHICH of a container's entries is the one the execution role may not retrieve.
+//!
 //! Nothing here reaches into any state struct: every value asserted is read back through
 //! `DescribeTasks` and CloudWatch Logs' own `GetLogEvents`/`DescribeLogStreams`, and the
 //! secret's value is the one Secrets Manager's own `CreateSecret` stored. The `stoppedReason`
@@ -915,6 +921,326 @@ async fn a_secret_the_execution_role_may_not_retrieve_fails_the_task_at_start() 
         assert!(
             streams.is_empty(),
             "case {name:?}: expected no stream in {LOG_GROUP} for this task, got {streams:?}"
+        );
+    }
+}
+
+/// Register one revision of `family` whose single container takes EVERY entry of `entries` as
+/// a `secrets` entry — each pair the environment variable the value is exposed under and the
+/// `valueFrom` that selects it — and runs a program that writes all of those variables, in the
+/// order the revision lists them, as one line of its `awslogs` stream.
+///
+/// `roles` is the revision's `(executionRoleArn, taskRoleArn)`.
+async fn register_entries(
+    router: &MultiServiceRouter,
+    family: &str,
+    roles: (&str, &str),
+    entries: &[(&str, String)],
+    case: &str,
+) {
+    let (execution_role_arn, task_role_arn) = roles;
+    let secrets: Vec<Value> = entries
+        .iter()
+        .map(|(variable, value_from)| json!({ "name": variable, "valueFrom": value_from }))
+        .collect();
+    // One line carrying every variable, so what the stream holds says what each entry alone
+    // resolved to: a variable nothing was injected for is written as the empty field it is.
+    let program = entries
+        .iter()
+        .map(|(variable, _)| format!("{variable}=${variable}"))
+        .collect::<Vec<String>>()
+        .join("|");
+    ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": family,
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            // A documented Fargate task size: 256 CPU units, 512 MiB.
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": execution_role_arn,
+            "taskRoleArn": task_role_arn,
+            "containerDefinitions": [{
+                "name": CONTAINER,
+                "image": IMAGE,
+                "command": ["sh", "-c", format!("echo \"{program}\"")],
+                "secrets": secrets,
+                "logConfiguration": {
+                    "logDriver": "awslogs",
+                    "options": {
+                        "awslogs-group": LOG_GROUP,
+                        "awslogs-region": SIGNED_REGION,
+                        "awslogs-stream-prefix": STREAM_PREFIX,
+                    },
+                },
+            }],
+        }),
+        case,
+    )
+    .await;
+}
+
+/// The one document the entries of [`ENTRIES`] all select out of, as `CreateSecret` stored it.
+const MIXED_DOCUMENT: &str = "{\"HOST\":\"db.internal\",\"PASSWORD\":\"p4ss-only\",\"PORT\":5432}";
+
+/// One `secrets` entry of a container that takes SEVERAL: the form its `valueFrom` is written
+/// with after the secret's own ARN, and the value that entry alone resolves to.
+struct Entry {
+    case: &'static str,
+    /// The environment variable the entry exposes its value under.
+    variable: &'static str,
+    /// What is written after the secret's ARN: the JSON key and the version positions, empty
+    /// for a reference to the whole value.
+    selector: &'static str,
+    /// The value the container's process is given for it.
+    injected: &'static str,
+}
+
+/// Every entry of ONE container, all naming the same secret through a different form.
+const ENTRIES: &[Entry] = &[
+    Entry {
+        case: "the secret's ARN alone, which is the whole document",
+        variable: "WHOLE_DOCUMENT",
+        selector: "",
+        injected: MIXED_DOCUMENT,
+    },
+    Entry {
+        case: "a JSON key with both version positions left empty",
+        variable: "JUST_PASSWORD",
+        selector: ":PASSWORD::",
+        injected: "p4ss-only",
+    },
+    Entry {
+        case: "a JSON key with no version position written at all",
+        variable: "JUST_HOST",
+        selector: ":HOST",
+        injected: "db.internal",
+    },
+    Entry {
+        case: "a JSON key beside the staging label of the current version",
+        variable: "STAGED_PASSWORD",
+        selector: ":PASSWORD:AWSCURRENT:",
+        injected: "p4ss-only",
+    },
+    Entry {
+        case: "a JSON key whose value is a number, as the document writes it",
+        variable: "JUST_PORT",
+        selector: ":PORT::",
+        injected: "5432",
+    },
+];
+
+/// RULE, carried over a container taking SEVERAL entries: every `secrets` entry of a container
+/// the EXECUTION role may retrieve is resolved on its own and exposed under its own name — a
+/// reference naming a JSON key within the secret gives that key's value and nothing else of
+/// the document, and the bare ARN beside it gives the whole document.
+#[tokio::test]
+async fn every_secrets_entry_of_one_container_resolves_on_its_own() {
+    let name = "several reference forms in one container";
+    let router = emulator();
+    let cluster = "secretforms";
+    create_cluster(&router, cluster, name).await;
+    create_log_group(&router, name).await;
+
+    let secret_arn = create_secret(&router, "mixed-forms", MIXED_DOCUMENT, name).await;
+    // The EXECUTION role is the one the retrieval is made by, so it is the one that carries
+    // the grant; the task role carries none, which is not what decides any of these entries.
+    let execution_role_arn = role(
+        &router,
+        "forms-exec",
+        Some(secret_policy(&[("Allow", &secret_arn)])),
+        name,
+    )
+    .await;
+    let task_role_arn = role(&router, "forms-task", None, name).await;
+
+    let entries: Vec<(&str, String)> = ENTRIES
+        .iter()
+        .map(|entry| (entry.variable, format!("{secret_arn}{}", entry.selector)))
+        .collect();
+    let family = "secretforms";
+    register_entries(
+        &router,
+        family,
+        (&execution_role_arn, &task_role_arn),
+        &entries,
+        name,
+    )
+    .await;
+    let task_arn = run_task(&router, cluster, family, name).await;
+
+    let events = poll_for_output(&router, &task_arn, name).await;
+    let expected = ENTRIES
+        .iter()
+        .map(|entry| format!("{}={}", entry.variable, entry.injected))
+        .collect::<Vec<String>>()
+        .join("|");
+    assert_eq!(
+        events,
+        vec![expected.clone()],
+        "case {name:?}: expected the container to write {expected:?} to {}, got {events:?}",
+        stream_of(&task_arn)
+    );
+    // And each entry on its own, so a row that resolved to the wrong value names itself.
+    let written: Vec<&str> = events
+        .first()
+        .map(|line| line.split('|').collect())
+        .unwrap_or_default();
+    for entry in ENTRIES {
+        let case = entry.case;
+        let pair = format!("{}={}", entry.variable, entry.injected);
+        assert!(
+            written.contains(&pair.as_str()),
+            "case {case:?}: expected the container to be given {pair:?}, it wrote {written:?}"
+        );
+    }
+
+    let (task, seen) = poll_to_stopped(&router, cluster, &task_arn, name).await;
+    assert!(
+        seen.contains(&RUNNING.to_string()),
+        "case {name:?}: expected the task to report {RUNNING} on its way, saw {seen:?}"
+    );
+    let containers = list(&task, "containers", name);
+    let exit_code = present_count(&containers[0], "exitCode", name);
+    assert_eq!(
+        exit_code,
+        Some(0),
+        "case {name:?}: expected exitCode 0, got {exit_code:?} in {task}"
+    );
+}
+
+/// One row of the mixed-entry refusal table: which of a container's two `secrets` entries the
+/// EXECUTION role may not retrieve.
+struct MixedRefusal {
+    case: &'static str,
+    /// The index, in the revision's own order, of the entry the execution role is given no
+    /// grant for — the task role is given it instead, which is the misconfiguration the rule
+    /// is about.
+    denied: usize,
+}
+
+const MIXED_REFUSALS: &[MixedRefusal] = &[
+    MixedRefusal {
+        case: "the first of the container's two entries, a bare ARN",
+        denied: 0,
+    },
+    MixedRefusal {
+        case: "the second of them, written with a JSON key selector",
+        denied: 1,
+    },
+];
+
+/// RULE, the refusing half carried over a container taking SEVERAL entries: ONE entry the
+/// EXECUTION role may not retrieve launches no container of the task, however many of its
+/// other entries that role may retrieve — the task stops under `TaskFailedToStart` with the
+/// agent's `ResourceInitializationError` naming the session of the EXECUTION role, the action
+/// a retrieval needs and the secret that entry names, and nothing is delivered for it.
+#[tokio::test]
+async fn one_entry_the_execution_role_may_not_retrieve_fails_the_whole_task() {
+    for (index, row) in MIXED_REFUSALS.iter().enumerate() {
+        let case = row.case;
+        let router = emulator();
+        let cluster = "mixedsecrets";
+        create_cluster(&router, cluster, case).await;
+        create_log_group(&router, case).await;
+
+        // Two secrets, referenced by the one container through the two forms: the first whole,
+        // the second through a JSON key of the document it holds.
+        let plain_arn = create_secret(&router, &format!("plain-{index}"), "plain-value", case).await;
+        let document_arn = create_secret(
+            &router,
+            &format!("document-{index}"),
+            "{\"PASSWORD\":\"p4ss-only\"}",
+            case,
+        )
+        .await;
+        let entries: Vec<(&str, String)> = vec![
+            ("FIRST_VALUE", plain_arn.clone()),
+            ("SECOND_PASSWORD", format!("{document_arn}:PASSWORD::")),
+        ];
+        let arns = [plain_arn.as_str(), document_arn.as_str()];
+        let denied_arn = arns[row.denied];
+        let readable_arn = arns[1 - row.denied];
+
+        // The execution role may retrieve the OTHER secret, and the task role is given the
+        // grant for the denied one: the role the retrieval is made by is what decides it.
+        let execution_role_name = format!("mixed-exec-{index}");
+        let execution_role_arn = role(
+            &router,
+            &execution_role_name,
+            Some(secret_policy(&[("Allow", readable_arn)])),
+            case,
+        )
+        .await;
+        let task_role_arn = role(
+            &router,
+            &format!("mixed-task-{index}"),
+            Some(secret_policy(&[("Allow", denied_arn)])),
+            case,
+        )
+        .await;
+
+        let family = format!("mixedsecrets{index}");
+        register_entries(
+            &router,
+            &family,
+            (&execution_role_arn, &task_role_arn),
+            &entries,
+            case,
+        )
+        .await;
+        let task_arn = run_task(&router, cluster, &family, case).await;
+
+        let (task, seen) = poll_to_stopped(&router, cluster, &task_arn, case).await;
+        assert!(
+            !seen.contains(&RUNNING.to_string()),
+            "case {case:?}: a task one of whose secrets could not be retrieved never runs, saw \
+             {seen:?}"
+        );
+        assert_eq!(
+            task["stopCode"],
+            json!(TASK_FAILED_TO_START),
+            "case {case:?}: expected stopCode {TASK_FAILED_TO_START}, got {task}"
+        );
+        let reason = string(&task, "stoppedReason", case);
+        assert!(
+            reason.starts_with(RESOURCE_INITIALIZATION_ERROR),
+            "case {case:?}: expected a reason beginning {RESOURCE_INITIALIZATION_ERROR:?}, got \
+             {reason:?}"
+        );
+        // The refusal is about the entry the grant was withheld for, named by the session of
+        // the EXECUTION role the retrieval was made in.
+        let session_arn = format!(
+            "arn:aws:sts::{ACCOUNT}:assumed-role/{execution_role_name}/{}",
+            task_id_of(&task_arn)
+        );
+        let refusal = format!(
+            "User: {session_arn} is not authorized to perform: {GET_SECRET_VALUE} on resource: \
+             {denied_arn}"
+        );
+        assert!(
+            reason.contains(&refusal),
+            "case {case:?}: expected the reason to carry {refusal:?}, got {reason:?}"
+        );
+        assert!(
+            !reason.contains(readable_arn),
+            "case {case:?}: expected the reason to name only the refused secret, got {reason:?}"
+        );
+        // No container started, so none reports a status it exited with, and nothing of either
+        // value reached the log group its configuration names.
+        let containers = list(&task, "containers", case);
+        let exit_code = present_count(&containers[0], "exitCode", case);
+        assert_eq!(
+            exit_code, None,
+            "case {case:?}: a container that never ran reports no exitCode, got {exit_code:?} \
+             in {task}"
+        );
+        let streams = streams_of(&router, &task_arn, case).await;
+        assert!(
+            streams.is_empty(),
+            "case {case:?}: expected no stream in {LOG_GROUP} for this task, got {streams:?}"
         );
     }
 }
