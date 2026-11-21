@@ -3165,19 +3165,47 @@ pub fn repository_endpoint_path(format: &str, repository: &str) -> String {
     format!("/{format}/{repository}/")
 }
 
-/// The ARN of the S3 bucket a domain stores its package assets in: the asset bucket of
-/// the account that OWNS the domain, in the Region the domain lives in.
+/// The ARN of the S3 bucket a domain stores its package assets in: the SERVICE's own
+/// asset bucket for the Region the domain lives in.
 ///
-/// CodeArtifact keeps those assets in one bucket per account and Region, named
-/// `assets-<domain-owner>-<region>`, so the ARN carries exactly those two suffix
-/// components and nothing per-domain or per-call: every domain an account owns in one
-/// Region reports the same bucket, and the value a domain reports is the same string for
-/// its whole lifetime. An S3 ARN carries NO region or account segment of its own, so this
-/// one cannot go through `engine::emulator_arn` (which always writes both) and is
-/// formatted here instead; the partition is the same `aws` that helper uses, so every ARN
-/// this service emits agrees on it.
-pub fn asset_bucket_arn(region: &str, domain_owner: &str) -> String {
-    format!("arn:aws:s3:::assets-{domain_owner}-{region}")
+/// CodeArtifact — not the caller — owns the bucket that holds a domain's package assets,
+/// one per Region, named `assets-<asset-bucket-account>-<region>`: the account component
+/// is the service's account for that Region ([`asset_bucket_account`]) and is therefore
+/// unrelated to the account that owns the domain, which is reported separately as
+/// `DomainDescription$owner`. The ARN carries exactly those two suffix components and
+/// nothing per-domain or per-call: every domain in one Region reports the same bucket, and
+/// the value a domain reports is the same string for its whole lifetime. An S3 ARN carries
+/// NO region or account segment of its own, so this one cannot go through
+/// `engine::emulator_arn` (which always writes both) and is formatted here instead; the
+/// partition is the same `aws` that helper uses, so every ARN this service emits agrees on
+/// it.
+pub fn asset_bucket_arn(region: &str) -> String {
+    format!("arn:aws:s3:::assets-{}-{region}", asset_bucket_account(region))
+}
+
+/// The 12-digit account the service's asset bucket of one Region lives in — a property of
+/// the REGION alone, never of the caller or of a domain.
+///
+/// The bucket that stores package assets belongs to the service itself, so its account is
+/// not the one the caller holds: it is derived from the Region (and from this service's own
+/// name, so two services deriving a Region-scoped account do not land on one value), which
+/// keeps it stable across reads and across restarts while giving each Region its own.
+///
+/// The derivation is kept inside the leading-zero, non-routable family the account id this
+/// emulator presents as the caller's belongs to (`engine::EMULATOR_ACCOUNT_ID`), so the
+/// value discloses no account that could be anyone's, and it is never zero, so it is never
+/// that account id itself.
+pub fn asset_bucket_account(region: &str) -> String {
+    /// How many distinct asset-bucket accounts the derivation can land on. Four significant
+    /// digits keep the value inside the placeholder family (eight leading zeros) while
+    /// leaving room for every Region to get its own.
+    const ACCOUNTS: u32 = 9_999;
+
+    let digest = identity_digest(&[SERVICE_SIGNING_NAME, "asset-bucket-account", region]);
+    let mut head = [0_u8; 4];
+    head.copy_from_slice(&digest[..4]);
+    // 1.. rather than 0.., so the account is never the one the caller's own ARNs carry.
+    format!("{:012}", 1 + u32::from_be_bytes(head) % ACCOUNTS)
 }
 
 /// The internal id this service knows one repository by — the `repoId` a refusal that

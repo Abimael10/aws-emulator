@@ -265,7 +265,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // managed key it selects for the account and Region when the caller named
             // none — and reports the key, as its ARN, either way.
             encryption_key,
-            s3_bucket_arn: crate::state::asset_bucket_arn(&region, &owner),
+            // The bucket that holds a domain's package assets is the SERVICE's own, one
+            // per Region — so its ARN is derived from the Region alone and its account
+            // component is not this account, which `owner` above reports.
+            s3_bucket_arn: crate::state::asset_bucket_arn(&region),
             tags,
             policy: None,
             repositories: ::std::collections::BTreeMap::new(),

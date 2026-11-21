@@ -11,11 +11,12 @@
 //!
 //! The rules under test, each asserted over a TABLE of inputs rather than one example:
 //!
-//! 1. `DomainDescription$s3BucketArn` is the ARN of the asset bucket of the ACCOUNT and
-//!    REGION the domain lives in — `arn:aws:s3:::assets-<domain-owner>-<region>`, two
-//!    suffix components and nothing per-domain or per-call — so every domain of one
-//!    account and Region reports the same bucket and every read of one domain reports the
-//!    same string.
+//! 1. `DomainDescription$s3BucketArn` is the ARN of the SERVICE's asset bucket for the
+//!    Region the domain lives in — `arn:aws:s3:::assets-<asset-bucket-account>-<region>`,
+//!    two suffix components and nothing per-domain or per-call, whose account component is
+//!    the service's own and so never the account that owns the domain — and every read of
+//!    one domain reports the same string. `tests/all/domain_asset_bucket.rs` carries the
+//!    Region scoping of that bucket.
 //! 2. `DomainDescription$encryptionKey` is the ARN of the key the domain IS encrypted
 //!    with: a create that names a key reports the key KMS resolves that reference to,
 //!    whichever of the four spellings it used (key id, key ARN, alias name, alias ARN),
@@ -233,18 +234,12 @@ fn policy(answer: &Answer) -> &Value {
 }
 
 // ---------------------------------------------------------------------------
-// RULE 1: the asset bucket is the account's and Region's, not the domain's
+// RULE 1: the asset bucket is the SERVICE's, for the Region, not the caller's
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_asset_bucket_arn_is_the_account_and_region_bucket() {
+async fn the_asset_bucket_arn_is_the_service_bucket_of_the_region() {
     let router = emulator_with_kms();
-
-    // The bucket ARN of the account the domains are created in, in the Region they are
-    // signed for: `assets-<domain-owner>-<region>`, with an S3 ARN's empty region and
-    // account segments. Composed here from the owner and the Region the responses
-    // themselves report, so the row below asserts the RULE and not a literal.
-    let expected = format!("arn:aws:s3:::assets-{ACCOUNT}-{REGION}");
 
     // Rows differ along what a per-domain derivation would have varied over: the name's
     // length (the modelled extremes of `DomainName`, len 2..50), its character classes,
@@ -271,23 +266,35 @@ async fn the_asset_bucket_arn_is_the_account_and_region_bucket() {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        assert_eq!(
-            reported, expected,
-            "case {label:?}: expected the account's asset bucket, got {created:?}"
-        );
-        // The suffix is exactly two components: the owner the domain reports, and the
-        // Region. Nothing per-domain and nothing random follows them.
-        let owner = created.body["domain"]["owner"]
-            .as_str()
-            .unwrap_or_default()
+        // The suffix is exactly two components: an account, and the Region. Nothing
+        // per-domain and nothing random follows them — and the account is the service's
+        // own, so it is neither the account that owns the domain nor the one its ARN
+        // carries.
+        let bucket_account = reported
+            .strip_prefix("arn:aws:s3:::assets-")
+            .and_then(|suffix| suffix.strip_suffix(&format!("-{REGION}")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {label:?}: expected an asset bucket of the Region, \
+                     got {reported:?}"
+                )
+            })
             .to_string();
+        assert!(
+            bucket_account.len() == 12 && bucket_account.chars().all(|digit| digit.is_ascii_digit()),
+            "case {label:?}: expected a 12-digit account in the bucket name, \
+             got {bucket_account:?}"
+        );
+        assert_ne!(
+            bucket_account, ACCOUNT,
+            "case {label:?}: the asset bucket is the service's, not the caller's, \
+             got {reported:?}"
+        );
         assert_eq!(
-            reported
-                .strip_prefix("arn:aws:s3:::assets-")
-                .map(|suffix| suffix.split('-').count()),
-            Some(format!("{owner}-{REGION}").split('-').count()),
-            "case {label:?}: the bucket name must carry no segment beyond \
-             <owner>-<region>, got {reported:?}"
+            created.body["domain"]["owner"].as_str(),
+            Some(ACCOUNT),
+            "case {label:?}: expected the caller's account as the domain owner, \
+             got {created:?}"
         );
 
         // Every read of the domain reports the identical string — the create, the
@@ -295,13 +302,13 @@ async fn the_asset_bucket_arn_is_the_account_and_region_bucket() {
         let described = describe_domain(&router, domain).await;
         assert_eq!(
             described.body["domain"]["s3BucketArn"].as_str(),
-            Some(expected.as_str()),
+            Some(reported.as_str()),
             "case {label:?}: DescribeDomain must report the same bucket, got {described:?}"
         );
         let deleted = delete_domain(&router, domain).await;
         assert_eq!(
             (deleted.status, deleted.body["domain"]["s3BucketArn"].as_str()),
-            (200, Some(expected.as_str())),
+            (200, Some(reported.as_str())),
             "case {label:?}: DeleteDomain must report the same bucket, got {deleted:?}"
         );
     }
