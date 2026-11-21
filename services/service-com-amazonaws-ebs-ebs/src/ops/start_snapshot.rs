@@ -4,7 +4,8 @@
 //!
 //! Implemented: mints a snapshot, persists it in [`crate::state`] and answers from the
 //! stored record. `ClientToken` makes the call idempotent; `ParentSnapshotId` seeds the
-//! new snapshot with a copy of the parent's blocks.
+//! new snapshot with a copy of the parent's blocks, so the volume the request asks for
+//! must address at least as much as the parent's does.
 //!
 //! ## Shape of an operation
 //!
@@ -148,7 +149,7 @@ use std::time::SystemTime;
 
 use crate::state::kms_reference::{self, request_region, KeyReference};
 use crate::state::{
-    expiry_from_timeout, fingerprint_hex_sha256, invalid_volume_size_message,
+    blocks_in_volume, expiry_from_timeout, fingerprint_hex_sha256, invalid_volume_size_message,
     is_well_formed_snapshot_id, malformed_snapshot_id_message, snapshot_not_found_message,
     BlockEntry, Snapshot, SnapshotStatus, SseType, StartSnapshotIdempotencyRecord, StoredTag,
     CLIENT_TOKEN_CONFLICT_MESSAGE, DEFAULT_SNAPSHOT_TIMEOUT_MINUTES,
@@ -343,6 +344,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "snapshot {parent_id} is {} and cannot be used as ParentSnapshotId",
                             parent.status.as_wire()
                         ),
+                    ));
+                }
+                // A snapshot started from a parent begins holding the parent's blocks,
+                // which occupy the offsets the PARENT's volume addresses, while the new
+                // snapshot addresses only the offsets ITS OWN volume does
+                // ([`blocks_in_volume`], the same bound `PutSnapshotBlock` enforces). A
+                // request whose extent does not cover the parent's therefore asks for a
+                // snapshot that cannot address the content it starts from, so the size the
+                // request asked for is rejected, with the service's one template for a
+                // `VolumeSize` it will not accept.
+                if blocks_in_volume(input.volume_size) < blocks_in_volume(parent.volume_size) {
+                    return Err(validation(
+                        "INVALID_VOLUME_SIZE",
+                        invalid_volume_size_message(input.volume_size),
                     ));
                 }
                 (Some(parent.blocks.clone()), parent.sse_type)

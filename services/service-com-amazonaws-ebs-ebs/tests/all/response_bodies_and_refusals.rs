@@ -22,6 +22,7 @@
 //! 7. Every "that snapshot is not stored" refusal uses ONE template, in every operation
 //!    that resolves a snapshot id.
 
+use crate::declared_block_inputs::invalid_volume_size_message;
 use crate::snapshot_block_loop::{
     block_bytes, checksum, complete_snapshot, complete_snapshot_with_algorithm, get_block,
     list_blocks, listed_blocks, member, put_block, put_block_with_algorithm,
@@ -676,7 +677,7 @@ async fn an_out_of_range_volume_size_is_refused_with_the_service_template() {
         );
         assert_eq!(
             member(&reply, "Message"),
-            format!("Invalid volume size: {volume_size}"),
+            invalid_volume_size_message(*volume_size),
             "case {case:?}: the refusal must name only the rejected value, got {}",
             reply.json()
         );

@@ -19,6 +19,10 @@
 //!    and status for that condition.
 //! 5. A repeated `ClientToken` replays the first answer; a changed request under the
 //!    same token conflicts.
+//! 6. A snapshot's blocks all lie inside the extent its own `VolumeSize` addresses, the
+//!    blocks it inherits from a `ParentSnapshotId` included — so a `VolumeSize` that
+//!    could not address the parent's content is refused, and every index a snapshot
+//!    reports is an index it accepts a write at.
 //!
 //! The harness below (`router`, `Reply`, the per-operation request helpers) is
 //! `pub(crate)` so the sibling suites in `tests/all/` drive the same wire path instead of
@@ -31,6 +35,14 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ebs_ebs::EmulatedService;
+
+// The refusal of an out-of-extent `BlockIndex`, the extent arithmetic it is computed from
+// and the wording of a rejected `VolumeSize` are stated once, by the suite that owns the
+// declared-value refusals; the extent rule below reads them from there rather than
+// restating either the wording or the assertion.
+use crate::declared_block_inputs::{
+    assert_validation, beyond_extent_message, extent_limit, invalid_volume_size_message,
+};
 
 /// The only block size the EBS direct APIs support: `PutSnapshotBlockRequest$DataLength`
 /// documents "Currently, the only supported size is `524288` bytes. Valid values:
@@ -1452,4 +1464,329 @@ async fn starting_more_snapshots_than_the_store_holds_is_refused_with_a_quota_er
         listed.status,
         String::from_utf8_lossy(&listed.body)
     );
+}
+
+/// One lineage of the table: a sealed parent of `parent_volume_size` GiB holding
+/// `parent_blocks`, and the volumes a child of it is asked for.
+struct Lineage {
+    case: &'static str,
+    parent_volume_size: i64,
+    parent_blocks: &'static [(i32, u8)],
+    /// The `VolumeSize` values the child is started with — below, at and above the
+    /// parent's.
+    child_volume_sizes: &'static [i64],
+}
+
+/// Rows differ along what the rule generalises over: the parent's volume, how many blocks
+/// it holds and at which indexes (each parent's last addressable index, an index past a
+/// smaller volume's extent, and a parent holding no block at all), and how the child's
+/// requested volume compares with the parent's.
+const LINEAGES: &[Lineage] = &[
+    Lineage {
+        case: "a 1 GiB parent holding the last block its volume addresses",
+        parent_volume_size: 1,
+        parent_blocks: &[(2047, 41)],
+        child_volume_sizes: &[1, 2, 9],
+    },
+    Lineage {
+        case: "a 2 GiB parent holding a block past the extent of 1 GiB",
+        parent_volume_size: 2,
+        parent_blocks: &[(0, 42), (3000, 43)],
+        child_volume_sizes: &[1, 2, 3],
+    },
+    Lineage {
+        case: "a 4 GiB parent holding the last block its volume addresses",
+        parent_volume_size: 4,
+        parent_blocks: &[(8191, 44)],
+        child_volume_sizes: &[1, 3, 4, 5],
+    },
+    Lineage {
+        case: "a 3 GiB parent holding no block at all",
+        parent_volume_size: 3,
+        parent_blocks: &[],
+        child_volume_sizes: &[1, 2, 3, 4],
+    },
+];
+
+/// RULE 6, the create: a snapshot addresses exactly the indexes its own `VolumeSize`
+/// covers, so a child whose requested volume is smaller than the volume of the
+/// `ParentSnapshotId` it starts from — and would therefore begin life holding offsets it
+/// cannot address — is refused with the modelled `ValidationException`
+/// (`INVALID_VOLUME_SIZE`). A child at or above the parent's volume is accepted and
+/// inherits the parent's indexes, every one of them inside the volume the child reports.
+#[tokio::test]
+async fn a_child_snapshot_is_refused_a_volume_smaller_than_its_parents() {
+    let router = router();
+
+    for lineage in LINEAGES {
+        let parent = write_snapshot(
+            &router,
+            lineage.case,
+            lineage.parent_volume_size,
+            lineage.parent_blocks,
+        )
+        .await;
+        let parent_indexes: Vec<i32> = lineage
+            .parent_blocks
+            .iter()
+            .map(|(block_index, _)| *block_index)
+            .collect();
+
+        for child_volume_size in lineage.child_volume_sizes {
+            let case = format!("{}, child asked for {child_volume_size} GiB", lineage.case);
+            // A `ClientToken` makes the refusal's effect observable on the wire: an
+            // accepted create records the token against the snapshot it minted, so a
+            // second, identical request replays that answer. A refused one records
+            // nothing, so the same request earns the same refusal again.
+            let request = serde_json::json!({
+                "VolumeSize": child_volume_size,
+                "ParentSnapshotId": parent.clone(),
+                "ClientToken": format!("{parent}-{child_volume_size}"),
+            });
+            let reply = start_snapshot(&router, &request).await;
+
+            if *child_volume_size < lineage.parent_volume_size {
+                assert_validation(
+                    &case,
+                    &reply,
+                    "INVALID_VOLUME_SIZE",
+                    &invalid_volume_size_message(*child_volume_size),
+                );
+                assert!(
+                    reply.json().get("SnapshotId").is_none(),
+                    "case {case:?}: a refused StartSnapshot must mint no snapshot, got {}",
+                    reply.json()
+                );
+                let retried = start_snapshot(&router, &request).await;
+                assert_validation(
+                    &format!("{case}, repeated under the same ClientToken"),
+                    &retried,
+                    "INVALID_VOLUME_SIZE",
+                    &invalid_volume_size_message(*child_volume_size),
+                );
+                continue;
+            }
+
+            assert_eq!(
+                reply.status, 201,
+                "case {case:?}: a child at least as large as its parent must answer 201, got {} \
+                 with body {}",
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+            let child = member(&reply, "SnapshotId");
+            assert_eq!(
+                reply.json().get("VolumeSize").and_then(serde_json::Value::as_i64),
+                Some(*child_volume_size),
+                "case {case:?}: the child must report the volume it was started with, got {}",
+                reply.json()
+            );
+
+            // The child wrote no block of its own, so its `ChangedBlocksCount` is zero;
+            // sealing it is what makes the blocks it inherited readable.
+            let sealed = complete_snapshot(&router, &child, 0).await;
+            assert_eq!(
+                sealed.status, 202,
+                "case {case:?}: CompleteSnapshot must seal the child, got {} with body {}",
+                sealed.status,
+                String::from_utf8_lossy(&sealed.body)
+            );
+
+            let listing = list_blocks(&router, &child, "").await;
+            let indexes: Vec<i32> = listed_blocks(&listing)
+                .iter()
+                .map(|(block_index, _)| *block_index)
+                .collect();
+            assert_eq!(
+                indexes, parent_indexes,
+                "case {case:?}: the child must inherit exactly the parent's indexes, got \
+                 {indexes:?}"
+            );
+            assert_eq!(
+                listing
+                    .json()
+                    .get("VolumeSize")
+                    .and_then(serde_json::Value::as_i64),
+                Some(*child_volume_size),
+                "case {case:?}: the listing must report the child's own volume, got {}",
+                listing.json()
+            );
+            let limit = extent_limit(*child_volume_size);
+            for block_index in &indexes {
+                assert!(
+                    *block_index < limit,
+                    "case {case:?}: every index the child reports must lie inside the volume it \
+                     reports, got {block_index} against a first unaddressed index of {limit}"
+                );
+            }
+        }
+    }
+}
+
+/// One row of the extent-reconciliation table: a sealed parent, and the volume the child
+/// that starts from it is asked for.
+struct Inheritance {
+    case: &'static str,
+    parent_volume_size: i64,
+    parent_blocks: &'static [(i32, u8)],
+    child_volume_size: i64,
+}
+
+/// Rows differ in the parent's volume, the indexes it holds (its own last addressable one,
+/// and one past a smaller volume's extent), and how much larger the child is.
+const INHERITANCES: &[Inheritance] = &[
+    Inheritance {
+        case: "a 1 GiB parent, a child of the same volume",
+        parent_volume_size: 1,
+        parent_blocks: &[(2047, 51)],
+        child_volume_size: 1,
+    },
+    Inheritance {
+        case: "a 1 GiB parent, a child of four times the volume",
+        parent_volume_size: 1,
+        parent_blocks: &[(0, 52), (2047, 53)],
+        child_volume_size: 4,
+    },
+    Inheritance {
+        case: "a 2 GiB parent holding a block past the extent of 1 GiB",
+        parent_volume_size: 2,
+        parent_blocks: &[(3000, 54)],
+        child_volume_size: 2,
+    },
+];
+
+/// RULE 6, the read and write paths reconciled: the extent a snapshot reports its blocks
+/// at is the extent it accepts a write at, so every index a child inherited takes a write
+/// while the child is pending, the first index past the CHILD's own volume is refused as
+/// beyond the extent, and an index the parent's smaller volume could not address is
+/// accepted once the child's own volume covers it.
+#[tokio::test]
+async fn every_index_a_child_reports_is_one_it_also_accepts_a_write_at() {
+    for Inheritance {
+        case,
+        parent_volume_size,
+        parent_blocks,
+        child_volume_size,
+    } in INHERITANCES
+    {
+        let router = router();
+        let parent = write_snapshot(&router, case, *parent_volume_size, parent_blocks).await;
+        let started = start_snapshot(
+            &router,
+            &serde_json::json!({
+                "VolumeSize": child_volume_size,
+                "ParentSnapshotId": parent,
+            }),
+        )
+        .await;
+        assert_eq!(
+            started.status, 201,
+            "case {case:?}: StartSnapshot from a parent must answer 201, got {} with body {}",
+            started.status,
+            String::from_utf8_lossy(&started.body)
+        );
+        let child = member(&started, "SnapshotId");
+
+        // Every index the child inherited takes a write: it is inside the volume the
+        // child reports.
+        for (block_index, seed) in *parent_blocks {
+            let data = block_bytes(seed.wrapping_add(100));
+            let written = put_block(
+                &router,
+                &child,
+                *block_index,
+                data.clone(),
+                BLOCK_SIZE,
+                &checksum(&data),
+            )
+            .await;
+            assert_eq!(
+                written.status, 201,
+                "case {case:?}: the child must accept a write at the index {block_index} it \
+                 reports, got {} with body {}",
+                written.status,
+                String::from_utf8_lossy(&written.body)
+            );
+        }
+
+        // The first index past the CHILD's own volume is beyond the extent, whatever the
+        // parent's volume was.
+        let beyond = extent_limit(*child_volume_size);
+        let beyond_bytes = block_bytes(60);
+        let refused = put_block(
+            &router,
+            &child,
+            beyond,
+            beyond_bytes.clone(),
+            BLOCK_SIZE,
+            &checksum(&beyond_bytes),
+        )
+        .await;
+        assert_validation(
+            &format!("{case}, written at {beyond}"),
+            &refused,
+            "INVALID_BLOCK",
+            &beyond_extent_message(beyond),
+        );
+
+        // An index the PARENT's volume could not address is accepted when the child's own
+        // volume does, which is what makes the bound the child's own rather than inherited.
+        let grew = child_volume_size > parent_volume_size;
+        if grew {
+            let past_parent = extent_limit(*parent_volume_size);
+            let data = block_bytes(61);
+            let accepted = put_block(
+                &router,
+                &child,
+                past_parent,
+                data.clone(),
+                BLOCK_SIZE,
+                &checksum(&data),
+            )
+            .await;
+            assert_eq!(
+                accepted.status, 201,
+                "case {case:?}: index {past_parent} lies inside the child's own volume and must \
+                 be accepted, got {} with body {}",
+                accepted.status,
+                String::from_utf8_lossy(&accepted.body)
+            );
+        }
+
+        // Sealed, the child reports exactly what it accepted — every index inside the
+        // volume it reports, each one fetchable through the token it was listed under.
+        let changed_blocks = i32::try_from(parent_blocks.len())
+            .expect("a small block count")
+            + i32::from(grew);
+        let sealed = complete_snapshot(&router, &child, changed_blocks).await;
+        assert_eq!(
+            sealed.status, 202,
+            "case {case:?}: CompleteSnapshot must seal the child, got {} with body {}",
+            sealed.status,
+            String::from_utf8_lossy(&sealed.body)
+        );
+        let listing = list_blocks(&router, &child, "").await;
+        let limit = extent_limit(*child_volume_size);
+        let listed = listed_blocks(&listing);
+        assert!(
+            !listed.is_empty(),
+            "case {case:?}: the sealed child must report the blocks it holds, got {}",
+            listing.json()
+        );
+        for (block_index, token) in &listed {
+            assert!(
+                *block_index < limit,
+                "case {case:?}: every index the child reports must lie inside the volume it \
+                 reports, got {block_index} against a first unaddressed index of {limit}"
+            );
+            let fetched = get_block(&router, &child, *block_index, token).await;
+            assert_eq!(
+                fetched.status, 200,
+                "case {case:?}: the block at index {block_index} must be served, got {} with \
+                 body {}",
+                fetched.status,
+                String::from_utf8_lossy(&fetched.body)
+            );
+        }
+    }
 }

@@ -39,8 +39,24 @@ use crate::snapshot_block_loop::{
 };
 
 /// Block indexes one GiB of volume addresses: one GiB divided by the `524288`-byte block
-/// `BlockIndex` counts in.
-const BLOCKS_PER_GIB: i32 = (1024 * 1024 * 1024) / BLOCK_SIZE;
+/// `BlockIndex` counts in. `pub(crate)` so a sibling suite asserting the same extent
+/// names this arithmetic rather than restating it.
+pub(crate) const BLOCKS_PER_GIB: i32 = (1024 * 1024 * 1024) / BLOCK_SIZE;
+
+/// The first block index a volume of `volume_size` GiB does NOT address.
+///
+/// Computed in `i64` and narrowed afterwards, so the product cannot overflow for any
+/// volume the service accepts (up to the documented maximum of 65536 GiB).
+pub(crate) fn extent_limit(volume_size: i64) -> i32 {
+    let limit = volume_size * i64::from(BLOCKS_PER_GIB);
+    i32::try_from(limit).expect("the extent of an accepted volume size fits an i32")
+}
+
+/// The template `StartSnapshot` refuses a `VolumeSize` it will not accept with: it names
+/// only the rejected value, whichever bound rejected it.
+pub(crate) fn invalid_volume_size_message(volume_size: i64) -> String {
+    format!("Invalid volume size: {volume_size}")
+}
 
 /// The template `PutSnapshotBlock` refuses an unsupported `DataLength` with.
 pub(crate) fn invalid_length_message(data_length: i32) -> String {
@@ -233,8 +249,7 @@ async fn an_index_past_the_volume_extent_is_refused_by_the_index_alone() {
     for volume_size in [1_i64, 2, 5] {
         let case_volume = format!("a {volume_size} GiB volume");
         let (router, snapshot_id) = pending_snapshot(&case_volume, volume_size).await;
-        let extent =
-            i32::try_from(volume_size).expect("the volume size fits an i32") * BLOCKS_PER_GIB;
+        let extent = extent_limit(volume_size);
         let data = block_bytes(72);
         let data_checksum = checksum(&data);
 

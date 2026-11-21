@@ -79,6 +79,11 @@ pub const MAX_STORED_BLOCKS_TOTAL: usize = 512;
 pub const MAX_STORED_SNAPSHOTS: usize = 1024;
 
 /// The number of block indexes a volume of `volume_size` GiB addresses.
+///
+/// Every block a snapshot holds sits below this bound for the snapshot's OWN
+/// `volume_size`, whether the block arrived through a write or was inherited from a
+/// parent snapshot, so the indexes a snapshot reports are exactly the indexes it accepts
+/// a write at.
 pub fn blocks_in_volume(volume_size: i64) -> i64 {
     volume_size.saturating_mul(BLOCKS_PER_GIB)
 }
@@ -631,8 +636,12 @@ pub fn unsupported_checksum_algorithm_message(algorithm: &str) -> String {
 /// service accepts: a request-derived template naming only the rejected value.
 ///
 /// It states no bound: the refusal reports which input was rejected, and the bound that
-/// rejected it ([`MAX_VOLUME_SIZE_GIB`], from `StartSnapshotRequest$VolumeSize`'s "The
-/// maximum size is 65536 GiB (64 TiB)") is documentation, not part of this sentence.
+/// rejected it is documentation, not part of this sentence. Two bounds reject a
+/// `VolumeSize`, and both are reported with THIS one sentence, since both are the same
+/// member carrying a size the service will not accept: [`MAX_VOLUME_SIZE_GIB`], from
+/// `StartSnapshotRequest$VolumeSize`'s "The maximum size is 65536 GiB (64 TiB)", and the
+/// volume of the `ParentSnapshotId` the snapshot starts from, below which the requested
+/// volume could not address the content it inherits (see [`blocks_in_volume`]).
 pub fn invalid_volume_size_message(volume_size: i64) -> String {
     format!("Invalid volume size: {volume_size}")
 }
