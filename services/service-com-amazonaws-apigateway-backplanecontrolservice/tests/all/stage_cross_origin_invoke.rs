@@ -4,16 +4,21 @@
 //! sends before a cross-origin call, and the real request that follows it.
 //!
 //! RULE under test: a deployed stage answers a request a browser sent from another site where
-//! a DEPLOYED METHOD DECLARING THAT ORIGIN answers it from the api's own records — the matched
-//! `MOCK` method's status, body and declared `Access-Control-*` header mappings, each header
-//! carrying the value the integration response DECLARES rather than anything taken from the
-//! request — and where no deployed method serves the request, which the stage refuses itself; a
-//! request from an origin no such method declares, and one whose method's integration names a
-//! backend, is not served by the stage at all.
+//! the RESOURCE it addresses DECLARES THAT ORIGIN in the api's own deployed records — a static
+//! `Access-Control-Allow-Origin` mapping on a response one of that resource's methods serves,
+//! naming the wildcard or that exact origin — and then answers it exactly as it answers any
+//! other caller: the matched method's status, body and declared `Access-Control-*` header
+//! mappings, each header carrying the value the integration response DECLARES rather than
+//! anything taken from the request. It also answers a request no deployed method serves, which
+//! the stage refuses itself. A request to a resource whose methods declare no such origin is not
+//! served by the stage at all, and neither is one whose only declaration is the wildcard — which
+//! names no site in particular — to a method whose integration names a backend.
 //!
 //! The rows span what that rule generalises over: what the resource deploys (a `MOCK` `OPTIONS`
 //! and `GET` declaring the wildcard, the same declaring one named origin, a resource declaring
-//! nothing, and a method whose integration names a backend), the origin the page was loaded from
+//! nothing, a resource declaring nothing whose method's integration names a backend, and a
+//! resource declaring the WILDCARD whose method's integration names a backend), the
+//! origin the page was loaded from
 //! (one a declaration names and one it does not), how the request reads as another site's (an
 //! `Origin` alone, as an older browser's preflight carries it, and an `Origin` beside a
 //! browser's own `cross-site` classification), the verb (the preflight, the real request, and a
@@ -64,6 +69,12 @@ const NO_SUCH_METHOD_BODY: &str = "{\"message\":\"Missing Authentication Token\"
 /// What the emulator's front door answers a request a browser sent from another site that the
 /// stage does not serve: `403`, and no answer of the api's own.
 const REFUSED_STATUS: u16 = 403;
+
+/// What API Gateway answers a call whose integration it could not perform, which is what the
+/// `/wildbackend` resource's HTTP backend is for a client the stage DOES serve: this emulator
+/// opens no connection to an upstream of its own.
+const CONFIGURATION_ERROR_STATUS: u16 = 500;
+const CONFIGURATION_ERROR_BODY: &str = "{\"message\":\"Internal server error\"}";
 
 /// One request this suite sends to the stage.
 struct Call<'c> {
@@ -237,11 +248,29 @@ async fn a_stage_answers_the_cross_origin_requests_its_records_declare() {
             mapped: &[],
         },
         Call {
-            case: "a cross-origin request to a method whose integration names a backend",
+            case: "a cross-origin request to a resource declaring nothing whose integration \
+                   names a backend",
             verb: "GET",
             path: "/backend",
             headers: page_cross_site,
             served: None,
+            mapped: &[],
+        },
+        Call {
+            case: "a cross-origin request admitted only by the wildcard to a method whose \
+                   integration names a backend",
+            verb: "GET",
+            path: "/wildbackend",
+            headers: page_cross_site,
+            served: None,
+            mapped: &[],
+        },
+        Call {
+            case: "the same request from a client that sets no browser header",
+            verb: "GET",
+            path: "/wildbackend",
+            headers: no_browser_headers,
+            served: Some((CONFIGURATION_ERROR_STATUS, CONFIGURATION_ERROR_BODY)),
             mapped: &[],
         },
     ];
@@ -356,6 +385,7 @@ async fn deployed_api(gateway: &Gateway) -> String {
         cors_resource(gateway, &api, &created, resource, declared).await;
     }
     backend_resource(gateway, &api, &root).await;
+    wildcard_backend_resource(gateway, &api, &root).await;
 
     let deployed = gateway
         .call(
@@ -467,9 +497,9 @@ async fn cors_resource(
     .await;
 }
 
-/// The `/backend` resource: one unauthorized `GET` whose integration names an HTTP backend
-/// rather than answering from the api's own records, which is the method a cross-origin request
-/// is NOT served for.
+/// The `/backend` resource: one unauthorized `GET` whose integration names an HTTP backend and
+/// which declares no origin at all, so it is the resource a cross-origin request is NOT served
+/// for.
 async fn backend_resource(gateway: &Gateway, api: &str, root: &str) {
     let created = create_resource(gateway, api, root, "backend").await;
     let created = string_member(&created, "id", "CreateResource(backend)");
@@ -490,6 +520,62 @@ async fn backend_resource(gateway: &Gateway, api: &str, root: &str) {
             "type": "HTTP_PROXY",
             "httpMethod": "GET",
             "uri": "https://backend.example/items",
+        }),
+    )
+    .await;
+}
+
+/// The `/wildbackend` resource: one unauthorized `GET` whose integration names an HTTP backend
+/// and whose responses declare the WILDCARD origin. A declaration naming every origin names no
+/// site in particular, so it admits only what the api's own records answer by themselves: this
+/// resource is the one a cross-origin request is NOT served for even though it declares an
+/// origin that covers the page.
+async fn wildcard_backend_resource(gateway: &Gateway, api: &str, root: &str) {
+    let created = create_resource(gateway, api, root, "wildbackend").await;
+    let created = string_member(&created, "id", "CreateResource(wildbackend)");
+    put_method(
+        gateway,
+        api,
+        &created,
+        "GET",
+        json!({ "authorizationType": "NONE" }),
+    )
+    .await;
+    put_integration(
+        gateway,
+        api,
+        &created,
+        "GET",
+        json!({
+            "type": "HTTP",
+            "httpMethod": "GET",
+            "uri": "https://backend.example/items",
+        }),
+    )
+    .await;
+    method_response(
+        gateway,
+        api,
+        &created,
+        "GET",
+        "200",
+        json!({
+            "responseParameters": {
+                "method.response.header.Access-Control-Allow-Origin": false,
+            },
+        }),
+    )
+    .await;
+    integration_response(
+        gateway,
+        api,
+        &created,
+        "GET",
+        "200",
+        json!({
+            "responseParameters": {
+                "method.response.header.Access-Control-Allow-Origin": format!("'{EVERY_ORIGIN}'"),
+            },
         }),
     )
     .await;

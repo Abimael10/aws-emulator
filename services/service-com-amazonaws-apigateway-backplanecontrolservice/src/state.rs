@@ -1073,6 +1073,42 @@ pub struct DeploymentEntry {
     /// This deployment's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`].
     pub sequence: u64,
+    /// The ADDRESS this emulator answers ITSELF on, as the call that created this
+    /// deployment was handed it (`ctx.callback()`): the in-process transport an invoke of a
+    /// stage pointing at this deployment performs its integration over.
+    ///
+    /// Recorded here because a deployment is what makes a stage invocable at all, and one
+    /// seam that serves those invokes is handed NO request context to read a transport from
+    /// — the seam that answers the invoke a browser sent from another site, which the front
+    /// door refuses after an operation is named for it and before it is run, so this service
+    /// can only answer it by naming no operation ([`crate::service::invoke::browser_invoke`]).
+    /// It is the same thing a custom domain name's own socket is opened with (see
+    /// [`custom_domain_endpoint`]): a second ADDRESS of one emulator rather than a second
+    /// emulator.
+    ///
+    /// It names the EMULATOR, never a caller. A
+    /// [`::smithy_server_runtime::EmbeddedEmulator`] is built by the front door from the one
+    /// router it serves (`EmbeddedEmulator::from_router`, over a router clone that every
+    /// request of this process shares) plus the credentials that router's own
+    /// AUTHENTICATORS vend — the keys this process minted, which every handler already signs
+    /// an in-process hop with — and a recursion depth. No header, body, credential or
+    /// identity of the request that carried it is in it, and its debug form discloses
+    /// nothing, so a request served over it is served over this process's own address and
+    /// not over some earlier caller's.
+    ///
+    /// `None` on a deployment created where no such address could be read, which leaves an
+    /// invoke of its stages served over a transport that reaches nothing: an integration
+    /// naming a backend is then reported as one that could not be performed.
+    ///
+    /// LIFETIME. The handle holds the router it names, the router holds the services mounted
+    /// on it, and those hold the engine this store lives in — so a stored one keeps that
+    /// router and engine alive for as long as the deployment record does, which for an
+    /// emulator serving its own data port is the life of the process. A host that builds many
+    /// routers over many engines in one process keeps one router per engine that saw a
+    /// `CreateDeployment` until that engine's deployments go: deleting the deployment
+    /// (`DeleteDeployment`, `DeleteRestApi`) drops the record and with it this handle, which
+    /// is the one release path either way.
+    pub reached_emulator: Option<::smithy_server_runtime::EmbeddedEmulator>,
 }
 
 /// One stored `DocumentationPart`: the API entity the documentation applies to, and the

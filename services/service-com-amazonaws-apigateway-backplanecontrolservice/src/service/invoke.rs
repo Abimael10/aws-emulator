@@ -316,7 +316,7 @@ use crate::ops::put_method_response::METHOD_RESPONSE_HEADER_PREFIX;
 use crate::ops::types::{GetIntegrationOutput, GetIntegrationResponseOutput, MethodSetting};
 use crate::state::{
     AnswerMapping, ApiKeyEntry, CachedResponse, DeploymentEntry, IntegrationAnswer, MethodEntry,
-    RestApiEntry, StageEntry,
+    ResourceEntry, RestApiEntry, StageEntry,
 };
 
 use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
@@ -4952,6 +4952,11 @@ pub use announced_address::*;
 /// re-exported whole, so the seam that serves it reaches it as `invoke::…`.
 mod browser_invoke;
 pub use browser_invoke::*;
+
+/// WHICH EMULATOR an invoke's integration is performed against, in a file of its own: the one
+/// concern that is about the TRANSPORT an invoke is performed over rather than about which
+/// answer is served.
+mod reached_emulator;
 
 /// Where the stage holds the result an authorizer returned for ONE identity, in a file of its
 /// own with the tests of that key's own property.

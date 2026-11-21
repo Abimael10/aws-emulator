@@ -284,7 +284,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let bad_request = |message: String| -> Self::Error {
@@ -383,6 +382,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `DeploymentEntry::resources`.
             resources: api.resources.clone(),
             sequence,
+            // The address this emulator answers itself on, which an invoke of a stage
+            // pointing at this deployment performs its integration over — see
+            // [`DeploymentEntry::reached_emulator`]. It names the emulator, not this
+            // caller.
+            reached_emulator: Some(ctx.callback().clone()),
         };
         api.deployments.insert(id.clone(), entry);
 

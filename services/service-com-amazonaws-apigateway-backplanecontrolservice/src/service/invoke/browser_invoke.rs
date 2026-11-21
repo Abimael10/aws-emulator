@@ -19,30 +19,43 @@
 //! refused `403`, the preflight included, which leaves a browser unable to make any
 //! cross-origin call to an emulated API.
 //!
-//! What this module admits, and what it withholds, is therefore narrow on purpose:
+//! API Gateway itself reads the `Origin` header of an invoke for NOTHING: a deployed stage
+//! answers the preflight from its `OPTIONS` method and the real request from its own method,
+//! integration and header mappings, and leaves to the browser what the `Access-Control-*`
+//! headers mean. So what this module decides is not whether the stage would answer — it always
+//! would — but HOW FAR the emulator's front door may be bypassed for this request, and that is
+//! the one thing it reads the records for ([`admission`]). The reading is the resource's own
+//! `Access-Control-Allow-Origin` mappings, which its developer configured through the CONTROL
+//! plane that no browser reaches, and they are read per RESOURCE rather than per method because
+//! that is where AWS's own "Enabling CORS for a REST API resource" flow puts them — on the
+//! `OPTIONS` method it adds, while the method the real request reaches is commonly a proxy that
+//! carries those headers in the backend's own answer instead. Three outcomes follow:
 //!
-//! * ADMITTED only where the api's own deployed records ADMIT the request and ANSWER IT BY
-//!   THEMSELVES ([`admitted_by_the_records`]). The method that would serve it must DECLARE the
-//!   request's origin — a static `Access-Control-Allow-Origin` mapping on a response it serves,
-//!   naming the wildcard or that exact origin, which is a statement made through the CONTROL
-//!   plane that no browser reaches, so the api's owner has said whose pages its answers are for
-//!   — and serving it must perform no call outside this service: a `MOCK` integration, the
-//!   integration a CORS method is wired to, whose answer is the request template that selects a
-//!   status, the integration response that maps it and that response's own template. A method
-//!   whose integration names a BACKEND (a function, another emulated service, an HTTP upstream)
-//!   is never admitted, and neither is a page from an origin no declaration names: both are
-//!   left to the front door, which refuses them exactly as it did before this seam existed.
-//!   The one request admitted without a declaration is one NO deployed method serves, because
-//!   what answers it is the stage's own refusal, which performs nothing — and the endpoint's
-//!   recorded behaviour is that it answers such a preflight (`403` `Missing Authentication
-//!   Token`), which is how a browser tells a resource that declines a preflight from one that
-//!   answers it.
-//! * SERVED over a transport that REACHES NOTHING ([`contained_transport`]). The seam that
-//!   answers such a request is handed no request context, so there is no transport to perform an
-//!   onward call over, and this module deliberately builds none that could: the handle the
-//!   serving is given is onto an emulator with no service mounted. So even a step that would
-//!   reach for one — an authorizer's decision, the stage's log delivery — reaches nothing, and
-//!   the answer is the api's own records and nothing else.
+//! * a declaration naming THE REQUEST'S OWN SITE is the api owner saying whose pages this
+//!   resource's answers are for, so the request is served exactly as the same request from any
+//!   other client is: the same resolution, the same authorization, the same method, integration,
+//!   templates and header mappings, with the `Origin` forwarded to the integration like every
+//!   other header and deciding nothing about the answer. It is the same statement a function
+//!   URL's own address reads off its `Cors$AllowOrigins` — and that address runs the function
+//!   for a page it names. The seam that answers it is handed no request context, so the
+//!   transport its integration is performed over is the address this emulator answers ITSELF
+//!   on, which the DEPLOYMENT the addressed stage serves carries
+//!   ([`crate::state::DeploymentEntry::reached_emulator`]): a deployment is what makes a stage
+//!   invocable at all, so the address its invokes are performed over is recorded with it;
+//! * a declaration naming EVERY origin names no site, so it is no page in particular that the
+//!   api's owner admitted. It admits only what this seam has always admitted: a method whose
+//!   answer needs no call outside this service — a `MOCK`, the integration a CORS method is
+//!   wired to, or no integration at all — served over a transport that REACHES NOTHING, so even
+//!   a step that would reach for one is withheld. A page from such a site can therefore drive
+//!   nothing of this emulator beyond the records of the api that admitted it;
+//! * a request NO deployed method serves is admitted too, because what answers it is the stage's
+//!   own refusal, which performs nothing — and the endpoint's recorded behaviour is that it
+//!   answers such a preflight (`403` `Missing Authentication Token`), which is how a browser
+//!   tells a resource that declines a preflight from one that answers it.
+//!
+//! Everything else — a page from a site no method of the resource names, and a page admitted
+//! only by a wildcard to a method whose integration names a backend — is left to the front door,
+//! which refuses it exactly as it did before this seam existed.
 //!
 //! The admission is the API's own, not the operator's, because the operator has no say to
 //! consult: the front door's check is fixed at same-origin-only, the emulator's command line
@@ -53,7 +66,7 @@
 
 use std::sync::Arc;
 
-use ::smithy_server_runtime::{MultiServiceRouter, ServiceIdentity};
+use ::smithy_server_runtime::ServiceIdentity;
 
 use super::*;
 
@@ -71,7 +84,7 @@ const OPAQUE_ORIGIN: &str = "null";
 
 /// Whether this plane answers `req` from the seam that runs ahead of the front door's
 /// cross-site refusal: a request a browser sent from another site, addressed to a deployed
-/// stage this plane serves, that the api's own deployed records ADMIT AND ANSWER BY THEMSELVES.
+/// stage this plane serves, that the api's own deployed records ADMIT ([`admission`]).
 ///
 /// Asked by BOTH seams in [`crate::service`] — the one that leaves such a request unnamed and
 /// the one that answers it — so the request the front door never refuses is exactly the request
@@ -82,7 +95,7 @@ pub fn claims_a_cross_origin_browser_request<Eng: Send + Sync + 'static>(
 ) -> bool {
     refused_by_the_front_door(req)
         && claims_request(engine, req)
-        && admitted_by_the_records(engine, req)
+        && admission(engine, req).is_some()
 }
 
 /// Whether the FRONT DOOR refuses this request before a named operation of this service is
@@ -105,47 +118,87 @@ fn refused_by_the_front_door(req: &RtRequest) -> bool {
     )
 }
 
-/// Whether the api's own DEPLOYED records admit `req` and answer it by themselves.
+/// What the api's own DEPLOYED records admit for a request the front door would refuse as
+/// another site's — WHICH of the two ways below it may be served, and `None` for a request
+/// this plane does not answer at all, which the front door then refuses exactly as it did
+/// before this seam existed.
+#[derive(Debug, Clone)]
+enum Admission {
+    /// From the api's own records ALONE, over a transport that reaches nothing
+    /// ([`super::reached_emulator::contained`]): the stage's own refusal of a request no
+    /// deployed method serves, and a method whose answer needs no call outside this service.
+    /// This is the whole of what this seam has ever done, and it is what a declaration naming
+    /// EVERY origin admits — the confinement, not the fidelity, is what that distinction is
+    /// about.
+    FromTheRecordsAlone,
+    /// With the matched method's own INTEGRATION PERFORMED, over the address this emulator
+    /// answers ITSELF on, which the DEPLOYMENT the stage serves carries
+    /// ([`crate::state::DeploymentEntry::reached_emulator`]) — the transport a named invoke of
+    /// the same stage performs its integration over. Admitted only where a method of the
+    /// resource declares the request's origin ITSELF: the api owner's statement, made through
+    /// the control plane, that pages from THAT site are what this resource's answers are for.
+    ///
+    /// `None` where that deployment carries no such address, which leaves the request served
+    /// over the contained transport, as [`Admission::FromTheRecordsAlone`] is.
+    WithTheIntegrationPerformed(Option<::smithy_server_runtime::EmbeddedEmulator>),
+}
+
+/// What the api's own DEPLOYED records admit for `req`.
 ///
 /// The records read are the ones that answer the request — the api this endpoint resolves to,
 /// the deployment its stage serves, the resource path that matches most specifically and the
-/// method that serves the verb — through this plane's own resolution, so the method this asks
-/// about is the method that then answers. Two things must hold of that method:
+/// method that serves the verb — through this plane's own resolution, so the resource this asks
+/// about is the resource that then answers. What decides it is the `Access-Control-Allow-Origin`
+/// mapping its deployed methods SERVE ([`declared_for`]), which is a statement made through the
+/// CONTROL plane that no browser reaches:
 ///
-/// 1. it DECLARES the request's origin: a static `Access-Control-Allow-Origin` mapping on a
-///    response it serves, naming the wildcard or that exact origin
-///    ([`declared_allow_origins`]). That declaration is a statement made through the CONTROL
-///    plane, which no browser reaches, so the api's owner has said which origins' pages its
-///    answers are for — the same question a function URL's own address asks of its
-///    `Cors$AllowOrigins`;
-/// 2. serving it performs no call to anything outside this service
-///    ([`performs_no_onward_call`]).
+/// * a declaration naming the request's origin ITSELF is the api owner saying whose pages this
+///   resource's answers are for — the same question a function URL's own address asks of its
+///   `Cors$AllowOrigins`, and that address runs the function for a page it names — so the
+///   method answers it as it answers anybody, with its integration performed over the address
+///   the deployment carries;
+/// * a declaration naming EVERY origin names no site, so it is nobody's page in particular: it
+///   admits only what this seam has always admitted, a method whose answer needs no call
+///   outside this service ([`performs_no_onward_call`]), served over a transport that reaches
+///   nothing. A page from a site no method names is not admitted at all.
 ///
 /// A request NO deployed method serves is admitted whatever the api declares, because what
 /// answers it is the stage's own refusal — nothing is performed for it, and the endpoint's
 /// recorded behaviour is that it answers such a preflight (`403` `Missing Authentication
 /// Token`), which is how a browser tells a resource that declines a preflight from one that
 /// answers it.
-fn admitted_by_the_records<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
-    let Some(state) = crate::state::service_state(engine) else {
-        return false;
-    };
+fn admission<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> Option<Admission> {
+    let state = crate::state::service_state(engine)?;
     let store = state.lock();
-    let Some(resolved) = resolve(&store, &Addressed::of_request(req)) else {
-        return false;
+    let resolved = resolve(&store, &Addressed::of_request(req))?;
+    let Some(served) = served_by(&resolved, req) else {
+        // No deployed method serves it: what answers it is the stage's own refusal.
+        return Some(Admission::FromTheRecordsAlone);
     };
-    let Some(method) = served_by(&resolved, req) else {
-        // No deployed method: what answers it is the stage's own refusal, which performs
-        // nothing at all.
-        return true;
-    };
-    performs_no_onward_call(Some(method)) && declares_the_requests_origin(method, req)
+    match declared_for(served.resource, req)? {
+        Declaration::TheOriginItself => Some(Admission::WithTheIntegrationPerformed(
+            served.deployment.reached_emulator.clone(),
+        )),
+        Declaration::EveryOrigin => performs_no_onward_call(served.method)
+            .then_some(Admission::FromTheRecordsAlone),
+    }
 }
 
-/// The DEPLOYED method that would serve `req` of the api `resolved` names, or `None` when the
-/// request names no deployed stage, no matching resource path or no method for its verb — each
-/// of which the stage answers with a refusal of its own rather than with a method's response.
-fn served_by<'s>(resolved: &Resolved<'s, '_>, req: &RtRequest) -> Option<&'s MethodEntry> {
+/// What a deployed stage of the resolved api would serve `req` from.
+struct ServedBy<'s> {
+    /// The deployment the addressed stage points at: the snapshot the request is matched
+    /// against, and what carries the address this emulator answers itself on.
+    deployment: &'s DeploymentEntry,
+    /// The resource of it whose path the request matched most specifically.
+    resource: &'s ResourceEntry,
+    /// The method of that resource that serves the request's verb.
+    method: &'s MethodEntry,
+}
+
+/// What would serve `req` of the api `resolved` names — or `None` when the request names no
+/// deployed stage, no matching resource path or no method for its verb, each of which the stage
+/// answers with a refusal of its own rather than with a method's response.
+fn served_by<'s>(resolved: &Resolved<'s, '_>, req: &RtRequest) -> Option<ServedBy<'s>> {
     let (stage_name, resource_path) = split_stage(resolved.invoke_path)?;
     let deployment = resolved
         .api
@@ -154,34 +207,68 @@ fn served_by<'s>(resolved: &Resolved<'s, '_>, req: &RtRequest) -> Option<&'s Met
         .and_then(|stage| resolved.api.deployments.get(&stage.deployment_id))?;
     let matched_path = match_resource_path(deployment, &resource_path)?;
     let (verb, _) = match_method(deployment, matched_path, req.method())?;
-    deployment
+    let resource = deployment
         .resources
         .values()
-        .find(|resource| resource.path == matched_path)
-        .and_then(|resource| resource.methods.get(verb))
+        .find(|resource| resource.path == matched_path)?;
+    resource.methods.get(verb).map(|method| ServedBy {
+        deployment,
+        resource,
+        method,
+    })
 }
 
-/// Whether `method` declares the origin `req` was sent from: one of the origins its served
-/// `Access-Control-Allow-Origin` mappings name ([`declared_allow_origins`]), either the wildcard
-/// or that exact origin, compared as an origin is — by the whole scheme, host and port.
+/// WHAT a resource's served `Access-Control-Allow-Origin` mappings say about the origin a
+/// request was sent from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Declaration {
+    /// One of them names that exact origin — by the whole scheme, host and port, as an origin
+    /// compares.
+    TheOriginItself,
+    /// None names it, and one names EVERY origin, which is a site nobody in particular.
+    EveryOrigin,
+}
+
+/// What `resource` declares about the origin `req` was sent from: one of its served
+/// `Access-Control-Allow-Origin` mappings ([`declared_allow_origins`]) naming that exact
+/// origin, else one naming every origin, else `None`.
 ///
 /// A request carrying no `Origin` names no origin to declare, and the opaque origin a sandboxed
 /// document sends ([`OPAQUE_ORIGIN`]) is no site's, so neither is admitted by a declaration:
 /// what a wildcard admits is a page loaded from some site.
-fn declares_the_requests_origin(method: &MethodEntry, req: &RtRequest) -> bool {
-    let Some(origin) = req.headers().get(::http::header::ORIGIN.as_str()) else {
-        return false;
-    };
+fn declared_for(resource: &ResourceEntry, req: &RtRequest) -> Option<Declaration> {
+    let origin = req.headers().get(::http::header::ORIGIN.as_str())?;
     if origin == OPAQUE_ORIGIN {
-        return false;
+        return None;
     }
-    declared_allow_origins(method)
-        .iter()
-        .any(|declared| *declared == EVERY_ORIGIN || *declared == origin)
+    let declared = declared_allow_origins(resource);
+    if declared.contains(&origin) {
+        return Some(Declaration::TheOriginItself);
+    }
+    declared
+        .contains(&EVERY_ORIGIN)
+        .then_some(Declaration::EveryOrigin)
 }
 
-/// The origins `method` declares its answers are for: the static literal of every
-/// `Access-Control-Allow-Origin` response-header mapping the method SERVES.
+/// The origins `resource` declares its answers are for: the static literal of every
+/// `Access-Control-Allow-Origin` response-header mapping ANY of its deployed methods serves.
+///
+/// Every method of the resource, because that is where AWS's own flow for enabling CORS puts
+/// the declaration: the `OPTIONS` method it adds is what carries the resource's
+/// `Access-Control-Allow-Origin` mapping, while the method the real request reaches is
+/// commonly a proxy whose own answer carries those headers and whose integration therefore
+/// declares no mapping at all. So the contract a browser is admitted on is the resource's,
+/// which is the unit AWS configures it on.
+fn declared_allow_origins(resource: &ResourceEntry) -> Vec<&str> {
+    resource
+        .methods
+        .values()
+        .flat_map(method_allow_origins)
+        .collect()
+}
+
+/// The origins ONE method declares: the static literal of every
+/// `Access-Control-Allow-Origin` response-header mapping it SERVES.
 ///
 /// A header is served only where the integration response maps it AND the method response of
 /// the same status declares it, which is the pair [`super::mapped_response_headers`] sends a
@@ -190,7 +277,7 @@ fn declares_the_requests_origin(method: &MethodEntry, req: &RtRequest) -> bool {
 /// reading of a static mapping (`static_mapping_literal`); a mapping that names a value of the
 /// call instead of a literal declares no origin, because what it resolves to is not knowable
 /// before the call is served.
-fn declared_allow_origins(method: &MethodEntry) -> Vec<&str> {
+fn method_allow_origins(method: &MethodEntry) -> Vec<&str> {
     let mut declared = Vec::new();
     let Some(integration) = method.integration.as_ref() else {
         return declared;
@@ -226,12 +313,10 @@ fn declared_allow_origins(method: &MethodEntry) -> Vec<&str> {
 /// response that maps it and its template), or no integration at all, which the stage answers
 /// with the configuration-error class without performing anything.
 ///
-/// `None` is a verb no deployed method serves, answered by the stage's own refusal — nothing is
-/// performed for it either.
-fn performs_no_onward_call(method: Option<&MethodEntry>) -> bool {
-    let Some(method) = method else {
-        return true;
-    };
+/// This is what [`Admission::FromTheRecordsAlone`] is confined to: a page admitted by a
+/// declaration that names no site in particular can reach nothing of this emulator beyond the
+/// records of the api whose own mapping admitted it.
+fn performs_no_onward_call(method: &MethodEntry) -> bool {
     match method.integration.as_ref() {
         None => true,
         Some(integration) => integration.r#type.as_deref() == Some(MOCK_INTEGRATION_TYPE),
@@ -241,22 +326,34 @@ fn performs_no_onward_call(method: Option<&MethodEntry>) -> bool {
 /// [`super::serve`] from the seam that answers a cross-origin browser request, which carries NO
 /// request context: every step is the same — the resolution, the authorization, the matched
 /// method, its integration response, its template and its header mappings — and the one
-/// difference is that the transport it is served over reaches nothing
-/// ([`contained_transport`]), so the answer is the api's own records and nothing beyond them.
+/// difference is where the transport comes from, since no context handed one in
+/// ([`serving_transport`]).
 ///
 /// `identity` is this service's own vended identity, which the context the invoke is served
 /// under names — the service's, not the request's, so it is the same identity a named invoke's
 /// context carries.
 ///
-/// An invoke this seam cannot serve at all — one on a runtime that cannot drive it, or one
-/// arriving while it is already serving as many as it serves at once — is answered as a method
-/// whose configuration could not serve the call, with the reason logged.
+/// An invoke this seam cannot serve at all — one the records admit nothing for, one on a runtime
+/// that cannot drive it, or one arriving while it is already serving as many as it serves at
+/// once — is answered as a method whose configuration could not serve the call, with the reason
+/// logged.
 pub fn serve_without_transport<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
     identity: &ServiceIdentity,
     req: &RtRequest,
 ) -> RtResponse {
     announce_once();
+    // WHICH of the two ways the records admit this request, asked again here rather than
+    // carried over from the seam that left it unnamed: the transport it is served over is the
+    // one that admission allows and nothing wider. A request the records admit nothing for
+    // reached this seam only through a store that changed in between, and is served nothing.
+    let Some(admission) = admission(&**engine, req) else {
+        tracing::warn!(
+            "the records of this api admit nothing for this cross-origin invoke, so it was not \
+             served"
+        );
+        return unservable();
+    };
     let (Some(head), Some(served_request)) = (request_head(req), req.try_clone()) else {
         tracing::warn!("this cross-origin invoke could not be rendered for the seam serving it");
         return unservable();
@@ -283,8 +380,9 @@ pub fn serve_without_transport<Eng: Send + Sync + 'static>(
     // inside it from them.
     let owned_engine = Arc::clone(engine);
     let owned_identity = identity.clone();
+    let transport = serving_transport(admission);
     let served = awaited(&handle, async move {
-        let ctx = OperationContext::new(&head, &owned_identity, contained_transport());
+        let ctx = OperationContext::new(&head, &owned_identity, transport);
         super::serve(&*owned_engine, &served_request, &ctx).await
     });
     drop(permit);
@@ -299,20 +397,20 @@ pub fn serve_without_transport<Eng: Send + Sync + 'static>(
     }
 }
 
-/// The transport a cross-origin browser request is served over: a handle onto an emulator with
-/// NO service mounted, so a call made over it reaches nothing at all.
+/// The transport a cross-origin browser request is served over, which is exactly what its
+/// [`Admission`] allows — see [`super::reached_emulator`] for what each handle is:
 ///
-/// The context every step of the serving reads carries a transport, and the step that would use
-/// one is the integration: an `AWS`/`AWS_PROXY` integration's call to another service, a
-/// function invocation, an authorizer's. This is what withholds exactly those from a request a
-/// browser made from another site — such an integration is reported as one that could not be
-/// performed instead — while the resolution, the authorization the api's own records decide, the
-/// `MOCK` integration a CORS method is wired to and every header mapping are served from the
-/// store as they are for any other caller. It is built here, per request, rather than
-/// remembered from some earlier call, so no request's own transport is ever lent to another
-/// caller.
-fn contained_transport() -> ::smithy_server_runtime::EmbeddedEmulator {
-    ::smithy_server_runtime::EmbeddedEmulator::from_router(MultiServiceRouter::new())
+/// * [`Admission::FromTheRecordsAlone`] — the handle that reaches nothing at all, so the
+///   answer is the api's own records and nothing beyond them;
+/// * [`Admission::WithTheIntegrationPerformed`] — the address this emulator answers ITSELF on,
+///   which the DEPLOYMENT the addressed stage serves carries.
+fn serving_transport(admission: Admission) -> ::smithy_server_runtime::EmbeddedEmulator {
+    match admission {
+        Admission::FromTheRecordsAlone => super::reached_emulator::contained(),
+        Admission::WithTheIntegrationPerformed(reached) => {
+            super::reached_emulator::reached_or_contained(reached)
+        }
+    }
 }
 
 /// Say ONCE, the first time this seam serves a request, that a browser from another site
@@ -327,8 +425,10 @@ fn announce_once() {
     ANNOUNCED.get_or_init(|| {
         tracing::warn!(
             "a browser is calling a deployed stage of this emulator from another site; such a \
-             request is served only where a deployed method declares that origin and answers \
-             from the api's own records, and it reaches no other service of this emulator"
+             request is served only where a deployed method of the resource it addresses \
+             declares that origin, it reaches this api's own integration only where a method of \
+             that resource declares THAT SITE itself, and a declaration naming every origin \
+             reaches nothing outside this service"
         );
     });
 }
@@ -504,58 +604,21 @@ mod tests {
         }
     }
 
-    /// RULE: the api's records answer a request by themselves exactly where the method that
-    /// would serve it performs no call outside this service — a `MOCK` integration, a method
-    /// carrying no integration, or no deployed method at all — and not where its integration
-    /// names a backend.
-    ///
-    /// The rows span every integration type this service's control plane accepts (`MOCK`, the
-    /// two `crate::ops::put_integration::AWS_INTEGRATION_TYPES` and the two
-    /// `HTTP_INTEGRATION_TYPES`), beside a method carrying no integration, a verb no method
-    /// serves, and a type this emulator knows nothing about.
-    #[test]
-    fn the_records_answer_a_mock_method_and_no_method_by_themselves() {
-        let cases: [(&str, Option<Option<&str>>, bool); 8] = [
-            ("no deployed method", None, true),
-            ("a method carrying no integration", Some(None), true),
-            ("a MOCK integration", Some(Some("MOCK")), true),
-            ("an AWS integration", Some(Some("AWS")), false),
-            ("an AWS_PROXY integration", Some(Some("AWS_PROXY")), false),
-            ("an HTTP integration", Some(Some("HTTP")), false),
-            ("an HTTP_PROXY integration", Some(Some("HTTP_PROXY")), false),
-            ("an integration type this emulator does not know", Some(Some("OTHER")), false),
-        ];
-        for (case, integration, expected) in cases {
-            let method = integration.map(|integration| MethodEntry {
-                integration: integration.map(|kind| GetIntegrationOutput {
-                    r#type: Some(kind.to_string()),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-            let actual = performs_no_onward_call(method.as_ref());
-            assert_eq!(
-                actual, expected,
-                "case {case:?}: expected the records to answer it by themselves to be \
-                 {expected}, got {actual}"
-            );
-        }
-    }
-
     /// One row of the declaration table below: the case, the mapping the method's one
     /// integration response carries (its key, its value, and whether the method response of the
-    /// same status declares that key) or none at all, the headers the request carries, and
-    /// whether the method admits that request's origin.
+    /// same status declares that key) or none at all, the headers the request carries, and WHAT
+    /// the resource then declares about that request's origin.
     type DeclarationRow = (
         &'static str,
         Option<(&'static str, &'static str, bool)>,
         &'static [(&'static str, &'static str)],
-        bool,
+        Option<Declaration>,
     );
 
-    /// RULE: a method admits the origin a request was sent from exactly where a response it
-    /// SERVES maps `Access-Control-Allow-Origin` to a static literal naming the wildcard or
-    /// that exact origin — the api owner's own statement, made through the control plane.
+    /// RULE: what a resource declares about the origin a request was sent from is read off the
+    /// `Access-Control-Allow-Origin` mappings its deployed methods SERVE — that exact origin
+    /// named is the api owner's statement about THAT site, the wildcard names no site in
+    /// particular, and anything else declares nothing.
     ///
     /// The rows span what that reading generalises over: the origin itself declared, the
     /// wildcard, another origin declared (which does not admit this one), a mapping the method
@@ -565,38 +628,38 @@ mod tests {
     /// own comparison), the opaque origin against the wildcard, and a request carrying no
     /// origin at all.
     #[test]
-    fn a_method_admits_the_origins_its_served_mapping_names() {
+    fn a_resource_declares_what_its_served_mappings_name() {
         const ALLOW_ORIGIN: &str = "method.response.header.Access-Control-Allow-Origin";
         let cases: [DeclarationRow; 10] = [
             (
                 "the origin itself declared",
                 Some((ALLOW_ORIGIN, "'https://app.example'", true)),
                 &[("origin", "https://app.example")],
-                true,
+                Some(Declaration::TheOriginItself),
             ),
             (
                 "the wildcard",
                 Some((ALLOW_ORIGIN, "'*'", true)),
                 &[("origin", "https://app.example")],
-                true,
+                Some(Declaration::EveryOrigin),
             ),
             (
                 "another origin declared",
                 Some((ALLOW_ORIGIN, "'https://other.example'", true)),
                 &[("origin", "https://app.example")],
-                false,
+                None,
             ),
             (
                 "a mapping the method response does not declare",
                 Some((ALLOW_ORIGIN, "'https://app.example'", false)),
                 &[("origin", "https://app.example")],
-                false,
+                None,
             ),
             (
                 "a mapping that names a value of the call",
                 Some((ALLOW_ORIGIN, "context.requestId", true)),
                 &[("origin", "https://app.example")],
-                false,
+                None,
             ),
             (
                 "another header's mapping",
@@ -606,13 +669,13 @@ mod tests {
                     true,
                 )),
                 &[("origin", "https://app.example")],
-                false,
+                None,
             ),
             (
                 "a method carrying no integration",
                 None,
                 &[("origin", "https://app.example")],
-                false,
+                None,
             ),
             (
                 "the header name in another case",
@@ -622,29 +685,130 @@ mod tests {
                     true,
                 )),
                 &[("origin", "https://app.example")],
-                true,
+                Some(Declaration::TheOriginItself),
             ),
             (
                 "the opaque origin against the wildcard",
                 Some((ALLOW_ORIGIN, "'*'", true)),
                 &[("origin", "null")],
-                false,
+                None,
             ),
             (
                 "no origin at all",
                 Some((ALLOW_ORIGIN, "'*'", true)),
                 &[],
-                false,
+                None,
             ),
         ];
         for (case, mapping, headers, expected) in cases {
-            let method = method_with(mapping);
-            let actual = declares_the_requests_origin(&method, &request(headers));
+            let resource = resource_with(&[("GET", method_with(mapping))]);
+            let actual = declared_for(&resource, &request(headers));
             assert_eq!(
                 actual, expected,
-                "case {case:?}: expected the method to admit the origin to be {expected}, got \
-                 {actual}"
+                "case {case:?}: expected the resource to declare {expected:?}, got {actual:?}"
             );
+        }
+    }
+
+    /// RULE: a method's answer needs no call outside this service exactly where its integration
+    /// is a `MOCK` or it carries no integration at all — which is what a page admitted only by a
+    /// declaration naming every origin is confined to.
+    ///
+    /// The rows span every integration type this service's control plane accepts (`MOCK`, the
+    /// two `crate::ops::put_integration::AWS_INTEGRATION_TYPES` and the two
+    /// `HTTP_INTEGRATION_TYPES`), beside a method carrying no integration and a type this
+    /// emulator knows nothing about.
+    #[test]
+    fn a_mock_method_and_a_method_with_no_integration_reach_nothing_outside_this_service() {
+        let cases: [(&str, Option<&str>, bool); 7] = [
+            ("a method carrying no integration", None, true),
+            ("a MOCK integration", Some("MOCK"), true),
+            ("an AWS integration", Some("AWS"), false),
+            ("an AWS_PROXY integration", Some("AWS_PROXY"), false),
+            ("an HTTP integration", Some("HTTP"), false),
+            ("an HTTP_PROXY integration", Some("HTTP_PROXY"), false),
+            ("an integration type this emulator does not know", Some("OTHER"), false),
+        ];
+        for (case, integration, expected) in cases {
+            let method = MethodEntry {
+                integration: integration.map(|kind| GetIntegrationOutput {
+                    r#type: Some(kind.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let actual = performs_no_onward_call(&method);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the method to reach nothing outside this service to be \
+                 {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// One row of the resource table below: the case, the mapping the resource's `OPTIONS`
+    /// method carries, the mapping the method the real request reaches carries, and WHAT the
+    /// resource then declares about the request's origin. A mapping is the triple
+    /// [`DeclarationRow`] carries.
+    type ResourceRow = (
+        &'static str,
+        Option<(&'static str, &'static str, bool)>,
+        Option<(&'static str, &'static str, bool)>,
+        Option<Declaration>,
+    );
+
+    /// RULE: the declaration is the RESOURCE's, so a request to any of its deployed methods
+    /// reads what ANY of them declares — which is what AWS's own flow for enabling CORS
+    /// produces, where the `OPTIONS` method carries the mapping and the method the real request
+    /// reaches commonly carries none of its own.
+    ///
+    /// The rows span what that generalises over: which method of the resource carries the
+    /// declaration (its `OPTIONS` preflight method, the method the real request reaches, both),
+    /// whether the other method declares anything at all, what the declaration names (that site
+    /// itself, every origin), and a resource whose declaration names another origin.
+    #[test]
+    fn a_resource_declares_what_any_of_its_methods_declares() {
+        const ALLOW_ORIGIN: &str = "method.response.header.Access-Control-Allow-Origin";
+        const ORIGIN: &str = "https://app.example";
+        let declared = Some((ALLOW_ORIGIN, "'https://app.example'", true));
+        let wildcard = Some((ALLOW_ORIGIN, "'*'", true));
+        let another = Some((ALLOW_ORIGIN, "'https://other.example'", true));
+        let itself = Some(Declaration::TheOriginItself);
+        let every = Some(Declaration::EveryOrigin);
+        let cases: [ResourceRow; 7] = [
+            ("only the OPTIONS method declares the origin", declared, None, itself),
+            ("only the OPTIONS method declares the wildcard", wildcard, None, every),
+            ("only the method the real request reaches declares it", None, declared, itself),
+            ("both methods declare it", declared, declared, itself),
+            ("the origin itself beside the wildcard", wildcard, declared, itself),
+            ("neither method declares anything", None, None, None),
+            ("the only declaration names another origin", another, None, None),
+        ];
+        for (case, on_options, on_get, expected) in cases {
+            let resource = resource_with(&[
+                ("OPTIONS", method_with(on_options)),
+                ("GET", method_with(on_get)),
+            ]);
+            for verb in ["OPTIONS", "GET"] {
+                let sent = verbed_request(verb, &[("origin", ORIGIN)]);
+                let actual = declared_for(&resource, &sent);
+                assert_eq!(
+                    actual, expected,
+                    "case {case:?} on {verb}: expected the resource to declare {expected:?}, got \
+                     {actual:?}"
+                );
+            }
+        }
+    }
+
+    /// One deployed resource carrying `methods`, keyed by verb as a stored resource is.
+    fn resource_with(methods: &[(&str, MethodEntry)]) -> ResourceEntry {
+        ResourceEntry {
+            methods: methods
+                .iter()
+                .map(|(verb, method)| ((*verb).to_string(), method.clone()))
+                .collect(),
+            ..Default::default()
         }
     }
 
@@ -689,8 +853,13 @@ mod tests {
 
     /// One preflight carrying `headers`.
     fn request(headers: &[(&str, &str)]) -> RtRequest {
+        verbed_request("OPTIONS", headers)
+    }
+
+    /// One request of `verb` carrying `headers`.
+    fn verbed_request(verb: &str, headers: &[(&str, &str)]) -> RtRequest {
         let mut builder = ::http::Request::builder()
-            .method("OPTIONS")
+            .method(verb)
             .uri("https://127.0.0.1:1/_aws/execute-api/abc1230000/live/cors");
         for (name, value) in headers {
             builder = builder.header(*name, *value);
