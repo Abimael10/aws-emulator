@@ -9,19 +9,52 @@
 //! queued, already executing, already finished — because that is what the rule generalises
 //! over; both readers that project the pair are asserted for every row.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
 
 use crate::suite_lifecycle::{run_configuration, thing_arn, Answer, Emulator, ROLE_ARN};
 
-/// The status-transition span this service promises callers, as the state module fixes it.
-fn span() -> Duration {
-    iotdeviceadvisor::state::STATUS_TRANSITION
-}
+/// How long a poll loop keeps looking before it gives up — generous on purpose: what is
+/// under test is the stamps a run reports, never how fast the host gets there.
+const DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long a poll loop waits between looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 const REGION: &str = "eu-west-1";
+
+/// Read the run at `run_path` until `satisfied` holds, and hand back that answer.
+///
+/// Waits for the CONDITION, never for a span: the loop looks again until the predicate
+/// holds or [`DEADLINE`] passes, so a slow or loaded host only makes it look more times.
+async fn poll_until(
+    emulator: &Emulator,
+    case: &str,
+    run_path: &str,
+    what: &str,
+    satisfied: impl Fn(&Answer) -> bool,
+) -> Answer {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let answer = emulator.call("GET", run_path, REGION, None).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: reading the run must succeed, got {} {}",
+            answer.status, answer.body
+        );
+        if satisfied(&answer) {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the run never reached {what}; it is {} with {}",
+            answer.string("status"),
+            answer.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
 
 /// One timestamp member, as a client reading epoch time off the wire sees it.
 fn epoch(answer: &Answer, member: &str) -> Option<f64> {
@@ -48,14 +81,19 @@ async fn listed_entry(emulator: &Emulator, definition_id: &str, run_id: &str) ->
         .clone()
 }
 
-/// Start one run on its own definition, so no row contends with another for the
-/// definition's single in-progress slot.
-async fn start_run(emulator: &Emulator, case: &str, index: usize) -> (String, String) {
+/// Start one run on its own definition, whose root group is `root_group`, so no row
+/// contends with another for the definition's single in-progress slot.
+async fn start_run(
+    emulator: &Emulator,
+    case: &str,
+    index: usize,
+    root_group: &str,
+) -> (String, String) {
     let definition = emulator
         .create_definition(
             &json!({
                 "suiteDefinitionName": format!("stop-stamp-suite-{index}"),
-                "rootGroup": "g",
+                "rootGroup": root_group,
                 "devicePermissionRoleArn": ROLE_ARN,
             }),
             REGION,
@@ -94,67 +132,80 @@ async fn start_run(emulator: &Emulator, case: &str, index: usize) -> (String, St
 async fn a_stopped_run_reports_the_start_stamp_it_left_the_queue_with() {
     let emulator = Emulator::new();
 
-    // (case, how long to wait before stopping, the status the run is in then, the status
-    // the stop leaves it in once the clock has run out).
-    let rows: Vec<(&str, Duration, &str, &str)> = vec![
+    // A root group naming one test case with a window far longer than this suite takes, so
+    // the row that stops a run while it EXECUTES finds it executing however slowly the
+    // host runs. The document shape is Device Advisor's own for a test suite definition.
+    const EXECUTING: &str = r#"{"tests":[{"name":"g","tests":[{"name":"t",
+        "configuration":{"EXECUTION_TIMEOUT":600},"test":{"id":"MQTT_Connect"}}]}]}"#;
+    // A root group naming no test case, so the run reaches its terminal status without
+    // waiting for an execution window.
+    const NOTHING_TO_RUN: &str = "g";
+
+    // (case, the root group the run's suite holds, the status to wait for before stopping,
+    // whether the stop is accepted in that status, the status the run ends in).
+    let rows: Vec<(&str, &str, &str, bool, &str)> = vec![
         (
             "stopped while still queued",
-            Duration::ZERO,
+            NOTHING_TO_RUN,
             "PENDING",
+            true,
             "STOPPED",
         ),
         (
             "stopped while executing",
-            span() * 3 / 2,
+            EXECUTING,
             "RUNNING",
+            true,
             "STOPPED",
         ),
         (
-            // Already terminal: the stop moves nothing, so the stamps it reached stand.
+            // Already terminal: there is nothing left to stop, so the call is refused and
+            // the stamps the run reached stand.
             "stopped after it already finished",
-            span() * 5 / 2,
+            NOTHING_TO_RUN,
             "ERROR",
+            false,
             "ERROR",
         ),
     ];
 
-    for (index, (case, wait, status_before_stop, status_after_stop)) in
+    for (index, (case, root_group, status_before_stop, stop_accepted, status_after_stop)) in
         rows.into_iter().enumerate()
     {
-        let (definition_id, run_id) = start_run(&emulator, case, index).await;
+        let (definition_id, run_id) = start_run(&emulator, case, index, root_group).await;
         let run_path = format!("/suiteDefinitions/{definition_id}/suiteRuns/{run_id}");
 
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
-        }
-        let before = emulator.call("GET", &run_path, REGION, None).await;
-        assert_eq!(
-            before.string("status"),
-            status_before_stop,
-            "case {case:?}: the stop must reach a run in this status, got {}",
-            before.body
-        );
+        // Wait for the STATUS the row stops the run in, not for a span.
+        let before = poll_until(&emulator, case, &run_path, status_before_stop, |answer| {
+            answer.string("status") == status_before_stop
+        })
+        .await;
         let start_before_stop = epoch(&before, "startTime");
 
         let stop = emulator
             .call("POST", &format!("{run_path}/stop"), REGION, None)
             .await;
-        assert_eq!(
-            stop.status, 200,
-            "case {case:?}: StopSuiteRun answers 200, got {} {}",
-            stop.status, stop.body
-        );
+        if stop_accepted {
+            assert_eq!(
+                stop.status, 200,
+                "case {case:?}: stopping a run that is in progress answers 200, got {} {}",
+                stop.status, stop.body
+            );
+        } else {
+            assert_eq!(
+                (stop.status, stop.error_code.as_deref()),
+                (400, Some("ValidationException")),
+                "case {case:?}: a run that has finished has nothing left to stop, got {} {}",
+                stop.status,
+                stop.body
+            );
+        }
 
-        // One span is what the stop transition is owed; waiting it out means every row
-        // is read in the status it ends in.
-        tokio::time::sleep(span() * 3 / 2).await;
-        let after = emulator.call("GET", &run_path, REGION, None).await;
-        assert_eq!(
-            after.string("status"),
-            status_after_stop,
-            "case {case:?}: expected the stop to leave the run in this status, got {}",
-            after.body
-        );
+        // The status the row ends in is what the next read waits for.
+        let after = poll_until(&emulator, case, &run_path, status_after_stop, |answer| {
+            answer.string("status") == status_after_stop
+        })
+        .await;
 
         let start_time = epoch(&after, "startTime");
         let end_time = epoch(&after, "endTime");
@@ -203,14 +254,17 @@ async fn a_stopped_run_reports_the_start_stamp_it_left_the_queue_with() {
              and {start_time:?}"
         );
 
-        // Stopping again moves nothing, so neither stamp moves either.
+        // The run has finished, so there is nothing left for a second stop to do: it is
+        // refused and neither stamp moves.
         let restop = emulator
             .call("POST", &format!("{run_path}/stop"), REGION, None)
             .await;
         assert_eq!(
-            restop.status, 200,
-            "case {case:?}: a second StopSuiteRun answers 200, got {} {}",
-            restop.status, restop.body
+            (restop.status, restop.error_code.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case:?}: a second StopSuiteRun on a finished run is refused, got {} {}",
+            restop.status,
+            restop.body
         );
         let again = emulator.call("GET", &run_path, REGION, None).await;
         assert_eq!(

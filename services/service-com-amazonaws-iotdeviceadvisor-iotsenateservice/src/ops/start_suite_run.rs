@@ -6,14 +6,16 @@
 //! endpoint the run's primary device connects to, and the `PENDING` status the run starts
 //! in.
 //!
-//! ## The run itself cannot execute here
+//! ## The run executes what its suite names, for as long as that takes
 //!
-//! Device Advisor drives real MQTT test cases against a physical device over the IoT data
-//! plane, which this emulator has no runner for. The control plane is real — the run is
-//! minted, tracked, readable and stoppable — and the execution it cannot perform ends in
-//! the service's own modelled failure status (`ERROR`, with
-//! [`crate::state::NO_TEST_RUNNER_REASON`] as `errorReason`) rather than in a fabricated
-//! `PASS`/`FAIL` with test results nothing produced.
+//! A run executes the test cases its definition's root group names, each for the window
+//! its `EXECUTION_TIMEOUT` configures ([`crate::state::SuiteExecution`]), so the run is
+//! `RUNNING` for the window in which a device under test could satisfy those cases. No
+//! device connects to a run's endpoint in this emulator, so the cases time out and the run
+//! ends in the modelled `FAIL` with a per-case result; a run whose suite names no test
+//! case to execute could not be executed at all and ends `ERROR` with
+//! [`crate::state::NO_TEST_RUNNER_REASON`]. Nothing here reports a `PASS` for a case
+//! nothing satisfied.
 //!
 //! ## `parallelRun` decides whether a concurrent run is refused
 //!
@@ -264,24 +266,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // open without limit.
         let wants_parallel =
             crate::state::asks_for_parallel_run(&input.suite_run_configuration);
-        let mut blocking: Option<String> = None;
+        let mut blocks = false;
         let mut in_progress_count = 0usize;
         for run in store.runs_of_mut(&input.suite_definition_id, now) {
             if !run.is_in_progress() {
                 continue;
             }
             in_progress_count += 1;
-            if blocking.is_none() && !(wants_parallel && run.allows_parallel_runs()) {
-                blocking = Some(run.id.clone());
+            if !(wants_parallel && run.allows_parallel_runs()) {
+                blocks = true;
             }
         }
-        if let Some(in_progress) = blocking {
+        if blocks {
+            // The service's own wording for this refusal, which carries no part of the
+            // request or of the blocking run (`crate::state::SUITE_ALREADY_RUNNING_MESSAGE`):
+            // every loser of a race for one suite is told the same thing.
             return Err(trail.refused(
                 StartSuiteRunErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "Suite run {in_progress} is still in progress for suite definition {}",
-                        input.suite_definition_id
-                    )),
+                    message: Some(crate::state::SUITE_ALREADY_RUNNING_MESSAGE.to_string()),
                 })
                 .into(),
             ));
@@ -346,6 +348,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             end_at: None,
             error_reason: None,
             endpoint,
+            // The run is QUEUED: the clock owes it `RUNNING` one transition span from now,
+            // and from there its own execution window
+            // (`crate::state::SuiteRun::materialize_due`).
             next_transition_at: Some(now + crate::state::STATUS_TRANSITION),
         };
 

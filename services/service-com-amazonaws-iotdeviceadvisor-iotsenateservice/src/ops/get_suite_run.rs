@@ -7,9 +7,12 @@
 //! ([`crate::state::SuiteRun::materialize_due`]) — the same state the next caller would
 //! have seen had nobody polled.
 //!
-//! `testResult` stays ABSENT: no device test case ran (see `start_suite_run`), so there is
-//! no group or test-case outcome to report, and inventing one would report a result for
-//! work nothing performed. `endTime` appears only once the status is terminal.
+//! `testResult` reports the test cases the run executes, as its suite's root group names
+//! them ([`crate::state::SuiteExecution`]): one group entry per group, one test-case entry
+//! per case, each in the status the run's own schedule puts it in — scheduled, executing,
+//! or finished on its outcome. A run whose suite names no test case reports no
+//! `testResult` at all, since there is no case to report on. `endTime` appears only once
+//! the status is terminal.
 //!
 //! ## Shape of an operation
 //!
@@ -173,6 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?
             .clone();
+        // What the run executes, which is what its per-group, per-case result reports on:
+        // the test cases its suite's root group names, scheduled from the run's own start
+        // stamp (`crate::state::SuiteExecution`). Resolved from the same store read that
+        // materialised the run's status, so the status and the result agree.
+        let test_result = store
+            .execution_of(&run.suite_definition_id)
+            .result(&run, now);
 
         Ok(GetSuiteRunOutput {
             suite_definition_id: Some(run.suite_definition_id.clone()),
@@ -180,8 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             suite_run_id: Some(run.id.clone()),
             suite_run_arn: Some(run.arn.clone()),
             suite_run_configuration: Some(run.configuration.clone()),
-            // No test case executed, so there is no group result to report.
-            test_result: None,
+            test_result,
             start_time: run.started_at.map(Into::into),
             end_time: run.end_at.map(Into::into),
             status: Some(run.status.clone()),

@@ -19,6 +19,13 @@ use serde_json::{json, Value};
 use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// A run's EXECUTION window and the per-case result it reports are their own concern, so
+/// they live in a suite of their own beside this one and share its harness. The `#[path]`
+/// is what points at it: this file is itself declared by one, so a bare `mod` would resolve
+/// next to it rather than under it.
+#[path = "suite_lifecycle/execution_window.rs"]
+mod execution_window;
+
 /// `SuiteDefinitionConfiguration$devicePermissionRoleArn` is `len 20..2048`; this is the
 /// role every row below points at.
 pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/DeviceAdvisorRole";
@@ -1256,12 +1263,28 @@ async fn stopping_a_run_is_observable_and_never_resurrects_a_terminal_run() {
         while_stopping.body
     );
 
-    tokio::time::sleep(span() * 3 / 2).await;
-    let finished = emulator.call("GET", &run_path, "us-east-1", None).await;
+    // Waiting for the CONDITION the stop owes rather than for a span: the loop looks again
+    // until the run reports an endTime, so a slow host only makes it look more times.
+    let finished = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let answer = emulator.call("GET", &run_path, "us-east-1", None).await;
+            if !answer.member("endTime").is_null() {
+                break answer;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case \"after the stop\": the run never finished; it is {} with {}",
+                answer.string("status"),
+                answer.body
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
     assert_eq!(
         finished.string("status"),
         "STOPPED",
-        "case \"one span after the stop\": expected STOPPED, got {}",
+        "case \"once the stop completed\": expected STOPPED, got {}",
         finished.body
     );
     let end_time = finished.member("endTime").clone();
@@ -1271,14 +1294,17 @@ async fn stopping_a_run_is_observable_and_never_resurrects_a_terminal_run() {
         finished.body
     );
 
-    // Stopping again changes nothing: the run stays STOPPED with the endTime it reached.
+    // A finished run has nothing left to stop, so stopping it again is REFUSED with the
+    // modelled client-input error and the run keeps the status and endTime it reached.
     let restop = emulator
         .call("POST", &format!("{run_path}/stop"), "us-east-1", None)
         .await;
     assert_eq!(
-        restop.status, 200,
-        "case \"stop a terminal run\": expected HTTP 200, got {} {}",
-        restop.status, restop.body
+        (restop.status, restop.error_code.as_deref()),
+        (400, Some("ValidationException")),
+        "case \"stop a terminal run\": expected a 400 ValidationException, got {} {}",
+        restop.status,
+        restop.body
     );
     let after = emulator.call("GET", &run_path, "us-east-1", None).await;
     assert_eq!(

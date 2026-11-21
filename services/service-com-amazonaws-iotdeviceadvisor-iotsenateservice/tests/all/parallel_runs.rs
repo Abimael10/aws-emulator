@@ -105,17 +105,19 @@ async fn parallel_run_decides_whether_a_concurrent_start_is_accepted() {
                 );
                 assert_eq!(
                     answer.member("message").as_str(),
-                    Some(
-                        format!(
-                            "Suite run {first_id} is still in progress for suite definition \
-                             {definition_id}"
-                        )
-                        .as_str()
-                    ),
-                    "case {case:?}: the refusal must name the run holding the definition and \
-                     the definition, got {}",
+                    Some(iotdeviceadvisor::state::SUITE_ALREADY_RUNNING_MESSAGE),
+                    "case {case:?}: the refusal must carry the service's fixed concurrency \
+                     message, got {}",
                     answer.body
                 );
+                let message = answer.string("message");
+                for named in [&first_id, &definition_id] {
+                    assert!(
+                        !message.contains(named.as_str()),
+                        "case {case:?}: the message is fixed text and names nothing of the \
+                         request or of the blocking run, got {named} in {message:?}"
+                    );
+                }
                 continue;
             }
 

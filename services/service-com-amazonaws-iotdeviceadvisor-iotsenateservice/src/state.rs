@@ -19,8 +19,12 @@ use crate::ops::types::{DeviceUnderTest, SuiteDefinitionConfiguration, SuiteRunC
 // WHICH host an operation that reports an endpoint reports lives in
 // `state/endpoint_addressing.rs`.
 pub mod endpoint_addressing;
+// WHAT a suite run executes, for how long, and with which per-case result, lives in
+// `state/suite_execution.rs`.
+pub mod suite_execution;
 
 pub use endpoint_addressing::{announced_endpoint, endpoint_for};
+pub use suite_execution::{PlannedCase, PlannedGroup, SuiteExecution};
 
 /// The region an ARN falls back to when the request carries no SigV4 scope.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -29,18 +33,25 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// (`arnNamespace: iotdeviceadvisor`).
 pub const ARN_NAMESPACE: &str = "iotdeviceadvisor";
 
-/// How long a suite run spends in each non-terminal status before the clock owes it the
-/// next one. A chosen span (AWS documents no duration for it): inside the 250–750 ms
-/// window the emulator contract fixes, so a caller acting straight after `StartSuiteRun`
-/// still observes `PENDING`, and never zero.
+/// How long a suite run spends QUEUED before the clock owes it the next status, and how
+/// long a stop takes to complete. A chosen span (AWS documents no duration for either):
+/// inside the 250–750 ms window the emulator contract fixes, so a caller acting straight
+/// after `StartSuiteRun` or `StopSuiteRun` still observes the transient status, and never
+/// zero.
+///
+/// This is NOT how long a run EXECUTES: that window belongs to the test cases the run's
+/// suite configures ([`SuiteExecution::window`]), so a run is `RUNNING` for as long as its
+/// suite asks to run rather than for a span of this emulator's choosing.
 pub const STATUS_TRANSITION: Duration = Duration::from_millis(500);
 
-/// Why a suite run cannot reach a test-result status in this emulator.
+/// Why a suite run could not be EXECUTED AT ALL.
 ///
-/// Device Advisor drives real MQTT test cases against a physical device over the IoT data
-/// plane; this emulator has no device and no test runner, so a run is accepted, tracked,
-/// and then ends in the modelled `ERROR` status carrying this reason — never in `PASS` /
-/// `FAIL` / `PASS_WITH_WARNINGS`, which would report an outcome for tests nothing ran.
+/// Device Advisor executes the test cases its definition's root group names
+/// ([`SuiteExecution`]); a run whose suite names no test case this service could execute
+/// has nothing to run, so it ends in the modelled `ERROR` status — the one that reports a
+/// run the service could not execute — carrying this reason. A run that DOES have test
+/// cases executes them and ends on their outcome instead ([`SuiteExecution::outcome`]):
+/// nothing here ever reports `PASS` for a case nothing satisfied.
 pub const NO_TEST_RUNNER_REASON: &str =
     "Device Advisor test execution is not available in this emulator: no device test runner \
      is attached, so the suite run could not be executed against the primary device.";
@@ -73,7 +84,8 @@ pub fn is_terminal(status: &str) -> bool {
 /// "successful", which is what decides whether a run has a qualification report
 /// ([`ComAmazonawsIotdeviceadvisorIotsenateserviceState::qualification_report`]).
 ///
-/// Nothing executes a suite in this emulator ([`NO_TEST_RUNNER_REASON`]), so no run of it
+/// No device satisfies a test case in this emulator, so a run that executes one ends on
+/// that case timing out ([`SuiteExecution::outcome`]) and no run this emulator drives
 /// reaches one of these; the rule still belongs here rather than in the reader, so a run
 /// that can succeed needs no second decision about what its success means.
 pub const SUCCESSFUL_STATUSES: &[&str] = &["PASS", "PASS_WITH_WARNINGS"];
@@ -438,14 +450,21 @@ pub struct SuiteRun {
 }
 
 impl SuiteRun {
-    /// Apply every status transition the clock has ALREADY made due at `now`.
+    /// Apply every status transition the clock has ALREADY made due at `now`, for a run
+    /// that executes `execution`.
     ///
     /// The whole lifecycle is clock-driven, so each reader materialises it before
-    /// answering and nothing has to sleep: `PENDING` -> `RUNNING` -> `ERROR` for a run the
-    /// emulator cannot execute (see [`NO_TEST_RUNNER_REASON`]), and `STOPPING` -> `STOPPED`
-    /// for one a caller stopped. A transition that is not due yet is left alone, and a
-    /// terminal run is never touched again.
-    pub fn materialize_due(&mut self, now: SystemTime) {
+    /// answering and nothing has to sleep: `PENDING` -> `RUNNING` once the run leaves the
+    /// queue, `RUNNING` -> the outcome its test cases reached
+    /// ([`SuiteExecution::outcome`]) once their execution window has elapsed, and
+    /// `STOPPING` -> `STOPPED` for a run a caller stopped. A transition that is not due yet
+    /// is left alone, and a terminal run is never touched again.
+    ///
+    /// The RUNNING dwell is the run's EXECUTION window ([`SuiteExecution::window`]), not a
+    /// transition span: a run executes for as long as its suite's test cases are configured
+    /// to take, which is the only window in which a device under test could satisfy them,
+    /// so a client polling the run observes it.
+    pub fn materialize_due(&mut self, now: SystemTime, execution: &SuiteExecution) {
         while let Some(due) = self.next_transition_at {
             if is_terminal(&self.status) {
                 // Nothing is owed from a terminal status: drop any stale due instant.
@@ -459,11 +478,11 @@ impl SuiteRun {
                 "PENDING" => {
                     self.status = "RUNNING".to_string();
                     self.leave_pending(due);
-                    self.next_transition_at = Some(due + STATUS_TRANSITION);
+                    self.next_transition_at = due.checked_add(execution.window());
                 }
                 "RUNNING" => {
-                    self.status = "ERROR".to_string();
-                    self.error_reason = Some(NO_TEST_RUNNER_REASON.to_string());
+                    self.status = execution.outcome().to_string();
+                    self.error_reason = execution.error_reason().map(ToString::to_string);
                     self.end_at = Some(due);
                     self.next_transition_at = None;
                 }
@@ -626,6 +645,18 @@ pub fn create_request_fingerprint(
 }
 
 impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
+    /// What a run of the definition `suite_definition_id` names EXECUTES: the test cases
+    /// its root group holds ([`SuiteExecution`]).
+    ///
+    /// The ONE place a reader resolves a run's execution, so the clock-owed transitions and
+    /// the `testResult` a read projects are driven by one answer. It is read from the
+    /// definition rather than stored on the run, exactly as every other read of a
+    /// definition serves its ONE live configuration, so a run and its result never
+    /// disagree about the suite being run.
+    pub fn execution_of(&self, suite_definition_id: &str) -> SuiteExecution {
+        SuiteExecution::of(self.definitions.get(suite_definition_id))
+    }
+
     /// Materialise every clock-owed run transition, then hand back the run named by
     /// `(definition id, run id)`.
     ///
@@ -639,31 +670,55 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
         suite_run_id: &str,
         now: SystemTime,
     ) -> Option<&mut SuiteRun> {
+        let execution = self.execution_of(suite_definition_id);
         let run = self.runs.get_mut(suite_run_id)?;
         if run.suite_definition_id != suite_definition_id {
             return None;
         }
-        run.materialize_due(now);
+        run.materialize_due(now, &execution);
         Some(run)
     }
 
     /// Every run OF ONE DEFINITION, with its clock-owed transitions materialised.
     ///
     /// The definition filter runs before the materialisation, so a call about one
-    /// definition never advances another definition's runs.
+    /// definition never advances another definition's runs. Every run selected runs that
+    /// one definition's suite, so its execution is resolved once for all of them.
     pub fn runs_of_mut(
         &mut self,
         suite_definition_id: &str,
         now: SystemTime,
     ) -> impl Iterator<Item = &mut SuiteRun> {
+        let execution = self.execution_of(suite_definition_id);
         let suite_definition_id = suite_definition_id.to_string();
         self.runs.values_mut().filter_map(move |run| {
             if run.suite_definition_id != suite_definition_id {
                 return None;
             }
-            run.materialize_due(now);
+            run.materialize_due(now, &execution);
             Some(run)
         })
+    }
+
+    /// Materialise the clock-owed transitions of every run `select` picks, for a reader
+    /// that spans definitions.
+    ///
+    /// Each run is advanced against the execution of the definition IT runs, and a run the
+    /// predicate rejects is left untouched — so a listing narrowed to one definition or
+    /// version never advances a run it was not asked about.
+    pub fn materialize_runs_due(
+        &mut self,
+        now: SystemTime,
+        mut select: impl FnMut(&SuiteRun) -> bool,
+    ) {
+        let definitions = &self.definitions;
+        for run in self.runs.values_mut() {
+            if !select(run) {
+                continue;
+            }
+            let execution = SuiteExecution::of(definitions.get(&run.suite_definition_id));
+            run.materialize_due(now, &execution);
+        }
     }
 
     /// Remove `keys` from the tags recorded for `arn` and report how many the call
@@ -786,13 +841,14 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
     /// most that many runs are ever skipped and the remaining candidates take the count
     /// down to `keep`.
     pub fn prune_runs(&mut self, suite_definition_id: &str, keep: usize, now: SystemTime) {
+        let execution = self.execution_of(suite_definition_id);
         let mut total = 0usize;
         let mut droppable: Vec<(SystemTime, String, String)> = Vec::new();
         for run in self.runs.values_mut() {
             if run.suite_definition_id != suite_definition_id {
                 continue;
             }
-            run.materialize_due(now);
+            run.materialize_due(now, &execution);
             total += 1;
             if !run.is_in_progress() {
                 droppable.push((run.created_at, run.id.clone(), run.arn.clone()));
@@ -831,10 +887,12 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
     /// request earned: a pair of ids this store holds nothing for is not found, while a
     /// run it DOES hold is refused as an invalid request stating which condition failed.
     ///
-    /// No run of THIS emulator reaches a successful status: nothing executes the suite
-    /// (see [`NO_TEST_RUNNER_REASON`]), so a run ends in `ERROR`. The rule is the
-    /// SERVICE's, not the lifecycle's: a report appears the moment a run can succeed,
-    /// with nothing here to change.
+    /// No run of THIS emulator reaches a successful status: no device under test connects
+    /// to a run's endpoint, so its test cases time out and the run ends `FAIL` (or `ERROR`
+    /// where its suite named no test case at all, see [`NO_TEST_RUNNER_REASON`]), and the
+    /// operation that reads this therefore refuses every run the emulator can produce. The
+    /// rule is the SERVICE's, not the lifecycle's: a report appears the moment a run can
+    /// succeed, with nothing here to change.
     ///
     /// A pure read: the clock-owed transitions are NOT materialised here, so a caller that
     /// wants the report of a run whose next transition has just become due materialises it
@@ -1031,6 +1089,33 @@ pub fn report_not_available_message(suite_run_id: &str, status: &str) -> String 
 /// see [`root_group_violation`] for the rule itself.
 pub const EMPTY_ROOT_GROUP_MESSAGE: &str =
     "Invalid Request: rootGroup cannot be empty for non-qualification test suite";
+
+/// The message a refusal carries when the suite run named is not RUNNING, so the stop
+/// cannot be carried out on it.
+///
+/// The text Device Advisor answers a stop of a run that is no longer running with, as the
+/// recorded refusal of such a call carries it: the fixed sentence
+/// `Invalid Request: Suite run <id> is not running and cannot be stopped`, whose one
+/// variable part is the `suiteRunId` the caller named. (The `Invalid Request: ` prefix is
+/// the same one [`EMPTY_ROOT_GROUP_MESSAGE`] carries.)
+pub fn not_running_message(suite_run_id: &str) -> String {
+    bounded_message(format!(
+        "Invalid Request: Suite run {} is not running and cannot be stopped",
+        echoed_value(suite_run_id)
+    ))
+}
+
+/// The message a `StartSuiteRun` refused for CONCURRENCY carries: a suite already has a
+/// run in progress, so this account cannot start another of it.
+///
+/// Entirely FIXED text — Device Advisor states the condition, what to do about it, and the
+/// remediation for running suites at the same time, and interpolates nothing from the
+/// request or from the blocking run. A message built from the blocking run's id would be
+/// neither the text a client matching on it expects nor the documented remediation, so the
+/// wording lives here, once, for the one branch that refuses a concurrent start.
+pub const SUITE_ALREADY_RUNNING_MESSAGE: &str =
+    "Suite already running with this account. Please stop suite run or wait until the suite \
+     finishes running. You can also use device-level endpoint to run suites in parallel.";
 
 /// The upper bound the `MaxResults` shape's `range` trait puts on `maxResults`
 /// (`range 1..50`), which is also the page size a caller who names none gets: one page

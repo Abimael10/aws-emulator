@@ -5,8 +5,20 @@
 //! Moves the persisted run to `STOPPING`, from which the clock owes it `STOPPED` with an
 //! `endTime`, so the following `GetSuiteRun` observes the new status. A run still queued
 //! when the stop arrives leaves `PENDING` here, so it carries a start stamp like every
-//! other run that left the queue. A run that already reached a terminal status is left
-//! exactly as it is — stopping never resurrects it.
+//! other run that left the queue.
+//!
+//! ## Only a run that is IN PROGRESS can be stopped
+//!
+//! The model's own words for this operation: "Stops a Device Advisor test suite run that is
+//! currently running". A run that has already reached a terminal status has nothing left to
+//! stop, so the request is REFUSED and the run is left exactly as it is — stopping never
+//! resurrects it, and answering such a call as a success would tell the caller a finished
+//! run had been stopped. The refusal is the modelled client-input error, the only one this
+//! operation declares for a request it understands but cannot carry out
+//! (`smithy_query(query="operation",operation="StopSuiteRun")` lists
+//! `InternalServerException`, `ResourceNotFoundException` and `ValidationException`, and no
+//! conflict error). A run that is already `STOPPING` is still in progress, so stopping it
+//! again is accepted and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -171,9 +183,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?;
 
-        // Only a run that has not been asked to stop and has not finished is moved: a
-        // second stop neither restarts the stop clock nor resurrects a finished run. The
-        // record owns that decision, and with it the stamps a run that leaves the queue
+        // The stop acts on a run that is IN PROGRESS. A run that has finished has nothing
+        // left to stop, so the call is refused with this operation's modelled client-input
+        // error and the finished run is left exactly as it is.
+        if !run.is_in_progress() {
+            let refusal = crate::state::not_running_message(&input.suite_run_id);
+            let arn = run.arn.clone();
+            trail.acted_on(&arn);
+            return Err(trail.refused(
+                StopSuiteRunErrorModeled::ValidationException(ValidationException {
+                    message: Some(refusal),
+                })
+                .into(),
+            ));
+        }
+
+        // Only a run that has not been asked to stop yet is moved: a second stop of a run
+        // that is already stopping neither restarts the stop clock nor changes its stamps.
+        // The record owns that decision, and with it the stamps a run that leaves the queue
         // here carries.
         let outcome = if run.begin_stop(now) {
             "stopping"

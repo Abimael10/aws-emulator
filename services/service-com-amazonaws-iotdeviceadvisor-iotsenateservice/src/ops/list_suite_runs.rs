@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // out in one deterministic order and the token below is stable while runs are
         // started or aged out between pages.
         let mut matching: Vec<crate::state::SuiteRun> = Vec::new();
-        for run in store.runs.values_mut() {
+        let selects = |run: &crate::state::SuiteRun| {
             let other_definition = input
                 .suite_definition_id
                 .as_deref()
@@ -191,11 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .suite_definition_version
                 .as_deref()
                 .is_some_and(|version| run.suite_definition_version != version);
-            if other_definition || other_version {
-                continue;
+            !(other_definition || other_version)
+        };
+        // Each selected run is advanced against the execution of the definition IT runs,
+        // which is why the store owns the materialisation rather than this loop.
+        store.materialize_runs_due(now, selects);
+        for run in store.runs.values() {
+            if selects(run) {
+                matching.push(run.clone());
             }
-            run.materialize_due(now);
-            matching.push(run.clone());
         }
 
         // The paging rule is the SERVICE's, decided once in `crate::state`: a token is a
@@ -231,10 +235,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .peekable();
 
         let mut page = Vec::new();
+        // One resolved execution per DEFINITION the page names, so a page of runs of one
+        // suite reads that suite's root group once rather than once per entry.
+        let mut executions: ::std::collections::BTreeMap<String, crate::state::SuiteExecution> =
+            ::std::collections::BTreeMap::new();
         while page.len() < page_size {
             let Some(run) = remaining.next() else {
                 break;
             };
+            // The passed/failed counts of the run's test cases, from the same projection
+            // `GetSuiteRun` reports case by case (`crate::state::SuiteExecution`), so the
+            // listing and the read of one run cannot disagree. A run whose suite names no
+            // test case reports neither count: zeroes would claim a result for tests
+            // nothing ran.
+            let execution = executions
+                .entry(run.suite_definition_id.clone())
+                .or_insert_with(|| store.execution_of(&run.suite_definition_id));
+            let (passed, failed) =
+                execution
+                    .counts(run, now)
+                    .map_or((None, None), |(passed, failed)| {
+                        (Some(passed), Some(failed))
+                    });
             page.push(SuiteRunInformation {
                 suite_definition_id: Some(run.suite_definition_id.clone()),
                 suite_definition_version: Some(run.suite_definition_version.clone()),
@@ -249,11 +271,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 started_at: run.started_at.map(Into::into),
                 end_at: run.end_at.map(Into::into),
                 status: Some(run.status.clone()),
-                // No test case executed (see `crate::state::NO_TEST_RUNNER_REASON`), so
-                // there is no passed/failed count to report: zeroes would claim a result
-                // for tests nothing ran.
-                passed: None,
-                failed: None,
+                passed,
+                failed,
             });
         }
 
