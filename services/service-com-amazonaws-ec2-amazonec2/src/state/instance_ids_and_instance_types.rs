@@ -2802,6 +2802,13 @@ pub(super) fn network_bandwidth_centi_gbps(
     (baseline, baseline.max(burst))
 }
 
+/// `gbps` Gigabit as the hundredths of a Gbps the figures above are counted in, which is the
+/// unit [`network_performance`] writes a figure from: a published figure that carries a
+/// fraction of a Gbps (3.125) is exact in those hundredths to the digits the text needs.
+pub(super) fn centi_gbps(gbps: f64) -> i64 {
+    (gbps * CENTI_GBPS as f64).round() as i64
+}
+
 /// `centi` hundredths of a Gbps as the published tables write the figure: a whole number of
 /// Gigabit without a fraction, and a fraction to the digits it needs (`12.5`).
 pub(super) fn gigabit_figure(centi: i64) -> String {
@@ -2833,20 +2840,36 @@ pub(super) fn network_performance(baseline_centi: i64, peak_centi: i64) -> Strin
 ///
 /// `published_performance` is the network performance AWS publishes for the type, where the
 /// catalog holds it: a type with ONE card reports that figure on the card too, the single
-/// card carrying the whole instance's network.
+/// card carrying the whole instance's network. `published_bandwidth` is the same published
+/// figure in Gbps ([`crate::state::PublishedInstanceTypeFacts::network_bandwidth_gbps`]),
+/// which is what the card's two numeric bandwidth members report — so a card cannot report a
+/// bandwidth the type's own published network performance contradicts.
 pub(super) fn network_cards(
     name: &InstanceTypeName<'_>,
     sixteenths: u32,
     cards: i32,
     maximum_network_interfaces: i32,
     efa_interfaces: i32,
-    published_performance: Option<&'static str>,
+    published_performance: Option<&str>,
+    published_bandwidth: Option<(f64, f64)>,
 ) -> Vec<NetworkCardInfo> {
     let (baseline, peak) = network_bandwidth_centi_gbps(name, sixteenths);
     let count = i64::from(cards.max(1));
     let per_card_baseline = (baseline / count).max(1);
     let per_card_peak = (peak / count).max(per_card_baseline);
     let interfaces_per_card = (maximum_network_interfaces / cards.max(1)).max(1);
+    // The bandwidth of ONE card: the published figure spread over the cards the instance
+    // carries, where the catalog publishes it, else this size's share of its host.
+    let (per_card_baseline_gbps, per_card_peak_gbps) = match published_bandwidth {
+        Some((baseline_gbps, peak_gbps)) => {
+            let cards = f64::from(cards.max(1));
+            (baseline_gbps / cards, peak_gbps / cards)
+        }
+        None => (
+            per_card_baseline as f64 / CENTI_GBPS as f64,
+            per_card_peak as f64 / CENTI_GBPS as f64,
+        ),
+    };
     let per_card_performance = match published_performance {
         Some(performance) if cards <= 1 => performance.to_string(),
         _ => network_performance(per_card_baseline, per_card_peak),
@@ -2861,8 +2884,8 @@ pub(super) fn network_cards(
             network_performance: Some(per_card_performance.clone()),
             maximum_network_interfaces: Some(interfaces_per_card),
             additional_flexible_network_interfaces: None,
-            baseline_bandwidth_in_gbps: Some(per_card_baseline as f64 / CENTI_GBPS as f64),
-            peak_bandwidth_in_gbps: Some(per_card_peak as f64 / CENTI_GBPS as f64),
+            baseline_bandwidth_in_gbps: Some(per_card_baseline_gbps),
+            peak_bandwidth_in_gbps: Some(per_card_peak_gbps),
             default_ena_queue_count_per_interface: None,
             maximum_ena_queue_count: None,
             maximum_ena_queue_count_per_interface: None,
@@ -2998,15 +3021,15 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
         .and_then(|facts| facts.efa_interfaces)
         .unwrap_or_else(|| efa_interfaces(&name, sixteenths));
     let (tcp_established, udp, udp_stream) = CONNECTION_TRACKING_TIMEOUTS;
-    // The network cards the instance has, and the bandwidth its size's share of the host
-    // carries: the per-card figures are derived from those two facts, so the cards of one
-    // instance cannot disagree with each other. A type whose row publishes a network
-    // performance reports THAT figure as its own, and its ONE card reports it too — a single
-    // card carries the whole instance's network — while the per-card bandwidth of a type with
-    // several cards stays this share until AWS's published per-card figures are recorded in
-    // the row too.
+    // The network cards the instance has, and the bandwidth AWS publishes for it: a type
+    // whose row publishes a network figure reports THAT figure as its own — as the text of
+    // the published column, and on its ONE card, which carries the whole instance's network —
+    // and a type the catalog holds no row for reports its size's share of its host, from
+    // which the per-card figures are derived so the cards of one instance cannot disagree
+    // with each other or with the instance.
     let cards = network_card_count(instance_type);
-    let published_performance = facts.and_then(|facts| facts.network_performance);
+    let published_performance = facts.and_then(PublishedInstanceTypeFacts::published_network_performance);
+    let published_bandwidth = facts.and_then(|facts| facts.network_bandwidth_gbps);
     let (baseline_centi, peak_centi) = network_bandwidth_centi_gbps(&name, sixteenths);
     let instance_store_disks = record
         .instance_storage
@@ -3163,9 +3186,8 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
             // type the catalog holds no row for — the instance's share of its host's
             // bandwidth, or the ceiling a size below that share bursts to.
             network_performance: Some(
-                published_performance.map_or_else(
+                published_performance.clone().unwrap_or_else(
                     || network_performance(baseline_centi, peak_centi),
-                    str::to_string,
                 ),
             ),
             maximum_network_interfaces: Some(record.maximum_network_interfaces),
@@ -3180,7 +3202,8 @@ pub fn instance_type_info(instance_type: &str) -> Option<InstanceTypeInfo> {
                 cards,
                 record.maximum_network_interfaces,
                 efa_interfaces,
-                published_performance,
+                published_performance.as_deref(),
+                published_bandwidth,
             )),
             ipv4_addresses_per_interface: Some(record.ipv4_addresses_per_interface),
             // "The maximum number of IPv6 addresses per network interface"

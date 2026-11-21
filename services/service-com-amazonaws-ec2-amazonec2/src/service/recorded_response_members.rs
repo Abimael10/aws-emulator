@@ -51,6 +51,14 @@
 //! owns the value resolves it and hands it here ([`hold_subnet_dhcp_options`],
 //! [`hold_instance_interface_public_hostname`]), because writing an element the model does
 //! not declare is still only possible at this seam.
+//!
+//! # The other difference this seam closes
+//!
+//! The same walk the envelope wraps is also where a value's RENDERING is corrected: EC2
+//! writes a `double`-typed member as a double, fraction and all, which
+//! [`service_common::query_decimal_floats`] does for every floating-point member of a body
+//! this service answers with ([`super::Ec2QueryEnvelope::serialize_output`] wraps this walk
+//! in its `DecimalFloatsRef`). Nothing here restates that rule.
 
 use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};

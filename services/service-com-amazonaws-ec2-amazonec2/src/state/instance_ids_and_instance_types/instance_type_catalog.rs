@@ -33,6 +33,7 @@ mod dense_hdd_storage_rows;
 mod eighth_generation_intel_rows;
 mod general_purpose_nvme_rows;
 mod gpu_rows;
+mod network_optimized_rows;
 mod previous_generation_rows;
 
 /// The EBS-optimized performance AWS publishes for one instance type: the two bandwidth and
@@ -296,6 +297,19 @@ pub struct PublishedInstanceTypeFacts {
     pub instance_store_devices: Option<(i32, i64)>,
     /// "The network performance", as the published table writes it.
     pub network_performance: Option<&'static str>,
+    /// The network bandwidth AWS publishes for the type, in Gbps, as (the figure it sustains,
+    /// the figure it can reach).
+    ///
+    /// This is the ONE published network figure of the type, and what differs between the
+    /// members that report it is only the reading: `NetworkInfo$NetworkPerformance` is its
+    /// TEXT as the published table writes that column — `Up to` the ceiling where the size
+    /// sustains less than it reaches, and the figure itself where it sustains what it reaches
+    /// ([`PublishedInstanceTypeFacts::published_network_performance`]) — while a network card
+    /// of the type reports the same figure in Gbps through
+    /// `NetworkCardInfo$BaselineBandwidthInGbps` and `$PeakBandwidthInGbps`. A row carries
+    /// the pair rather than the text because the text of an `Up to` row does not say what the
+    /// size SUSTAINS, which is half the published figure.
+    pub network_bandwidth_gbps: Option<(f64, f64)>,
     /// The bandwidth weightings the type can be configured with
     /// (`NetworkInfo$BandwidthWeightings`): a type whose network and EBS bandwidth can be
     /// weighted towards one or the other publishes the weightings it accepts, one value of
@@ -412,6 +426,7 @@ impl PublishedInstanceTypeFacts {
             attachment_limit_type: None,
             instance_store_devices: None,
             network_performance: None,
+            network_bandwidth_gbps: None,
             bandwidth_weightings: None,
             flexible_ena_queues_supported: None,
             maximum_network_interfaces: None,
@@ -599,6 +614,21 @@ impl PublishedInstanceTypeFacts {
     /// The type's network performance, as the published table writes it.
     const fn network(mut self, performance: &'static str) -> Self {
         self.network_performance = Some(performance);
+        self
+    }
+
+    /// The network bandwidth the type publishes, in Gbps: the figure it sustains and the
+    /// figure it can reach, which are the same where its share of the host is dedicated.
+    const fn network_bandwidth(mut self, baseline_gbps: f64, peak_gbps: f64) -> Self {
+        self.network_bandwidth_gbps = Some((baseline_gbps, peak_gbps));
+        self
+    }
+
+    /// The type takes its cores ALL at once, so the one count it can be configured with is
+    /// its default: a step no core count of the type is a multiple of, which is what
+    /// [`super::InstanceTypeRecord::valid_cores`] reports that default alone for.
+    const fn cores_all_at_once(mut self) -> Self {
+        self.valid_core_step = Some(i32::MAX);
         self
     }
 
@@ -812,6 +842,24 @@ impl PublishedInstanceTypeFacts {
             memory_mib_each,
         });
         self
+    }
+
+    /// The network performance this row publishes, as the published table writes that column,
+    /// or `None` where the row publishes no network figure at all.
+    ///
+    /// A row that carries the TEXT of the column reports that; a row that carries the Gbps
+    /// figure instead ([`PublishedInstanceTypeFacts::network_bandwidth_gbps`]) reports the
+    /// text OF that figure, so the one published fact answers this member and the type's
+    /// network cards alike rather than being written twice and able to disagree.
+    pub fn published_network_performance(&self) -> Option<String> {
+        if let Some(performance) = self.network_performance {
+            return Some(performance.to_string());
+        }
+        let (baseline_gbps, peak_gbps) = self.network_bandwidth_gbps?;
+        Some(network_performance(
+            centi_gbps(baseline_gbps),
+            centi_gbps(peak_gbps),
+        ))
     }
 }
 
@@ -4619,16 +4667,17 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// Every published row the catalog holds, whichever table it sits in.
 ///
 /// The rows of the families above, then the rows each child module holds for the families it
-/// groups — the AMD EPYC families, the accelerated ones, the previous generation ones, the
-/// burstable family on pre-Nitro hardware, the dense HDD storage ones, the eighth generation
-/// Intel ones and the general purpose families with local NVMe devices. A row is reached by its
-/// instance type alone, so which table it is written in is nothing but where the figures of one
-/// group of families are kept together.
+/// groups — the AMD EPYC families, the accelerated ones, the network optimized ones, the
+/// previous generation ones, the burstable family on pre-Nitro hardware, the dense HDD storage
+/// ones, the eighth generation Intel ones and the general purpose families with local NVMe
+/// devices. A row is reached by its instance type alone, so which table it is written in is
+/// nothing but where the figures of one group of families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
     PUBLISHED_INSTANCE_TYPE_FACTS
         .iter()
         .chain(amd_epyc_rows::AMD_EPYC_INSTANCE_TYPE_FACTS)
         .chain(gpu_rows::GPU_INSTANCE_TYPE_FACTS)
+        .chain(network_optimized_rows::NETWORK_OPTIMIZED_INSTANCE_TYPE_FACTS)
         .chain(previous_generation_rows::PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS)
         .chain(burstable_xen_rows::BURSTABLE_XEN_INSTANCE_TYPE_FACTS)
         .chain(dense_hdd_storage_rows::DENSE_HDD_STORAGE_INSTANCE_TYPE_FACTS)
