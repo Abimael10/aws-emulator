@@ -214,6 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_value(message));
         }
         let now = ::std::time::SystemTime::now();
+        // Everything this modify writes happens under ONE lock, and the sockets the
+        // cache is served on are opened after it: opening one is async, and no await
+        // may happen while the store is held.
+        let (engine_changed, serverless_cache) = {
         let mut store = state.lock();
         // A user group whose change has fallen due is `active` now, so the
         // status read for one this request attaches is the settled one.
@@ -406,6 +410,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Nothing below refuses anything, so from here the change is applied to
         // the stored record.
+        //
+        // Whether this cache is reached on sockets of this emulator's own is read
+        // before the record is borrowed, because it decides which port its
+        // endpoints publish below.
+        let served = crate::state::serverless_cache_is_served(&store, &name);
         let Some(cache) = store.serverless_caches.get_mut(&name) else {
             return Err(
                 ModifyServerlessCacheErrorModeled::ServerlessCacheNotFoundFault(
@@ -434,13 +443,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &cache.major_engine_version,
             );
         }
-        if engine_changed {
-            // The endpoint's port is the engine's default port, which is the
-            // invariant the create establishes (`crate::state::default_port`):
-            // a cache moved onto another engine is reached on that engine's
-            // port. The endpoint ADDRESS is minted once and stays, so a client
-            // keeps resolving the same name.
+        if engine_changed && !served {
+            // A cache this emulator serves no data plane for is reached on the
+            // engine's own client port, which is the invariant the create
+            // establishes (`crate::state::default_port`): a cache moved onto
+            // another engine is reached on that engine's port. One that IS
+            // served keeps the port of the socket serving each endpoint, which
+            // `serve_serverless_cache` writes below once this store guard is
+            // released — an endpoint names the address and the port it answers
+            // on, so neither endpoint ever publishes a port nothing listens at,
+            // which resetting the port of a cache that has sockets open would.
+            // The endpoint ADDRESS of an unserved cache is minted once and
+            // stays, so a client keeps resolving the same name.
             cache.endpoint_port = crate::state::default_port(&cache.engine);
+            cache.reader_endpoint_port = cache.endpoint_port;
         }
         if let Some(description) = description {
             cache.description = description;
@@ -498,6 +514,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "Serverless cache modified",
             now,
         );
+        (engine_changed, serverless_cache)
+        };
+
+        // A cache moved onto another engine is served by the engine it now runs:
+        // one moved onto an engine this emulator serves gains its sockets here,
+        // and the endpoints it publishes are the addresses and ports those
+        // sockets answer on (`crate::state::serve_serverless_cache`).
+        if engine_changed {
+            crate::state::serve_serverless_cache(&*self.engine, &state, &name, None).await;
+        }
+        // Read back once the sockets are open, so this answer publishes the
+        // addresses the cache really answers on rather than the ones its record
+        // carried before it was served.
+        let serverless_cache = state
+            .lock()
+            .serverless_caches
+            .get(&name)
+            .map(crate::state::ServerlessCacheRecord::to_modeled)
+            .unwrap_or(serverless_cache);
 
         Ok(ModifyServerlessCacheOutput {
             serverless_cache: Some(serverless_cache),

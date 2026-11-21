@@ -145,6 +145,10 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             endpoint_address,
             reader_endpoint_address,
             endpoint_port: new.port,
+            // Both endpoints start on the engine's own client port: the socket each of
+            // them is served on is opened after this record is stored
+            // ([`crate::state::serve_serverless_cache`]), and publishes its own port then.
+            reader_endpoint_port: new.port,
             tags: new.tags,
             // A created cache is under no migration: `PrepareMigration` and
             // `StartMigration` are what open one on it.

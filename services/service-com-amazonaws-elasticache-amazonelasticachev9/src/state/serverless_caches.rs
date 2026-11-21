@@ -603,6 +603,10 @@ pub struct ServerlessCacheRecord {
     pub endpoint_address: String,
     pub reader_endpoint_address: String,
     pub endpoint_port: i32,
+    /// The port the cache's READER endpoint answers on, which is its own socket's
+    /// ([`crate::state::serve_serverless_cache`]) and the engine's client port for a cache
+    /// this emulator serves no data plane for.
+    pub reader_endpoint_port: i32,
     pub arn: String,
     /// The tags `CreateServerlessCache` was given; see
     /// [`CacheClusterRecord::tags`].
@@ -697,7 +701,7 @@ impl ServerlessCacheRecord {
             }),
             reader_endpoint: Some(Endpoint {
                 address: Some(self.reader_endpoint_address.clone()),
-                port: Some(self.endpoint_port),
+                port: Some(self.reader_endpoint_port),
             }),
             arn: Some(self.arn.clone()),
             user_group_id: self.user_group_id.clone(),

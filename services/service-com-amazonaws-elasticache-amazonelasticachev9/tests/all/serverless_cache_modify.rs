@@ -228,9 +228,12 @@ const CASES: &[ModifyCase] = &[
         transient: false,
     },
     ModifyCase {
-        // A cache moved onto another engine reports that engine's version line,
-        // the full version derived from it, and that engine's client port
-        // (Memcached 11211, Valkey / Redis OSS 6379).
+        // A cache moved onto another engine reports that engine's version line.
+        // The PORTS its endpoints publish are the ports those endpoints answer
+        // on, so a cache moved onto an engine this emulator serves publishes the
+        // sockets it gains rather than the engine's client port; that is the
+        // subject of the `serverless_cache_endpoints` suite, which opens a
+        // session on each of them.
         case: "the engine and its version line",
         name: "engine-cache",
         request_name: "engine-cache",
@@ -240,7 +243,6 @@ const CASES: &[ModifyCase] = &[
             ("Engine", "valkey"),
             ("MajorEngineVersion", "8"),
             ("FullEngineVersion", "8.0"),
-            ("Endpoint/Port", "6379"),
             ("DailySnapshotTime", "04:30"),
         ],
         reported_lists: &[],

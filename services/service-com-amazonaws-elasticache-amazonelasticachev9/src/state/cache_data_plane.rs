@@ -105,8 +105,14 @@ pub enum CacheIdentity {
         replication_group_id: String,
         cache_cluster_id: String,
     },
-    /// A serverless cache.
+    /// A serverless cache, at the endpoint its writes go to.
     ServerlessCache { name: String },
+    /// A serverless cache, at its READER endpoint: the same cache over the same keyspace,
+    /// reached on a socket of its own, where a session may read and not write.
+    ///
+    /// A serverless cache publishes two endpoints, one per role, so each role is a socket
+    /// of its own and a client reaches the role it asked for.
+    ServerlessCacheReader { name: String },
 }
 
 /// One cache's data plane, as the store holds it: the keyspace, and the socket's handle.
@@ -272,6 +278,9 @@ fn data_plane_key(identity: &CacheIdentity) -> String {
             cache_cluster_id,
         } => format!("replication-group:{replication_group_id}:{cache_cluster_id}"),
         CacheIdentity::ServerlessCache { name } => format!("serverless-cache:{name}"),
+        CacheIdentity::ServerlessCacheReader { name } => {
+            format!("serverless-cache-reader:{name}")
+        }
     }
 }
 
@@ -421,7 +430,8 @@ pub fn cache_facts(
                 }),
             }
         }
-        CacheIdentity::ServerlessCache { name } => {
+        CacheIdentity::ServerlessCache { name }
+        | CacheIdentity::ServerlessCacheReader { name } => {
             let Some(cache) = store.serverless_caches.get(name) else {
                 return CacheFacts::default();
             };
@@ -433,7 +443,10 @@ pub fn cache_facts(
                 exists: true,
                 engine: cache.engine.clone(),
                 engine_version: cache.full_engine_version.clone(),
-                writable: true,
+                // "You can't write against a read only replica": a session on the cache's
+                // READER endpoint reads what the cache holds and writes nothing, which is
+                // what makes that endpoint the read role's own.
+                writable: !matches!(identity, CacheIdentity::ServerlessCacheReader { .. }),
                 cluster_enabled: false,
                 auth_token_digests: Vec::new(),
                 user_group_id: cache.user_group_id.clone(),
@@ -588,7 +601,7 @@ pub fn cache_parameters(
         }
         // A serverless cache has no parameter group; the one setting a client can read is
         // the policy its keyspace makes room by.
-        CacheIdentity::ServerlessCache { .. } => {
+        CacheIdentity::ServerlessCache { .. } | CacheIdentity::ServerlessCacheReader { .. } => {
             return vec![(
                 "maxmemory-policy".to_string(),
                 SERVERLESS_MAXMEMORY_POLICY.to_string(),
@@ -1003,45 +1016,122 @@ pub async fn serve_replication_group_holding<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Open the socket a serverless cache is served on and publish its address as the cache's
-/// `Endpoint` and `ReaderEndpoint`.
+/// Open the sockets a serverless cache is served on and publish their addresses as the
+/// cache's `Endpoint` and `ReaderEndpoint`.
 ///
-/// A serverless cache is always served TLS, because that is the only way ElastiCache
-/// serves one.
+/// A serverless cache publishes TWO endpoints — the one a client writes to and the one it
+/// reads from — so it is served by TWO sockets over the ONE keyspace: a session on the
+/// reader's socket reads what the cache holds and writes nothing (the engine's own
+/// `-READONLY`), which is what makes the reader endpoint the read role's own endpoint
+/// rather than a second name for the writer's. Each endpoint is published as the address
+/// and the port ITS OWN socket answers on, so a client that reads either one out of the
+/// control plane reaches the role it asked for.
+///
+/// Both are always served TLS, because that is the only way ElastiCache serves a
+/// serverless cache. The core owns the socket, the bind interface, the port range, the
+/// certificate and the connection caps for each of them ([`open_cache_data_plane`]), and
+/// the two are bounded by what bounds the caches themselves: this account holds at most
+/// [`super::SERVERLESS_CACHE_QUOTA`] serverless caches, so the sockets a request can make
+/// this process open are bounded by that quota and not by the request.
 ///
 /// `restored` is the data set the cache starts with: the keyspace a snapshot the create
 /// named was taken of, so a client's first `GET` on a restored cache answers what was
 /// stored before the snapshot. `None` for a cache created from nothing, which starts empty.
+///
+/// Idempotent, and it RE-publishes: a cache whose sockets are already open keeps them and
+/// has their addresses written onto its record again, so a `ModifyServerlessCache` that
+/// moved the cache onto another engine publishes the ports the cache answers on instead of
+/// leaving behind a port nothing listens at.
 pub async fn serve_serverless_cache<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<super::ComAmazonawsElasticacheAmazonelasticachev9State>,
     name: &str,
     restored: Option<SharedKeyspace>,
 ) {
-    let identity = CacheIdentity::ServerlessCache {
+    let writer = CacheIdentity::ServerlessCache {
         name: name.to_string(),
     };
-    {
+    let reader = CacheIdentity::ServerlessCacheReader {
+        name: name.to_string(),
+    };
+    // What the two sockets serve, read under one guard taken and dropped before the awaits
+    // below: the keyspace the cache ALREADY holds when one of its sockets is open, so a
+    // second call neither moves a client's data nor opens a second keyspace beside it.
+    let (serves_resp, held) = {
         let store = state.lock();
         let Some(cache) = store.serverless_caches.get(name) else {
             return;
         };
-        if !engine_speaks_resp(&cache.engine) || store.cache_data_planes.get(&identity).is_some()
-        {
+        (
+            engine_speaks_resp(&cache.engine),
+            store
+                .cache_data_planes
+                .get(&writer)
+                .map(|plane| Arc::clone(plane.keyspace())),
+        )
+    };
+    if !serves_resp {
+        return;
+    }
+    // The WRITER's socket first: its keyspace is the one the reader's socket shares, which
+    // is what makes a read on the reader endpoint answer what was written on the writer's.
+    let keyspace = match held {
+        Some(keyspace) => keyspace,
+        None => {
+            let Some(plane) =
+                open_cache_data_plane(engine, state, writer.clone(), true, restored).await
+            else {
+                return;
+            };
+            let keyspace = Arc::clone(plane.keyspace());
+            state.lock().cache_data_planes.insert(&writer, plane);
+            keyspace
+        }
+    };
+    if state.lock().cache_data_planes.get(&reader).is_none() {
+        let Some(plane) =
+            open_cache_data_plane(engine, state, reader.clone(), true, Some(keyspace)).await
+        else {
             return;
+        };
+        state.lock().cache_data_planes.insert(&reader, plane);
+    }
+    // Published once both sockets are open, so neither endpoint ever names a port that is
+    // not yet accepting connections.
+    let mut store = state.lock();
+    let served = [&writer, &reader].map(|identity| {
+        store
+            .cache_data_planes
+            .get(identity)
+            .map(|plane| plane.endpoint().clone())
+    });
+    let [writer_endpoint, reader_endpoint] = served;
+    if let Some(cache) = store.serverless_caches.get_mut(name) {
+        if let Some(endpoint) = writer_endpoint {
+            cache.endpoint_address = endpoint.host;
+            cache.endpoint_port = endpoint.port;
+        }
+        if let Some(endpoint) = reader_endpoint {
+            cache.reader_endpoint_address = endpoint.host;
+            cache.reader_endpoint_port = endpoint.port;
         }
     }
-    let Some(plane) = open_cache_data_plane(engine, state, identity.clone(), true, restored).await
-    else {
-        return;
-    };
-    let mut store = state.lock();
-    if let Some(cache) = store.serverless_caches.get_mut(name) {
-        cache.endpoint_address = plane.endpoint().host.clone();
-        cache.reader_endpoint_address = plane.endpoint().host.clone();
-        cache.endpoint_port = plane.endpoint().port;
-    }
-    store.cache_data_planes.insert(&identity, plane);
+}
+
+/// Whether this emulator holds an open socket for the serverless cache `name`, which is
+/// the question "is the endpoint this cache publishes one of our own sockets" — asked by
+/// the operations that would otherwise publish the engine's own client port for a cache
+/// that is reached on a socket instead.
+pub fn serverless_cache_is_served(
+    store: &super::ComAmazonawsElasticacheAmazonelasticachev9State,
+    name: &str,
+) -> bool {
+    store
+        .cache_data_planes
+        .get(&CacheIdentity::ServerlessCache {
+            name: name.to_string(),
+        })
+        .is_some()
 }
 
 /// Close the socket a cache cluster was served on — the delete, which takes the port and
@@ -1099,12 +1189,20 @@ pub fn close_replication_group_data_plane(
     }
 }
 
-/// Close the socket a serverless cache was served on.
+/// Close the sockets a serverless cache was served on — both of its endpoints, because
+/// both were opened for it.
 pub fn close_serverless_cache_data_plane(
     store: &mut super::ComAmazonawsElasticacheAmazonelasticachev9State,
     name: &str,
 ) {
-    store.cache_data_planes.remove(&CacheIdentity::ServerlessCache {
-        name: name.to_string(),
-    });
+    for identity in [
+        CacheIdentity::ServerlessCache {
+            name: name.to_string(),
+        },
+        CacheIdentity::ServerlessCacheReader {
+            name: name.to_string(),
+        },
+    ] {
+        store.cache_data_planes.remove(&identity);
+    }
 }
