@@ -12,8 +12,9 @@
 //! `InvalidTagging`, an `OriginSslProtocols` whose `Quantity` disagrees with its `Items` is
 //! `InconsistentQuantities`, an endpoint configuration this service's argument validation does
 //! not accept — an `Arn` naming no resource a VPC origin can front, or a port no origin can be
-//! reached on — is `InvalidArgument`, and a store already holding as many VPC origins as this
-//! emulator can is `EntityLimitExceeded`.
+//! reached on — is `InvalidArgument`, a `Name` the account already holds a VPC origin under is
+//! `EntityAlreadyExists`, and a store already holding as many VPC origins as this emulator can
+//! is `EntityLimitExceeded`.
 //!
 //! ## Shape of an operation
 //!
@@ -199,6 +200,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Materialise whatever the clock owes the rest of the store before this call reads
         // it, as every handler here does.
         store.settle(now);
+
+        // "A unique entity" is what this create demands of the one value a caller CHOOSES about
+        // a VPC origin: `VpcOriginEndpointConfig$Name` is the name the account knows the origin
+        // by, so a name the account already holds cannot name a second one and the repeat is
+        // refused with this operation's conflict error. Checked BEFORE anything is minted, so a
+        // retried create neither doubles the resource nor changes the one that holds the name.
+        if store.holds_vpc_origin_named(&config.name) {
+            return Err(CreateVpcOriginErrorModeled::EntityAlreadyExists(
+                crate::state::vpc_origin_already_exists(),
+            )
+            .into());
+        }
 
         // "The entity limit has been exceeded." The store grows only here and a VPC origin
         // record is what every later read answers from, so the bound is an entry count

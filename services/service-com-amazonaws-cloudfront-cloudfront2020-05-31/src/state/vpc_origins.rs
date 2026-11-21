@@ -17,7 +17,7 @@
 //! and nothing ever sleeps for it.
 
 use super::*;
-use crate::ops::types::{VpcOrigin, VpcOriginEndpointConfig};
+use crate::ops::types::{VpcOrigin, VpcOriginEndpointConfig, VpcOriginSummary};
 
 /// The prefix every VPC origin id this service mints carries.
 ///
@@ -52,7 +52,11 @@ pub const MAX_VPC_ORIGINS: usize = 1_000;
 /// operation that resolves a VPC origin answers an id it holds none under the same way. It is
 /// the answer to a READABLE identifier alone ([`is_vpc_origin_id`]): an argument of no form a
 /// VPC origin id takes never named a VPC origin to be absent.
-pub const VPC_ORIGIN_NOT_FOUND_MESSAGE: &str = "The specified VPC origin does not exist.";
+///
+/// The value below is the WIRE text — what the recorded service answers this condition with for
+/// THIS resource kind, down to the lower-case resource name and the absent full stop, which is
+/// not how the neighbouring kinds write their own sentence: do not "correct" it into theirs.
+pub const VPC_ORIGIN_NOT_FOUND_MESSAGE: &str = "The specified vpc origin does not exist";
 
 /// The modelled `EntityNotFound` (HTTP 404) for an `Id` no stored VPC origin answers to.
 ///
@@ -66,6 +70,49 @@ pub const VPC_ORIGIN_NOT_FOUND_MESSAGE: &str = "The specified VPC origin does no
 pub fn vpc_origin_not_found() -> EntityNotFound {
     EntityNotFound {
         message: Some(VPC_ORIGIN_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence CloudFront answers a VPC origin name that is already taken with, on the wire.
+///
+/// `CreateVpcOrigin` models `EntityAlreadyExists` for the one value a caller CHOOSES about a
+/// VPC origin — `VpcOriginEndpointConfig$Name` — so the conflict this sentence states is a name
+/// the account already holds. The WIRE text for THIS resource kind, fixed whole: what the
+/// refusal states is a property of the CONDITION, so neither the name submitted nor the
+/// identifier of the resource holding it reaches it. It differs from the sentence the MODEL's
+/// documentation of the shape uses ("The entity already exists. You must provide a unique
+/// entity."), which documents the condition for every kind sharing the code and is not served,
+/// and from the way the neighbouring kinds that share the code word their own
+/// ([`TRUST_STORE_ALREADY_EXISTS_MESSAGE`]).
+pub const VPC_ORIGIN_ALREADY_EXISTS_MESSAGE: &str =
+    "Another vpc origin with the same name already exists within the aws account.";
+
+/// The modelled `EntityAlreadyExists` (HTTP 409) for a VPC origin name that is already taken.
+///
+/// Takes no name, for the reason [`trust_store_already_exists`] takes none: every refusal of
+/// this condition reads the same ([`VPC_ORIGIN_ALREADY_EXISTS_MESSAGE`]).
+pub fn vpc_origin_already_exists() -> EntityAlreadyExists {
+    EntityAlreadyExists {
+        message: Some(VPC_ORIGIN_ALREADY_EXISTS_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence a delete refuses a VPC origin whose endpoint has not been deployed yet with.
+///
+/// `DeleteVpcOrigin` models `IllegalDelete` ("Deletion is not allowed for this entity"), and the
+/// condition it states for this resource kind is the one the CLOCK owes away: a VPC origin whose
+/// create is still propagating to the edge locations ([`VPC_ORIGIN_STATUS_DEPLOYING`]) is not a
+/// VPC origin a delete may remove, so the refusal stands until the deployment settles. Worded in
+/// the form [`ILLEGAL_DELETE_MANAGED_POLICY_MESSAGE`] gives this code — the CONDITION and
+/// nothing from the request — so every refusal of it reads the same.
+pub const VPC_ORIGIN_ILLEGAL_DELETE_MESSAGE: &str =
+    "The request failed because delete is not allowed while the VPC origin is being deployed.";
+
+/// The modelled `IllegalDelete` (HTTP 400) for a delete of a VPC origin that is still deploying
+/// ([`VPC_ORIGIN_ILLEGAL_DELETE_MESSAGE`]).
+pub fn vpc_origin_illegal_delete() -> crate::ops::types::IllegalDelete {
+    crate::ops::types::IllegalDelete {
+        message: Some(VPC_ORIGIN_ILLEGAL_DELETE_MESSAGE.to_string()),
     }
 }
 
@@ -215,16 +262,50 @@ fn names_vpc_origin_resource(service: &str, resource: &str) -> bool {
     }
 }
 
+/// The ARN service namespaces that own the resources a VPC origin endpoint can front: the
+/// load balancers ([`LOAD_BALANCER_ARN_NAMESPACE`]) and the compute instances
+/// ([`INSTANCE_ARN_NAMESPACE`]) `VpcOriginEndpointConfig$Arn` names.
+pub const VPC_ORIGIN_ENDPOINT_ARN_NAMESPACES: [&str; 2] =
+    [LOAD_BALANCER_ARN_NAMESPACE, INSTANCE_ARN_NAMESPACE];
+
+/// Whether `value` is an ARN of one of the services that own a resource a VPC origin endpoint
+/// can front ([`VPC_ORIGIN_ENDPOINT_ARN_NAMESPACES`]) — read from the value alone, with no
+/// question asked about the resource it names.
+///
+/// This is the FORM `VpcOriginEndpointConfig$Arn` takes: the member holds the ARN of a load
+/// balancer or of an instance, so a value that is no ARN at all AND one that is an ARN of any
+/// other service are both outside that form, while one inside it goes on to be VALIDATED
+/// ([`is_vpc_origin_endpoint_arn`]). That split is what the two sentences this member is refused
+/// with state ([`vpc_origin_endpoint_config_validation`]).
+pub fn is_vpc_origin_endpoint_arn_namespace(value: &str) -> bool {
+    if !is_readable_arn(value) {
+        return false;
+    }
+    value
+        .split(':')
+        .nth(2)
+        .is_some_and(|service| VPC_ORIGIN_ENDPOINT_ARN_NAMESPACES.contains(&service))
+}
+
 /// The refusal CloudFront's argument validation answers a `VpcOriginEndpointConfig` it does
 /// not accept, or `None` when the configuration validates.
 ///
 /// `Arn` is the member that NAMES a resource, and the two ways that value can fail are two
-/// refusals, told apart as the service tells them apart: a value that is no ARN at all is
-/// refused on the member's FORM ([`parameter_invalid_format`]), and one that reads as an ARN
-/// but names no resource a VPC origin can front ([`is_vpc_origin_endpoint_arn`]) fails that
-/// member's validation ([`parameter_validation_error`]). Either way the member is named by its
-/// PATH in the request. The two PORTS are read with this service's one origin-port rule.
-/// Nothing is minted from a configuration this refuses.
+/// refusals, told apart as the service tells them apart:
+///
+/// * a value outside the FORM the member takes — the member holds the ARN of one of the
+///   resources a VPC origin fronts, so a value that is no ARN at all and one that is an ARN of
+///   any other service alike are not in that form
+///   ([`is_vpc_origin_endpoint_arn_namespace`]) — is refused on the member's form
+///   ([`parameter_invalid_format`]);
+/// * a value in that form whose resource part is not one that kind's own ARNs carry, so it
+///   names no resource a VPC origin can front ([`is_vpc_origin_endpoint_arn`]), fails that
+///   member's validation ([`parameter_validation_error`]).
+///
+/// Either way the member is named by its PATH in the request. Both sentences are recorded
+/// behaviour of this member, so the split between them is the member's form against its
+/// validation and not one condition worded two ways. The two PORTS are read with this service's
+/// one origin-port rule. Nothing is minted from a configuration this refuses.
 ///
 /// The configuration's other members are judged by the model itself: `Name`, `Arn`,
 /// `HTTPPort`, `HTTPSPort` and `OriginProtocolPolicy` are `@required` and the protocol members
@@ -237,10 +318,11 @@ pub fn vpc_origin_endpoint_config_validation(
     config: &VpcOriginEndpointConfig,
 ) -> Option<crate::ops::types::InvalidArgument> {
     if !is_vpc_origin_endpoint_arn(&config.arn) {
-        // One reading of the value decides which of the two refusals it gets: a value that
-        // could not be read as an ARN at all failed the member's FORM, and one that was read
-        // but names no resource a VPC origin can front failed its validation.
-        return Some(if is_readable_arn(&config.arn) {
+        // One reading of the value decides which of the two refusals it gets: a value outside
+        // the form this member takes — no ARN at all, or an ARN of a service that owns no
+        // resource a VPC origin fronts — failed the member's FORM, and one inside that form
+        // whose resource part names no such resource failed its validation.
+        return Some(if is_vpc_origin_endpoint_arn_namespace(&config.arn) {
             parameter_validation_error(VPC_ORIGIN_ENDPOINT_CONFIG_ARN_MEMBER_PATH)
         } else {
             parameter_invalid_format(VPC_ORIGIN_ENDPOINT_CONFIG_ARN_MEMBER_PATH)
@@ -366,6 +448,29 @@ impl StoredVpcOrigin {
             vpc_origin_endpoint_config: self.endpoint_config.clone(),
         }
     }
+
+    /// The `VpcOriginSummary` a listing serves for this VPC origin, read from the SAME stored
+    /// record the full projection is read from — so a listing and a read of one of its entries
+    /// can never disagree.
+    ///
+    /// The summary is the full projection's members minus the configuration, with the
+    /// configuration's own `Name` ("The VPC origin summary name"), its `Arn` ("The VPC origin
+    /// summary origin endpoint ARN" — the resource in the VPC this origin fronts, which the
+    /// summary carries beside the VPC origin's own ARN) and its `IpAddressType` hoisted onto
+    /// it.
+    pub fn to_summary(&self) -> VpcOriginSummary {
+        VpcOriginSummary {
+            id: self.id.clone(),
+            name: self.endpoint_config.name.clone(),
+            status: self.status.clone(),
+            created_time: ::aws_smithy_types::DateTime::from(self.created_time),
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            arn: self.arn.clone(),
+            account_id: Some(::engine::emulator_account_id().to_string()),
+            origin_endpoint_arn: self.endpoint_config.arn.clone(),
+            ip_address_type: self.endpoint_config.ip_address_type.clone(),
+        }
+    }
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -387,5 +492,46 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// record is held under, so the lookup is that one map read rather than a scan.
     pub fn vpc_origin(&self, id: &str) -> Option<&StoredVpcOrigin> {
         self.vpc_origins.get(id)
+    }
+
+    /// Whether the store holds a VPC origin under exactly the ID `id` — what tells a `Marker`
+    /// this service handed out from one shaped like an id that names no VPC origin, which is a
+    /// resume point that resumes nothing rather than a bad argument.
+    ///
+    /// By KEY rather than through [`Self::vpc_origin`]: a resume point is the id the previous
+    /// page ended at.
+    pub fn holds_vpc_origin(&self, id: &str) -> bool {
+        self.vpc_origins.contains_key(id)
+    }
+
+    /// Whether the account already holds a VPC origin whose endpoint configuration is called
+    /// `name` — what makes a repeated name a [`vpc_origin_already_exists`] rather than a second
+    /// VPC origin.
+    ///
+    /// A scan over the stored records rather than a second index beside them, for the reason
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::holds_trust_store_named`] scans: those
+    /// records are the single source of truth for which names are taken, so the answer cannot
+    /// drift out of step with what a read reports, and the collection is bounded by
+    /// [`MAX_VPC_ORIGINS`].
+    pub fn holds_vpc_origin_named(&self, name: &str) -> bool {
+        self.vpc_origins
+            .values()
+            .any(|vpc_origin| vpc_origin.endpoint_config.name == name)
+    }
+
+    /// The id of the distribution one of whose origins fronts the VPC origin `id` names, or
+    /// `None` when nothing stored does.
+    ///
+    /// What makes a VPC origin IN USE, and so what a delete of one is refused for: a
+    /// distribution names a VPC origin in exactly one place ([`references_vpc_origin`]), the
+    /// same place the listing of the distributions a VPC origin fronts reads, so the two can
+    /// never disagree about which VPC origins are still referenced. A scan over the STORED
+    /// configurations rather than a second index beside them, for the reason
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_trust_store`] scans.
+    pub fn distribution_using_vpc_origin(&self, id: &str) -> Option<&str> {
+        self.distributions
+            .values()
+            .find(|stored| references_vpc_origin(&stored.config, id))
+            .map(|stored| stored.id.as_str())
     }
 }

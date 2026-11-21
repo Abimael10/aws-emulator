@@ -16,10 +16,11 @@
 //!    (`EntityNotFound`, 404) while every other value is the argument the service cannot read
 //!    (`InvalidArgument`, 400, "<member> format is invalid" naming the member it arrived in);
 //! 2. `CreateVpcOrigin` validates the endpoint configuration's `Arn` before it mints
-//!    anything: a value that is no ARN at all is refused on the member's form ("The parameter
-//!    <member path> Invalid Format."), one that reads as an ARN but names no resource a VPC
-//!    origin can front fails that member's validation ("The parameter <member path>
-//!    ValidationError."), and an ARN naming one of the resources a VPC origin fronts is
+//!    anything: a value outside the FORM that member takes — no ARN at all, or an ARN of a
+//!    service that owns no resource a VPC origin fronts — is refused on the member's form ("The
+//!    parameter <member path> Invalid Format."), one inside that form whose resource part names
+//!    no resource a VPC origin can front fails that member's validation ("The parameter <member
+//!    path> ValidationError."), and an ARN naming one of the resources a VPC origin fronts is
 //!    accepted and read back;
 //! 3. a port no origin can be reached on is refused with the one sentence this service states
 //!    for that condition, wherever an origin configuration carries a port — the VPC origin
@@ -396,15 +397,17 @@ async fn an_endpoint_arn_naming_a_resource_a_vpc_origin_fronts_is_accepted() {
 
 /// RULE 2, the refusal side: a value this service's argument validation does not accept is
 /// refused 400 `InvalidArgument`, naming the member by its PATH in the request, and mints
-/// nothing — with the sentence for a value that is not even in the FORM the member takes, and
-/// the sentence for a readable ARN that names no resource a VPC origin can front.
+/// nothing — with the sentence for a value outside the FORM the member takes (no ARN at all, or
+/// an ARN of a service that owns no resource a VPC origin fronts) and the sentence for a value
+/// inside that form whose resource part names no resource a VPC origin can front.
 ///
 /// The rows differ along which stage the value fails at and why: a value that is no ARN (empty,
-/// a word, a URL, too few segments, an empty partition or resource) and an ARN that names
-/// another service's resource, another resource type, a load balancer kind CloudFront does not
-/// front, a load balancer name Elastic Load Balancing could not have issued (past its published
-/// bound, carrying a character outside its alphabet, beginning with the label it reserves), a
-/// resource id of neither service's form, or no region or account at all.
+/// a word, a URL, too few segments, an empty partition or resource) or an ARN naming another
+/// service's resource altogether, and an ARN of a service that owns one naming another resource
+/// type, a load balancer kind CloudFront does not front, a load balancer name Elastic Load
+/// Balancing could not have issued (past its published bound, carrying a character outside its
+/// alphabet, beginning with the label it reserves), a resource id of neither service's form, or
+/// no region or account at all.
 #[tokio::test]
 async fn an_endpoint_arn_the_validation_rejects_mints_nothing() {
     let router = emulator();
@@ -440,7 +443,7 @@ async fn an_endpoint_arn_the_validation_rejects_mints_nothing() {
         (
             "another service's resource",
             "arn:aws:s3:::orders-bucket".to_string(),
-            unvalidated.as_str(),
+            unreadable.as_str(),
         ),
         (
             "another resource type of a service that owns one",

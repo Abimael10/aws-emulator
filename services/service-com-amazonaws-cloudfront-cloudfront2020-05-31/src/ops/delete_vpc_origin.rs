@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteVpcOrigin
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteVpcOrigin`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteVpcOrigin::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Delete an Amazon CloudFront VPC origin": the one stored record the create persisted is
+//! REMOVED, under the optimistic-concurrency precondition every conditional write of this
+//! service runs under — so the id answers no later read, the ARN carries no tags and no
+//! resource policy, and the name the endpoint configuration held is free again.
+//!
+//! The order the refusals are decided in is the order the request can be judged in: the `Id`
+//! has to be written the way CloudFront writes a VPC origin identifier at all
+//! (`InvalidArgument`, 400) and has to name a stored VPC origin (`EntityNotFound`, 404); the
+//! `If-Match` the request carried has to be that record's current version token — a value that
+//! is no version token at all is `InvalidIfMatchVersion` (400) and a well-formed token that is
+//! not the current one is `PreconditionFailed` (412); a VPC origin whose create is still
+//! propagating to the edge locations cannot be deleted yet (`IllegalDelete`, 400); and one a
+//! stored distribution still fronts cannot be deleted at all
+//! (`CannotDeleteEntityWhileInUse`, 409). NO refusal writes anything: the record and the
+//! version token an `If-Match` is checked against stand exactly as they were, so a caller that
+//! re-reads the VPC origin and retries with the version it reports lands.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +86,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +166,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteVpcOrigin` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteVpcOriginErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteVpcOrigin"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "The VPC origin ID": whether the value is an identifier CloudFront writes a VPC origin
+        // under is a property of the REQUEST alone, so it is read before the store is consulted
+        // — the same split `GetVpcOrigin` reads its path member with, so the two operations
+        // addressed by this identifier cannot disagree about which values name a VPC origin that
+        // is merely absent.
+        if !crate::state::is_vpc_origin_id(&input.id) {
+            return Err(DeleteVpcOriginErrorModeled::InvalidArgument(
+                crate::state::invalid_id_format("Id"),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes this service's state before the call reads
+        // it, so both the version this precondition is evaluated against and the status it reads
+        // are the ones a read at this instant reports.
+        store.settle(SystemTime::now());
+
+        // An id no stored VPC origin answers to names nothing to delete: `EntityNotFound` is
+        // what this operation models for an entity it cannot find, and it is decided before
+        // anything else is spent on the request.
+        let Some(stored) = store.vpc_origin(&input.id).cloned() else {
+            return Err(DeleteVpcOriginErrorModeled::EntityNotFound(
+                crate::state::vpc_origin_not_found(),
+            )
+            .into());
+        };
+
+        // "The version identifier of the VPC origin to delete. This is the ETag value returned
+        // in the response to GetVpcOrigin": the precondition is evaluated next, the way HTTP
+        // evaluates one, so a caller holding a version that is no longer current is told that
+        // before anything about the VPC origin's own state. A value that is no version token at
+        // all is "the If-Match version is missing or not valid", and a well-formed token that is
+        // not the stored one is a failed precondition — the one split every conditional write of
+        // this service runs ([`crate::state::check_if_match`]). The member is `@required`, so a
+        // request stating no `If-Match` is refused at the request boundary.
+        match crate::state::check_if_match(&stored.etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(DeleteVpcOriginErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(DeleteVpcOriginErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // A VPC origin whose endpoint is still being deployed to the edge locations is not one a
+        // delete may remove: the deployment is owed by the CLOCK, so the refusal stands only
+        // until the propagation the create started has settled, and the record is left exactly
+        // as it was for the retry that follows.
+        if stored.status == crate::state::VPC_ORIGIN_STATUS_DEPLOYING {
+            return Err(DeleteVpcOriginErrorModeled::IllegalDelete(
+                crate::state::vpc_origin_illegal_delete(),
+            )
+            .into());
+        }
+
+        // A VPC origin a stored distribution still fronts through one of its origins is IN USE,
+        // so the delete is refused and the VPC origin stays readable: the reference is the one
+        // place a configuration names a VPC origin, read from the stored configurations, so this
+        // answers exactly when the listing of the distributions that VPC origin fronts lists
+        // one.
+        if store.distribution_using_vpc_origin(&input.id).is_some() {
+            return Err(DeleteVpcOriginErrorModeled::CannotDeleteEntityWhileInUse(
+                crate::state::entity_in_use(),
+            )
+            .into());
+        }
+
+        // Gone means gone: the record every read of this VPC origin answered from is removed —
+        // with the tags it carried, which were held on it — so neither the id nor the ARN answers
+        // a later read, and the name its endpoint configuration held is free for a later create.
+        store.vpc_origins.remove(&input.id);
+
+        Ok(DeleteVpcOriginOutput {
+            // "The VPC origin" and "The VPC origin ETag" — the record this call removed, read
+            // from the record itself rather than from the request that was served.
+            vpc_origin: Some(stored.to_vpc_origin()),
+            e_tag: Some(stored.etag),
+        })
     }
 }

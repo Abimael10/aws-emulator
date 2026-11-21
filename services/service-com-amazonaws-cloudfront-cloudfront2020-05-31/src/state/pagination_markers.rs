@@ -63,6 +63,12 @@ pub const CONTINUOUS_DEPLOYMENT_POLICY_MARKER_KIND: &str = "CF continuous deploy
 /// namespace-prefixed resource kinds word theirs ([`CONNECTION_GROUP_MARKER_KIND`]).
 pub const TRUST_STORE_MARKER_KIND: &str = "CF trust store Id";
 
+/// The kind a VPC ORIGIN listing's marker names, worded as the sibling listings of the
+/// namespace-prefixed resource kinds word theirs ([`TRUST_STORE_MARKER_KIND`]), over the name
+/// this service's own VPC origin sentences spell the kind with
+/// ([`crate::state::VPC_ORIGIN_NOT_FOUND_MESSAGE`]).
+pub const VPC_ORIGIN_MARKER_KIND: &str = "CF vpc origin Id";
+
 /// The sentence this service refuses a `Marker` that is no resume point with, for a listing
 /// whose marker names `kind`.
 ///

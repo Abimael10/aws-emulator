@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListVpcOrigins
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListVpcOrigins`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListVpcOrigins::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "List the CloudFront VPC origins in your account": ONE page of the VPC origins this
+//! service holds, read from the stored records — so a listing and a read of any one of its
+//! entries report the same id, ARN, status and endpoint, and a VPC origin a delete removed is
+//! listed by neither.
+//!
+//! `Marker` names where the previous page ENDED, so this page starts after it and walking the
+//! pages enumerates every stored VPC origin exactly once; `MaxItems` BOUNDS the page, so only
+//! a negative size names no page at all (`InvalidArgument`). A marker outside the form
+//! CloudFront writes a VPC origin identifier in was never a resume point this service handed
+//! out (`InvalidArgument`), and one of that form the store holds nothing under names no entity
+//! (`EntityNotFound`).
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +73,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -142,18 +148,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListVpcOrigins` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListVpcOriginsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListVpcOrigins"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "The maximum number of items included in the list" — the member BOUNDS the page
+        // rather than demanding one, so only a negative size names no page at all. A request
+        // that names no size is served this service's page size, which is also the ceiling it
+        // serves at, so one request cannot serve the whole store in a single response.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListVpcOriginsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // Materialise the deployment the clock already owes, so no summary reports a stale
+        // status.
+        store.settle(SystemTime::now());
+
+        // "The marker associated with the VPC origins list": the marker is a VPC origin id this
+        // service handed out as a `NextMarker`. A value outside that form was never a resume
+        // point (`InvalidArgument`), and one of that form naming no stored VPC origin names no
+        // entity, which is what this listing's `EntityNotFound` is about — the same split the
+        // sibling listing of a namespace-prefixed kind makes.
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
+            if !crate::state::is_vpc_origin_id(marker) {
+                return Err(ListVpcOriginsErrorModeled::InvalidArgument(InvalidArgument {
+                    message: Some(crate::state::invalid_marker_message(
+                        crate::state::VPC_ORIGIN_MARKER_KIND,
+                    )),
+                })
+                .into());
+            }
+            if !store.holds_vpc_origin(marker) {
+                return Err(ListVpcOriginsErrorModeled::EntityNotFound(
+                    crate::state::vpc_origin_not_found(),
+                )
+                .into());
+            }
+        }
+
+        // The page starts AFTER the marker, so walking the pages enumerates every stored VPC
+        // origin exactly once. The store is ordered by id, so the resume point is a range bound
+        // rather than a scan.
+        let start = match crate::state::resume_marker(input.marker.as_deref()) {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut items: Vec<VpcOriginSummary> = Vec::new();
+        let mut is_truncated = false;
+        for (_, stored) in store.vpc_origins.range::<str, _>((start, Bound::Unbounded)) {
+            if items.len() >= page_size {
+                is_truncated = true;
+                break;
+            }
+            items.push(stored.to_summary());
+        }
+
+        Ok(ListVpcOriginsOutput {
+            vpc_origin_list: Some(VpcOriginList {
+                // "The marker associated with the VPC origins list" — the value the request
+                // provided, echoed back, which is the empty value for a first page.
+                marker: input.marker.unwrap_or_default(),
+                // "The next marker associated with the VPC origins list": present exactly when
+                // VPC origins remain, carrying the id this page ended at — the value the next
+                // request carries as its `Marker`.
+                next_marker: if is_truncated {
+                    items.last().map(|summary| summary.id.clone())
+                } else {
+                    None
+                },
+                // "The maximum number of items included in the list", as the request bounded it.
+                max_items,
+                // "A flag that indicates whether more VPC origins remain to be listed."
+                is_truncated,
+                // "The number of VPC origins in the list": the length of `Items`.
+                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+                // A page that lists nothing carries no `Items` element at all, as every other
+                // summary listing of this service answers an empty page.
+                items: if items.is_empty() { None } else { Some(items) },
+            }),
+        })
     }
 }
