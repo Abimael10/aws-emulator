@@ -17,14 +17,18 @@
 //!
 //! The answer is PER SECRET, which is what the batch APIs' `UnprocessedScramSecret`
 //! reports ("Error info for scram secret associate/disassociate failure"): the call
-//! answers 200, the rest of the batch is associated, and every secret the service could
+//! answers 200, the rest of the batch is applied, and every secret the service could
 //! not act on comes back named, with a code and a message, and is NOT stored — so a
-//! later listing of the cluster's secrets does not report it.
+//! later listing of the cluster's secrets does not report it. The ENTRY is built here
+//! too ([`unprocessed_secret`]), for both batch operations: the DISASSOCIATION decides
+//! admissibility against the cluster's own stored set rather than against Secrets
+//! Manager (an entry that names no association of the cluster is what it cannot act
+//! on), and reports what it could not act on with the same one code and sentence.
 //!
-//! Every entry here is GROUNDED in what Secrets Manager ANSWERED. An emulator with no
-//! Secrets Manager mounted knows nothing about the account's secrets, and nothing is
-//! what it reports: a secret is never called unprocessable because the service that
-//! holds it could not be reached.
+//! Every entry the ASSOCIATION reports is GROUNDED in what Secrets Manager ANSWERED. An
+//! emulator with no Secrets Manager mounted knows nothing about the account's secrets,
+//! and nothing is what it reports: a secret is never called unprocessable because the
+//! service that holds it could not be reached.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -46,31 +50,46 @@ const SECRETS_MANAGER: &str = "secretsmanager";
 /// emulator failing to ask.
 const SECRET_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
-/// The `UnprocessedScramSecret$ErrorCode` for a secret ARN this endpoint's Secrets
-/// Manager holds no secret for — a secret that was never created, one already deleted,
-/// or one of another Region or account, none of which this cluster's brokers could read
-/// a credential out of.
+/// The `UnprocessedScramSecret$ErrorCode` for EVERY secret the SCRAM batch surface
+/// cannot act on: one this endpoint's Secrets Manager holds no secret for (never
+/// created, already deleted, or of another Region or account), one encrypted with the
+/// Amazon Web Services managed Secrets Manager key rather than with a customer managed
+/// KMS key, and — on the disassociation — one the cluster holds no association for.
 ///
-/// CHOSEN, with [`SECRET_ABSENT_ERROR_MESSAGE`] and the pair below: the model declares
-/// `ErrorCode` and `ErrorMessage` as plain strings and publishes no value for either,
-/// so this crate states one short code and one sentence per condition, in the error
-/// classes' usual spelling, and keeps them here rather than in the handlers so the two
-/// batch operations cannot word one condition two ways.
-pub const SECRET_ABSENT_ERROR_CODE: &str = "InvalidSecretArn";
+/// ONE code for the whole class, because that is what the service answers: Amazon MSK
+/// classifies every such entry as a secret ARN it could not act on and says WHICH
+/// condition it met in the entry's `ErrorMessage`, so a per-condition code of this
+/// emulator's own would be a value no client can get from the service. The model
+/// declares `ErrorCode` and `ErrorMessage` as plain strings, so the code and the
+/// sentences live here rather than in the handlers and the two batch operations cannot
+/// word one condition two ways.
+pub const UNPROCESSED_SECRET_ERROR_CODE: &str = "InvalidSecretArn";
 
-/// See [`SECRET_ABSENT_ERROR_CODE`]. Fixed text: the ARN at fault is reported in the
-/// entry's own `SecretArn`, so it is not interpolated into the sentence.
-pub const SECRET_ABSENT_ERROR_MESSAGE: &str = "The provided secret ARN is invalid.";
+/// The `ErrorMessage` for a secret encrypted with the Amazon Web Services managed
+/// Secrets Manager key rather than with a customer managed KMS key: the requirement
+/// Amazon MSK states for a secret it is to read a SASL/SCRAM credential out of, which
+/// is what distinguishes this condition from the one
+/// [`super::SECRET_ARN_INVALID_MESSAGE`] states — the ARN resolves to a secret, and
+/// that secret's encryption key is the reason it cannot serve.
+///
+/// Fixed text: the ARN at fault is reported in the entry's own `SecretArn`, so it is
+/// not interpolated into the sentence.
+pub const SECRET_ON_MANAGED_KEY_MESSAGE: &str =
+    "The provided secret ARN is encrypted with the default AWS KMS key. Amazon MSK requires a \
+     secret encrypted with a customer managed AWS KMS key.";
 
-/// The `UnprocessedScramSecret$ErrorCode` for a secret encrypted with the Amazon Web
-/// Services managed Secrets Manager key rather than with a customer managed KMS key.
-pub const SECRET_ON_MANAGED_KEY_ERROR_CODE: &str = "InvalidSecretKmsKeyId";
-
-/// See [`SECRET_ON_MANAGED_KEY_ERROR_CODE`]: the requirement Amazon MSK states for a
-/// secret it is to read a SASL/SCRAM credential out of. Fixed text, for the same reason
-/// [`SECRET_ABSENT_ERROR_MESSAGE`] is.
-pub const SECRET_ON_MANAGED_KEY_ERROR_MESSAGE: &str =
-    "The secret must be encrypted with a customer managed AWS KMS key.";
+/// The `UnprocessedScramSecrets` entry naming `secret_arn`, carrying
+/// [`UNPROCESSED_SECRET_ERROR_CODE`] and the sentence the condition states.
+///
+/// The single place either batch operation builds such an entry, so an association and
+/// a disassociation report one condition identically.
+pub fn unprocessed_secret(secret_arn: &str, error_message: &str) -> UnprocessedScramSecret {
+    UnprocessedScramSecret {
+        error_code: Some(UNPROCESSED_SECRET_ERROR_CODE.to_string()),
+        error_message: Some(error_message.to_string()),
+        secret_arn: Some(secret_arn.to_string()),
+    }
+}
 
 /// A batch of secret ARNs split into the ones that can be associated and the ones that
 /// come back unprocessed.
@@ -142,13 +161,9 @@ pub async fn admit_for_association<'a>(
     let mut unprocessed: Vec<UnprocessedScramSecret> = Vec::new();
     let mut refused: BTreeSet<&str> = BTreeSet::new();
     for arn in distinct {
-        if let Some((error_code, error_message)) = refusal(&client, arn).await {
+        if let Some(error_message) = inadmissible(&client, arn).await {
             refused.insert(arn.as_str());
-            unprocessed.push(UnprocessedScramSecret {
-                error_code: Some(error_code.to_string()),
-                error_message: Some(error_message.to_string()),
-                secret_arn: Some(arn.clone()),
-            });
+            unprocessed.push(unprocessed_secret(arn, error_message));
         }
     }
     if refused.is_empty() {
@@ -170,8 +185,8 @@ pub async fn admit_for_association<'a>(
     }
 }
 
-/// The code and message the secret `secret_arn` comes back unprocessed with, or `None`
-/// when it can be associated.
+/// The sentence the secret `secret_arn` comes back unprocessed with, or `None` when it
+/// can be associated.
 ///
 /// Two conditions, both of them Secrets Manager's to answer: whether it holds a secret
 /// under that ARN, and — from the secret it reports — whether the secret is encrypted
@@ -179,10 +194,10 @@ pub async fn admit_for_association<'a>(
 /// (`envelope::customer_managed_key`, where the rule that an absent, empty or
 /// `aws/secretsmanager`-aliased `KmsKeyId` all name the managed key lives), so the two
 /// services cannot drift apart about which secrets are on a key a caller can grant on.
-async fn refusal(
+async fn inadmissible(
     client: &::aws_sdk_secretsmanager::Client,
     secret_arn: &str,
-) -> Option<(&'static str, &'static str)> {
+) -> Option<&'static str> {
     let described = match client.describe_secret().secret_id(secret_arn).send().await {
         Ok(described) => described,
         Err(error) => {
@@ -192,7 +207,7 @@ async fn refusal(
                 .unwrap_or_default()
                 .to_string();
             if code == SECRET_NOT_FOUND_CODE {
-                return Some((SECRET_ABSENT_ERROR_CODE, SECRET_ABSENT_ERROR_MESSAGE));
+                return Some(super::SECRET_ARN_INVALID_MESSAGE);
             }
             // Any other answer is this emulator failing to ask rather than Secrets
             // Manager reporting on the secret, so it grounds no entry — and it is worth
@@ -205,8 +220,7 @@ async fn refusal(
             return None;
         }
     };
-    customer_managed_key(described.kms_key_id()).is_none().then_some((
-        SECRET_ON_MANAGED_KEY_ERROR_CODE,
-        SECRET_ON_MANAGED_KEY_ERROR_MESSAGE,
-    ))
+    customer_managed_key(described.kms_key_id())
+        .is_none()
+        .then_some(SECRET_ON_MANAGED_KEY_MESSAGE)
 }

@@ -32,16 +32,20 @@ use crate::kafka_harness::{pct, sleep_past_activation, ClusterRequest, Emulator,
 /// in another Region, which is what [`OTHER_REGION`] is for.
 const OTHER_REGION: &str = "us-east-2";
 
-/// The `ErrorCode` a secret ARN Secrets Manager holds no secret for comes back with, and
-/// the sentence beside it. Written out here rather than read from the service's own
-/// constants, so the pair is pinned by this suite instead of by the code under test.
+/// The `ErrorCode` a secret this surface cannot act on comes back with, and the sentence
+/// beside it when the ARN resolves to no secret of this endpoint. Written out here
+/// rather than read from the service's own constants, so the pair is pinned by this
+/// suite instead of by the code under test.
 const ABSENT_CODE: &str = "InvalidSecretArn";
 const ABSENT_MESSAGE: &str = "The provided secret ARN is invalid.";
 
 /// The same for a secret encrypted with the Amazon Web Services managed Secrets Manager
-/// key instead of a customer managed KMS key.
-const MANAGED_KEY_CODE: &str = "InvalidSecretKmsKeyId";
-const MANAGED_KEY_MESSAGE: &str = "The secret must be encrypted with a customer managed AWS KMS key.";
+/// key instead of a customer managed KMS key: ONE code for the whole class — the service
+/// says which condition it met in the sentence, not in the code.
+const MANAGED_KEY_CODE: &str = ABSENT_CODE;
+const MANAGED_KEY_MESSAGE: &str =
+    "The provided secret ARN is encrypted with the default AWS KMS key. Amazon MSK requires a \
+     secret encrypted with a customer managed AWS KMS key.";
 
 /// A customer managed KMS key named by its full ARN — one of the three forms a
 /// `KmsKeyId` takes ("The ARN, key ID, or alias of the KMS key", Secrets Manager's

@@ -125,7 +125,9 @@
 //! the [`Cluster::scram_secret_arns`] set: `BatchAssociateScramSecret` adds to it
 //! through [`Cluster::associate_scram_secrets`],
 //! `BatchDisassociateScramSecret` removes from it through
-//! [`Cluster::disassociate_scram_secrets`] and `ListScramSecrets` pages that one
+//! [`Cluster::disassociate_scram_secrets`] \u2014 which answers the entries the set
+//! held no association for, so that operation can report them per item \u2014 and
+//! `ListScramSecrets` pages that one
 //! set, so the two writers and the reader cannot disagree about which secrets a
 //! cluster authenticates its clients with, and the secrets leave with the
 //! cluster.

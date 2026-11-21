@@ -280,15 +280,35 @@ impl Cluster {
     }
 
     /// Disassociate `secret_arns` from this cluster, so its SASL/SCRAM clients
-    /// can no longer authenticate with those secrets.
+    /// can no longer authenticate with those secrets, and answer the entries
+    /// this cluster held NO association for.
     ///
     /// The counterpart of [`Self::associate_scram_secrets`] on the same stored
-    /// set, so a secret the cluster does not hold is removed from nothing and
-    /// the call is idempotent in the same way the association is.
-    pub fn disassociate_scram_secrets(&mut self, secret_arns: &[String]) {
+    /// set, and decided PER ENTRY: an entry the set holds is taken off, and one
+    /// it does not — a secret never associated, one a call before this already
+    /// took off, or a value that is no secret ARN at all, none of which name an
+    /// association of this cluster — is removed from nothing and comes back
+    /// here, which is what the operation reports as unprocessed. Removing the
+    /// rest of the batch is unaffected, so the outcomes are isolated per entry.
+    ///
+    /// DISTINCT, in the order the batch first named them: a batch may repeat an
+    /// entry, and one secret is one outcome however many times it was named —
+    /// so neither the work here nor what is answered is sized by the
+    /// repetitions. Both collections below are sized by the batch's distinct
+    /// entries and the answer is at most one entry per one of them, so nothing
+    /// here grows beyond the request that named it.
+    pub fn disassociate_scram_secrets(&mut self, secret_arns: &[String]) -> Vec<String> {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut not_associated: Vec<String> = Vec::new();
         for arn in secret_arns {
-            self.scram_secret_arns.remove(arn);
+            if !seen.insert(arn.as_str()) {
+                continue;
+            }
+            if !self.scram_secret_arns.remove(arn) {
+                not_associated.push(arn.clone());
+            }
         }
+        not_associated
     }
 
     /// Take this cluster's resource-based policy off the record, handing back

@@ -6,22 +6,28 @@
 //! `ListScramSecrets` stops reporting them.
 //!
 //! The inverse of `BatchAssociateScramSecret` on the one stored set
-//! ([`crate::state::Cluster::disassociate_scram_secrets`]), hence idempotent in
-//! the same way: a secret the cluster does not hold is removed from nothing, so
-//! repeating a disassociation leaves the stored set unchanged.
+//! ([`crate::state::Cluster::disassociate_scram_secrets`]).
 //!
 //! A `ClusterArn` that is not an MSK cluster ARN is `BadRequestException`, and a
 //! well-formed cluster ARN this endpoint's region holds no cluster for is
 //! `NotFoundException`.
 //!
 //! The `SecretArnList` entries are NOT given a syntax pass of their own, which is
-//! where this operation parts company with the association: the documented
-//! contract is ONE refusal for a reference that resolves to no association of this
-//! cluster, whether the entry names a secret that was never associated or is no
-//! secret ARN at all. Both resolve to nothing associated, so both are answered the
-//! same way — the cluster's own not-found refusal when the cluster is not there,
-//! and the removal of nothing when it is — and neither is reported as a request
-//! the service cannot read.
+//! where this operation parts company with the association: the contract is ONE
+//! outcome for a reference that resolves to no association of this cluster,
+//! whether the entry names a secret that was never associated, one a call before
+//! this already took off, or no secret ARN at all. All of them resolve to nothing
+//! associated, so all are answered the same way — the cluster's own not-found
+//! refusal when the cluster is not there, and a PER-ITEM entry in
+//! `UnprocessedScramSecrets` when it is — and none is reported as a request the
+//! service cannot read.
+//!
+//! That per-item list is this operation's refusal channel, since the model gives
+//! it the one 200 success code: an accepted call takes off exactly the secrets
+//! the cluster holds and names every other entry of the batch there, with the
+//! code and sentence [`crate::state::scram_secret_admission`] words every
+//! reference this surface cannot act on with, so one item failing neither stops
+//! the rest nor goes unreported.
 //!
 //! A cluster
 //! whose client authentication does not turn SASL/SCRAM on holds no secret set
@@ -30,7 +36,6 @@
 //! association and the listing, that test is what this operation answers on
 //! WHATEVER state the cluster is in, because withdrawing a credential is not
 //! something the cluster has to be serving for.
-//! `UnprocessedScramSecrets` is therefore empty on every accepted call.
 //!
 //! ## Shape of an operation
 //!
@@ -216,8 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names no association of this cluster for exactly the same reason a
         // well-formed secret ARN that was never associated names none. Both are
         // carried to the removal below, which takes off exactly the secrets the
-        // cluster holds — so the two are answered identically, and the
-        // association's own shape refusal stays the association's.
+        // cluster holds and reports every other entry per item — so the two are
+        // answered identically, and the association's own shape refusal stays the
+        // association's.
         let mut state = state.lock();
         let Some(cluster) = state.settled_cluster_in_mut(
             &region,
@@ -253,22 +259,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Removal goes through the record's own path, which drops exactly the
-        // secrets the cluster holds and leaves the rest of the set alone: an entry
-        // that resolves to no association of this cluster is removed from nothing,
-        // whether it is unreadable or simply never associated, which is the one
-        // answer this operation's contract gives both.
-        cluster.disassociate_scram_secrets(&input.secret_arn_list);
+        // secrets the cluster holds, leaves the rest of the set alone, and hands
+        // back the entries it held no association for: an entry that resolves to
+        // no association of this cluster is removed from nothing, whether it is
+        // unreadable, never associated or already taken off, which is the one
+        // outcome this operation's contract gives all three. Decided per entry,
+        // so the secrets the cluster does hold are removed whatever else the
+        // batch named.
+        let not_associated = cluster.disassociate_scram_secrets(&input.secret_arn_list);
 
         Ok(BatchDisassociateScramSecretOutput {
             // The STORED cluster's ARN, so the answer names the record the
             // secrets were taken off rather than echoing the request.
             cluster_arn: Some(cluster.arn.clone()),
-            // Nothing is left unprocessed: the conditions that stop this call
-            // refuse it whole above (the cluster, and its client
-            // authentication), and withdrawing a credential this cluster does not
-            // hold is not one of them — there is nothing left for it to take off,
-            // so the removal above cannot fail on an entry.
-            unprocessed_scram_secrets: Some(Vec::new()),
+            // One entry per DISTINCT entry of the batch that named no association
+            // of this cluster, in the order the batch named them: this call could
+            // not withdraw a credential it never held, and the per-item list is
+            // where a batch API reports that, so a caller can tell a secret it
+            // removed from one it never had. Empty when every entry was held.
+            unprocessed_scram_secrets: Some(
+                not_associated
+                    .iter()
+                    .map(|secret_arn| {
+                        crate::state::scram_secret_admission::unprocessed_secret(
+                            secret_arn,
+                            // The sentence for a reference that names nothing this
+                            // call can act on: the entry's own `SecretArn` is what
+                            // says WHICH one, so the text carries none of it.
+                            crate::state::SECRET_ARN_INVALID_MESSAGE,
+                        )
+                    })
+                    .collect(),
+            ),
         })
     }
 }

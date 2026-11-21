@@ -8,7 +8,9 @@
 //! The rules here are about the ONE set of AWS Secrets Manager secrets a cluster
 //! authenticates its SASL/SCRAM clients with: an association stores exactly the
 //! secrets it named and the listing reports that set, once per secret, in one
-//! total order; a disassociation removes exactly the secrets it names; and a
+//! total order; a disassociation removes exactly the secrets it names and
+//! reports every entry the cluster held no association for as a per-item
+//! failure; and a
 //! request this endpoint cannot act on — a cluster ARN it cannot parse or
 //! resolve, an entry that is not a secret ARN, a cluster that does not
 //! authenticate SASL/SCRAM clients at all — is refused and stores nothing.
@@ -375,9 +377,40 @@ async fn an_association_is_what_the_listing_reports() {
     }
 }
 
+/// The `secretArn` of every `unprocessedScramSecrets` entry a reply carries, in
+/// the order it reports them — asserting on the way that each carries a code and
+/// a sentence, which is what makes the entry a per-item failure a client can act
+/// on.
+fn unprocessed_arns(reply: &Reply) -> Vec<String> {
+    reply
+        .at("/unprocessedScramSecrets")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|entry| {
+            let member = |name: &str| {
+                entry
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let secret_arn = member("secretArn");
+            assert!(
+                !member("errorCode").is_empty() && !member("errorMessage").is_empty(),
+                "expected the unprocessed entry for {secret_arn:?} to carry a code and a \
+                 message, got {entry}"
+            );
+            secret_arn
+        })
+        .collect()
+}
+
 /// RULE: a disassociation removes exactly the secrets it names from the stored
-/// set and leaves the rest of it alone, so removing a secret the cluster does
-/// not hold removes nothing.
+/// set and leaves the rest of it alone, and every entry it held no association
+/// for comes back in `unprocessedScramSecrets` rather than being reported as
+/// removed.
 #[tokio::test]
 async fn a_disassociation_removes_exactly_the_secrets_it_names() {
     let emulator = Emulator::new();
@@ -393,7 +426,8 @@ async fn a_disassociation_removes_exactly_the_secrets_it_names() {
         let stored = batch.expected();
 
         // A secret the cluster never held, and nothing else, is removed from
-        // nothing: the stored set is untouched.
+        // nothing: the stored set is untouched and that entry comes back
+        // unprocessed.
         let miss = disassociate(&emulator, &cluster, std::slice::from_ref(&never_associated)).await;
         assert_eq!(
             miss.status, 200,
@@ -406,6 +440,12 @@ async fn a_disassociation_removes_exactly_the_secrets_it_names() {
             "case {case}: expected the disassociation to name the cluster, got {}",
             miss.body
         );
+        assert_eq!(
+            unprocessed_arns(&miss),
+            vec![never_associated.clone()],
+            "case {case}: expected the unheld secret to come back unprocessed, got {}",
+            miss.body
+        );
         let untouched = listed(&list(&emulator, &cluster, "").await, case);
         assert_eq!(
             untouched, stored,
@@ -413,7 +453,8 @@ async fn a_disassociation_removes_exactly_the_secrets_it_names() {
         );
 
         // The first stored secret goes, twice over: the second call removes
-        // nothing, because the set no longer holds it.
+        // nothing, because the set no longer holds it — so it comes back
+        // unprocessed there where the first call reported nothing.
         let first = stored.first().expect("every batch stores one secret").clone();
         let remaining: Vec<String> = stored.iter().skip(1).cloned().collect();
         for round in 0..2 {
@@ -424,11 +465,16 @@ async fn a_disassociation_removes_exactly_the_secrets_it_names() {
                  got {} {}",
                 reply.status, reply.body
             );
+            let expected_unprocessed: Vec<String> = match round {
+                0 => Vec::new(),
+                _ => vec![first.clone()],
+            };
             assert_eq!(
-                reply.at("/unprocessedScramSecrets"),
-                &json!([]),
-                "case {case} round {round}: expected no unprocessed secrets, got {}",
-                reply.at("/unprocessedScramSecrets")
+                unprocessed_arns(&reply),
+                expected_unprocessed,
+                "case {case} round {round}: expected the entries the cluster held no association \
+                 for to come back unprocessed, got {}",
+                reply.body
             );
             let after = listed(&list(&emulator, &cluster, "").await, case);
             assert_eq!(
@@ -439,11 +485,20 @@ async fn a_disassociation_removes_exactly_the_secrets_it_names() {
         }
 
         // The whole stored set goes, so the listing reports an empty page for a
-        // cluster that holds nothing — not a refusal.
+        // cluster that holds nothing — not a refusal. The secret the rounds above
+        // already took off is the one entry of that batch reported unprocessed.
+        let emptying = disassociate(&emulator, &cluster, &stored).await;
         assert_eq!(
-            disassociate(&emulator, &cluster, &stored).await.status,
-            200,
-            "case {case}: expected removing every stored secret to return 200"
+            emptying.status, 200,
+            "case {case}: expected removing every stored secret to return 200, got {} {}",
+            emptying.status, emptying.body
+        );
+        assert_eq!(
+            unprocessed_arns(&emptying),
+            vec![first.clone()],
+            "case {case}: expected only the secret already taken off to come back unprocessed, \
+             got {}",
+            emptying.body
         );
         let emptied = listed(&list(&emulator, &cluster, "").await, case);
         assert!(
