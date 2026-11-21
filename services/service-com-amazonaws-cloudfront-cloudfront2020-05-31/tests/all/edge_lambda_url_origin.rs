@@ -193,7 +193,7 @@ pub(crate) fn element(body: &str, name: &str) -> String {
 /// session of the role IAM holds, and the invocations it admits are counted in the CloudWatch
 /// store both services share.
 pub(crate) struct Topology {
-    router: MultiServiceRouter,
+    pub(crate) router: MultiServiceRouter,
     callback: EmbeddedEmulator,
     engine: Arc<engine::InMemoryEngine>,
     /// Whether this emulator VERIFIES the signature of every request, as it does when it is
@@ -211,7 +211,7 @@ impl Topology {
 
     /// An emulator that VERIFIES every request's signature, where each call below is signed
     /// the way an in-process call of this emulator is.
-    fn verifying() -> Self {
+    pub(crate) fn verifying() -> Self {
         Self::with_verification(true)
     }
 
@@ -269,7 +269,7 @@ impl Topology {
     }
 
     /// The Lambda client, over the same callback.
-    fn lambda(&self) -> aws_sdk_lambda::Client {
+    pub(crate) fn lambda(&self) -> aws_sdk_lambda::Client {
         let config = aws_sdk_lambda::Config::builder()
             .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
             .region(aws_sdk_lambda::config::Region::new(REGION))
@@ -359,7 +359,7 @@ impl Topology {
 
     /// The HOST of a function URL over [`HANDLER_SOURCE`] whose `AuthType` is `auth_type`: the
     /// execution role, the function, the wait for the state the clock owes it, and the URL.
-    async fn function_url_host(
+    pub(crate) async fn function_url_host(
         &self,
         case: &str,
         function: &str,
@@ -483,7 +483,7 @@ impl Topology {
 
     /// One `OriginAccessControl` over a Lambda function URL origin: `sigv4`, signing always, of
     /// origin type `lambda`. Answers the id it minted.
-    async fn origin_access_control(&self, case: &str, name: &str) -> String {
+    pub(crate) async fn origin_access_control(&self, case: &str, name: &str) -> String {
         let (status, raw) = self
             .cloudfront(
                 case,
