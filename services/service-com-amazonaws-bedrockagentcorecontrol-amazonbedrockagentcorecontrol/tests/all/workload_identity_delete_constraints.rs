@@ -23,8 +23,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    carries_no_member, create_identity, delete_identity, error_code, get_identity,
-    list_identities, listed_names, router, text, MAX_RESULTS_MAX, NAME_MAX_LENGTH, NAME_MIN_LENGTH,
+    carries_no_member, create_identity, delete_identity, error_code, get_identity, router,
+    stored_names, text, NAME_MAX_LENGTH, NAME_MIN_LENGTH,
 };
 
 /// `DeleteWorkloadIdentity`'s modelled success status, and the status every refusal of
@@ -82,12 +82,6 @@ fn expected_clause(requirements: &[String]) -> String {
         })
         .collect();
     format!("{detected}: {}", clauses.join("; "))
-}
-
-/// The names the listing reports, at a page size above every count this suite stores.
-async fn stored_names(router: &smithy_server_runtime::MultiServiceRouter) -> Vec<String> {
-    let (_, page) = list_identities(router, Some(MAX_RESULTS_MAX), None).await;
-    listed_names(&page)
 }
 
 /// A delete naming a value outside `WorkloadIdentityNameType` is refused with the modelled

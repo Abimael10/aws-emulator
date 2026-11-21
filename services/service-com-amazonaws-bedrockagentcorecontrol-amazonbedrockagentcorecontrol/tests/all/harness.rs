@@ -118,6 +118,13 @@ pub async fn list_identities(
     post(router, "/identities/ListWorkloadIdentities", &body).await
 }
 
+/// The names the listing reports, at a page size above every count the suites store: one
+/// copy, so no suite keeps its own idea of how the stored directory is read back.
+pub async fn stored_names(router: &MultiServiceRouter) -> Vec<String> {
+    let (_, page) = list_identities(router, Some(MAX_RESULTS_MAX), None).await;
+    listed_names(&page)
+}
+
 /// The error code `restJson1` puts in `__type` / `x-amzn-errortype`.
 pub fn error_code(body: &Value) -> String {
     body.get("__type")

@@ -27,9 +27,8 @@ use serde_json::{json, Value};
 
 use super::harness::{
     assert_not_found, carries_no_member, create_identity, delete_identity, expected_arn,
-    expected_url_list, get_identity, instant, list_identities, listed_names, not_found_by_id,
-    not_found_by_name, router, text, update_identity, MAX_RESULTS_MAX, NAME_MAX_LENGTH,
-    NAME_MIN_LENGTH,
+    expected_url_list, get_identity, instant, not_found_by_id, not_found_by_name, router,
+    stored_names, text, update_identity, NAME_MAX_LENGTH, NAME_MIN_LENGTH,
 };
 
 /// The modelled success statuses: `UpdateWorkloadIdentity` answers 200, and
@@ -56,12 +55,6 @@ struct DeleteCase {
     case: &'static str,
     name: String,
     urls: Option<Vec<&'static str>>,
-}
-
-/// The names the listing reports, at a page size above every count these tests store.
-async fn stored_names(router: &smithy_server_runtime::MultiServiceRouter) -> Vec<String> {
-    let (_, page) = list_identities(router, Some(MAX_RESULTS_MAX), None).await;
-    listed_names(&page)
 }
 
 /// An update replaces the stored return-URL list with exactly the one the request carried,
