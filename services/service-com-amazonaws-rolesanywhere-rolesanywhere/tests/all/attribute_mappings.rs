@@ -34,6 +34,14 @@
 //! (the modelled bound and one past it).
 //!
 //! The harness below is local to this suite, as in each sibling suite.
+//!
+//! The last two suites here are about how a refusal of this service QUOTES the requirement
+//! a value failed, rather than about mappings: a `@pattern` is quoted as the expression the
+//! service publishes (the model's text without the whole-value anchors it wraps it in) and
+//! an enumerated type as the values it admits in the order this service states them. Both
+//! are properties of the SHAPE a member targets, so the tables span this model's patterned
+//! shapes and enumerated types — `PutAttributeMapping$certificateField`, the recorded one,
+//! among them — over several operations, bindings and depths.
 
 use std::sync::Arc;
 
@@ -1074,6 +1082,398 @@ async fn a_put_refuses_a_specifier_the_certificate_field_cannot_carry() {
             specifiers_in(&after, field).as_ref(),
             Some(&expected),
             "case {case:?}: expected {field:?} to map {expected:?}, got {after:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// How this service QUOTES the requirement a refused value failed.
+//
+// The rule: a value a modelled constraint refuses is answered 400 `ValidationException`
+// whose clause quotes the requirement as this service PUBLISHES it — a `@pattern` as the
+// expression without the whole-value anchors the model wraps it in, and an enumerated type
+// as the values it admits in the order the front door's own table of them is walked
+// (ascending bucket of each value's string hash) rather than the order the model declares
+// them in. Both are properties of the SHAPE a member targets, so they hold for every
+// member targeting it, in any operation, in whatever binding carried the value and at any
+// depth of the request; the envelope, the member path and the echoed value are the
+// framework's.
+// ---------------------------------------------------------------------------------------
+
+/// The expression `ResourceName` publishes: the model declares
+/// `@pattern("^[ a-zA-Z0-9-_]*$")` (`smithy_query(query="shape", shape="ResourceName")`)
+/// and the pair of whole-value anchors is the model's wrapping, not part of the expression.
+const PUBLISHED_RESOURCE_NAME_PATTERN: &str = "[ a-zA-Z0-9-_]*";
+
+/// The expression `TrustAnchorArn` publishes: the model declares
+/// `@pattern("^arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:trust-anchor.*)$")`
+/// (`smithy_query(query="operation", operation="ImportCrl")`), the same wrapping dropped.
+const PUBLISHED_TRUST_ANCHOR_ARN_PATTERN: &str =
+    r"arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:trust-anchor.*)";
+
+/// The expression `Uuid` publishes, which the model declares UNANCHORED
+/// (`@pattern("[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}")`,
+/// `smithy_query(query="operation", operation="PutAttributeMapping")`): nothing to drop, so
+/// it is quoted exactly as declared.
+const PUBLISHED_UUID_PATTERN: &str = "[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}";
+
+/// A value outside the modelled `Uuid` form that no profile or trust anchor is created
+/// under: it breaks the pattern and nothing else, so a refusal of it states one clause.
+const UPPERCASE_UUID: &str = "0123ABCD-4567-89EF-0123-456789ABCDEF";
+
+/// A `Uuid` nothing in the store is created under, used where the request has to carry one
+/// and the refusal is about ANOTHER member: the boundary refuses before the handler would
+/// resolve it.
+const UNMINTED_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+/// The admitted values of `CertificateField` (declared `x509Subject, x509Issuer, x509SAN`,
+/// `smithy_query(query="shape", shape="CertificateField")`) in the order this service
+/// states them: ascending bucket of each value's string hash, which is neither the declared
+/// nor the sorted order.
+const STATED_CERTIFICATE_FIELD_SET: &str = "[x509Subject, x509SAN, x509Issuer]";
+
+/// The admitted values of `TrustAnchorType` (declared `AWS_ACM_PCA, CERTIFICATE_BUNDLE,
+/// SELF_SIGNED_REPOSITORY`, `smithy_query(query="shape", shape="TrustAnchorType")`) in that
+/// same stated order.
+const STATED_TRUST_ANCHOR_TYPE_SET: &str =
+    "[CERTIFICATE_BUNDLE, AWS_ACM_PCA, SELF_SIGNED_REPOSITORY]";
+
+/// The admitted values of `NotificationEvent` (declared `CA_CERTIFICATE_EXPIRY,
+/// END_ENTITY_CERTIFICATE_EXPIRY`, `smithy_query(query="shape",
+/// shape="NotificationEvent")`) in that same stated order, which here REVERSES the
+/// declaration.
+const STATED_NOTIFICATION_EVENT_SET: &str =
+    "[END_ENTITY_CERTIFICATE_EXPIRY, CA_CERTIFICATE_EXPIRY]";
+
+/// The admitted values of `NotificationChannel`, which the model declares as the single
+/// value `ALL` (`smithy_query(query="shape", shape="NotificationChannel")`).
+const STATED_NOTIFICATION_CHANNEL_SET: &str = "[ALL]";
+
+/// AWS's one-error validation envelope over one clause: the value as the request carried
+/// it, the member path, and the requirement that value failed.
+fn one_error_clause(value: &str, member_path: &str, requirement: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at '{member_path}' failed to satisfy \
+         constraint: {requirement}"
+    )
+}
+
+/// The requirement clause a `@pattern` violation states.
+fn pattern_requirement(pattern: &str) -> String {
+    format!("Member must satisfy regular expression pattern: {pattern}")
+}
+
+/// The requirement clause a violation of an enumerated type states.
+fn enum_requirement(value_set: &str) -> String {
+    format!("Member must satisfy enum value set: {value_set}")
+}
+
+/// A certificate bundle source whose certificate data is not read at all on these paths:
+/// every row below is refused by the boundary walk, before any handler reads the source.
+fn unread_source(source_type: &str) -> Value {
+    json!({"sourceType": source_type, "sourceData": {"x509CertificateData": "not-a-pem"}})
+}
+
+/// One refused request: where it goes, what it carries, and the three things its clause
+/// must state.
+struct RefusalCase {
+    label: &'static str,
+    method: &'static str,
+    uri: String,
+    body: Option<Value>,
+    value: String,
+    member_path: &'static str,
+    requirement: String,
+}
+
+/// Every request whose refusal quotes a `@pattern` requirement.
+///
+/// The rows differ along what the rule generalises over: which shape's expression is quoted
+/// (two the model anchors, one it leaves unanchored), which operation and member carried the
+/// value (a create, an update, a path label, a body member, an ARN member), and which end of
+/// the anchored expression the value broke.
+fn pattern_cases() -> Vec<RefusalCase> {
+    let crl_data = aws_smithy_types::base64::encode("x".as_bytes());
+    let trust_anchor_arn =
+        format!("arn:aws:rolesanywhere:{REGION}:{ACCOUNT}:trust-anchor/{UNMINTED_UUID}");
+    vec![
+        RefusalCase {
+            label: "the name of a created profile",
+            method: "POST",
+            uri: "/profiles".to_string(),
+            body: Some(json!({
+                "name": "no!punctuation",
+                "roleArns": [format!("arn:aws:iam::{ACCOUNT}:role/DemoRole")],
+            })),
+            value: "no!punctuation".to_string(),
+            member_path: "name",
+            requirement: pattern_requirement(PUBLISHED_RESOURCE_NAME_PATTERN),
+        },
+        RefusalCase {
+            label: "the name of an updated profile",
+            method: "PATCH",
+            uri: format!("/profile/{UNMINTED_UUID}"),
+            body: Some(json!({"name": "tab\tseparated"})),
+            value: "tab\tseparated".to_string(),
+            member_path: "name",
+            requirement: pattern_requirement(PUBLISHED_RESOURCE_NAME_PATTERN),
+        },
+        RefusalCase {
+            label: "the name of a created trust anchor",
+            method: "POST",
+            uri: "/trustanchors".to_string(),
+            body: Some(json!({
+                "name": "trust/anchor",
+                "source": unread_source("CERTIFICATE_BUNDLE"),
+            })),
+            value: "trust/anchor".to_string(),
+            member_path: "name",
+            requirement: pattern_requirement(PUBLISHED_RESOURCE_NAME_PATTERN),
+        },
+        RefusalCase {
+            label: "the name of an imported certificate revocation list",
+            method: "POST",
+            uri: "/crls".to_string(),
+            body: Some(json!({
+                "name": "crl#1",
+                "crlData": crl_data.clone(),
+                "trustAnchorArn": trust_anchor_arn,
+            })),
+            value: "crl#1".to_string(),
+            member_path: "name",
+            requirement: pattern_requirement(PUBLISHED_RESOURCE_NAME_PATTERN),
+        },
+        RefusalCase {
+            label: "an ARN member whose expression opens with a literal",
+            method: "POST",
+            uri: "/crls".to_string(),
+            body: Some(json!({
+                "name": "importable crl",
+                "crlData": crl_data,
+                "trustAnchorArn": "not-a-trust-anchor-arn",
+            })),
+            value: "not-a-trust-anchor-arn".to_string(),
+            member_path: "trustAnchorArn",
+            requirement: pattern_requirement(PUBLISHED_TRUST_ANCHOR_ARN_PATTERN),
+        },
+        RefusalCase {
+            label: "a path label whose expression the model leaves unanchored",
+            method: "PUT",
+            uri: format!("/profiles/{UPPERCASE_UUID}/mappings"),
+            body: Some(json!({
+                "certificateField": "x509Subject",
+                "mappingRules": [{"specifier": "CN"}],
+            })),
+            value: UPPERCASE_UUID.to_string(),
+            member_path: "profileId",
+            requirement: pattern_requirement(PUBLISHED_UUID_PATTERN),
+        },
+    ]
+}
+
+/// Every request whose refusal quotes an enumerated type's admitted set.
+///
+/// The rows differ along what the rule generalises over: which enumerated type the value
+/// belongs to (four of this model's, two of them stated in neither their declared nor their
+/// sorted order), which operation and member carried it (a body member, a member of a
+/// nested structure, a member of a structure inside a list), how many values the type
+/// admits (one, two, three), and how the refused value was spelled (a name no value
+/// carries, an admitted value miscased, an admitted value of ANOTHER type).
+fn enum_cases(profile_id: &str) -> Vec<RefusalCase> {
+    vec![
+        RefusalCase {
+            label: "the certificate field of a put mapping",
+            method: "PUT",
+            uri: format!("/profiles/{profile_id}/mappings"),
+            body: Some(json!({
+                "certificateField": "x509subject",
+                "mappingRules": [{"specifier": "CN"}],
+            })),
+            value: "x509subject".to_string(),
+            member_path: "certificateField",
+            requirement: enum_requirement(STATED_CERTIFICATE_FIELD_SET),
+        },
+        RefusalCase {
+            label: "the source type NESTED in a created trust anchor's source",
+            method: "POST",
+            uri: "/trustanchors".to_string(),
+            body: Some(json!({
+                "name": "enum anchor",
+                "source": unread_source("CERTIFICATE_CHAIN"),
+            })),
+            value: "CERTIFICATE_CHAIN".to_string(),
+            member_path: "source.sourceType",
+            requirement: enum_requirement(STATED_TRUST_ANCHOR_TYPE_SET),
+        },
+        RefusalCase {
+            label: "the source type of an updated trust anchor",
+            method: "PATCH",
+            uri: format!("/trustanchor/{UNMINTED_UUID}"),
+            body: Some(json!({"source": unread_source("certificate_bundle")})),
+            value: "certificate_bundle".to_string(),
+            member_path: "source.sourceType",
+            requirement: enum_requirement(STATED_TRUST_ANCHOR_TYPE_SET),
+        },
+        RefusalCase {
+            label: "the event of a notification setting carried in a LIST",
+            method: "PATCH",
+            uri: "/put-notifications-settings".to_string(),
+            body: Some(json!({
+                "trustAnchorId": UNMINTED_UUID,
+                "notificationSettings": [
+                    {"enabled": true, "event": "CERTIFICATE_EXPIRY", "threshold": 7},
+                ],
+            })),
+            value: "CERTIFICATE_EXPIRY".to_string(),
+            member_path: "notificationSettings.1.member.event",
+            requirement: enum_requirement(STATED_NOTIFICATION_EVENT_SET),
+        },
+        RefusalCase {
+            label: "the single-valued channel of a notification setting",
+            method: "PATCH",
+            uri: "/put-notifications-settings".to_string(),
+            body: Some(json!({
+                "trustAnchorId": UNMINTED_UUID,
+                "notificationSettings": [{
+                    "enabled": true,
+                    "event": "CA_CERTIFICATE_EXPIRY",
+                    "channel": "EMAIL",
+                }],
+            })),
+            value: "EMAIL".to_string(),
+            member_path: "notificationSettings.1.member.channel",
+            requirement: enum_requirement(STATED_NOTIFICATION_CHANNEL_SET),
+        },
+    ]
+}
+
+/// Drive one refused request and hold its answer to the clause the rule states.
+async fn assert_refused(client: &Client, case: &RefusalCase) {
+    let answer = client
+        .send(case.method, &case.uri, case.body.clone())
+        .await;
+    assert_eq!(
+        (answer.status, answer.error_code.as_str()),
+        (400, "ValidationException"),
+        "case {:?}: a value outside a modelled constraint must be refused 400 \
+         ValidationException, got {answer:?}",
+        case.label
+    );
+    let expected = one_error_clause(&case.value, case.member_path, &case.requirement);
+    assert_eq!(
+        answer.message(),
+        Some(expected.as_str()),
+        "case {:?}: expected {expected:?}, got {:?}",
+        case.label,
+        answer.message()
+    );
+}
+
+/// A `@pattern` requirement is quoted as the expression the service publishes: the model's
+/// text with the whole-value anchor pair dropped, and an expression the model leaves
+/// unanchored quoted exactly as declared.
+#[tokio::test]
+async fn a_pattern_requirement_quotes_the_expression_without_the_whole_value_anchors() {
+    let client = Client::new();
+    for case in pattern_cases() {
+        assert_refused(&client, &case).await;
+    }
+}
+
+/// Every refusal of a value outside an enumerated type lists that type's admitted values in
+/// the order this service states them, whatever member, operation, binding or depth carried
+/// the value — and lists exactly the values the model declares, nothing added or dropped.
+#[tokio::test]
+async fn an_enum_requirement_lists_the_admitted_values_in_the_order_the_service_states_them() {
+    let client = Client::new();
+    let id = profile_id(&client, "enum value sets").await;
+    for case in enum_cases(&id) {
+        assert_refused(&client, &case).await;
+    }
+
+    // And the stated sets are permutations of what the model declares: the order moves, the
+    // membership does not.
+    let declared: Vec<(&str, &str, Vec<&str>)> = vec![
+        (
+            "CertificateField",
+            STATED_CERTIFICATE_FIELD_SET,
+            CERTIFICATE_FIELDS.to_vec(),
+        ),
+        (
+            "TrustAnchorType",
+            STATED_TRUST_ANCHOR_TYPE_SET,
+            vec!["AWS_ACM_PCA", "CERTIFICATE_BUNDLE", "SELF_SIGNED_REPOSITORY"],
+        ),
+        (
+            "NotificationEvent",
+            STATED_NOTIFICATION_EVENT_SET,
+            vec!["CA_CERTIFICATE_EXPIRY", "END_ENTITY_CERTIFICATE_EXPIRY"],
+        ),
+        (
+            "NotificationChannel",
+            STATED_NOTIFICATION_CHANNEL_SET,
+            vec!["ALL"],
+        ),
+    ];
+    for (shape, stated, modelled) in declared {
+        let mut listed: Vec<&str> = stated
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(", ")
+            .collect();
+        listed.sort_unstable();
+        let mut sorted = modelled.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            listed, sorted,
+            "case {shape:?}: the stated set must list exactly the values the model declares \
+             {sorted:?}, got {listed:?}"
+        );
+    }
+}
+
+/// The expression `TagKey` and `TagValue` publish: both are modelled
+/// `@pattern("^[ a-zA-Z0-9_.:/=+@-]*$")` and `@sensitive`
+/// (`smithy_query(query="shape", shape="Tag")`), so the pair of whole-value anchors is
+/// dropped from the quoted expression while the VALUE the member carried is not disclosed.
+const PUBLISHED_TAG_PATTERN: &str = "[ a-zA-Z0-9_.:/=+@-]*";
+
+/// A refused `@sensitive` member states the published expression and withholds the value:
+/// the requirement is quoted the same way as for every other patterned shape, and nothing
+/// the caller sent in a member the model marks sensitive comes back in the message.
+#[tokio::test]
+async fn a_refused_sensitive_member_states_the_published_pattern_without_its_value() {
+    let client = Client::new();
+    let secretish = "tag key!";
+    for (case, tag) in [
+        ("the tag key", json!({"key": secretish, "value": "allowed"})),
+        ("the tag value", json!({"key": "allowed", "value": secretish})),
+    ] {
+        let answer = client
+            .send(
+                "POST",
+                "/TagResource",
+                Some(json!({
+                    "resourceArn": profile_arn(REGION, UNMINTED_UUID),
+                    "tags": [tag],
+                })),
+            )
+            .await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a value outside the published tag expression must be refused 400 \
+             ValidationException, got {answer:?}"
+        );
+        let said = answer.message().unwrap_or_default();
+        assert!(
+            said.contains(&pattern_requirement(PUBLISHED_TAG_PATTERN)),
+            "case {case:?}: the clause must quote the published expression {:?}, got {said:?}",
+            PUBLISHED_TAG_PATTERN
+        );
+        assert!(
+            !said.contains(secretish),
+            "case {case:?}: a sensitive member's value must not be disclosed, got {said:?}"
         );
     }
 }

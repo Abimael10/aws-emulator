@@ -24,8 +24,8 @@
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. Wired to [`validation`], which words a constraint
+//!   refusal the way this service words one.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -52,6 +52,7 @@
 //! X.509 signature are verified is in [`x509_signature`].
 
 pub mod create_session;
+pub mod validation;
 pub mod x509_signature;
 
 use smithy_server_runtime::{
@@ -128,15 +129,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service word it the way this service words one: the framework's own
+        // envelope with the two renderings that are this service's — the
+        // expression a `@pattern` requirement quotes, and the order an
+        // enumerated type's admissible values are listed in. Both live in
+        // [`validation`], with the code the chosen message travels with.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

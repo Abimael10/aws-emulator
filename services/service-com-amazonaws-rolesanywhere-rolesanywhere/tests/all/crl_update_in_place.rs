@@ -59,7 +59,9 @@ const REGION: &str = "us-west-2";
 /// (`smithy_query(query="shape", shape="UpdateCrlRequest")`).
 const NAME_MIN_LENGTH: usize = 1;
 const NAME_MAX_LENGTH: usize = 255;
-const NAME_PATTERN: &str = "^[ a-zA-Z0-9-_]*$";
+/// The expression a refusal quotes for that member: the published expression, which is the
+/// model's text without the whole-value anchor pair the model wraps it in.
+const NAME_PATTERN: &str = "[ a-zA-Z0-9-_]*";
 const CRL_DATA_MIN_LENGTH: usize = 1;
 const CRL_DATA_MAX_LENGTH: usize = 300_000;
 

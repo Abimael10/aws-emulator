@@ -1179,7 +1179,11 @@ pub fn source_rejection(source: &Source) -> Option<SourceRejection> {
             member: "source.sourceType",
             constraint: format!(
                 "Member must satisfy enum value set: [{}]",
-                TRUST_ANCHOR_TYPE_VALUES.join(", ")
+                // The same order every refusal of this service lists an enumerated type's
+                // admissible values in (`crate::service::validation`), so one type reads
+                // identically whether the boundary or a handler refuses the value.
+                ::service_common::validation_message::hashed_enum_order(TRUST_ANCHOR_TYPE_VALUES)
+                    .join(", ")
             ),
         });
     }

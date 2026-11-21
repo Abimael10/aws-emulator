@@ -49,9 +49,14 @@ const OTHER_CERTIFICATE_BUNDLE_PEM: &str = include_str!("../data/certificate_aut
 const REGION: &str = "us-west-2";
 
 /// Every value the modelled `TrustAnchorType` enum accepts, in the order the model lists
-/// them (`smithy_query(query="shape", shape="TrustAnchorType")`). The wording of the
-/// service's enum refusal lists them in this order.
+/// them (`smithy_query(query="shape", shape="TrustAnchorType")`).
 const TRUST_ANCHOR_TYPES: [&str; 3] = ["AWS_ACM_PCA", "CERTIFICATE_BUNDLE", "SELF_SIGNED_REPOSITORY"];
+
+/// The same values in the order a refusal of this service LISTS them, which is ascending
+/// bucket of each value's own string hash rather than the model's declaration order (see
+/// the enum-value-set tables in `attribute_mappings.rs`).
+const STATED_TRUST_ANCHOR_TYPES: [&str; 3] =
+    ["CERTIFICATE_BUNDLE", "AWS_ACM_PCA", "SELF_SIGNED_REPOSITORY"];
 
 /// A client over one emulator: one engine, one mounted service, so every request in a
 /// test observes the state the previous one wrote.
@@ -255,7 +260,7 @@ fn validation_message_for(value: &str, member: &str, constraint: &str) -> String
 fn enum_value_set_constraint() -> String {
     format!(
         "Member must satisfy enum value set: [{}]",
-        TRUST_ANCHOR_TYPES.join(", ")
+        STATED_TRUST_ANCHOR_TYPES.join(", ")
     )
 }
 
