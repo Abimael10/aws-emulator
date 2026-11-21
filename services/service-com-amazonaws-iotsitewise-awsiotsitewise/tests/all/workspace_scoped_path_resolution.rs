@@ -3,14 +3,19 @@
 //! Every operation whose route nests a resource inside `/workspaces/{name}`
 //! resolves the path's resources OUTSIDE IN, so the refusal names the OUTERMOST
 //! resource the request got wrong: the workspace when the store holds no
-//! workspace of that name, and only then the pipeline, task, query, export job or
-//! pipeline execution inside it.
+//! workspace of that name, and only then the pipeline, task, query, search,
+//! export job or pipeline execution inside it.
 //!
 //! The rows span that whole class of routes — the reads, the writes and the
 //! deletes, at every nesting depth the service has (one, two and three path
 //! resources) — rather than the one request an issue happened to record, and each
 //! row carries its own identifier so the expected message is built from what the
 //! row sent.
+//!
+//! A consequence the last three suites below pin for the asynchronous query and
+//! search slice, where several operations address the SAME resource: all of them
+//! answer the same absence for one request, so no two of them can disagree about
+//! which resource a request is wrong about.
 //!
 //! The expected strings are written out BY HAND as an independent oracle: this
 //! suite never calls the crate's message helpers, so a handler that drifts to a
@@ -56,6 +61,10 @@ const UNKNOWN_JOB: &str = "11111111-2222-3333-4444-555555555555";
 /// A `QueryId` (len 1..64, pattern `^[a-zA-Z0-9-]+$`) no query holds.
 const UNKNOWN_QUERY: &str = "no-such-query";
 
+/// A `SearchId` (len 23..36, pattern `^[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*$`) no search
+/// holds.
+const UNKNOWN_SEARCH: &str = "no-such-search-0123456789";
+
 /// Resource names nothing in the fixture was created under.
 const UNKNOWN_PIPELINE: &str = "no-such-pipeline";
 const UNKNOWN_TASK: &str = "no-such-task";
@@ -67,6 +76,7 @@ const PIPELINE_KIND: &str = "Pipeline";
 const PIPELINE_EXECUTION_KIND: &str = "Pipeline Execution";
 const TASK_KIND: &str = "Task";
 const QUERY_KIND: &str = "Query";
+const SEARCH_KIND: &str = "Search";
 const EXPORT_JOB_KIND: &str = "Dataset Export Job";
 
 /// One row: the case name, the HTTP method, the URI, the request body, and the
@@ -409,5 +419,344 @@ async fn resolving_outside_in_still_serves_every_path_the_store_does_hold() {
         body["workspaceName"].as_str(),
         Some(WORKSPACE),
         "the execution's own path reports its workspace, expected {WORKSPACE}, got {body}"
+    );
+}
+
+/// A second workspace the store DOES hold, so a query or search of the first one
+/// can be addressed through a workspace that resolves but holds it not.
+const OTHER_WORKSPACE: &str = "resolution_workspace_2";
+
+/// A statement `StartQuery` takes: the SQL this service's query language is, over
+/// a view its catalog names.
+const QUERY_STATEMENT: &str = "SELECT asset_name FROM asset";
+
+/// A statement `StartSearch` takes (`SearchQueryStatement`, len 1..5000 — prose
+/// rather than SQL).
+const SEARCH_STATEMENT: &str = "turbine vibration last week";
+
+/// One route of the asynchronous query/search family, and the resource it
+/// addresses INSIDE the workspace when it addresses one.
+struct Route {
+    label: &'static str,
+    method: &'static str,
+    uri: String,
+    body: Option<Value>,
+    /// The kind and the identifier of the resource the path names inside the
+    /// workspace; `None` for a route that names only the workspace.
+    inner: Option<(&'static str, String)>,
+    /// Every status this route may answer with once every resource on it
+    /// resolves. One value for most of them — the success status `OPERATIONS.md`
+    /// reports — and two for the routes whose answer then depends on the status
+    /// the CLOCK has made due for the resource, which no suite may pin to one
+    /// value: `CancelQuery` refuses a query that already reached a terminal
+    /// status with the modelled conflict (409), and a search's results are
+    /// "available only after the search has reached the SUCCEEDED status", the
+    /// modelled invalid-request refusal (400) before then.
+    served: &'static [u16],
+}
+
+/// Every operation of a workspace's asynchronous query and search slice, as
+/// `OPERATIONS.md` reports its route: the read, the results read, the cancel, the
+/// listing and the start of a query, and the read, the results read, the listing
+/// and the start of a search. `query` and `search` are the identifiers each row
+/// addresses inside `workspace`.
+///
+/// Several of these rows address the SAME resource, which is the point: a request
+/// is wrong about ONE resource, so every operation that takes it must say the same
+/// thing about which one.
+fn query_and_search_family(workspace: &str, query: &str, search: &str) -> Vec<Route> {
+    vec![
+        Route {
+            label: "DescribeQuery",
+            method: "GET",
+            uri: format!("/workspaces/{workspace}/queries/{query}"),
+            body: None,
+            inner: Some((QUERY_KIND, query.to_string())),
+            served: &[200],
+        },
+        Route {
+            label: "GetQueryResults",
+            method: "GET",
+            uri: format!("/workspaces/{workspace}/queries/{query}/results"),
+            body: None,
+            inner: Some((QUERY_KIND, query.to_string())),
+            served: &[200],
+        },
+        Route {
+            label: "CancelQuery",
+            method: "POST",
+            uri: format!("/workspaces/{workspace}/queries/{query}/cancel"),
+            body: Some(json!({})),
+            inner: Some((QUERY_KIND, query.to_string())),
+            served: &[202, 409],
+        },
+        Route {
+            label: "ListQueries",
+            method: "GET",
+            uri: format!("/workspaces/{workspace}/queries"),
+            body: None,
+            inner: None,
+            served: &[200],
+        },
+        Route {
+            label: "StartQuery",
+            method: "POST",
+            uri: format!("/workspaces/{workspace}/queries"),
+            body: Some(json!({ "queryStatement": QUERY_STATEMENT })),
+            inner: None,
+            served: &[202],
+        },
+        Route {
+            label: "DescribeSearch",
+            method: "GET",
+            uri: format!("/workspaces/{workspace}/searches/{search}"),
+            body: None,
+            inner: Some((SEARCH_KIND, search.to_string())),
+            served: &[200],
+        },
+        Route {
+            label: "GetSearchResults",
+            method: "GET",
+            uri: format!("/workspaces/{workspace}/searches/{search}/results"),
+            body: None,
+            inner: Some((SEARCH_KIND, search.to_string())),
+            served: &[200, 400],
+        },
+        Route {
+            label: "ListSearches",
+            method: "POST",
+            uri: format!("/workspaces/{workspace}/searches/list"),
+            body: Some(json!({})),
+            inner: None,
+            served: &[200],
+        },
+        Route {
+            label: "StartSearch",
+            method: "POST",
+            uri: format!("/workspaces/{workspace}/searches"),
+            body: Some(json!({ "queryStatement": SEARCH_STATEMENT })),
+            inner: None,
+            served: &[202],
+        },
+    ]
+}
+
+/// Two workspaces this store holds, the first carrying one started query and one
+/// started search, and the identifiers they were minted under — so every row
+/// below is wrong in exactly the place it says.
+async fn async_resource_fixture(router: &MultiServiceRouter) -> (String, String) {
+    create_workspace(router, WORKSPACE).await;
+    create_workspace(router, OTHER_WORKSPACE).await;
+
+    let (status, started) = call(
+        router,
+        "POST",
+        &format!("/workspaces/{WORKSPACE}/queries"),
+        Some(json!({ "queryStatement": QUERY_STATEMENT })),
+    )
+    .await;
+    assert_eq!(status, 202, "StartQuery: got {status} {started}");
+    let query = started["queryId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("StartQuery: no queryId in {started}"))
+        .to_string();
+
+    let (status, searched) = call(
+        router,
+        "POST",
+        &format!("/workspaces/{WORKSPACE}/searches"),
+        Some(json!({ "queryStatement": SEARCH_STATEMENT })),
+    )
+    .await;
+    assert_eq!(status, 202, "StartSearch: got {status} {searched}");
+    let search = searched["searchId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("StartSearch: no searchId in {searched}"))
+        .to_string();
+
+    (query, search)
+}
+
+#[tokio::test]
+async fn every_reader_of_one_query_or_search_names_the_unheld_workspace_it_was_addressed_through() {
+    let router = router();
+    let (query, search) = async_resource_fixture(&router).await;
+
+    // Each row names a workspace this store holds no record of, and the identifier
+    // of a query or a search the store really does hold in the workspace it was
+    // started in. The workspace is the outermost resource the request got wrong, so
+    // every one of these operations — the two reads of the query, its cancel, the
+    // listings and the starts, and the same for the search — reports the WORKSPACE,
+    // and none of them reports the resource inside it.
+    for workspace in UNKNOWN_WORKSPACES {
+        let expected = absent(WORKSPACE_KIND, workspace);
+        let rows: Vec<Row> = query_and_search_family(workspace, &query, &search)
+            .into_iter()
+            .map(|route| {
+                (
+                    route.label,
+                    route.method,
+                    route.uri,
+                    route.body,
+                    expected.clone(),
+                )
+            })
+            .collect();
+        assert_rows(&router, rows).await;
+    }
+
+    // A refused request changed nothing it named: the query was not cancelled, and
+    // the two starts among the rows above started nothing — the workspace that
+    // holds them still holds exactly the one query and the one search the fixture
+    // started.
+    let (status, described) = call(
+        &router,
+        "GET",
+        &format!("/workspaces/{WORKSPACE}/queries/{query}"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeQuery after the refusals: got {status} {described}"
+    );
+    // `status` is a REQUIRED member of `DescribeQueryOutput`, so a body without it
+    // fails here rather than satisfying the inequality below by default.
+    let reported = described["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("DescribeQuery: no status in {described}"));
+    assert!(
+        reported != "CANCELED" && reported != "CANCELING",
+        "a refused CancelQuery cancels nothing: the query reports {reported:?} in {described}"
+    );
+
+    let (status, listed) = call(
+        &router,
+        "GET",
+        &format!("/workspaces/{WORKSPACE}/queries"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "ListQueries: got {status} {listed}");
+    assert_eq!(
+        listed["queries"].as_array().map(Vec::len),
+        Some(1),
+        "the refused StartQuery rows started no query, expected the fixture's one, got {listed}"
+    );
+
+    let (status, listed) = call(
+        &router,
+        "POST",
+        &format!("/workspaces/{WORKSPACE}/searches/list"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, 200, "ListSearches: got {status} {listed}");
+    assert_eq!(
+        listed["searchSummaries"].as_array().map(Vec::len),
+        Some(1),
+        "the refused StartSearch rows started no search, expected the fixture's one, got {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_workspace_that_resolves_leaves_the_query_or_search_inside_it_to_report_its_absence() {
+    let router = router();
+    let (query, search) = async_resource_fixture(&router).await;
+
+    // With the workspace held, the outermost resource the request gets wrong is the
+    // one INSIDE it, in both ways a pair can address no resource: an identifier
+    // nothing was ever started under, and the identifier of a resource ANOTHER
+    // workspace holds.
+    let inside: [(&str, &str, &str, &str); 2] = [
+        (
+            "an identifier nothing was started under",
+            WORKSPACE,
+            UNKNOWN_QUERY,
+            UNKNOWN_SEARCH,
+        ),
+        (
+            "a resource of another workspace",
+            OTHER_WORKSPACE,
+            query.as_str(),
+            search.as_str(),
+        ),
+    ];
+    for (case, workspace, query_id, search_id) in inside {
+        let rows: Vec<Row> = query_and_search_family(workspace, query_id, search_id)
+            .into_iter()
+            .filter_map(|route| {
+                let (kind, id) = route.inner?;
+                Some((
+                    route.label,
+                    route.method,
+                    route.uri,
+                    route.body,
+                    absent(kind, &id),
+                ))
+            })
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "case {case:?}: the family must carry rows addressing a resource inside the workspace"
+        );
+        assert_rows(&router, rows).await;
+    }
+}
+
+#[tokio::test]
+async fn resolving_outside_in_still_serves_the_query_and_search_the_workspace_holds() {
+    let router = router();
+    let (query, search) = async_resource_fixture(&router).await;
+
+    // The resolution refuses nothing that resolves: every route of the family, on
+    // the workspace that holds the query and the search, answers one of the
+    // statuses `OPERATIONS.md` reports for it rather than an absence — a single
+    // success status for all but the cancel and the search's results, whose answer
+    // then depends on the status the clock has made due for the resource.
+    for route in query_and_search_family(WORKSPACE, &query, &search) {
+        let label = route.label;
+        let served = route.served;
+        let (status, body) = call(&router, route.method, &route.uri, route.body).await;
+        assert!(
+            served.contains(&status),
+            "case {label:?}: a path whose every resource the store holds answers one of \
+             {served:?}, got {status} {body}"
+        );
+    }
+
+    // And the query and the search the fixture started are still the ones their own
+    // paths report.
+    let (status, body) = call(
+        &router,
+        "GET",
+        &format!("/workspaces/{WORKSPACE}/queries/{query}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeQuery: got {status} {body}");
+    assert_eq!(
+        body["queryId"].as_str(),
+        Some(query.as_str()),
+        "DescribeQuery reports the query it was addressed with, expected {query}, got {body}"
+    );
+
+    let (status, body) = call(
+        &router,
+        "GET",
+        &format!("/workspaces/{WORKSPACE}/searches/{search}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "DescribeSearch: got {status} {body}");
+    assert_eq!(
+        body["searchId"].as_str(),
+        Some(search.as_str()),
+        "DescribeSearch reports the search it was addressed with, expected {search}, got {body}"
+    );
+    assert_eq!(
+        body["workspaceName"].as_str(),
+        Some(WORKSPACE),
+        "DescribeSearch reports its workspace, expected {WORKSPACE}, got {body}"
     );
 }
