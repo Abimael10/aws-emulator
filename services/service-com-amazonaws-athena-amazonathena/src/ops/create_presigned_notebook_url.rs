@@ -178,10 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // The id names a session this account holds, or it names nothing this service will
-        // act on — the one sentence every session-addressed operation of this service
-        // states for that miss (`crate::state::SESSION_NOT_FOUND`).
+        // act on — the one refusal every session-addressed operation of this service states
+        // for that miss (`crate::state::session_not_authorized`).
         let Some(session) = store.sessions.session(&input.session_id) else {
-            return Err(invalid_request(crate::state::SESSION_NOT_FOUND));
+            return Err(crate::state::session_not_authorized());
         };
 
         // The URL "points directly to the opened notebook", which the session's own engine

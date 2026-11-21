@@ -3,7 +3,9 @@
 //! @op ListSessions
 //! IMPLEMENTED: reports the sessions of the workgroup the request names that are in an
 //! active state, newest first, one page at a time — each summary projected from the record
-//! `StartSession` persisted.
+//! `StartSession` persisted. A workgroup that does not run Spark hosts no interactive
+//! session, so a listing addressed to one is refused about its engine version
+//! ([`crate::state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK`]) rather than answered empty.
 //!
 //! ## Shape of an operation
 //!
@@ -190,6 +192,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListSessionsError::invalid_request(
                 crate::state::ERROR_CODE_INVALID_INPUT,
                 crate::state::WORK_GROUP_NOT_FOUND,
+            ));
+        }
+
+        // An interactive session runs on the Spark engine — "Lists the sessions in a
+        // workgroup", and a session is started only in a Spark enabled workgroup
+        // (`crate::state::is_spark_enabled`) — so a workgroup running Athena SQL hosts none
+        // and the listing is refused about its ENGINE VERSION rather than answered empty,
+        // the same way a start into it and a listing of its notebooks are. Athena's own
+        // default workgroup, which the registry holds no record for, runs Athena SQL.
+        let spark_enabled = store
+            .work_groups
+            .get(&input.work_group)
+            .is_some_and(crate::state::is_spark_enabled);
+        if !spark_enabled {
+            return Err(ListSessionsError::invalid_request(
+                crate::state::ERROR_CODE_INVALID_INPUT,
+                crate::state::WORK_GROUP_ENGINE_VERSION_NOT_SPARK,
             ));
         }
 

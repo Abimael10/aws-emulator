@@ -738,6 +738,28 @@ pub fn notebook_of_engine_configuration(
 /// gone, or one serving no notebook for a calculation to be a cell of).
 pub const SESSION_NOT_FOUND: &str = "Not authorized to make this request.";
 
+/// The error code of a refusal whose cause is that the request addressed a session or a
+/// calculation this service will not act on for the caller.
+///
+/// Its own class rather than [`ERROR_CODE_INVALID_INPUT`], which says the request was
+/// malformed and can be corrected locally: the request IS well formed, and what Athena
+/// states about it — in the sentence [`SESSION_NOT_FOUND`] words — is that the reference is
+/// not one this principal may address, without disclosing whether anything holds that id.
+/// A client branching on the class is told to stop rather than to rebuild the request.
+pub const ERROR_CODE_UNAUTHORIZED: &str = "UNAUTHORIZED";
+
+/// The refusal every request addressing ONE session this service will not act on is
+/// answered with: HTTP 400 `InvalidRequestException`, the class
+/// [`ERROR_CODE_UNAUTHORIZED`], and the sentence [`SESSION_NOT_FOUND`].
+///
+/// The class and the sentence are paired HERE, in the one place both are named, so no
+/// handler can state the one under the other's class and no two of them can disagree about
+/// an id neither resolves. Generic over the operation's modeled error, so each handler
+/// returns it through its own error channel.
+pub fn session_not_authorized<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::invalid_request(ERROR_CODE_UNAUTHORIZED, SESSION_NOT_FOUND)
+}
+
 /// The message a start that names a notebook version without the notebook it belongs to is
 /// refused with: the requirement `StartSessionRequest$NotebookVersion` states, "If you
 /// specify a value for NotebookVersion, you must also specify a value for NotebookId",

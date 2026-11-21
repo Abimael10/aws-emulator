@@ -224,3 +224,12 @@ pub const CALCULATION_CODE_REQUIRED: &str =
 /// for execution within a session" — and Athena refuses a request for one it will not act on
 /// in fixed text that quotes the id back no more than a session's does.
 pub const CALCULATION_NOT_FOUND: &str = SESSION_NOT_FOUND;
+
+/// The refusal a request addressing ONE calculation this service will not act on is
+/// answered with: the SAME refusal a session-addressed request takes
+/// ([`session_not_authorized`]), named here for the resource the operation resolves — a
+/// calculation is addressed inside the session it was submitted into, so Athena states the
+/// same class and the same sentence for both.
+pub fn calculation_not_authorized<E>() -> crate::scaffolded::Scaffolded<E> {
+    session_not_authorized()
+}

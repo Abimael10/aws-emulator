@@ -161,15 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         // The same refusal every session-addressed request this service will not act on
-        // answers with (`crate::state::SESSION_NOT_FOUND`): RECORDED behaviour for an id
-        // that never named a session, and the sentence states nothing about whether one
+        // answers with (`crate::state::session_not_authorized`): RECORDED behaviour for an
+        // id that never named a session, and the refusal states nothing about whether one
         // does. A session this account DOES hold is terminated below, whatever state it is
         // in.
         let Some(record) = store.sessions.session_mut(&input.session_id) else {
-            return Err(TerminateSessionError::invalid_request(
-                crate::state::ERROR_CODE_INVALID_INPUT,
-                crate::state::SESSION_NOT_FOUND,
-            ));
+            return Err(crate::state::session_not_authorized());
         };
 
         // "A TerminateSession call on a session that is already inactive (for example, in a

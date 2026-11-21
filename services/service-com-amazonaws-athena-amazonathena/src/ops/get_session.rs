@@ -173,11 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the instants its record already holds, so reporting it moves nothing on.
         let store = session_state.lock();
 
+        // The one refusal every session-addressed request this service will not act on
+        // answers with (`crate::state::session_not_authorized`), which states nothing about
+        // whether a session has that id.
         let Some(session) = store.sessions.session(&input.session_id) else {
-            return Err(GetSessionError::invalid_request(
-                crate::state::ERROR_CODE_INVALID_INPUT,
-                crate::state::SESSION_NOT_FOUND,
-            ));
+            return Err(crate::state::session_not_authorized());
         };
 
         Ok(GetSessionOutput {

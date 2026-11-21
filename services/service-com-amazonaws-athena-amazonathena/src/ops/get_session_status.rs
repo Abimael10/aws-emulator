@@ -154,12 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same refusal every session-addressed request this service will not act on
         // answers with, stating nothing about whether a session has that id
-        // (`crate::state::SESSION_NOT_FOUND`).
+        // (`crate::state::session_not_authorized`).
         let Some(record) = store.sessions.session(&input.session_id) else {
-            return Err(GetSessionStatusError::invalid_request(
-                crate::state::ERROR_CODE_INVALID_INPUT,
-                crate::state::SESSION_NOT_FOUND,
-            ));
+            return Err(crate::state::session_not_authorized());
         };
 
         Ok(GetSessionStatusOutput {

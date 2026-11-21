@@ -26,8 +26,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
-    self, ERROR_CODE_INVALID_INPUT, NOTEBOOK_ID_CONFIG, NOTEBOOK_SESSION_NOT_OPEN,
-    NOTEBOOK_TYPE_IPYNB, PYSPARK_ENGINE_VERSION, SESSION_NOT_FOUND, SESSION_STATE_TERMINATED,
+    self, ERROR_CODE_INVALID_INPUT, ERROR_CODE_UNAUTHORIZED, NOTEBOOK_ID_CONFIG,
+    NOTEBOOK_SESSION_NOT_OPEN, NOTEBOOK_TYPE_IPYNB, PYSPARK_ENGINE_VERSION, SESSION_NOT_FOUND,
+    SESSION_STATE_TERMINATED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -434,7 +435,7 @@ async fn the_grant_is_refused_for_an_unknown_and_for_a_closed_session() {
             case,
             status,
             &refused,
-            ERROR_CODE_INVALID_INPUT,
+            ERROR_CODE_UNAUTHORIZED,
             SESSION_NOT_FOUND,
         );
     }

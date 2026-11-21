@@ -158,12 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
 
         // The id names a calculation some earlier submission minted, or it names nothing this
-        // service will act on.
+        // service will act on — the one refusal stated for that
+        // (`crate::state::calculation_not_authorized`).
         let Some(record) = store.calculations.calculation(&input.calculation_execution_id) else {
-            return Err(GetCalculationExecutionCodeError::invalid_request(
-                crate::state::ERROR_CODE_INVALID_INPUT,
-                crate::state::CALCULATION_NOT_FOUND,
-            ));
+            return Err(crate::state::calculation_not_authorized());
         };
 
         Ok(GetCalculationExecutionCodeOutput {

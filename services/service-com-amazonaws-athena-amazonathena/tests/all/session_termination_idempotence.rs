@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_athena_amazonathena::state::{
-    ERROR_CODE_INVALID_INPUT, PYSPARK_ENGINE_VERSION, SESSION_STATE_CREATING, SESSION_STATE_IDLE,
+    ERROR_CODE_UNAUTHORIZED, PYSPARK_ENGINE_VERSION, SESSION_STATE_CREATING, SESSION_STATE_IDLE,
     SESSION_STATE_TERMINATED, SESSION_STATE_TERMINATING,
 };
 
@@ -276,7 +276,7 @@ async fn a_terminate_of_an_id_that_never_named_a_session_is_refused() {
             case,
             status,
             &refused,
-            ERROR_CODE_INVALID_INPUT,
+            ERROR_CODE_UNAUTHORIZED,
             UNKNOWN_SESSION_MESSAGE,
         );
     }

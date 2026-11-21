@@ -32,8 +32,9 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_athena_amazonathena::state::{
     self, SessionRecord, CALCULATION_CODE_REQUIRED, CALCULATION_NOT_FOUND,
-    CALCULATION_STATE_CREATED, ERROR_CODE_INVALID_INPUT, IDEMPOTENT_PARAMETERS_DO_NOT_MATCH,
-    PYSPARK_ENGINE_VERSION, SESSION_NOT_FOUND, SESSION_STATE_IDLE,
+    CALCULATION_STATE_CREATED, ERROR_CODE_INVALID_INPUT, ERROR_CODE_UNAUTHORIZED,
+    IDEMPOTENT_PARAMETERS_DO_NOT_MATCH, PYSPARK_ENGINE_VERSION, SESSION_NOT_FOUND,
+    SESSION_STATE_IDLE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -402,7 +403,7 @@ async fn a_session_serving_no_notebook_takes_no_calculation() {
             case,
             status,
             &refused,
-            ERROR_CODE_INVALID_INPUT,
+            ERROR_CODE_UNAUTHORIZED,
             SESSION_NOT_FOUND,
         );
         assert_eq!(
@@ -467,7 +468,7 @@ async fn a_session_this_service_will_not_act_on_takes_no_calculation() {
             case,
             status,
             &refused,
-            ERROR_CODE_INVALID_INPUT,
+            ERROR_CODE_UNAUTHORIZED,
             SESSION_NOT_FOUND,
         );
         assert_eq!(
@@ -609,7 +610,7 @@ async fn an_unminted_calculation_has_no_code_to_read() {
             case,
             status,
             &refused,
-            ERROR_CODE_INVALID_INPUT,
+            ERROR_CODE_UNAUTHORIZED,
             CALCULATION_NOT_FOUND,
         );
     }
@@ -664,7 +665,7 @@ async fn deleting_the_work_group_takes_its_calculations() {
         "after the delete",
         status,
         &refused,
-        ERROR_CODE_INVALID_INPUT,
+        ERROR_CODE_UNAUTHORIZED,
         CALCULATION_NOT_FOUND,
     );
 }

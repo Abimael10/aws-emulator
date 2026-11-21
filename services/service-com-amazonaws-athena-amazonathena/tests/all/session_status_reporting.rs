@@ -31,8 +31,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_athena_amazonathena::state::{
-    ERROR_CODE_INVALID_INPUT, PYSPARK_ENGINE_VERSION, SESSION_NOT_FOUND, SESSION_STATE_CREATING,
-    SESSION_STATE_IDLE, SESSION_STATE_TERMINATED, SESSION_STATE_TERMINATING,
+    ERROR_CODE_INVALID_INPUT, ERROR_CODE_UNAUTHORIZED, PYSPARK_ENGINE_VERSION, SESSION_NOT_FOUND,
+    SESSION_STATE_CREATING, SESSION_STATE_IDLE, SESSION_STATE_TERMINATED,
+    SESSION_STATE_TERMINATING,
 };
 
 use crate::harness::{assert_refusal, call, request_token, router};
@@ -401,30 +402,38 @@ async fn a_status_read_refuses_an_id_no_session_is_held_under() {
     let shortest = "x".to_string();
     let longest = "s".repeat(256);
     let overlong = "s".repeat(257);
-    let rows: Vec<(&str, Value, String)> = vec![
+    // Each row carries the CLASS as well: an id this account holds no session under is the
+    // reference class (`UNAUTHORIZED`), while an id outside the modelled length is the
+    // request itself being wrong (`INVALID_INPUT`).
+    let rows: Vec<(&str, Value, &str, String)> = vec![
         (
             "an id at the shortest the model admits",
             json!({ "SessionId": shortest }),
+            ERROR_CODE_UNAUTHORIZED,
             SESSION_NOT_FOUND.to_string(),
         ),
         (
             "an id at the longest the model admits",
             json!({ "SessionId": longest }),
+            ERROR_CODE_UNAUTHORIZED,
             SESSION_NOT_FOUND.to_string(),
         ),
         (
             "an id shaped like one this service mints",
             json!({ "SessionId": "6f1c9f2a-0000-4000-8000-0f1c9f2a0000" }),
+            ERROR_CODE_UNAUTHORIZED,
             SESSION_NOT_FOUND.to_string(),
         ),
         (
             "the id of another session with one character changed",
             json!({ "SessionId": format!("{session_id}z") }),
+            ERROR_CODE_UNAUTHORIZED,
             SESSION_NOT_FOUND.to_string(),
         ),
         (
             "an id one character past the longest the model admits",
             json!({ "SessionId": overlong }),
+            ERROR_CODE_INVALID_INPUT,
             "1 validation error detected: Value at 'sessionId' failed to satisfy constraint: \
              Member must have length less than or equal to 256"
                 .to_string(),
@@ -432,6 +441,7 @@ async fn a_status_read_refuses_an_id_no_session_is_held_under() {
         (
             "an id one character below the shortest the model admits",
             json!({ "SessionId": "" }),
+            ERROR_CODE_INVALID_INPUT,
             "1 validation error detected: Value at 'sessionId' failed to satisfy constraint: \
              Member must have length greater than or equal to 1"
                 .to_string(),
@@ -439,15 +449,16 @@ async fn a_status_read_refuses_an_id_no_session_is_held_under() {
         (
             "no id at all",
             json!({}),
+            ERROR_CODE_INVALID_INPUT,
             "1 validation error detected: Value null at 'sessionId' failed to satisfy \
              constraint: Member must not be null"
                 .to_string(),
         ),
     ];
 
-    for (case, request, expected) in rows {
+    for (case, request, class, expected) in rows {
         let (code, body) = call(&router, "GetSessionStatus", &request).await;
-        assert_refusal(case, code, &body, ERROR_CODE_INVALID_INPUT, &expected);
+        assert_refusal(case, code, &body, class, &expected);
     }
 
     // The refusals changed nothing: the session that does exist still reports what it did.

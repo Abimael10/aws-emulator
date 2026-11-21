@@ -236,21 +236,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Submits calculations for execution WITHIN A SESSION": the id names a session this
         // account holds, or it names nothing this service will act on — the one sentence every
         // session-addressed operation of this service states for that
-        // (`crate::state::SESSION_NOT_FOUND`), which discloses nothing about which ids name
-        // sessions.
+        // (`crate::state::session_not_authorized`), which discloses nothing about which ids
+        // name sessions.
         let Some(session) = store.sessions.session(&input.session_id) else {
-            return Err(invalid_request(crate::state::SESSION_NOT_FOUND));
+            return Err(crate::state::session_not_authorized());
         };
         // A session whose resources are no longer running — one shutting down, one whose
         // resources are gone, one that ended badly — runs nothing, so there is nothing for a
-        // calculation to be submitted into. It takes the session-addressed sentence rather
+        // calculation to be submitted into. It takes the session-addressed refusal rather
         // than the distinct wording `CreatePresignedNotebookUrl` answers for the same
         // condition (`crate::state::NOTEBOOK_SESSION_NOT_OPEN`), which is the message
         // RECORDED for that operation: no recording covers this one for a session that is
         // shutting down or gone, so the refusal stays inside the class every other
         // session-addressed request of this operation takes.
         if !session.is_active_at(now) {
-            return Err(invalid_request(crate::state::SESSION_NOT_FOUND));
+            return Err(crate::state::session_not_authorized());
         }
         // The code of a calculation is the code of a cell of the notebook the session's engine
         // serves, and WHICH notebook that is was decided by the start that bound the session to
@@ -269,7 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|notebook_id| store.notebooks.notebook(notebook_id).is_some())
             .map(ToString::to_string);
         let Some(notebook_id) = notebook_id else {
-            return Err(invalid_request(crate::state::SESSION_NOT_FOUND));
+            return Err(crate::state::session_not_authorized());
         };
         let session_id = session.id.clone();
         let work_group = session.work_group.clone();
