@@ -48,7 +48,7 @@ use super::query_wire::{element, form_encode};
 
 /// Keep this at or above the stack the other whole-router suites build on: the same assembly
 /// runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The Region every call below is signed for.
 const REGION: &str = "us-west-2";
@@ -61,7 +61,7 @@ const MASTER_PASSWORD: &str = "emu-Secret-77";
 
 /// The database the cluster is created with: its `DatabaseName`, which is the database a Data
 /// API call that names none addresses.
-const DATABASE: &str = "shareddb";
+pub(crate) const DATABASE: &str = "shareddb";
 
 /// The database the PostgreSQL engine itself comes with, which a cluster running it therefore
 /// has as well — the second database name both doors address.
@@ -147,14 +147,18 @@ const CROSSINGS: &[Crossing] = &[
 ];
 
 /// What one call answered.
-struct Answer {
-    status: u16,
-    body: String,
+///
+/// This suite's harness is `pub(crate)` from here on, so the sibling suite that drives BOTH
+/// doors at once ([`crate::rds_cluster_both_doors_at_once`]) reuses it rather than keeping a
+/// second copy of the same client.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 impl Answer {
     /// Assert the call was served, and hand back its body.
-    fn served(self, case: &str) -> String {
+    pub(crate) fn served(self, case: &str) -> String {
         assert_eq!(
             self.status, 200,
             "case {case:?}: the call must be served, got HTTP {} with {}",
@@ -222,7 +226,7 @@ async fn rds(router: &MultiServiceRouter, action: &str, params: &[(&str, String)
 }
 
 /// One call to the cluster's Data API HTTP endpoint at `path`, as its JSON client sends one.
-async fn data_api(router: &MultiServiceRouter, path: &str, call: &Value) -> Answer {
+pub(crate) async fn data_api(router: &MultiServiceRouter, path: &str, call: &Value) -> Answer {
     dispatch(
         router,
         "rds-data",
@@ -236,7 +240,7 @@ async fn data_api(router: &MultiServiceRouter, path: &str, call: &Value) -> Answ
 
 /// One `ExecuteStatement` on the cluster `resource_arn`, in the database `database` (or in the
 /// cluster's own, for a call that names none) and inside `transaction_id` where it names one.
-async fn execute_statement(
+pub(crate) async fn execute_statement(
     router: &MultiServiceRouter,
     resource_arn: &str,
     secret_arn: &str,
@@ -260,7 +264,7 @@ async fn execute_statement(
 
 /// The values of one column of an `ExecuteStatement` answer, as the `Field` members it reports
 /// them in: a string as it stands, a number and a boolean as the client would print them.
-fn api_column(case: &str, body: &str) -> Vec<String> {
+pub(crate) fn api_column(case: &str, body: &str) -> Vec<String> {
     let answer: Value = serde_json::from_str(body)
         .unwrap_or_else(|error| panic!("case {case:?}: the Data API answers JSON, got {error}"));
     let records = answer["records"].as_array().cloned().unwrap_or_default();
@@ -287,23 +291,23 @@ fn api_column(case: &str, body: &str) -> Vec<String> {
 /// A refusal the PostgreSQL server sent: the SQLSTATE a client branches on and the sentence it
 /// reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Refusal {
-    code: String,
-    message: String,
+pub(crate) struct Refusal {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 /// A PostgreSQL session opened on the cluster's engine endpoint, in the clear.
 ///
 /// It reads result ROWS, which is what this suite asserts on, and logs in on the database the
 /// case names.
-struct Session {
+pub(crate) struct Session {
     conn: TcpStream,
 }
 
 impl Session {
     /// Open a session on `address:port` as libpq does: the startup message naming the user and
     /// the database, the cleartext password, and then the parameters the server reports.
-    async fn open(case: &str, address: &str, port: u16, database: &str) -> Self {
+    pub(crate) async fn open(case: &str, address: &str, port: u16, database: &str) -> Self {
         // The endpoint the control plane published is a HOST a client RESOLVES and then dials:
         // a DB cluster publishes the DNS name it mints from its identifier, which this
         // emulator announces in the zone reserved for the interface the core binds its
@@ -387,7 +391,7 @@ impl Session {
 
     /// Run one simple query and answer with its rows, each field as the text the server sent
     /// (`None` for a NULL).
-    async fn query(
+    pub(crate) async fn query(
         &mut self,
         case: &str,
         sql: &str,
@@ -416,7 +420,7 @@ impl Session {
     }
 
     /// Run one statement that must be served, and answer with its rows.
-    async fn served(&mut self, case: &str, sql: &str) -> Vec<Vec<Option<String>>> {
+    pub(crate) async fn served(&mut self, case: &str, sql: &str) -> Vec<Vec<Option<String>>> {
         self.query(case, sql).await.unwrap_or_else(|refusal| {
             panic!("case {case:?}: {sql:?} must be served, got {refusal:?}")
         })
@@ -515,16 +519,20 @@ fn read_cstring(body: &[u8], at: usize) -> (String, usize) {
 
 /// The cluster this suite serves both doors of: its ARN, the credential its Data API calls
 /// authenticate with, and the address its engine endpoint publishes.
-struct Provisioned {
-    cluster_arn: String,
-    secret_arn: String,
-    address: String,
-    port: u16,
+pub(crate) struct Provisioned {
+    pub(crate) cluster_arn: String,
+    pub(crate) secret_arn: String,
+    pub(crate) address: String,
+    pub(crate) port: u16,
 }
 
 /// Create the cluster with its Data API HTTP endpoint on and a secret carrying its master
 /// credential, and wait for the cluster to report `available`.
-async fn provisioned(router: &MultiServiceRouter, identifier: &str, secret: &str) -> Provisioned {
+pub(crate) async fn provisioned(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    secret: &str,
+) -> Provisioned {
     let created = rds(
         router,
         "CreateDBCluster",

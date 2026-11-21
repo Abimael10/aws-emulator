@@ -15,7 +15,7 @@
 //! dialect and its own diagnostics — and each with its own in-process SQL engine. What this
 //! module gives them is the one thing they must NOT each have: the STORAGE. A database of a
 //! cluster is named here once, as a backing the engine shares between connections, so every
-//! surface of that cluster opens a connection onto the SAME pages while keeping its own
+//! surface of that cluster opens a connection onto the SAME database while keeping its own
 //! connection, its own confinement and its own bounds.
 //!
 //! * [`ClusterVolumes::of`] vends the naming of ONE shared engine, so two emulators in one
@@ -24,7 +24,11 @@
 //!   the cluster's own immutable resource id and the database's name.
 //! * [`open_backing`] is the one place such a backing is opened, and the one place a
 //!   PRIVATE database (a copy, a snapshot, a working set) is opened instead — so the choice
-//!   between the two is a parameter and never a second way of opening a connection.
+//!   between the two is a parameter and never a second way of opening a connection. It is
+//!   also where the surfaces are SERIALISED: two of them write one backing, so a statement
+//!   that arrives while another surface is writing waits for the pages rather than being
+//!   refused them ([`BACKING_BUSY_TIMEOUT`]), exactly as a second connection to a database
+//!   server does.
 //! * [`ClusterVolume::locks`] is the one table of ROW LOCKS over that storage
 //!   ([`crate::sql_row_locks`]): the rows a transaction holds are rows every surface of the
 //!   cluster waits for, because they are rows of one database.
@@ -202,10 +206,10 @@ impl ClusterVolume {
     ///
     /// What the name addresses is therefore always ONE in-memory database of the engine,
     /// shared between the connections opened on that name and reachable through nothing else:
-    /// `mode=memory` means no host path is opened and no file is created, and the two
-    /// encoded components are what keep one cluster's database out of another's. The database
-    /// name is folded to lower case first, because the engines behind these endpoints resolve
-    /// a database name without regard to case.
+    /// the VFS the name carries holds the whole database in memory, so no host path is opened
+    /// and no file is created, and the two encoded components are what keep one cluster's
+    /// database out of another's. The database name is folded to lower case first, because the
+    /// engines behind these endpoints resolve a database name without regard to case.
     #[must_use]
     pub fn backing(&self, database: &str) -> String {
         format!(
@@ -220,11 +224,31 @@ impl ClusterVolume {
 /// What every shared backing's name begins with, so a name this module built is recognisable
 /// in a diagnostic, can collide with nothing else, and is told from any other name at the one
 /// place a connection is opened ([`names_a_cluster_volume`]).
-const BACKING_PREFIX: &str = "file:aws-emulator-cluster-volume-";
+const BACKING_PREFIX: &str = "file:/aws-emulator-cluster-volume-";
 
-/// What every shared backing's name ends with: the engine's reading of it as an IN-MEMORY
-/// database shared between the connections opened on that name, and nothing else.
-const BACKING_SUFFIX: &str = "?mode=memory&cache=shared";
+/// What every shared backing's name ends with: the engine's own IN-MEMORY file system, which
+/// holds the database named in front of it in memory and shares it with every connection
+/// opened on that name, and nothing else.
+///
+/// It is this reading — rather than one page cache shared between the connections — that
+/// makes a statement of one surface WAIT for storage another surface is writing instead of
+/// being refused it: a shared page cache locks per table and answers a second connection
+/// "locked" at once, without ever asking the waiter whether it would wait
+/// ([`BACKING_BUSY_TIMEOUT`]), while a database each connection has its own cache of is
+/// locked the way any other database file is, which the engine's own wait covers.
+const BACKING_SUFFIX: &str = "?vfs=memdb";
+
+/// How long a statement of one surface WAITS for storage another surface is writing before the
+/// engine reports it could not have it.
+///
+/// A DB cluster is one database behind several doors, so two surfaces of it write one backing,
+/// and the engine serialises them: the one that arrives second waits for the pages rather than
+/// being refused them, exactly as a second connection to a database server does. The wait is
+/// bounded so a waiter cannot sit for ever, and the bound is as long as the longest ceiling a
+/// surface of this emulator runs ONE statement under — so a waiter outlasts a full-length
+/// statement of the other door, and a statement of its own that is cut off is cut off by its
+/// own deadline rather than by this.
+const BACKING_BUSY_TIMEOUT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
 
 /// Whether `backing` is a name [`ClusterVolume::backing`] composed: this module's own prefix,
 /// then the namespace, the cluster and the database as hexadecimal and nothing else, then the
@@ -254,9 +278,11 @@ fn names_a_cluster_volume(backing: &str) -> bool {
 /// asks for:
 ///
 /// * `Some(backing)` — a database of a cluster, which every surface of that cluster opens a
-///   connection on ([`ClusterVolume::backing`]): the engine keeps ONE set of pages for that
-///   name and hands each connection its own view of them, so what one surface commits is
-///   what the next statement of another surface reads;
+///   connection on ([`ClusterVolume::backing`]): the engine keeps ONE database for that name
+///   and hands each connection its own view of it, so what one surface commits is what the
+///   next statement of another surface reads, and a statement that arrives while another
+///   surface is writing WAITS for the pages ([`BACKING_BUSY_TIMEOUT`]) rather than being
+///   refused them;
 /// * `None` — a database nothing else addresses: a copy taken for a snapshot, the working
 ///   set of one transaction, the scratch of one request.
 ///
@@ -267,22 +293,28 @@ fn names_a_cluster_volume(backing: &str) -> bool {
 /// wrote in the database name a data plane composed its backing from.
 ///
 /// The connection is opened with the flags a bounded in-process engine needs and NOTHING
-/// else: read/write, create, and the URI reading that names an in-memory backing. No path on
-/// the host is ever opened — a backing is `mode=memory`, and a private database is the
-/// engine's own anonymous in-memory one — and the caller installs its own confinement,
-/// limits and functions on the connection it gets back, exactly as it does on a private one.
+/// else: read/write, create, and the URI reading that names the in-memory file system a
+/// backing is held in. No path on the host is ever opened — a backing names that file system
+/// ([`BACKING_SUFFIX`]), and a private database is the engine's anonymous in-memory one — and
+/// the caller installs its own confinement, limits and functions on the connection it gets
+/// back, exactly as it does on a private one.
 pub fn open_backing(backing: Option<&str>) -> ::rusqlite::Result<Connection> {
     match backing {
-        // `SQLITE_OPEN_FULL_MUTEX`: the pages of a backing are shared between the
-        // connections of several surfaces, which run on different threads, so the engine
-        // serialises access to them rather than leaving that to the callers' own locks.
-        Some(backing) if names_a_cluster_volume(backing) => Connection::open_with_flags(
-            backing,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_URI
-                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
-        ),
+        // `SQLITE_OPEN_FULL_MUTEX`: one connection on a backing is used from more than one
+        // thread (a surface runs each statement on the pool), so the engine serialises the
+        // uses of it rather than leaving that to the callers' own locks. The WAIT below is
+        // what serialises the surfaces' separate connections against each other.
+        Some(backing) if names_a_cluster_volume(backing) => {
+            let conn = Connection::open_with_flags(
+                backing,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+            )?;
+            conn.busy_timeout(BACKING_BUSY_TIMEOUT)?;
+            Ok(conn)
+        }
         Some(refused) => Err(::rusqlite::Error::InvalidPath(
             ::std::path::PathBuf::from(refused),
         )),
@@ -370,6 +402,106 @@ mod tests {
             "case {:?}: expected both rows through either connection, got {rows}",
             "a row written through the other surface"
         );
+    }
+
+    /// RULE: two surfaces of one cluster database may use it AT THE SAME TIME — a statement
+    /// that arrives while another surface is writing waits for the storage and is served,
+    /// rather than being refused it, and every write of both surfaces is in the database
+    /// afterwards.
+    ///
+    /// The rows differ along what the SECOND surface is doing while the first writes: reading
+    /// the very table being written, writing that table, writing another table of the same
+    /// database, and running a transaction of several statements.
+    #[test]
+    fn a_statement_waits_for_storage_another_surface_is_writing() {
+        /// How many statements each surface runs in one case: enough rounds that the two
+        /// surfaces' statements overlap, few enough that the case costs milliseconds.
+        const ROUNDS: usize = 200;
+        // (case, what the second surface runs each round)
+        let rows: &[(&str, &str)] = &[
+            (
+                "a read of the table the other surface is writing",
+                "SELECT count(*) FROM seats",
+            ),
+            (
+                "a write of that same table",
+                "INSERT INTO seats (holder) VALUES ('the second surface')",
+            ),
+            (
+                "a write of another table of the same database",
+                "INSERT INTO seats_elsewhere (holder) VALUES ('the second surface')",
+            ),
+            (
+                "a transaction of several statements",
+                "BEGIN; \
+                 INSERT INTO seats_elsewhere (holder) VALUES ('in a transaction'); \
+                 UPDATE seats_elsewhere SET holder = 'committed' \
+                   WHERE id = (SELECT max(id) FROM seats_elsewhere); \
+                 COMMIT;",
+            ),
+        ];
+        for (case, second) in rows {
+            let volumes =
+                ClusterVolumes(::engine::InMemoryEngine::new().state::<SharedSqlVolumes>());
+            let backing = volumes.cluster("cluster-ABCDEF").backing("appdata");
+            // Held for the whole case: a backing lives exactly as long as a connection to it
+            // is open, so this is the surface that keeps the cluster's database there.
+            let held = open_backing(Some(&backing)).expect("the backing opens");
+            held.execute_batch(
+                "CREATE TABLE seats (id INTEGER PRIMARY KEY, holder TEXT NOT NULL);
+                 CREATE TABLE seats_elsewhere (id INTEGER PRIMARY KEY, holder TEXT NOT NULL)",
+            )
+            .expect("the first surface writes");
+
+            // Each surface runs on a thread of its own, with a connection of its own on the
+            // one backing — which is how the two doors of a cluster reach it.
+            let surfaces: Vec<std::thread::JoinHandle<Vec<String>>> = [
+                "INSERT INTO seats (holder) VALUES ('the first surface')",
+                second,
+            ]
+            .into_iter()
+            .map(|statement| {
+                let backing = backing.clone();
+                let statement = statement.to_string();
+                std::thread::spawn(move || {
+                    let conn = open_backing(Some(&backing)).expect("the backing opens");
+                    let mut refused = Vec::new();
+                    for round in 0..ROUNDS {
+                        if let Err(error) = conn.execute_batch(&statement) {
+                            refused.push(format!("round {round}: {error}"));
+                        }
+                    }
+                    refused
+                })
+            })
+            .collect();
+            let refused: Vec<String> = surfaces
+                .into_iter()
+                .flat_map(|surface| surface.join().expect("the surface finishes"))
+                .collect();
+            assert!(
+                refused.is_empty(),
+                "case {case:?}: every statement of two surfaces at once must be served, got \
+                 {} refusal(s), the first {:?}",
+                refused.len(),
+                refused.first()
+            );
+
+            // And the writes are IN the database: the first surface's rows are all there,
+            // whatever the second surface was doing beside them.
+            let seats: i64 = held
+                .query_row(
+                    "SELECT count(*) FROM seats WHERE holder = 'the first surface'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("the database is readable");
+            assert_eq!(
+                seats,
+                ROUNDS as i64,
+                "case {case:?}: expected the {ROUNDS} rows the first surface wrote, got {seats}"
+            );
+        }
     }
 
     /// RULE: one engine names its backings under ONE namespace, drawn once, and two engines
@@ -567,6 +699,12 @@ mod tests {
             "file:aws-emulator-cluster-volume-1-61-62?mode=memory&cache=shared&vfs=unix",
             "file:aws-emulator-cluster-volume-1-../../etc/passwd?mode=memory&cache=shared",
             "file:aws-emulator-cluster-volume-?mode=memory&cache=shared",
+            // The forms a backing of the composed shape takes once the IN-MEMORY file system
+            // it names is dropped or replaced: without that reading the same name is a path on
+            // the HOST, which is the one thing a connection here is never opened on.
+            "file:/aws-emulator-cluster-volume-1-61-62",
+            "file:/aws-emulator-cluster-volume-1-61-62?vfs=unix",
+            "file:/aws-emulator-cluster-volume-1-61-62?vfs=memdb&mode=rwc",
             "",
             "appdata",
         ] {
