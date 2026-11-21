@@ -244,7 +244,10 @@ const LAMBDA_TRUST_POLICY: &str = "{\"Version\":\"2012-10-17\",\"Statement\":\
 /// binary: AppSync publishes the endpoint and builds the event, Lambda runs the functions, IAM
 /// holds the service role and its policy, and CloudFormation archives each handler's inline
 /// source into the deployment package it is created from.
-fn build_router() -> MultiServiceRouter {
+///
+/// Shared with the sibling suites that drive an AppSync data plane backed by Lambda, so one
+/// assembly of the emulator serves them all.
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
     // Request authentication is off in this target: what a graded call pins is what the
@@ -290,8 +293,9 @@ async fn appsync(
     (status, parsed)
 }
 
-/// The same, asserting the call was served.
-async fn appsync_ok(
+/// The same, asserting the call was served. Shared with the sibling suites that set an AppSync
+/// API up over this target's router.
+pub(crate) async fn appsync_ok(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -398,7 +402,14 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 /// out in a suite comes to exist at all. Both the stack's completion and the function's own
 /// provisioning window are owed by the clock, so this looks until each holds rather than
 /// sleeping a span on either service's behalf.
-async fn create_function(router: &MultiServiceRouter, name: &str, source: &str) -> String {
+///
+/// Shared with the sibling suites that gate an AppSync API on a function of their own, so there
+/// is one reading of how a handler written out in a suite comes to be invocable.
+pub(crate) async fn create_function(
+    router: &MultiServiceRouter,
+    name: &str,
+    source: &str,
+) -> String {
     // The role the function RUNS as: trusted by Lambda, which `CreateFunction` checks. What it
     // may do is not what this suite is about — the role under test is the DATA SOURCE's.
     let execution_role = iam(
@@ -697,7 +708,10 @@ pub(crate) async fn post_published_uri(
 }
 
 /// The authority and the path of a published URL — what a client dials and what it asks for.
-fn published_parts(case: &str, uri: &str) -> (String, String) {
+///
+/// Shared with the sibling suites that grade a published address, so there is one reading of how
+/// such a URL is decomposed.
+pub(crate) fn published_parts(case: &str, uri: &str) -> (String, String) {
     let rest = uri
         .split_once("://")
         .map(|(_, rest)| rest)
