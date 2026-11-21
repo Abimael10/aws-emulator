@@ -44,6 +44,12 @@
 //!    allocation, one owed by an issued credit code, both owed in either order, a term that
 //!    closed one millisecond ago and terms still open; and the same over the sibling
 //!    `ListBenefitAllocations`, which materialises the same expiries.
+//! 8. **Whether a term has closed at an instant is ONE boundary**: the allocation's term
+//!    and an issued credit code's term are judged by the same rule, each against its own
+//!    `ExpiresAt`. Rows: an instant on either side of a term's end and at the end itself,
+//!    and, over the wire, the two terms placed at different instants so that each of one
+//!    closed and one open is reported on its own end — through this operation and through
+//!    the sibling `ListBenefitAllocations`.
 
 use std::collections::BTreeSet;
 
@@ -52,8 +58,9 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
     BENEFIT_ALLOCATION_STATUS_VALUES, CURRENCY_CODE_VALUES, FULFILLMENT_TYPE_VALUES,
 };
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    not_found_message, now_millis, service_state, AllocatedCreditCode, AllocationFulfillment,
-    BenefitAllocation, Issuance, Money, ALLOCATION_EXPIRED_REASON, ALLOCATION_RESOURCE,
+    not_found_message, now_millis, service_state, term_closed, AllocatedCreditCode,
+    AllocationFulfillment, BenefitAllocation, Issuance, Money, ALLOCATION_EXPIRED_REASON,
+    ALLOCATION_RESOURCE,
     ALLOCATION_STATUS_ACTIVE, ALLOCATION_STATUS_FULFILLED, ALLOCATION_STATUS_INACTIVE,
     ALLOCATION_KIND, APPLICATION_RESOURCE, BENEFIT_RESOURCE, CATALOG_KIND,
     FULFILLMENT_TYPE_ACCESS, FULFILLMENT_TYPE_CASH, FULFILLMENT_TYPE_CREDITS, SEEDED_CATALOGS,
@@ -1066,4 +1073,230 @@ fn place_term(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 8 — the two terms are judged by ONE boundary
+// ---------------------------------------------------------------------------
+
+/// One question put to the expiry boundary: how far a term's end lies from the instant the
+/// question is asked, and whether the term is closed then.
+///
+/// The rows differ along what the boundary generalises over — which side of the end the
+/// instant falls on and how far from it — and include the two the clock-driven reads below
+/// cannot place: the end instant itself, and the millisecond before it.
+const TERM_BOUNDARY_ROWS: &[(&str, i64, bool)] = &[
+    ("a term ending 400 days from now is open", 400 * MILLIS_PER_DAY, false),
+    ("a term ending one millisecond from now is open", 1, false),
+    ("a term ending at this very instant is closed", 0, true),
+    ("a term that ended one millisecond ago is closed", -1, true),
+    ("a term that ended 400 days ago is closed", -400 * MILLIS_PER_DAY, true),
+];
+
+/// Rule 8: the boundary that decides whether a term has closed at an instant is ONE rule,
+/// so an allocation's term and an issued credit code's term answer it identically for the
+/// same pair of instants — at the end instant itself included.
+#[tokio::test]
+async fn one_boundary_decides_an_allocation_term_and_a_credit_code_term_alike() {
+    let harness = Harness::new();
+    let case = "the allocation that has issued a credit code";
+    let stored = pick_allocation(&harness, case, CATALOG, Pick::IssuedCode);
+    let issued = issued_codes(case, &stored);
+
+    // Two anchors for "now", so neither answer can come from the magnitude of the instants:
+    // the epoch itself and a present-day instant.
+    for now in [0_i64, now_millis()] {
+        for (row, offset, closed) in TERM_BOUNDARY_ROWS {
+            let case = format!("{row} (now {now})");
+            let expires_at = now + offset;
+            assert_eq!(
+                term_closed(expires_at, now),
+                *closed,
+                "case {case:?}: expected term_closed({expires_at}, {now}) to be {closed}, \
+                 got {}",
+                term_closed(expires_at, now)
+            );
+
+            let mut allocation = stored.clone();
+            allocation.expires_at_millis = expires_at;
+            assert_eq!(
+                allocation.has_expired(now),
+                *closed,
+                "case {case:?}: an allocation's term must be judged by the one boundary, \
+                 expected {closed}, got {}",
+                allocation.has_expired(now)
+            );
+
+            let mut code = issued[0].clone();
+            code.expires_at_millis = expires_at;
+            assert_eq!(
+                code.has_expired(now),
+                *closed,
+                "case {case:?}: an issued code's term must be judged by the same boundary, \
+                 expected {closed}, got {}",
+                code.has_expired(now)
+            );
+        }
+    }
+}
+
+/// One row of the wire table below: the allocation's own term and its issued codes' term
+/// placed at DIFFERENT offsets from the row's base instant (a negative offset is in the
+/// past, so that term has closed), and the status each must then be reported in.
+struct SplitTermRow {
+    case: &'static str,
+    allocation_expiry: i64,
+    code_expiry: i64,
+    allocation_status: &'static str,
+    code_status: &'static str,
+}
+
+/// The rows differ along which of the two terms has closed, so each term is judged on its
+/// OWN end: one closed while the other is open, in either direction, both closed and
+/// neither closed.
+const SPLIT_TERM_ROWS: &[SplitTermRow] = &[
+    SplitTermRow {
+        case: "only the allocation's own term has closed",
+        allocation_expiry: -9 * MILLIS_PER_DAY,
+        code_expiry: 400 * MILLIS_PER_DAY,
+        allocation_status: ALLOCATION_STATUS_INACTIVE,
+        code_status: ALLOCATION_STATUS_ACTIVE,
+    },
+    SplitTermRow {
+        case: "only the issued code's term has closed",
+        allocation_expiry: 400 * MILLIS_PER_DAY,
+        code_expiry: -1,
+        allocation_status: ALLOCATION_STATUS_ACTIVE,
+        code_status: ALLOCATION_STATUS_INACTIVE,
+    },
+    SplitTermRow {
+        case: "both terms have closed",
+        allocation_expiry: -1,
+        code_expiry: -9 * MILLIS_PER_DAY,
+        allocation_status: ALLOCATION_STATUS_INACTIVE,
+        code_status: ALLOCATION_STATUS_INACTIVE,
+    },
+    SplitTermRow {
+        case: "neither term has closed",
+        allocation_expiry: 400 * MILLIS_PER_DAY,
+        code_expiry: 400 * MILLIS_PER_DAY,
+        allocation_status: ALLOCATION_STATUS_ACTIVE,
+        code_status: ALLOCATION_STATUS_ACTIVE,
+    },
+];
+
+/// Rule 8 over the wire, through `GetBenefitAllocation`: with the two terms ending at
+/// different instants, the allocation is reported on its own end and each issued code on
+/// its own, which is the one boundary asked twice.
+#[tokio::test]
+async fn a_read_judges_each_term_on_its_own_end() {
+    for row in SPLIT_TERM_ROWS {
+        let case = row.case;
+        let harness = Harness::new();
+        let base = now_millis();
+        let allocation = pick_allocation(&harness, case, CATALOG, Pick::IssuedCode);
+        place_term(
+            &harness,
+            case,
+            CATALOG,
+            &allocation.id,
+            ALLOCATION_STATUS_ACTIVE,
+            base - 500 * MILLIS_PER_DAY,
+            base + row.allocation_expiry,
+            Some(base + row.code_expiry),
+        );
+
+        let body = get(&harness, case, CATALOG, &allocation.id).await;
+        assert_eq!(
+            member(&body, "Status").as_deref(),
+            Some(row.allocation_status),
+            "case {case:?}: expected the allocation reported {:?}, got {body:?}",
+            row.allocation_status
+        );
+        let codes = body["FulfillmentDetail"]["CreditDetails"]["Codes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected credit codes, got {body:?}"))
+            .clone();
+        assert!(
+            !codes.is_empty(),
+            "case {case:?}: the row needs an issued code to judge, got {body:?}"
+        );
+        for code in &codes {
+            assert_eq!(
+                member(code, "Status").as_deref(),
+                Some(row.code_status),
+                "case {case:?}: expected the issued code reported {:?}, got {code:?}",
+                row.code_status
+            );
+        }
+    }
+}
+
+/// Rule 8 over the wire, through the sibling `ListBenefitAllocations`: the other report
+/// materialises the same two expiries, so it judges each term on its own end as well.
+#[tokio::test]
+async fn the_sibling_report_judges_each_term_on_its_own_end_too() {
+    for row in SPLIT_TERM_ROWS {
+        let case = row.case;
+        let harness = Harness::new();
+        let base = now_millis();
+        let allocation = pick_allocation(&harness, case, CATALOG, Pick::IssuedCode);
+        place_term(
+            &harness,
+            case,
+            CATALOG,
+            &allocation.id,
+            ALLOCATION_STATUS_ACTIVE,
+            base - 500 * MILLIS_PER_DAY,
+            base + row.allocation_expiry,
+            Some(base + row.code_expiry),
+        );
+
+        let (summaries, _) = list(&harness, case, &json!({ "Catalog": CATALOG })).await;
+        let summary = summaries
+            .iter()
+            .find(|summary| member(summary, "Id").as_deref() == Some(allocation.id.as_str()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the listing must report {:?}, got {summaries:?}",
+                    allocation.id
+                )
+            });
+        assert_eq!(
+            member(summary, "Status").as_deref(),
+            Some(row.allocation_status),
+            "case {case:?}: expected the allocation listed {:?}, got {summary:?}",
+            row.allocation_status
+        );
+
+        // The listing reports no credit code of its own, so the expiry it materialised on
+        // the codes is read back from the store it wrote.
+        let stored = stored_allocations(&harness, CATALOG)
+            .into_iter()
+            .find(|stored| stored.id == allocation.id)
+            .unwrap_or_else(|| panic!("case {case:?}: the allocation is still stored"));
+        for code in issued_codes(case, &stored) {
+            assert_eq!(
+                code.status, row.code_status,
+                "case {case:?}: expected the issued code left {:?}, got {code:?}",
+                row.code_status
+            );
+        }
+    }
+}
+
+/// The credit codes a stored allocation has issued, which a row judging a code's own term
+/// needs at least one of.
+fn issued_codes(case: &str, allocation: &BenefitAllocation) -> Vec<AllocatedCreditCode> {
+    let codes = match &allocation.fulfillment {
+        Some(AllocationFulfillment::Credits { codes, .. }) => codes.clone(),
+        other => panic!(
+            "case {case:?}: expected an allocation fulfilled with credits, got {other:?}"
+        ),
+    };
+    assert!(
+        !codes.is_empty(),
+        "case {case:?}: expected an allocation that has issued a credit code, got {codes:?}"
+    );
+    codes
 }

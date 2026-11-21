@@ -862,8 +862,15 @@ pub struct AllocatedCreditCode {
 }
 
 impl AllocatedCreditCode {
+    /// Whether this code's term has closed at `now_millis`, decided by [`term_closed`] —
+    /// the one place the boundary lives — against this code's own `ExpiresAt`.
+    pub fn has_expired(&self, now_millis: i64) -> bool {
+        term_closed(self.expires_at_millis, now_millis)
+    }
+
     /// Materialise the expiry the clock has already made due on this code, exactly as
-    /// [`BenefitAllocation::expire_due`] does for the allocation: a code past its own
+    /// [`BenefitAllocation::expire_due`] does for the allocation — the same boundary, read
+    /// through [`Self::has_expired`] and so through [`term_closed`]: a code past its own
     /// `ExpiresAt` can no longer be redeemed, so it is `INACTIVE` whether or not anybody
     /// has looked at it. A redeemed (`FULFILLED`) code is terminal.
     ///
@@ -871,7 +878,7 @@ impl AllocatedCreditCode {
     /// that holds it can date the write by that instant rather than by the instant it was
     /// read, and `None` where nothing was owed.
     fn expire_due(&mut self, now_millis: i64) -> Option<i64> {
-        if self.status != ALLOCATION_STATUS_ACTIVE || now_millis < self.expires_at_millis {
+        if self.status != ALLOCATION_STATUS_ACTIVE || !self.has_expired(now_millis) {
             return None;
         }
         self.status = ALLOCATION_STATUS_INACTIVE.to_string();
@@ -1028,11 +1035,11 @@ impl BenefitAllocation {
         }
     }
 
-    /// Whether this allocation's term has closed at `now_millis` — `ExpiresAt` is the
-    /// instant the model documents it "expires and is no longer usable" at, so the term is
-    /// closed from that instant on.
+    /// Whether this allocation's term has closed at `now_millis`, decided by
+    /// [`term_closed`] — the one place the boundary lives — against the allocation's own
+    /// `ExpiresAt`.
     pub fn has_expired(&self, now_millis: i64) -> bool {
-        now_millis >= self.expires_at_millis
+        term_closed(self.expires_at_millis, now_millis)
     }
 
     /// Materialise the expiry the clock has already made due, and report whether this call
@@ -1043,8 +1050,8 @@ impl BenefitAllocation {
     /// instant, which is why a reporting operation may apply it. `FULFILLED` is terminal —
     /// the benefit was delivered, so there is nothing left to expire — and an allocation
     /// already `INACTIVE` has nowhere to move. Each credit code the allocation has issued
-    /// expires on the same rule, against its own `ExpiresAt` (see
-    /// [`AllocatedCreditCode::expire_due`]).
+    /// expires on the same rule — the same [`term_closed`] boundary — against its own
+    /// `ExpiresAt` (see [`AllocatedCreditCode::expire_due`]).
     ///
     /// `UpdatedAt` is dated by the instant the change FELL DUE — the `ExpiresAt` the record
     /// already holds, the latest one where this call materialises several — and never by
@@ -3052,6 +3059,18 @@ pub fn now_millis() -> i64 {
 /// than the write before it, which is what a caller comparing two reads relies on.
 pub fn bump_millis(previous: i64, applied_at: i64) -> i64 {
     applied_at.max(previous.saturating_add(1))
+}
+
+/// Whether a term that ends at `expires_at_millis` has closed at `now_millis`.
+///
+/// The ONE place the expiry boundary is decided: `ExpiresAt` is the instant the model
+/// documents a term "expires and is no longer usable" at, so the term is closed from that
+/// instant on. Both terms this service holds are judged here — the allocation's
+/// ([`BenefitAllocation::has_expired`]) and an issued credit code's
+/// ([`AllocatedCreditCode::has_expired`]) — so the boundary cannot be stated one way for
+/// one of them and another way for the other.
+pub fn term_closed(expires_at_millis: i64, now_millis: i64) -> bool {
+    now_millis >= expires_at_millis
 }
 
 /// Render a stored epoch-millisecond instant as the modelled `date-time` timestamp.
