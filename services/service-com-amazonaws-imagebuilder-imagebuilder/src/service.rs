@@ -79,9 +79,10 @@
 pub mod parameter_refusal;
 
 use parameter_refusal::{
-    body_parameter_refusal, unstated_pattern_refusal, uri_parameter_refusal,
+    body_parameter_refusal, pipeline_listing_body_refusal, unstated_pattern_refusal,
+    uri_parameter_refusal,
 };
-use service_common::front_door::{FrontDoor, UriWording};
+use service_common::front_door::{BodyWording, FrontDoor, UriWording};
 use service_common::query_error_envelope::{
     RequestIdEnvelopeDefinition, RequestIdReportingOperation,
 };
@@ -96,20 +97,30 @@ use std::sync::Arc;
 /// operation rather than spelled again here.
 ///
 /// `uri_wording` is how THIS operation words a refusal of a value its request carries outside
-/// the body; the body half is the one wording every operation of this service shares. The
+/// the body, and `body_wording` how it words one the request carried IN the body. The
 /// request-id report wraps the door, so every response the operation answers — through the
 /// door or behind it — names the request it answered.
-fn serve<O: Operation + ErasedOperation + 'static>(
+fn serve_worded<O: Operation + ErasedOperation + 'static>(
     table: &mut OperationRoutingTable,
     operation: O,
+    body_wording: BodyWording,
     uri_wording: UriWording,
 ) {
     table.add_operation(
         O::NAME,
         Box::new(RequestIdReportingOperation::error_member(
-            FrontDoor::worded(operation, body_parameter_refusal).wording_uri(uri_wording),
+            FrontDoor::worded(operation, body_wording).wording_uri(uri_wording),
         )) as Box<dyn ErasedOperation>,
     );
+}
+
+/// [`serve_worded`] with the body wording every operation of this service shares.
+fn serve<O: Operation + ErasedOperation + 'static>(
+    table: &mut OperationRoutingTable,
+    operation: O,
+    uri_wording: UriWording,
+) {
+    serve_worded(table, operation, body_parameter_refusal, uri_wording);
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each served behind
@@ -214,7 +225,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             list_image_build_versions::ListImageBuildVersions,
             list_image_packages::ListImagePackages,
             list_image_pipeline_images::ListImagePipelineImages,
-            list_image_pipelines::ListImagePipelines,
             list_image_recipes::ListImageRecipes,
             list_image_scan_finding_aggregations::ListImageScanFindingAggregations,
             list_image_scan_findings::ListImageScanFindings,
@@ -243,6 +253,18 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             update_image_pipeline::UpdateImagePipeline,
             update_infrastructure_configuration::UpdateInfrastructureConfiguration,
             update_lifecycle_policy::UpdateLifecyclePolicy,
+        );
+        // The one operation that states a COLLECTION's `@length` requirement its own way: the
+        // pipeline listing's recorded refusals of a `filters` outside its bounds name the
+        // modelled bound the member's length had to satisfy, where every other refusal of this
+        // service states how many items the member has to carry. Which wording is stated is a
+        // property of the operation the request addressed, so it is chosen here, where each
+        // operation's own door is built.
+        serve_worded(
+            &mut front_door,
+            crate::ops::list_image_pipelines::ListImagePipelines::new(Arc::clone(&engine)),
+            pipeline_listing_body_refusal,
+            uri_parameter_refusal,
         );
         Self {
             entry: RequestIdEnvelopeDefinition::error_member(crate::ServiceDefinition::new(engine)),

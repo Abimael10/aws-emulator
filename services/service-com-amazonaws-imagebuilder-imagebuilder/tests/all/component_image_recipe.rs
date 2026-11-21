@@ -1412,8 +1412,9 @@ async fn listing_reports_the_stored_recipes_filtered_and_paginated() {
 
     // (case, the request, the error code the refusal carries): a filter naming a member
     // this operation does not filter on is a value the `filters` parameter does not admit,
-    // which this service refuses as that parameter's value; a filter that is not a filter
-    // at all — no name, no values — is a malformed request.
+    // which this service refuses as that parameter's value; a filter that left out a member
+    // every filter has to carry — no name, or no values — is reported as the parameter the
+    // request omitted, which the model cannot require.
     let refusals: Vec<(&str, Value, &str)> = vec![
         (
             "an unsupported filter name",
@@ -1423,12 +1424,12 @@ async fn listing_reports_the_stored_recipes_filtered_and_paginated() {
         (
             "a filter with no values",
             json!({"filters": [{"name": "name"}]}),
-            "InvalidRequestException",
+            "MissingParametersException",
         ),
         (
             "a filter with no name",
             json!({"filters": [{"values": ["alpha-recipe"]}]}),
-            "InvalidRequestException",
+            "MissingParametersException",
         ),
     ];
     for (case, body, code) in refusals {

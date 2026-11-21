@@ -757,8 +757,9 @@ async fn the_listing_reports_the_stored_configurations_of_its_own_region() {
     }
 
     // A filter naming a member this listing does not filter on is a value its `filters`
-    // parameter does not admit; one carrying no values at all is an incomplete filter; and a
-    // token this store did not issue is not a position in any listing.
+    // parameter does not admit; one that left out a member every filter has to carry is
+    // reported as the parameter the request omitted; and a token this store did not issue is
+    // not a position in any listing.
     for (case, body, code, message) in [
         (
             "a filter on a member this listing does not filter on",
@@ -769,10 +770,15 @@ async fn the_listing_reports_the_stored_configurations_of_its_own_region() {
                 .to_string(),
         ),
         (
+            // A filter that left out a member every filter has to carry is reported as the
+            // parameter the request omitted, under this service's missing-parameter class:
+            // the model requires neither member of a `Filter`.
             "a filter carrying no values",
             json!({ "filters": [{ "name": "name" }] }),
-            "InvalidRequestException",
-            "Each filter must specify a name and one or more values.".to_string(),
+            "MissingParametersException",
+            "Required parameters are missing from the request: 'values'. Verify that you have \
+             entered all of the required parameters in your request and try again."
+                .to_string(),
         ),
         (
             "a token this store did not issue",

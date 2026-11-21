@@ -206,26 +206,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a `nextToken` is minted and read back as the opaque value this store issued.
         let page_token_key = state.lock().page_token_key;
 
-        // Each filter names one member and the values it admits. An unnamed filter, one
-        // with no values, and a name this operation does not filter on are all refused
-        // rather than ignored: a filter nothing applies would answer with recipes the
-        // caller did not ask for.
+        // Each filter names one member and the values it admits. A filter that left either
+        // member out is reported as the parameter the request omitted, and a name this
+        // operation does not filter on is refused rather than ignored: a filter nothing
+        // applies would answer with recipes the caller did not ask for.
         for filter in input.filters.iter().flatten() {
             let Some(name) = filter.name.as_deref() else {
-                return Err(ListImageRecipesErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(crate::state::incomplete_filter_message()),
-                    },
-                )
-                .into());
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::MISSING_PARAMETERS_CODE,
+                    crate::state::MISSING_PARAMETERS_STATUS,
+                    crate::state::missing_filter_member_message(crate::state::FILTER_NAME_MEMBER),
+                ));
             };
             if filter.values.as_ref().is_none_or(|values| values.is_empty()) {
-                return Err(ListImageRecipesErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(crate::state::incomplete_filter_message()),
-                    },
-                )
-                .into());
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::MISSING_PARAMETERS_CODE,
+                    crate::state::MISSING_PARAMETERS_STATUS,
+                    crate::state::missing_filter_member_message(
+                        crate::state::FILTER_VALUES_MEMBER,
+                    ),
+                ));
             }
             if !crate::state::IMAGE_RECIPE_FILTER_NAMES.contains(&name) {
                 return Err(ListImageRecipesErrorModeled::InvalidParameterValueException(

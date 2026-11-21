@@ -607,8 +607,9 @@ async fn a_listing_selects_on_the_filters_the_operation_documents() {
         );
     }
 
-    // A filter this listing does not filter on, an incomplete filter and a values list the
-    // model does not admit are each refused rather than ignored.
+    // A filter this listing does not filter on, a filter that left out a member every filter
+    // has to carry and a values list the model does not admit are each refused rather than
+    // ignored.
     //
     // (case, the request body, the class it is refused with)
     let refusals: Vec<(&str, Value, &str)> = vec![
@@ -618,14 +619,16 @@ async fn a_listing_selects_on_the_filters_the_operation_documents() {
             "InvalidParameterValueException",
         ),
         (
+            // Neither member of a `Filter` is one the model can require, so a filter that
+            // left one out is reported as the parameter the request omitted.
             "a filter naming no member",
             json!({ "filters": [{ "values": ["Alpha Image"] }] }),
-            "InvalidRequestException",
+            "MissingParametersException",
         ),
         (
             "a filter carrying no values",
             json!({ "filters": [{ "name": "name" }] }),
-            "InvalidRequestException",
+            "MissingParametersException",
         ),
         (
             // The modelled `values` list carries at least one value, which the centralized

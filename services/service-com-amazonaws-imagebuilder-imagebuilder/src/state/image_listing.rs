@@ -36,6 +36,18 @@ pub const LIST_IMAGES_OPERATION: &str = "ListImages";
 /// is also what a request naming no page size gets.
 pub const MAX_IMAGES_PER_PAGE: usize = 25;
 
+/// The filter names `ListImages`' own refusal STATES, in the order it states them.
+///
+/// The SET is [`super::IMAGE_FILTER_NAMES`], the `filters` member's own list, which this
+/// operation shares with `ListImageBuildVersions` — membership is what every other reader
+/// asks of it, and order does not change it. The ORDER is this operation's own: AWS's
+/// recorded unsupported-filter refusal of `ListImages` lists the names in it rather than in
+/// the alphabetical order the member's documentation happens to use, exactly as
+/// [`super::COMPONENT_FILTER_NAMES`] does for the component listing. The operations whose own
+/// refusal no recording of this service words state the documented order.
+pub const LIST_IMAGES_STATED_FILTER_NAMES: &[&str] =
+    &["name", "version", "platform", "osVersion", "type"];
+
 /// The ARN of the image `name` names at `version` in `region`, carrying no build number: the
 /// VERSION ARN of three assigned nodes, or the name ARN when `version` is
 /// [`WILDCARD_VERSION`]. See [`super::component_version_arn`], the same ARN of the other

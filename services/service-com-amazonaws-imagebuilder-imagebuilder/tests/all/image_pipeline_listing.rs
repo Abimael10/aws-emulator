@@ -52,16 +52,25 @@ const INVALID_TOKEN_MESSAGE: &str = "The value supplied for parameter 'nextToken
                                      valid. The provided token does not meet the required \
                                      format.";
 
-/// The sentence a listing refuses a filter that names no member, or admits no value, with.
-const INCOMPLETE_FILTER_MESSAGE: &str = "Each filter must specify a name and one or more \
-                                         values.";
+/// The class a filter that left out a member every filter has to carry is reported under
+/// (`crate::state::MISSING_PARAMETERS_CODE`): the member is not one the model can require, so
+/// the report is this service's missing-parameter class rather than a modelled error.
+const MISSING_PARAMETERS: &str = "MissingParametersException";
+
+/// Why a filter of a PIPELINE listing that left `member` out is reported: the
+/// missing-parameter report, naming the element and the member of it the request omitted.
+fn missing_filter_member(index: usize, member: &str) -> String {
+    format!("Required parameters are missing: filters[{index}].{member}")
+}
 
 /// The sentence a filter whose value list is empty is refused with: the modelled `values`
 /// length (`smithy_query(query="shape",shape="Filter")`: 1..10) stated as the requirement,
-/// naming the member by its path through the request.
+/// naming the member by its path through the request. This listing states a collection's
+/// length requirement as the modelled bound it had to satisfy; `tests/all/filter_list_refusals.rs`
+/// spans that wording and the one every other operation of this service states.
 const EMPTY_FILTER_VALUES_MESSAGE: &str = "The value supplied for parameter 'filters[0].values' \
-                                           is not valid. filters[0].values must contain at \
-                                           least 1 items";
+                                           is not valid. filters[0].values length must satisfy \
+                                           min_items 1";
 
 /// A build component document: one `build` phase, which is all the recipe these cases name
 /// needs.
@@ -536,36 +545,37 @@ async fn each_pipeline_filter_selects_on_its_own_member_and_filters_combine() {
         let message = text(&case, &answer, "message");
         assert_eq!(
             message,
-            "The value supplied for parameter 'filters' is not valid. Allowed filters for \
-             ListImagePipelines are: description, distributionConfigurationArn, imageRecipeArn, \
-             infrastructureConfigurationArn, name, status.",
+            "The value supplied for parameter 'filters[0].name' is not valid. Unsupported \
+             filter name. Allowed: name, description, status, imageRecipeArn, \
+             infrastructureConfigurationArn, distributionConfigurationArn",
             "case {case:?}: got {message:?}"
         );
     }
 
-    // A filter carrying no name, and one carrying no values, name no member and admit no
-    // value, so they select nothing at all and are refused as incomplete. A filter whose
-    // value list is EMPTY is refused one step earlier, by the modelled constraint the
-    // `values` member carries (`smithy_query(query="shape",shape="Filter")`: `length`
-    // 1..10), which is this service's parameter-value refusal.
+    // A filter carrying no name, and one carrying no values, left out a member every filter
+    // has to carry, so each is reported as the parameter the request omitted. A filter whose
+    // value list is EMPTY carried the member and is refused one step earlier, by the modelled
+    // constraint the `values` member carries
+    // (`smithy_query(query="shape",shape="Filter")`: `length` 1..10), which is this service's
+    // parameter-value refusal.
     for (case, filter, code, message) in [
         (
             "a filter with no name",
             json!({ "values": ["pipelines-two"] }),
-            "InvalidRequestException",
-            INCOMPLETE_FILTER_MESSAGE,
+            MISSING_PARAMETERS,
+            missing_filter_member(0, "name"),
         ),
         (
             "a filter with no values",
             json!({ "name": "name" }),
-            "InvalidRequestException",
-            INCOMPLETE_FILTER_MESSAGE,
+            MISSING_PARAMETERS,
+            missing_filter_member(0, "values"),
         ),
         (
             "a filter with an empty value list",
             json!({ "name": "name", "values": [] }),
             INVALID_PARAMETER_VALUE,
-            EMPTY_FILTER_VALUES_MESSAGE,
+            EMPTY_FILTER_VALUES_MESSAGE.to_string(),
         ),
     ] {
         let (status, answer) = list_in(&router, REGION, &json!({ "filters": [filter] })).await;

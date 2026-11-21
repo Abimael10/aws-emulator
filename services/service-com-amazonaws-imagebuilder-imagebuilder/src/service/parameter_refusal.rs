@@ -22,13 +22,18 @@
 //! ## Which requirement it states
 //!
 //! The one the value broke, for the constraint classes this service's recorded refusals
-//! establish a clause for: a `@pattern`, a `@range` bound, an enumerated value set, and the
-//! `@length` MINIMUM of a COLLECTION ([`must_contain_at_least`]). A class they do not — a
-//! `@length` bound on a STRING, a `@length` maximum, a repeated element of a `@uniqueItems`
-//! list — is left to the framework's own refusal rather than being given a clause this
-//! service has never been seen to state. Two of them, the `@range` MINIMUM and a
-//! collection's, this service words its own way ([`must_be_at_least`],
-//! [`must_contain_at_least`]); every other clause is the shared statement of it.
+//! establish a clause for: a `@pattern`, a `@range` bound, an enumerated value set, and both
+//! `@length` bounds of a COLLECTION ([`StatedCollectionLength`]). A class they do not — a
+//! `@length` bound on a STRING, a repeated element of a `@uniqueItems` list — is left to the
+//! framework's own refusal rather than being given a clause this service has never been seen
+//! to state. Three of them, the `@range` MINIMUM and a collection's two bounds, this service
+//! words its own way ([`must_be_at_least`], [`StatedCollectionLength`]); every other clause is
+//! the shared statement of it.
+//!
+//! A collection's `@length` bound is the class two of this service's listings word
+//! differently from each other, so which clause is stated is a property of the operation the
+//! request addressed, like the ARN form below: [`StatedCollectionLength`] carries the two, and
+//! each operation is served behind the wording that operation states.
 //!
 //! A member the shape REQUIRES and the request OMITS is not one of those classes at all:
 //! there is no value to state a requirement about, so the refusal is about the request as a
@@ -155,23 +160,63 @@ fn must_be_at_least(member: &str, bound: &str) -> String {
     format!("{member} must be bigger than or equal to {bound}")
 }
 
-/// The requirement clause this service states for a COLLECTION member carrying fewer items
-/// than its `@length` minimum: how many items that member has to carry.
+/// How a refusal of this service states the requirement a COLLECTION member whose `@length`
+/// bound was broken had to satisfy.
 ///
-/// A collection has no scalar rendering, so the clause states the COUNT the member had to
-/// reach rather than the length of a value — which is how this service's recorded refusal of
-/// an empty list reads, and why the clause is stated here instead of being taken from
-/// `service_common::validation_message`. The count is written as the model declares the bound,
-/// so a minimum of one reads the same way a minimum of several does.
-fn must_contain_at_least(member: &str, bound: i64) -> String {
-    format!("{member} must contain at least {bound} items")
+/// A collection has no scalar rendering, so the clause states a COUNT rather than the length
+/// of a value — which is why it is stated here instead of being taken from
+/// `service_common::validation_message` — and in TWO wordings, because this service's
+/// listings do not state one: the pipeline listing's own refusals name the modelled length
+/// constraint the member had to satisfy, where every other refusal of this service that
+/// states this class states how many items the member has to carry or may carry. Both quote
+/// the bound as the model declares it, so a bound of one reads the same way a bound of several
+/// does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatedCollectionLength {
+    /// How many items the member had to carry: the clauses every operation of this service
+    /// states but the one below.
+    ItemCount,
+    /// The modelled length constraint the member had to satisfy, under the name that refusal
+    /// addresses the bound by: the clauses the pipeline listing states.
+    ModelledConstraint,
+}
+
+impl StatedCollectionLength {
+    /// The requirement clause this wording states for `member`, whose `@length` MINIMUM
+    /// `bound` the request fell short of.
+    fn at_least(self, member: &str, bound: i64) -> String {
+        match self {
+            Self::ItemCount => format!("{member} must contain at least {bound} items"),
+            Self::ModelledConstraint => {
+                format!("{member} length must satisfy min_items {bound}")
+            }
+        }
+    }
+
+    /// The requirement clause this wording states for `member`, whose `@length` MAXIMUM
+    /// `bound` the request went past.
+    fn at_most(self, member: &str, bound: i64) -> String {
+        match self {
+            Self::ItemCount => {
+                format!("{member} must contain less than or equal to {bound} items")
+            }
+            Self::ModelledConstraint => {
+                format!("{member} length must satisfy max_items {bound}")
+            }
+        }
+    }
 }
 
 /// The requirement clause this service states for `violation`, naming the parameter as
 /// `member` spells it, or `None` for a constraint class no recorded refusal of this service
 /// establishes a clause for — which keeps the framework's own wording for it rather than
 /// inventing one.
-fn requirement(member: &str, violation: &Violation, form: StatedPattern) -> Option<String> {
+fn requirement(
+    member: &str,
+    violation: &Violation,
+    form: StatedPattern,
+    length: StatedCollectionLength,
+) -> Option<String> {
     match &violation.kind {
         ViolationKind::Pattern(pattern) => Some(form.pattern_requirement(member, pattern)),
         ViolationKind::MaxValue(bound) => Some(must_be_at_most(member, bound)),
@@ -186,7 +231,15 @@ fn requirement(member: &str, violation: &Violation, form: StatedPattern) -> Opti
             .value
             .as_deref()
             .and_then(list_item_count)
-            .map(|_| must_contain_at_least(member, *bound)),
+            .map(|_| length.at_least(member, *bound)),
+        // A `@length` MAXIMUM is read the same way and for the same reason: the clause is
+        // stated for a LIST, whose size the walk renders, and a string's keeps the
+        // framework's wording.
+        ViolationKind::MaxLength(bound) => violation
+            .value
+            .as_deref()
+            .and_then(list_item_count)
+            .map(|_| length.at_most(member, *bound)),
         _ => None,
     }
 }
@@ -228,7 +281,11 @@ fn missing_properties(refused: &[(Violation, SubmittedEcho)]) -> Option<Refused>
 /// value was refused, and a sentence naming several would be a different sentence. The one
 /// refusal that does name several is the request that carried none of the properties it had
 /// to ([`missing_properties`]), which is about no single value.
-fn refusal(refused: &[(Violation, SubmittedEcho)], form: StatedPattern) -> Option<Refused> {
+fn refusal(
+    refused: &[(Violation, SubmittedEcho)],
+    form: StatedPattern,
+    length: StatedCollectionLength,
+) -> Option<Refused> {
     if let Some(stated) = missing_properties(refused) {
         return Some(stated);
     }
@@ -236,7 +293,7 @@ fn refusal(refused: &[(Violation, SubmittedEcho)], form: StatedPattern) -> Optio
         .iter()
         .map(|(violation, _)| {
             let member = api_parameter_path(&violation.path);
-            requirement(&member, violation, form).map(|requirement| (member, requirement))
+            requirement(&member, violation, form, length).map(|requirement| (member, requirement))
         })
         .collect::<Option<Vec<_>>>()?;
     let (member, requirement) = stated.first()?;
@@ -248,20 +305,43 @@ fn refusal(refused: &[(Violation, SubmittedEcho)], form: StatedPattern) -> Optio
 
 /// How this service refuses a value its request carried in the BODY.
 pub fn body_parameter_refusal(refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
-    refusal(refused, StatedPattern::RegionCode)
+    refusal(
+        refused,
+        StatedPattern::RegionCode,
+        StatedCollectionLength::ItemCount,
+    )
+}
+
+/// How the PIPELINE LISTING refuses a value its request carried in the body: every clause
+/// [`body_parameter_refusal`] states, with its own statement of a collection whose `@length`
+/// bound was broken ([`StatedCollectionLength::ModelledConstraint`]).
+pub fn pipeline_listing_body_refusal(refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
+    refusal(
+        refused,
+        StatedPattern::RegionCode,
+        StatedCollectionLength::ModelledConstraint,
+    )
 }
 
 /// How this service refuses a value its request carried in the REQUEST LINE — an
 /// `@httpQuery` parameter, an `@httpLabel` path segment.
 pub fn uri_parameter_refusal(refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
-    refusal(refused, StatedPattern::CharacterClass)
+    refusal(
+        refused,
+        StatedPattern::CharacterClass,
+        StatedCollectionLength::ItemCount,
+    )
 }
 
 /// How the one operation whose own check echoes no expression refuses a value its request
 /// carried in the REQUEST LINE: the parameter, and the fact that it does not match the
 /// pattern that parameter requires.
 pub fn unstated_pattern_refusal(refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
-    refusal(refused, StatedPattern::Unstated)
+    refusal(
+        refused,
+        StatedPattern::Unstated,
+        StatedCollectionLength::ItemCount,
+    )
 }
 
 #[cfg(test)]
@@ -317,7 +397,8 @@ mod tests {
                 "imagePipelineArn",
                 ViolationKind::Pattern(MODELLED_IMAGE_PIPELINE_ARN.to_owned()),
             )];
-            let stated = refusal(&refused, form).expect("a stated refusal");
+            let stated = refusal(&refused, form, StatedCollectionLength::ItemCount)
+                .expect("a stated refusal");
             let expected = format!(
                 "The value supplied for parameter 'imagePipelineArn' is not valid. \
                  imagePipelineArn must match pattern {expression}"
@@ -340,7 +421,12 @@ mod tests {
             "distributionConfigurationArn",
             ViolationKind::Pattern(MODELLED_IMAGE_PIPELINE_ARN.to_owned()),
         )];
-        let stated = refusal(&refused, StatedPattern::Unstated).expect("a stated refusal");
+        let stated = refusal(
+            &refused,
+            StatedPattern::Unstated,
+            StatedCollectionLength::ItemCount,
+        )
+        .expect("a stated refusal");
         assert_eq!(
             stated.message,
             "The value supplied for parameter 'distributionConfigurationArn' is not valid. \
@@ -359,7 +445,8 @@ mod tests {
                 "semanticVersion",
                 ViolationKind::Pattern(r"^[0-9]+\.[0-9]+\.[0-9]+$".to_owned()),
             )];
-            let stated = refusal(&refused, form).expect("a stated refusal");
+            let stated = refusal(&refused, form, StatedCollectionLength::ItemCount)
+                .expect("a stated refusal");
             assert_eq!(
                 stated.message,
                 "The value supplied for parameter 'semanticVersion' is not valid. \
@@ -501,7 +588,11 @@ mod tests {
         ];
 
         for (case, refused, expected) in &rows {
-            let stated = refusal(std::slice::from_ref(refused), StatedPattern::RegionCode);
+            let stated = refusal(
+                std::slice::from_ref(refused),
+                StatedPattern::RegionCode,
+                StatedCollectionLength::ItemCount,
+            );
             match expected {
                 Some(message) => {
                     let stated =
@@ -530,9 +621,138 @@ mod tests {
             violation("description", ViolationKind::MaxLength(1024)),
         ];
         assert!(
-            refusal(&mixed, StatedPattern::RegionCode).is_none(),
+            refusal(
+                &mixed,
+                StatedPattern::RegionCode,
+                StatedCollectionLength::ItemCount
+            )
+            .is_none(),
             "case \"a stated class beside an unstated one\": expected the framework's own \
              wording"
         );
+    }
+
+    /// RULE: a COLLECTION whose `@length` bound was broken states the count that bound sets,
+    /// in the wording the operation that was addressed states; a STRING whose own was broken
+    /// keeps the framework's.
+    #[test]
+    fn a_collection_whose_length_bound_was_broken_states_the_count_that_bound_sets() {
+        /// One list `@length` violation of `member`, carrying `found` items against `kind`, as
+        /// the validating walk renders one.
+        fn of_a_list(
+            member: &str,
+            found: usize,
+            kind: ViolationKind,
+        ) -> (Violation, SubmittedEcho) {
+            (
+                Violation {
+                    path: member.to_owned(),
+                    kind,
+                    value: Some(format!("{found} items")),
+                    sensitive: false,
+                },
+                SubmittedEcho::Rendered("[…]".to_owned()),
+            )
+        }
+
+        /// One row of the table: the case, the violation, the wording the addressed operation
+        /// states, and the sentence — or `None` to leave the refusal to the framework.
+        type Row = (
+            &'static str,
+            (Violation, SubmittedEcho),
+            StatedCollectionLength,
+            Option<&'static str>,
+        );
+
+        let rows: Vec<Row> = vec![
+            (
+                "a filter list one over its maximum",
+                of_a_list("filters", 11, ViolationKind::MaxLength(10)),
+                StatedCollectionLength::ItemCount,
+                Some(
+                    "The value supplied for parameter 'filters' is not valid. filters must \
+                     contain less than or equal to 10 items",
+                ),
+            ),
+            (
+                "the same list under the wording the pipeline listing states",
+                of_a_list("filters", 11, ViolationKind::MaxLength(10)),
+                StatedCollectionLength::ModelledConstraint,
+                Some(
+                    "The value supplied for parameter 'filters' is not valid. filters length \
+                     must satisfy max_items 10",
+                ),
+            ),
+            (
+                "an empty filter list under its minimum",
+                of_a_list("filters", 0, ViolationKind::MinLength(1)),
+                StatedCollectionLength::ItemCount,
+                Some(
+                    "The value supplied for parameter 'filters' is not valid. filters must \
+                     contain at least 1 items",
+                ),
+            ),
+            (
+                "the same empty list under the wording the pipeline listing states",
+                of_a_list("filters", 0, ViolationKind::MinLength(1)),
+                StatedCollectionLength::ModelledConstraint,
+                Some(
+                    "The value supplied for parameter 'filters' is not valid. filters length \
+                     must satisfy min_items 1",
+                ),
+            ),
+            (
+                "a list far over a maximum of several, inside a list element",
+                of_a_list("filters.1.member.values", 64, ViolationKind::MaxLength(10)),
+                StatedCollectionLength::ItemCount,
+                Some(
+                    "The value supplied for parameter 'filters[0].values' is not valid. \
+                     filters[0].values must contain less than or equal to 10 items",
+                ),
+            ),
+            (
+                "a list under a minimum of several, under the pipeline listing's wording",
+                of_a_list("supportedOsVersions", 1, ViolationKind::MinLength(2)),
+                StatedCollectionLength::ModelledConstraint,
+                Some(
+                    "The value supplied for parameter 'supportedOsVersions' is not valid. \
+                     supportedOsVersions length must satisfy min_items 2",
+                ),
+            ),
+            (
+                "a string over its own maximum, which renders no item count",
+                violation("description", ViolationKind::MaxLength(1024)),
+                StatedCollectionLength::ItemCount,
+                None,
+            ),
+        ];
+
+        for (case, refused, length, expected) in &rows {
+            let stated = refusal(
+                std::slice::from_ref(refused),
+                StatedPattern::RegionCode,
+                *length,
+            );
+            match expected {
+                Some(message) => {
+                    let stated =
+                        stated.unwrap_or_else(|| panic!("case {case:?}: expected a refusal"));
+                    assert_eq!(
+                        stated.code, INVALID_PARAMETER_VALUE_EXCEPTION,
+                        "case {case:?}: expected this service's own code, got {:?}",
+                        stated.code
+                    );
+                    assert_eq!(
+                        stated.message, *message,
+                        "case {case:?}: expected {message:?}, got {:?}",
+                        stated.message
+                    );
+                }
+                None => assert!(
+                    stated.is_none(),
+                    "case {case:?}: expected the framework's own wording, got {stated:?}"
+                ),
+            }
+        }
     }
 }

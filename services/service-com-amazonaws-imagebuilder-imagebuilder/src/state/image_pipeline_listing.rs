@@ -29,14 +29,56 @@ pub const MAX_IMAGE_PIPELINES_PER_PAGE: usize = 25;
 /// the following filters to streamline results: description,
 /// distributionConfigurationArn, imageRecipeArn, infrastructureConfigurationArn, name,
 /// status").
+///
+/// Held in the order this operation's own refusal STATES them, which is the order AWS's
+/// recorded unsupported-filter refusal of it lists them in rather than the alphabetical order
+/// the member's documentation happens to use (as [`super::COMPONENT_FILTER_NAMES`] is);
+/// membership is what every other reader asks of this set, and order does not change it.
 pub const IMAGE_PIPELINE_FILTER_NAMES: &[&str] = &[
+    "name",
     "description",
-    "distributionConfigurationArn",
+    "status",
     "imageRecipeArn",
     "infrastructureConfigurationArn",
-    "name",
-    "status",
+    "distributionConfigurationArn",
 ];
+
+/// Why the PIPELINE listing refuses a filter naming a member it does not filter on.
+///
+/// This service's own parameter-value sentence
+/// ([`crate::service::parameter_refusal`]) about the parameter the refused value sat at — the
+/// failing element's `name` member ([`super::filter_member_parameter`]) — whose requirement
+/// reports that the name is not one this listing filters on and lists the ones it does, in the
+/// order this operation states them ([`IMAGE_PIPELINE_FILTER_NAMES`]). The name the request
+/// carried is the refused VALUE, so it is withheld like every other refused value.
+///
+/// The other listings of this service state the same class in their own sentence
+/// ([`super::unsupported_filter_message`]), which names the `filters` member and the
+/// operation whose set it is: each listing's refusal is the one AWS's recording of THAT
+/// operation words.
+#[must_use]
+pub fn unsupported_filter_name_message(parameter: &str, supported: &[&str]) -> String {
+    ::service_common::validation_message::parameter_value_mismatch(
+        parameter,
+        &format!("Unsupported filter name. Allowed: {}", supported.join(", ")),
+    )
+}
+
+/// Why the PIPELINE listing reports a filter that left a member out, under the
+/// missing-parameter class every such report of this service carries
+/// ([`super::MISSING_PARAMETERS_CODE`]).
+///
+/// This listing addresses the omitted member by its PATH through the request — the element and
+/// the member of it ([`super::filter_member_parameter`]) — and states nothing else, which is
+/// how AWS's own recorded report of this operation reads: a request carrying several filters is
+/// told which one left the member out, which the member name alone cannot say. The other
+/// listings of this service report the same class in the sentence every parameter their model
+/// cannot require is reported in ([`super::missing_filter_member_message`]), which is the
+/// wording their own recorded reports carry.
+#[must_use]
+pub fn missing_filter_parameter_message(parameter: &str) -> String {
+    format!("Required parameters are missing: {parameter}")
+}
 
 impl ImagePipelineRecord {
     /// The value of the member `filter_name` filters on, or `None` when this record

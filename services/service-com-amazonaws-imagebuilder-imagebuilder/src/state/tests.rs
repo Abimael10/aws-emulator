@@ -532,3 +532,27 @@ fn the_status_of_a_build_version_follows_the_clock_of_its_build_and_its_cancella
         }
     }
 }
+
+/// RULE: a listing's STATED filter names are the SET that listing filters on, in the order it
+/// states them — so the two orders the image listings state cannot drift into two sets, which
+/// would admit a filter one listing refuses or refuse one it admits.
+#[test]
+fn the_filter_names_a_listing_states_are_the_ones_it_filters_on() {
+    // (case, the set the listing filters on, the names its refusal states)
+    let rows: &[(&str, &[&str], &[&str])] = &[(
+        "the image listing",
+        IMAGE_FILTER_NAMES,
+        LIST_IMAGES_STATED_FILTER_NAMES,
+    )];
+    for (case, set, stated) in rows {
+        let mut sorted_set: Vec<&str> = set.to_vec();
+        sorted_set.sort_unstable();
+        let mut sorted_stated: Vec<&str> = stated.to_vec();
+        sorted_stated.sort_unstable();
+        assert_eq!(
+            sorted_stated, sorted_set,
+            "case {case:?}: expected the stated names to be the set it filters on \
+             ({sorted_set:?}), got {sorted_stated:?}"
+        );
+    }
+}

@@ -152,6 +152,10 @@ pub use workflow::*;
 mod image_pipeline_listing;
 pub use image_pipeline_listing::*;
 
+/// How a listing addresses ONE filter, and how it reports a filter missing a member.
+mod filter_parameters;
+pub use filter_parameters::*;
+
 /// What an image listing asks for, and what one of its entries stands for.
 mod image_listing;
 pub use image_listing::*;
@@ -4587,8 +4591,16 @@ pub fn too_many_resource_tags_message(arn: &str, merged: usize) -> String {
 /// The `supported` names are the `filters` member's own list, of the operation the request
 /// called ([`IMAGE_RECIPE_FILTER_NAMES`], [`COMPONENT_FILTER_NAMES`]) — each operation
 /// filters on the members of the resource it lists, so the wording names the ones the
-/// caller may ask for rather than any one operation's — and `operation` is that operation,
-/// which the sentence names because the set belongs to it.
+/// caller may ask for rather than any one operation's — in the order THAT operation states
+/// them, and `operation` is that operation, which the sentence names because the set belongs
+/// to it.
+///
+/// The sentence is the one AWS's own recorded refusals of these operations state, naming the
+/// operation and closing on a full stop: `ListImages`' recorded refusal reads "The value
+/// supplied for parameter 'filters' is not valid. Allowed filters for ListImages are: name,
+/// version, platform, osVersion, type." The PIPELINE listing's own validator states a
+/// different sentence about a different parameter, which is why it has its own
+/// ([`unsupported_filter_name_message`]) rather than this one.
 #[must_use]
 pub fn unsupported_filter_message(operation: &str, supported: &[&str]) -> String {
     ::service_common::validation_message::parameter_value_mismatch(
@@ -4615,12 +4627,6 @@ pub fn by_name_with_version_filter_message() -> String {
 /// The member every listing of this service carries its filters in, as the API addresses
 /// it — the parameter a refusal about one of them names.
 pub const FILTERS_MEMBER: &str = "filters";
-
-/// Why a list naming a filter with no name or no values is refused.
-#[must_use]
-pub fn incomplete_filter_message() -> String {
-    "Each filter must specify a name and one or more values.".to_string()
-}
 
 /// Why a call naming a resource this Region holds nothing under reports it missing, as the
 /// required resource it is.
