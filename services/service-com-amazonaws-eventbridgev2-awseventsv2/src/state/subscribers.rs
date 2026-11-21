@@ -16,7 +16,7 @@
 //! [`super::subscriber_delivery`].
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use super::{base36, spread, ComAmazonawsEventbridgev2Awseventsv2State, StoredEvent, ARN_SERVICE};
 use crate::ops::types::{
@@ -379,6 +379,120 @@ pub fn starting_sequence_number(
         }
         Some(_) => tip,
     }
+}
+
+/// How far in the past a `TIMESTAMP` starting point has to lie for the bus to
+/// replay from it.
+///
+/// Recorded behaviour of this operation: AWS refuses a `TIMESTAMP` point newer
+/// than this — the most recently received events are not replayable yet — and
+/// the refusal it answers STATES the width in words ("at least 5 minutes in the
+/// past"), which is where this number comes from rather than from a span this
+/// emulator chose. The bound is a property of the service and not of the
+/// request, so no member carries it and
+/// [`starting_point_too_recent_message`] renders that one sentence from this
+/// one constant.
+///
+/// It is the NEAR side of the replayable window; the far side is the bus's own
+/// `RetentionWindowStartTime` ([`super::EventBus::retention_window_start`]), so
+/// a bus younger than this bound has no replayable instant yet and a `HORIZON`
+/// point is how a caller asks for its log instead.
+pub const MIN_STARTING_POINT_AGE: Duration = Duration::from_secs(5 * 60);
+
+/// The whole `Message` of the `InvalidInputException` a create naming a
+/// `TIMESTAMP` starting point that has not happened yet is refused with: fixed
+/// text naming the member at fault, interpolating no value of the request.
+pub const STARTING_POINT_IN_FUTURE_MESSAGE: &str =
+    "PointInTimeConfiguration.StartingPoint must not be in the future";
+
+/// The whole `Message` of the `InvalidInputException` a create carrying
+/// `PointType` `TIMESTAMP` with no `StartingPoint` is refused with —
+/// "Required when PointType is TIMESTAMP", per the member's own documentation.
+pub const STARTING_POINT_REQUIRED_MESSAGE: &str =
+    "PointInTimeConfiguration.StartingPoint is required when PointType is TIMESTAMP";
+
+/// The whole `Message` of the `InvalidInputException` a create naming a
+/// `TIMESTAMP` starting point newer than [`MIN_STARTING_POINT_AGE`] is refused
+/// with: fixed text, stating the bound in minutes off that one constant so the
+/// refusal cannot name a width the gate does not apply.
+pub fn starting_point_too_recent_message() -> String {
+    format!(
+        "PointInTimeConfiguration.StartingPoint must be at least {} minutes in the past",
+        MIN_STARTING_POINT_AGE.as_secs() / 60
+    )
+}
+
+/// The whole `Message` of the `InvalidInputException` a create naming a
+/// `TIMESTAMP` starting point before the bus's retention window is refused
+/// with: fixed text around ONE variable part, the `StartingPoint` the REQUEST
+/// named, rendered at whole-second UTC ([`starting_point_stamp`]). The window
+/// the point falls outside of is the bus's own
+/// `StorageConfiguration.RetentionWindowStartTime`, so the message names the
+/// value the caller has to correct rather than restating the bus's.
+pub fn starting_point_outside_window_message(stamp: &str) -> String {
+    format!(
+        "PointInTimeConfiguration.StartingPoint ({stamp}) falls outside the bus's retention window"
+    )
+}
+
+/// A requested `StartingPoint` as the refusal above renders it: RFC 3339 at
+/// whole-second precision closed by `Z`, the resolution every `Timestamp` of
+/// this service travels at ([`super::to_date_time`]).
+pub fn starting_point_stamp(value: &::aws_smithy_types::DateTime) -> String {
+    ::aws_smithy_types::DateTime::from_secs(value.secs())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
+}
+
+/// Why `point` names a position `bus` cannot be replayed from, or `None` when it
+/// names one it can.
+///
+/// A `POINT_IN_TIME` subscriber is placed inside the bus's RETAINED log
+/// ([`starting_sequence_number`]), so a `TIMESTAMP` point has to be an instant
+/// that log can still answer for: one that has already happened, old enough to
+/// have been stored ([`MIN_STARTING_POINT_AGE`]), and no earlier than the
+/// window the bus reports as `RetentionWindowStartTime` — "the earliest point in
+/// time from which stored events are available. Events older than this have
+/// expired from retention". A point outside that range names no reachable
+/// position, so the create is refused rather than pinned to one.
+///
+/// ONE reading of that range, so the gate a create is held to and the window a
+/// read of the bus reports cannot disagree. `HORIZON` carries no instant of the
+/// request — the bus itself decides where its log begins — and a configuration
+/// beside any other starting position is "not applicable", so neither is placed
+/// here.
+pub fn point_in_time_fault(
+    bus: &super::EventBus,
+    starting_position: &str,
+    point: Option<&PointInTimeConfiguration>,
+    now: SystemTime,
+) -> Option<String> {
+    if starting_position != STARTING_POSITION_POINT_IN_TIME {
+        return None;
+    }
+    let point = point?;
+    if point.point_type != POINT_TYPE_TIMESTAMP {
+        return None;
+    }
+    let Some(requested) = point.starting_point.as_ref() else {
+        return Some(STARTING_POINT_REQUIRED_MESSAGE.to_string());
+    };
+    let stamp = starting_point_stamp(requested);
+    // An instant outside the instants this platform can represent is outside
+    // every bus's window too, and is reported as the value the request named.
+    let Some(from) = super::from_date_time(requested) else {
+        return Some(starting_point_outside_window_message(&stamp));
+    };
+    let Ok(age) = now.duration_since(from) else {
+        return Some(STARTING_POINT_IN_FUTURE_MESSAGE.to_string());
+    };
+    if age < MIN_STARTING_POINT_AGE {
+        return Some(starting_point_too_recent_message());
+    }
+    if from < bus.retention_window_start(now) {
+        return Some(starting_point_outside_window_message(&stamp));
+    }
+    None
 }
 
 /// Mint the ARN of a subscriber:
@@ -1036,16 +1150,24 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
         self.subscribers.remove(arn).is_some()
     }
 
-    /// Forget the subscribers of a bus that has finished disappearing.
+    /// Forget the subscribers that were still DELIVERING a bus which has
+    /// finished disappearing.
     ///
-    /// A subscriber is created ON one bus, so it cannot outlive that bus: one
-    /// left behind would name a bus no read can resolve. Its client token goes
-    /// with it, because the token is held by the subscriber itself.
+    /// A subscriber that still delivers its bus's events cannot outlive it: one
+    /// left behind would be delivering from a bus no read can resolve. Its
+    /// client token goes with it, because the token is held by the subscriber
+    /// itself.
+    ///
+    /// A REVOKED subscriber is not one of those. Revoking it is what released
+    /// the bus for deletion ([`Self::unrevoked_subscribers_of_bus`]) and
+    /// revocation is terminal with the delete left available for cleanup, so
+    /// the record outlives the bus — readable, reporting `Revoked` and the
+    /// `EventBusArn` it was created on — until its own delete removes it.
     pub fn forget_subscribers_of_bus(&mut self, event_bus_arn: &str) {
         let orphaned: Vec<String> = self
             .subscribers
             .values()
-            .filter(|subscriber| subscriber.event_bus_arn == event_bus_arn)
+            .filter(|subscriber| subscriber.event_bus_arn == event_bus_arn && !subscriber.revoked)
             .map(|subscriber| subscriber.arn.clone())
             .collect();
         for arn in orphaned {

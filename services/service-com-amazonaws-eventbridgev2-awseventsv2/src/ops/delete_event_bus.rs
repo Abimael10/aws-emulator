@@ -2,7 +2,7 @@
 
 //! @op DeleteEventBus
 //! Implemented: retires the stored event bus with this ARN, unless a subscriber
-//! nobody has revoked still holds it.
+//! or an event source nobody has revoked still holds it.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +82,19 @@ use super::types::*;
 /// revoke them and retry".
 pub const SUBSCRIBERS_IN_USE_MESSAGE: &str = "The event bus cannot be deleted because it has \
      one or more subscribers that are not revoked. Delete or revoke them and retry.";
+
+/// The whole `Message` of the `ResourceInUseException` this operation answers
+/// while the addressed bus still carries an event source nobody has revoked.
+///
+/// The same refusal, worded for the EVENT-SOURCE relation the documentation
+/// names beside the subscriber one ("an event bus with subscribers or event
+/// sources cannot be deleted until they are deleted"): fixed text throughout,
+/// naming neither the bus, nor a source, nor how many are attached, because the
+/// resource a caller has to deal with is already identified by the request it
+/// sent. It scopes the refusal the same way too — the sources that hold the bus
+/// are the ones "that are not revoked", and either remedy it names releases it.
+pub const EVENT_SOURCES_IN_USE_MESSAGE: &str = "The event bus cannot be deleted because it has \
+     one or more event sources that are not revoked. Delete or revoke them and retry.";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -199,6 +212,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(DeleteEventBusErrorModeled::ResourceInUseException(
                 ResourceInUseException {
                     message: Some(SUBSCRIBERS_IN_USE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The other half of the same sentence — "a bus with subscribers or
+        // event sources cannot be deleted" — read the same way: an event source
+        // forwards onto this bus until it is deleted or revoked, so while one
+        // nobody has revoked is attached the bus is in use and the delete is
+        // refused, leaving the bus exactly as it stands. A revoked source has
+        // taken the second of the two remedies this refusal names, so it holds
+        // nothing while staying readable for the record.
+        if state.unrevoked_event_sources_of_bus(&input.event_bus_arn) > 0 {
+            return Err(DeleteEventBusErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(EVENT_SOURCES_IN_USE_MESSAGE.to_string()),
                 },
             )
             .into());

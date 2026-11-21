@@ -73,6 +73,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// `core/router/src/lib.rs` mounts them in, which is what makes a handler's
 /// in-process callback reach the other service.
 fn emulator() -> MultiServiceRouter {
+    emulator_with_store().0
+}
+
+/// The same emulator, with the engine it is mounted on handed back beside it:
+/// the rows that have to move a STORED instant (a bus's creation, an event's
+/// receipt) reach it through this service's own store rather than by waiting.
+fn emulator_with_store() -> (MultiServiceRouter, Arc<InMemoryEngine>) {
     let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -80,7 +87,7 @@ fn emulator() -> MultiServiceRouter {
     router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
         Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// A SigV4 `Authorization` header naming `region` and `service`, which is how a
@@ -920,16 +927,19 @@ async fn a_created_subscriber_is_read_back_as_it_was_created() {
 ///
 /// Each row publishes TWO events before the subscriber is created and one after
 /// it, and states how many of the three the target must hold.
+///
+/// The `POINT_IN_TIME` rows name their point as the `HORIZON`, because a
+/// `TIMESTAMP` point is held to the bus's replayable window and a bus these rows
+/// create moments earlier has none of its own past to name — that window, and a
+/// `TIMESTAMP` point inside it, are asserted by
+/// [`a_timestamp_inside_the_window_replays_the_events_behind_it`] below and by
+/// `point_in_time_starting_point_window.rs`.
 #[tokio::test]
 async fn a_subscriber_is_owed_its_bus_log_from_its_starting_position() {
-    // An instant before anything this test publishes, and one well after it:
-    // the two sides of a TIMESTAMP point. Both are request VALUES, so nothing
-    // here is a wall-clock assertion.
+    // An instant before anything this test publishes, which is a request VALUE,
+    // so nothing here is a wall-clock assertion.
     let before = ::aws_smithy_types::DateTime::from(
         std::time::SystemTime::now() - Duration::from_secs(600),
-    );
-    let after = ::aws_smithy_types::DateTime::from(
-        std::time::SystemTime::now() + Duration::from_secs(600),
     );
 
     // (case, what the create asks for, how many of the three events land)
@@ -959,32 +969,6 @@ async fn a_subscriber_is_owed_its_bus_log_from_its_starting_position() {
                 ..Default::default()
             },
             3,
-        ),
-        (
-            "POINT_IN_TIME from a TIMESTAMP before the backlog",
-            Requested {
-                starting_position: Some(eventsv2::state::STARTING_POSITION_POINT_IN_TIME),
-                point: Some(PointInTimeConfiguration {
-                    point_type: eventsv2::state::POINT_TYPE_TIMESTAMP.to_string(),
-                    starting_point: Some(before),
-                    end_point: None,
-                }),
-                ..Default::default()
-            },
-            3,
-        ),
-        (
-            "POINT_IN_TIME from a TIMESTAMP no stored event reaches",
-            Requested {
-                starting_position: Some(eventsv2::state::STARTING_POSITION_POINT_IN_TIME),
-                point: Some(PointInTimeConfiguration {
-                    point_type: eventsv2::state::POINT_TYPE_TIMESTAMP.to_string(),
-                    starting_point: Some(after),
-                    end_point: None,
-                }),
-                ..Default::default()
-            },
-            1,
         ),
         (
             "POINT_IN_TIME from the HORIZON, stopping before anything was published",
@@ -1084,9 +1068,116 @@ async fn a_subscriber_is_owed_its_bus_log_from_its_starting_position() {
 }
 
 // ---------------------------------------------------------------------------
-// The envelope an untransformed delivery carries
+// A TIMESTAMP point inside the bus's replayable window
 // ---------------------------------------------------------------------------
 
+/// RULE: a `POINT_IN_TIME` subscriber whose `TIMESTAMP` point lies inside its
+/// bus's replayable window is owed the stored events its bus received at or
+/// after that point, and nothing received before it — which is the delivery the
+/// position decides, observed on the target queue.
+///
+/// A `TIMESTAMP` point has to be inside that window to be accepted at all (its
+/// near side is five minutes, its far side the bus's own
+/// `RetentionWindowStartTime`, which never precedes the bus's creation), so a
+/// bus minted moments ago has no such instant. Rather than wait out hours, each
+/// row moves the STORED instants of the bus and of its backlog back and then
+/// names a point on one side of that backlog; nothing here sleeps or asserts on
+/// elapsed time.
+#[tokio::test]
+async fn a_timestamp_inside_the_window_replays_the_events_behind_it() {
+    // (case, how far back the point is, how many of the three events land)
+    let rows: Vec<(&str, Duration, usize)> = vec![
+        (
+            "a point before the backlog: the backlog and what follows",
+            Duration::from_secs(3 * 3_600 + 1_800),
+            3,
+        ),
+        (
+            "a point after the backlog: only what follows it",
+            Duration::from_secs(3_600),
+            1,
+        ),
+    ];
+
+    for (index, (case, back, expected)) in rows.into_iter().enumerate() {
+        let (router, engine) = emulator_with_store();
+        let (queue_url, queue_arn) = given_queue(&router, case, &format!("window-{index}")).await;
+        let bus_arn = given_active_bus(&router, case, &format!("window-bus-{index}")).await;
+
+        // Two events on the log before any subscriber exists.
+        publish(
+            &router,
+            case,
+            &bus_arn,
+            vec![
+                entry("orders.service", "order.created", r#"{"orderId":"W-1"}"#, None),
+                entry("orders.service", "order.created", r#"{"orderId":"W-2"}"#, None),
+            ],
+        )
+        .await;
+
+        // The bus is made four hours old and its backlog three hours old, so
+        // every instant from its creation to five minutes ago is replayable.
+        let moment = std::time::SystemTime::now();
+        {
+            let store = eventsv2::state::service_state(&*engine)
+                .expect("the in-memory engine always has this service's store");
+            let mut state = store.lock();
+            let bus = state
+                .event_buses
+                .get_mut(&bus_arn)
+                .unwrap_or_else(|| panic!("case {case:?}: the created bus must be stored"));
+            bus.creation_time = moment - Duration::from_secs(4 * 3_600);
+            for event in &mut bus.events {
+                event.received_at = moment - Duration::from_secs(3 * 3_600);
+            }
+        }
+
+        let point = ::aws_smithy_types::DateTime::from(moment - back);
+        given_subscriber(
+            &router,
+            case,
+            &format!("window-subscriber-{index}"),
+            &bus_arn,
+            &queue_arn,
+            Requested {
+                starting_position: Some(eventsv2::state::STARTING_POSITION_POINT_IN_TIME),
+                point: Some(PointInTimeConfiguration {
+                    point_type: eventsv2::state::POINT_TYPE_TIMESTAMP.to_string(),
+                    starting_point: Some(point),
+                    end_point: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // And one event after the subscriber exists, which it is owed whatever
+        // point it started from.
+        publish(
+            &router,
+            case,
+            &bus_arn,
+            vec![entry(
+                "orders.service",
+                "order.created",
+                r#"{"orderId":"W-3"}"#,
+                None,
+            )],
+        )
+        .await;
+
+        let depth = queue_depth(&router, case, &queue_url).await;
+        assert_eq!(
+            depth, expected as u64,
+            "case {case:?}: expected {expected} message(s) on the target queue, got {depth}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The envelope an untransformed delivery carries
+// ---------------------------------------------------------------------------
 /// The `Source` every entry of the envelope table publishes under.
 const ENVELOPE_SOURCE: &str = "orders.service";
 

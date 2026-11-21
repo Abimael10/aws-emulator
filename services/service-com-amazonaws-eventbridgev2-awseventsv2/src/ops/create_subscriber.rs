@@ -301,6 +301,26 @@ fn create(
         .starting_position
         .clone()
         .unwrap_or_else(|| crate::state::STARTING_POSITION_LATEST.to_string());
+
+    // A `POINT_IN_TIME` subscriber is placed inside the bus's RETAINED log, so
+    // the point it names has to be one that log can still answer for. A point
+    // outside the replayable window names no reachable position, so the create
+    // is refused here — before the position is resolved and before anything is
+    // minted, which is what leaves a refused create with no subscriber behind.
+    if let Some(reason) = crate::state::point_in_time_fault(
+        bus,
+        &starting_position,
+        input.point_in_time_configuration.as_ref(),
+        now,
+    ) {
+        return Err(CreateSubscriberErrorModeled::InvalidInputException(
+            InvalidInputException {
+                message: Some(reason),
+            },
+        )
+        .into());
+    }
+
     let next_sequence_number = crate::state::starting_sequence_number(
         bus,
         &starting_position,

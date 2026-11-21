@@ -554,9 +554,11 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             // the ARN so a later read of it is refused as the bus that is not
             // there rather than as a value naming no resource at all.
             self.retire_bus_arn(arn.clone());
-            // An EventSource forwards onto one bus, so it goes with the bus.
+            // An EventSource that still forwards onto this bus goes with it; a
+            // revoked one is detached from it and stays.
             self.forget_event_sources_of_bus(&arn);
-            // A subscriber is created on one bus, so it goes with the bus too.
+            // A subscriber still delivering this bus's events goes with it too,
+            // and a revoked one stays, for the same reason.
             self.forget_subscribers_of_bus(&arn);
         }
     }

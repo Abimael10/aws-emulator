@@ -189,6 +189,19 @@ impl Harness {
     }
 
     async fn delete_bus(&self, arn: &str) {
+        self.try_delete_bus(arn)
+            .await
+            .unwrap_or_else(|e| panic!("case {arn:?}: DeleteEventBus must succeed, got {e:?}"));
+    }
+
+    /// `DeleteEventBus` as it answers, for the rows that assert a refusal.
+    async fn try_delete_bus(
+        &self,
+        arn: &str,
+    ) -> Result<
+        eventsv2::ops::types::DeleteEventBusOutput,
+        eventsv2::ops::delete_event_bus::DeleteEventBusError,
+    > {
         DeleteEventBus::new(Arc::clone(&self.engine))
             .handle(
                 DeleteEventBusInput {
@@ -197,7 +210,6 @@ impl Harness {
                 &self.ctx(),
             )
             .await
-            .unwrap_or_else(|e| panic!("case {arn:?}: DeleteEventBus must succeed, got {e:?}"));
     }
 
     async fn create_source(
@@ -892,9 +904,14 @@ async fn a_repeated_client_token_replays_the_source_it_minted() {
 }
 
 /// RULE: `DescribeEventSource` reports only a stored EventSource — an ARN
-/// nothing minted, and one whose bus has finished disappearing, are both
-/// `ResourceNotFoundException` (404), because an EventSource forwards onto one
-/// bus and cannot outlive it.
+/// nothing minted, and one its own delete has removed, are both
+/// `ResourceNotFoundException` (404).
+///
+/// A source is removed by its OWN delete: while nobody has revoked it, the bus
+/// it forwards onto cannot be deleted under it, and once revoked the source
+/// outlives that bus. Both halves of that relation are asserted in
+/// `event_bus_in_use_by_event_source.rs`; what this row needs of it is that the
+/// bus delete below changes nothing about the source.
 #[tokio::test]
 async fn describe_refuses_an_event_source_that_is_not_stored() {
     let harness = Harness::new();
@@ -913,17 +930,22 @@ async fn describe_refuses_an_event_source_that_is_not_stored() {
         .event_source_arn
         .expect("CreateEventSource must report an EventSourceArn");
 
-    harness.delete_bus(&bus).await;
-    // Wait for the CONDITION the rows below need — the bus's deletion having
-    // completed, so the source it held is gone — rather than for a duration.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while harness.describe_source(&source).await.is_ok() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "case \"bus deleted under it\": the source must disappear with the bus that held it"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    // The bus cannot be taken out from under a source nobody has revoked, so
+    // the source is still there to be read afterwards.
+    harness
+        .try_delete_bus(&bus)
+        .await
+        .expect_err("case \"the bus under it\": DeleteEventBus must be refused");
+    harness
+        .describe_source(&source)
+        .await
+        .expect("case \"the bus under it\": the source must still be readable");
+
+    // Its own delete is what removes it.
+    harness
+        .delete_source(&source)
+        .await
+        .expect("case \"deleted by its own delete\": DeleteEventSource must succeed");
 
     let never = format!(
         "arn:aws:events:{REGION}:{ACCOUNT}:event-sourcev2/aws.service/absent/\
@@ -931,7 +953,7 @@ async fn describe_refuses_an_event_source_that_is_not_stored() {
     );
     for (case, arn) in [
         ("never created", never.as_str()),
-        ("bus deleted under it", source.as_str()),
+        ("deleted by its own delete", source.as_str()),
     ] {
         let error = harness
             .describe_source(arn)
@@ -960,7 +982,7 @@ async fn describe_refuses_an_event_source_that_is_not_stored() {
             .lock()
             .event_source_by_client_token(REGION, "transient-token")
             .is_none(),
-        "case \"bus deleted under it\": the replay record must go with the source"
+        "case \"deleted by its own delete\": the replay record must go with the source"
     );
 }
 

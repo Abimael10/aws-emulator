@@ -369,6 +369,24 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
             .count()
     }
 
+    /// How many EventSources of this bus have NOT been revoked.
+    ///
+    /// An EventSource forwards onto the bus it was created on until it is
+    /// deleted or revoked, so the unrevoked sources are the ones still using
+    /// their bus — which is what makes the bus in use for `DeleteEventBus`. A
+    /// revoked source holds nothing: `Revoked` documents that "Revocation is
+    /// terminal" and that `DeleteEventSource` "stays available so a revoked
+    /// EventSource can still be cleaned up", so such a source is a record left
+    /// to clean up rather than a forwarder onto the bus — which is why the
+    /// in-use refusal names revoking beside deleting as a way to release the
+    /// bus (`crate::ops::delete_event_bus::EVENT_SOURCES_IN_USE_MESSAGE`).
+    pub fn unrevoked_event_sources_of_bus(&self, event_bus_arn: &str) -> usize {
+        self.event_sources
+            .values()
+            .filter(|source| source.event_bus_arn == event_bus_arn && !source.revoked)
+            .count()
+    }
+
     /// Remove the EventSource at this ARN, reporting whether one was there.
     ///
     /// The source IS the record of its own client token, so forgetting it frees
@@ -379,16 +397,26 @@ impl ComAmazonawsEventbridgev2Awseventsv2State {
         self.event_sources.remove(arn).is_some()
     }
 
-    /// Forget the EventSources of a bus that has finished disappearing.
+    /// Forget the EventSources that were still FORWARDING onto a bus which has
+    /// finished disappearing.
     ///
-    /// An EventSource forwards onto one bus, so it cannot outlive that bus: a
-    /// source left behind would name a bus no read can resolve. Its client
-    /// token goes with it, because the token is held by the source itself.
+    /// An EventSource that still forwards onto its bus cannot outlive it: a
+    /// source left behind would be forwarding onto a bus no read can resolve.
+    /// Its client token goes with it, because the token is held by the source
+    /// itself.
+    ///
+    /// A REVOKED source is not one of those. Revoking it is what released the
+    /// bus for deletion ([`Self::unrevoked_event_sources_of_bus`]) and
+    /// `Revoked` documents the revocation as terminal with
+    /// `DeleteEventSource` "available so a revoked EventSource can still be
+    /// cleaned up", so the record outlives the bus — readable, reporting
+    /// `Revoked` and the `EventBusArn` it was created on — until its own delete
+    /// removes it.
     pub fn forget_event_sources_of_bus(&mut self, event_bus_arn: &str) {
         let orphaned: Vec<String> = self
             .event_sources
             .values()
-            .filter(|source| source.event_bus_arn == event_bus_arn)
+            .filter(|source| source.event_bus_arn == event_bus_arn && !source.revoked)
             .map(|source| source.arn.clone())
             .collect();
         for arn in orphaned {
