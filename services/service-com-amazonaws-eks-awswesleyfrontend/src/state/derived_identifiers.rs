@@ -112,10 +112,56 @@ pub fn derive_cluster_endpoint(resource_id: &str, region: &str) -> String {
     format!("https://{resource_id}.{shard}.{region}.eks.amazonaws.com")
 }
 
-/// The cluster's OIDC identity provider issuer URL, in the form EKS publishes:
-/// `https://oidc.eks.<region>.amazonaws.com/id/<resource id>`.
-pub fn derive_oidc_issuer(resource_id: &str, region: &str) -> String {
-    format!("https://oidc.eks.{region}.amazonaws.com/id/{resource_id}")
+/// The address a cluster publishes its OIDC issuer on: the endpoint of THIS
+/// emulator the request reached, and `None` only for an emulator served on no
+/// address at all.
+///
+/// The issuer is a URL its holder FETCHES later — a relying party reads
+/// `<issuer>/.well-known/openid-configuration` and the key set it names to
+/// validate a token the cluster signed — so it has to lead back to this emulator
+/// rather than to a host only AWS answers on. It is the endpoint the request
+/// itself reached when that endpoint is the emulator's own
+/// ([`::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts`]),
+/// which is a client that resolves nothing else; otherwise the one address this
+/// process answers on
+/// ([`::service_common::data_plane_addressing::served_endpoint_authority`]), so a
+/// cluster created by an in-process call of another service publishes an address
+/// that service's caller can reach too.
+///
+/// Both readings are the workspace's shared ones, so this service writes no
+/// second rule for which host is the emulator's own.
+#[must_use]
+pub fn oidc_issuer_authority(
+    parts: &::http::request::Parts,
+    served_base: &str,
+) -> Option<String> {
+    ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(parts)
+        .or_else(|| ::service_common::data_plane_addressing::served_endpoint_authority(served_base))
+}
+
+/// The cluster's OIDC identity provider issuer URL: `endpoint_authority` — the
+/// address this emulator is reached at ([`oidc_issuer_authority`]) — followed by
+/// the `/id/<resource id>` path EKS publishes a cluster's issuer under.
+///
+/// The PATH is the one AWS gives it, so a client that reads the cluster's
+/// identifier out of the issuer URL reads the same segment it would against AWS;
+/// only the host is this emulator's, because the issuer is an address a relying
+/// party dials. A cluster created on an emulator with no address of its own to
+/// publish falls back to the regional host AWS's own form names
+/// (`https://oidc.eks.<region>.amazonaws.com/id/<resource id>`).
+///
+/// It is computed once, when the cluster is created, and stored on the record, so
+/// one cluster announces ONE issuer however its later callers address this
+/// emulator.
+pub fn derive_oidc_issuer(
+    resource_id: &str,
+    region: &str,
+    endpoint_authority: Option<&str>,
+) -> String {
+    match endpoint_authority {
+        Some(authority) => format!("https://{authority}/id/{resource_id}"),
+        None => format!("https://oidc.eks.{region}.amazonaws.com/id/{resource_id}"),
+    }
 }
 
 /// A fresh 32-hex-character resource identifier, in the shape

@@ -499,7 +499,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !pending.remove_labels.is_empty() {
             params.push(UpdateParam {
                 r#type: Some(UPDATE_PARAM_LABELS_TO_REMOVE.to_string()),
-                value: Some(pending.remove_labels.join(",")),
+                // The JSON TEXT of the submitted value, for the reason
+                // [`taints_param`] states: a list of label keys is the JSON array of
+                // those keys, which is what a client reading the update parses.
+                value: Some(::serde_json::json!(pending.remove_labels).to_string()),
             });
         }
         for (taints, param) in [
@@ -652,23 +655,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The `params` value a taint change reports: one `key=value:effect` entry per
-/// taint, in the order the request named them.
+/// The `params` value a taint change reports: the JSON text of the taint list the
+/// request submitted.
 ///
-/// `UpdateParam$value` is a single string, so a list of taints has to be rendered
-/// into one — and `key=value:effect` is the form `kubectl taint` takes and the
-/// one a reader of the update can act on.
+/// `UpdateParam$value` is a single `String`, and what the service this emulates puts
+/// in it is the JSON TEXT of the value the request carried — so a list of taints is
+/// the JSON array of `Taint` objects, each carrying the members the request named for
+/// it. A client reading `update.params` to confirm which taints an asynchronous
+/// update applied parses that text; a rendering of its own (the `key=value:effect`
+/// form `kubectl taint` takes, say) is not a value any client can parse.
+///
+/// The members are written in the order the recorded answers of this API carry them —
+/// `effect`, `value`, `key` — and a member the submitted taint did not carry is not
+/// written at all.
 fn taints_param(taints: &[Taint]) -> String {
-    taints
+    let entries: Vec<::serde_json::Value> = taints
         .iter()
         .map(|taint| {
-            format!(
-                "{}={}:{}",
-                taint.key.clone().unwrap_or_default(),
-                taint.value.clone().unwrap_or_default(),
-                taint.effect.clone().unwrap_or_default()
-            )
+            let mut entry = ::serde_json::Map::new();
+            for (name, value) in [
+                ("effect", taint.effect.as_deref()),
+                ("value", taint.value.as_deref()),
+                ("key", taint.key.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    entry.insert(name.to_string(), ::serde_json::json!(value));
+                }
+            }
+            ::serde_json::Value::Object(entry)
         })
-        .collect::<Vec<_>>()
-        .join(",")
+        .collect();
+    ::serde_json::Value::Array(entries).to_string()
 }

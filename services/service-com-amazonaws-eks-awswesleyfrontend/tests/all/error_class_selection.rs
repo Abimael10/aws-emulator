@@ -33,7 +33,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{create, delete, minimal_request as cluster_request, REGION};
 use crate::nodegroup_lifecycle::{create_cluster, create_nodegroup_in, minimal_request};
-use crate::wire::{call, emulator, encode_label, Answer};
+use crate::wire::{call, emulator, encode_label, Answer, TAG_MUTATION_STATUS};
 
 // ---------------------------------------------------------------------------
 // RULE 1: `CreateNodegroup` resolves `clusterName` before it reports anything about
@@ -309,48 +309,51 @@ async fn a_well_formed_eks_arn_is_resolved_and_only_then_reported_missing() {
     let removed = delete(&router, "class-gone").await;
     assert_eq!(removed.status, 200, "setup delete: got {removed:?}");
 
-    // (case, ARN, the status both tag operations earn) — every row is a WELL-FORMED
-    // resource ARN of this service, so none of them is a bad request: the answer is
-    // decided by whether the store owns the resource.
-    let rows: Vec<(&str, String, u16)> = vec![
-        ("the ARN of a cluster the store owns", real_arn.clone(), 200),
-        ("the ARN of a deleted cluster", gone_arn, 404),
+    // (case, ARN, whether the store OWNS the resource that ARN names) — every row is
+    // a WELL-FORMED resource ARN of this service, so none of them is a bad request:
+    // the answer is decided by whether the store owns the resource. A resolved write
+    // answers the no-content status a tag mutation of this service carries, and a
+    // resolved read answers 200 with the stored map.
+    let rows: Vec<(&str, String, bool)> = vec![
+        ("the ARN of a cluster the store owns", real_arn.clone(), true),
+        ("the ARN of a deleted cluster", gone_arn, false),
         (
             "a cluster ARN for a name never created",
             format!("arn:aws:eks:{REGION}:000000000000:cluster/never"),
-            404,
+            false,
         ),
         (
             "a resource kind this slice does not hold",
             format!("arn:aws:eks:{REGION}:000000000000:nodegroup/c/n/uuid"),
-            404,
+            false,
         ),
         (
             "a cluster ARN in another partition",
             "arn:aws-cn:eks:cn-north-1:000000000000:cluster/never".to_string(),
-            404,
+            false,
         ),
         (
             "a partition-global cluster ARN, region and account fields empty",
             "arn:aws:eks:::cluster/never".to_string(),
-            404,
+            false,
         ),
     ];
 
-    for (case, arn, status) in &rows {
-        for (operation, answer) in [
-            ("TagResource", tag(&router, arn).await),
-            ("ListTagsForResource", list_tags(&router, arn).await),
+    for (case, arn, owned) in &rows {
+        for (operation, answer, resolved_status) in [
+            ("TagResource", tag(&router, arn).await, TAG_MUTATION_STATUS),
+            ("ListTagsForResource", list_tags(&router, arn).await, 200),
         ] {
+            let status = if *owned { resolved_status } else { 404 };
             let case = format!("{case} / {operation}");
             assert_eq!(
-                answer.status, *status,
+                answer.status, status,
                 "case {case:?}: expected HTTP {status}, got {answer:?}"
             );
-            let expected_code = if *status == 404 {
-                Some("NotFoundException")
-            } else {
+            let expected_code = if *owned {
                 None
+            } else {
+                Some("NotFoundException")
             };
             assert_eq!(
                 answer.error_type.as_deref(),

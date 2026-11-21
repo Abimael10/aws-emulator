@@ -608,13 +608,6 @@ pub const IP_FAMILY_IPV4: &str = "ipv4";
 /// The other `IpFamily` member (`smithy_query query="shape" shape="IpFamily"`).
 pub const IP_FAMILY_IPV6: &str = "ipv6";
 
-/// The service CIDR Kubernetes assigns when `serviceIpv4Cidr` is absent on an
-/// `ipv4` cluster: "If you don't specify a block, Kubernetes assigns addresses
-/// from either the `10.100.0.0/16` or `172.20.0.0/16` CIDR blocks"
-/// (`KubernetesNetworkConfigRequest$serviceIpv4Cidr`). One of the two documented
-/// blocks is pinned so a read-back is stable.
-pub const DEFAULT_SERVICE_IPV4_CIDR: &str = "10.100.0.0/16";
-
 /// The `authenticationMode` a cluster gets when `accessConfig` does not name one:
 /// "If you create a cluster by using the EKS API, Amazon Web Services SDKs, or
 /// CloudFormation, the default is `CONFIG_MAP`"
@@ -2594,12 +2587,14 @@ impl UpdateRecord {
             r#type: Some(self.r#type.clone()),
             params: Some(self.params.clone()),
             created_at: Some(reported_instant(self.created_at)),
-            // `errors` carries "any errors associated with a `Failed` update",
-            // and no slice can fail an update yet (each operation that could is
-            // still 501 with its own gap issue). `cancellation` "is present only
-            // if any cancellation is attempted", so it is reported exactly when
-            // `CancelUpdate` has attempted one.
-            errors: None,
+            // `errors` carries "any errors associated with a `Failed` update", so
+            // it is the EMPTY list on an update nothing has failed — a list member
+            // of a structure this API reports is reported as the list it is, not
+            // dropped, and no slice can fail an update yet (each operation that
+            // could is still 501 with its own gap issue). `cancellation` "is
+            // present only if any cancellation is attempted", so it is reported
+            // exactly when `CancelUpdate` has attempted one.
+            errors: Some(Vec::new()),
             cancellation: self.cancellation.clone(),
         }
     }

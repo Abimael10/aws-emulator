@@ -212,7 +212,7 @@ use crate::state::{
     self, CertificateAuthorityRecord, ClusterRecord, CLUSTER_ACTIVATION_DELAY,
     DEFAULT_AUTHENTICATION_MODE,
     DEFAULT_KUBERNETES_VERSION, DEFAULT_PUBLIC_ACCESS_CIDR_V4, DEFAULT_PUBLIC_ACCESS_CIDR_V6,
-    DEFAULT_SERVICE_IPV4_CIDR, DEFAULT_SUPPORT_TYPE, IP_FAMILY_IPV4,
+    DEFAULT_SUPPORT_TYPE, IP_FAMILY_IPV4,
     IP_FAMILY_IPV6, MAX_CLUSTERS, MAX_STORED_CLUSTERS, PLATFORM_VERSION, STATUS_CREATING,
 };
 use std::time::SystemTime;
@@ -637,21 +637,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The last of the service CIDR's rules, the one that needs the NETWORK the
-        // cluster is created in: "Doesn't overlap with any CIDR block assigned to
-        // the VPC that you selected". The VPC is the one those subnets resolved to
-        // and its address space is EC2's to report
-        // ([`state::resolve_vpc_cidr_blocks`]), so this read happens only for a
-        // request that named a block of its own, and a VPC nothing answered for
-        // grounds no refusal.
-        if let (Some(cidr), Some(vpc_id)) = (
-            input
-                .kubernetes_network_config
-                .as_ref()
-                .and_then(|network| network.service_ipv4_cidr.as_deref()),
-            resolved_subnets.vpc_id.as_deref(),
-        ) {
-            let vpc_cidr_blocks = state::resolve_vpc_cidr_blocks(ctx, &region, vpc_id).await;
+        // The VPC's own address space, which the cluster's service CIDR is settled
+        // against: the last of that member's rules — "Doesn't overlap with any CIDR
+        // block assigned to the VPC that you selected" — for a request that named a
+        // block of its own, and which of the two blocks Kubernetes assigns from the
+        // cluster gets when it named none ([`state::default_service_ipv4_cidr`]).
+        // The VPC is the one those subnets resolved to and its address space is
+        // EC2's to report ([`state::resolve_vpc_cidr_blocks`]), so it is read here,
+        // with no lock held; a VPC nothing answered for reports no block, which
+        // grounds no refusal and rules no block out.
+        let vpc_cidr_blocks = match resolved_subnets.vpc_id.as_deref() {
+            Some(vpc_id) => state::resolve_vpc_cidr_blocks(ctx, &region, vpc_id).await,
+            None => Vec::new(),
+        };
+        if let Some(cidr) = input
+            .kubernetes_network_config
+            .as_ref()
+            .and_then(|network| network.service_ipv4_cidr.as_deref())
+        {
             if let Some(why) =
                 state::service_ipv4_cidr_vpc_overlap_refusal(&input.name, cidr, &vpc_cidr_blocks)
             {
@@ -669,9 +672,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_id = state::derive_cluster_resource_id(&arn);
 
         // `ipFamily` decides which of the two service CIDRs the cluster reports: an
-        // `ipv4` cluster gets the requested (or default) IPv4 block, an `ipv6` cluster
-        // gets a server-assigned IPv6 block and no IPv4 one. The family itself was read
-        // off the request above, where the members that depend on it are judged.
+        // `ipv4` cluster gets the requested block, or the one Amazon EKS assigns for
+        // the network it is created in when the request named none
+        // ([`state::default_service_ipv4_cidr`], read against the VPC's own ranges
+        // above); an `ipv6` cluster gets a server-assigned IPv6 block and no IPv4
+        // one. The family itself was read off the request above, where the members
+        // that depend on it are judged.
         let requested_network = input.kubernetes_network_config.unwrap_or_default();
         let is_ipv6 = ip_family.eq_ignore_ascii_case(IP_FAMILY_IPV6);
         let kubernetes_network_config = KubernetesNetworkConfigResponse {
@@ -682,7 +688,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     requested_network
                         .service_ipv4_cidr
                         .clone()
-                        .unwrap_or_else(|| DEFAULT_SERVICE_IPV4_CIDR.to_string()),
+                        .unwrap_or_else(|| state::default_service_ipv4_cidr(&vpc_cidr_blocks)),
                 )
             },
             service_ipv6_cidr: is_ipv6.then(|| state::derive_service_ipv6_cidr(&resource_id)),
@@ -797,7 +803,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint: None,
             identity: Some(Identity {
                 oidc: Some(OIDC {
-                    issuer: Some(state::derive_oidc_issuer(&resource_id, &region)),
+                    // The issuer is an address a relying party FETCHES, so it is
+                    // the endpoint of this emulator the create was made through
+                    // ([`state::oidc_issuer_authority`]) under the path EKS
+                    // publishes a cluster's issuer at, settled here and stored on
+                    // the record so one cluster announces one issuer.
+                    issuer: Some(state::derive_oidc_issuer(
+                        &resource_id,
+                        &region,
+                        state::oidc_issuer_authority(ctx.parts(), ctx.endpoint().as_str())
+                            .as_deref(),
+                    )),
                 }),
             }),
             certificate_authority: Some(Certificate {
@@ -867,6 +883,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     remote_pod_networks: config.remote_pod_networks,
                 }
             }),
+            // The compute capability as the REQUEST configured it: the node pool
+            // list a stored cluster reports is projected from this
+            // ([`state::reported_compute_config`], applied by every read of the
+            // record), so the record holds what was asked for.
             compute_config: input.compute_config.map(|config| ComputeConfigResponse {
                 enabled: config.enabled,
                 node_pools: config.node_pools,

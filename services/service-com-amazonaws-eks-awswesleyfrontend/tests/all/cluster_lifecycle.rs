@@ -25,7 +25,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // The wire plumbing (one shared engine behind the production router, label
 // encoding, the reduced `Answer`) is shared with every other suite in this
 // crate — see `tests/all/wire.rs`.
-use crate::wire::{call, emulator, encode_label, Answer};
+use crate::wire::{call, emulator, encode_label, Answer, TAG_MUTATION_STATUS};
 
 pub(crate) const REGION: &str = "us-west-2";
 
@@ -476,6 +476,12 @@ async fn a_created_cluster_reads_back_exactly_as_stored() {
              data, got {:?}",
             described.cluster()["certificateAuthority"]
         );
+        // A request that names no host of its own (the harness sends none) addresses
+        // no endpoint of this emulator, so the cluster announces the regional form
+        // its model documents. WHICH address a cluster publishes its issuer on for a
+        // client that reached an endpoint of this emulator — the address such a
+        // client can actually fetch the issuer's documents from — is
+        // `tests/all/cluster_plane_reported_members.rs`.
         assert!(
             described.cluster()["identity"]["oidc"]["issuer"]
                 .as_str()
@@ -837,8 +843,9 @@ async fn tagging_merges_into_the_stored_map_and_is_read_back() {
             let body = serde_json::json!({ "tags": merge });
             let answer = call(&router, REGION, "POST", &tags_uri, &body.to_string()).await;
             assert_eq!(
-                answer.status, 200,
-                "case {case:?}: expected 200 from TagResource for {merge:?}, got {answer:?}"
+                answer.status, TAG_MUTATION_STATUS,
+                "case {case:?}: expected {TAG_MUTATION_STATUS} from TagResource for {merge:?}, \
+                 got {answer:?}"
             );
         }
 
@@ -1308,8 +1315,8 @@ async fn the_tag_ceiling_applies_to_the_accumulated_map() {
         let answer = call(&router, REGION, "POST", &tags_uri, &body.to_string()).await;
         if *accepted {
             assert_eq!(
-                answer.status, 200,
-                "case {case:?}: expected 200, got {answer:?}"
+                answer.status, TAG_MUTATION_STATUS,
+                "case {case:?}: expected {TAG_MUTATION_STATUS}, got {answer:?}"
             );
         } else {
             assert_eq!(
@@ -1533,7 +1540,7 @@ async fn the_same_name_in_two_regions_is_two_independent_clusters() {
         )
         .await;
         assert_eq!(
-            tagged.status, 200,
+            tagged.status, TAG_MUTATION_STATUS,
             "case {case:?}: tagging {survivor_arn:?} must succeed, got {tagged:?}"
         );
         let tags = call(

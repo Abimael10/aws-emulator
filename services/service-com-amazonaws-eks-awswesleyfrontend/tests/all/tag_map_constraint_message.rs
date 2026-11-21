@@ -21,7 +21,7 @@
 //! `tests/all/wire.rs`; the tag helpers are `tag_contract`'s.
 
 use crate::tag_contract::{stored, tag_map, taggable, Tags};
-use crate::wire::{emulator, error_code};
+use crate::wire::{emulator, error_code, TAG_MUTATION_STATUS};
 
 /// The published character bounds of one tag key and one tag value, which are also
 /// the bounds a clause states: `TagKey` is `@length {min: 1, max: 128}` and `TagValue`
@@ -408,8 +408,8 @@ async fn an_entry_inside_both_bounds_is_stored() {
         map.insert("k".repeat(*key_length), "v".repeat(*value_length));
         let answer = tag_map(&router, &arn, &map).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected HTTP 200, got {answer:?}"
+            answer.status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected HTTP {TAG_MUTATION_STATUS}, got {answer:?}"
         );
         assert_eq!(
             stored(&router, &arn).await,

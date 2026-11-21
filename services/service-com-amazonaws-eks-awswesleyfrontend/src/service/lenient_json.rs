@@ -25,8 +25,10 @@
 //!
 //! Nothing else about either walk changes: a member's wire name, its order, its
 //! schema and every constraint the model puts on it stay exactly as the model gave
-//! them, and a response is written exactly as before — a response carries each
-//! member in its modelled type, which is what a client reads.
+//! them, and a response carries each member in its modelled type, which is what a
+//! client reads. The one thing the output seam corrects is FRAMING, not content: an
+//! answer at the no-content status carries no body (see the note on
+//! `ServerProtocol::serialize_output` below).
 //!
 //! The wrapper adds one stack frame per nesting level and nothing else: no buffer,
 //! no copy of the document, no caller-sized allocation and no second pass. A scalar
@@ -292,6 +294,22 @@ impl ServerProtocol for LenientRestJson {
         Ok(Box::new(LenientReader(inner)))
     }
 
+    /// The model's own rendering, with one correction: an answer at the no-content
+    /// status carries no body.
+    ///
+    /// This service's two tag mutations answer `204 No Content`
+    /// (`crate::ops::tag_resource`), and the renderer writes the empty JSON object
+    /// `{}` for their members-less output structures — content on a response that
+    /// declares it has none. The correction is the workspace's shared one
+    /// ([`::service_common::no_content_responses::without_content`]), applied at the
+    /// one seam every response of a modelled operation passes through; every answer
+    /// that carries content is handed back exactly as the renderer wrote it.
+    ///
+    /// The FRAMING HEADER of such an answer is below a service crate: the length a
+    /// response states is written by the transport
+    /// (`vendor/server`'s `set_framing_content_length`, which leaves a status that
+    /// carries no content without one, "as hyper writes it"), so what this seam
+    /// decides is the body, not the header.
     fn serialize_output(
         &self,
         output: &dyn SerializableStruct,
@@ -301,6 +319,7 @@ impl ServerProtocol for LenientRestJson {
     ) -> Result<Self::Response, ProtocolError> {
         self.inner
             .serialize_output(output, output_schema, operation_name, success_status)
+            .map(::service_common::no_content_responses::without_content)
     }
 
     fn serialize_error(

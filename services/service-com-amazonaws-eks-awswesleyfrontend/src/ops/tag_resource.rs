@@ -126,7 +126,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A tag mutation of this service answers NO CONTENT: the output shape carries no
+    // member, and the status the recorded service answers a `TagResource` with is 204
+    // rather than the 200 the model's `@http` trait declares. A client that branches on
+    // "no content" for a tag write reads the same status it would from AWS.
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,

@@ -8,7 +8,7 @@
 //! keys the request names and nothing else — a key the request does not name
 //! survives, and a key the resource does not carry is removed vacuously — so
 //! `ListTagsForResource` and `DescribeCluster` then report the remaining map and a
-//! repeated call answers the same 200.
+//! repeated call answers the same 204 No Content.
 //!
 //! Every suite here asserts that rule over a TABLE of inputs rather than one
 //! recorded request: the rows differ along what the rule generalises over (how
@@ -22,7 +22,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::MAX_TAGS_PER_RESOURCE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{create, delete, describe, minimal_request, REGION};
-use crate::wire::{call, emulator, encode_label, error_code, Answer};
+use crate::wire::{call, emulator, encode_label, error_code, Answer, TAG_MUTATION_STATUS};
 
 type Tags = BTreeMap<String, String>;
 
@@ -166,8 +166,9 @@ async fn untagging_removes_only_the_named_keys() {
 
         let answer = untag(&router, &arn, tag_keys).await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected 200 from UntagResource for {tag_keys:?}, got {answer:?}"
+            answer.status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected {TAG_MUTATION_STATUS} from UntagResource for \
+             {tag_keys:?}, got {answer:?}"
         );
 
         let expected_json = serde_json::to_value(expected).expect("tags serialize");
@@ -240,8 +241,9 @@ async fn untagging_is_idempotent_and_a_deleted_key_can_be_tagged_again() {
         for round in 1..=2 {
             let answer = untag(&router, &arn, tag_keys).await;
             assert_eq!(
-                answer.status, 200,
-                "case {case:?}: round {round} of UntagResource must answer 200, got {answer:?}"
+                answer.status, TAG_MUTATION_STATUS,
+                "case {case:?}: round {round} of UntagResource must answer \
+                 {TAG_MUTATION_STATUS}, got {answer:?}"
             );
             let listed = list_tags(&router, &arn).await;
             assert_eq!(
@@ -259,8 +261,8 @@ async fn untagging_is_idempotent_and_a_deleted_key_can_be_tagged_again() {
             .collect();
         let tagged = tag(&router, &arn, &re_added).await;
         assert_eq!(
-            tagged.status, 200,
-            "case {case:?}: expected 200 re-tagging {re_added:?}, got {tagged:?}"
+            tagged.status, TAG_MUTATION_STATUS,
+            "case {case:?}: expected {TAG_MUTATION_STATUS} re-tagging {re_added:?}, got {tagged:?}"
         );
         let mut after: Tags = expected.clone();
         after.extend(re_added.clone());

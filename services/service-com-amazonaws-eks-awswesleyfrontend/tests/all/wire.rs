@@ -106,6 +106,17 @@ pub fn error_code(answer: &Answer) -> String {
 /// which is the account's own published credential.
 pub const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
 
+/// The status a tag MUTATION of this service answers.
+///
+/// `TagResource` and `UntagResource` both have an EMPTY output shape and answer 204 No
+/// Content — the status the service this emulates answers a tag write with, which is
+/// what a client branching on "no content" for such a write reads. A read of the tags
+/// (`ListTagsForResource`) carries a body and answers 200.
+///
+/// It lives here, beside the harness every suite drives, so the suites that assert a
+/// tag write's status all name ONE value.
+pub const TAG_MUTATION_STATUS: u16 = 204;
+
 /// The emulator under test beside the two services a decision about WHO is calling reads
 /// from: IAM (the user, the role and their identity policies) and STS (the session a role
 /// is assumed into), all over the SAME shared engine.

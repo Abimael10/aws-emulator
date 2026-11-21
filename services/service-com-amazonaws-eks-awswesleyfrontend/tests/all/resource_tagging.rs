@@ -24,7 +24,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{access_entry_cluster_request, REGION};
-use crate::wire::{call, emulator, encode_label, error_code, Answer};
+use crate::wire::{call, emulator, encode_label, error_code, Answer, TAG_MUTATION_STATUS};
 
 /// The cluster every child resource below hangs off.
 const CLUSTER: &str = "tagged-resources";
@@ -220,7 +220,7 @@ async fn every_resource_this_service_mints_an_arn_for_is_taggable_through_it() {
         )
         .await;
         assert_eq!(
-            tagged.status, 200,
+            tagged.status, TAG_MUTATION_STATUS,
             "case {case:?}: TagResource must succeed for {arn}, got {tagged:?}"
         );
         let merged = serde_json::json!({
@@ -257,7 +257,7 @@ async fn every_resource_this_service_mints_an_arn_for_is_taggable_through_it() {
         )
         .await;
         assert_eq!(
-            untagged.status, 200,
+            untagged.status, TAG_MUTATION_STATUS,
             "case {case:?}: UntagResource must succeed for {arn}, got {untagged:?}"
         );
         let (status, tags) = listed_tags(&router, arn).await;

@@ -31,7 +31,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::{create, minimal_request, REGION};
-use crate::wire::{call, emulator, encode_label, error_code, Answer};
+use crate::wire::{call, emulator, encode_label, error_code, Answer, TAG_MUTATION_STATUS};
 
 pub(crate) type Tags = BTreeMap<String, String>;
 
@@ -172,8 +172,8 @@ async fn the_tag_count_ceiling_is_a_bad_request_with_the_tagging_sentence() {
         let map = distinct_tags(count);
         let answer = tag_map(&router, &arn, &map).await;
         assert_eq!(
-            answer.status, 200,
-            "case {count} tags: expected HTTP 200, got {answer:?}"
+            answer.status, TAG_MUTATION_STATUS,
+            "case {count} tags: expected HTTP {TAG_MUTATION_STATUS}, got {answer:?}"
         );
         let expected = serde_json::to_value(&map).expect("tags serialize");
         assert_eq!(
@@ -185,8 +185,8 @@ async fn the_tag_count_ceiling_is_a_bad_request_with_the_tagging_sentence() {
         let keys: Vec<String> = map.keys().cloned().collect();
         let cleared = untag(&router, &arn, &keys).await;
         assert_eq!(
-            cleared.status, 200,
-            "case {count} tags: setup untag must answer 200, got {cleared:?}"
+            cleared.status, TAG_MUTATION_STATUS,
+            "case {count} tags: setup untag must answer {TAG_MUTATION_STATUS}, got {cleared:?}"
         );
     }
 }
@@ -217,8 +217,9 @@ async fn the_accumulated_ceiling_earns_the_same_sentence() {
         let stored_first = distinct_tags(*first);
         let seeded = tag_map(&router, &arn, &stored_first).await;
         assert_eq!(
-            seeded.status, 200,
-            "case {case:?}: setup tag of {first} keys must answer 200, got {seeded:?}"
+            seeded.status, TAG_MUTATION_STATUS,
+            "case {case:?}: setup tag of {first} keys must answer {TAG_MUTATION_STATUS}, got \
+             {seeded:?}"
         );
 
         // Fresh keys, none of them already on the record, so the merge GROWS the map.
@@ -229,8 +230,8 @@ async fn the_accumulated_ceiling_earns_the_same_sentence() {
 
         if *accepted {
             assert_eq!(
-                answer.status, 200,
-                "case {case:?}: expected HTTP 200, got {answer:?}"
+                answer.status, TAG_MUTATION_STATUS,
+                "case {case:?}: expected HTTP {TAG_MUTATION_STATUS}, got {answer:?}"
             );
             let mut both = stored_first.clone();
             both.extend(added.clone());
@@ -270,7 +271,10 @@ async fn the_accumulated_ceiling_earns_the_same_sentence() {
     let arn = taggable(&router, "merge-overwrite").await;
     let full = distinct_tags(MAX_TAGS_PER_RESOURCE);
     let seeded = tag_map(&router, &arn, &full).await;
-    assert_eq!(seeded.status, 200, "setup tag: got {seeded:?}");
+    assert_eq!(
+        seeded.status, TAG_MUTATION_STATUS,
+        "setup tag: got {seeded:?}"
+    );
     let overwrite: Tags = full
         .keys()
         .take(3)
@@ -278,8 +282,8 @@ async fn the_accumulated_ceiling_earns_the_same_sentence() {
         .collect();
     let answer = tag_map(&router, &arn, &overwrite).await;
     assert_eq!(
-        answer.status, 200,
-        "overwriting keys of a full map must answer 200, got {answer:?}"
+        answer.status, TAG_MUTATION_STATUS,
+        "overwriting keys of a full map must answer {TAG_MUTATION_STATUS}, got {answer:?}"
     );
     let mut expected = full.clone();
     expected.extend(overwrite.clone());
@@ -326,8 +330,8 @@ async fn the_key_and_value_bounds_are_refused_as_a_bad_request() {
 
         if *accepted {
             assert_eq!(
-                answer.status, 200,
-                "case {case:?}: expected HTTP 200, got {answer:?}"
+                answer.status, TAG_MUTATION_STATUS,
+                "case {case:?}: expected HTTP {TAG_MUTATION_STATUS}, got {answer:?}"
             );
             assert_eq!(
                 stored(&router, &arn).await,
@@ -410,7 +414,10 @@ async fn untag_refuses_its_declared_bounds_in_the_same_channel() {
     let arn = taggable(&router, "untag-bounds").await;
     let stored_map = distinct_tags(MAX_TAGS_PER_RESOURCE);
     let seeded = tag_map(&router, &arn, &stored_map).await;
-    assert_eq!(seeded.status, 200, "setup tag: got {seeded:?}");
+    assert_eq!(
+        seeded.status, TAG_MUTATION_STATUS,
+        "setup tag: got {seeded:?}"
+    );
 
     let every_key: Vec<String> = stored_map.keys().cloned().collect();
     let too_many: Vec<String> = (0..=MAX_TAGS_PER_RESOURCE)
@@ -446,15 +453,15 @@ async fn untag_refuses_its_declared_bounds_in_the_same_channel() {
         // Re-seed, so every row deletes from the same stored map.
         let reseeded = tag_map(&router, &arn, &stored_map).await;
         assert_eq!(
-            reseeded.status, 200,
-            "case {case:?}: setup re-tag must answer 200, got {reseeded:?}"
+            reseeded.status, TAG_MUTATION_STATUS,
+            "case {case:?}: setup re-tag must answer {TAG_MUTATION_STATUS}, got {reseeded:?}"
         );
 
         let answer = untag(&router, &arn, keys).await;
         if *accepted {
             assert_eq!(
-                answer.status, 200,
-                "case {case:?}: expected HTTP 200, got {answer:?}"
+                answer.status, TAG_MUTATION_STATUS,
+                "case {case:?}: expected HTTP {TAG_MUTATION_STATUS}, got {answer:?}"
             );
             continue;
         }

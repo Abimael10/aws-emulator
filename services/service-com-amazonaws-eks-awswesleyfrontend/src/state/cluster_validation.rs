@@ -48,6 +48,66 @@ pub const SERVICE_IPV4_MIN_PREFIX: u8 = 12;
 /// [`SERVICE_IPV4_MIN_PREFIX`].
 pub const SERVICE_IPV4_MAX_PREFIX: u8 = 24;
 
+/// The two blocks Kubernetes assigns service addresses from when a cluster is
+/// created without a `serviceIpv4Cidr` of its own, in the order Amazon EKS
+/// prefers them.
+///
+/// "If you didn't specify a CIDR block when you created the cluster, then
+/// Kubernetes assigns addresses from either the `10.100.0.0/16` or
+/// `172.20.0.0/16` CIDR blocks"
+/// (`KubernetesNetworkConfigResponse$serviceIpv4Cidr`) — so the block is one of
+/// these two and WHICH of them is the service's choice per cluster, never a
+/// constant. `172.20.0.0/16` is first because that is the block the recorded
+/// answer for a cluster whose VPC overlaps neither of them carries; the other is
+/// what such a cluster gets when its VPC's address space leaves no room for the
+/// first (see [`default_service_ipv4_cidr`]).
+pub const SERVICE_IPV4_CIDR_BLOCKS: &[&str] = &["172.20.0.0/16", "10.100.0.0/16"];
+
+/// The service CIDR a cluster created with no `serviceIpv4Cidr` is assigned, for
+/// the address space of the VPC its subnets resolved to.
+///
+/// The rule is the one the member states for a block a CALLER names — "Doesn't
+/// overlap with any CIDR block assigned to the VPC that you selected"
+/// (`KubernetesNetworkConfigRequest$serviceIpv4Cidr`) — applied to the block the
+/// SERVICE picks: pod addresses come out of the VPC's own ranges, so a service
+/// range inside one of them would collide with them. The first of
+/// [`SERVICE_IPV4_CIDR_BLOCKS`] that overlaps none of `vpc_cidr_blocks` is the
+/// one the cluster gets.
+///
+/// A VPC nothing answered for ([`super::resolve_vpc_cidr_blocks`] reports no
+/// block for an emulator with no EC2 mounted, or a VPC it does not hold) rules
+/// nothing out, so the preferred block stands — and so it does for a VPC whose
+/// ranges overlap both, where there is no third block to assign.
+#[must_use]
+pub fn default_service_ipv4_cidr(vpc_cidr_blocks: &[String]) -> String {
+    SERVICE_IPV4_CIDR_BLOCKS
+        .iter()
+        .find(|candidate| overlapping_vpc_cidr(candidate, vpc_cidr_blocks).is_none())
+        .unwrap_or(&SERVICE_IPV4_CIDR_BLOCKS[0])
+        .to_string()
+}
+
+/// The first of `vpc_cidr_blocks` that overlaps `cidr`, and `None` when none of
+/// them does or when `cidr` is not an IPv4 block at all.
+///
+/// The ONE overlap reading of this service, shared by the refusal of a block a
+/// caller named ([`service_ipv4_cidr_vpc_overlap_refusal`]) and the choice of the
+/// one the service assigns ([`default_service_ipv4_cidr`]), so the block a create
+/// hands out can never be one the same create would have refused.
+fn overlapping_vpc_cidr<'blocks>(
+    cidr: &str,
+    vpc_cidr_blocks: &'blocks [String],
+) -> Option<&'blocks String> {
+    let block = ::ipnet::Ipv4Net::from_str(cidr).ok()?;
+    vpc_cidr_blocks.iter().find(|vpc_cidr| {
+        // Two CIDR blocks are aligned prefixes, so they overlap exactly when one
+        // contains the other — which `ipnet` answers for a whole block.
+        ::ipnet::Ipv4Net::from_str(vpc_cidr)
+            .map(|vpc_block| vpc_block.contains(&block) || block.contains(&vpc_block))
+            .unwrap_or(false)
+    })
+}
+
 /// The refusal deleting a cluster that still has managed node groups earns: "If
 /// you have managed node groups or Fargate profiles attached to the cluster, you
 /// must delete them first" (`DeleteCluster`). The whole sentence is fixed — it
@@ -190,14 +250,7 @@ pub fn service_ipv4_cidr_vpc_overlap_refusal(
     cidr: &str,
     vpc_cidr_blocks: &[String],
 ) -> Option<String> {
-    let block = ::ipnet::Ipv4Net::from_str(cidr).ok()?;
-    let overlapping = vpc_cidr_blocks.iter().find(|vpc_cidr| {
-        // Two CIDR blocks are aligned prefixes, so they overlap exactly when one
-        // contains the other — which `ipnet` answers for a whole block.
-        ::ipnet::Ipv4Net::from_str(vpc_cidr)
-            .map(|vpc_block| vpc_block.contains(&block) || block.contains(&vpc_block))
-            .unwrap_or(false)
-    })?;
+    let overlapping = overlapping_vpc_cidr(cidr, vpc_cidr_blocks)?;
     Some(invalid_service_cidr(
         cluster_name,
         cidr,

@@ -103,6 +103,27 @@ pub fn reported_elastic_load_balancing(
     }
 }
 
+/// The compute capability a STORED cluster reports, for the `computeConfig` it is
+/// `configured` with — the one its create named, or the one an update left it with.
+///
+/// `ComputeConfigResponse$nodePools` "indicates the current configuration of node
+/// pools in your EKS Auto Mode cluster" and targets a `StringList`, so a cluster
+/// that runs none of them reports an EMPTY list rather than no member at all: the
+/// list is part of the compute capability a stored cluster reports, and a client
+/// that iterates it without a null guard reads what it would read from AWS. The
+/// other two members are reported exactly as they were configured — a capability
+/// the request said nothing about has nothing to report for them.
+///
+/// This is the projection of a STORED cluster, so it is applied by
+/// [`ClusterRecord::to_cluster`] and not by the create's own answer, which reports
+/// the configuration the request carried ([`ClusterRecord::to_created_cluster`]).
+pub fn reported_compute_config(configured: ComputeConfigResponse) -> ComputeConfigResponse {
+    ComputeConfigResponse {
+        node_pools: Some(configured.node_pools.unwrap_or_default()),
+        ..configured
+    }
+}
+
 /// The scaling tier a cluster reports, for the `controlPlaneScalingConfig` a
 /// request asked for: the tier it asked for, or [`DEFAULT_CONTROL_PLANE_TIER`].
 pub fn reported_control_plane_scaling_config(
@@ -508,6 +529,19 @@ impl ClusterRecord {
     /// `UpdateClusterConfig` — so this projection reports the record as it
     /// stands.
     pub fn to_cluster(&self) -> Cluster {
+        // The compute capability a STORED cluster reports carries its node pool
+        // list ([`reported_compute_config`]); the create's own answer reports the
+        // configuration its request carried instead, so that member is handed to
+        // the shared body rather than read off the record there.
+        self.reported_cluster(self.compute_config.clone().map(reported_compute_config))
+    }
+
+    /// Every member a `Cluster` answer carries except the ones that differ per
+    /// CALL: `computeConfig`, which [`Self::to_cluster`] and
+    /// [`Self::to_created_cluster`] each hand in, and
+    /// `accessConfig.bootstrapClusterCreatorAdminPermissions`, which the latter
+    /// writes on afterwards.
+    fn reported_cluster(&self, compute_config: Option<ComputeConfigResponse>) -> Cluster {
         let provisioned = self.control_plane_provisioned;
         Cluster {
             name: Some(self.name.clone()),
@@ -560,7 +594,7 @@ impl ClusterRecord {
             upgrade_policy: self.upgrade_policy.clone(),
             zonal_shift_config: self.zonal_shift_config.clone(),
             remote_network_config: self.remote_network_config.clone(),
-            compute_config: self.compute_config.clone(),
+            compute_config,
             storage_config: self.storage_config.clone(),
             control_plane_scaling_config: self.control_plane_scaling_config.clone(),
             kube_api_server_config: self.kube_api_server_config.clone(),
@@ -581,15 +615,24 @@ impl ClusterRecord {
 
     /// This record as the `Cluster` the call that CREATED it answers with: the
     /// cluster plus the one member that belongs to that call rather than to the
-    /// cluster.
+    /// cluster, and with the compute capability as the REQUEST configured it.
     ///
     /// `accessConfig.bootstrapClusterCreatorAdminPermissions` "specifies whether
     /// or not the cluster creator IAM principal was set as a cluster admin access
     /// entry during cluster creation time" — a decision the create request made,
     /// which is why the create answers with it while a later read of the cluster
     /// reports the cluster's access configuration without it.
+    ///
+    /// `computeConfig` is the other way round: this call answers with the
+    /// configuration its request carried, so a request that named no `nodePools`
+    /// gets no `nodePools` back, while every READ of the stored cluster reports the
+    /// node pool list the cluster runs ([`reported_compute_config`], an empty list
+    /// when it runs none). EVIDENCE, not inference: the recorded create of this
+    /// issue's fixture carries no `computeConfig.nodePools` at all, while the
+    /// recorded describe and delete of that same cluster both carry `[]` — each of
+    /// the latter two is among the issue's replay keys and the create is not.
     pub fn to_created_cluster(&self) -> Cluster {
-        let mut cluster = self.to_cluster();
+        let mut cluster = self.reported_cluster(self.compute_config.clone());
         if let Some(access_config) = cluster.access_config.as_mut() {
             access_config.bootstrap_cluster_creator_admin_permissions =
                 self.bootstrap_cluster_creator_admin_permissions;

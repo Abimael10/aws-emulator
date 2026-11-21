@@ -1022,6 +1022,12 @@ fn json_list(values: &[String]) -> String {
 /// same JSON shape it arrived in, so a caller reading the update back sees what it asked
 /// for rather than a rendering of this service's internals. Every member of the shapes
 /// below is rendered the same way: present exactly when the request carried it.
+///
+/// The one value NORMALIZED rather than echoed is the `types` list: a `LogType` set is a
+/// SET of the control plane log types an entry names, so it is reported in the order the
+/// model declares those types ([`normalized_log_types`]) — the order every reader of a
+/// cluster's logging configuration already sees it in — rather than in the order one
+/// request happened to list them.
 fn logging_value(logging: &Logging) -> String {
     let setups: Vec<::serde_json::Value> = logging
         .cluster_logging
@@ -1030,7 +1036,10 @@ fn logging_value(logging: &Logging) -> String {
         .map(|setup| {
             let mut entry = ::serde_json::Map::new();
             if let Some(types) = setup.types.as_deref() {
-                entry.insert("types".to_string(), ::serde_json::json!(types));
+                entry.insert(
+                    "types".to_string(),
+                    ::serde_json::json!(normalized_log_types(types)),
+                );
             }
             if let Some(enabled) = setup.enabled {
                 entry.insert("enabled".to_string(), ::serde_json::json!(enabled));
@@ -1039,6 +1048,26 @@ fn logging_value(logging: &Logging) -> String {
         })
         .collect();
     ::serde_json::json!({ "clusterLogging": setups }).to_string()
+}
+
+/// `types` in the order the model declares `LogType`'s members
+/// ([`LOG_TYPE_VALUES`], whose order is `api`, `audit`, `authenticator`,
+/// `controllerManager`, `scheduler`), which is the order this service reports every
+/// other reading of a log type set in ([`state::reported_logging`]).
+///
+/// A value the enum does not declare keeps its place after the declared ones, in the
+/// order the request listed it: it names no member there is a position for, and a
+/// request's own text is never dropped from the value it is echoed in.
+fn normalized_log_types(types: &[String]) -> Vec<String> {
+    let declared = |log_type: &String| {
+        LOG_TYPE_VALUES
+            .iter()
+            .position(|declared| *declared == log_type.as_str())
+            .unwrap_or(LOG_TYPE_VALUES.len())
+    };
+    let mut ordered = types.to_vec();
+    ordered.sort_by_key(declared);
+    ordered
 }
 
 /// See [`logging_value`] — the requested `computeConfig`.
