@@ -1,0 +1,42 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: ecr.pull-through-cache-rule-upstream-repository-prefix-read-back ecr.validate-pull-through-cache-rule-secret-not-found-rejected
+Issue-Shape-Id: com.amazonaws.ecr#AmazonEC2ContainerRegistry_V20150921
+Issue-Key: ecr.pull-through-cache-rule-upstream-repository-prefix-read-back|run#13|AssertionError|assert described == {root_prefix: expected_root, named_prefix: expected_named}, (
+Issue-Key: ecr.validate-pull-through-cache-rule-secret-not-found-rejected|run#24|AssertionError|assert restored_result["isValid"] is False, (
+Issue-Commit: ef5208a2316f6e603f33dcb5e1ac1bc1a8b9d2da
+
+# ecr: 2 net-new causes — DescribePullThroughCacheRules invents an updatedAt for a rule that was never updated, and ValidatePullThroughCacheRule reports isValid=true for an accessible-but-bogus upstream credential
+
+> _Note: this issue was identified against the code base at commit `ef5208a2316f6e603f33dcb5e1ac1bc1a8b9d2da`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribePullThroughCacheRules
+
+## Description
+Two net-new causes, both in ECR's pull-through-cache control plane. Related open issue that does NOT cover either of these as they now fail: 20261024T014332Z-ecr-asynchronous-effects-never-occur-and-several-enforcement.md — its Cause 4 covers the FIRST assertion of ecr.validate-pull-through-cache-rule-secret-not-found-rejected (a deleted credential secret validating true); that assertion now passes (the emulator reports isValid=false with UNABLE_TO_ACCESS_SECRET for a deleted secret) and the check now fails one step LATER, on the rebind-to-an-existing-secret leg described as Cause 2 below.
+
+Cause 1 of 2: DescribePullThroughCacheRules reports an updatedAt timestamp on a rule that has never been updated.
+AWS: Smithy: PullThroughCacheRule members are ecrRepositoryPrefix, upstreamRegistryUrl, createdAt, registryId, credentialArn, customRoleArn, upstreamRepositoryPrefix, upstreamRegistry, updatedAt — updatedAt is documented as "The date and time, in JavaScript date format, when the pull through cache rule was last updated." Recorded behavior: for a rule just created by CreatePullThroughCacheRule and never passed to UpdatePullThroughCacheRule, both the Create response and DescribePullThroughCacheRules carry ecrRepositoryPrefix, registryId, upstreamRegistryUrl, upstreamRepositoryPrefix and createdAt and carry NO updatedAt member at all; the member appears only once the rule has actually been updated.
+Emulator: CreatePullThroughCacheRule's own response is correct (no updatedAt), but DescribePullThroughCacheRules adds updatedAt to every rule, set to the rule's creation instant — the two rules in the failing check come back with updatedAt values a few milliseconds apart from their createdAt. The timestamps themselves are per-run values; the defect is that the member is present on a never-updated rule.
+Why: a client that uses updatedAt to detect configuration change (idempotent reconciliation, drift detection, "has this rule been retargeted since I cached it") sees every rule as modified, and cannot distinguish a freshly created rule from one whose credential or prefix was changed. The read-back of Create therefore does not agree with the read-back of Describe for the same rule.
+Fix: the projection used by the DescribePullThroughCacheRules handler / the pull-through-cache rule state — updatedAt must stay unset until UpdatePullThroughCacheRule mutates the rule, instead of being seeded from createdAt.
+Traces: ecr.pull-through-cache-rule-upstream-repository-prefix-read-back.
+
+Cause 2 of 2: ValidatePullThroughCacheRule only checks that the credential secret is readable, never that it authenticates upstream, so a rule bound to an existing secret holding bogus credentials validates as good.
+AWS: Smithy: ValidatePullThroughCacheRuleResponse{ecrRepositoryPrefix, registryId, upstreamRegistryUrl, credentialArn, customRoleArn, upstreamRepositoryPrefix, isValid (boolean, default false), failure}; isValid is documented as true only "If Amazon ECR was able to reach the upstream registry and authentication was successful", with `failure` naming the cause otherwise. Recorded behavior: for a docker-hub rule (upstreamRegistryUrl registry-1.docker.io) whose credentialArn names an existing ecr-pullthroughcache/ secret whose username/password are not valid Docker Hub credentials, ValidatePullThroughCacheRule answers HTTP 200 with isValid=false and failure containing UPSTREAM_REGISTRY_ACCESS_DENIED (and no UNABLE_TO_ACCESS_SECRET, since the secret is readable). A credential-free ECR Public rule validates isValid=true.
+Emulator: after UpdatePullThroughCacheRule rebinds the rule to a freshly created, readable secret holding bogus credentials, ValidatePullThroughCacheRule answers HTTP 200 with isValid=true and failure='' — the secret's readability is the only thing evaluated, so validation never reaches the upstream-authentication verdict and the failure code never moves off the secret-access class.
+Why: ValidatePullThroughCacheRule is the documented pre-flight for a cache rule. A client is told the rule is good, then every pull through that prefix fails upstream with no diagnosis, and the operator has no way to tell "secret unreachable" from "credentials rejected by the upstream registry" — exactly the distinction the failure code exists to carry.
+Fix: the ValidatePullThroughCacheRule handler — after resolving credentialArn, evaluate the resolved credential against the upstream registry model and report isValid=false with failure UPSTREAM_REGISTRY_ACCESS_DENIED when the credential does not authenticate, reserving UNABLE_TO_ACCESS_SECRET for a secret that cannot be read.
+Traces: ecr.validate-pull-through-cache-rule-secret-not-found-rejected.
+
+## Evidence
+Cause 1 — ecr.pull-through-cache-rule-upstream-repository-prefix-read-back, AssertionError: "expected DescribePullThroughCacheRules to return both rules as created, got {'<named-prefix>': {'ecrRepositoryPrefix': '<named-prefix>', 'upstreamRegistryUrl': 'public.ecr.aws', 'registryId': '<account>', 'upstreamRepositoryPrefix': 'docker', 'updatedAt': datetime(...)}, '<root-prefix>': {..., 'upstreamRepositoryPrefix': 'ROOT', 'updatedAt': datetime(...)}}". Expected per rule (createdAt excluded by the check): {ecrRepositoryPrefix, registryId, upstreamRegistryUrl, upstreamRepositoryPrefix} and NO updatedAt. The same two rules came back correctly, without updatedAt, from CreatePullThroughCacheRule moments earlier (that assertion passed). Prefix names, account id and timestamps are per-run values.
+
+Cause 2 — ecr.validate-pull-through-cache-rule-secret-not-found-rejected, AssertionError: "expected a bogus-but-accessible credential to still fail upstream auth: {'ecrRepositoryPrefix': '<prefix>', 'registryId': '<account>', 'upstreamRegistryUrl': 'registry-1.docker.io', 'credentialArn': 'arn:aws:secretsmanager:<region>:<account>:secret:ecr-pullthroughcache/<name>', 'isValid': True, 'failure': '', 'ResponseMetadata': {'HTTPStatusCode': 200}}". Expected: HTTP 200, isValid=false, failure containing UPSTREAM_REGISTRY_ACCESS_DENIED and not containing UNABLE_TO_ACCESS_SECRET. The preceding legs passed: with the credential secret deleted the emulator does report isValid=false / UNABLE_TO_ACCESS_SECRET, and UpdatePullThroughCacheRule did persist the new credentialArn.
+
+## Steps to Reproduce
+Cause 1: ecr.create_pull_through_cache_rule(ecrRepositoryPrefix=P, upstreamRegistryUrl='public.ecr.aws', upstreamRepositoryPrefix='ROOT') — note the response has no updatedAt — then ecr.describe_pull_through_cache_rules(ecrRepositoryPrefixes=[P]) and inspect the returned rule: updatedAt is present although the rule was never updated.
+
+Cause 2: secretsmanager.create_secret(Name='ecr-pullthroughcache/<n>', SecretString='{"username":"bogus","accessToken":"bogus"}'); ecr.create_pull_through_cache_rule(ecrRepositoryPrefix=P, upstreamRegistryUrl='registry-1.docker.io', upstreamRegistry='docker-hub', credentialArn=<that secret ARN>); ecr.validate_pull_through_cache_rule(ecrRepositoryPrefix=P) — the emulator answers isValid=true/failure='' where AWS answers isValid=false with failure UPSTREAM_REGISTRY_ACCESS_DENIED. (Reached in the check by first deleting the original secret, validating, then UpdatePullThroughCacheRule onto the readable bogus secret.)
