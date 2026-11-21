@@ -182,6 +182,10 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # `GetGroupsForCapacityReservation` reports off it.
 # TEST-ONLY — `src/` reaches that service over the in-process callback instead.
 service-com-amazonaws-resourcegroups-ardi = { workspace = true }
+# Builds the real certificate, chain and key the Client VPN export suite imports into ACM, so
+# the material the exported configuration file embeds is a certificate something other than the
+# code under test produced. TEST-ONLY.
+rcgen = "0.13"
 
 [lints]
 workspace = true

@@ -13526,6 +13526,7 @@ dependencies = [
  "md-5 0.10.6",
  "pkcs1",
  "pkcs8 0.10.2",
+ "rcgen",
  "roxmltree",
  "serde_json",
  "service-com-amazonaws-acm-certificatemanager",

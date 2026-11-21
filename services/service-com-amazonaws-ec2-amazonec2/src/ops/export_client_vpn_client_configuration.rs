@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportClientVpnClientConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportClientVpnClientConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportClientVpnClientConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +129,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportClientVpnClientConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportClientVpnClientConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportClientVpnClientConfiguration"))
+        use crate::state;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`ExportClientVpnClientConfigurationRequest$DryRun`). That is a PERMISSION check and
+        // nothing else: every caller of this emulator is permitted, so a dry run reports that
+        // outcome FIRST and reads nothing — not the endpoint the request names.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "The ID of the Client VPN endpoint"
+        // (`ExportClientVpnClientConfigurationRequest$ClientVpnEndpointId`) is modelled
+        // `@required` AND `@clientOptional`, so a request that leaves it out reaches this
+        // handler rather than being refused at the boundary: an absent parameter is reported
+        // as the parameter it left out, in the one sentence this crate answers for an absent
+        // required member.
+        let endpoint_id = input.client_vpn_endpoint_id.as_str();
+        if endpoint_id.is_empty() {
+            return Err(state::missing_required_parameter("ClientVpnEndpointId"));
+        }
+
+        // The Region the request was signed for: the endpoint's DNS name names it, and the
+        // credential scope is the only thing a request says about the Region it is asking in.
+        let region = state::request_region(ctx.parts());
+
+        // A pure READ of one endpoint. The configuration is derived from what the store holds
+        // for it, so two exports of one unchanged endpoint hand back the same file; the guard
+        // is released before the certificate below is resolved, so no lock is held across a
+        // call into another service.
+        let endpoint = {
+            let state_handle = state::require_service_state(&*self.engine)?;
+            let store = state_handle.lock();
+            state::require_client_vpn_endpoint(&store, endpoint_id)?.clone()
+        };
+
+        // "The Client VPN endpoint configuration file includes the Client VPN endpoint and
+        // certificate information clients need to establish a connection with the Client VPN
+        // endpoint" (`ExportClientVpnClientConfiguration`). The certificate information is the
+        // chain of trust of the server certificate the endpoint presents, and that certificate
+        // is ACM's resource, so the chain is read from the service that holds it
+        // ([`crate::state::acm_certificate_chain`]) rather than written here: a file carries
+        // the certificate material the account really holds, or none at all.
+        let certificate_chain = match endpoint.server_certificate_arn.as_deref() {
+            None => None,
+            Some(certificate_arn) => {
+                state::acm_certificate_chain(ctx, &region, certificate_arn).await
+            }
+        };
+
+        Ok(ExportClientVpnClientConfigurationOutput {
+            client_configuration: Some(client_configuration(
+                &endpoint,
+                &region,
+                certificate_chain.as_deref(),
+            )),
+        })
     }
+}
+
+/// The OpenVPN `dev` the Client VPN endpoint configuration file names: a routed `tun`
+/// device, which is the one the AWS Client VPN Administrator Guide's own configuration file
+/// carries.
+const OPENVPN_DEVICE: &str = "tun";
+
+/// The data-channel cipher that file names, as the published configuration file carries it.
+const OPENVPN_CIPHER: &str = "AES-256-GCM";
+
+/// The logging verbosity that file names.
+const OPENVPN_VERBOSITY: u8 = 3;
+
+/// The configuration file `endpoint` is reached with, as
+/// `ExportClientVpnClientConfigurationResult$ClientConfiguration` carries it: the OpenVPN
+/// directives a client needs to establish a session with THIS endpoint
+/// (`ClientVpnEndpoint$VpnProtocol` is `openvpn`, the one protocol the model declares).
+///
+/// Every directive that names a value is read off the STORED endpoint, so a caller gets a
+/// file describing the endpoint the account holds rather than a fixed document: the transport
+/// protocol and the port it listens on, the DNS name clients dial it by, the chain of trust
+/// of the server certificate it presents (`<ca>`, absent when ACM holds no material for that
+/// certificate), and the credentials its authentication options demand — `auth-user-pass` for
+/// an endpoint that authenticates users against a directory, `auth-federate` and `auth-retry
+/// interact` for one that hands authentication to a SAML identity provider, and neither for an
+/// endpoint that authenticates a client by its certificate alone.
+///
+/// `region` is the Region the request asked in, used only for an endpoint the store holds no
+/// DNS name for, which is derived the one way this crate derives one
+/// ([`crate::state::client_vpn_endpoint_dns_name`]).
+fn client_configuration(
+    endpoint: &ClientVpnEndpoint,
+    region: &str,
+    certificate_chain: Option<&str>,
+) -> String {
+    let endpoint_id = endpoint
+        .client_vpn_endpoint_id
+        .as_deref()
+        .unwrap_or_default();
+    let dns_name = endpoint
+        .dns_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::state::client_vpn_endpoint_dns_name(endpoint_id, region));
+    let transport_protocol = endpoint
+        .transport_protocol
+        .as_deref()
+        .filter(|protocol| !protocol.is_empty())
+        .unwrap_or(crate::state::CLIENT_VPN_DEFAULT_TRANSPORT_PROTOCOL);
+    let vpn_port = endpoint
+        .vpn_port
+        .unwrap_or(crate::state::CLIENT_VPN_DEFAULT_PORT);
+
+    let mut lines: Vec<String> = vec![
+        "client".to_string(),
+        format!("dev {OPENVPN_DEVICE}"),
+        format!("proto {transport_protocol}"),
+        format!("remote {dns_name} {vpn_port}"),
+        "remote-random-hostname".to_string(),
+        "resolv-retry infinite".to_string(),
+        "nobind".to_string(),
+        "remote-cert-tls server".to_string(),
+        format!("cipher {OPENVPN_CIPHER}"),
+        format!("verb {OPENVPN_VERBOSITY}"),
+    ];
+    if let Some(chain) = certificate_chain {
+        lines.push(format!("<ca>\n{chain}\n</ca>"));
+    }
+    lines.push("reneg-sec 0".to_string());
+
+    // Which credentials a connecting client presents follows from what the endpoint
+    // authenticates against (`ClientVpnEndpoint$AuthenticationOptions`): a directory
+    // authenticates a USER, so the client prompts for a user name and password, while a SAML
+    // identity provider authenticates that user ITSELF, so the client hands authentication to
+    // the provider and asks again interactively rather than prompting for a password it would
+    // have nowhere to send. An endpoint that authenticates a client by its own certificate
+    // asks for neither.
+    let kinds: Vec<&str> = endpoint
+        .authentication_options
+        .iter()
+        .flatten()
+        .filter_map(|option| option.r#type.as_deref())
+        .collect();
+    if kinds.contains(&crate::state::CLIENT_VPN_AUTHENTICATION_FEDERATED) {
+        lines.push("auth-federate".to_string());
+        lines.push("auth-retry interact".to_string());
+    }
+    if kinds.contains(&crate::state::CLIENT_VPN_AUTHENTICATION_DIRECTORY_SERVICE) {
+        lines.push("auth-user-pass".to_string());
+    }
+
+    // A configuration FILE: every directive is one line, and the last one ends.
+    let mut configuration = lines.join("\n");
+    configuration.push('\n');
+    configuration
 }

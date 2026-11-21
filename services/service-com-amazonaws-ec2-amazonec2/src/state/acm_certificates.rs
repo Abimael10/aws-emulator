@@ -70,6 +70,53 @@ pub async fn acm_certificate_is_absent(
     }
 }
 
+/// The chain of trust ACM holds for `certificate_arn`, as that service hands it out — or
+/// `None` when it holds none.
+///
+/// "Certificates forming the requested certificate's chain of trust"
+/// (`acm:GetCertificate`'s `CertificateChain`) is the material a client needs to verify the
+/// certificate an EC2 resource presents, and ACM is the one record of it, so it is READ from
+/// that service exactly as [`acm_certificate_is_absent`] reads whether a certificate exists at
+/// all: over the emulator's in-process callback, signed in the emulator's name, with nothing
+/// cached and nothing written.
+///
+/// `None` for every answer that establishes no chain — a value that is not an ACM certificate
+/// ARN, a certificate that service holds none under, one it has not issued yet, or a call it
+/// did not answer — so a caller embeds the certificate material the account really holds or
+/// none at all, never material nobody issued.
+///
+/// Public certificate material only: `acm:GetCertificate` hands out the certificate and its
+/// chain, never the private key, so nothing secret passes through here.
+pub async fn acm_certificate_chain(
+    ctx: &OperationContext<'_>,
+    region: &str,
+    certificate_arn: &str,
+) -> Option<String> {
+    if !super::acm_certificate_arn_is_well_formed(certificate_arn) {
+        return None;
+    }
+    match client(ctx, region)
+        .get_certificate()
+        .certificate_arn(certificate_arn)
+        .send()
+        .await
+    {
+        Ok(answer) => answer
+            .certificate_chain()
+            .map(str::trim)
+            .filter(|chain| !chain.is_empty())
+            .map(str::to_string),
+        Err(error) => {
+            ::tracing::debug!(
+                certificate = %certificate_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the certificate manager handed out no chain of trust for the certificate"
+            );
+            None
+        }
+    }
+}
+
 /// The ACM client this service reads that service through: the AWS SDK driven over the
 /// emulator's own in-process transport, signing in the emulator's name — EC2 reads the
 /// certificate a request named with its own service principal.
