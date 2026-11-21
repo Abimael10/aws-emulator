@@ -1348,8 +1348,15 @@ pub fn instance_family_of(instance_type: &str) -> &str {
 /// The boundary's constraint walk reports a refused enum value as the value set it failed
 /// rather than as the shape that declared it, so the catalog IS how that type is recognised
 /// ([`is_caller_role_catalog`] records the rule in full). Keyed to the TYPE's catalog and not
-/// to the operation carrying it, so a launch, a Spot Instance request, a Spot Fleet pool and a
-/// launch template's own data are each refused an unpublished type in the same words.
+/// to the operation carrying it, so a launch, a Spot Instance request and a Spot Fleet pool are
+/// each refused an unpublished type in the same words.
+///
+/// The launch parameters a LAUNCH TEMPLATE holds are the one exception, and they are not
+/// refused here: a template stores PARAMETERS rather than placing anything, so an unpublished
+/// type is a finding on the write ([`launch_template_warning`]) and a refusal on the placement
+/// that tries to use it ([`unplaceable_instance_type`]). The member is taken off this walk
+/// where its shape is declared, and both halves are pinned together in
+/// `crate::service::launch_template_instance_types`.
 ///
 /// Compared as a SET rather than member by member in order: this catalog is the largest in the
 /// model, and [`offered_instance_types`] reports it sorted while the walk reports it in the
@@ -1366,6 +1373,25 @@ pub fn is_instance_type_catalog(allowed: &[String]) -> bool {
 /// value echoed back.
 pub fn instance_type_refusal_message(value: &str) -> String {
     format!("Invalid value '{}' for InstanceType.", echoed_resource_id(value))
+}
+
+/// Refuse a placement whose effective instance type the published catalog does not hold: HTTP
+/// 400 `InvalidParameterValue` with [`instance_type_refusal_message`] — or `None` when the
+/// type is one the catalog holds, and when there is no type to judge at all.
+///
+/// A request that names the type DIRECTLY is held to the catalog by the model's own value set,
+/// at the boundary, before any handler runs. A type that reaches a placement through a LAUNCH
+/// TEMPLATE is not: a template stores launch PARAMETERS rather than placing anything, so an
+/// unpublished type is a finding on the write that stored it ([`launch_template_warning`]) and
+/// this refusal on the placement that tries to use it — no instance of a type the catalog does
+/// not hold is ever placed. The ONE writer of that refusal, so a launch, a fleet and a Spot
+/// Fleet pool answer one code and one sentence for it, the same ones the boundary answers for a
+/// type a request named itself.
+pub fn unplaceable_instance_type<E>(instance_type: Option<&str>) -> Option<Scaffolded<E>> {
+    let instance_type = instance_type.filter(|instance_type| !instance_type.is_empty())?;
+    (!instance_type_is_modelled(instance_type)).then(|| {
+        Scaffolded::invalid_parameter_value(instance_type_refusal_message(instance_type))
+    })
 }
 
 /// EC2's error code for a request that names an instance type the catalog does not hold where

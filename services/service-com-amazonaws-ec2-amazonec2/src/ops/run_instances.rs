@@ -794,6 +794,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .instance_type
             .clone()
             .unwrap_or_else(|| DEFAULT_INSTANCE_TYPE.to_string());
+        // The type an instance is PLACED as has to be one the catalog holds. A launch that
+        // names it itself is held to that set by the model, but a type this launch took from
+        // a launch TEMPLATE reached here without passing it: a template stores launch
+        // PARAMETERS, so an instance type the catalog does not hold is a finding on the write
+        // that stored it (`crate::state::launch_template_warning`) and this refusal on the
+        // placement that tries to use it — through the ONE writer of that refusal
+        // ([`crate::state::unplaceable_instance_type`], which every placement of this service
+        // answers from), so a caller reads one code and one wording whichever way the type
+        // reached the launch.
+        if let Some(refusal) = crate::state::unplaceable_instance_type(Some(&instance_type)) {
+            return Err(refusal);
+        }
         // An instance type is offered per Availability Zone, not per Region: AWS does not
         // offer every type in every zone, so a launch into a zone that does not offer the
         // requested type is refused `Unsupported` rather than placed there. Asked against

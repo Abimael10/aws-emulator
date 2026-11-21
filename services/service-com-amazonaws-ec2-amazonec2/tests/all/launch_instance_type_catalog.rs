@@ -19,8 +19,10 @@
 //! so the table is read against that catalog rather than asserting a copy of it.
 //!
 //! The second table is the same rule at the OTHER calls that name the instance type an
-//! instance will be placed as — a Spot Instance request, a Spot Fleet pool and a launch
-//! template — so the catalog is one catalog rather than one per operation.
+//! instance will be placed as — a Spot Instance request and a Spot Fleet pool — so the
+//! catalog is one catalog rather than one per operation. A launch-template WRITE is not one
+//! of them: it places nothing, so an unpublished type there is a finding of the response's
+//! `warning` rather than a refusal (`launch_template_unpublished_instance_type`).
 
 use ec2::state::ComAmazonawsEc2Amazonec2State as Ec2State;
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -170,8 +172,12 @@ async fn a_launch_is_held_to_the_published_instance_type_catalog() {
 }
 
 /// Every other call that names the instance type an instance will be PLACED as is held to the
-/// same catalog: a Spot Instance request's launch specification, one pool of a Spot Fleet
-/// request, and the launch template data every launch made from a template carries.
+/// same catalog: a Spot Instance request's launch specification and one pool of a Spot Fleet
+/// request.
+///
+/// A launch-template write is deliberately absent: it stores launch PARAMETERS instead of
+/// placing an instance, so the same value earns a finding on a 200 there
+/// (`super::launch_template_unpublished_instance_type`).
 #[tokio::test]
 async fn every_call_that_places_an_instance_is_held_to_the_same_catalog() {
     /// A value outside the catalog, whichever call names it.
@@ -206,13 +212,6 @@ async fn every_call_that_places_an_instance_is_held_to_the_same_catalog() {
                     "SpotFleetRequestConfig.LaunchSpecifications.1.InstanceType",
                     named,
                 ),
-            ]
-        }),
-        ("the data of a launch template", "CreateLaunchTemplate", |named| {
-            vec![
-                p("LaunchTemplateName", format!("template-for-{named}")),
-                p("LaunchTemplateData.ImageId", AMI),
-                p("LaunchTemplateData.InstanceType", named),
             ]
         }),
     ];

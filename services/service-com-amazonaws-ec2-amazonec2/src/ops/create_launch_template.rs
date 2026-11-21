@@ -16,6 +16,12 @@
 //! from it could ever find
 //! ([`crate::state::ComAmazonawsEc2Amazonec2State::rejected_ssm_image_alias`]).
 //!
+//! An `InstanceType` the published catalog does not hold is kept as given as well, and
+//! REPORTED: a template is a set of launch parameters rather than a launch, so such a type is
+//! one of the findings the response's `Warning` carries
+//! ([`crate::state::launch_template_warning`]) and the launch that tries to use it is what
+//! refuses it.
+//!
 //! A name is refused unless the modelled `LaunchTemplateName` can carry it, and a name the
 //! account already holds a template under is refused with
 //! `InvalidLaunchTemplateName.AlreadyExistsException`: a name resolves one template for

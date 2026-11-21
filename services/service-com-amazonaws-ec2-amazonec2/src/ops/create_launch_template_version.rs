@@ -9,7 +9,11 @@
 //! template's DEFAULT version is left where it is — a new version is not the default one
 //! until something makes it so. The version keeps the launch parameters as given, an
 //! `ImageId` naming a Systems Manager parameter included: that "will resolve to an AMI ID on
-//! launch", so it is stored unresolved and read by the launch alone.
+//! launch", so it is stored unresolved and read by the launch alone. An `InstanceType` the
+//! published catalog does not hold is kept too, and reported as one of the findings the
+//! response's `Warning` carries ([`crate::state::launch_template_warning`]): a version is a
+//! set of launch parameters rather than a launch, so the launch that tries to use such a type
+//! is what refuses it.
 //!
 //! ## Shape of an operation
 //!

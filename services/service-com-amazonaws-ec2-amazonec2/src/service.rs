@@ -137,6 +137,11 @@ pub mod required_boolean_parameters;
 /// made against.
 pub mod parameter_refusals;
 
+/// Why this front door does NOT judge a launch template's instance type at the boundary, and
+/// where that value is judged instead: the one member of this model whose modelled value set
+/// the dispatch walk is told to leave alone, pinned so neither half can drift.
+pub mod launch_template_instance_types;
+
 /// The `com-amazonaws-ec2-amazonec2` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

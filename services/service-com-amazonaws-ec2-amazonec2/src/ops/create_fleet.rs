@@ -989,6 +989,19 @@ fn resolve_pools(
                     image_id: Some(&image_id),
                 },
             );
+            // The type this pool's instances are PLACED as has to be one the catalog holds.
+            // An override names it on this request, where the model's own value set holds it
+            // to the catalog, but a type the pool took from the template VERSION reached here
+            // without passing it: a template stores launch PARAMETERS, so such a type is a
+            // finding on the write that stored it and a refusal on every placement that tries
+            // to use it — through the one writer of that refusal, which the launch and the
+            // Spot Fleet pools answer from as well, so no fleet reports an instance of a type
+            // that does not exist.
+            if let Some(refusal) =
+                crate::state::unplaceable_instance_type(launch.instance_type.as_deref())
+            {
+                return Err(refusal);
+            }
             // A configuration that gave no overrides reports none: the pool IS the template
             // version, so there is nothing an override replaced in it.
             let reported_override = over.is_some().then(|| override_view.clone());

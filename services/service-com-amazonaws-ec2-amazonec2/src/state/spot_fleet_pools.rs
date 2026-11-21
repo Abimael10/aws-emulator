@@ -151,8 +151,20 @@ pub fn spot_fleet_template_pools<E>(
             }
             let pool_price = over.and_then(|over| over.spot_price.clone());
             validate_hourly_price("spotPrice", pool_price.as_deref())?;
+            let launch = spot_fleet_launch_from_template(&launch_data, over);
+            // The type this pool's instances are PLACED as has to be one the catalog holds.
+            // An override names it on the request, where the model's own value set holds it to
+            // the catalog, but a type the pool took from the template VERSION reached here
+            // without passing it: a template stores launch PARAMETERS, so such a type is a
+            // finding on the write that stored it and a refusal on every placement that tries
+            // to use it — through the one writer of that refusal
+            // ([`unplaceable_instance_type`], which the launch and the fleet answer from as
+            // well), so no pool ever holds an instance of a type that does not exist.
+            if let Some(refusal) = unplaceable_instance_type(launch.instance_type.as_deref()) {
+                return Err(refusal);
+            }
             pools.push(SpotFleetPoolPlacement {
-                launch: spot_fleet_launch_from_template(&launch_data, over),
+                launch,
                 weighted_capacity: spot_fleet_pool_weighted_capacity(
                     over.and_then(|over| over.weighted_capacity),
                 )?,

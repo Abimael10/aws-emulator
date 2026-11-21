@@ -10,13 +10,21 @@
 //! and reported back as a finding instead of being refused — the launch that tries to use it
 //! is what refuses it.
 //!
+//! An instance type the published catalog does not hold is one such parameter: the type an
+//! instance launched from the template would be placed as is resolved when a launch is made,
+//! so a write that names a type this service publishes no record of stores the parameters and
+//! reports the type as a finding instead of refusing the write.
+//!
 //! Both creates answer from here, so the two cannot report one template's parameters
 //! differently, and the findings sit beside the other readings of a version's parameters
 //! this store makes (`super::launch_template_security_groups`).
 
 use crate::ops::types::{RequestLaunchTemplateData, ValidationError, ValidationWarning};
 
-use super::{iam_held_instance_profile, INVALID_PARAMETER_COMBINATION};
+use super::{
+    iam_held_instance_profile, instance_type_is_modelled, nonexistent_instance_types_message,
+    INVALID_INSTANCE_TYPE, INVALID_PARAMETER_COMBINATION,
+};
 
 /// The error code a reference to an IAM instance profile the account does not hold carries:
 /// EC2's own code for a profile that is not there.
@@ -49,6 +57,18 @@ pub fn launch_template_warning<Eng: Send + Sync + 'static>(
     data: &RequestLaunchTemplateData,
 ) -> Option<ValidationWarning> {
     let mut errors: Vec<ValidationError> = Vec::new();
+    if let Some(instance_type) = unpublished_instance_type(data) {
+        errors.push(ValidationError {
+            // EC2's own code for an instance type that does not exist
+            // ([`INVALID_INSTANCE_TYPE`]), in the sentence it words every answer about
+            // supplied types the catalog does not hold with
+            // ([`nonexistent_instance_types_message`]) — so a client reads one code and one
+            // wording whether it asked the catalog about the type or named it as a launch
+            // parameter a template keeps.
+            code: Some(INVALID_INSTANCE_TYPE.to_string()),
+            message: Some(nonexistent_instance_types_message(&[instance_type])),
+        });
+    }
     if !security_groups_are_part_of_the_network_interface(data) {
         errors.push(ValidationError {
             // "The error code that indicates why the parameter or parameter combination is
@@ -69,6 +89,27 @@ pub fn launch_template_warning<Eng: Send + Sync + 'static>(
     (!errors.is_empty()).then_some(ValidationWarning {
         errors: Some(errors),
     })
+}
+
+/// The instance type this template names that the published catalog does not hold, or `None`
+/// when it names one the catalog holds or names none at all.
+///
+/// "The instance type" (`RequestLaunchTemplateData$InstanceType`) is the type an instance
+/// launched from the template would be placed as, and which types EXIST is the catalog's own
+/// answer ([`instance_type_is_modelled`], the one reading of it every operation of this
+/// service that resolves a type takes) rather than a list kept here. A template is a set of
+/// launch parameters, so a type the catalog does not hold is a finding on the write and a
+/// refusal on the launch that tries to use it.
+///
+/// A value with no text names no type: ec2Query carries an omitted member and an empty one
+/// identically, which is a template that says nothing about an instance type rather than one
+/// naming a type that does not exist.
+fn unpublished_instance_type(data: &RequestLaunchTemplateData) -> Option<String> {
+    let instance_type = data
+        .instance_type
+        .as_deref()
+        .filter(|instance_type| !instance_type.is_empty())?;
+    (!instance_type_is_modelled(instance_type)).then(|| instance_type.to_string())
 }
 
 /// Whether this template's security groups are where a template that declares a network
