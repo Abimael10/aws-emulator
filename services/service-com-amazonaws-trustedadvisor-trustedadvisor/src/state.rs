@@ -64,6 +64,15 @@
 //! ([`foreign_resource_refusal`]): no support plan grants an account access to
 //! another account's resources.
 //!
+//! The store also holds the secret its paginated reads authenticate their
+//! cursors under ([`PageTokenKey`], drawn from the system's randomness when the
+//! store is built). A continuation token carries the position it names INSIDE
+//! itself, so without that authenticator any value of a token's shape would
+//! name some position in the sequence and a caller could resume from a position
+//! the service never offered; with it, [`decode_token`] answers a key only for a
+//! token THIS store minted for THAT read's scope, and every other value is a
+//! [`MalformedToken`] the handler refuses.
+//!
 //! The one rule a lifecycle update applies to a stored recommendation lives
 //! here as well — [`apply_lifecycle_update`], with the guard
 //! [`lifecycle_update_conflict`] ahead of it — because the account-level
@@ -116,6 +125,12 @@ use crate::ops::types::{
     RecommendationCostOptimizingAggregates, RecommendationPillarSpecificAggregates,
     RecommendationResourceSummary, RecommendationResourcesAggregates, RecommendationSummary,
 };
+
+/// The secret a paginated read of this service authenticates its cursors under,
+/// so a value a caller assembled is told from one this store issued. The
+/// workspace's one reading of a page token, re-exported so this crate's
+/// pagination helpers and the tests that drive them name one type.
+pub use ::service_common::page_tokens::PageTokenKey;
 
 /// What this service answers a caller whose account's support plan does not
 /// include the Trusted Advisor API: the support-level gate's refusal, carried by
@@ -1335,6 +1350,19 @@ pub struct ComAmazonawsTrustedadvisorTrustedadvisorState {
     /// it, which is both how a subscribed account is modelled and how the gate is
     /// observed.
     support_plan: SupportPlan,
+    /// The secret THIS store's page tokens are authenticated under, drawn from
+    /// the system's randomness when the store is built and never reported.
+    ///
+    /// What lets a paginated read tell a cursor it ISSUED from a value a caller
+    /// assembled: the position a token names travels inside the token, so
+    /// without an authenticator over it any value of the right shape would name
+    /// a position in the sequence (see [`encode_token`]). A token minted by
+    /// another store — another emulator process, a restarted one — is not one
+    /// this store issued either, and is refused for the same reason.
+    ///
+    /// [`PageTokenKey`]'s own `Debug` renders nothing of the secret, so this
+    /// state's derived `Debug` carries none of it.
+    page_token_key: PageTokenKey,
 }
 
 impl ComAmazonawsTrustedadvisorTrustedadvisorState {
@@ -1342,6 +1370,15 @@ impl ComAmazonawsTrustedadvisorTrustedadvisorState {
     /// a request on.
     pub fn support_plan(&self) -> SupportPlan {
         self.support_plan
+    }
+
+    /// The secret THIS store's page tokens are authenticated under.
+    ///
+    /// Handed back by value — [`PageTokenKey`] is `Copy` — so a paginated read
+    /// takes the key off the store and goes on to borrow the entries it is about
+    /// to report in the same call.
+    pub fn page_token_key(&self) -> PageTokenKey {
+        self.page_token_key
     }
 
     /// Record the support plan of the calling account, so the gate admits — or
@@ -1751,23 +1788,44 @@ pub fn list_scope(list: &str, filters: &[(&str, Option<&str>)]) -> String {
 }
 
 /// The cursor for a page of `scope` that ended on `last_key`: base64 of the
-/// scope and that key, so the token is opaque to a caller and carries no state
-/// of its own.
+/// scope and that key behind an AUTHENTICATOR this store computes under
+/// `token_key`, so the token is opaque to a caller and carries no state of its
+/// own.
 ///
-/// `scope` names the read the cursor belongs to (see [`list_scope`]), so a token
-/// cannot be replayed on a different list or filter set, where the same key
-/// would mean something else.
-pub fn encode_token(scope: &str, last_key: &str) -> String {
-    ::aws_smithy_types::base64::encode(format!("{scope}{TOKEN_SEPARATOR}{last_key}"))
+/// The position a continuation token names travels INSIDE the token — there is
+/// no page kept on the side to look it up in — so the scope and the key alone
+/// would make every value of that shape a position in some sequence, and a
+/// caller knows both halves: the scope is built from the request it sent, and
+/// the key is a stored id or ARN. The authenticator is the half it cannot
+/// produce ([`PageTokenKey`]), so a value it assembles is not a cursor this read
+/// issued and [`decode_token`] refuses it.
+///
+/// `scope` names the read the cursor belongs to (see [`list_scope`]) and is
+/// authenticated together with the key, so a token cannot be replayed on a
+/// different list or filter set, where the same key would mean something else.
+pub fn encode_token(token_key: &PageTokenKey, scope: &str, last_key: &str) -> String {
+    ::aws_smithy_types::base64::encode(
+        token_key.mint(&format!("{scope}{TOKEN_SEPARATOR}{last_key}")),
+    )
 }
 
 /// The key a cursor points at, or [`MalformedToken`] when the token is not one
-/// this service issued for `scope`.
-pub fn decode_token(scope: &str, token: &str) -> Result<String, MalformedToken> {
+/// this service issued for `scope`: a value that is not the base64 of a minted
+/// token, one whose authenticator does not match the bytes it travels with (so
+/// one this store did not mint, a value a caller assembled and one another store
+/// minted alike), one that carries no cursor, and one minted for another list or
+/// another filter set.
+pub fn decode_token(
+    token_key: &PageTokenKey,
+    scope: &str,
+    token: &str,
+) -> Result<String, MalformedToken> {
     let bytes =
         ::aws_smithy_types::base64::decode(token).map_err(|_| MalformedToken::new(token))?;
-    let decoded = String::from_utf8(bytes).map_err(|_| MalformedToken::new(token))?;
-    let (token_scope, key) = decoded
+    let minted = token_key
+        .cursor_of(&bytes)
+        .ok_or_else(|| MalformedToken::new(token))?;
+    let (token_scope, key) = minted
         .split_once(TOKEN_SEPARATOR)
         .ok_or_else(|| MalformedToken::new(token))?;
     if token_scope != scope {
@@ -1782,16 +1840,20 @@ pub fn decode_token(scope: &str, token: &str) -> Result<String, MalformedToken> 
 /// `next_token` resumes strictly after the key it names, and the returned token
 /// is present only when entries remain — so a caller that follows the token
 /// until it is absent sees every entry exactly once. Both the token read and the
-/// token written carry `scope`, so a cursor is only accepted by the list that
-/// issued it.
+/// token written carry `scope` and are authenticated under this store's own
+/// secret `token_key`, so a cursor is only accepted by the list that issued it
+/// and only when THIS store issued it: a value a caller assembled names no
+/// position at all and is refused as a [`MalformedToken`], rather than resumed
+/// from as if the service had offered it.
 pub fn paginate<T>(
+    token_key: &PageTokenKey,
     scope: &str,
     entries: Vec<(String, T)>,
     next_token: Option<&str>,
     max_results: Option<i32>,
 ) -> Result<Page<T>, MalformedToken> {
     let after = match next_token {
-        Some(token) => Some(decode_token(scope, token)?),
+        Some(token) => Some(decode_token(token_key, scope, token)?),
         None => None,
     };
     // `maxResults` is already inside its modelled range when a handler runs;
@@ -1808,7 +1870,7 @@ pub fn paginate<T>(
     let truncated = remaining.len() > limit;
     let page: Vec<(String, T)> = remaining.into_iter().take(limit).collect();
     let next_token = match (truncated, page.last()) {
-        (true, Some((last_key, _))) => Some(encode_token(scope, last_key)),
+        (true, Some((last_key, _))) => Some(encode_token(token_key, scope, last_key)),
         _ => None,
     };
     Ok(Page {
@@ -2330,6 +2392,9 @@ impl Default for ComAmazonawsTrustedadvisorTrustedadvisorState {
             recommendation_resources: BTreeMap::new(),
             organization_recommendations: BTreeMap::new(),
             support_plan: seeded_support_plan(),
+            // One key per store, from the system's randomness: see
+            // [`PageTokenKey`].
+            page_token_key: PageTokenKey::new(),
         };
         for (index, row) in SEED.iter().enumerate() {
             let recommendation_id = format!("{}-recommendation", row.check_id);

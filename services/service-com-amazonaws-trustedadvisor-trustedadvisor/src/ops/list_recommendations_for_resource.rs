@@ -263,6 +263,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let state = state.lock();
+        // The secret this store authenticates its cursors under, taken off the
+        // store before the entries below are borrowed: it is what tells a
+        // `nextToken` this read issued from a value a caller assembled (see
+        // [`crate::state::encode_token`]).
+        let token_key = state.page_token_key();
 
         // Every stored recommendation resource whose AWS resource is the one
         // asked about, kept in recommendation-resource ARN order (the resource
@@ -316,6 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot resume another sequence. `language` is deliberately not part of
         // it: it changes no row and no order.
         let page = crate::state::paginate(
+            &token_key,
             &crate::state::list_scope(
                 &format!("recommendations-for-resource/{}", input.aws_resource_arn),
                 &[

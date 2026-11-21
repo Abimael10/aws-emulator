@@ -209,6 +209,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let state = state.lock();
+        // The secret this store authenticates its cursors under, taken off the
+        // store before the entries below are borrowed: it is what tells a
+        // `nextToken` this read issued from a value a caller assembled (see
+        // [`crate::state::encode_token`]).
+        let token_key = state.page_token_key();
 
         // Every filter is an equality (or membership) test against the stored
         // check; an absent filter matches every check.
@@ -234,6 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         let page = crate::state::paginate(
+            &token_key,
             &crate::state::list_scope(
                 "checks",
                 &[

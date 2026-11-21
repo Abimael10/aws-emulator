@@ -33,14 +33,28 @@
 //! Every message is read back through the SAME two readers
 //! `tests/all/refusal_sentence_one_builder.rs` parses the other two refusal paths with, so
 //! a handler wording its own envelope or its own clause skeleton has nothing to parse.
+//!
+//! WHICH values are not cursors is pinned here too, because the condition and the sentence
+//! are one answer: **a paginated read resumes only from a continuation token THIS store
+//! issued for THAT read, so every other value — one a caller assembled, one another store
+//! minted, one of this read's own cursors with a byte changed — is refused instead of being
+//! read as a position in the sequence.** The position a token names travels inside the
+//! token, so the value is told apart by an authenticator over that position and not by its
+//! shape: `no_value_but_a_cursor_this_store_issued_resumes_a_paginated_read` builds, for
+//! each of the seven reads, values carrying that read's OWN scope and keys of its own
+//! sequence, which is everything about a cursor a caller can read off the token it was
+//! handed.
 
 use serde_json::json;
-use service_com_amazonaws_trustedadvisor_trustedadvisor::state::SupportPlan;
+use service_com_amazonaws_trustedadvisor_trustedadvisor::state::{
+    service_state, PageTokenKey, SupportPlan,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::organization_recommendation_lifecycle::organization_recommendation_arn;
 use crate::recommendation_loop::{
-    call, emulator_on_plan, error_code, label, recommendation_arn, PRIORITIZED_CHECK_IDS,
+    call, emulator_on_plan, error_code, label, recommendation_arn, resource_arn,
+    PRIORITIZED_CHECK_IDS,
 };
 use crate::refusal_sentence_one_builder::{clause_parts, clauses_of, Clause};
 
@@ -378,6 +392,223 @@ async fn a_token_outside_the_modelled_length_is_the_frameworks_refusal_not_this_
             clauses[0].2, *requirement,
             "case {case}: expected the requirement {requirement:?}, got {:?}",
             clauses[0].2
+        );
+    }
+}
+
+/// What separates a cursor's scope from the key it points at. Written out here rather than
+/// shared with `src/state.rs`: this suite is a caller assembling values out of the halves a
+/// token it was handed reveals, not a second copy of the crate's encoding.
+const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// How many bytes of authenticator a minted token carries ahead of its cursor
+/// (`service_common::page_tokens::AUTHENTICATOR_BYTES`), so a row below can build a value
+/// with the SHAPE of a minted token without restating the width.
+const AUTHENTICATOR_BYTES: usize = ::service_common::page_tokens::AUTHENTICATOR_BYTES;
+
+/// A mounted emulator holding a SECOND entry everywhere a seeded read would otherwise hold
+/// one, so each of the seven paginated reads truncates at `maxResults=1` and hands back a
+/// cursor of its own.
+///
+/// Written straight into the store: Trusted Advisor models no operation that creates a
+/// check result, so a second finding or a second member account can only arrive from
+/// outside the API, exactly as the sibling suites write one.
+fn emulator_with_two_entries_in_every_read() -> MultiServiceRouter {
+    let (router, engine) = emulator_on_plan(SupportPlan::Business);
+    let state = service_state(&*engine).expect("the engine carries this service's state");
+    let mut state = state.lock();
+    let check = PRIORITIZED_CHECK_IDS[0];
+
+    // A second finding on the SAME AWS resource as the seeded one, so
+    // `ListRecommendationsForResource` on that resource's ARN has two rows to page: the
+    // flagged resource's ARN is derived from the stored resource's own Region, id and
+    // owner, so a copy carrying those unchanged answers to the same ARN.
+    let seeded = state
+        .recommendation_resources
+        .get(&resource_arn(check, "res-ec2-0001"))
+        .cloned()
+        .expect("the seeded store holds this check's first resource");
+    let mut second_finding = seeded.clone();
+    second_finding.id = "res-ec2-0009".to_string();
+    second_finding.arn = resource_arn(check, "res-ec2-0009");
+    state
+        .recommendation_resources
+        .insert(second_finding.arn.clone(), second_finding);
+
+    // A second member account recommendation under that check's organization
+    // recommendation, so `ListOrganizationRecommendationAccounts` has two rows to page.
+    let member = state
+        .recommendations
+        .get(&recommendation_arn(check))
+        .cloned()
+        .expect("the seeded store holds this check's recommendation");
+    let mut second_member = member.clone();
+    second_member.id = format!("{}-second", member.id);
+    second_member.arn = format!("{}-second", member.arn);
+    let second_member_arn = second_member.arn.clone();
+    state
+        .recommendations
+        .insert(second_member_arn.clone(), second_member);
+    state
+        .organization_recommendations
+        .get_mut(&organization_recommendation_arn(check))
+        .expect("the seeded store holds this check's organization recommendation")
+        .member_recommendation_arns
+        .push(second_member_arn);
+
+    drop(state);
+    router
+}
+
+/// The bytes a `nextToken` carries, base64-decoded.
+fn token_bytes(case: &str, token: &str) -> Vec<u8> {
+    aws_smithy_types::base64::decode(token).unwrap_or_else(|_| {
+        panic!("case {case}: expected a cursor this read issued to be base64, got {token:?}")
+    })
+}
+
+/// The scope and the key the cursor inside an issued token names.
+///
+/// A minted token is the authenticator followed by the cursor itself — a continuation token
+/// is opaque, not confidential — so both halves are readable here. That is the point: every
+/// value forged below carries the read's own scope and a key of its own sequence, so the
+/// only thing it lacks is the authenticator, which is exactly what a caller cannot produce.
+fn cursor_of(case: &str, token: &str) -> (String, String) {
+    let bytes = token_bytes(case, token);
+    assert!(
+        bytes.len() > AUTHENTICATOR_BYTES,
+        "case {case}: expected a cursor behind an authenticator of {AUTHENTICATOR_BYTES} \
+         bytes, got {} bytes",
+        bytes.len()
+    );
+    let cursor = String::from_utf8(bytes[AUTHENTICATOR_BYTES..].to_vec())
+        .unwrap_or_else(|_| panic!("case {case}: the cursor behind the authenticator is not text"));
+    let (scope, key) = cursor.split_once(CURSOR_SEPARATOR).unwrap_or_else(|| {
+        panic!("case {case}: expected a cursor of a scope and a key, got {cursor:?}")
+    });
+    (scope.to_string(), key.to_string())
+}
+
+/// A `nextToken` a caller assembles out of `authenticator`, a scope and a key: the whole
+/// encoding of a cursor except the one half it cannot compute.
+fn assembled(authenticator: &[u8], scope: &str, key: &str) -> String {
+    let cursor = format!("{scope}{CURSOR_SEPARATOR}{key}");
+    aws_smithy_types::base64::encode([authenticator, cursor.as_bytes()].concat())
+}
+
+#[tokio::test]
+async fn no_value_but_a_cursor_this_store_issued_resumes_a_paginated_read() {
+    let router = emulator_with_two_entries_in_every_read();
+    // A key of another store — another emulator process, a restarted one — whose cursors
+    // are not cursors this store issued either.
+    let another_store = PageTokenKey::new();
+
+    for (operation, base) in paginated_reads() {
+        // This read's own first page, truncated to one entry so it hands back a cursor,
+        // and the scope and key that cursor names.
+        let (status, page) = call(&router, "GET", &format!("{base}?maxResults=1"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {operation}: expected 200 from the issuing read, got {status} with {page}"
+        );
+        let issued = page["nextToken"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {operation}: expected a nextToken on a truncated page, got {page}")
+            })
+            .to_string();
+        let (scope, key) = cursor_of(operation, &issued);
+
+        // One of this read's own cursors with a single byte changed, in the authenticator
+        // and in the cursor alike.
+        let mut authenticator_changed = token_bytes(operation, &issued);
+        authenticator_changed[0] ^= 0x01;
+        let mut cursor_changed = token_bytes(operation, &issued);
+        let last = cursor_changed.len() - 1;
+        cursor_changed[last] ^= 0x01;
+
+        // Each row: how the value fails to be a cursor this store issued for this read, and
+        // the value. Rows differ along the KEY named (the one the read just offered, one
+        // before every entry, one between two of them, one past every entry), along the
+        // AUTHENTICATOR carried (none at all, all-zero, all-ones, another store's, one of
+        // this store's with a byte changed) and along where a changed byte sits.
+        let rows: Vec<(&str, String)> = vec![
+            (
+                "the read's own scope and the key it just offered, with no authenticator",
+                assembled(&[], &scope, &key),
+            ),
+            (
+                "the read's own scope and the empty key, with no authenticator",
+                assembled(&[], &scope, ""),
+            ),
+            (
+                "the read's own scope and a key between two entries, with no authenticator",
+                assembled(&[], &scope, &format!("{key}0")),
+            ),
+            (
+                "the read's own scope and a key past every entry, with no authenticator",
+                assembled(&[], &scope, "zzzzzzzz"),
+            ),
+            (
+                "the shape of a minted token, all-zero authenticator",
+                assembled(&[0_u8; AUTHENTICATOR_BYTES], &scope, &key),
+            ),
+            (
+                "the shape of a minted token, all-ones authenticator",
+                assembled(&[0xff_u8; AUTHENTICATOR_BYTES], &scope, &key),
+            ),
+            (
+                "a cursor another store minted for this very read",
+                aws_smithy_types::base64::encode(
+                    another_store.mint(&format!("{scope}{CURSOR_SEPARATOR}{key}")),
+                ),
+            ),
+            (
+                "this read's own cursor with one byte of its authenticator changed",
+                aws_smithy_types::base64::encode(&authenticator_changed),
+            ),
+            (
+                "this read's own cursor with one byte of its cursor changed",
+                aws_smithy_types::base64::encode(&cursor_changed),
+            ),
+        ];
+
+        for (what, token) in &rows {
+            let case = format!("{operation} with {what}");
+            // Inside the modelled `@length(4, 10000)`, so the refusal reached is the
+            // handler's own and not the framework's constraint walk.
+            let length = token.chars().count();
+            assert!(
+                (4..=10_000).contains(&length),
+                "case {case}: expected a value the model admits, got one of {length} \
+                 characters"
+            );
+            let clauses = refused_clauses(
+                &router,
+                &case,
+                &format!("{base}?maxResults=1&nextToken={}", label(token)),
+            )
+            .await;
+            assert_eq!(
+                clauses,
+                vec![token_clause(token)],
+                "case {case}: expected one clause about {TOKEN_MEMBER}, got {clauses:?}"
+            );
+        }
+
+        // And the cursor this read DID issue still resumes it: authenticating a token
+        // refuses none of the positions the service itself offered.
+        let (status, resumed) = call(
+            &router,
+            "GET",
+            &format!("{base}?maxResults=1&nextToken={}", label(&issued)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {operation}: expected the issued cursor to resume the read, got {status} \
+             with {resumed}"
         );
     }
 }

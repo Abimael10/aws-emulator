@@ -270,6 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let state = state.lock();
+        // The secret this store authenticates its cursors under, taken off the
+        // store before the entries below are borrowed: it is what tells a
+        // `nextToken` this read issued from a value a caller assembled (see
+        // [`crate::state::encode_token`]).
+        let token_key = state.page_token_key();
 
         // The eight filters this read cuts on, and the ONE predicate they
         // select a stored recommendation with — the same one the account-level
@@ -306,6 +311,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // named and ordered once, beside the predicate. The list name is this
         // read's own, so neither listing's token resumes the other.
         let page = crate::state::paginate(
+            &token_key,
             &filters.scope("organizationRecommendations"),
             matching,
             input.next_token.as_deref(),

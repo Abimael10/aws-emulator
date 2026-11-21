@@ -220,6 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let state = state.lock();
+        // The secret this store authenticates its cursors under, taken off the
+        // store before the entries below are borrowed: it is what tells a
+        // `nextToken` this read issued from a value a caller assembled (see
+        // [`crate::state::encode_token`]).
+        let token_key = state.page_token_key();
 
         if !state
             .recommendations
@@ -259,6 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so a token issued for one recommendation's resources (or under another
         // filter set) cannot resume another sequence.
         let page = crate::state::paginate(
+            &token_key,
             &crate::state::list_scope(
                 &format!("resources/{}", input.recommendation_identifier),
                 &filters.scope(),
