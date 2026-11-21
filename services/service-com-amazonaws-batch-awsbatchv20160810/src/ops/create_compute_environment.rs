@@ -14,6 +14,11 @@
 //! Amazon ECS answered with, which is what `DescribeComputeEnvironments` reports as
 //! `ecsClusterArn` (`state::ecs_cluster`).
 //!
+//! A MANAGED environment created with no `serviceRole` falls back to this account's Batch
+//! service-linked role, the substitution the `serviceRole` member's own doc states, and the
+//! role is stored on the environment so every later read reports the principal Batch assumes
+//! for it (`state::service_linked_role`).
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -285,6 +290,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let name = input.compute_environment_name.clone();
             let arn = batch::compute_environment_arn(&region, &name);
+            // The role Batch assumes for this environment: the one the request named, else
+            // this account's Batch service-linked role for an environment Batch MANAGES —
+            // the fallback this operation's own `serviceRole` documentation states, and the
+            // one that makes a managed environment always report the principal it runs as
+            // (`state::service_linked_role`).
+            let service_role = batch::created_service_role(&input.r#type, input.service_role);
             let uuid = store.new_uuid();
             let mut environment = batch::ComputeEnvironment {
                 name: name.clone(),
@@ -311,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `CreateComputeEnvironment` models no `updatePolicy`; only
                 // `UpdateComputeEnvironment` sets one.
                 update_policy: None,
-                service_role: input.service_role,
+                service_role,
                 eks_configuration: input.eks_configuration,
                 ecs_settings: input.ecs_settings,
                 context: input.context,

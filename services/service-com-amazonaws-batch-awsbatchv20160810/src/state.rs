@@ -112,6 +112,7 @@ mod job_logs;
 mod placement;
 mod queue_snapshot;
 mod service_job_dispatch;
+mod service_linked_role;
 mod share_selection;
 
 pub use array_jobs::*;
@@ -131,6 +132,7 @@ pub use job_logs::*;
 pub use placement::*;
 pub use queue_snapshot::*;
 pub use service_job_dispatch::*;
+pub use service_linked_role::*;
 
 use crate::ops::types::{
     AttemptContainerDetail, AttemptDetail, CapacityLimit, ClientException, ComputeEnvironmentOrder,
