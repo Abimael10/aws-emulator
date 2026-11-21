@@ -1759,9 +1759,7 @@ impl SourceApiAssociationRecord {
     ///
     /// Scheduling is all this does: the merge itself comes due one [`MERGE_SPAN`] later
     /// and [`Self::settle`] materialises it, exactly as the create that first scheduled
-    /// one does. One merge at a time: a call that arrives while the association still
-    /// owes one is refused below, so this never leaves two merges owed for one
-    /// association nor pushes an owed one out.
+    /// one does.
     ///
     /// The merge carries the types the source API holds, so it DEPENDS on a schema
     /// creation that API still owes: `source_schema_due` is that creation's due instant
@@ -1771,15 +1769,18 @@ impl SourceApiAssociationRecord {
     /// activity on that API cannot postpone an owed merge and leave the association
     /// non-terminal for as long as a caller keeps changing the source schema.
     ///
-    /// An association whose DELETION the clock still owes is being destroyed and has no
-    /// schema left to merge, and that deletion is a modification already in progress, so
-    /// the call is refused rather than overwriting the status the deletion left behind.
+    /// A merge the clock ALREADY owes this association is the very merge this call is
+    /// asking for, so the initiation COALESCES into it: nothing is scheduled a second
+    /// time, the owed due instant is not pushed out, and the answer is the non-terminal
+    /// status the association already carries ([`MERGE_SCHEDULED`]). One merge stays owed
+    /// at a time either way, and a caller that initiates a merge straight after the
+    /// create that scheduled one is answered the merge it asked for rather than a
+    /// conflict with itself.
     ///
-    /// A merge the clock still owes is likewise an operation on this association that is
-    /// already in progress: AppSync serializes an association's merges, so the call is
-    /// refused ([`ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE`]) while the association's
-    /// status is non-terminal rather than scheduling a second one. Once the association
-    /// has settled the same call is accepted.
+    /// An association whose DELETION the clock still owes is being destroyed and has no
+    /// schema left to merge, and that deletion is a modification that genuinely conflicts
+    /// with this one, so the call is refused rather than overwriting the status the
+    /// deletion left behind.
     pub fn start_merge(
         &mut self,
         now: SystemTime,
@@ -1791,9 +1792,7 @@ impl SourceApiAssociationRecord {
             ));
         }
         if self.merge_pending() {
-            return Err(AssociationRefusal::ConcurrentModification(
-                ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE.to_string(),
-            ));
+            return Ok(self.status.clone());
         }
         self.merge_due_at = Some(merge_due_instant(now, source_schema_due));
         self.status = MERGE_SCHEDULED.to_string();
@@ -3087,23 +3086,12 @@ pub fn merge_failed_detail(source_api_id: &str, association_id: &str, conflict: 
     )
 }
 
-/// The text `ConcurrentModificationException` (HTTP 409) carries for a merge initiated on
-/// an association that is still carrying one out.
-///
-/// Entirely fixed text: the sentence states that THIS association has an operation in
-/// progress, so it interpolates nothing of the request — which association is meant is
-/// what the caller addressed.
-pub const ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE: &str =
-    "This association currently has an operation in progress, please wait until that is \
-     complete";
-
 /// How long after an association is created the merge it scheduled comes due.
 ///
 /// A chosen span, inside the emulator's 250-750 ms band for a transition the clock
 /// owes: AppSync reports a new association in the non-terminal [`MERGE_SCHEDULED`]
-/// status, so the span is never zero — a caller reading or merging straight after the
-/// create still observes that status and the refusals that go with it
-/// ([`ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE`]). A merge that DEPENDS on a schema
+/// status, so the span is never zero — a caller reading straight after the create still
+/// observes that status, and one initiating a merge is answered it. A merge that DEPENDS on a schema
 /// creation the source API still owes takes one such span after that creation comes due
 /// ([`merge_due_instant`]). Nothing sleeps for it — the due instant is stored on the
 /// record and [`ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::settle_associations`]
