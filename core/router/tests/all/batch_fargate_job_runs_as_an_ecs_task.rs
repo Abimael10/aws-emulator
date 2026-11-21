@@ -16,9 +16,9 @@
 //! `startedAt`/`stoppedAt`, its attempt's `exitCode`, `reason`, `logStreamName` and
 //! `networkInterfaces` and its container's `exitCode` are the task's own. A task that never
 //! started a container reports why it did not; a container that produced no exit status at all
-//! leaves both the task and the job RUNNING — Amazon ECS stops a task for the EXIT of an
-//! essential container, and nothing of such a task exited — so no outcome is claimed for work
-//! nothing performed.
+//! produced no outcome for the job to report, and the detail the task reports for that
+//! container is the detail the job's attempt carries — the job `FAILED` with no exit code
+//! invented for it, because nothing performed its program.
 //!
 //! Sources: `smithy_query(query="operation",operation="DescribeJobs")` for `JobDetail`'s
 //! `status`, `statusReason`, `startedAt`, `stoppedAt`, `attempts` and `container`;
@@ -338,11 +338,10 @@ enum Ends {
     /// The container exited with this status, so the job carries it and the fixed AWS sentence
     /// for a task whose essential container exited.
     Exited(i64),
-    /// The container produced no exit status at all, so nothing ran it: the task it was
-    /// placed as goes on running — Amazon ECS stops a task for the EXIT of an essential
-    /// container, and no container of this one exited — so the job goes on running too and
-    /// claims no outcome for work nothing performed.
-    NothingRanIt,
+    /// The container produced no exit status at all, because this emulator performed none of
+    /// the program it declared: nothing ran it, so the job ends `FAILED` carrying the detail
+    /// the task reports for that container and no exit code at all.
+    NothingPerformedIt,
     /// The task never started a container, because it could not fetch its image.
     CouldNotFetchTheImage,
 }
@@ -385,7 +384,7 @@ fn rows() -> Vec<Row> {
             case: "a program the image holds",
             command: vec!["/opt/simparity/run", "--once"],
             reachable: true,
-            ends: Ends::NothingRanIt,
+            ends: Ends::NothingPerformedIt,
         },
         Row {
             // The boundary of the placement: a task whose subnet reaches no registry fetches
@@ -551,92 +550,6 @@ async fn until_terminal(router: &MultiServiceRouter, case: &str, job_id: &str) -
     }
 }
 
-/// How long the row whose container nothing performed watches its job: past the span in which
-/// Amazon ECS reports a standalone task whose essential container HAS exited as stopped
-/// (`state::CONTAINER_WORK_SPAN`), so a job that is ended without any container of its task
-/// having exited is observed ending rather than read once before it does.
-const WATCH_WINDOW: Duration = Duration::from_secs(6);
-
-/// Assert what a job whose container's declared program this emulator performs none of
-/// reports: the task it was placed as STARTED it, so the job is `RUNNING` — and it stays
-/// there, claiming no exit status and no end, because no container of that task exited and
-/// Amazon ECS stops a task for the exit of an essential container.
-async fn nothing_ran_it_claims_no_outcome(router: &MultiServiceRouter, case: &str, job_id: &str) {
-    // The job RAN: its attempt names the task, and the task is the one Amazon ECS holds.
-    let deadline = Instant::now() + DEADLINE;
-    let (task_arn, cluster) = loop {
-        let detail = described(router, case, job_id).await;
-        if let Some(arn) = detail["attempts"][0]["container"]["taskArn"].as_str() {
-            let cluster = arn
-                .split('/')
-                .nth(1)
-                .unwrap_or_else(|| panic!("case {case:?}: expected a task ARN, got {arn}"))
-                .to_string();
-            if detail["startedAt"].as_i64().is_some_and(|at| at > 0) {
-                break (arn.to_string(), cluster);
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the job never started as a task, last {detail}"
-        );
-        tokio::time::sleep(POLL_INTERVAL).await;
-    };
-
-    let until = Instant::now() + WATCH_WINDOW;
-    while Instant::now() < until {
-        tokio::time::sleep(POLL_INTERVAL).await;
-        let detail = described(router, case, job_id).await;
-        let status = detail["status"].as_str().unwrap_or_default().to_string();
-        assert_eq!(
-            status, "RUNNING",
-            "case {case:?}: a job whose container nothing performed goes on running, got \
-             {detail}"
-        );
-        for (where_, found) in [
-            ("the job", &detail["stoppedAt"]),
-            ("its attempt", &detail["attempts"][0]["stoppedAt"]),
-            ("the job's container", &detail["container"]["exitCode"]),
-            (
-                "the attempt's container",
-                &detail["attempts"][0]["container"]["exitCode"],
-            ),
-        ] {
-            assert!(
-                found.as_i64().is_none(),
-                "case {case:?}: expected no end on {where_}, got {found} in {detail}"
-            );
-        }
-    }
-
-    // And the same fact where Amazon ECS holds it: the task runs on, its container reports no
-    // exit status, and nothing stopped it.
-    let tasks = ecs(
-        router,
-        case,
-        "DescribeTasks",
-        &json!({"cluster": &cluster, "tasks": [&task_arn]}),
-    )
-    .await;
-    let task = tasks["tasks"][0].clone();
-    assert_eq!(
-        task["lastStatus"].as_str(),
-        Some("RUNNING"),
-        "case {case:?}: expected the task to go on running, got {task}"
-    );
-    for member in ["stopCode", "stoppedReason"] {
-        assert!(
-            task[member].is_null(),
-            "case {case:?}: expected no {member} on a task no container of which exited, got \
-             {task}"
-        );
-    }
-    assert!(
-        task["containers"][0]["exitCode"].is_null(),
-        "case {case:?}: expected no exitCode on a container nothing ran, got {task}"
-    );
-}
-
 /// RULE: a placed Fargate job runs as a task of its compute environment's Amazon ECS cluster,
 /// and the status, the instants and the attempt it reports are that task's own.
 #[tokio::test]
@@ -680,10 +593,6 @@ async fn a_placed_fargate_job_runs_as_a_task_of_its_compute_environments_cluster
 
     for (row, job_id) in rows.iter().zip(&submitted) {
         let case = row.case;
-        if row.ends == Ends::NothingRanIt {
-            nothing_ran_it_claims_no_outcome(&router, case, job_id).await;
-            continue;
-        }
         let detail = until_terminal(&router, case, job_id).await;
 
         // ONE attempt per placement, carrying the task the job was placed as.
@@ -737,9 +646,7 @@ async fn a_placed_fargate_job_runs_as_a_task_of_its_compute_environments_cluster
         let (expected_status, expected_exit) = match row.ends {
             Ends::Exited(0) => (SUCCEEDED, Some(0)),
             Ends::Exited(status) => (FAILED, Some(status)),
-            Ends::CouldNotFetchTheImage => (FAILED, None),
-            // Read above instead: such a job never ends, so it has no terminal record.
-            Ends::NothingRanIt => unreachable!("case {case:?}: read by its own assertions"),
+            Ends::CouldNotFetchTheImage | Ends::NothingPerformedIt => (FAILED, None),
         };
         assert_eq!(
             detail["status"].as_str(),
@@ -758,8 +665,13 @@ async fn a_placed_fargate_job_runs_as_a_task_of_its_compute_environments_cluster
                 "case {case:?}: a task that could not fetch its image reports the fetch failure \
                  naming the reference, got {reason:?}"
             ),
-            // Read above instead: such a job never ends, so it reports no reason for an end.
-            Ends::NothingRanIt => unreachable!("case {case:?}: read by its own assertions"),
+            // The detail the task reports for a container whose program nothing performed
+            // NAMES that program, which is the one the row declared.
+            Ends::NothingPerformedIt => assert!(
+                reason.contains(row.command[0]),
+                "case {case:?}: a job whose container's program nothing performed reports the \
+                 detail naming it, got {reason:?}"
+            ),
         }
 
         // The run's own members: the exit status the container produced, on the attempt and on

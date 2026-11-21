@@ -26,6 +26,14 @@
 //! reaches a health verdict, rather than a target set that churns between a draining
 //! address and a newly registering one.
 //!
+//! And the third rule: such a container does report one thing about its run —
+//! `Container$reason`, "a short (1024 max characters) human-readable string to provide
+//! additional details about a running or stopped container" — which says WHY no status came,
+//! naming the command nothing performed where there is one to name. It is the only account of
+//! that run there will be, which is what a client that placed the task (AWS Batch places one
+//! per job it runs) reads to learn that no outcome is coming; a container whose program really
+//! ended answered for itself, so it reports the status and no such detail.
+//!
 //! The rows span what the rule generalises over: WHICH part of a program is not performed —
 //! a utility the session has no program for (named directly in the vector and inside a shell
 //! program), an unsupported compound form, an unsupported assignment form — and where it sits
@@ -330,6 +338,189 @@ async fn a_program_this_container_does_not_perform_claims_no_exit_status() {
         for (row, arn) in &unperformed {
             let task = describe(&router, cluster, arn, row.case).await;
             claims_nothing(&task, row.case);
+        }
+    }
+}
+
+/// A command name far longer than a detail may carry, for the clipping row.
+const LONG_PROGRAM: &str =
+    "simparity-worker-with-a-name-that-keeps-going-well-past-anything-a-detail-about-one-run-\
+     could-sensibly-carry-and-then-some-more";
+
+/// How many bytes a detail about one run may come to. `Container$reason` is "a short (1024 max
+/// characters) human-readable string to provide additional details about a running or stopped
+/// container", and the `reason` AWS Batch reports for the attempt of a job running as the task
+/// is "a short (255 max characters)" one — so the tighter of the two is what every detail here
+/// has to fit, whatever the request declared. Spelled out rather than imported.
+const MAX_DETAIL_BYTES: usize = 255;
+
+/// One row of the DETAIL table: what the container declares, and what it must then report
+/// about the run as `Container$reason`.
+struct DetailRow {
+    case: &'static str,
+    /// The `command` the revision states, and `None` for one that states none — a container
+    /// whose program is the one inside its image.
+    command: Option<&'static [&'static str]>,
+    /// The word of the program the detail must NAME, where the thing nothing performed was a
+    /// command name; `None` where it was a form, which has no one name to report.
+    names: Option<&'static str>,
+    /// The status the run ended with, for the contrast row — which reports it and no detail.
+    exit_code: Option<i64>,
+}
+
+const DETAIL_ROWS: &[DetailRow] = &[
+    DetailRow {
+        case: "a vector naming a command the container has no program for",
+        command: Some(&["simparity-worker", "--once"]),
+        names: Some("simparity-worker"),
+        exit_code: None,
+    },
+    DetailRow {
+        // The bound on the variable part: the command name is a word a CALLER declared, so a
+        // long one is clipped and the detail still fits what the member documents — asserted
+        // for every row below ([`MAX_DETAIL_BYTES`]).
+        case: "a vector naming a command whose name is longer than the detail may carry",
+        command: Some(&[LONG_PROGRAM]),
+        names: Some("simparity-worker-with-a-name-that-keeps"),
+        exit_code: None,
+    },
+    DetailRow {
+        // The command is reached only after one that really ran, so what nothing performed is
+        // part of the way through the program rather than the whole of it.
+        case: "a shell program reaching a command the container has no program for",
+        command: Some(&["sh", "-c", "echo starting && simparity-step --now"]),
+        names: Some("simparity-step"),
+        exit_code: None,
+    },
+    DetailRow {
+        case: "a function definition, a form this container does not perform",
+        command: Some(&["sh", "-c", "greet() { echo hello; }; greet"]),
+        names: None,
+        exit_code: None,
+    },
+    DetailRow {
+        // The program that would run is the image's own entry point, which this emulator
+        // starts none of.
+        case: "a revision stating no command at all",
+        command: None,
+        names: None,
+        exit_code: None,
+    },
+    DetailRow {
+        // The contrast: a program that really ends answers for itself, so there is no
+        // additional detail about its run to report.
+        case: "a program that ends with a status of its own",
+        command: Some(&["sh", "-c", "echo leaving; exit 7"]),
+        names: None,
+        exit_code: Some(7),
+    },
+];
+
+/// Register one revision of `family` for a detail row, whose single essential container runs
+/// the row's `command` — and states none where the row states none.
+async fn register_detail_row(router: &MultiServiceRouter, family: &str, row: &DetailRow) {
+    let mut container = json!({
+        "name": "app",
+        "image": IMAGE,
+        "memory": 128,
+        "essential": true,
+    });
+    if let Some(command) = row.command {
+        container["command"] = json!(command);
+    }
+    ok(
+        router,
+        "RegisterTaskDefinition",
+        json!({ "family": family, "containerDefinitions": [container] }),
+        row.case,
+    )
+    .await;
+}
+
+/// Read one task again until its single container has something to say about its run — an
+/// `exitCode` or a `reason` — and answer that container.
+///
+/// Waiting for the CONDITION rather than for a span: the run of a container's program happens
+/// once its task is running, and what it leaves behind is what is asserted.
+async fn container_after_the_run(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    arn: &str,
+    case: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let task = describe(router, cluster, arn, case).await;
+        let containers = list(&task, "containers", case);
+        let container = containers
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a container, got {task}"))
+            .clone();
+        if present_count(&container, "exitCode", case).is_some()
+            || container["reason"].as_str().is_some()
+        {
+            return container;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the container never reported the end of its run, got {task}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: a container whose run produced NO exit status reports, as the additional detail about
+/// it (`Container$reason`, "a short (1024 max characters) human-readable string to provide
+/// additional details about a running or stopped container"), why it produced none — naming
+/// the command nothing performed where there is one — and a container whose program really
+/// ended reports the status instead and no such detail. The detail is the only account of such
+/// a run there will be, which is what a client that placed the task reads to learn that no
+/// outcome is coming.
+#[tokio::test]
+async fn a_run_that_produced_no_status_reports_the_detail_of_what_it_performed() {
+    let router = crate::ecs_wire::service();
+    let cluster = "rundetail";
+    cluster_with_capacity(&router, cluster, "runs that produced nothing").await;
+
+    // Every row's task is launched FIRST and read afterwards, so the runs happen together in
+    // the one emulator rather than one after another.
+    let mut launched: Vec<(&DetailRow, String)> = Vec::new();
+    for (index, row) in DETAIL_ROWS.iter().enumerate() {
+        let family = format!("rundetail{index}");
+        register_detail_row(&router, &family, row).await;
+        launched.push((row, run_task(&router, cluster, &family, row.case).await));
+    }
+
+    for (row, arn) in &launched {
+        let case = row.case;
+        let container = container_after_the_run(&router, cluster, arn, case).await;
+        let reported = present_count(&container, "exitCode", case);
+        let detail = container["reason"].as_str().map(str::to_string);
+        assert_eq!(
+            reported, row.exit_code,
+            "case {case:?}: expected exitCode {:?}, got {reported:?} in {container}",
+            row.exit_code
+        );
+        if row.exit_code.is_some() {
+            assert_eq!(
+                detail, None,
+                "case {case:?}: a run that answered for itself leaves no detail about it, got \
+                 {detail:?} in {container}"
+            );
+            continue;
+        }
+        let detail = detail.unwrap_or_else(|| {
+            panic!("case {case:?}: expected a detail about the run, got {container}")
+        });
+        assert!(
+            !detail.is_empty() && detail.len() <= MAX_DETAIL_BYTES,
+            "case {case:?}: expected a detail inside the member's own bound, got {detail:?}"
+        );
+        if let Some(named) = row.names {
+            assert!(
+                detail.contains(named),
+                "case {case:?}: expected the detail to name {named:?}, got {detail:?}"
+            );
         }
     }
 }

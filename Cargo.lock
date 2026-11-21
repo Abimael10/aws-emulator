@@ -10505,6 +10505,7 @@ dependencies = [
  "http",
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
+ "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-ecr-amazonec2containerregistry-v20150921",
  "service-com-amazonaws-ecrpublic-spencerfrontendservice",
  "service-com-amazonaws-ecs-amazonec2containerservicev20141113",

@@ -608,6 +608,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// from the container"; a job "reaches SUCCEEDED when its essential container exits 0"),
     /// `FAILED` for one that exited with anything else, and `FAILED` saying nothing started it
     /// for a container that produced no exit status at all.
+    ///
+    /// A job whose task is still RUNNING settles too once that task reports a container
+    /// DETAIL with no exit status beside it: such a container has produced the only account of
+    /// its run there will be, so the job's work is over and it reports `FAILED` carrying that
+    /// detail — rather than following, for ever, a task whose container owes it no status.
     fn record_task_report(&mut self, job_id: &str, report: &TaskReport, now: i64) {
         if self
             .jobs
@@ -641,6 +646,41 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             }
         }
         if !report.stopped() {
+            // The task is still running, but its container may already have produced
+            // everything it ever will. `Container$reason` is "a short human-readable string to
+            // provide additional details about a RUNNING or stopped container", and
+            // `AttemptContainerDetail$reason` is where AWS Batch reports that same detail for
+            // the attempt — so a container the task reports a detail for while reporting NO
+            // exit status has produced the only account of its run there will be: no exit
+            // status is owed by anything still running it. The job's work is over, so it is
+            // reported FAILED carrying that detail, with no exit code invented for a container
+            // that produced none — and the task it was placed as is stopped with the job, the
+            // way the task of any job that ends while running one is
+            // ([`Self::take_task_steps`]'s `Stop` step).
+            if report.exit_code.is_none() {
+                if let Some(detail) = report
+                    .container_reason
+                    .as_deref()
+                    .filter(|detail| !detail.is_empty())
+                    .map(str::to_string)
+                {
+                    // What the run DID produce is on the record before the end is written: the
+                    // interface the task reports its container was reached on is the attempt's,
+                    // exactly as it is for a container that exited ([`Self::record_task_report`]
+                    // below). No exit code is written: the container produced none.
+                    if let Some(job) = self.jobs.get_mut(job_id) {
+                        if let Some(attempt) = job.attempts.last_mut() {
+                            attempt.network_interfaces = report.network_interfaces.clone();
+                        }
+                        if let Some(container) = job.container.as_mut() {
+                            container.network_interfaces =
+                                Some(report.network_interfaces.clone());
+                        }
+                    }
+                    self.finish_job(job_id, JOB_FAILED, Some(&detail), now);
+                    return;
+                }
+            }
             // The task is still going, so the next read is owed — or the job's own attempt
             // deadline is, when that falls first ([`super::attempt_timeout`]).
             self.set_job_due_bounded_by_attempt_deadline(job_id, now + JOB_TASK_POLL_MILLIS);
@@ -1227,6 +1267,98 @@ mod tests {
                 job.next_phase_due_at, owed,
                 "case {case}: expected the clock to owe {owed:?}, got {job:?}"
             );
+        }
+    }
+
+    /// RULE: a job whose task is still RUNNING settles as soon as that task reports a container
+    /// DETAIL with no exit status beside it — such a container has produced the only account of
+    /// its run there will be — and goes on being read while the task has an outcome still to
+    /// produce.
+    #[test]
+    fn a_container_detail_with_no_exit_status_ends_the_job() {
+        /// What one row's read of the task found, and what the job must report after it.
+        struct Row {
+            case: &'static str,
+            /// `Container$exitCode`, which a container that produced no status has none of.
+            exit_code: Option<i32>,
+            /// `Container$reason`, the additional detail about the container.
+            container_reason: Option<&'static str>,
+            /// The `JobStatus` the job must be in after the read, and the `statusReason` it
+            /// must carry — `None` where the job must still be running.
+            settled: Option<(&'static str, &'static str)>,
+        }
+        // The rows differ along what the RUNNING task reports of its container: a detail with
+        // no status (the run produced nothing), no detail at all (the run is still to answer),
+        // and a detail beside a status the container really produced, which the stop of the
+        // task is what finalises.
+        let nothing_performed = "This emulator performs a container's declared program itself \
+                                 and provides no program named \"simparity-worker\".";
+        let rows: &[Row] = &[
+            Row {
+                case: "a detail with no exit status",
+                exit_code: None,
+                container_reason: Some(nothing_performed),
+                settled: Some((JOB_FAILED, nothing_performed)),
+            },
+            Row {
+                case: "no detail at all",
+                exit_code: None,
+                container_reason: None,
+                settled: None,
+            },
+            Row {
+                case: "an empty detail, which says nothing",
+                exit_code: None,
+                container_reason: Some(""),
+                settled: None,
+            },
+            Row {
+                case: "a detail beside an exit status the container produced",
+                exit_code: Some(0),
+                container_reason: Some("what the agent saw"),
+                settled: None,
+            },
+        ];
+        for row in rows {
+            let case = row.case;
+            let mut store = holding(placed(JOB_RUNNING, JobTaskDispatch::Running));
+            let report = TaskReport {
+                last_status: "RUNNING".to_string(),
+                started_at: Some(1_000),
+                exit_code: row.exit_code,
+                container_reason: row.container_reason.map(str::to_string),
+                ..TaskReport::default()
+            };
+            store.record_task_report("job-1", &report, 2_000);
+            let job = store.jobs.get("job-1").expect("the job is held");
+            match row.settled {
+                Some((status, reason)) => {
+                    assert_eq!(
+                        job.status, status,
+                        "case {case}: expected the job to settle {status}, got {job:?}"
+                    );
+                    assert_eq!(
+                        job.status_reason.as_deref(),
+                        Some(reason),
+                        "case {case}: expected the task's own detail as the end, got {job:?}"
+                    );
+                    assert_eq!(
+                        job.next_phase_due_at, None,
+                        "case {case}: a settled job owes the clock nothing, got {job:?}"
+                    );
+                }
+                None => {
+                    assert_eq!(
+                        job.status, JOB_RUNNING,
+                        "case {case}: expected the job to go on running, got {job:?}"
+                    );
+                    assert_eq!(
+                        job.next_phase_due_at,
+                        Some(2_000 + JOB_TASK_POLL_MILLIS),
+                        "case {case}: expected the next read of the task to be owed, got {job:?}"
+                    );
+                }
+            }
         }
     }
 }

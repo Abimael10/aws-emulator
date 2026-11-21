@@ -444,6 +444,53 @@ pub enum ContainerOutcome {
     Abandoned,
 }
 
+/// How many bytes of the command name a detail NAMES, past which the name is clipped.
+///
+/// The name is a word of the program a CALLER declared, so its length is a caller's; the
+/// detail it goes into is a member with a documented ceiling of its own — `Container$reason`
+/// is "a short (1024 max characters) human-readable string", and the `reason` AWS Batch
+/// reports for the attempt of a job running as the task is "a short (255 max characters)"
+/// one — so the sentence stays well inside both however long a word the request carried.
+const MAX_DETAIL_PROGRAM_NAME_BYTES: usize = 64;
+
+/// The detail a container reports for a run that needed a program named `name` this emulator
+/// has none of: the program was never started, so the container produced no outcome at all.
+///
+/// One variable part, the command name the run reached, taken from the program the container
+/// declared and clipped to [`MAX_DETAIL_PROGRAM_NAME_BYTES`] at a character boundary. Fixed
+/// text otherwise: no status, exit code or duration is claimed with it.
+#[must_use]
+pub fn program_not_performed_detail(name: &str) -> String {
+    let mut clipped = MAX_DETAIL_PROGRAM_NAME_BYTES.min(name.len());
+    while clipped > 0 && !name.is_char_boundary(clipped) {
+        clipped -= 1;
+    }
+    let name = &name[..clipped];
+    format!(
+        "This emulator performs a container's declared program itself and provides no program \
+         named \"{name}\", so the program was never started and the container produced no \
+         outcome."
+    )
+}
+
+/// The detail a container reports for a run that needed a command FORM or an expansion this
+/// emulator performs none of, where there is no one command name to name.
+pub const PROGRAM_FORM_NOT_PERFORMED_DETAIL: &str =
+    "This emulator performs a container's declared program itself and performed none of the \
+     program this container declared, so the container produced no outcome.";
+
+/// The detail a container whose launch named NO argument vector reports: the program that
+/// would run is the one inside the image, which this emulator starts none of.
+pub const NO_DECLARED_PROGRAM_DETAIL: &str =
+    "This emulator starts no container image, so the program the image declares as its own \
+     entry point was never started and the container produced no outcome.";
+
+/// The detail a container reports for a run a bound of this emulator ended before the program
+/// finished ([`MAX_COMMANDS_PER_RUN`], and the lifetime one run is given).
+pub const RUN_ENDED_BY_A_BOUND_DETAIL: &str =
+    "The run of this container's program was ended by a bound of this emulator before the \
+     program finished, so the container produced no outcome.";
+
 /// Whether `text` is inside the bounds the parse below is given: its size, and how many
 /// nested commands it opens — through a grouping character or a reserved word.
 fn within_parse_bounds(text: &str) -> bool {
@@ -497,6 +544,10 @@ pub struct ContainerShell {
     /// perform ([`Self::declined`]) — which makes the outcome
     /// [`ContainerOutcome::Abandoned`] for the reason the module docs give.
     unperformed: bool,
+    /// The NAME of the first command this session had no program for, when the thing it did
+    /// not perform was a command name rather than a form — what the detail a container
+    /// reports for such a run names ([`Self::nothing_performed_detail`]).
+    declined_command: Option<String>,
     /// Whether the termination signal has arrived and its handler has not run yet.
     pending_term: bool,
     /// Whether the termination handler is running, so the checkpoint inside it does not
@@ -614,6 +665,7 @@ impl ContainerShell {
             exit_status: None,
             abandoned: false,
             unperformed: false,
+            declined_command: None,
             pending_term: false,
             delivering_term: false,
             output,
@@ -714,6 +766,38 @@ impl ContainerShell {
     fn declined(&mut self) -> i32 {
         self.unperformed = true;
         EXIT_COMMAND_NOT_FOUND
+    }
+
+    /// [`Self::declined`] for a command NAME this session has no program for, which is the
+    /// name the detail such a run leaves on the container names
+    /// ([`Self::nothing_performed_detail`]). The FIRST such name is kept: it is the command
+    /// the run stopped performing the program at.
+    fn declined_command(&mut self, name: &str) -> i32 {
+        if self.declined_command.is_none() {
+            self.declined_command = Some(name.to_string());
+        }
+        self.declined()
+    }
+
+    /// The additional detail a container whose run produced NO outcome reports for it, and
+    /// `None` for a run that ended with a status of its own.
+    ///
+    /// `Container$reason` is "a short (1024 max characters) human-readable string to provide
+    /// additional details about a running or stopped container", and the additional detail
+    /// about a container of this emulator whose program produced nothing is WHY it produced
+    /// nothing: the program it declared is one this emulator performs none of — named, where
+    /// the thing it could not perform was a command name — or a bound of this emulator ended
+    /// the run before the program finished. No status, no exit code and no stop is claimed
+    /// with it: the detail is the whole of what is known about the run.
+    #[must_use]
+    pub fn nothing_performed_detail(&self) -> Option<String> {
+        if self.unperformed {
+            return Some(match self.declined_command.as_deref() {
+                Some(name) => program_not_performed_detail(name),
+                None => PROGRAM_FORM_NOT_PERFORMED_DETAIL.to_string(),
+            });
+        }
+        self.abandoned.then(|| RUN_ENDED_BY_A_BOUND_DETAIL.to_string())
     }
 
     /// The status a command whose WORD had no expansion answers.
@@ -1813,9 +1897,11 @@ impl ContainerShell {
                 return self.run_aws_cli(arguments, redirections).await;
             }
             // The catalogs are what this container provides: a command outside them needs a
-            // program or a network this container does not have.
+            // program or a network this container does not have — and the NAME of it is what
+            // the detail such a container reports names
+            // ([`Self::nothing_performed_detail`]).
             if !BUILT_IN_COMMANDS.contains(&name) {
-                return self.declined();
+                return self.declined_command(name);
             }
             match name {
                 "echo" => {

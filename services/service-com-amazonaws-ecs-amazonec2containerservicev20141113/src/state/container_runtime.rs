@@ -593,8 +593,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// container was running is over — and a task whose ESSENTIAL container that was is
     /// stopped with it.
     ///
-    /// A run this emulator gave up on records nothing ([`ContainerOutcome::Abandoned`]): no
-    /// exit code was produced, so none is reported.
+    /// A run this emulator gave up on records no STATUS ([`ContainerOutcome::Abandoned`]): no
+    /// exit code was produced, so none is reported — and what IS known about such a run is
+    /// the additional detail `detail` carries, recorded on the container
+    /// ([`Self::record_container_without_outcome`]).
     ///
     /// The stop is what a container definition's `essential` member means: "If the
     /// `essential` parameter of a container is marked as `true`, and that container fails or
@@ -613,11 +615,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         &mut self,
         container_arn: &str,
         outcome: ContainerOutcome,
+        detail: Option<String>,
     ) {
         let ContainerOutcome::Exited(status) = outcome else {
-            // The run is over either way, so its entry stops counting against
-            // [`MAX_CONTAINER_RUNS`] and the container's program is not restarted.
-            self.end_container_run(container_arn);
+            self.record_container_without_outcome(container_arn, detail);
             return;
         };
         self.end_container_run(container_arn);
@@ -640,6 +641,46 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             task.version += 1;
             if essential && task.work_is_running() && task.work_done_due_at.is_none() {
                 task.finish_work(at);
+            }
+            return;
+        }
+    }
+
+    /// Record that one container's run produced NO outcome: no status is claimed for it, and
+    /// the additional detail about the container is what `detail` says.
+    ///
+    /// `Container$reason` is "a short (1024 max characters) human-readable string to provide
+    /// additional details about a running or stopped container", and the additional detail
+    /// about a container whose program produced nothing is that nothing performed it
+    /// ([`ContainerShell::nothing_performed_detail`]) — which is the only account of the run
+    /// there will be, since no exit code was produced and the container's own exit is what
+    /// stops the task it belongs to. A detail something else has already recorded for the
+    /// container — the agent's own report, the reason a launch could not be made
+    /// ([`TaskRecord::fail_launch`]) — is left as it was given: this adds what is known about
+    /// a run, and overwrites nothing.
+    ///
+    /// The task keeps the status it has: an exit is what stops a task whose essential
+    /// container exited, and no container of this one produced one.
+    fn record_container_without_outcome(&mut self, container_arn: &str, detail: Option<String>) {
+        // The run is over either way, so its entry stops counting against
+        // [`MAX_CONTAINER_RUNS`] and the container's program is not restarted.
+        self.end_container_run(container_arn);
+        let Some(detail) = detail else {
+            return;
+        };
+        for task in self.tasks.values_mut() {
+            let Some(container) = task
+                .containers
+                .iter_mut()
+                .find(|container| container.container_arn == container_arn)
+            else {
+                continue;
+            };
+            if container.reason.is_none() {
+                container.reason = Some(detail);
+                // "Every time a task experiences a change ... the version counter is
+                // incremented."
+                task.version += 1;
             }
             return;
         }
@@ -796,9 +837,14 @@ async fn run_container(
     let Some(environment) =
         fetched_environment(&callback, &launch.environment, &launch.secrets).await
     else {
-        state
-            .lock()
-            .record_container_outcome(&launch.container_arn, ContainerOutcome::Abandoned);
+        // What kept the program from starting is the retrieval itself, which the step that
+        // made it words on the task and its container ([`super::container_secrets`]), so
+        // nothing is added here.
+        state.lock().record_container_outcome(
+            &launch.container_arn,
+            ContainerOutcome::Abandoned,
+            None,
+        );
         return;
     };
     let output = Arc::new(ContainerOutput::new(&callback, launch.log_target));
@@ -806,10 +852,14 @@ async fn run_container(
     // which is the order the driver itself does it in.
     output.open().await;
     let Some(program) = launch.program.as_ref() else {
-        // The driver is initialised and there is nothing of this container's own to run.
-        state
-            .lock()
-            .record_container_outcome(&launch.container_arn, ContainerOutcome::Abandoned);
+        // The driver is initialised and there is nothing of this container's own to run, which
+        // is what the container reports as the detail of its run
+        // ([`NO_DECLARED_PROGRAM_DETAIL`]).
+        state.lock().record_container_outcome(
+            &launch.container_arn,
+            ContainerOutcome::Abandoned,
+            Some(NO_DECLARED_PROGRAM_DETAIL.to_string()),
+        );
         return;
     };
     let deadline = Instant::now() + CONTAINER_RUN_LIFETIME;
@@ -835,10 +885,14 @@ async fn run_container(
     // ([`super::container_consumption`]).
     .with_consumption(Arc::clone(&launch.consumption));
     let outcome = shell.run(program).await;
+    // What is known about a run that produced no status of its own, which is what such a
+    // container reports as the additional detail about it
+    // ([`ContainerShell::nothing_performed_detail`]).
+    let detail = shell.nothing_performed_detail();
     // The session is OVER, so it holds nothing more: what the container still occupies is its
     // own layer, which outlives the session that wrote it.
     launch.consumption.release();
     state
         .lock()
-        .record_container_outcome(&launch.container_arn, outcome);
+        .record_container_outcome(&launch.container_arn, outcome, detail);
 }

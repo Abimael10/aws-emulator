@@ -101,6 +101,11 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # service (`state::ecs_cluster`) and the suite reads it back through its own
 # `DescribeClusters`.
 service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
+# Amazon EC2 goes with it, because the elastic network interface the Amazon ECS task of a
+# placed Fargate job is given is created in a subnet of THAT service: a placement naming a
+# subnet Amazon VPC holds none of is refused, so the suite that drives a job all the way to
+# the task it runs as builds its network through Amazon EC2's own API.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true
