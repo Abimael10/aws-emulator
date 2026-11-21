@@ -22,7 +22,13 @@
 //!   owes, observable as `CREATE_IN_PROGRESS` / `DELETE_IN_PROGRESS` until their span has
 //!   passed;
 //! * a method path that has no settings yet takes API Gateway's documented defaults for
-//!   the settings the patch did not name.
+//!   the settings the patch did not name;
+//! * a deployment id that names no deployment of the addressed API is refused by its own
+//!   class AND its own sentence depending on WHERE the request carries it: as a VALUE (a
+//!   `/deploymentId` or `/canarySettings/deploymentId` patch value, and the same members on
+//!   `CreateStage`) it is the bad request a caller fixes by sending another value, while in
+//!   the URI it is the not-found of a resource that is gone — neither refusal reuses the
+//!   other's sentence.
 
 use std::time::Duration;
 
@@ -941,4 +947,190 @@ async fn an_update_changes_only_the_stage_it_addresses() {
             read.body
         );
     }
+}
+
+/// API Gateway's sentence for a deployment id a request carries as a VALUE that names no
+/// deployment of the api, and the one for a deployment id in the URI that names none.
+///
+/// Spelled out here rather than read from the crate's own constants — the way
+/// `refusal_contract_sentences` pins a refusal's text — so what this suite holds the service
+/// to is the WORDING a client keys on and not whichever constant the handler reached for.
+/// Both are entirely fixed: neither carries the id it was given.
+const UNKNOWN_DEPLOYMENT_VALUE: &str = "Deployment id does not exist";
+const UNKNOWN_DEPLOYMENT_IDENTIFIER: &str = "Invalid Deployment identifier specified";
+
+/// Assert `answer` is the refusal a deployment id carried as a request VALUE earns — the
+/// bad request a caller answers by sending another value — sentence included.
+fn assert_value_refusal(answer: &Answer, case: &str) {
+    assert_failure(answer, 400, "BadRequestException", case);
+    assert_eq!(
+        answer.body["message"].as_str(),
+        Some(UNKNOWN_DEPLOYMENT_VALUE),
+        "case {case}: expected {UNKNOWN_DEPLOYMENT_VALUE:?}, got {:?}",
+        answer.body["message"]
+    );
+}
+
+/// Assert `answer` is the refusal a deployment id carried in the URI earns — the not-found
+/// of a resource that is not there — sentence included.
+fn assert_identifier_refusal(answer: &Answer, case: &str) {
+    assert_failure(answer, 404, "NotFoundException", case);
+    assert_eq!(
+        answer.body["message"].as_str(),
+        Some(UNKNOWN_DEPLOYMENT_IDENTIFIER),
+        "case {case}: expected {UNKNOWN_DEPLOYMENT_IDENTIFIER:?}, got {:?}",
+        answer.body["message"]
+    );
+}
+
+/// The deployment id `stage_name` of `api` serves, read back through `GetStage`.
+async fn served_deployment(gateway: &Gateway, api: &str, stage_name: &str, case: &str) -> String {
+    let read = get_stage(gateway, api, stage_name).await;
+    assert_eq!(
+        read.status, 200,
+        "case {case}: expected 200 from GetStage({stage_name}), got {} with {:?}",
+        read.status, read.body
+    );
+    read.body["deploymentId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: expected a deploymentId, got {:?}", read.body))
+        .to_owned()
+}
+
+#[tokio::test]
+async fn an_unknown_deployment_id_is_a_bad_request_as_a_value_and_a_not_found_in_the_uri() {
+    let gateway = Gateway::new();
+    let (api, served, repointed_to) =
+        api_with_two_deployments(&gateway, "update-stage-unknown-deployment").await;
+    // A deployment that existed and then did not: the delete is what makes its id name no
+    // deployment, so the rule is asserted on an id this service really minted as well as on
+    // ids nothing ever minted.
+    let deleted = create_deployment(&gateway, &api, "the deleted deployment", json!({})).await;
+    let dropped = gateway
+        .call(
+            "DELETE",
+            &format!("/restapis/{api}/deployments/{deleted}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        dropped.status, 202,
+        "case DeleteDeployment({deleted}): expected 202, got {} with {:?}",
+        dropped.status, dropped.body
+    );
+    // A deployment of ANOTHER API: a stage serves a deployment of its OWN API, so this id
+    // names a real record and still names no deployment of the API patched below.
+    let (other_api, _) = create_api(&gateway, "update-stage-unknown-deployment-other").await;
+    let foreign =
+        create_deployment(&gateway, &other_api, "the other API's deployment", json!({})).await;
+
+    create_stage(&gateway, &api, &served, "prod", json!({})).await;
+
+    // Rows differ along what the rule generalises over: HOW an id comes to name no
+    // deployment of this API (never minted, minted and then deleted, minted under another
+    // API) and the FORM it takes (letters, digits, and a string longer than a minted id).
+    // The second field is the stage-name fragment the rows that create a stage use.
+    let rows: Vec<(&str, &str, String)> = vec![
+        ("letters only", "letters", "zzzzzzzzzz".to_string()),
+        ("digits only", "digits", "0123456789".to_string()),
+        (
+            "longer than a minted id",
+            "longer",
+            "bogus1234567890xyz".to_string(),
+        ),
+        ("deleted after it was created", "deleted", deleted.clone()),
+        ("a deployment of another API", "foreign", foreign.clone()),
+    ];
+
+    for (row, slug, unknown) in &rows {
+        // As a patch VALUE, on the stage's own pointer and on its canary's: the bad request
+        // with the value sentence, and the stage still serves the deployment it served.
+        for pointer in ["/deploymentId", "/canarySettings/deploymentId"] {
+            let case = format!("UpdateStage replace {pointer} ({row})");
+            let answer = update_stage(&gateway, &api, "prod", replace(pointer, unknown)).await;
+            assert_value_refusal(&answer, &case);
+            let still = served_deployment(&gateway, &api, "prod", &case).await;
+            assert_eq!(
+                still, served,
+                "case {case}: a refused patch leaves the stage serving {served}, got {still}"
+            );
+        }
+
+        // The same value where the CREATE carries it, which is the same kind of value and
+        // earns the same refusal — on the stage's member and on its canary's alike.
+        for (member, request) in [
+            (
+                "deploymentId",
+                json!({ "stageName": format!("s-{slug}"), "deploymentId": unknown }),
+            ),
+            (
+                "canarySettings.deploymentId",
+                json!({
+                    "stageName": format!("c-{slug}"),
+                    "deploymentId": served,
+                    "canarySettings": { "deploymentId": unknown },
+                }),
+            ),
+        ] {
+            let case = format!("CreateStage {member} ({row})");
+            let answer = gateway
+                .call("POST", &format!("/restapis/{api}/stages"), Some(request))
+                .await;
+            assert_value_refusal(&answer, &case);
+        }
+
+        // The SAME id in the URI, where it addresses a resource instead of carrying a
+        // value: the not-found class and the identifier sentence, from every reader that
+        // resolves a deployment that way.
+        for (reader, method, body) in [
+            ("GetDeployment", "GET", None),
+            ("DeleteDeployment", "DELETE", None),
+            (
+                "UpdateDeployment",
+                "PATCH",
+                Some(json!({ "patchOperations": [
+                    { "op": "replace", "path": "/description", "value": "patched" }
+                ] })),
+            ),
+        ] {
+            let case = format!("{reader} ({row})");
+            let answer = gateway
+                .call(
+                    method,
+                    &format!("/restapis/{api}/deployments/{unknown}"),
+                    body,
+                )
+                .await;
+            assert_identifier_refusal(&answer, &case);
+        }
+    }
+
+    // The positive control: the same patch with a REAL deployment of this API is applied
+    // and reads back, so every refusal above is about the id and not about the stage — and
+    // the id the URI readers refused above resolves for them once it names a deployment.
+    let case = "UpdateStage replace /deploymentId (a real deployment)";
+    let accepted =
+        update_stage(&gateway, &api, "prod", replace("/deploymentId", &repointed_to)).await;
+    assert_eq!(
+        accepted.status, 200,
+        "case {case}: expected 200, got {} with {:?}",
+        accepted.status, accepted.body
+    );
+    let now_served = served_deployment(&gateway, &api, "prod", case).await;
+    assert_eq!(
+        now_served, repointed_to,
+        "case {case}: expected the stage to serve {repointed_to}, got {now_served}"
+    );
+    let read = gateway
+        .call(
+            "GET",
+            &format!("/restapis/{api}/deployments/{repointed_to}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        read.status, 200,
+        "case GetDeployment(a real deployment): expected 200, got {} with {:?}",
+        read.status, read.body
+    );
 }
