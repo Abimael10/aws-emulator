@@ -28,6 +28,12 @@
 //! `key1=value1&key2=value2` query string `CreateTopicRule` takes), whether a tag carries
 //! a value at all, whether a key is added or modified, and whether an untagged key was
 //! ever set.
+//!
+//! A second table spans the TEXT of a tag rather than the resource it belongs to: every
+//! class of character the modelled key expression admits and both ends of each published
+//! length bound, written and read back CHARACTER FOR CHARACTER, because the read reports
+//! the key and value that were stored and neither re-encodes nor normalises them. Past a
+//! published bound the request is refused and the stored set is left as it was.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -691,4 +697,368 @@ async fn the_tag_read_issues_no_continuation_token_and_refuses_one() {
         Some("InvalidRequestException"),
         "case a continuation token this listing never issued: got {resumed:?}"
     );
+}
+
+/// The longest key the model admits. `TagKey` is `length 1..128` with the expression
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$` (`smithy_query(query="shape",shape="Tag")`), and a
+/// `@length` bound on a string counts CHARACTERS, so a key of 128 multi-byte characters
+/// sits ON this bound rather than past it.
+const MAX_TAG_KEY_CHARACTERS: usize = 128;
+/// The shortest key the model admits (`TagKey` is `length 1..128`), which is why an empty
+/// key is a refusal and a one-character key is not.
+const MIN_TAG_KEY_CHARACTERS: usize = 1;
+/// The longest value the model admits: `TagValue` is `length 0..256` and carries no
+/// expression at all (`smithy_query(query="shape",shape="Tag")`), so a value may hold
+/// characters no key may.
+const MAX_TAG_VALUE_CHARACTERS: usize = 256;
+
+/// `text` repeated until it is exactly `characters` characters long, for the rows that sit
+/// on a published bound. Panics when `text` does not divide the bound, so a row cannot
+/// claim a bound it does not sit on.
+fn exactly(text: &str, characters: usize) -> String {
+    let unit = text.chars().count();
+    assert_eq!(
+        characters % unit,
+        0,
+        "case a row on a published bound: {text:?} ({unit} characters) does not divide \
+         {characters}"
+    );
+    let built = text.repeat(characters / unit);
+    assert_eq!(
+        built.chars().count(),
+        characters,
+        "case a row on a published bound: expected {characters} characters, got {}",
+        built.chars().count()
+    );
+    built
+}
+
+/// One class of tag TEXT the model admits: a key and the value stored under it.
+struct TagClass {
+    case: &'static str,
+    key: String,
+    value: String,
+}
+
+/// The catalog of tag text under test, read off the modelled constraints rather than off
+/// one recorded request: `TagKey` admits letters (`\p{L}`, any script), separators
+/// (`\p{Z}`), numbers (`\p{N}`, any digit set) and the marks `_ . : / = + - @`, between 1
+/// and 128 characters; `TagValue` admits ANY text between 0 and 256 characters
+/// (`smithy_query(query="shape",shape="Tag")`). One row per class of that catalog, plus a
+/// row on each published bound, and none of them is a tag the recorded cases above carry.
+fn tag_classes() -> Vec<TagClass> {
+    vec![
+        TagClass {
+            case: "ASCII letters, digits and every mark the key expression lists",
+            key: "fleet_owner.team:east/west=1+2-3@aws".to_string(),
+            value: "ops-team".to_string(),
+        },
+        TagClass {
+            case: "a separator, which the key expression admits as \\p{Z}",
+            key: "cost centre".to_string(),
+            value: "fleet ops".to_string(),
+        },
+        TagClass {
+            case: "Greek, Cyrillic and CJK letters",
+            key: "κλειδί-ключ-钥匙".to_string(),
+            value: "τιμή-значение-值".to_string(),
+        },
+        TagClass {
+            case: "Arabic letters beside an Arabic-Indic digit",
+            key: "مفتاح٣".to_string(),
+            value: "قيمة".to_string(),
+        },
+        TagClass {
+            case: "Hebrew letters, beside a value of Devanagari and its combining marks, \
+                   which no key may carry",
+            key: "מפתח".to_string(),
+            value: "कुंजी-मूल्य".to_string(),
+        },
+        TagClass {
+            case: "the shortest key the model admits",
+            key: exactly("k", MIN_TAG_KEY_CHARACTERS),
+            value: "1".to_string(),
+        },
+        TagClass {
+            case: "the longest key the model admits, in ASCII characters",
+            key: exactly("a", MAX_TAG_KEY_CHARACTERS),
+            value: "at the key maximum".to_string(),
+        },
+        TagClass {
+            case: "the longest key the model admits, in three-byte characters",
+            key: exactly("鍵", MAX_TAG_KEY_CHARACTERS),
+            value: "a key of 128 multi-byte characters".to_string(),
+        },
+        TagClass {
+            case: "the empty value the model admits",
+            key: "unset-value".to_string(),
+            value: String::new(),
+        },
+        TagClass {
+            case: "the longest value the model admits, in two-byte characters",
+            key: "longest-value".to_string(),
+            value: exactly("значение", MAX_TAG_VALUE_CHARACTERS),
+        },
+        TagClass {
+            case: "a value carrying what no key may: punctuation, markup and an emoji",
+            key: "unconstrained-value".to_string(),
+            value: "🛠 50% {\"json\":true} <tag> \\ \"quoted\"".to_string(),
+        },
+    ]
+}
+
+/// One resource whose tag set is kept in one of the two shapes this service stores tags
+/// in, with the calls that create it and the ARN the tag plane addresses it by.
+struct Storage {
+    label: &'static str,
+    setup: Vec<Call>,
+    arn: String,
+}
+
+/// Both storage shapes, so a class of text is asserted against the `TagList` families and
+/// against the software-package family's `TagMap` alike.
+fn storages() -> Vec<Storage> {
+    vec![
+        Storage {
+            label: "a thing group, whose tags are the modelled TagList pairs",
+            setup: vec![Call::new(
+                "POST",
+                "/thing-groups/text-classes".to_string(),
+                Some(json!({})),
+            )],
+            arn: iot_arn("thinggroup/text-classes"),
+        },
+        Storage {
+            label: "a package version, whose tags are a TagMap",
+            setup: vec![
+                Call::new("PUT", "/packages/text-classes".to_string(), Some(json!({}))),
+                Call::new(
+                    "PUT",
+                    "/packages/text-classes/versions/1.0.0".to_string(),
+                    Some(json!({})),
+                ),
+            ],
+            arn: iot_arn("package/text-classes/version/1.0.0"),
+        },
+    ]
+}
+
+/// RULE: the tag read reports the key and the value that were STORED, character for
+/// character — every class of text the model admits, on either end of each published
+/// bound, in either storage shape — so a key is neither re-encoded nor normalised on the
+/// way in or out, and a key is removed by the same text it was written under.
+#[tokio::test]
+async fn every_tag_text_class_round_trips_through_the_tag_read() {
+    let classes = tag_classes();
+    for storage in storages() {
+        let label = storage.label;
+        let emulator = Emulator::new();
+        emulator.create(label, &storage.setup).await;
+
+        // Every class in ONE write, so the keys are stored side by side and a class that
+        // collided with another would be missing from the answer.
+        let pairs: Vec<(&str, Option<&str>)> = classes
+            .iter()
+            .map(|class| (class.key.as_str(), Some(class.value.as_str())))
+            .collect();
+        let written = emulator.tag(&storage.arn, &pairs).await;
+        assert_eq!(
+            written.status, 200,
+            "case {label:?}: writing every text class expected 200, got {written:?}"
+        );
+
+        let read = emulator.list_tags(&storage.arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case {label:?}: a tag read expected 200, got {read:?}"
+        );
+        let reported = read
+            .tags()
+            .unwrap_or_else(|| panic!("case {label:?}: expected a tags member, got {read:?}"));
+        for class in &classes {
+            assert_eq!(
+                reported.get(&class.key).cloned(),
+                Some(Some(class.value.clone())),
+                "case {label:?} / {}: expected the value stored under {:?}, got {:?}",
+                class.case,
+                class.key,
+                reported.get(&class.key)
+            );
+        }
+        let expected: BTreeMap<String, Option<String>> = classes
+            .iter()
+            .map(|class| (class.key.clone(), Some(class.value.clone())))
+            .collect();
+        assert_eq!(
+            reported, expected,
+            "case {label:?}: expected exactly the tags written, got {reported:?}"
+        );
+
+        // A second read reports the same set: reporting the tags changed nothing.
+        let reread = emulator.list_tags(&storage.arn).await;
+        assert_eq!(
+            reread.tags(),
+            Some(expected.clone()),
+            "case {label:?}: a second read reported {reread:?}"
+        );
+
+        // A key is removed by the text it was stored under, multi-byte characters
+        // included, and no other key goes with it.
+        let removed_key = classes
+            .iter()
+            .find(|class| class.case == "Greek, Cyrillic and CJK letters")
+            .map(|class| class.key.clone())
+            .expect("the catalog carries the multi-script row");
+        let removed = emulator.untag(&storage.arn, &[removed_key.as_str()]).await;
+        assert_eq!(
+            removed.status, 200,
+            "case {label:?}: untagging {removed_key:?} expected 200, got {removed:?}"
+        );
+        let mut still_expected = expected.clone();
+        still_expected.remove(&removed_key);
+        let read = emulator.list_tags(&storage.arn).await;
+        assert_eq!(
+            read.tags(),
+            Some(still_expected),
+            "case {label:?}: expected only {removed_key:?} to go, got {read:?}"
+        );
+    }
+}
+
+/// RULE: the tags a CREATE carried are the tags the read reports — the same text, in both
+/// shapes a create takes tags in — because a create's tags and the tag plane's tags are
+/// one set.
+#[tokio::test]
+async fn tags_a_create_carried_are_read_back_character_for_character() {
+    let emulator = Emulator::new();
+    // Multi-script text on both members, so a create that re-encoded a key or a value
+    // would not be read back.
+    let key = "κλειδί-钥匙";
+    let value = "τιμή-值";
+    let other_key = "مفتاح";
+    let other_value = "قيمة";
+
+    // A `TagList` create (`Tag$Value` optional) and a `TagMap` create, each carrying the
+    // same text.
+    let rows: Vec<(&str, Vec<Call>, String)> = vec![
+        (
+            "a thing group created with a TagList",
+            vec![Call::new(
+                "POST",
+                "/thing-groups/unicode-at-create".to_string(),
+                Some(json!({
+                    "tags": [
+                        { "Key": key, "Value": value },
+                        { "Key": other_key, "Value": other_value },
+                    ],
+                })),
+            )],
+            iot_arn("thinggroup/unicode-at-create"),
+        ),
+        (
+            "a package version created with a TagMap",
+            vec![
+                Call::new(
+                    "PUT",
+                    "/packages/unicode-at-create".to_string(),
+                    Some(json!({})),
+                ),
+                Call::new(
+                    "PUT",
+                    "/packages/unicode-at-create/versions/1.0.0".to_string(),
+                    Some(json!({ "tags": { key: value, other_key: other_value } })),
+                ),
+            ],
+            iot_arn("package/unicode-at-create/version/1.0.0"),
+        ),
+    ];
+
+    let expected: BTreeMap<String, Option<String>> = [
+        (key.to_string(), Some(value.to_string())),
+        (other_key.to_string(), Some(other_value.to_string())),
+    ]
+    .into_iter()
+    .collect();
+
+    for (case, setup, arn) in rows {
+        emulator.create(case, &setup).await;
+        let read = emulator.list_tags(&arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: a tag read expected 200, got {read:?}"
+        );
+        assert_eq!(
+            read.tags(),
+            Some(expected.clone()),
+            "case {case:?}: expected the tags its create carried, got {read:?}"
+        );
+    }
+}
+
+/// RULE: a tag whose text is outside what the model admits is refused as a BAD REQUEST,
+/// and the resource's stored tag set is left exactly as it was — so the bounds the table
+/// above sits on are bounds and not the longest text that happens to work.
+#[tokio::test]
+async fn a_tag_outside_the_modelled_text_is_refused_and_changes_nothing() {
+    let emulator = Emulator::new();
+    let arn = iot_arn("thinggroup/bounded-text");
+    emulator
+        .create(
+            "a thing group with one stored tag",
+            &[Call::new(
+                "POST",
+                "/thing-groups/bounded-text".to_string(),
+                Some(json!({ "tags": [{ "Key": "stage", "Value": "test" }] })),
+            )],
+        )
+        .await;
+    let stored: BTreeMap<String, Option<String>> =
+        [("stage".to_string(), Some("test".to_string()))]
+            .into_iter()
+            .collect();
+
+    // One row per way a tag's text can fall outside the model: past either published
+    // maximum, short of the key minimum, and outside the key expression.
+    let over_long_key = exactly("a", MAX_TAG_KEY_CHARACTERS + 1);
+    let over_long_value = exactly("v", MAX_TAG_VALUE_CHARACTERS + 1);
+    let rows: Vec<(&str, &str, &str)> = vec![
+        (
+            "a key one character past its maximum",
+            over_long_key.as_str(),
+            "x",
+        ),
+        ("an empty key, short of its minimum", "", "x"),
+        (
+            "a key carrying a character its expression does not admit",
+            "owner!",
+            "x",
+        ),
+        (
+            "a value one character past its maximum",
+            "over-long-value",
+            over_long_value.as_str(),
+        ),
+    ];
+
+    for (case, key, value) in rows {
+        let refused = emulator.tag(&arn, &[(key, Some(value))]).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected 400, got {refused:?}"
+        );
+        assert_eq!(
+            refused
+                .error_code
+                .as_deref()
+                .map(|code| code.split(':').next().unwrap_or(code)),
+            Some("InvalidRequestException"),
+            "case {case:?}: expected InvalidRequestException, got {refused:?}"
+        );
+        let read = emulator.list_tags(&arn).await;
+        assert_eq!(
+            read.tags(),
+            Some(stored.clone()),
+            "case {case:?}: the stored tags changed, got {read:?}"
+        );
+    }
 }
