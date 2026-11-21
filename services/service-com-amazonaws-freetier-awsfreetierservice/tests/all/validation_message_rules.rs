@@ -21,7 +21,11 @@
 //!    AWS validation envelope — one clause per failing member, with the value as
 //!    submitted, the member's dotted path and the requirement — and a constraint broken by
 //!    a LIST's elements is stated ONCE at the list member, with the whole list as the value
-//!    and every constraint the element shape declares nested.
+//!    and every constraint the element shape declares nested. A handler that re-checks such
+//!    a constraint for itself — so its refusal stays that operation's own modelled error
+//!    whatever the boundary does with the value — states the SAME message, down to the
+//!    envelope, the clause and the value echo, and never wraps it in the envelope of rule 1:
+//!    one condition cannot read two ways depending on which layer refused the request.
 //!
 //! Every assertion below is about those rules over a TABLE of inputs rather than one
 //! recorded call: the rows differ along the arity, the operator set, the nesting depth, the
@@ -29,20 +33,30 @@
 //! failing elements. Each refusal table carries its positive control, so a passing row
 //! cannot mean "every request is refused".
 
+use std::sync::Arc;
+
 use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
-
-use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
-    ACTIVITY_STATUS_VALUES, DIMENSION_VALUES, MATCH_OPTION_VALUES,
+use smithy_server_runtime::{
+    EmbeddedEmulator, MultiServiceRouter, Operation, OperationContext, Service,
 };
+
+use service_com_amazonaws_freetier_awsfreetierservice::ops::get_account_activity::{
+    GetAccountActivity, GetAccountActivityErrorModeled,
+};
+use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
+    GetAccountActivityInput, ACTIVITY_STATUS_VALUES, DIMENSION_VALUES, LANGUAGE_CODE_VALUES,
+    MATCH_OPTION_VALUES,
+};
+use service_com_amazonaws_freetier_awsfreetierservice::scaffolded::Scaffolded;
 use service_com_amazonaws_freetier_awsfreetierservice::state::{
     stated_validation, ComAmazonawsFreetierAwsfreetierserviceState, ACCOUNT_PLAN_TYPE_VALUE_SET,
     ACTIVITIES_INVALID_NEXT_TOKEN, INVALID_NEXT_TOKEN, PAYMENT_INSTRUMENT_VET_FAILURE,
     PLAN_STATUS_ACTIVE, PLAN_STATUS_EXPIRED, PLAN_TYPE_FREE, PLAN_TYPE_PAID,
 };
+use service_com_amazonaws_freetier_awsfreetierservice::EmulatedService;
 
-use crate::free_tier::{call, error_code, harness, ok, text};
+use crate::free_tier::{call, error_code, harness, ok, text, ACTIVITIES_PAGE_SIZE_CEILING};
 
 /// The modelled `Value` constraints, from
 /// `smithy_query(query="shape", shape="Values,Value")`: the list's member targets `Value`,
@@ -1334,4 +1348,236 @@ async fn the_closed_free_window_reads_alike_however_the_window_was_closed() {
         "case the two self-worded refusals of this operation: two conditions must not read \
          alike, got {vetting:?} for both"
     );
+}
+
+/// The member of `GetAccountActivityRequest` whose modelled constraints that operation
+/// re-checks for itself, spelled as the request spells it
+/// (`smithy_query(query="operation",operation="GetAccountActivity")`: `activityId`, a
+/// required `ActivityId`).
+const ACTIVITY_ID_MEMBER: &str = "activityId";
+
+/// Request metadata a handler called directly is handed: the same signed `POST /` an SDK
+/// sends this awsJson service, without the body the handler is given as a built input.
+fn request_parts() -> http::request::Parts {
+    let (parts, ()) = http::Request::builder()
+        .method("POST")
+        .uri("https://freetier.us-east-1.amazonaws.com/")
+        .header("x-amz-target", "AWSFreeTierService.GetAccountActivity")
+        .header(
+            "authorization",
+            "AWS4-HMAC-SHA256 \
+             Credential=AKIDEMULATOR/20260101/us-east-1/freetier/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=0000",
+        )
+        .body(())
+        .expect("the request builds")
+        .into_parts();
+    parts
+}
+
+/// One activity read as the HANDLER answers it, called with a typed input so the refusal
+/// the handler itself raises is observable — the boundary refuses such a request in FRONT
+/// of `handle`, so this is the only place that refusal can be read.
+async fn read_activity(
+    engine: &Arc<engine::InMemoryEngine>,
+    ctx: &OperationContext<'_>,
+    activity_id: &str,
+    language_code: Option<&str>,
+) -> Result<
+    service_com_amazonaws_freetier_awsfreetierservice::ops::types::GetAccountActivityOutput,
+    Scaffolded<GetAccountActivityErrorModeled>,
+> {
+    GetAccountActivity::new(Arc::clone(engine))
+        .handle(
+            GetAccountActivityInput {
+                activity_id: activity_id.to_string(),
+                language_code: language_code.map(str::to_string),
+            },
+            ctx,
+        )
+        .await
+}
+
+/// RULE 2 where a HANDLER re-checks the constraint: the message it refuses with is the one
+/// the boundary's own refusal of the same request carries — the same envelope, the same
+/// clause, the same value echo — and it is never wrapped in the envelope rule 1's
+/// conditions are stated in.
+///
+/// Asserted on BOTH legs of each row: the wire leg observes the boundary's refusal (the
+/// constraint walk runs in front of `handle`), the typed leg the handler's own, and the
+/// rule is that the two read alike. A handler that stated a sentence of its own would pass
+/// every wire assertion in this file and still answer a second, drifting wording to
+/// anything that reached it.
+///
+/// The rows differ along HOW the value misses the modelled `ActivityId`
+/// (`smithy_query(query="shape",shape="ActivityId")`: `@length(32, 32)`,
+/// `@pattern(^[a-zA-Z0-9]+$)`): the length on either side, far past the length, the
+/// character class at and inside the length, a non-ASCII character, the empty string, and
+/// one value breaking the length and the class at once — and along what else the request
+/// carried, so the clause cannot depend on the rest of it. The positive controls are an id
+/// the catalog holds, which is served, and a well-formed id it does not, which is a
+/// not-found and not a validation refusal.
+#[tokio::test]
+async fn a_handlers_recheck_of_a_modelled_constraint_states_the_boundarys_message() {
+    let (router, engine) = harness();
+    let service = EmulatedService::new(Arc::clone(&engine));
+    let parts = request_parts();
+    let ctx = OperationContext::new(
+        &parts,
+        service.definition().identity(),
+        EmbeddedEmulator::from_router(router.clone()),
+    );
+
+    // How the envelope this service's OWN validation layer states a condition in opens,
+    // read off that layer rather than restated here. A clause the boundary's writer wrote
+    // is never wrapped in it.
+    let own_envelope = stated_validation("probe");
+    let own_envelope_opens = own_envelope
+        .split_once("probe")
+        .expect("the service's own envelope wraps the sentence it is handed")
+        .0
+        .to_string();
+    assert!(
+        !own_envelope_opens.is_empty(),
+        "case the service's own envelope: expected an opening before the sentence, got \
+         {own_envelope:?}"
+    );
+
+    let held: Vec<String> = ok(
+        &router,
+        "ListAccountActivities",
+        &json!({"maxResults": ACTIVITIES_PAGE_SIZE_CEILING}),
+    )
+    .await["activities"]
+        .as_array()
+        .expect("activities is a list")
+        .iter()
+        .map(|summary| text(summary, "activityId"))
+        .collect();
+    assert!(
+        !held.is_empty(),
+        "case the catalog: the account must hold activities for the controls to mean anything"
+    );
+
+    let malformed: Vec<(&str, String)> = vec![
+        ("shorter than the length", "short".to_string()),
+        ("one character short of the length", "0".repeat(31)),
+        ("one character past the length", "0".repeat(33)),
+        ("far past the length", "0".repeat(400)),
+        (
+            "an illegal character at the length",
+            format!("{}-", "0".repeat(31)),
+        ),
+        (
+            "an illegal character inside the length",
+            format!("{}-{}", "0".repeat(17), "0".repeat(14)),
+        ),
+        (
+            "a non-ASCII character at the length",
+            format!("é{}", "0".repeat(31)),
+        ),
+        ("the empty string", String::new()),
+        (
+            "the length and the character class at once",
+            "sho-t".to_string(),
+        ),
+    ];
+
+    // Each malformed id alone, and beside the one other member this operation models, so
+    // the clause cannot depend on the rest of the request.
+    let also: [(&str, Option<&str>); 2] = [
+        ("alone", None),
+        (
+            "with a languageCode the model declares",
+            Some(LANGUAGE_CODE_VALUES[0]),
+        ),
+    ];
+
+    for (row, activity_id) in &malformed {
+        for (beside, language_code) in also {
+            let case = format!("{row} {beside}");
+            let mut body = json!({"activityId": activity_id});
+            if let Some(code) = language_code {
+                body["languageCode"] = json!(code);
+            }
+            let boundary = refusal_message(&router, &case, "GetAccountActivity", &body).await;
+
+            let answered = read_activity(&engine, &ctx, activity_id, language_code).await;
+            let stated = match answered {
+                Err(Scaffolded::Modeled(GetAccountActivityErrorModeled::ValidationException(
+                    refused,
+                ))) => refused.message,
+                other => panic!(
+                    "case {case}: expected the handler's own modelled ValidationException, got \
+                     {other:?}"
+                ),
+            };
+
+            assert_eq!(
+                stated, boundary,
+                "case {case}: the handler's re-check must state the boundary's own message \
+                 {boundary:?}, got {stated:?}"
+            );
+            // The AWS validation envelope of rule 1 — the clause count, then the clauses —
+            // and not the envelope rule 1's own conditions are stated in.
+            let (count, clauses) = stated.split_once(" validation error").unwrap_or_else(|| {
+                panic!("case {case}: expected the AWS validation envelope, got {stated:?}")
+            });
+            let count: usize = count.parse().unwrap_or_else(|_| {
+                panic!("case {case}: expected a clause count opening the envelope, got {stated:?}")
+            });
+            assert!(
+                count >= 1,
+                "case {case}: expected at least one clause, got {stated:?}"
+            );
+            assert!(
+                !stated.starts_with(&own_envelope_opens),
+                "case {case}: a clause written by the boundary's writer carries no second \
+                 envelope, got {stated:?}"
+            );
+            // Rule 2's own halves: the member's path, and the value as submitted.
+            assert!(
+                clauses.contains(&format!(
+                    "at '{ACTIVITY_ID_MEMBER}' failed to satisfy constraint: "
+                )),
+                "case {case}: expected a clause naming '{ACTIVITY_ID_MEMBER}' and its \
+                 requirement, got {stated:?}"
+            );
+            assert!(
+                clauses.contains(&format!("Value '{activity_id}'")),
+                "case {case}: expected the value as submitted in the clause, got {stated:?}"
+            );
+        }
+    }
+
+    // The positive controls: every id the catalog holds is served by the same handler, and
+    // a well-formed id it does not hold is the not-found condition rather than a refusal
+    // of the id's form.
+    for activity_id in &held {
+        let served = read_activity(&engine, &ctx, activity_id, None)
+            .await
+            .unwrap_or_else(|refused| {
+                panic!("case the held id {activity_id}: expected the stored row, got {refused:?}")
+            });
+        assert_eq!(
+            served.activity_id, *activity_id,
+            "case the held id {activity_id}: expected the row asked for, got {served:?}"
+        );
+    }
+
+    let unheld = "0".repeat(32);
+    assert!(
+        !held.contains(&unheld),
+        "case the unheld id {unheld}: the probe must be an id the catalog does not hold, which \
+         holds {held:?}"
+    );
+    match read_activity(&engine, &ctx, &unheld, None).await {
+        Err(Scaffolded::Restated {
+            modeled: GetAccountActivityErrorModeled::ResourceNotFoundException(_),
+            ..
+        }) => {}
+        other => panic!(
+            "case the unheld id {unheld}: expected the modelled not-found, got {other:?}"
+        ),
+    }
 }

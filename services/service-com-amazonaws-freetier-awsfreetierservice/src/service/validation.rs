@@ -39,11 +39,16 @@
 //! 8. a MODELLED constraint a handler re-checks for itself, so its refusal stays this
 //!    operation's 400 whatever the boundary does with the value, is stated through the
 //!    very clause writer the walk's own refusal goes through
-//!    ([`outside_enum`], [`outside_element_enum`]) — so no second rendering of a value
+//!    ([`outside_enum`], [`outside_element_enum`], [`outside_declared_constraints`]) — so
+//!    no second rendering of a value
 //!    set, of a member path or of a requirement exists in this crate to drift from the
 //!    one above; where the member's value set is not already in the handler's hands it is
 //!    read off the same schemas the walk checks against ([`declared_enum_values`]), so one
-//!    enum is never listed from two readings of the model.
+//!    enum is never listed from two readings of the model. A constraint whose CHECK is the
+//!    walk's own too — a `@length`, a `@pattern`, any bound the framework enforces over a
+//!    built input — is re-checked by running that walk again over the input the handler
+//!    holds ([`outside_declared_constraints`]), so neither the condition nor the sentence
+//!    is restated for it.
 //!
 //! Rules 1-3 and 5 are `services/common`'s already
 //! (`service_common::validation_message::aws_validation_refusal`), which cannot be
@@ -65,7 +70,8 @@ use ::aws_smithy_schema_server::constraints::{
     path, ElementConstraintsTrait, EnumTrait, LengthTrait, PatternTrait, RangeTrait, Violation,
     ViolationKind,
 };
-use ::service_common::validation::{list_of_element, quoted_echo, unanchored};
+use ::aws_smithy_schema::serde::SerializableStruct;
+use ::service_common::validation::{list_of_element, quoted_echo, unanchored, with_submitted_values};
 use ::service_common::validation_message::{list_item_count, map_entry_count};
 use ::smithy_server_runtime::Refused;
 
@@ -295,6 +301,43 @@ pub(crate) fn outside_element_enum(
     let lists = HashMap::from([(member.to_string(), rendered.to_string())]);
     let violation = enum_violation(element, value, declared);
     one_clause(&violation, &lists)
+}
+
+/// The whole `message` of this service's refusal of the value the member at `member`
+/// carries, when that value breaks a constraint the MODEL declares for it, as rule 8
+/// states it — and `None` when it breaks none.
+///
+/// For a handler that re-checks a constraint whose CHECK the framework already owns: a
+/// `@length`, a `@pattern`, a bound it enforces over a built input. `input` and `schema`
+/// are the operation's built input and its input schema, so the violations are the
+/// framework's OWN ([`::aws_smithy_schema_server::constraints::validate`], the walk that
+/// refuses the request in front of the handler) rather than a second reading of the
+/// model: no copy of the condition, of the member path or of the requirement exists here
+/// to drift from the one the boundary states. Every value echo is restored to the bytes
+/// the caller sent exactly as the seam restores one ([`crate::service`]'s
+/// `stated_refusal`), so one value reads the same whichever layer refused it.
+///
+/// Only the violations AT `member` are stated: a handler re-checks the member it is about
+/// to use, and a violation elsewhere in the request is the boundary's to report.
+///
+/// A violation class this module has no wording for keeps the framework's own envelope
+/// rather than losing the refusal — the same fallback [`one_clause`] and [`above_ceiling`]
+/// make.
+pub(crate) fn outside_declared_constraints(
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+    member: &str,
+) -> Option<String> {
+    let found = ::aws_smithy_schema_server::constraints::validate(input, schema);
+    let at_member: Vec<Violation> = with_submitted_values(found, input, schema)
+        .into_iter()
+        .filter(|violation| violation.path == member)
+        .collect();
+    if at_member.is_empty() {
+        return None;
+    }
+    message(&at_member, &HashMap::new())
+        .or_else(|| ::aws_smithy_schema_server::envelope(&at_member))
 }
 
 /// One violation of an enumerated type's value set, recorded the way the constraint walk

@@ -175,12 +175,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An id that cannot be an `ActivityId` is a malformed request, not a
         // missing activity: the framework refuses it before `handle` runs, and
-        // checking here keeps that a `ValidationException` rather than a
-        // not-found whatever the boundary does.
-        let activity_id = input.activity_id.as_str();
-        if !crate::state::is_activity_id(activity_id) {
-            return Err(validation(MALFORMED_ACTIVITY_ID));
+        // re-checking it here keeps that a `ValidationException` of this
+        // operation rather than a not-found whatever the boundary does. Both the
+        // condition and the sentence are the boundary walk's own
+        // (`crate::service::validation`'s rule 8): the modelled `ActivityId`
+        // constraints are checked by re-running that walk over the input this
+        // handler already holds, and its violations are worded by the one clause
+        // writer the walk's refusal goes through, so neither the requirement nor
+        // the member path is restated here.
+        if let Some(message) = crate::service::validation::outside_declared_constraints(
+            &input,
+            Self::INPUT_SCHEMA,
+            ACTIVITY_ID_MEMBER,
+        ) {
+            return Err(refusal(message));
         }
+
+        let activity_id = input.activity_id.as_str();
 
         // As on `ListAccountActivities`: the code selects the language of the
         // title and description this operation reports ("The language code used
@@ -227,22 +238,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// Refuse the request with this operation's own modelled `ValidationException`
-/// (HTTP 400), stating `message` in the envelope this service's validation
-/// front door states a refusal in ([`crate::state::stated_validation`]).
-fn validation(message: impl AsRef<str>) -> GetAccountActivityError {
-    GetAccountActivityErrorModeled::ValidationException(ValidationException {
-        message: crate::state::stated_validation(message.as_ref()),
-    })
-    .into()
-}
-
-/// Refuse the request with this operation's own modelled `ValidationException`
 /// (HTTP 400), stating `message` VERBATIM.
 ///
-/// The counterpart of [`validation`] for a refusal of a value outside an
-/// enumerated type, which is worded by the module that words the boundary walk's
-/// own refusal of it (`crate::service::validation`) and carries no second
-/// envelope — exactly as its sibling reader states the same refusal.
+/// Every refusal of a value the MODEL constrains goes through here: the message
+/// is worded by the module that words the boundary walk's own refusal of that
+/// value (`crate::service::validation`), so it carries no second envelope —
+/// exactly as its sibling reader states the same refusal, and as the service's
+/// own validation envelope ([`crate::state::stated_validation`]) is reserved for
+/// the conditions a handler checks that no constraint declares.
 fn refusal(message: impl Into<String>) -> GetAccountActivityError {
     GetAccountActivityErrorModeled::ValidationException(ValidationException {
         message: message.into(),
@@ -250,19 +253,16 @@ fn refusal(message: impl Into<String>) -> GetAccountActivityError {
     .into()
 }
 
-/// What this service states for an `activityId` that cannot be an `ActivityId`
-/// at all: a FIXED sentence, whose terms are the modelled constraints
-/// (`smithy_query(query="shape",shape="ActivityId")`: exactly 32 characters, each
-/// alphanumeric) and not the id submitted.
+/// The member whose modelled constraints this operation re-checks, spelled as
+/// its input spells it — which is the dotted path the boundary walk reports a
+/// violation of that member at, and so the path the re-check reads its own
+/// violations off ([`crate::service::validation::outside_declared_constraints`]).
 ///
-/// The sibling of [`ACTIVITY_NOT_FOUND`], for the same reason and in the envelope
-/// this service's own validation layer states a condition in: every id that is
-/// not one reads the same, however it fails to be one. The clause that DOES echo
-/// the submitted id is the boundary walk's own, which refuses the request in
-/// front of this handler; the re-check here is what keeps the refusal this
-/// operation's 400 whatever the boundary does with such a value.
-const MALFORMED_ACTIVITY_ID: &str =
-    "The activity id must be exactly 32 alphanumeric characters";
+/// The CONSTRAINTS are not named here: what an `ActivityId` has to satisfy is the
+/// model's to state (`smithy_query(query="shape",shape="ActivityId")`) and the
+/// framework's to enforce, so this names only which member of this request the
+/// handler re-checks.
+const ACTIVITY_ID_MEMBER: &str = "activityId";
 
 /// What this service states for a well-formed `ActivityId` that names no
 /// activity of the caller's account: a FIXED sentence with no variable parts.

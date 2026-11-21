@@ -728,9 +728,11 @@ pub const ACTIVITIES_INVALID_NEXT_TOKEN: &str = "Invalid nextToken";
 /// branch on it depend on something the rule does not distinguish. The rule's own
 /// terms — the operators an expression may set, the options an option compares
 /// by, a bound this service enforces — are part of the condition rather than of
-/// the request, so a sentence states those; the one refusal that echoes a
-/// submitted value is the boundary walk's own clause, which a handler restates
-/// VERBATIM and outside this envelope ([`enum_value_refusal`]).
+/// the request, so a sentence states those; the refusals that DO echo a submitted
+/// value are the boundary walk's own clauses, which a handler restates VERBATIM
+/// and outside this envelope ([`enum_value_refusal`], and the re-check of a
+/// constraint the model declares,
+/// [`crate::service::validation::outside_declared_constraints`]).
 pub fn stated_validation(sentence: &str) -> String {
     format!("[Message = {sentence}]")
 }
@@ -965,12 +967,6 @@ const LANGUAGE_CODE_MEMBER: &str = "languageCode";
 /// enumerated type in.
 pub fn language_code_refusal(language_code: Option<&str>) -> Option<String> {
     enum_value_refusal(LANGUAGE_CODE_MEMBER, language_code?, LANGUAGE_CODE_VALUES)
-}
-
-/// Whether `activity_id` satisfies the modelled `ActivityId` constraints:
-/// exactly 32 characters, each of `[a-zA-Z0-9]`.
-pub fn is_activity_id(activity_id: &str) -> bool {
-    activity_id.len() == 32 && activity_id.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// The activity catalog this emulator reports for an account.
