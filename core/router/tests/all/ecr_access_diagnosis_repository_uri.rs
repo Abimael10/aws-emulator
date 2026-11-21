@@ -37,7 +37,8 @@
 //!
 //! The rows differ along what the rule generalises over: which Region's registry holds the
 //! repository (the service's own Region, another Region of the same partition, a Region of
-//! another partition, and a GovCloud Region), the form of the repository's name
+//! another partition whose registries carry that partition's own DNS suffix, and a GovCloud
+//! Region, which publishes the commercial one), the form of the repository's name
 //! (namespaced, flat, the shortest the pattern allows, and one carrying the punctuation it
 //! allows), and how the revision's image addresses it (a tag, a digest, and no tag at all).
 //! Every service is created wanting no task, because what is under test is the read path a

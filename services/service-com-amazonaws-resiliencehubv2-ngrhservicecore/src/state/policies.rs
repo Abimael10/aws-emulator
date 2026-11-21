@@ -22,7 +22,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     AvailabilitySlo, DataRecoveryTargets, DisasterRecoverySource, EffectivePolicyValues,
-    MultiAzTargets, MultiRegionTargets, Policy, SloSource, TargetSource,
+    MultiAzTargets, MultiRegionTargets, Policy, PolicySummary, SloSource, TargetSource,
 };
 
 use super::{
@@ -115,6 +115,36 @@ impl PolicyRecord {
             created_at: Some(to_date_time(self.created_at)),
             updated_at: Some(to_date_time(self.updated_at)),
         }
+    }
+
+    /// This record as the `PolicySummary` shape `ListPolicies` emits.
+    ///
+    /// The same projection as [`Self::to_policy`], restricted to the members the summary
+    /// shape declares: it carries no `description`, `kmsKeyId` or `tags`, so a listing
+    /// cannot report a member the summary has no room for, and every member it DOES share
+    /// with the full body reads the same stored value.
+    pub fn to_summary(&self, associated_service_count: i32) -> PolicySummary {
+        let policy = self.to_policy(associated_service_count);
+        PolicySummary {
+            policy_arn: policy.policy_arn,
+            name: policy.name,
+            availability_slo: policy.availability_slo,
+            multi_az: policy.multi_az,
+            multi_region: policy.multi_region,
+            data_recovery: policy.data_recovery,
+            sharing_enabled: policy.sharing_enabled,
+            organization_id: policy.organization_id,
+            associated_service_count: policy.associated_service_count,
+            created_at: policy.created_at,
+            updated_at: policy.updated_at,
+        }
+    }
+
+    /// The account that OWNS this policy: the account segment of its ARN, which is where a
+    /// resource's owning account lives. `None` only for a value with too few segments to
+    /// carry one, which a minted ARN never is.
+    pub fn account_id(&self) -> Option<&str> {
+        arn_account(&self.policy_arn)
     }
 
     /// The `EffectivePolicyValues` a service that references this policy has in force.
