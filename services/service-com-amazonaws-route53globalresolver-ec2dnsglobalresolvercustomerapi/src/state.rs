@@ -8,11 +8,17 @@
 //! a create is observable by the next get/list and a delete by the next reader.
 //!
 //! Two things this slice deliberately does NOT emulate, so a reader does not
-//! mistake a modelled error for reachable behaviour: authorization (every
-//! operation models `AccessDeniedException`, and the emulator holds no principals
-//! to evaluate, so no handler constructs it) and throttling (`ThrottlingException`,
-//! likewise). The emulator verifies request signatures in the framework, before any
+//! mistake a modelled error for reachable behaviour: throttling
+//! (`ThrottlingException`), and the evaluation of stored IAM documents — the one
+//! authorization decision this service takes is the one it can take from a request
+//! alone, on the resource ARN a caller supplies (`crate::service`'s resource-ARN
+//! gate). The emulator verifies request signatures in the framework, before any
 //! handler runs.
+
+/// Which resource of this service a tag-family `resourceArn` addresses, and the
+/// refusals that reading settles.
+mod tagging;
+pub use tagging::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr};

@@ -25,6 +25,12 @@ use smithy_server_runtime::MultiServiceRouter;
 #[path = "global_resolver_lifecycle/refusal_bodies.rs"]
 mod refusal_bodies;
 
+// The TAG family of this service — the three operations that address their resource by an
+// ARN the caller supplies — as a second child module of this suite, in the same directory
+// and reusing this file's emulator for the same reason.
+#[path = "global_resolver_lifecycle/resource_tagging.rs"]
+mod resource_tagging;
+
 /// The Region the request's SigV4 credential scope names. Route 53 Global
 /// Resolver's own docs tell callers to use US East (Ohio).
 const REGION: &str = "us-east-2";
@@ -150,6 +156,36 @@ impl Emulator {
             "GET",
             &format!("/dns-views/resolver/{resolver_id}{query}"),
             None,
+        )
+        .await
+    }
+
+    /// `TagResource` for `resource_arn`, carrying `tags` as the request's map.
+    async fn tag(&self, resource_arn: &str, tags: Value) -> Answer {
+        self.call(
+            "POST",
+            "/tag-resource",
+            Some(json!({ "resourceArn": resource_arn, "tags": tags })),
+        )
+        .await
+    }
+
+    /// `UntagResource` for `resource_arn`, naming `tag_keys`.
+    async fn untag(&self, resource_arn: &str, tag_keys: &[&str]) -> Answer {
+        self.call(
+            "POST",
+            "/untag-resource",
+            Some(json!({ "resourceArn": resource_arn, "tagKeys": tag_keys })),
+        )
+        .await
+    }
+
+    /// `ListTagsForResource` for `resource_arn`.
+    async fn list_tags(&self, resource_arn: &str) -> Answer {
+        self.call(
+            "POST",
+            "/get-all-tags",
+            Some(json!({ "resourceArn": resource_arn })),
         )
         .await
     }

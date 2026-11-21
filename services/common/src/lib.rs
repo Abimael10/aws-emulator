@@ -319,6 +319,10 @@ pub mod agentic_rft_jobs;
 /// and read by the AgentCore DATA plane, which creates neither and so cannot tell a
 /// resource of this account from one that was never created.
 pub mod agentcore_resources;
+/// The ONE pre-dispatch read of the string a request names the resource it acts on by, and
+/// the gate that decides which request names none, for every service whose authorization of
+/// a caller-supplied resource comes before the modelled walk.
+pub mod addressed_resource;
 /// The registry of which resources are registered with Amazon Application Recovery
 /// Controller for zonal shift, written by the service that OWNS the resource — ARC models
 /// no operation that registers one — and read by ARC, which reports a managed resource it

@@ -215,6 +215,8 @@ struct ConstraintCase {
     operation: &'static str,
     method: &'static str,
     path: String,
+    /// The request body, for an operation that carries the refused value in one.
+    body: Option<Value>,
     member: &'static str,
     value: String,
     requirement: String,
@@ -227,16 +229,18 @@ async fn a_pattern_requirement_is_quoted_without_the_models_whole_value_anchors(
         format!("Member must satisfy regular expression pattern: {RESOURCE_ID_PATTERN_AS_QUOTED}");
 
     // Rows: every operation of this slice whose `@httpLabel` targets `ResourceId`,
-    // each with a value of a different form that the model's pattern rejects — a
-    // space, an underscore, punctuation, a comma. Each value CONTAINS runs the
-    // pattern matches, so a refusal proves the CHECK is still the model's anchored
-    // one even though the MESSAGE quotes the expression unanchored. The last row is
-    // a different constraint on the same member, which the quoting leaves alone.
+    // plus the two creates that carry such a member in the URI and in the BODY, each
+    // with a value of a different form that the model's pattern rejects — a space, an
+    // underscore, punctuation, a comma. Each value CONTAINS runs the pattern matches,
+    // so a refusal proves the CHECK is still the model's anchored one even though the
+    // MESSAGE quotes the expression unanchored. The last row is a different constraint
+    // on the same member, which the quoting leaves alone.
     let cases = vec![
         ConstraintCase {
             operation: "GetGlobalResolver",
             method: "GET",
             path: "/global-resolver/bad%20id!".to_string(),
+            body: None,
             member: "globalResolverId",
             value: "bad id!".to_string(),
             requirement: pattern_requirement.clone(),
@@ -245,6 +249,7 @@ async fn a_pattern_requirement_is_quoted_without_the_models_whole_value_anchors(
             operation: "DeleteGlobalResolver",
             method: "DELETE",
             path: "/global-resolver/gr_underscore".to_string(),
+            body: None,
             member: "globalResolverId",
             value: "gr_underscore".to_string(),
             requirement: pattern_requirement.clone(),
@@ -253,6 +258,7 @@ async fn a_pattern_requirement_is_quoted_without_the_models_whole_value_anchors(
             operation: "GetDNSView",
             method: "GET",
             path: "/dns-views/view(1)".to_string(),
+            body: None,
             member: "dnsViewId",
             value: "view(1)".to_string(),
             requirement: pattern_requirement.clone(),
@@ -261,6 +267,7 @@ async fn a_pattern_requirement_is_quoted_without_the_models_whole_value_anchors(
             operation: "ListDNSViews",
             method: "GET",
             path: "/dns-views/resolver/one,two".to_string(),
+            body: None,
             member: "globalResolverId",
             value: "one,two".to_string(),
             requirement: pattern_requirement.clone(),
@@ -269,8 +276,36 @@ async fn a_pattern_requirement_is_quoted_without_the_models_whole_value_anchors(
             operation: "GetFirewallDomainList",
             method: "GET",
             path: "/firewall-domain-lists/list%20one".to_string(),
+            body: None,
             member: "firewallDomainListId",
             value: "list one".to_string(),
+            requirement: pattern_requirement.clone(),
+        },
+        // A create whose refused member is the one in its URI, with the rest of the
+        // request well formed: the quoting is the service's, so it does not depend on
+        // which operation or which member carried the value.
+        ConstraintCase {
+            operation: "CreateDNSView",
+            method: "POST",
+            path: "/dns-views/not%20an%20id%20!!!".to_string(),
+            body: Some(json!({ "name": "a-view" })),
+            member: "globalResolverId",
+            value: "not an id !!!".to_string(),
+            requirement: pattern_requirement.clone(),
+        },
+        // And a create whose refused member arrives in the BODY rather than the URI,
+        // which is the other half of that rule.
+        ConstraintCase {
+            operation: "CreateFirewallRule",
+            method: "POST",
+            path: "/firewall-rules".to_string(),
+            body: Some(json!({
+                "dnsViewId": "not an id !!!",
+                "name": "a-rule",
+                "action": "BLOCK"
+            })),
+            member: "dnsViewId",
+            value: "not an id !!!".to_string(),
             requirement: pattern_requirement.clone(),
         },
         ConstraintCase {
@@ -278,6 +313,7 @@ async fn a_pattern_requirement_is_quoted_without_the_models_whole_value_anchors(
             method: "GET",
             // 65 characters: one past `ResourceId`'s published maximum of 64.
             path: format!("/global-resolver/{}", "a".repeat(65)),
+            body: None,
             member: "globalResolverId",
             value: "a".repeat(65),
             requirement: "Member must have length less than or equal to 64".to_string(),
@@ -285,7 +321,9 @@ async fn a_pattern_requirement_is_quoted_without_the_models_whole_value_anchors(
     ];
 
     for case in cases {
-        let answer = emulator.call(case.method, &case.path, None).await;
+        let answer = emulator
+            .call(case.method, &case.path, case.body.clone())
+            .await;
         let label = format!("{} with {:?}", case.operation, case.value);
         assert_eq!(
             answer.status, 400,

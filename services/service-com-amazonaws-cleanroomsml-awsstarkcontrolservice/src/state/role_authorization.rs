@@ -88,10 +88,12 @@ pub fn role_arn_not_present_message(member: &str, action: &str) -> String {
 }
 
 /// The IAM action `operation` asks for, spelled as a policy names it: this service's ARN
-/// namespace — its SigV4 signing name, which is the same token — then the operation.
+/// namespace — its SigV4 signing name, which is the same token — then the operation. The
+/// qualification is the shared one (`service_common::iam_authorization::iam_action`), so this
+/// service and every other that names an action in a refusal spell it the same way.
 #[must_use]
 pub fn iam_action(signing_name: &str, operation: &str) -> String {
-    format!("{signing_name}:{operation}")
+    ::service_common::iam_authorization::iam_action(signing_name, operation)
 }
 
 /// The sentence Clean Rooms ML words for a role it assumed and that may not read the table a

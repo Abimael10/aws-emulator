@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or updates the tags of the resource the caller's `resourceArn` addresses, in
+//! [`crate::state`], so the next `ListTagsForResource` of that ARN reports them.
+//!
+//! The order of the checks is the service's, not this file's: the caller is authorized
+//! against the ARN as supplied BEFORE the member's modelled shape is checked
+//! (`crate::service`'s resource-ARN gate, which answers a value that names no resource
+//! with `AccessDeniedException`), so by the time this handler runs the value is an ARN.
+//! What is left for the handler is which resource it addresses: one of this service's own
+//! ([`crate::state::tagged_resource`]) is looked up and tagged or reported missing, and an
+//! ARN that addresses none is refused `Invalid ARN format`.
 //!
 //! ## Shape of an operation
 //!
@@ -83,13 +85,16 @@ use super::types::*;
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53globalresolver-ec2dnsglobalresolvercustomerapi.json");
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `TagResourceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53globalresolver#TagResource")]
+// model declares for this operation, plus any widened in with `extra_errors` — here
+// `InternalServerException`, a shape the SERVICE models that this operation does not
+// list, which is the only answer a request that cannot reach the store can be given.
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53globalresolver#TagResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ValidationException(ValidationException),
@@ -146,18 +151,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        // An ARN that addresses no resource of this service is a bad request, refused on the
+        // input before anything is looked up: the value names another vendor's resource, or
+        // none at all, so there is nothing of this service's to find under it.
+        let Some(resource) = crate::state::tagged_resource(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::invalid_arn_format(&input.resource_arn),
+            )
+            .into());
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
+
+        let Some(tags) = state.tags_of_mut(resource) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(resource.kind.message_kind(), resource.id),
+            )
+            .into());
+        };
+
+        // What the resource would hold once the request's pairs are merged in: a key it
+        // already carries is REPLACED rather than added, so re-tagging an existing key never
+        // counts against the ceiling.
+        let merged = input
+            .tags
+            .keys()
+            .filter(|key| !tags.contains_key(*key))
+            .count()
+            + tags.len();
+        if merged > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                crate::state::tag_quota_exceeded(resource.kind, resource.id),
+            )
+            .into());
+        }
+        for (key, value) in &input.tags {
+            tags.insert(key.clone(), value.clone());
+        }
+
+        Ok(TagResourceOutput {})
     }
 }

@@ -661,6 +661,22 @@ pub fn account_principals(arn: &str) -> Vec<String> {
     ]
 }
 
+/// The fully qualified IAM action an operation of a service asks for: that service's action
+/// namespace — its ARN namespace, which is its SigV4 signing name — then the operation's own
+/// name, which is how every AWS action is published
+/// (`<service action namespace>:<ApiName>`).
+///
+/// Stated here beside the sentences that NAME an action
+/// ([`not_authorized_to_perform`] and its siblings), because each of them takes the action
+/// already qualified and the qualification is one rule: a refusal of two services must spell
+/// an action the same way. `namespace` is the caller's to supply, read off its own vended
+/// identity rather than restated, so the action a refusal names cannot drift from the name the
+/// request signed with.
+#[must_use]
+pub fn iam_action(namespace: &str, operation: &str) -> String {
+    format!("{namespace}:{operation}")
+}
+
 /// The sentence AWS refuses a request with when the RESOURCE it names grants the calling
 /// principal nothing: the principal that signed, the action it asked for and the resource
 /// it asked for, each as the request carried them.

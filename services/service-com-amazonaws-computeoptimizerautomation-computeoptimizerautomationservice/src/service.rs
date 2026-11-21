@@ -50,6 +50,11 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
+// The one-member read of the `resourceArn` member every service's tagging operations name
+// their resource by, and the gate that decides which request names none: shared, because that
+// read is the same in every service whose authorization of a caller-supplied resource comes
+// before the modelled walk.
+use service_common::addressed_resource::RESOURCE_ARN_REQUEST;
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, ServerHttpProtocol,
     Service,
@@ -181,11 +186,15 @@ impl<Eng: Send + Sync + 'static> DenyUnauthorizedResource<Eng> {
 ///
 /// Resolves the operation first, so only the operations that take a resource ARN
 /// ([`RESOURCE_MEMBERS`]) are judged at all, then reads that operation's
-/// resource member out of the body ([`supplied_resource`]) and asks
+/// resource member out of the body and asks
 /// [`crate::state::names_automation_rule`] whether it names an automation rule
-/// of this service. A request this cannot read — an unknown operation, a
-/// streamed body, a body that is not the serving protocol's object — is `None`
-/// and is left to the modelled walk, which refuses it on its own terms.
+/// of this service. Both the read and that ordering are the shared ones
+/// (`service_common::addressed_resource::unaddressed_resource`), so this service
+/// and every other that authorizes a caller-supplied resource ahead of the
+/// modelled walk read a request the same way; what this file supplies is the two
+/// halves that are its own. A request the read cannot make sense of — an unknown
+/// operation, a streamed body, a body that is not the serving protocol's object —
+/// is `None` and is left to the modelled walk, which refuses it on its own terms.
 ///
 /// `protocol` is the codec the request is SERVED in, so both reads are the ones
 /// the rest of the request uses: a service that declares several protocols is
@@ -195,19 +204,21 @@ fn unauthorized_resource(
     protocol: &dyn ServerHttpProtocol,
     req: &aws_smithy_runtime_api::http::Request,
 ) -> Option<(&'static str, String)> {
-    let routing_key = protocol.routing_key(req).ok()?;
-    let (operation, request_schema) = RESOURCE_MEMBERS
-        .iter()
-        .find(|(candidate, _)| *candidate == routing_key)?;
-    let supplied = supplied_resource(protocol, req, request_schema)?;
-    (!crate::state::names_automation_rule(&supplied)).then_some((*operation, supplied))
+    ::service_common::addressed_resource::unaddressed_resource(
+        protocol,
+        req,
+        &RESOURCE_MEMBERS,
+        crate::state::names_automation_rule,
+    )
 }
 
-/// The namespace the two read-only schemas below name themselves in. They stand
-/// for the READ this gate performs, not for a shape of the model — the model's
-/// own input shapes carry every other member of their operation, which this read
-/// deliberately does not look at — so they are named after the gate.
-const AUTHORIZATION_READ_NAMESPACE: &str = "emulator.authorization";
+/// The namespace the read-only schema below names itself in: the shared gate's own
+/// (`service_common::addressed_resource`), because the schema stands for the READ
+/// this gate performs rather than for a shape of the model — the model's own input
+/// shapes carry every other member of their operation, which this read deliberately
+/// does not look at.
+const AUTHORIZATION_READ_NAMESPACE: &str =
+    ::service_common::addressed_resource::AUTHORIZATION_READ_NAMESPACE;
 
 /// The `ruleArn` member of a request, typed as the string it is on the wire.
 static RULE_ARN: Schema = Schema::new_member(
@@ -221,19 +232,6 @@ static RULE_ARN: Schema = Schema::new_member(
     0,
 );
 
-/// The `resourceArn` member of a request, the name the tagging operations spell
-/// the same `RuleArn` with.
-static RESOURCE_ARN: Schema = Schema::new_member(
-    ShapeId::from_static(
-        "emulator.authorization#ResourceArnRequest$resourceArn",
-        AUTHORIZATION_READ_NAMESPACE,
-        "resourceArn",
-    ),
-    ShapeType::String,
-    "resourceArn",
-    0,
-);
-
 /// The body schema a `ruleArn` request is read through: a structure declaring
 /// THAT ONE member.
 ///
@@ -242,6 +240,10 @@ static RESOURCE_ARN: Schema = Schema::new_member(
 /// member a schema does not declare, so this reads the resource string and
 /// nothing else, and a body that also misses another required member, or carries
 /// one outside its constraints, still names the resource the decision is about.
+/// The counterpart for the `resourceArn` member the tagging operations spell the
+/// same `RuleArn` with is the shared
+/// `service_common::addressed_resource::RESOURCE_ARN_REQUEST`, since that member
+/// name is every service's rather than this one's.
 static RULE_ARN_REQUEST: Schema = Schema::new_struct(
     ShapeId::from_static(
         "emulator.authorization#RuleArnRequest",
@@ -251,40 +253,6 @@ static RULE_ARN_REQUEST: Schema = Schema::new_struct(
     ShapeType::Structure,
     &[&RULE_ARN],
 );
-
-/// The body schema a `resourceArn` request is read through; see
-/// [`RULE_ARN_REQUEST`].
-static RESOURCE_ARN_REQUEST: Schema = Schema::new_struct(
-    ShapeId::from_static(
-        "emulator.authorization#ResourceArnRequest",
-        AUTHORIZATION_READ_NAMESPACE,
-        "ResourceArnRequest",
-    ),
-    ShapeType::Structure,
-    &[&RESOURCE_ARN],
-);
-
-/// The resource string `req` supplies, read through the codec the request is
-/// SERVED in and against `request_schema`'s one member.
-///
-/// `None` when the body is not a structure in that codec, carries no such member,
-/// or carries something other than a string there: then the request names no
-/// resource this gate can judge, and the modelled walk answers it.
-fn supplied_resource(
-    protocol: &dyn ServerHttpProtocol,
-    req: &aws_smithy_runtime_api::http::Request,
-    request_schema: &Schema,
-) -> Option<String> {
-    let mut reader = protocol.deserialize_input(req, request_schema).ok()?;
-    let mut supplied = None;
-    reader
-        .read_struct(request_schema, &mut |member, value| {
-            supplied = Some(value.read_string(member)?);
-            Ok(())
-        })
-        .ok()?;
-    supplied
-}
 
 /// The `com-amazonaws-computeoptimizerautomation-computeoptimizerautomationservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.

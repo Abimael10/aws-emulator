@@ -725,9 +725,11 @@ pub const ACCESS_DENIED_MESSAGE: &str =
 /// `sigv4Name` and `endpointPrefix`,
 /// `smithy_query(query="service_info")`) — read off this service's own identity
 /// by the caller rather than restated here, so the action named in a refusal
-/// cannot drift from the name the request signed with.
+/// cannot drift from the name the request signed with. The qualification itself is the
+/// shared one (`service_common::iam_authorization::iam_action`), so this service and every
+/// other that names an action in a refusal spell it the same way.
 pub fn iam_action(signing_name: &str, operation: &str) -> String {
-    format!("{signing_name}:{operation}")
+    ::service_common::iam_authorization::iam_action(signing_name, operation)
 }
 
 /// How an authorization decision taken on the resource string a request supplied

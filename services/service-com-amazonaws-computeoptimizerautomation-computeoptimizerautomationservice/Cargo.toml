@@ -26,6 +26,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `addressed_resource`: the shared pre-dispatch read of the string a request names the
+# resource it acts on by, and the gate that decides which request names none — the same
+# read in every service whose authorization of a caller-supplied resource comes before the
+# modelled walk, so this service parameterises it rather than keeping a second copy.
+service-common = { path = "../common" }
 # Minting a `ruleId` (16 chars of `[0-9A-Za-z]`) and fingerprinting a request for
 # the client-token ledger are both digests; `hex` renders them.
 sha2 = { workspace = true }
