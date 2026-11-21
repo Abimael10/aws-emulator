@@ -30,400 +30,23 @@
 //! model for the two lifecycles, `smithy_query(query="shape", shape="MasterUserSecret")` for
 //! `SecretStatus`, and `smithy_query(query="operation", operation="ExecuteStatement")` on the
 //! rdsdata model for the call that reads the rows back.
+//!
+//! The calls and the polls this lifecycle is driven by live in
+//! [`crate::rds_cluster_lifecycle_calls`], beside the other suite that drives it
+//! (`rds_restored_cluster_vpc_scaling_and_managed_secret.rs`): what each suite is ABOUT stays
+//! here, how either one reaches the service does not.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use bytes::Bytes;
-use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::query_wire::{block_of, blocks_of, element, form_encode, opt_element};
-
-/// The Region every request below is signed for.
-const REGION: &str = "us-west-2";
-
-/// The engine the whole lifecycle runs on, the one whose clusters serve the Data API.
-const ENGINE: &str = "aurora-postgresql";
-
-/// The database every cluster below is created with, and the one most statements run
-/// against.
-const DATABASE: &str = "simparitydb";
+use crate::query_wire::{blocks_of, element, opt_element};
+use crate::rds_cluster_lifecycle_calls::{
+    add_writer, await_active_secret, await_available_cluster, build_router, create_source_cluster,
+    served, take_snapshot, Addressed, DATABASE, ENGINE, STATUS_AVAILABLE, TABLE,
+};
 
 /// A SECOND database, created through the Data API itself: the rule is about every database
 /// a cluster holds, so one of the rows below writes into one the create never named.
 const SECOND_DATABASE: &str = "ledgerdb";
-
-/// The master user every cluster below is created with.
-const MASTER_USER: &str = "simparity";
-
-/// The DB instance class an Aurora Serverless v2 writer is provisioned with
-/// (`smithy_query(query="doc", shape="CreateDBInstanceMessage", member="DBInstanceClass")`).
-const SERVERLESS_CLASS: &str = "db.serverless";
-
-/// How often a poll looks again, and how long it keeps looking: every condition below is
-/// owed by the CLOCK, so each poll waits for the CONDITION under a generous deadline rather
-/// than for a fixed span.
-const LOOK: Duration = Duration::from_millis(25);
-const DEADLINE: Duration = Duration::from_secs(120);
-
-/// The terminal values this lifecycle's statuses settle on: `DBClusterSnapshot$Status` and
-/// `DBCluster$Status` (`available`), `MasterUserSecret$SecretStatus` (`active`) and
-/// `DBInstance$DBInstanceStatus` (`available`).
-const STATUS_AVAILABLE: &str = "available";
-const SECRET_ACTIVE: &str = "active";
-
-/// PostgreSQL's own code for a statement naming a relation the database does not hold
-/// ("undefined_table", its "Error Codes" appendix) — what a restored cluster answers for a
-/// table its snapshot did not carry.
-const SQLSTATE_UNDEFINED_TABLE: &str = "42P01";
-
-/// The table the rows are written to, in each database.
-const TABLE: &str = "sim2real_snap_restore";
-
-/// The emulator as it is ASSEMBLED, on one engine: the hops Amazon RDS makes to Secrets
-/// Manager and the ones the Data API makes back to Amazon RDS are dispatched into this same
-/// router.
-fn build_router() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = aws_emulator_router::build_router(engine);
-    // The signature is never checked here, as in every other suite of this crate; the
-    // credential scope is what routes a request.
-    router.set_request_authentication(false);
-    router
-}
-
-/// A SigV4 `Authorization` header whose credential scope names `service`, which is what
-/// routes the request.
-fn authorization(service: &str) -> String {
-    format!(
-        "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260101/{REGION}/{service}/\
-         aws4_request, SignedHeaders=host, Signature=0000"
-    )
-}
-
-/// One Amazon RDS awsQuery call, answered with the HTTP status and the XML body.
-async fn rds(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> (u16, String) {
-    let mut body = format!("Action={action}&Version=2014-10-31");
-    for (key, value) in members {
-        body.push('&');
-        body.push_str(&form_encode(key));
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("host", format!("rds.{REGION}.amazonaws.com"))
-        .header("content-type", "application/x-www-form-urlencoded")
-        .header("authorization", authorization("rds"))
-        .body(Bytes::from(body))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    (status, String::from_utf8_lossy(response.body()).to_string())
-}
-
-/// One Amazon RDS call that must be served, answered with its XML body.
-async fn served(
-    router: &MultiServiceRouter,
-    case: &str,
-    action: &str,
-    members: &[(&str, &str)],
-) -> String {
-    let (status, body) = rds(router, action, members).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: {action} must be served, got {status} with {body}"
-    );
-    body
-}
-
-/// One Data API `ExecuteStatement`, answered with the HTTP status and the parsed body.
-async fn execute(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/Execute")
-        .header("host", format!("rds-data.{REGION}.amazonaws.com"))
-        .header("content-type", "application/json")
-        .header("authorization", authorization("rds-data"))
-        .body(Bytes::from(body.to_string()))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-    (status, parsed)
-}
-
-/// A cluster a Data API caller addresses: its ARN and the ARN of the secret holding the
-/// credentials a call authenticates with.
-#[derive(Debug, Clone)]
-struct Addressed {
-    arn: String,
-    secret_arn: String,
-}
-
-impl Addressed {
-    /// Run `sql` against `database` and answer the HTTP status and the parsed response.
-    async fn statement_in(
-        &self,
-        router: &MultiServiceRouter,
-        database: &str,
-        sql: &str,
-    ) -> (u16, Value) {
-        execute(
-            router,
-            &json!({
-                "resourceArn": self.arn,
-                "secretArn": self.secret_arn,
-                "database": database,
-                "sql": sql,
-            }),
-        )
-        .await
-    }
-
-    /// Run `sql` against `database`; it must be served.
-    async fn run_in(
-        &self,
-        router: &MultiServiceRouter,
-        case: &str,
-        database: &str,
-        sql: &str,
-    ) -> Value {
-        let (status, answered) = self.statement_in(router, database, sql).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: {sql} on {database:?} must be served, got {status} with {answered}"
-        );
-        answered
-    }
-
-    /// Run `sql` against [`DATABASE`]; it must be served.
-    async fn run(&self, router: &MultiServiceRouter, case: &str, sql: &str) -> Value {
-        self.run_in(router, case, DATABASE, sql).await
-    }
-
-    /// Poll until the Data API ANSWERS a statement on this cluster: the classes a cluster
-    /// that is still starting up is refused with are transient, so the call is retried under
-    /// a generous deadline.
-    async fn await_data_api(&self, router: &MultiServiceRouter, case: &str) {
-        let deadline = Instant::now() + DEADLINE;
-        loop {
-            let (status, answered) = self.statement_in(router, DATABASE, "SELECT 1").await;
-            if status == 200 {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "case {case:?}: the Data API must answer on {:?}, last got {status} with \
-                 {answered}",
-                self.arn
-            );
-            tokio::time::sleep(LOOK).await;
-        }
-    }
-
-    /// The ids the table in `database` holds, in key order.
-    async fn ids_in(&self, router: &MultiServiceRouter, case: &str, database: &str) -> Vec<i64> {
-        let answered = self
-            .run_in(
-                router,
-                case,
-                database,
-                &format!("SELECT id FROM {TABLE} ORDER BY id"),
-            )
-            .await;
-        ids(&answered)
-    }
-
-    /// Assert that this cluster serves NO such table in `database`: the data a snapshot did
-    /// not carry is data the restored cluster does not have, which is a refusal and never an
-    /// empty answer.
-    async fn assert_no_table_in(&self, router: &MultiServiceRouter, case: &str, database: &str) {
-        let (status, refused) = self
-            .statement_in(router, database, &format!("SELECT id FROM {TABLE}"))
-            .await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: a table the snapshot did not carry must be refused in {database:?}, \
-             got {status} with {refused}"
-        );
-        let message = refused
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        assert!(
-            message.contains(TABLE) || message.contains(database),
-            "case {case:?}: expected the refusal to name the relation or the database \
-             ({SQLSTATE_UNDEFINED_TABLE} for a relation nothing created), got {message:?}"
-        );
-    }
-}
-
-/// Poll `DescribeDBClusters` until the cluster reports `available`.
-async fn await_available_cluster(router: &MultiServiceRouter, case: &str, identifier: &str) {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let read = served(
-            router,
-            case,
-            "DescribeDBClusters",
-            &[("DBClusterIdentifier", identifier)],
-        )
-        .await;
-        let reported = opt_element(&read, "Status").unwrap_or_default();
-        if reported == STATUS_AVAILABLE {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the DB cluster {identifier:?} must reach {STATUS_AVAILABLE:?}, last \
-             reported {reported:?} in {read}"
-        );
-        tokio::time::sleep(LOOK).await;
-    }
-}
-
-/// Poll `DescribeDBClusters` until the cluster's managed master user secret reports
-/// `active`, answering that secret's ARN.
-async fn await_active_secret(router: &MultiServiceRouter, case: &str, identifier: &str) -> String {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let read = served(
-            router,
-            case,
-            "DescribeDBClusters",
-            &[("DBClusterIdentifier", identifier)],
-        )
-        .await;
-        if let Some(secret) = block_of(&read, "MasterUserSecret") {
-            if opt_element(secret, "SecretStatus").unwrap_or_default() == SECRET_ACTIVE {
-                return element(secret, "SecretArn");
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the managed secret of {identifier:?} must reach {SECRET_ACTIVE:?}, \
-             last read {read}"
-        );
-        tokio::time::sleep(LOOK).await;
-    }
-}
-
-/// Poll `DescribeDBInstances` until the DB instance reports `available`.
-async fn await_available_instance(router: &MultiServiceRouter, case: &str, identifier: &str) {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let read = served(
-            router,
-            case,
-            "DescribeDBInstances",
-            &[("DBInstanceIdentifier", identifier)],
-        )
-        .await;
-        let reported = opt_element(&read, "DBInstanceStatus").unwrap_or_default();
-        if reported == STATUS_AVAILABLE {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the DB instance {identifier:?} must reach {STATUS_AVAILABLE:?}, last \
-             reported {reported:?} in {read}"
-        );
-        tokio::time::sleep(LOOK).await;
-    }
-}
-
-/// Poll `DescribeDBClusterSnapshots` until the snapshot reports `available`.
-async fn await_available_snapshot(router: &MultiServiceRouter, case: &str, identifier: &str) {
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        let read = served(
-            router,
-            case,
-            "DescribeDBClusterSnapshots",
-            &[("DBClusterSnapshotIdentifier", identifier)],
-        )
-        .await;
-        let reported = opt_element(&read, "Status").unwrap_or_default();
-        if reported == STATUS_AVAILABLE {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: the DB cluster snapshot {identifier:?} must reach \
-             {STATUS_AVAILABLE:?}, last reported {reported:?} in {read}"
-        );
-        tokio::time::sleep(LOOK).await;
-    }
-}
-
-/// Create an Aurora Serverless v2 cluster with RDS managing the master user password and the
-/// Data API turned on, and wait until that credential is usable.
-async fn create_source_cluster(
-    router: &MultiServiceRouter,
-    case: &str,
-    identifier: &str,
-) -> Addressed {
-    let created = served(
-        router,
-        case,
-        "CreateDBCluster",
-        &[
-            ("DBClusterIdentifier", identifier),
-            ("Engine", ENGINE),
-            ("DatabaseName", DATABASE),
-            ("MasterUsername", MASTER_USER),
-            ("ManageMasterUserPassword", "true"),
-            ("EnableHttpEndpoint", "true"),
-            ("BackupRetentionPeriod", "1"),
-            ("ServerlessV2ScalingConfiguration.MinCapacity", "0.5"),
-            ("ServerlessV2ScalingConfiguration.MaxCapacity", "1.0"),
-        ],
-    )
-    .await;
-    let addressed = Addressed {
-        arn: element(&created, "DBClusterArn"),
-        secret_arn: await_active_secret(router, case, identifier).await,
-    };
-    await_available_cluster(router, case, identifier).await;
-    addressed.await_data_api(router, case).await;
-    addressed
-}
-
-/// Add a writer DB instance to `cluster` and wait until it is available.
-async fn add_writer(router: &MultiServiceRouter, case: &str, cluster: &str, instance: &str) {
-    served(
-        router,
-        case,
-        "CreateDBInstance",
-        &[
-            ("DBInstanceIdentifier", instance),
-            ("DBClusterIdentifier", cluster),
-            ("Engine", ENGINE),
-            ("DBInstanceClass", SERVERLESS_CLASS),
-        ],
-    )
-    .await;
-    await_available_instance(router, case, instance).await;
-}
-
-/// Take a DB cluster snapshot of `cluster` and wait until it is available.
-async fn take_snapshot(router: &MultiServiceRouter, case: &str, cluster: &str, snapshot: &str) {
-    served(
-        router,
-        case,
-        "CreateDBClusterSnapshot",
-        &[
-            ("DBClusterSnapshotIdentifier", snapshot),
-            ("DBClusterIdentifier", cluster),
-        ],
-    )
-    .await;
-    await_available_snapshot(router, case, snapshot).await;
-}
 
 /// Restore `snapshot` into a NEW cluster called `identifier`, wait for every status the
 /// lifecycle owes, give the restored cluster a managed master user password of its own and
@@ -473,27 +96,6 @@ async fn restore_cluster(
     addressed
 }
 
-/// The `id` column of every record of an answered `SELECT`, in the order the answer reports
-/// them.
-fn ids(answered: &Value) -> Vec<i64> {
-    answered
-        .get("records")
-        .and_then(Value::as_array)
-        .map(|records| {
-            records
-                .iter()
-                .filter_map(|record| {
-                    record
-                        .as_array()
-                        .and_then(|fields| fields.first())
-                        .and_then(|field| field.get("longValue"))
-                        .and_then(Value::as_i64)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// The whole lifecycle a client drives, in order, with every status it polls for: the
 /// snapshot, the restored cluster, the restored cluster's managed secret and its writer all
 /// reach their terminal value, and the restored cluster serves the rows the snapshot held
@@ -506,7 +108,7 @@ async fn an_aurora_cluster_snapshot_and_restore_converge_and_carry_the_snapshots
     let snapshot = "emu-snaprestore-snap";
     let case = "the snapshot-and-restore lifecycle";
 
-    let source = create_source_cluster(&router, case, source_cluster).await;
+    let source = create_source_cluster(&router, case, source_cluster, &[]).await;
     add_writer(&router, case, source_cluster, "emu-snaprestore-src-1").await;
 
     // The rows the snapshot must carry, committed through the Data API before it is taken.
@@ -607,7 +209,7 @@ struct Checkpoint {
 async fn what_a_restored_cluster_serves_is_what_its_snapshot_held() {
     let router = build_router();
     let source_cluster = "emu-snapheld-src";
-    let source = create_source_cluster(&router, "the source cluster", source_cluster).await;
+    let source = create_source_cluster(&router, "the source cluster", source_cluster, &[]).await;
 
     let checkpoints: &[Checkpoint] = &[
         Checkpoint {
