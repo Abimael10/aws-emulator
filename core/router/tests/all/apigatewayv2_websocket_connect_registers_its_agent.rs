@@ -538,18 +538,22 @@ pub(crate) async fn answered_handshake_at(
 /// `pub(crate)` for the same reason [`Head`] is: it is where [`answered_handshake_at`] stops
 /// reading an answer — a completed handshake is followed by frames rather than by a body — so
 /// every suite that writes a handshake through it stops at the same place.
+///
+/// One byte at a time, so nothing BEYOND the head is consumed: what follows a completed
+/// handshake is frames, and a suite that goes on to read them over the same socket
+/// ([`super::apigatewayv2_websocket_lifecycle_watcher_push`]) would otherwise lose the first of
+/// them into this buffer. A head is a few hundred bytes, so the reads cost nothing a case
+/// measures.
 pub(crate) async fn read_head(stream: &mut TcpStream) -> Option<String> {
     let mut head: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 1024];
     while head.len() < MAX_HEAD_BYTES {
-        match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return None,
-            Ok(read) => head.extend_from_slice(&chunk[..read]),
+        let mut byte = [0u8; 1];
+        match stream.read_exact(&mut byte).await {
+            Ok(_read) => head.push(byte[0]),
+            Err(_error) => return None,
         }
-        if let Some(end) = head
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-        {
+        if head.ends_with(b"\r\n\r\n") {
+            let end = head.len() - 4;
             return String::from_utf8(head[..end].to_vec()).ok();
         }
     }
