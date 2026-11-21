@@ -8,7 +8,7 @@
 //! `ResetNotificationSettings`,
 //! `CreateProfile`, `GetProfile`, `ListProfiles`, `DisableProfile`, `DeleteProfile`,
 //! `PutAttributeMapping`, `DeleteAttributeMapping`, `ImportCrl`,
-//! `GetCrl`, `ListCrls`) are backed entirely by the maps below, so a write is visible to the next
+//! `GetCrl`, `ListCrls`, `DisableCrl`, `EnableCrl`) are backed entirely by the maps below, so a write is visible to the next
 //! request on the same engine. The record types and their projections live here rather
 //! than in a handler because several operations reach each of them.
 //!

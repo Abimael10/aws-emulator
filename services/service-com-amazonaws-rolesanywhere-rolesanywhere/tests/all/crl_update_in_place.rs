@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for `UpdateCrl` as an IN-PLACE PARTIAL write on the stored
-//! certificate revocation list.
+//! End-to-end HTTP tests for the IN-PLACE writes on a stored certificate revocation list:
+//! `UpdateCrl` as a PARTIAL write, and the two enablement switches `DisableCrl` and
+//! `EnableCrl`.
 //!
 //! The rule under test: an update addresses one stored record by id and writes only the
 //! members the request carries — a member it omits keeps the value the import or an earlier
@@ -12,6 +13,13 @@
 //! (`smithy_query(query="operation", operation="UpdateCrl",
 //! model_path="services/service-com-amazonaws-rolesanywhere-rolesanywhere/smithy-model/com-amazonaws-rolesanywhere-rolesanywhere.json")`),
 //! so `enabled`, `trustAnchorArn`, the ids and the resource's tag set are outside its reach.
+//!
+//! `DisableCrl` and `EnableCrl` are the same rule with ONE member each: they carry `crlId`
+//! alone and write the addressed record's `enabled` flag — false and true respectively —
+//! answering the whole `CrlDetail`
+//! (`smithy_query(query="operation", operation="DisableCrl,EnableCrl")`), so every other
+//! member, the tag set and the sibling records all survive, the flag is written rather than
+//! toggled, and an id that resolves to no stored record is refused instead of answered.
 //!
 //! Three tables, each differing along what the rule generalises over.
 //!
@@ -70,6 +78,59 @@ const CRL_DATA_MAX_LENGTH: usize = 300_000;
 const UUID_LENGTH: usize = 36;
 const UUID_PATTERN: &str = "[a-f0-9]{8}-([a-z0-9]{4}-){3}[a-z0-9]{12}";
 
+/// The account every emulated ARN carries (`engine::emulator_account_id`).
+const ACCOUNT: &str = "000000000000";
+
+/// Ids shaped like the modelled `Uuid` that nothing in the store is ever imported under, so
+/// the boundary validator accepts them and the handler has to resolve them.
+const UNMINTED_IDS: [(&str, &str); 3] = [
+    ("all-zero-id", "00000000-0000-0000-0000-000000000000"),
+    ("hex-words-id", "deadbeef-dead-beef-dead-beefdeadbeef"),
+    ("all-f-id", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
+];
+
+/// Ids OUTSIDE the modelled `Uuid` form: too short by one, too long by one, uppercase hex,
+/// no separators, and not a uuid at all.
+const MALFORMED_IDS: [&str; 5] = [
+    "0123abcd-4567-89ef-0123-456789abcde",
+    "0123abcd-4567-89ef-0123-456789abcdef0",
+    "0123ABCD-4567-89EF-0123-456789ABCDEF",
+    "0123abcd456789ef0123456789abcdef0123",
+    "not-a-uuid",
+];
+
+/// The two enablement switches a stored CRL has, one operation each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Switch {
+    Disable,
+    Enable,
+}
+
+impl Switch {
+    /// The last path segment the model binds the operation to: `POST /crl/{crlId}/disable`
+    /// and `POST /crl/{crlId}/enable`
+    /// (`smithy_query(query="operation", operation="DisableCrl,EnableCrl")`).
+    fn path_suffix(self) -> &'static str {
+        match self {
+            Switch::Disable => "disable",
+            Switch::Enable => "enable",
+        }
+    }
+
+    /// The `enabled` flag the switch writes on the record it addresses.
+    fn target(self) -> bool {
+        matches!(self, Switch::Enable)
+    }
+
+    /// The operation's name, for the assertion messages.
+    fn operation(self) -> &'static str {
+        match self {
+            Switch::Disable => "DisableCrl",
+            Switch::Enable => "EnableCrl",
+        }
+    }
+}
+
 /// A client over one emulator: one engine, one mounted service, so every request in a test
 /// observes the state the previous one wrote.
 struct Client {
@@ -110,6 +171,16 @@ impl Client {
     }
 
     async fn send(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+        self.send_in_region(method, uri, body, REGION).await
+    }
+
+    async fn send_in_region(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        region: &str,
+    ) -> Answer {
         let payload = body
             .map(|value| bytes::Bytes::from(serde_json::to_vec(&value).expect("serialize body")))
             .unwrap_or_default();
@@ -122,7 +193,7 @@ impl Client {
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/rolesanywhere/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/rolesanywhere/aws4_request, \
                      SignedHeaders=host, Signature=deadbeef"
                 ),
             )
@@ -189,6 +260,25 @@ impl Client {
 
     async fn update_crl(&self, id: &str, body: Value) -> Answer {
         self.send("PATCH", &format!("/crl/{id}"), Some(body)).await
+    }
+
+    async fn delete_crl(&self, id: &str) -> Answer {
+        self.send("DELETE", &format!("/crl/{id}"), None).await
+    }
+
+    /// Throw one of the two enablement switches on the CRL an id addresses.
+    async fn switch_crl(&self, switch: Switch, id: &str) -> Answer {
+        self.switch_crl_in_region(switch, id, REGION).await
+    }
+
+    async fn switch_crl_in_region(&self, switch: Switch, id: &str, region: &str) -> Answer {
+        self.send_in_region(
+            "POST",
+            &format!("/crl/{id}/{}", switch.path_suffix()),
+            None,
+            region,
+        )
+        .await
     }
 
     /// The `ListCrls` element whose `crlId` is `id`, over every page.
@@ -784,5 +874,421 @@ async fn update_crl_refuses_input_outside_the_published_constraints_and_stores_n
         member("inside-every-constraint", &served.crl(), "name").as_str(),
         Some("n".repeat(NAME_MAX_LENGTH).as_str()),
         "case \"inside-every-constraint\": the served update must write the submitted name"
+    );
+}
+
+/// The ARN a CRL id carries in `region`, which is the ARN a refusal naming that id words:
+/// `CrlDetail$crlArn` is `@pattern("^arn:aws(-[^:]+)?:rolesanywhere(:.*){2}(:crl.*)$")`
+/// (`smithy_query(query="shape", shape="CrlDetail")`).
+fn crl_arn(region: &str, crl_id: &str) -> String {
+    format!("arn:aws:rolesanywhere:{region}:{ACCOUNT}:crl/{crl_id}")
+}
+
+/// The wording an ARN-keyed miss carries.
+fn arn_not_found_message(resource_arn: &str) -> String {
+    format!("The item doesn't exist. arn: {resource_arn} ; aborting.")
+}
+
+/// Whether a returned detail reports the CRL as enabled.
+fn enabled_flag(case: &str, crl: &Value) -> bool {
+    crl.get("enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| panic!("case {case:?}: enabled must be a boolean, got {crl:?}"))
+}
+
+/// One row of the enablement table: the shape and enablement the record is imported with,
+/// so each switch lands on a record in a different state.
+struct EnablementRow {
+    case: &'static str,
+    imported_enabled: Option<bool>,
+    name: String,
+    data: Vec<u8>,
+    tags: Vec<(&'static str, &'static str)>,
+}
+
+/// The rows the enablement switches are driven over: the `enabled` state the import left
+/// (omitted, on, off), the name length at both published bounds, and `crlData` spanning a
+/// text PEM, every byte value and the published floor.
+fn enablement_rows() -> Vec<EnablementRow> {
+    vec![
+        EnablementRow {
+            case: "enabled-omitted-pem-data-no-tags",
+            imported_enabled: None,
+            name: "c".repeat(NAME_MIN_LENGTH),
+            data: CRL_PEM.as_bytes().to_vec(),
+            tags: Vec::new(),
+        },
+        EnablementRow {
+            case: "imported-on-binary-data-one-tag",
+            imported_enabled: Some(true),
+            name: "imported on".to_string(),
+            data: (0u8..=255).collect(),
+            tags: vec![("owner", "platform")],
+        },
+        EnablementRow {
+            case: "imported-off-name-at-the-ceiling-two-tags",
+            imported_enabled: Some(false),
+            name: "c".repeat(NAME_MAX_LENGTH),
+            data: vec![b'z'; 4096],
+            tags: vec![("owner", "platform"), ("tier", "prod")],
+        },
+        EnablementRow {
+            case: "imported-on-data-at-the-floor-three-tags",
+            imported_enabled: Some(true),
+            name: "floor data".to_string(),
+            data: vec![b'-'; CRL_DATA_MIN_LENGTH],
+            tags: vec![("owner", "platform"), ("tier", "prod"), ("team", "iam")],
+        },
+    ]
+}
+
+/// A switch writes the addressed record's `enabled` flag and NOTHING else, and the single
+/// stored record is what the operation's own answer, `GetCrl` and the `ListCrls` projection
+/// all report afterwards.
+///
+/// Each row is driven through the SAME sequence of switches, so every step composes with what
+/// the step before it wrote: both directions, and a repeat of each, which must report the same
+/// state because the flag is written rather than toggled.
+#[tokio::test]
+async fn crl_enablement_switches_only_the_stored_flag_and_persists_it() {
+    let sequence = [
+        Switch::Disable,
+        Switch::Disable,
+        Switch::Enable,
+        Switch::Enable,
+        Switch::Disable,
+        Switch::Enable,
+    ];
+
+    for row in enablement_rows() {
+        let client = Client::new();
+        let anchor = trust_anchor_arn(&client, "enablement anchor").await;
+        // A sibling the case never addresses, so a write that reached the wrong record shows
+        // up below.
+        let sibling_case = format!("{}/sibling", row.case);
+        let (sibling_id, _, sibling) = import(
+            &client,
+            &sibling_case,
+            json!({
+                "name": "untouched sibling",
+                "crlData": aws_smithy_types::base64::encode(CRL_PEM.as_bytes()),
+                "trustAnchorArn": anchor.clone(),
+                "enabled": true,
+            }),
+        )
+        .await;
+
+        let mut body = json!({
+            "name": row.name,
+            "crlData": aws_smithy_types::base64::encode(&row.data),
+            "trustAnchorArn": anchor,
+            "tags": row
+                .tags
+                .iter()
+                .map(|(key, value)| json!({"key": key, "value": value}))
+                .collect::<Vec<Value>>(),
+        });
+        if let Some(enabled) = row.imported_enabled {
+            body["enabled"] = json!(enabled);
+        }
+        let (id, arn, imported) = import(&client, row.case, body).await;
+        let tags_before = client.resource_tags(row.case, &arn).await;
+        let mut previous_updated = instant_secs(row.case, &imported, "updatedAt");
+
+        for (index, switch) in sequence.iter().enumerate() {
+            let case = format!("{}/{}-{index}", row.case, switch.path_suffix());
+            let before = clock_secs();
+            let answer = client.switch_crl(*switch, &id).await;
+            let after = clock_secs();
+            assert_eq!(
+                answer.status,
+                200,
+                "case {case:?}: expected {} 200, got {answer:?}",
+                switch.operation()
+            );
+            let crl = answer.crl();
+            assert_eq!(
+                enabled_flag(&case, &crl),
+                switch.target(),
+                "case {case:?}: {} must report enabled {}, got {crl:?}",
+                switch.operation(),
+                switch.target()
+            );
+
+            // Only the flag and the instant of the write may differ from what the import
+            // stored: a switch has no input for any other member, and `createdAt` belongs
+            // to the import.
+            for untouched in [
+                "crlId",
+                "crlArn",
+                "name",
+                "crlData",
+                "trustAnchorArn",
+                "createdAt",
+            ] {
+                assert_eq!(
+                    member(&case, &crl, untouched),
+                    member(row.case, &imported, untouched),
+                    "case {case:?}: {untouched} is not this operation's to change, got {crl:?}"
+                );
+            }
+
+            // `updatedAt` is the instant of THIS write — inside the window the test brackets
+            // the call with — and it never goes backwards.
+            let updated = instant_secs(&case, &crl, "updatedAt");
+            assert!(
+                updated >= before && updated <= after,
+                "case {case:?}: updatedAt must be the instant of this write, got {updated} \
+                 outside [{before}, {after}]"
+            );
+            assert!(
+                updated >= previous_updated,
+                "case {case:?}: updatedAt must not precede the previous write's, got {updated} \
+                 after {previous_updated}"
+            );
+            previous_updated = updated;
+
+            // One stored record: the read and the list projection report what the write
+            // answered, and the resource's tag set is untouched by it.
+            let read = client.get_crl(&id).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: expected GetCrl 200, got {read:?}"
+            );
+            assert_eq!(
+                read.crl(),
+                crl,
+                "case {case:?}: GetCrl must report the record the switch wrote"
+            );
+            assert_eq!(
+                client.listed_crl(&case, &id).await,
+                crl,
+                "case {case:?}: the ListCrls projection must report the record the switch wrote"
+            );
+            assert_eq!(
+                client.resource_tags(&case, &arn).await,
+                tags_before,
+                "case {case:?}: an enablement switch must not touch the resource's tag set"
+            );
+        }
+
+        // The sibling is untouched, flag and instants alike.
+        let sibling_read = client.get_crl(&sibling_id).await;
+        assert_eq!(
+            sibling_read.status, 200,
+            "case {sibling_case:?}: expected GetCrl 200, got {sibling_read:?}"
+        );
+        assert_eq!(
+            sibling_read.crl(),
+            sibling,
+            "case {sibling_case:?}: no other CRL may change"
+        );
+    }
+}
+
+/// Switching one CRL is confined to the CRL it addresses: with a store of many, exactly the
+/// addressed ones report the flag their last switch wrote, on the read path and in the list
+/// projection.
+///
+/// The rows differ in how many CRLs the store holds, how many of them are switched, in what
+/// order, and in which direction.
+#[tokio::test]
+async fn crl_enablement_is_confined_to_the_crl_it_addresses() {
+    /// One row: how many CRLs the store holds, and which of them are switched in what order.
+    struct Row {
+        case: &'static str,
+        total: usize,
+        switches: Vec<(usize, Switch)>,
+    }
+
+    let cases = [
+        Row {
+            case: "one-of-one-disabled",
+            total: 1,
+            switches: vec![(0, Switch::Disable)],
+        },
+        Row {
+            case: "none-of-four",
+            total: 4,
+            switches: Vec::new(),
+        },
+        Row {
+            case: "first-of-four-disabled",
+            total: 4,
+            switches: vec![(0, Switch::Disable)],
+        },
+        Row {
+            case: "last-then-first-of-four-disabled",
+            total: 4,
+            switches: vec![(3, Switch::Disable), (0, Switch::Disable)],
+        },
+        Row {
+            case: "all-of-three-in-reverse-then-one-back-on",
+            total: 3,
+            switches: vec![
+                (2, Switch::Disable),
+                (1, Switch::Disable),
+                (0, Switch::Disable),
+                (1, Switch::Enable),
+            ],
+        },
+    ];
+
+    for Row {
+        case,
+        total,
+        switches,
+    } in &cases
+    {
+        let (case, total) = (*case, *total);
+        let client = Client::new();
+        let anchor = trust_anchor_arn(&client, "confinement anchor").await;
+        let mut ids: Vec<String> = Vec::new();
+        for index in 0..total {
+            let (id, _, _) = import(
+                &client,
+                &format!("{case}/import-{index}"),
+                json!({
+                    "name": format!("crl {index}"),
+                    "crlData": aws_smithy_types::base64::encode(CRL_PEM.as_bytes()),
+                    "trustAnchorArn": anchor.clone(),
+                    // Imported on, so a CRL this case does not address has an enablement a
+                    // stray write could still change.
+                    "enabled": true,
+                }),
+            )
+            .await;
+            ids.push(id);
+        }
+
+        let mut expected = vec![true; total];
+        for (index, switch) in switches {
+            let labelled = format!("{case}/{}-{index}", switch.path_suffix());
+            let answer = client.switch_crl(*switch, &ids[*index]).await;
+            assert_eq!(
+                answer.status,
+                200,
+                "case {labelled:?}: expected {} 200, got {answer:?}",
+                switch.operation()
+            );
+            expected[*index] = switch.target();
+        }
+
+        for (index, id) in ids.iter().enumerate() {
+            let labelled = format!("{case}/crl-{index}");
+            let read = client.get_crl(id).await;
+            assert_eq!(
+                read.status, 200,
+                "case {labelled:?}: expected GetCrl 200, got {read:?}"
+            );
+            assert_eq!(
+                enabled_flag(&labelled, &read.crl()),
+                expected[index],
+                "case {labelled:?}: expected enabled {}, got {read:?}",
+                expected[index]
+            );
+            let element = client.listed_crl(&labelled, id).await;
+            assert_eq!(
+                enabled_flag(&labelled, &element),
+                expected[index],
+                "case {labelled:?}: the ListCrls projection must report enabled {}, got \
+                 {element:?}",
+                expected[index]
+            );
+        }
+    }
+}
+
+/// An id that resolves to no stored CRL is the modelled 404 carrying the ARN-keyed wording —
+/// never a canned success — and an id outside the modelled `Uuid` form is a 400. Neither
+/// switch writes anything on a refused call.
+///
+/// The rows span both switches, why the id does not resolve (never imported, deleted a moment
+/// ago) and the Region the request is signed for, which is the only variable part of the
+/// message.
+#[tokio::test]
+async fn crl_enablement_refuses_an_id_that_resolves_to_nothing() {
+    let client = Client::new();
+    let anchor = trust_anchor_arn(&client, "refusal anchor").await;
+    let (survivor_id, _, survivor) = import(
+        &client,
+        "survivor",
+        json!({
+            "name": "survivor crl",
+            "crlData": aws_smithy_types::base64::encode(CRL_PEM.as_bytes()),
+            "trustAnchorArn": anchor.clone(),
+            "enabled": true,
+        }),
+    )
+    .await;
+    let (deleted_id, _, _) = import(
+        &client,
+        "deleted",
+        json!({
+            "name": "deleted crl",
+            "crlData": aws_smithy_types::base64::encode(CRL_PEM.as_bytes()),
+            "trustAnchorArn": anchor,
+        }),
+    )
+    .await;
+    let removed = client.delete_crl(&deleted_id).await;
+    assert_eq!(
+        removed.status, 200,
+        "case \"delete-the-deleted-fixture\": expected DeleteCrl 200, got {removed:?}"
+    );
+
+    let mut cases: Vec<(String, String, &str)> = Vec::new();
+    for (label, id) in UNMINTED_IDS {
+        cases.push((format!("unminted-{label}"), id.to_string(), REGION));
+    }
+    cases.push(("deleted-crl-id".to_string(), deleted_id.clone(), REGION));
+    for region in ["eu-central-1", "ap-southeast-2", "us-east-1"] {
+        cases.push((
+            format!("unminted-in-{region}"),
+            UNMINTED_IDS[1].1.to_string(),
+            region,
+        ));
+    }
+
+    for switch in [Switch::Disable, Switch::Enable] {
+        for (label, id, region) in &cases {
+            let case = format!("{}/{label}", switch.path_suffix());
+            let expected = arn_not_found_message(&crl_arn(region, id));
+            let answer = client.switch_crl_in_region(switch, id, region).await;
+            assert_eq!(
+                (answer.status, answer.error_code.as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?}: an unresolvable crlId must be refused, got {answer:?}"
+            );
+            assert_eq!(
+                answer.message(),
+                expected.as_str(),
+                "case {case:?}: expected message {expected:?}, got {:?}",
+                answer.message()
+            );
+        }
+
+        for id in MALFORMED_IDS {
+            let case = format!("{}/malformed-{id}", switch.path_suffix());
+            let answer = client.switch_crl(switch, id).await;
+            assert_eq!(
+                (answer.status, answer.error_code.as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: an id outside the modelled Uuid form must be refused, got \
+                 {answer:?}"
+            );
+        }
+    }
+
+    // Not one refusal wrote anything: the stored CRL is still exactly as imported.
+    let still_there = client.get_crl(&survivor_id).await;
+    assert_eq!(
+        still_there.status, 200,
+        "case \"survivor\": expected GetCrl 200, got {still_there:?}"
+    );
+    assert_eq!(
+        still_there.crl(),
+        survivor,
+        "case \"survivor\": a refused call must change nothing"
     );
 }
