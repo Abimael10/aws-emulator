@@ -97,6 +97,16 @@ pub mod revision_location;
 /// policy every deployment runs under.
 pub mod deployment_summary;
 
+/// The Amazon EC2 instances a deployment group's EC2 tag selectors select,
+/// resolved against the service that OWNS instances: the one place that fleet is
+/// read.
+pub mod ec2_fleet;
+
+/// The WAVES a deployment takes its targets out of service in: the one place the
+/// resolved configuration's `minimumHealthyHosts` bound is applied, and the one
+/// place a target's own status is read off the deployment's progress.
+pub mod target_waves;
+
 /// The revision a deployment deploys when it names an S3 object, FETCHED from the
 /// object store that holds it: the one place a revision's identity is resolved and
 /// the one place a deployment whose revision cannot be located is failed.
@@ -125,6 +135,13 @@ use crate::ops::types::{
 const DEPLOYMENT_START_MILLIS: i64 = 250;
 /// See [`DEPLOYMENT_START_MILLIS`]: three seconds after the deployment starts.
 const DEPLOYMENT_COMPLETION_MILLIS: i64 = DEPLOYMENT_START_MILLIS + 3_000;
+/// How long ONE WAVE of a deployment's targets is out of service: the span above,
+/// which is what a deployment that takes its whole fleet out of service at once
+/// runs for. A deployment the resolved configuration's `minimumHealthyHosts`
+/// bounds to a fraction of its fleet works through it one wave at a time, so it is
+/// held open for one of these per wave ([`target_waves`]).
+pub const DEPLOYMENT_WAVE_MILLIS: i64 =
+    DEPLOYMENT_COMPLETION_MILLIS - DEPLOYMENT_START_MILLIS;
 
 /// The statuses a deployment the emulator created moves through. All three are
 /// members of the model's `DeploymentStatus` enum
@@ -1565,6 +1582,13 @@ pub struct Deployment {
     /// status; see [`deployment_targets`], [`Deployment::target_count`] and
     /// [`terminal_status`].
     pub targets: Vec<DeploymentTargetSnapshot>,
+    /// How many WAVES of those targets the clock has already taken out of service
+    /// and finished, materialised by
+    /// [`ComAmazonawsCodedeployCodedeploy20141006State::advance_clock`] from the
+    /// instants the deployment owes them ([`target_waves`]): the targets of an
+    /// earlier wave have been deployed to, the targets of this one are being
+    /// deployed to right now, and the targets of a later one are still waiting.
+    pub target_waves_finished: usize,
     /// Whether this deployment terminates the instances of the original (blue)
     /// environment after traffic routing: true only for a blue/green deployment
     /// whose group chose the `TERMINATE` action, which is also exactly when the
@@ -1689,6 +1713,12 @@ pub struct DeploymentTargetSnapshot {
     /// The `TargetLabel` this target carries, for a target of an EC2/on-premises
     /// deployment that HAS one; see [`deployment_targets`].
     pub instance_label: Option<String>,
+    /// Which WAVE of its deployment deploys to this target, counted from zero:
+    /// the deployment takes its targets out of service a wave at a time, as many
+    /// to a wave as the resolved configuration's `minimumHealthyHosts` allows
+    /// ([`target_waves`]). A deployment whose configuration bounds nothing has
+    /// every target in wave zero.
+    pub wave: usize,
 }
 
 impl Deployment {
@@ -2380,6 +2410,11 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 deployment.status = DEPLOYMENT_STATUS_IN_PROGRESS.to_string();
                 deployment.start_time_ms = Some(deployment.starts_at_ms);
             }
+            // How far through its WAVES of targets the deployment is: a wave the
+            // clock already owed is finished, whether or not anybody called, and a
+            // wave that finished stays finished.
+            deployment.target_waves_finished = target_waves::waves_finished_at(deployment, now_ms)
+                .max(deployment.target_waves_finished);
             // A blue/green deployment that terminates the original instances
             // reports its termination wait as started once traffic routing is
             // complete, which the clock owes at the same instant whoever asks.
@@ -3024,13 +3059,15 @@ pub fn malformed_deployment_id_message(deployment_id: &str) -> String {
 ///   declares no function leaves it unnamed (see
 ///   [`DeploymentTargetSnapshot::target_id`]).
 /// * `Server` (EC2/on-premises): the instances the group selects, reported under
-///   their instance ids. The instances this emulator HOLDS are the on-premises
-///   ones registered with it, so they are resolved from that registry through
-///   the group's `onPremisesInstanceTagFilters` and `onPremisesTagSet` (see
-///   [`group_selects_instance`]). An `ec2TagFilter`, an `ec2TagSet` or an Auto
-///   Scaling group names EC2 inventory, which CodeDeploy's state does not keep
-///   and which this emulator reads from no other service, so those selectors
-///   resolve nothing.
+///   their instance ids. Two selectors resolve, each against the records that
+///   hold the instances it names: the on-premises registry this service keeps,
+///   through the group's `onPremisesInstanceTagFilters` and `onPremisesTagSet`
+///   (see [`group_selects_instance`]), and the account's Amazon EC2 fleet,
+///   through the group's `ec2TagFilters` and `ec2TagSet` — those instances
+///   belong to Amazon EC2, so they are RESOLVED from that service before this is
+///   called and handed in as `ec2_fleet` ([`ec2_fleet`]). An Auto Scaling group
+///   names Amazon EC2 Auto Scaling's own membership, which this emulator reads
+///   from no service, so that selector resolves nothing.
 ///
 /// A target of a blue/green deployment group carries the `TargetLabel` of the
 /// environment it belongs to: the instances the group selects are the ORIGINAL
@@ -3039,9 +3076,14 @@ pub fn malformed_deployment_id_message(deployment_id: &str) -> String {
 /// (GREEN)"). The replacement environment is provisioned from EC2 inventory this
 /// emulator does not keep, so it resolves no `GREEN` target; an in-place
 /// deployment has no two environments, so its targets carry no label at all.
+///
+/// Every target comes back in wave zero; which wave actually deploys to it is
+/// the resolved deployment configuration's to decide
+/// ([`target_waves::assign_waves`]).
 pub fn deployment_targets(
     state: &ComAmazonawsCodedeployCodedeploy20141006State,
     group: &DeploymentGroup,
+    ec2_fleet: &[ec2_fleet::Ec2Instance],
 ) -> Vec<DeploymentTargetSnapshot> {
     match group.compute_platform.as_str() {
         "ECS" => group
@@ -3055,6 +3097,7 @@ pub fn deployment_targets(
                 )),
                 target_type: DEPLOYMENT_TARGET_TYPE_ECS.to_string(),
                 instance_label: None,
+                wave: 0,
             })
             .collect(),
         // Lambda: one target per deployment, named inside the revision; see the
@@ -3063,6 +3106,7 @@ pub fn deployment_targets(
             target_id: None,
             target_type: DEPLOYMENT_TARGET_TYPE_LAMBDA.to_string(),
             instance_label: None,
+            wave: 0,
         }],
         // Server (EC2/on-premises), which is what `computePlatform` holds here
         // when it is neither of the two above — the member is the modelled enum
@@ -3071,15 +3115,22 @@ pub fn deployment_targets(
         // cannot target has no targets to report.
         _ => {
             let instance_label = group_is_blue_green(group).then(|| TARGET_LABEL_BLUE.to_string());
-            state
+            let on_premises = state
                 .on_premises_instance_order
                 .iter()
                 .filter_map(|name| state.on_premises_instances.get(name))
                 .filter(|instance| group_selects_instance(group, &instance.tags))
-                .map(|instance| DeploymentTargetSnapshot {
-                    target_id: Some(instance.instance_name.clone()),
+                .map(|instance| instance.instance_name.clone());
+            let ec2 = ec2_fleet
+                .iter()
+                .map(|instance| instance.instance_id.clone());
+            on_premises
+                .chain(ec2)
+                .map(|instance_id| DeploymentTargetSnapshot {
+                    target_id: Some(instance_id),
                     target_type: DEPLOYMENT_TARGET_TYPE_INSTANCE.to_string(),
                     instance_label: instance_label.clone(),
+                    wave: 0,
                 })
                 .collect()
         }
@@ -3117,7 +3168,7 @@ fn deployment_target_count(
     state: &ComAmazonawsCodedeployCodedeploy20141006State,
     group: &DeploymentGroup,
 ) -> usize {
-    deployment_targets(state, group).len()
+    deployment_targets(state, group, &[]).len()
 }
 
 /// Whether `group` deploys blue/green, which is what gives its targets an
@@ -3131,30 +3182,10 @@ fn group_is_blue_green(group: &DeploymentGroup) -> bool {
         == Some(DEPLOYMENT_TYPE_BLUE_GREEN)
 }
 
-/// The `TargetStatus` each target of `deployment` carries.
-///
-/// A deployment's targets are where its revision is being installed, so a
-/// target's status follows the deployment's own progress: this emulator
-/// deploys to every target of a deployment together, so each of them is as far
-/// along as the deployment is. `TargetStatus`
-/// (`smithy_query(query="shape",shape="TargetStatus")`: Pending | InProgress |
-/// Succeeded | Failed | Skipped | Unknown | Ready) maps onto `DeploymentStatus`
-/// one for one here: a deployment still running has `InProgress` targets, a
-/// finished one has targets that `Succeeded` or `Failed` with it, and a
-/// deployment a caller STOPPED leaves its targets `Skipped` — the revision was
-/// never finished on them. A deployment the clock has not started yet has
-/// `Pending` targets, which no listing reaches: an operation over the targets of
-/// a deployment that has not started is refused with
-/// `DeploymentNotStartedException` (see [`Deployment::is_started`]).
-pub fn target_status(deployment: &Deployment) -> &'static str {
-    match deployment.status.as_str() {
-        DEPLOYMENT_STATUS_SUCCEEDED => TARGET_STATUS_SUCCEEDED,
-        DEPLOYMENT_STATUS_FAILED => TARGET_STATUS_FAILED,
-        DEPLOYMENT_STATUS_STOPPED => TARGET_STATUS_SKIPPED,
-        _ if deployment.is_started() => TARGET_STATUS_IN_PROGRESS,
-        _ => TARGET_STATUS_PENDING,
-    }
-}
+/// The `TargetStatus` each target of `deployment` carries: see
+/// [`target_waves::target_status`], where a target's own status is read off the
+/// deployment's progress through the waves of targets it deploys in.
+pub use target_waves::target_status;
 
 /// Why a value is not an id a target of `compute_platform` could ever be
 /// reported under.
@@ -3310,7 +3341,7 @@ pub fn deployment_target_view(
 ) -> crate::ops::types::DeploymentTarget {
     let deployment_id = Some(deployment.deployment_id.clone());
     let target_id = target.target_id.clone();
-    let status = Some(target_status(deployment).to_string());
+    let status = Some(target_status(deployment, target).to_string());
     let last_updated_at = Some(timestamp(target_last_updated_at_ms(deployment)));
     let lifecycle_events = target_lifecycle::events_of(deployment);
     let mut view = crate::ops::types::DeploymentTarget {
@@ -3348,7 +3379,7 @@ pub fn deployment_target_view(
         _ => {
             view.instance_target = Some(crate::ops::types::InstanceTarget {
                 deployment_id,
-                target_arn: instance_target_arn(state, target),
+                target_arn: instance_target_arn(state, deployment, target),
                 target_id,
                 status,
                 last_updated_at,
@@ -3381,7 +3412,7 @@ pub fn instance_summary(
     crate::ops::types::InstanceSummary {
         deployment_id: Some(deployment.deployment_id.clone()),
         instance_id: target.target_id.clone(),
-        status: Some(target_status(deployment).to_string()),
+        status: Some(target_status(deployment, target).to_string()),
         last_updated_at: Some(timestamp(target_last_updated_at_ms(deployment))),
         lifecycle_events: target_lifecycle::events_of(deployment),
         instance_type: target.instance_label.clone(),
@@ -3390,16 +3421,27 @@ pub fn instance_summary(
 
 /// The `targetArn` of an instance target: the ARN of the instance itself.
 ///
-/// The instances this emulator holds are the on-premises ones registered with
-/// it, and their ARN is the one the registry MINTED at registration
-/// ([`instance_arn`]) rather than one rebuilt here, so a target's ARN and the
-/// `instanceArn` the on-premises readers answer are the same string. An instance
-/// the registry no longer holds has no ARN to report.
+/// The instance a target names is a resource of the service that owns instances,
+/// so its ARN is the one that service's resource carries: an on-premises instance
+/// keeps the ARN the registry MINTED at registration ([`instance_arn`]) rather
+/// than one rebuilt here, so a target's ARN and the `instanceArn` the on-premises
+/// readers answer are the same string, and an Amazon EC2 instance — which a
+/// deployment only ever targets because Amazon EC2 itself reported it running
+/// ([`ec2_fleet`]) — carries EC2's own documented instance ARN. Both come from the
+/// one place an ARN follows from a target id ([`deployment_target_arn`]), in the
+/// Region the deployment ran in. An on-premises host name the registry no longer
+/// holds has no ARN to report.
 fn instance_target_arn(
     state: &ComAmazonawsCodedeployCodedeploy20141006State,
+    deployment: &Deployment,
     target: &DeploymentTargetSnapshot,
 ) -> Option<String> {
-    on_premises_instance_arn(state, target.target_id.as_deref()?)
+    deployment_target_arn(
+        state,
+        &deployment.compute_platform,
+        &deployment.region,
+        target.target_id.as_deref()?,
+    )
 }
 
 /// The ARN the on-premises registry holds for `instance_name`, if it holds a

@@ -12012,6 +12012,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-ec2",
  "aws-sdk-ecs",
  "aws-sdk-lambda",
  "aws-sdk-sns",

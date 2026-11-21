@@ -69,6 +69,12 @@ aws-sdk-sns = { version = "1", default-features = false }
 # `DescribeServices` through the in-process callback before the group is stored
 # (`state::ecs_services`); `default-features = false` for the reason above.
 aws-sdk-ecs = { version = "1", default-features = false }
+# A deployment group's `ec2TagFilters`/`ec2TagSet` select Amazon EC2 instances,
+# which are that service's resources: the fleet a deployment deploys to is READ
+# over Amazon EC2's own modelled `DescribeInstances` through the in-process
+# callback when the deployment is created (`state::ec2_fleet`);
+# `default-features = false` for the reason above.
+aws-sdk-ec2 = { version = "1", default-features = false }
 # An Amazon ECS deployment INSTALLS a replacement task set in the service its group
 # targets and then reroutes the production traffic onto it. The task sets are Amazon
 # ECS's own resources and the listeners Elastic Load Balancing v2's, so each write is

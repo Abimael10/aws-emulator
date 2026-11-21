@@ -32,6 +32,11 @@ const SERVICE_ROLE: &str = "arn:aws:iam::123456789012:role/CodeDeployRole";
 /// The one deployment group name every case here creates.
 const GROUP: &str = "dg";
 
+/// The built-in EC2/on-premises configuration that takes the WHOLE fleet out of
+/// service at once (`minimumHealthyHosts` HOST_COUNT 0), which is what the suites
+/// built on [`group_with`] deploy under.
+pub(crate) const ALL_AT_ONCE: &str = "CodeDeployDefault.AllAtOnce";
+
 /// Register an on-premises instance carrying `tags`.
 ///
 /// `pub(crate)` because the `deployment_targets` suite drives the same fleet
@@ -64,6 +69,15 @@ pub(crate) async fn register(emulator: &Emulator, instance: &str, tags: &[(&str,
 
 /// Create an application on `platform` and a deployment group of it carrying
 /// `extras`.
+///
+/// The group deploys ALL AT ONCE unless a row names a configuration of its own:
+/// an EC2/on-premises deployment takes at most (fleet - the configuration's
+/// `minimumHealthyHosts`) instances out of service at an instant, so under the
+/// service default (`CodeDeployDefault.OneAtATime`) the targets of a fleet of
+/// several are deployed to one after another — which the suites built on this
+/// helper are not about. They read what EVERY target of a deployment reports, so
+/// they deploy to the whole fleet in one wave; the pacing itself is asserted in
+/// `core/router/tests/all/codedeploy_minimum_healthy_hosts_paces_instance_targets.rs`.
 pub(crate) async fn group_with(
     emulator: &Emulator,
     application: &str,
@@ -81,6 +95,9 @@ pub(crate) async fn group_with(
         "deploymentGroupName": GROUP,
         "serviceRoleArn": SERVICE_ROLE,
     });
+    if platform == "Server" {
+        request["deploymentConfigName"] = json!(ALL_AT_ONCE);
+    }
     for (member, value) in extras.as_object().cloned().unwrap_or_default() {
         request[member] = value;
     }

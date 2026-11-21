@@ -371,6 +371,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map(crate::state::s3_revision::awaits_fetch);
 
+        // The EC2 tag selectors the deployment group carries, read under the store
+        // guard and then released: the instances they name belong to Amazon EC2,
+        // so the fleet is RESOLVED from that service below with this service's
+        // store unlocked — the two stores are never held at once, exactly as a
+        // group's `ecsServices` are loaded (`crate::state::ec2_fleet`). A request
+        // naming no such group resolves no selector, and is answered for the
+        // resource it named inside.
+        let ec2_selectors = crate::state::with_state(&*self.engine, |state| {
+            state
+                .applications
+                .get(&application_name)
+                .and_then(|application| {
+                    application.deployment_groups.get(&deployment_group_name)
+                })
+                .map(crate::state::ec2_fleet::selectors_of)
+        })
+        .flatten()
+        .unwrap_or_default();
+        // The RUNNING instances of the account those selectors take in: the fleet
+        // this deployment deploys to, as the service that owns instances reports
+        // it right now.
+        let ec2_fleet =
+            crate::state::ec2_fleet::selected_instances(ctx, &region, &ec2_selectors).await;
+
         let outcome = crate::state::with_state(&*self.engine, |state| {
             let Some(application) = state.applications.get(&application_name) else {
                 return Err(CreateDeploymentErrorModeled::ApplicationDoesNotExistException(
@@ -426,7 +450,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The targets this deployment group resolves, which is what decides
             // the terminal status the clock owes the deployment, and what the
             // deployment reports as its targets from here on.
-            let mut targets = crate::state::deployment_targets(state, group);
+            let mut targets = crate::state::deployment_targets(state, group, &ec2_fleet);
             // What this deployment owes the original environment: a blue/green
             // group that terminates its instances holds the deployment open for
             // the wait it configured.
@@ -537,6 +561,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     starts_at_ms,
                     &increments,
                 );
+            // How many of its targets this deployment may take out of service at
+            // one instant, which is the resolved configuration's
+            // `minimumHealthyHosts` applied to the fleet it resolved: the targets
+            // are put in the waves that bound implies, and the deployment is held
+            // open for one span per wave, since a wave starts only once the wave
+            // before it is finished (`crate::state::target_waves`).
+            let minimum_healthy_hosts = state
+                .deployment_configs
+                .get(&deployment_config_name)
+                .and_then(|config| config.minimum_healthy_hosts.clone());
+            let concurrency = crate::state::target_waves::concurrency(
+                minimum_healthy_hosts.as_ref(),
+                targets.len(),
+            );
+            crate::state::target_waves::assign_waves(&mut targets, concurrency);
+            let waves_complete_at_ms = crate::state::target_waves::waves_complete_at_ms(
+                starts_at_ms,
+                crate::state::target_waves::wave_count(&targets),
+            );
             let deployment_id = state.mint_deployment_id();
             let used_revision = revision.clone();
             // The traffic shift this deployment performs: a Lambda deployment's
@@ -591,13 +634,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 start_time_ms: None,
                 complete_time_ms: None,
                 starts_at_ms,
-                completes_at_ms: traffic_routing_complete_at_ms + termination_wait_millis,
+                completes_at_ms: traffic_routing_complete_at_ms.max(waves_complete_at_ms)
+                    + termination_wait_millis,
                 // Nothing has failed, and no lifecycle event hook has reported
                 // yet: both are written as the deployment runs.
                 error_information: None,
                 lifecycle_hook_executions: Vec::new(),
                 hook_executions,
                 targets,
+                // Nothing has been deployed to yet: the clock owes the deployment
+                // each wave of its targets at the instant that wave falls due.
+                target_waves_finished: 0,
                 terminates_original_instances,
                 termination_wait_millis,
                 instance_termination_wait_time_started: false,

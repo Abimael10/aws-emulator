@@ -303,7 +303,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             }
-            let status = crate::state::target_status(deployment);
             let matching: Vec<String> = deployment
                 .targets
                 .iter()
@@ -313,6 +312,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // omits narrows nothing. An instance with no label belongs to
                 // neither environment, so it satisfies no environment filter.
                 .filter(|target| {
+                    let status = crate::state::target_status(deployment, target);
                     wanted_statuses
                         .as_ref()
                         .is_none_or(|wanted| wanted.iter().any(|value| value == status))

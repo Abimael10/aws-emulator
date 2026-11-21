@@ -43,7 +43,7 @@ use crate::ops::types::RollbackInfo;
 
 use super::{
     deployment_completion_due, deployment_start_due, lambda_traffic_shift, lifecycle_hook,
-    revision_key, termination_wait, traffic_shift,
+    revision_key, target_waves, termination_wait, traffic_shift,
     ComAmazonawsCodedeployCodedeploy20141006State, Deployment, DeploymentGroup,
     DEPLOYMENT_CREATOR_ROLLBACK, DEPLOYMENT_STATUS_CREATED, DEPLOYMENT_STATUS_FAILED,
 };
@@ -293,13 +293,24 @@ pub fn record_rollback(
             start_time_ms: None,
             complete_time_ms: None,
             starts_at_ms: deployment_start_due(now_ms),
-            completes_at_ms: deployment_completion_due(now_ms) + termination_wait_millis,
+            // A rollback paces the targets it inherited exactly as the deployment
+            // it rolls back paced them — same group, same configuration — so it is
+            // held open for the same one span per wave (`super::target_waves`).
+            completes_at_ms: deployment_completion_due(now_ms).max(
+                target_waves::waves_complete_at_ms(
+                    deployment_start_due(now_ms),
+                    target_waves::wave_count(&targets),
+                ),
+            ) + termination_wait_millis,
             // Nothing has failed, and no lifecycle event hook has reported
             // against the rollback yet.
             error_information: None,
             lifecycle_hook_executions: Vec::new(),
             hook_executions,
             targets,
+            // The rollback deploys to those targets itself, so it has finished no
+            // wave of them yet.
+            target_waves_finished: 0,
             terminates_original_instances,
             termination_wait_millis,
             instance_termination_wait_time_started: false,

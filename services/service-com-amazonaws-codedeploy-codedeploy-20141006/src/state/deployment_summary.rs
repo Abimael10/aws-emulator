@@ -57,27 +57,32 @@ pub fn file_exists_behavior(requested: Option<String>) -> String {
 /// the summary is one view of the same target state the target readers answer
 /// from and cannot disagree with them.
 ///
-/// This emulator deploys to every target of a deployment together, so each of
-/// them is as far along as the deployment is ([`super::target_status`]) and the
-/// targets are counted under the one status they hold. `Ready` counts "the
-/// number of instances in a replacement environment ready to receive traffic in
-/// a blue/green deployment": a replacement environment is provisioned from EC2
+/// So the summary PARTITIONS the deployment's targets: every one of them is
+/// counted exactly once, under the status it holds
+/// ([`super::target_waves::target_status`]), and the counts therefore add up to
+/// the fleet at every instant — which for a deployment pacing its fleet a wave at
+/// a time means some targets counted as finished, at most a wave's worth counted
+/// as in progress, and the rest still pending. `Ready` counts "the number of
+/// instances in a replacement environment ready to receive traffic in a
+/// blue/green deployment": a replacement environment is provisioned from EC2
 /// inventory this emulator does not keep, so no deployment here resolves such a
 /// target (see [`super::deployment_targets`]) and nothing is counted under it.
 #[must_use]
 pub fn deployment_overview(deployment: &Deployment) -> DeploymentOverview {
     let mut overview = DeploymentOverview::default();
-    let counted = i64::try_from(deployment.target_count()).unwrap_or(i64::MAX);
-    match super::target_status(deployment) {
-        TARGET_STATUS_PENDING => overview.pending = counted,
-        TARGET_STATUS_IN_PROGRESS => overview.in_progress = counted,
-        TARGET_STATUS_SUCCEEDED => overview.succeeded = counted,
-        TARGET_STATUS_FAILED => overview.failed = counted,
-        TARGET_STATUS_SKIPPED => overview.skipped = counted,
-        // A `TargetStatus` this service maps no deployment onto leaves every
-        // count where it is, which is the summary of a deployment whose targets
-        // are in none of the states above.
-        _ => {}
+    for target in &deployment.targets {
+        let counted = match super::target_waves::target_status(deployment, target) {
+            TARGET_STATUS_PENDING => &mut overview.pending,
+            TARGET_STATUS_IN_PROGRESS => &mut overview.in_progress,
+            TARGET_STATUS_SUCCEEDED => &mut overview.succeeded,
+            TARGET_STATUS_FAILED => &mut overview.failed,
+            TARGET_STATUS_SKIPPED => &mut overview.skipped,
+            // A `TargetStatus` this service maps no target onto leaves every
+            // count where it is, which is the summary of a target in none of the
+            // states above.
+            _ => continue,
+        };
+        *counted = counted.saturating_add(1);
     }
     overview
 }

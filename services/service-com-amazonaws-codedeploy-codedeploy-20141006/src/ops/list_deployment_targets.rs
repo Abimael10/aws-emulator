@@ -270,11 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             }
-            let status = crate::state::target_status(deployment);
             let matching: Vec<String> = deployment
                 .targets
                 .iter()
                 .filter(|target| {
+                    let status = crate::state::target_status(deployment, target);
                     filters
                         .iter()
                         .all(|filter| filter.matches(status, target.instance_label.as_deref()))

@@ -2,15 +2,19 @@
 
 //! The window a deployment is IN FLIGHT for, driven over the wire.
 //!
-//! Two rules, one window. A deployment is not a record that lands already
+//! Three rules, one window. A deployment is not a record that lands already
 //! finished: from the moment CodeDeploy dispatches it to its targets until it
 //! reaches an outcome it is reported `InProgress`, and so are the targets it
 //! dispatched to — a client that polls `GetDeployment`, or reads a target while
-//! nothing has reported for it yet, reads that state rather than a success. And
-//! while that window is open the deployment group it belongs to is BUSY: a
-//! deployment group runs one deployment at a time, so a second `CreateDeployment`
-//! against the same group is refused with `DeploymentLimitExceededException` (HTTP
-//! 400) until the first is terminal.
+//! nothing has reported for it yet, reads that state rather than a success. How
+//! many of those targets are out of service AT ONE INSTANT is bounded by the
+//! resolved deployment configuration's `minimumHealthyHosts`, so a deployment that
+//! has to keep part of its fleet healthy works through it in waves and is held open
+//! for longer than one that takes the whole fleet at once. And while that window is
+//! open the deployment group it belongs to is BUSY: a deployment group runs one
+//! deployment at a time, so a second `CreateDeployment` against the same group is
+//! refused with `DeploymentLimitExceededException` (HTTP 400) until the first is
+//! terminal.
 //!
 //! Every case goes through the same front door a client uses — the shared
 //! [`Emulator`] harness in `codedeploy_lifecycle` — so the awsJson1_1 envelope,
@@ -194,6 +198,13 @@ async fn a_dispatched_deployment_and_its_targets_are_in_progress_until_it_settle
             "onPremisesInstanceTagFilters": [
                 {"Key": "Fleet", "Value": application, "Type": "KEY_AND_VALUE"},
             ],
+            // This rule is about EVERY target a deployment DISPATCHED to, so the
+            // group deploys to its whole fleet in one go: under a configuration
+            // that keeps part of the fleet healthy, CodeDeploy takes only
+            // (fleet - minimumHealthyHosts) instances out of service at an
+            // instant and the rest are still pending (asserted in
+            // `core/router/tests/all/codedeploy_minimum_healthy_hosts_paces_instance_targets.rs`).
+            "deploymentConfigName": "CodeDeployDefault.AllAtOnce",
         });
         if let Some(members) = members.as_object() {
             for (name, value) in members {
@@ -243,6 +254,211 @@ async fn a_dispatched_deployment_and_its_targets_are_in_progress_until_it_settle
             vec!["Succeeded".to_string(); *fleet],
             "case {case:?}: expected every target to have succeeded with it, got {settled:?}"
         );
+    }
+}
+
+/// One row of the pacing table: the configuration a deployment runs under, and how
+/// many of the fleet that configuration leaves deployable at one instant.
+struct Paced {
+    /// What the row is about.
+    case: &'static str,
+    /// The `minimumHealthyHosts` a configuration created for this row states, or
+    /// `None` to name [`builtin`](Paced::builtin) instead.
+    minimum_healthy_hosts: Option<(&'static str, i32)>,
+    /// The built-in the group names, for a row that creates no configuration of its
+    /// own; `None` leaves the group without one, which runs it under the service's
+    /// own default (`CodeDeployDefault.OneAtATime`).
+    builtin: Option<&'static str>,
+    /// How many of the fleet are out of service at one instant under it.
+    concurrency: usize,
+}
+
+/// The six counts `deploymentOverview` partitions a deployment's targets into
+/// (`smithy_query(query="shape",shape="DeploymentOverview")`).
+const OVERVIEW_COUNTS: &[&str] = &[
+    "Pending",
+    "InProgress",
+    "Succeeded",
+    "Failed",
+    "Skipped",
+    "Ready",
+];
+
+/// How many of `overview`'s targets are `InProgress`, asserting that its six counts
+/// partition a fleet of `fleet` targets.
+fn in_progress_of(case: &str, overview: &Value, fleet: usize) -> usize {
+    let mut total = 0_i64;
+    for name in OVERVIEW_COUNTS {
+        total += overview[*name].as_i64().unwrap_or_else(|| {
+            panic!("case {case:?}: expected deploymentOverview.{name} as a number, got {overview}")
+        });
+    }
+    assert_eq!(
+        usize::try_from(total).unwrap_or_default(),
+        fleet,
+        "case {case:?}: expected the summary to partition the fleet of {fleet}, got {overview}"
+    );
+    usize::try_from(overview["InProgress"].as_i64().unwrap_or_default()).unwrap_or_default()
+}
+
+/// RULE: a deployment takes at most (fleet - the resolved configuration's
+/// `minimumHealthyHosts`) of its targets out of service at one instant — never
+/// fewer than one — so it works through its fleet in waves of that size: its
+/// targets partition the fleet at every instant, and a deployment that needs more
+/// than one wave is held open longer (`createTime` to `completeTime`, as the
+/// service itself reports those instants) than one that takes the whole fleet at
+/// once.
+///
+/// Rows differ along how the bound is stated: a built-in that keeps nothing back, a
+/// built-in that keeps all but one host healthy, no configuration at all (the
+/// service's own default), and client-created `HOST_COUNT` and `FLEET_PERCENT`
+/// configurations — including a percentage that rounds up to a whole host.
+#[tokio::test]
+async fn minimum_healthy_hosts_bounds_the_targets_out_of_service_at_once() {
+    const FLEET: usize = 3;
+    // The tag every host of this fleet carries, which every row's group selects on.
+    const FLEET_TAG: &str = "paced-fleet";
+    let emulator = Emulator::new();
+    for index in 0..FLEET {
+        given_on_premises_instance(
+            &emulator,
+            &format!("paced-host-{index}"),
+            ("Fleet", FLEET_TAG),
+        )
+        .await;
+    }
+
+    let cases: &[Paced] = &[
+        Paced {
+            case: "the built-in that takes the whole fleet at once",
+            minimum_healthy_hosts: None,
+            builtin: Some("CodeDeployDefault.AllAtOnce"),
+            concurrency: FLEET,
+        },
+        Paced {
+            case: "the built-in that takes one host at a time",
+            minimum_healthy_hosts: None,
+            builtin: Some("CodeDeployDefault.OneAtATime"),
+            concurrency: 1,
+        },
+        Paced {
+            case: "no configuration on the group, which is the service's own default",
+            minimum_healthy_hosts: None,
+            builtin: None,
+            concurrency: 1,
+        },
+        Paced {
+            case: "a HOST_COUNT of one, which leaves two of three deployable",
+            minimum_healthy_hosts: Some(("HOST_COUNT", 1)),
+            builtin: None,
+            concurrency: 2,
+        },
+        Paced {
+            case: "a FLEET_PERCENT of 50, rounded up to two healthy of three",
+            minimum_healthy_hosts: Some(("FLEET_PERCENT", 50)),
+            builtin: None,
+            concurrency: 1,
+        },
+    ];
+
+    // The window of the row that takes the whole fleet at once, which every paced
+    // row's window is compared against: one wave is the fewest a deployment can run.
+    let mut unpaced_window: Option<f64> = None;
+    for (index, case) in cases.iter().enumerate() {
+        // One application and group per row: a deployment group runs one deployment
+        // at a time, and every row deploys over the same fleet.
+        let application = format!("paced-{index:02}");
+        let group = format!("{application}-dg");
+        let mut members = json!({
+            "onPremisesInstanceTagFilters": [
+                {"Key": "Fleet", "Value": FLEET_TAG, "Type": "KEY_AND_VALUE"},
+            ],
+        });
+        if let Some((kind, value)) = case.minimum_healthy_hosts {
+            let config = format!("paced-config-{index:02}");
+            emulator
+                .ok(
+                    "CreateDeploymentConfig",
+                    json!({
+                        "deploymentConfigName": config,
+                        "computePlatform": "Server",
+                        "minimumHealthyHosts": {"type": kind, "value": value},
+                    }),
+                )
+                .await;
+            members["deploymentConfigName"] = json!(config);
+        } else if let Some(builtin) = case.builtin {
+            members["deploymentConfigName"] = json!(builtin);
+        }
+        given_group(&emulator, &application, "Server", &group, &members).await;
+
+        let deployment_id = deploy(&emulator, &application, &group).await;
+        // Sample the deployment until it reaches its outcome, checking the bound and
+        // the partition at every sample a client could have made.
+        let deadline_at = Instant::now() + Duration::from_secs(60);
+        let mut most_in_progress = 0_usize;
+        let info = loop {
+            let info = emulator
+                .ok("GetDeployment", json!({"deploymentId": deployment_id}))
+                .await["deploymentInfo"]
+                .clone();
+            let in_progress = in_progress_of(case.case, &info["deploymentOverview"], FLEET);
+            assert!(
+                in_progress <= case.concurrency,
+                "case {:?}: expected at most {} target(s) out of service at once, got \
+                 {in_progress} in {info}",
+                case.case,
+                case.concurrency
+            );
+            most_in_progress = most_in_progress.max(in_progress);
+            if matches!(
+                info["status"].as_str(),
+                Some("Succeeded" | "Failed" | "Stopped")
+            ) {
+                break info;
+            }
+            assert!(
+                Instant::now() < deadline_at,
+                "case {:?}: expected the deployment to reach an outcome, last {info}",
+                case.case
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            info["status"].as_str(),
+            Some("Succeeded"),
+            "case {:?}: expected the deployment over its fleet to succeed, got {info}",
+            case.case
+        );
+        assert_eq!(
+            most_in_progress, case.concurrency,
+            "case {:?}: expected a wave of {} target(s) to have been out of service at once, the \
+             most seen was {most_in_progress}",
+            case.case, case.concurrency
+        );
+        // Every target of the finished deployment succeeded with it, so the whole
+        // fleet was deployed to and not just the first wave.
+        let settled = target_statuses(&emulator, &deployment_id, case.case).await;
+        assert_eq!(
+            settled,
+            vec!["Succeeded".to_string(); FLEET],
+            "case {:?}: expected every target to have succeeded with it, got {settled:?}",
+            case.case
+        );
+
+        let window = info["completeTime"].as_f64().unwrap_or_default()
+            - info["createTime"].as_f64().unwrap_or_default();
+        if case.concurrency >= FLEET {
+            unpaced_window = Some(window);
+        } else {
+            let unpaced = unpaced_window.expect("the unpaced row runs first");
+            assert!(
+                window > unpaced,
+                "case {:?}: expected the paced deployment to be held open longer than the \
+                 unpaced {unpaced} seconds the service reported, got {window}",
+                case.case
+            );
+        }
     }
 }
 
