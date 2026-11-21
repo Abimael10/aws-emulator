@@ -44,14 +44,10 @@ const DOMAIN_LIST_DELETING_MESSAGE: &str = "Deleting the Firewall Domain List";
 
 /// The sentence DNS Firewall states for a rule group that stands in its
 /// created, settled step, and the one it states once a write of its rules has
-/// landed.
+/// landed. A delete of the group reports the step the group stood in, so its
+/// answer carries whichever of the two the group had reached.
 const RULE_GROUP_CREATED_MESSAGE: &str = "Created Firewall Rule Group";
 const RULE_GROUP_CHANGED_MESSAGE: &str = "Finished rule group update";
-
-/// The sentence DNS Firewall states for a rule group a delete has been
-/// accepted for — the group's own delete-step sentence, as
-/// [`DOMAIN_LIST_DELETING_MESSAGE`] is the list's.
-const RULE_GROUP_DELETING_MESSAGE: &str = "Deleting the Firewall Rule Group";
 
 /// The sentence DNS Firewall states while the rule-group-to-VPC association a
 /// caller just asked for is still being put in place, the one it states while a
@@ -302,8 +298,9 @@ async fn every_domain_list_projection_states_the_step_the_list_stands_in() {
 
 /// Every projection of a rule group — the create, the read and the delete —
 /// reports the step the group stands in as both `Status` and `StatusMessage`.
-/// The delete has been accepted when it answers, so the group it answers with
-/// stands in its deleting step.
+/// The delete reports the step the group STOOD in when it was accepted: the
+/// rule group's machine has no delete step the service stamps, unlike the
+/// domain list's.
 #[tokio::test]
 async fn every_rule_group_projection_states_the_step_the_group_stands_in() {
     let router = emulator();
@@ -346,8 +343,8 @@ async fn every_rule_group_projection_states_the_step_the_group_stands_in() {
         );
         assert_step(
             &deleted,
-            DELETING,
-            RULE_GROUP_DELETING_MESSAGE,
+            SETTLED,
+            RULE_GROUP_CREATED_MESSAGE,
             FIREWALL_RULE_GROUP_STATUS_VALUES,
             &format!("{case}: the delete"),
         );

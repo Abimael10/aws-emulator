@@ -798,9 +798,12 @@ pub const MAX_STORED_FIREWALL_DOMAIN_LISTS: usize = 1_000;
 /// The model's enum (`smithy_query(query="shape",shape="FirewallRuleGroupStatus")`,
 /// re-exported as [`crate::ops::types::FIREWALL_RULE_GROUP_STATUS_VALUES`]) is
 /// `COMPLETE | DELETING | UPDATING`: the other two describe a delete or an
-/// update in flight, neither of which a create performs —
-/// `CreateFirewallRuleGroup` "creates an empty DNS Firewall rule group", which
-/// is settled the moment it exists, so the clock owes it no transition.
+/// update in flight, and this is the step every call of this service leaves a
+/// group in — `CreateFirewallRuleGroup` "creates an empty DNS Firewall rule
+/// group", which is settled the moment it exists, so the clock owes it no
+/// transition; a rule write to a group is in effect when the call that made it
+/// answers; and the delete reports the group as it stood
+/// ([`firewall_rule_group_status_message`]).
 pub const FIREWALL_RULE_GROUP_STATUS_COMPLETE: &str = "COMPLETE";
 
 /// The `StatusMessage` a rule group reports while it holds
@@ -824,24 +827,18 @@ pub const FIREWALL_RULE_GROUP_STATUS_MESSAGE_COMPLETE: &str = "Created Firewall 
 /// change rather than its creation.
 pub const FIREWALL_RULE_GROUP_STATUS_MESSAGE_CHANGED: &str = "Finished rule group update";
 
-/// The `FirewallRuleGroupStatus` a rule group reports once a delete has been
-/// accepted for it, the model's `DELETING`: `DeleteFirewallRuleGroup` answers
-/// with the rule group it just deleted, which is on its way out and so is no
-/// longer in the settled status it held until that call — the rule-group twin of
-/// [`FIREWALL_DOMAIN_LIST_STATUS_DELETING`].
-pub const FIREWALL_RULE_GROUP_STATUS_DELETING: &str = "DELETING";
-
-/// The `StatusMessage` a rule group reports once it holds
-/// [`FIREWALL_RULE_GROUP_STATUS_DELETING`] — the delete step's own sentence,
-/// stated for the resource it is about exactly as the domain list's
-/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_DELETING`]) is, and likewise carrying
-/// nothing from the request.
-pub const FIREWALL_RULE_GROUP_STATUS_MESSAGE_DELETING: &str = "Deleting the Firewall Rule Group";
-
 /// The `StatusMessage` the lifecycle step `status` leaves on a rule group that
 /// last underwent `change`, or `None` for a step DNS Firewall states nothing
 /// for — the rule-group twin of [`firewall_domain_list_status_message`], and
 /// derived from the status and that change for the same reason.
+///
+/// Every call of this service leaves a group in the settled step, so that is
+/// the one step a projection of a group states a sentence for: the create
+/// answers a group that is settled the moment it exists, a rule write is in
+/// effect when the call that made it answers, and `DeleteFirewallRuleGroup`
+/// reports the group exactly as it stood — the rule group's machine has no
+/// delete step the service stamps, unlike the domain list's
+/// ([`FIREWALL_DOMAIN_LIST_STATUS_DELETING`]).
 pub fn firewall_rule_group_status_message(status: &str, change: FirewallChange) -> Option<String> {
     match status {
         FIREWALL_RULE_GROUP_STATUS_COMPLETE => Some(
@@ -851,9 +848,6 @@ pub fn firewall_rule_group_status_message(status: &str, change: FirewallChange) 
             }
             .to_string(),
         ),
-        FIREWALL_RULE_GROUP_STATUS_DELETING => {
-            Some(FIREWALL_RULE_GROUP_STATUS_MESSAGE_DELETING.to_string())
-        }
         _ => None,
     }
 }

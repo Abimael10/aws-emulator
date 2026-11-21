@@ -17,19 +17,19 @@
 //! last change has not settled is refused and changes nothing.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::ops::types::FIREWALL_RULE_GROUP_STATUS_VALUES;
 use service_com_amazonaws_route53resolver_route53resolver::state::{
-    service_state, FIREWALL_RULE_GROUP_STATUS_COMPLETE, FIREWALL_RULE_GROUP_STATUS_DELETING,
+    service_state, FIREWALL_DOMAIN_LIST_STATUS_DELETING, FIREWALL_RULE_GROUP_STATUS_COMPLETE,
     PROVISIONING_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, emulator, emulator_on, error_type, expect_error, ok, parse_time, string_member, ACCOUNT,
-    REGION,
+    call, emulator, emulator_on, error_type, expect_error, ok, parse_time, settled_rule_group,
+    string_member, ACCOUNT, REGION,
 };
 
 /// What a refusal of a state transition states, from the model's documentation
@@ -41,11 +41,15 @@ use super::harness::{
 const STATE_TRANSITION_CONFLICT: &str = "The requested state transition isn't valid.";
 
 /// The sentence DNS Firewall states in `FirewallRuleGroup$StatusMessage` for a
-/// group that reached its created, settled lifecycle step, and the one it
-/// states once a delete has been accepted for the group: fixed text for the
-/// step, with no part of the request in it.
+/// group that stands in its created, settled lifecycle step — the step a group
+/// nothing has written to stands in, and so the one its delete reports: fixed
+/// text for the step, with no part of the request in it.
 const CREATED_RULE_GROUP_MESSAGE: &str = "Created Firewall Rule Group";
-const DELETING_RULE_GROUP_MESSAGE: &str = "Deleting the Firewall Rule Group";
+
+/// The sentence DNS Firewall states for a group once a write of its rules has
+/// landed: the step such a group stands in instead, and so the one ITS delete
+/// reports.
+const CHANGED_RULE_GROUP_MESSAGE: &str = "Finished rule group update";
 
 /// The `FirewallRuleGroup` of a create/get/delete response.
 fn rule_group(body: &Value) -> &Value {
@@ -83,12 +87,6 @@ async fn delete(router: &MultiServiceRouter, id: &str) -> Value {
         .await,
     )
     .clone()
-}
-
-/// Wait out the span the clock owes a rule group whose change has not settled,
-/// so the settled status is due.
-async fn settle() {
-    tokio::time::sleep(PROVISIONING_DELAY + Duration::from_millis(250)).await;
 }
 
 /// One row of the delete table: what the rule group was created with.
@@ -184,16 +182,20 @@ async fn a_deleted_rule_group_is_removed_from_state() {
         let deleted = delete(&router, &id).await;
 
         // The delete answers the group it just took out: the record as it
-        // stood, not a fresh one.
+        // stood, not a fresh one — the lifecycle pair included, because the
+        // rule group's machine has no delete step the service stamps.
         for member in [
             "Id",
             "Arn",
             "Name",
             "CreatorRequestId",
             "CreationTime",
+            "ModificationTime",
             "OwnerId",
             "ShareStatus",
             "RuleCount",
+            "Status",
+            "StatusMessage",
         ] {
             assert_eq!(
                 deleted.get(member),
@@ -213,19 +215,20 @@ async fn a_deleted_rule_group_is_removed_from_state() {
         );
         let status = string_member(&deleted, "Status");
         assert_eq!(
-            status, FIREWALL_RULE_GROUP_STATUS_DELETING,
-            "case {case:?}: the delete has been accepted, so the group it answers with is on its way out, got {deleted}"
+            status, FIREWALL_RULE_GROUP_STATUS_COMPLETE,
+            "case {case:?}: the group stood in its settled step, which is what the delete reports, got {deleted}"
         );
         assert!(
             FIREWALL_RULE_GROUP_STATUS_VALUES.contains(&status.as_str()),
             "case {case:?}: Status must be a modelled FirewallRuleGroupStatus, got {status:?}"
         );
-        // The status message goes with the step the status names, so the delete
-        // states the delete step rather than the one the reads before it stated.
+        // The status message goes with the step the status names, and nothing
+        // this call did moved the group off the step the reads before it
+        // stated.
         let message = string_member(&deleted, "StatusMessage");
         assert_eq!(
-            message, DELETING_RULE_GROUP_MESSAGE,
-            "case {case:?}: the delete must state the step the group stands in, got {deleted}"
+            message, CREATED_RULE_GROUP_MESSAGE,
+            "case {case:?}: the delete must state the step the group stood in, got {deleted}"
         );
         assert_eq!(
             string_member(&before, "StatusMessage"),
@@ -467,18 +470,18 @@ async fn a_rule_group_whose_change_has_not_settled_cannot_be_deleted_yet() {
             "case {case:?}: the refused delete must leave the group as it was, got {kept}"
         );
 
-        settle().await;
+        settled_rule_group(&router, &id, &case).await;
 
         let deleted = delete(&router, &id).await;
         assert_eq!(
             string_member(&deleted, "Status"),
-            FIREWALL_RULE_GROUP_STATUS_DELETING,
-            "case {case:?}: once the change has settled the delete is served, got {deleted}"
+            FIREWALL_RULE_GROUP_STATUS_COMPLETE,
+            "case {case:?}: once the change has settled the delete is served, and reports that settled step, got {deleted}"
         );
         assert_eq!(
             string_member(&deleted, "StatusMessage"),
-            DELETING_RULE_GROUP_MESSAGE,
-            "case {case:?}: the served delete states the step the group stands in, got {deleted}"
+            CREATED_RULE_GROUP_MESSAGE,
+            "case {case:?}: the served delete states the step the group stood in, got {deleted}"
         );
         expect_error(
             &router,
@@ -554,5 +557,221 @@ async fn a_delete_leaves_the_groups_beside_it_alone() {
     assert_eq!(
         stored, kept,
         "case \"the store after the deletes\": it must hold exactly the groups that were kept, got {stored}"
+    );
+}
+
+/// What was done to a rule group before it was deleted, and the step it
+/// therefore stood in — what the rule generalises over, because the delete
+/// reports the step the group stood in and stamps none of its own.
+struct AcceptedDeleteCase {
+    case: &'static str,
+    /// How many rules were written into the group and removed from it again
+    /// before the delete. A group that still holds a rule cannot be deleted,
+    /// and a group whose rules a caller wrote has a different LAST change from
+    /// one nothing touched since the create.
+    rules: usize,
+    /// How many tags the create carried.
+    tags: usize,
+    /// The sentence the step the group stood in states.
+    message: &'static str,
+}
+
+/// `FirewallRuleGroup$StatusMessage`'s modelled maximum length, from the
+/// member's `length` trait (0..255).
+const STATUS_MESSAGE_MAX: usize = 255;
+
+/// The sentence DNS Firewall states for a domain LIST a delete has been
+/// accepted for: the sibling resource keeps its own lifecycle machine, whose
+/// delete step IS stamped, which is what shows the rule group's answer is the
+/// group's own step and not one state the service reports for every delete.
+const DELETING_DOMAIN_LIST_MESSAGE: &str = "Deleting the Firewall Domain List";
+
+/// A delete of a rule group REPORTS the group as it stood when the call was
+/// accepted: the lifecycle pair it answers with is the pair a read of the group
+/// taken an instant earlier reports, because the rule group's machine has no
+/// delete step the service stamps.
+///
+/// The rows span what the rule generalises over — the step the group stood in
+/// and how it got there: a group nothing touched since its create, groups whose
+/// rules a caller wrote and removed again (one rule and several, so the group's
+/// last change is a rule write rather than the create), and groups created with
+/// and without tags.
+#[tokio::test]
+async fn a_delete_reports_the_step_the_rule_group_stood_in() {
+    let router = emulator();
+
+    // One domain list per rule a row writes: a rule is addressed by its group
+    // and its domain list, so two rules of one group need two lists.
+    let mut lists = Vec::new();
+    for index in 0..3 {
+        let made = ok(
+            &router,
+            "CreateFirewallDomainList",
+            json!({
+                "CreatorRequestId": format!("req-rule-source-{index}"),
+                "Name": format!("rule-source-{index}"),
+            }),
+        )
+        .await;
+        lists.push(string_member(
+            made.get("FirewallDomainList")
+                .expect("the create answers a FirewallDomainList"),
+            "Id",
+        ));
+    }
+
+    let cases = [
+        AcceptedDeleteCase {
+            case: "a group nothing touched since its create, no tags",
+            rules: 0,
+            tags: 0,
+            message: CREATED_RULE_GROUP_MESSAGE,
+        },
+        AcceptedDeleteCase {
+            case: "a group one rule was written into and removed from again",
+            rules: 1,
+            tags: 0,
+            message: CHANGED_RULE_GROUP_MESSAGE,
+        },
+        AcceptedDeleteCase {
+            case: "a group three rules were written into and removed from again",
+            rules: 3,
+            tags: 1,
+            message: CHANGED_RULE_GROUP_MESSAGE,
+        },
+        AcceptedDeleteCase {
+            case: "a group created with several tags and never written to",
+            rules: 0,
+            tags: 2,
+            message: CREATED_RULE_GROUP_MESSAGE,
+        },
+    ];
+
+    for (
+        index,
+        AcceptedDeleteCase {
+            case,
+            rules,
+            tags,
+            message: expected_message,
+        },
+    ) in cases.into_iter().enumerate()
+    {
+        let made = create(
+            &router,
+            json!({
+                "CreatorRequestId": format!("req-accepted-{index}"),
+                "Name": format!("accepted-{index}"),
+                "Tags": (0..tags)
+                    .map(|tag| json!({ "Key": format!("k{tag}"), "Value": format!("v{tag}") }))
+                    .collect::<Vec<Value>>(),
+            }),
+        )
+        .await;
+        let id = string_member(&made, "Id");
+
+        for (rule, source) in lists.iter().take(rules).enumerate() {
+            ok(
+                &router,
+                "CreateFirewallRule",
+                json!({
+                    "CreatorRequestId": format!("req-rule-{index}-{rule}"),
+                    "FirewallRuleGroupId": id.clone(),
+                    "FirewallDomainListId": source.clone(),
+                    "Name": format!("rule-{index}-{rule}"),
+                    "Priority": 100 * (rule + 1),
+                    "Action": "ALERT",
+                }),
+            )
+            .await;
+        }
+        for source in lists.iter().take(rules) {
+            ok(
+                &router,
+                "DeleteFirewallRule",
+                json!({
+                    "FirewallRuleGroupId": id.clone(),
+                    "FirewallDomainListId": source.clone(),
+                }),
+            )
+            .await;
+        }
+
+        // What a read of the group reports an instant before the delete is
+        // what the delete has to answer with.
+        let before = read(&router, &id).await;
+        let deleted = delete(&router, &id).await;
+        let status = string_member(&deleted, "Status");
+        assert_eq!(
+            status, FIREWALL_RULE_GROUP_STATUS_COMPLETE,
+            "case {case:?}: the group stood in its settled step, which is what the delete reports, got {deleted}"
+        );
+        assert!(
+            FIREWALL_RULE_GROUP_STATUS_VALUES.contains(&status.as_str()),
+            "case {case:?}: Status must be a modelled FirewallRuleGroupStatus, got {status:?}"
+        );
+        let message = string_member(&deleted, "StatusMessage");
+        assert_eq!(
+            message, expected_message,
+            "case {case:?}: the sentence of the step the group stood in goes beside it, got {deleted}"
+        );
+        assert!(
+            message.len() <= STATUS_MESSAGE_MAX,
+            "case {case:?}: StatusMessage must satisfy its modelled length 0..255, got {message:?}"
+        );
+        for member in ["Status", "StatusMessage", "ModificationTime"] {
+            assert_eq!(
+                deleted.get(member),
+                before.get(member),
+                "case {case:?}: {member} must be the one the read reported, got {deleted}"
+            );
+        }
+        assert_eq!(
+            deleted.get("RuleCount").and_then(Value::as_i64),
+            Some(0),
+            "case {case:?}: the group held no rule when it was deleted, got {deleted}"
+        );
+        expect_error(
+            &router,
+            "GetFirewallRuleGroup",
+            json!({ "FirewallRuleGroupId": id }),
+            case,
+            "ResourceNotFoundException",
+        )
+        .await;
+    }
+
+    // The step is the group's own: the sibling resource of this slice keeps its
+    // own machine, whose delete step the service DOES stamp, so neither answer
+    // is one state the service reports for every delete.
+    let list = string_member(
+        ok(
+            &router,
+            "CreateFirewallDomainList",
+            json!({ "CreatorRequestId": "req-sibling", "Name": "sibling-list" }),
+        )
+        .await
+        .get("FirewallDomainList")
+        .expect("the create answers a FirewallDomainList"),
+        "Id",
+    );
+    let removed = ok(
+        &router,
+        "DeleteFirewallDomainList",
+        json!({ "FirewallDomainListId": list }),
+    )
+    .await;
+    let removed = removed
+        .get("FirewallDomainList")
+        .expect("the delete answers a FirewallDomainList");
+    assert_eq!(
+        string_member(removed, "Status"),
+        FIREWALL_DOMAIN_LIST_STATUS_DELETING,
+        "case \"the sibling domain list\": its delete reports the list's own step, got {removed}"
+    );
+    assert_eq!(
+        string_member(removed, "StatusMessage"),
+        DELETING_DOMAIN_LIST_MESSAGE,
+        "case \"the sibling domain list\": its delete states the list's own sentence, got {removed}"
     );
 }

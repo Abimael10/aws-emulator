@@ -276,17 +276,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .firewall_rule_group_creator_request_ids
             .remove(&record.creator_request_id);
 
-        // The answer is the group this call took out, as it stood — with the
-        // rules it held counted — and it is on its way out, so it reports the
-        // deleting step rather than the settled one it held until this call,
-        // with that step's own sentence beside it: the same way the domain-list
-        // delete reports the list it just took out. The step is reached as the
-        // call is served, so the clock owes nothing on it.
-        let mut record = record;
-        record.status = crate::state::FIREWALL_RULE_GROUP_STATUS_DELETING.to_string();
-        record.settled_at = None;
-        record.modification_time = crate::state::now_rfc3339();
-
+        // The answer is the group this call took out, exactly as it stood — the
+        // rules it held counted, and the lifecycle step it stood in reported as
+        // a read of it would have reported it. The rule group's status machine
+        // has no delete step of its own, so this call stamps none.
         Ok(DeleteFirewallRuleGroupOutput {
             firewall_rule_group: Some(record.to_rule_group(now)),
         })

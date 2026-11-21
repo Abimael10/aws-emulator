@@ -166,8 +166,7 @@ pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_COMPLETE: &str =
 /// The `StatusMessage` an association reports once it holds
 /// [`FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING`] — the delete step's own
 /// sentence, stated for the resource it is about exactly as the domain list's
-/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_DELETING`]) and the rule group's
-/// ([`FIREWALL_RULE_GROUP_STATUS_MESSAGE_DELETING`]) are.
+/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_DELETING`]) is.
 pub const FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_MESSAGE_DELETING: &str =
     "Deleting Firewall Rule Group Association";
 
