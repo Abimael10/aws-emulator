@@ -47,6 +47,14 @@
 //! handler, a frame that reached none while the connection stayed open — and never an
 //! unanswered wait.
 //!
+//! One further slice is about what the client READS BACK of that answer:
+//!
+//! > The `RouteResponse` is what carries an integration's answer to the sending client: a
+//! > route that declares one relays the BODY its integration answered as a TEXT frame holding
+//! > exactly those bytes — whatever document the function wrote, whatever status it answered
+//! > with, and the decoded octets where it stated that body base64-encoded — while the same
+//! > function on a route that declares no route response answers the client nothing at all.
+//!
 //! The suites that own the steps BEFORE the integration are not restated here: the
 //! handshake's own statuses and the `MOCK` reply rule are
 //! `websocket_transport_data_plane.rs`, and the identity-source precondition over every
@@ -63,7 +71,7 @@ use crate::http_api_backend_dispatch::{
     gateway_may_invoke, given_function, given_ungranted_function, granted, revoked,
 };
 use crate::websocket_transport_data_plane::{
-    exchanged_reply, handshake_at, ClientSocket, ACTION_SELECTION_EXPRESSION,
+    exchange, exchanged_reply, handshake_at, ClientSocket, ACTION_SELECTION_EXPRESSION,
 };
 
 /// The Region every control-plane request below is signed for.
@@ -2496,4 +2504,274 @@ async fn a_frame_its_routes_model_refuses_is_answered_by_the_gateway() {
             row.case
         );
     }
+}
+
+/// The marker the relaying handler below folds into every body it answers: a value planted in
+/// the FUNCTION that nothing the client sends carries, so a frame holding it can only be that
+/// integration's own answer carried back.
+const RELAY_MARKER: &str = "two-way-reply-marker";
+
+/// The route key of the TWO-WAY route the table below drives — the one that declares a
+/// `RouteResponse`, "to define a two-way route, create a route response" — and the key of the
+/// ONE-WAY route beside it, which fronts the SAME function and declares none.
+const RELAY_ROUTE: &str = "relay";
+const ONE_WAY_ROUTE: &str = "oneway";
+
+/// A handler whose reply BODY is a document it writes itself: the marker above, the route it
+/// was called for, and the value the message asked it to carry — answered with the status the
+/// message named and, where the message asked for it, base64-encoded, which is how a proxy
+/// integration states a body that is not text (`isBase64Encoded`).
+///
+/// The document is assembled by concatenation rather than dumped from a mapping, so the bytes
+/// it answers are fixed by the handler and a case can state them exactly
+/// ([`relayed_document`]).
+fn relaying_handler() -> String {
+    let marker = serde_json::to_string(RELAY_MARKER).expect("the marker is JSON text");
+    format!(
+        "import base64\n\
+         import json\n\
+         \n\
+         \n\
+         def lambda_handler(event, context):\n\
+         \x20   directive = json.loads(event[\"body\"])\n\
+         \x20   document = (\n\
+         \x20       '{{\"marker\":{marker},\"routeKey\":'\n\
+         \x20       + json.dumps(event[\"requestContext\"][\"routeKey\"])\n\
+         \x20       + ',\"payload\":'\n\
+         \x20       + json.dumps(\n\
+         \x20           directive[\"payload\"], separators=(\",\", \":\"), ensure_ascii=False\n\
+         \x20       )\n\
+         \x20       + '}}'\n\
+         \x20   )\n\
+         \x20   reply = {{\"statusCode\": directive[\"status\"]}}\n\
+         \x20   if directive[\"encoded\"]:\n\
+         \x20       reply[\"body\"] = base64.b64encode(\n\
+         \x20           document.encode(\"utf-8\")\n\
+         \x20       ).decode(\"ascii\")\n\
+         \x20       reply[\"isBase64Encoded\"] = True\n\
+         \x20   else:\n\
+         \x20       reply[\"body\"] = document\n\
+         \x20   return reply\n"
+    )
+}
+
+/// The document [`relaying_handler`] answers for a call of `route_key` carrying `payload`:
+/// the bytes the client must read back, written here the way the handler assembles them.
+fn relayed_document(route_key: &str, payload: &Value) -> String {
+    format!(
+        "{{\"marker\":{marker},\"routeKey\":{route},\"payload\":{payload}}}",
+        marker = serde_json::to_string(RELAY_MARKER).expect("the marker is JSON text"),
+        route = serde_json::to_string(route_key).expect("the route key is JSON text"),
+        payload = serde_json::to_string(payload).expect("the payload is JSON"),
+    )
+}
+
+/// The frame the client reads for `sent`, as it arrived — the bytes, unparsed.
+///
+/// Same transient [`route_reply`] waits out: a function whose runtime is still starting leaves
+/// the gateway with no answer to relay, which arrives as its own frame, so that one answer is
+/// offered the message again until `patience` passes. Nothing else is retried, and nothing
+/// here asserts on the clock.
+async fn relayed(
+    case: &str,
+    row: &str,
+    socket: &mut ClientSocket,
+    sent: &str,
+    patience: std::time::Instant,
+) -> String {
+    loop {
+        let answered = exchanged_reply(row, socket, sent).await;
+        if !is_gateway_frame(&answered) {
+            return answered;
+        }
+        assert!(
+            std::time::Instant::now() < patience,
+            "case {case:?} / {row}: expected the two-way route's own reply, got the gateway's \
+             frame {answered:?}"
+        );
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    }
+}
+
+/// Whether `answered` is the gateway's own `Internal server error` frame rather than a route's
+/// reply.
+fn is_gateway_frame(answered: &str) -> bool {
+    serde_json::from_str::<Value>(answered)
+        .is_ok_and(|document| member(&document, "/message") == json!(INTERNAL_SERVER_ERROR_FRAME))
+}
+
+/// What the client reads back on a TWO-WAY route is the BODY its integration answered, byte
+/// for byte, and what it reads on a route that declares no `RouteResponse` is nothing at all.
+///
+/// Nothing asserted here is a value this emulator fills in: every expected frame is the
+/// document the FUNCTION assembled — carrying a marker the client never sent — so a body the
+/// gateway re-encoded, truncated, wrapped or replaced with its own frame is read as different
+/// bytes rather than as a frame that merely arrived.
+#[tokio::test]
+async fn a_two_way_routes_reply_carries_its_integrations_body_byte_for_byte() {
+    /// One row: the value the integration folds into the body it answers, the status it
+    /// answers with, and whether it states that body base64-encoded.
+    struct Row {
+        case: &'static str,
+        payload: Value,
+        status: u16,
+        encoded: bool,
+    }
+
+    // The rows span what the relay rule generalises over: the JSON TYPE of what the body
+    // carries (object, array, string, number, boolean, null), the SIZE of the body (a few
+    // bytes up to kilobytes), whether its text is ASCII, the STATUS the integration answered
+    // it with, and whether the function stated the body base64-encoded.
+    let rows = vec![
+        Row {
+            // The recorded case: a handler answering a JSON document of its own.
+            case: "a body that is a JSON object",
+            payload: json!({ "greeting": "hello" }),
+            status: 200,
+            encoded: false,
+        },
+        Row {
+            case: "a body that is a JSON array",
+            payload: json!([1, 2, 3]),
+            status: 200,
+            encoded: false,
+        },
+        Row {
+            case: "a body that is a bare JSON string",
+            payload: json!("plain text, no object"),
+            status: 200,
+            encoded: false,
+        },
+        Row {
+            case: "a body carrying non-ASCII text",
+            payload: json!("héllo✓ プロトコル"),
+            status: 200,
+            encoded: false,
+        },
+        Row {
+            case: "a body carrying every JSON type",
+            payload: json!({
+                "flag": true,
+                "list": ["x", { "y": 1 }],
+                "n": 42,
+                "nothing": null
+            }),
+            status: 200,
+            encoded: false,
+        },
+        Row {
+            case: "a body of 8 KiB",
+            payload: json!("a".repeat(8 * 1024)),
+            status: 200,
+            encoded: false,
+        },
+        Row {
+            case: "an empty JSON object as the body's payload",
+            payload: json!({}),
+            status: 200,
+            encoded: false,
+        },
+        Row {
+            case: "a body the function stated base64-encoded",
+            payload: json!({ "octets": "safe" }),
+            status: 200,
+            encoded: true,
+        },
+        Row {
+            case: "a body the function answered 201 with",
+            payload: json!("created"),
+            status: 201,
+            encoded: false,
+        },
+    ];
+
+    let case = "an api whose relay route declares a route response and whose oneway route \
+                declares none, both fronting one function";
+    let (emulator, engine) = emulator();
+    let function =
+        given_function(&emulator, &engine, case, "relay-route", &relaying_handler()).await;
+    let api = given_api(&emulator, case).await;
+    given_route(
+        &emulator,
+        case,
+        &api.api_id,
+        RELAY_ROUTE,
+        &function,
+        true,
+        None,
+    )
+    .await;
+    given_route(
+        &emulator,
+        case,
+        &api.api_id,
+        ONE_WAY_ROUTE,
+        &function,
+        false,
+        None,
+    )
+    .await;
+    given_stage(&emulator, case, &api.api_id).await;
+
+    let mut socket: ClientSocket = upgraded(case, &api.authority).await;
+    // ONE budget for the whole table, like every other table of this suite: what it waits out
+    // is the function runtime starting, which happens once.
+    let patience = std::time::Instant::now() + DECISION_WAIT;
+    for row in &rows {
+        let sent = json!({
+            "action": RELAY_ROUTE,
+            "payload": row.payload,
+            "status": row.status,
+            "encoded": row.encoded
+        })
+        .to_string();
+        let expected = relayed_document(RELAY_ROUTE, &row.payload);
+        let frame = relayed(case, row.case, &mut socket, &sent, patience).await;
+        assert_eq!(
+            frame, expected,
+            "case {case:?} / {}: the two-way route's reply must carry the integration's own \
+             body, expected {expected:?}, got {frame:?}",
+            row.case
+        );
+    }
+
+    // The ROUTE RESPONSE is what carries that body to the client: the same function, reached
+    // through the route that declares none, answers the client nothing — and the connection
+    // goes on serving the two-way route afterwards, so the silence is of that route and not of
+    // the socket.
+    let one_way = json!({
+        "action": ONE_WAY_ROUTE,
+        "payload": "no route response, no frame",
+        "status": 200,
+        "encoded": false
+    })
+    .to_string();
+    let silent = exchange(case, &mut socket, &one_way).await;
+    assert!(
+        silent.is_none(),
+        "case {case:?}: a route declaring no route response must answer the client nothing, \
+         got {silent:?}"
+    );
+    let payload = json!("still serving");
+    let after = json!({
+        "action": RELAY_ROUTE,
+        "payload": payload,
+        "status": 200,
+        "encoded": false
+    })
+    .to_string();
+    let expected = relayed_document(RELAY_ROUTE, &payload);
+    let frame = relayed(
+        case,
+        "the two-way route after the one-way route",
+        &mut socket,
+        &after,
+        patience,
+    )
+    .await;
+    assert_eq!(
+        frame, expected,
+        "case {case:?}: the two-way route must still carry its integration's body after the \
+         one-way route answered nothing, expected {expected:?}, got {frame:?}"
+    );
 }
