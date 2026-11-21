@@ -38,11 +38,11 @@ use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
 };
 use service_com_amazonaws_freetier_awsfreetierservice::state::{
     stated_validation, ComAmazonawsFreetierAwsfreetierserviceState, ACCOUNT_PLAN_TYPE_VALUE_SET,
-    ACTIVITIES_INVALID_NEXT_TOKEN, INVALID_NEXT_TOKEN, PLAN_STATUS_ACTIVE, PLAN_TYPE_FREE,
-    PLAN_TYPE_PAID,
+    ACTIVITIES_INVALID_NEXT_TOKEN, INVALID_NEXT_TOKEN, PAYMENT_INSTRUMENT_VET_FAILURE,
+    PLAN_STATUS_ACTIVE, PLAN_STATUS_EXPIRED, PLAN_TYPE_FREE, PLAN_TYPE_PAID,
 };
 
-use crate::free_tier::{call, error_code, harness, ok};
+use crate::free_tier::{call, error_code, harness, ok, text};
 
 /// The modelled `Value` constraints, from
 /// `smithy_query(query="shape", shape="Values,Value")`: the list's member targets `Value`,
@@ -1121,5 +1121,217 @@ async fn the_closed_free_window_refusal_states_one_sentence() {
         answered["accountPlanType"].as_str().unwrap_or_default(),
         PLAN_TYPE_FREE,
         "case an account whose window is open: expected the plan asked for, got {answered}"
+    );
+}
+
+/// How the account's one-off free window came to be closed — the two ways a CLIENT can
+/// close it, so a row reaches the refusal through this service's own operations rather
+/// than through a store a test wrote.
+enum WindowClosedBy {
+    /// The account left the free plan for the paid one, after asking for the free plan
+    /// `free_calls_first` times while its window was still open.
+    LeavingForThePaidPlan { free_calls_first: usize },
+    /// The clock carried the free window `seconds` past the instant the plan itself
+    /// names.
+    TheWindowElapsing { seconds: i64 },
+}
+
+/// Mount the service and close the account's one-off free window the way `how` says,
+/// driving every plan write through `UpgradeAccountPlan` itself. Reports the router and
+/// the plan the store then holds, as `GetAccountPlanState` reports it.
+async fn window_closed(case: &str, how: &WindowClosedBy) -> (MultiServiceRouter, Value) {
+    let (router, engine) = harness();
+    let free = json!({"accountPlanType": PLAN_TYPE_FREE});
+
+    match *how {
+        WindowClosedBy::LeavingForThePaidPlan { free_calls_first } => {
+            // The paid plan's own precondition is not what these rows are about (its
+            // wording is pinned in `paid_plan_vetting.rs`), so the account carries a
+            // vetted payment instrument and the move onto that plan is served.
+            engine
+                .state::<ComAmazonawsFreetierAwsfreetierserviceState>()
+                .lock()
+                .vet_payment_instrument(engine::emulator_account_id());
+            for attempt in 1..=free_calls_first {
+                let inside = ok(&router, "UpgradeAccountPlan", &free).await;
+                assert_eq!(
+                    text(&inside, "accountPlanType"),
+                    PLAN_TYPE_FREE,
+                    "case {case}: call {attempt} inside the open window must be served the \
+                     free plan, got {inside}"
+                );
+            }
+            let paid = ok(
+                &router,
+                "UpgradeAccountPlan",
+                &json!({"accountPlanType": PLAN_TYPE_PAID}),
+            )
+            .await;
+            assert_eq!(
+                text(&paid, "accountPlanType"),
+                PLAN_TYPE_PAID,
+                "case {case}: the account must reach the paid plan over the wire, got {paid}"
+            );
+        }
+        WindowClosedBy::TheWindowElapsing { seconds } => {
+            let established = ok(&router, "UpgradeAccountPlan", &free).await;
+            assert_eq!(
+                text(&established, "accountPlanType"),
+                PLAN_TYPE_FREE,
+                "case {case}: the window has to be open before it can elapse, got \
+                 {established}"
+            );
+            // What the clock does to a window that elapses: the instant the plan names
+            // is now in the past.
+            let state = engine.state::<ComAmazonawsFreetierAwsfreetierserviceState>();
+            let mut store = state.lock();
+            let now = DateTime::from(std::time::SystemTime::now()).secs();
+            store.plan_mut(engine::emulator_account_id()).expiration_date =
+                Some(DateTime::from_secs(now - seconds));
+        }
+    }
+
+    let plan = ok(&router, "GetAccountPlanState", &json!({})).await;
+    (router, plan)
+}
+
+/// RULE 1 on the same handler-checked condition, reached the way a CLIENT reaches it:
+/// the one-off free window closed by this service's own operations and by the clock
+/// rather than by a store a test wrote. However the window came to be closed — the
+/// account left the free plan for the paid one, or the window's own instant passed — and
+/// however often the refused call is repeated, the refusal states ONE sentence for the
+/// whole condition, so the plan the store holds and the status it is in, which the rule
+/// does not distinguish between, are no part of what a client branches on.
+///
+/// The rows differ along what the rule generalises over: which of the two ways closed
+/// the window, how many served calls preceded it, and how far past its instant the
+/// window is.
+#[tokio::test]
+async fn the_closed_free_window_reads_alike_however_the_window_was_closed() {
+    const DAY: i64 = 86_400;
+    // The sentence the handler states for this whole condition, in the envelope this
+    // service states a handler-checked condition in (`state::stated_validation`).
+    const FREE_WINDOW_CLOSED: &str = "The FREE plan is a one-off window this account no \
+                                      longer holds";
+    let expected = stated_validation(FREE_WINDOW_CLOSED);
+    let request = json!({"accountPlanType": PLAN_TYPE_FREE});
+
+    let rows: [(&str, WindowClosedBy); 5] = [
+        (
+            "an account that moved straight onto the paid plan",
+            WindowClosedBy::LeavingForThePaidPlan {
+                free_calls_first: 0,
+            },
+        ),
+        (
+            "an account that asked for its open free window three times, then left it",
+            WindowClosedBy::LeavingForThePaidPlan {
+                free_calls_first: 3,
+            },
+        ),
+        (
+            "a free window one second past its instant",
+            WindowClosedBy::TheWindowElapsing { seconds: 1 },
+        ),
+        (
+            "a free window a day past its instant",
+            WindowClosedBy::TheWindowElapsing { seconds: DAY },
+        ),
+        (
+            "a free window a decade past its instant",
+            WindowClosedBy::TheWindowElapsing {
+                seconds: 3_650 * DAY,
+            },
+        ),
+    ];
+
+    let mut stated: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut stored: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (case, how) in &rows {
+        let (router, plan) = window_closed(case, how).await;
+        stored.insert(format!(
+            "{}/{}",
+            text(&plan, "accountPlanType"),
+            text(&plan, "accountPlanStatus")
+        ));
+
+        // Repeated, because the condition is the same condition every time it is
+        // reached: a refusal that reworded itself on a retry is the same defect as one
+        // that reworded itself per stored state.
+        for attempt in 1..=3 {
+            let actual = refusal_message(&router, case, "UpgradeAccountPlan", &request).await;
+            assert_eq!(
+                actual, expected,
+                "case {case}, attempt {attempt}: expected {expected:?}, got {actual:?}"
+            );
+            // Neither the plan the store holds, nor the status it is in, nor the member
+            // the plan was asked at, nor the account asking belongs in the sentence.
+            for token in [
+                PLAN_TYPE_PAID,
+                PLAN_STATUS_ACTIVE,
+                PLAN_STATUS_EXPIRED,
+                "accountPlanType",
+                engine::emulator_account_id(),
+            ] {
+                assert!(
+                    !actual.contains(token),
+                    "case {case}, attempt {attempt}: expected a sentence carrying nothing of \
+                     the request or of the stored plan, but it names {token:?}: {actual:?}"
+                );
+            }
+            stated.insert(actual);
+        }
+    }
+
+    let stated: Vec<String> = stated.into_iter().collect();
+    assert_eq!(
+        stated,
+        vec![expected.clone()],
+        "case the whole table of closed windows: expected the one sentence {expected:?}, got \
+         {stated:?}"
+    );
+    // That the rows really did reach the condition both ways: one half of it is an
+    // account on the paid plan, the other a free plan the clock has expired, and the one
+    // sentence above was stated for both.
+    let reached: std::collections::BTreeSet<String> = [
+        format!("{PLAN_TYPE_PAID}/{PLAN_STATUS_ACTIVE}"),
+        format!("{PLAN_TYPE_FREE}/{PLAN_STATUS_EXPIRED}"),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        stored, reached,
+        "case the whole table of closed windows: expected both ways of closing the window to \
+         be reached over the wire ({reached:?}), got {stored:?}"
+    );
+
+    // The positive control, and the contrast: on an account whose window is still open
+    // the free plan is served, and the handler's OTHER self-worded refusal — the paid
+    // plan's unvetted payment instrument — answers its own fixed text, outside the
+    // envelope above. Two conditions, two fixed sentences, neither varying with the
+    // store.
+    let (router, _engine) = harness();
+    let served = ok(&router, "UpgradeAccountPlan", &request).await;
+    assert_eq!(
+        text(&served, "accountPlanType"),
+        PLAN_TYPE_FREE,
+        "case an account whose window is open: expected the plan asked for, got {served}"
+    );
+    let vetting = refusal_message(
+        &router,
+        "an account with no vetted payment instrument",
+        "UpgradeAccountPlan",
+        &json!({"accountPlanType": PLAN_TYPE_PAID}),
+    )
+    .await;
+    assert_eq!(
+        vetting, PAYMENT_INSTRUMENT_VET_FAILURE,
+        "case an account with no vetted payment instrument: expected \
+         {PAYMENT_INSTRUMENT_VET_FAILURE:?}, got {vetting:?}"
+    );
+    assert_ne!(
+        vetting, expected,
+        "case the two self-worded refusals of this operation: two conditions must not read \
+         alike, got {vetting:?} for both"
     );
 }
