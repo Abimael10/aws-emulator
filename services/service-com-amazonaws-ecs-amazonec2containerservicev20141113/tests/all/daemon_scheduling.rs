@@ -39,9 +39,12 @@
 //!   and because it only reports, repeating it changes nothing a later caller sees;
 //! * `DeleteDaemon`: "Deleting a daemon stops all running daemon tasks on the associated
 //!   container instances", the daemon is answered `DELETE_IN_PROGRESS`, and it leaves
-//!   `ListDaemons` on the clock — after which an `UpdateDaemon` naming it names a daemon
-//!   that can no longer take one, whichever stage the delete has reached, which is a
-//!   different refusal from the one an ARN that never named a daemon earns;
+//!   `ListDaemons` on the clock — and because the operation is `@idempotent`, a REPEAT of a
+//!   delete already under way answers the stored record and the drain the first call
+//!   started rather than starting a second one, whatever capacity there was to drain —
+//!   after which an `UpdateDaemon` naming it names a daemon that can no longer take one,
+//!   whichever stage the delete has reached, which is a different refusal from the one an
+//!   ARN that never named a daemon earns;
 //! * the same placement rule over the other daemon-scheduled workload this service has:
 //!   "The daemon scheduling strategy deploys exactly one task on each active container
 //!   instance", so a `schedulingStrategy=DAEMON` SERVICE's `desiredCount` follows the
@@ -187,6 +190,19 @@ async fn list_deployments(
     list_deployments_page(router, json!({ "daemonArn": daemon_arn }), case)
         .await
         .0
+}
+
+/// The ARNs of every daemon deployment of one daemon, SORTED — for a caller that compares
+/// the SET of a daemon's rollouts before and after a call, rather than the order
+/// `ListDaemonDeployments` reports them in.
+async fn deployment_arns(router: &MultiServiceRouter, daemon_arn: &str, case: &str) -> Vec<String> {
+    let mut arns: Vec<String> = list_deployments(router, daemon_arn, case)
+        .await
+        .iter()
+        .map(|deployment| string(deployment, "daemonDeploymentArn", case))
+        .collect();
+    arns.sort();
+    arns
 }
 
 /// `DescribeDaemonDeployments` for one rollout.
@@ -908,6 +924,188 @@ async fn a_delete_drains_the_daemon_tasks_and_the_daemon_leaves_the_listing() {
         ),
         "case {CASE:?}: expected the deleted daemon to be gone"
     );
+}
+
+/// The delete of a daemon both REPORTS and carries out the delete, and the model marks it
+/// `@idempotent`: the daemon it names is answered out of the store in the status the delete
+/// moved it to, with the instant of the call as its `updatedAt`, its `createdAt` as the
+/// create left it and the drain this delete started as its `deploymentArn` — and a REPEAT
+/// of the same delete answers that same stored record and that same drain, asking for
+/// nothing a second time. Once the clock has carried the delete out, nothing backs the
+/// daemon any more, so a delete that arrives then is refused about the daemon.
+///
+/// The rows differ along what the rule generalises over: HOW MUCH the delete has to drain —
+/// no container instance at all, one, and two — because what the repeat answers is the
+/// first call's own effect, whatever capacity the daemon was holding when it arrived.
+#[tokio::test]
+async fn a_repeated_delete_answers_the_record_and_the_drain_the_first_one_started() {
+    let router = service();
+    let capacities: [(&str, usize); 3] = [
+        ("a delete of a daemon whose cluster holds no container instance", 0),
+        ("a delete of a daemon over one container instance", 1),
+        ("a delete of a daemon over two container instances", 2),
+    ];
+    for (case, instances) in capacities {
+        let cluster = format!("daemon-delete-repeat-{instances}");
+        create_cluster(&router, &cluster, case).await;
+        for index in 0..instances {
+            register_instance(
+                &router,
+                &cluster,
+                &format!("i-0daemonrepeat{instances}{index}"),
+                case,
+            )
+            .await;
+        }
+        let provider =
+            create_managed_provider(&router, &cluster, &format!("mi-repeat-{instances}"), case)
+                .await;
+        let definition = register_daemon_definition(
+            &router,
+            &format!("daemondeleterepeat{instances}"),
+            IMAGE,
+            case,
+        )
+        .await;
+        let (daemon_arn, create_deployment) = create_daemon(
+            &router,
+            &cluster,
+            "agents",
+            &[provider],
+            &definition,
+            case,
+        )
+        .await;
+        // The delete arrives at a daemon that has finished rolling out, so what it has to
+        // drain is exactly the capacity this row states.
+        poll_daemon_tasks(&router, &cluster, &definition, instances, case).await;
+        let before = describe_daemon(&router, &daemon_arn, case).await;
+        let created_at = before["createdAt"].as_f64().unwrap_or_else(|| {
+            panic!("case {case:?}: expected the stored daemon's createdAt, got {before}")
+        });
+        // What this daemon's rollouts are before any delete: the one the create started.
+        let rollouts_before = deployment_arns(&router, &daemon_arn, case).await;
+
+        let first = ok(
+            &router,
+            "DeleteDaemon",
+            json!({ "daemonArn": daemon_arn }),
+            case,
+        )
+        .await;
+        // The REPEAT, of the delete already under way: the call has already had its effect,
+        // so it answers the record and the drain the first one made.
+        let repeat = ok(
+            &router,
+            "DeleteDaemon",
+            json!({ "daemonArn": daemon_arn }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            repeat, first,
+            "case {case:?}: expected a repeated delete to answer the stored record the first one \
+             left, got {repeat} after {first}"
+        );
+        assert_eq!(
+            (
+                first["daemonArn"].as_str(),
+                first["status"].as_str(),
+                first["createdAt"].as_f64(),
+            ),
+            (
+                Some(daemon_arn.as_str()),
+                Some("DELETE_IN_PROGRESS"),
+                Some(created_at),
+            ),
+            "case {case:?}: expected the delete to answer the daemon it named, in the status it \
+             moved to, with the createdAt the create left, got {first}"
+        );
+        let updated_at = first["updatedAt"].as_f64().unwrap_or_else(|| {
+            panic!("case {case:?}: expected the delete's updatedAt, got {first}")
+        });
+        assert!(
+            updated_at >= created_at,
+            "case {case:?}: expected an updatedAt at or after the createdAt {created_at}, got \
+             {updated_at}"
+        );
+        let drain = string(&first, "deploymentArn", case);
+        assert_ne!(
+            drain, create_deployment,
+            "case {case:?}: expected the drain this delete triggered rather than the rollout the \
+             create started, got {first}"
+        );
+        assert!(
+            drain.starts_with(&format!(
+                "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:daemon-deployment/{cluster}/agents/"
+            )),
+            "case {case:?}: expected a daemon-deployment ARN of this daemon, got {drain:?}"
+        );
+        // Both deletes together started ONE drain: the second asked for nothing a second
+        // time, and the drain the answers name is a STORED daemon deployment of this daemon
+        // rather than an ARN assembled for the response.
+        let mut expected_rollouts = rollouts_before.clone();
+        expected_rollouts.push(drain.clone());
+        expected_rollouts.sort();
+        let rollouts_after = deployment_arns(&router, &daemon_arn, case).await;
+        assert_eq!(
+            rollouts_after, expected_rollouts,
+            "case {case:?}: expected the two deletes to have started exactly the one drain \
+             {drain:?} beside {rollouts_before:?}, got {rollouts_after:?}"
+        );
+        // The read agrees with the answer: the delete WROTE the record the response reports,
+        // so nothing in it was assembled for the response alone.
+        let reported = describe_daemon(&router, &daemon_arn, case).await;
+        assert_eq!(
+            (
+                reported["status"].as_str(),
+                reported["deploymentArn"].as_str(),
+                reported["createdAt"].as_f64(),
+                reported["updatedAt"].as_f64(),
+            ),
+            (
+                Some("DELETE_IN_PROGRESS"),
+                Some(drain.as_str()),
+                Some(created_at),
+                Some(updated_at),
+            ),
+            "case {case:?}: expected the stored daemon to carry what the delete answered, got \
+             {reported}"
+        );
+
+        // "Deleting a daemon stops all running daemon tasks on the associated container
+        // instances", and the daemon itself is gone one transition span later on the clock,
+        // with no further call from anybody: the read no longer answers it, and the listing
+        // of its cluster no longer holds it.
+        poll_daemon_tasks(&router, &cluster, &definition, 0, case).await;
+        deleted_daemon_is_gone(&router, &daemon_arn, case).await;
+        let listed = ok(
+            &router,
+            "ListDaemons",
+            json!({ "clusterArn": cluster }),
+            case,
+        )
+        .await;
+        assert!(
+            list(&listed, "daemonSummariesList", case).is_empty(),
+            "case {case:?}: expected the deleted daemon to have left the listing, got {listed}"
+        );
+        // The idempotent answer ends with the record: once the delete has been carried out,
+        // no daemon metadata backs the ARN and that is what the delete is refused about.
+        let (code, message) = refusal(
+            &router,
+            "DeleteDaemon",
+            json!({ "daemonArn": daemon_arn }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("DaemonNotFoundException", "No daemon metadata found."),
+            "case {case:?}: expected the delete of a daemon nothing backs to be refused about \
+             the daemon"
+        );
+    }
 }
 
 #[tokio::test]
