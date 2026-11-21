@@ -36,8 +36,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccessDeniedException, EncryptionConfiguration, ResourceNotFoundException,
-    StorageConfiguration, StorageConfigurationOutput,
+    AccessDeniedException, EncryptionConfiguration, InvalidInputException,
+    ResourceNotFoundException, StorageConfiguration, StorageConfigurationOutput,
 };
 
 /// Region used when the request carries no SigV4 credential scope to read one
@@ -134,6 +134,30 @@ pub const RESOURCE_ALREADY_EXISTS_MESSAGE: &str = "Resource already exists";
 /// this service and found it gone names that resource instead (see
 /// [`event_bus_not_found`]).
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource does not exist";
+
+/// The whole `Message` of the `InvalidInputException` answered a create that
+/// states no `ClientToken`.
+///
+/// Every create of this service takes the idempotency token and REQUIRES the
+/// caller to state it: the member is what makes a retried create a replay rather
+/// than a second resource, so a create that carries none is refused before
+/// anything is minted. The model marks the member `@idempotencyToken` and not
+/// `@required` — a code-generated client fills it in itself, which is why the
+/// contract leaves it optional — so the requirement is the SERVICE's and is
+/// stated here rather than by the constraint walk.
+///
+/// FIXED text of that refusal: it names the member that was missing and nothing
+/// of the request. It is named once here because all three creates word it the
+/// same way.
+pub const CLIENT_TOKEN_REQUIRED_MESSAGE: &str = "ClientToken is required";
+
+/// The `InvalidInputException` a create answers when the request states no
+/// `ClientToken` ([`CLIENT_TOKEN_REQUIRED_MESSAGE`]).
+pub fn client_token_required() -> InvalidInputException {
+    InvalidInputException {
+        message: Some(CLIENT_TOKEN_REQUIRED_MESSAGE.to_string()),
+    }
+}
 
 /// The whole `Message` of the `AccessDeniedException` answered for an event bus
 /// whose `KmsKeyIdentifier` names a key this account and Region do not hold.

@@ -2251,19 +2251,20 @@ impl Repo {
 
     /// The `Repository` every operation that reports this repository returns.
     ///
-    /// `repositoryUri` is composed here rather than stored on the record, from the registry
-    /// that HOLDS this repository — the account id and the Region the record carries — and
-    /// the record's own name ([`repository_uri`], and see
-    /// [`registry_address`](crate::state::registry_address)): it is the reference a client
-    /// writes an image address in, so it names that registry whoever reads it, exactly as
-    /// the other members that carry the repository's identity do (`registryId`, and the ARN,
-    /// which names the Region).
-    pub fn to_repository(&self) -> Repository {
+    /// `repositoryUri` is composed here rather than stored on the record, from
+    /// `published_registry_endpoint` — the endpoint this emulator answers THIS caller's
+    /// registry requests at — and the record's own name ([`repository_uri`], and see
+    /// [`registry_address`](crate::state::registry_address)): it is the address a client
+    /// pushes and pulls at, so every reader is handed an address it can reach. Which
+    /// registry HOLDS the repository is reported beside it by the members that carry that
+    /// identity, read off the record and moved by no reader: `registryId`, and the ARN,
+    /// which names the Region.
+    pub fn to_repository(&self, published_registry_endpoint: &str) -> Repository {
         Repository {
             repository_arn: Some(self.arn.clone()),
             registry_id: Some(self.registry_id.clone()),
             repository_name: Some(self.name.clone()),
-            repository_uri: Some(repository_uri(&self.registry_id, &self.region, &self.name)),
+            repository_uri: Some(repository_uri(published_registry_endpoint, &self.name)),
             created_at: Some(reported_instant(self.created_at)),
             image_tag_mutability: Some(self.image_tag_mutability.clone()),
             image_tag_mutability_exclusion_filters: if self

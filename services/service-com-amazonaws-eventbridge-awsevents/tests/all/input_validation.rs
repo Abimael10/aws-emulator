@@ -1004,25 +1004,32 @@ async fn put_events_fails_an_entry_whose_detail_type_is_over_the_documented_maxi
     );
 }
 
-/// The expression a `@pattern` refusal reports is the member's modelled expression
-/// exactly as the model spells it, `^`/`$` included. The rows span six operations and
+/// The expression a `@pattern` refusal reports is the one the service PUBLISHES for the
+/// member's shape — the modelled expression without the `^`/`$` pair the model wraps a
+/// whole-value match in. The rows span six operations and
 /// six pattern-constrained members — a top-level member, a nested list element and a
 /// list-of-strings element — plus one control row per OTHER constraint class this
 /// service can be made to violate (a string's length maximum, a list's length minimum
 /// on two operations, an integer's range bounds, and an absent required member), which
 /// keep the wording they had.
 #[tokio::test]
-async fn a_pattern_refusal_reports_the_expression_the_model_spells() {
+async fn a_pattern_refusal_reports_the_expression_the_service_publishes() {
     let emulator = emulator();
 
-    // The expression as a refusal must report it: the model's own spelling, which is
-    // what this service matched the value against. Written out in the row constants
-    // above rather than taken from the service, so a wrong constant in the
-    // implementation cannot make a row pass.
+    // The expression as a refusal must report it: the body of the model's whole-value
+    // expression. The model's own text is in the row constants above rather than taken
+    // from the service, and the pair is dropped here rather than by the implementation's
+    // reading of it, so a wrong constant or a wrong rendering cannot make a row pass.
     fn pattern_message(value: &str, path: &str, model_pattern: &str) -> String {
+        let published = model_pattern
+            .strip_prefix('^')
+            .and_then(|body| body.strip_suffix('$'))
+            .unwrap_or_else(|| {
+                panic!("the modelled pattern {model_pattern:?} must wrap the whole value")
+            });
         format!(
             "1 validation error detected: Value '{value}' at '{path}' failed to satisfy \
-             constraint: Member must satisfy regular expression pattern: {model_pattern}"
+             constraint: Member must satisfy regular expression pattern: {published}"
         )
     }
 
@@ -1199,18 +1206,18 @@ async fn a_pattern_refusal_reports_the_expression_the_model_spells() {
         );
     }
 
-    // And the expression is the model's own: whatever the member, the reported pattern
-    // carries the anchors the model spells it with, so a client comparing it against the
-    // model's own text finds them equal.
+    // And the expression is the one the service publishes: whatever the member, the
+    // reported pattern carries neither end of the whole-value pair the model wraps it
+    // in, so a caller can compile what it was handed.
     const CLAUSE: &str = "Member must satisfy regular expression pattern: ";
     for (case, _, _, expected) in &rows {
         let Some((_, reported)) = expected.split_once(CLAUSE) else {
             continue;
         };
         assert!(
-            reported.starts_with('^') && reported.ends_with('$'),
-            "case {case:?}: the reported expression must be the modelled one, anchors \
-             included, got {reported:?}"
+            !reported.starts_with('^') && !reported.ends_with('$'),
+            "case {case:?}: the reported expression must be the published one, without the \
+             whole-value anchors, got {reported:?}"
         );
     }
 }

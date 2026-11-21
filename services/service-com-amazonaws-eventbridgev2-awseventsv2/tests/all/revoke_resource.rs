@@ -51,6 +51,8 @@ use eventsv2::ops::types::{
 };
 use eventsv2::scaffolded::Scaffolded;
 
+use crate::modelled_input_refusal::with_client_token;
+
 /// The account segment every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
 
@@ -152,10 +154,13 @@ impl Harness {
     async fn active_bus(&self, case: &str, name: &str) -> String {
         let arn = CreateEventBus::new(Arc::clone(&self.engine))
             .handle(
-                CreateEventBusInput {
+                // Every create of this service states the idempotency token it requires;
+                // the harness supplies a fresh one, as a code-generated client does
+                // (`crate::modelled_input_refusal::with_client_token`).
+                with_client_token(CreateEventBusInput {
                     name: name.to_string(),
                     ..Default::default()
-                },
+                }),
                 &self.ctx(),
             )
             .await
@@ -315,14 +320,14 @@ async fn revocable_resources(harness: &Harness, bus: &str) -> Vec<Resource> {
     for (case, name, configuration) in sources {
         let arn = CreateEventSource::new(Arc::clone(&harness.engine))
             .handle(
-                CreateEventSourceInput {
+                with_client_token(CreateEventSourceInput {
                     name: name.to_string(),
                     event_bus_arn: bus.to_string(),
                     configuration,
                     description: None,
                     tags: None,
                     client_token: None,
-                },
+                }),
                 &harness.ctx(),
             )
             .await
@@ -338,7 +343,7 @@ async fn revocable_resources(harness: &Harness, bus: &str) -> Vec<Resource> {
     for (case, name, state) in subscribers {
         let arn = CreateSubscriber::new(Arc::clone(&harness.engine))
             .handle(
-                CreateSubscriberInput {
+                with_client_token(CreateSubscriberInput {
                     name: name.to_string(),
                     event_bus_arn: bus.to_string(),
                     invoke_configuration: InvokeConfiguration {
@@ -348,7 +353,7 @@ async fn revocable_resources(harness: &Harness, bus: &str) -> Vec<Resource> {
                     },
                     state: state.map(str::to_string),
                     ..Default::default()
-                },
+                }),
                 &harness.ctx(),
             )
             .await

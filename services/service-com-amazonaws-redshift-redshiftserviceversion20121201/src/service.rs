@@ -73,6 +73,39 @@ use std::sync::Arc;
 /// branches on the code, so the two layers' findings are not told apart by it.
 const INPUT_REFUSAL_CODE: &str = "ValidationError";
 
+/// The expressions this API publishes for a shape EXACTLY as the model declares them,
+/// whole-value anchors included, rather than as the body inside that pair.
+///
+/// One API can publish both forms, and which of the two a shape takes cannot be read off
+/// the text: it is reference data about the shape
+/// ([`::service_common::validation::unanchored_unless_published_as_declared`], which owns
+/// the rule). The row here is the zero-ETL source ARN
+/// (`smithy_query(query="operation",operation="CreateIntegration")` reports `SourceArn`
+/// with this `@pattern`), whose refusal this surface is recorded answering with the
+/// model's text; every other shape of this model is published as the body alone, which is
+/// the fleet's default rendering.
+const PUBLISHED_AS_DECLARED: &[&str] = &[SOURCE_ARN_PATTERN];
+
+/// The modelled `@pattern` of `SourceArn`, the shape a zero-ETL integration's source is
+/// named by (`smithy_query(query="operation",operation="CreateIntegration")`), spelled out
+/// here because it is the key [`PUBLISHED_AS_DECLARED`] names the shape by.
+const SOURCE_ARN_PATTERN: &str = r"^arn:aws[a-z\-]*:(s3|dynamodb):.*:.*:[a-zA-Z0-9._\-\/]+$";
+
+/// How this API quotes a `@pattern` requirement in a refusal: the expression the SERVICE
+/// publishes for the member's shape.
+///
+/// For a shape [`PUBLISHED_AS_DECLARED`] names that is the model's text verbatim, and for
+/// every other shape it is that text without the whole-value pair the model wrapped it in.
+/// The RULE is the fleet's one home for it, called rather than restated, so this API cannot
+/// drift from another recorded stating both forms; what is this crate's is the row above,
+/// which is about this model's shapes. The CHECK is always the model's pattern as written.
+fn quoted_pattern(pattern: &str) -> String {
+    ::service_common::validation::unanchored_unless_published_as_declared(
+        pattern,
+        PUBLISHED_AS_DECLARED,
+    )
+}
+
 /// The `com-amazonaws-redshift-redshiftserviceversion20121201` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -144,18 +177,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The MESSAGE is the shared rendering of AWS's own envelope over the
         // framework's clauses (`service_common::validation_message`), so nothing
         // about the sentence — the count word, the member paths or the
-        // requirements — is spelled per service. ONE thing inside a clause is
+        // requirements — is spelled per service. TWO things inside a clause are
         // this service's own and not the model's: the ORDER an enumerated type's
         // value set is listed in ([`stated_enum_value_sets`]), which is restated
-        // on the VIOLATIONS before that rendering runs, so the clause, the
+        // on the VIOLATIONS before that rendering runs, and how a `@pattern`
+        // requirement is quoted ([`quoted_pattern`]) — so the clause, the
         // envelope and the code all stay where they are written.
         //
         // An authentication refusal is declined: it is a 403 under its own code
         // rather than an input refusal, and this seam is handed no detail of
         // which credential failure it was.
         let stated = stated_enum_value_sets::in_stated_order(refusal);
-        let message =
-            ::service_common::validation_message::aws_validation_refusal(&stated)?.message;
+        let message = ::service_common::validation_message::aws_validation_refusal_with(
+            &stated,
+            quoted_pattern,
+        )?
+        .message;
         Some(Refused {
             code: INPUT_REFUSAL_CODE.to_string(),
             message,

@@ -258,6 +258,17 @@ fn create(
 ) -> Result<Created, CreateSubscriberError> {
     state.settle_lifecycles(now);
 
+    // The idempotency token is what makes a retried create a replay rather than
+    // a second subscriber, and this service REQUIRES the caller to state it: a
+    // create that carries none is refused before anything is minted
+    // (`crate::state::client_token_required`).
+    if input.client_token.is_none() {
+        return Err(CreateSubscriberErrorModeled::InvalidInputException(
+            crate::state::client_token_required(),
+        )
+        .into());
+    }
+
     // The bus the subscriber is created on has to exist, and "The bus must
     // be ACTIVE": a bus that is still provisioning or on its way out cannot
     // take on a new subscriber.

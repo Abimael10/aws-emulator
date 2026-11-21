@@ -4,12 +4,14 @@
 //! the value had to satisfy, end to end over the wire (`awsJson1_1`, `POST /` with
 //! `X-Amz-Target: AWSEvents.<Operation>`) through the real `MultiServiceRouter`.
 //!
-//! The RULE asserted here: the requirement clause quotes the member's modelled
-//! `@pattern` exactly as the model spells it — the anchors included — because that
-//! expression is the one this service matched the value against, and an expression
-//! reported without its anchors describes values this service refuses. The refusal
-//! is `ValidationException` (HTTP 400) over the constraint-clause template, and it
-//! leaves the resource it was made against exactly as it was.
+//! The RULE asserted here: the requirement clause quotes the expression this
+//! service PUBLISHES for the member's shape, which is the modelled `@pattern`
+//! without the `^`/`$` pair the model wraps a whole-value match in — a caller
+//! lifts that expression out of the message and compiles it, so it is the one the
+//! service advertises rather than the model's spelling of it. The CHECK is
+//! unchanged: the value is still matched against the model's own pattern. The
+//! refusal is `ValidationException` (HTTP 400) over the constraint-clause
+//! template, and it leaves the resource it was made against exactly as it was.
 //!
 //! The expressions below are the model's own
 //! (`smithy_query(query="shape", shape="KmsKeyIdentifier,ConnectionName,RuleName")`),
@@ -107,12 +109,30 @@ fn error_message(body: &Value) -> String {
 
 /// The whole message a `@pattern` violation must answer with: the envelope over
 /// one clause naming the value that was rejected, the member path it sat at and
-/// the expression it failed.
+/// the expression it failed, as the service publishes that expression
+/// ([`published_expression`]).
 fn expected_message(value: &str, path: &str, pattern: &str) -> String {
     format!(
         "1 validation error detected: Value '{value}' at '{path}' failed to satisfy \
-         constraint: Member must satisfy regular expression pattern: {pattern}"
+         constraint: Member must satisfy regular expression pattern: {}",
+        published_expression(pattern)
     )
+}
+
+/// The expression a clause quotes for the modelled whole-value `pattern`: its body,
+/// without the `^`/`$` pair the model writes around it.
+///
+/// Spelled out here rather than imported so that the implementation's own reading of
+/// the wrapping cannot make a row pass, and it panics on a constant that is not a
+/// whole-value expression, so a model text that changed shape fails this suite
+/// rather than quietly weakening it.
+fn published_expression(model_pattern: &str) -> &str {
+    model_pattern
+        .strip_prefix('^')
+        .and_then(|body| body.strip_suffix('$'))
+        .unwrap_or_else(|| {
+            panic!("the modelled pattern {model_pattern:?} must wrap the whole value")
+        })
 }
 
 /// The `API_KEY` connection the update rows are made against, carrying a
@@ -134,9 +154,9 @@ async fn given_connection(router: &MultiServiceRouter) {
     assert_eq!(status, 200, "CreateConnection answered {status} {body}");
 }
 
-/// Every `@pattern` refusal reports the modelled expression as the model spells it.
+/// Every `@pattern` refusal reports the expression the service publishes.
 #[tokio::test]
-async fn a_pattern_refusal_quotes_the_modelled_expression() {
+async fn a_pattern_refusal_quotes_the_published_expression() {
     let router = emulator();
     given_connection(&router).await;
 

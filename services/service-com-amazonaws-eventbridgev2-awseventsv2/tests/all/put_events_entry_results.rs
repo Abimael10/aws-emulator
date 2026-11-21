@@ -45,6 +45,8 @@ use eventsv2::ops::types::{
 use eventsv2::scaffolded::Scaffolded;
 use service_com_amazonaws_eventbridgev2_awseventsv2 as eventsv2;
 
+use crate::modelled_input_refusal::with_client_token;
+
 /// The account segment every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
 
@@ -159,10 +161,13 @@ impl Harness {
     async fn active_bus(&self, name: &str) -> String {
         let created = CreateEventBus::new(Arc::clone(&self.engine))
             .handle(
-                CreateEventBusInput {
+                // Every create of this service states the idempotency token it requires;
+                // the harness supplies a fresh one, as a code-generated client does
+                // (`crate::modelled_input_refusal::with_client_token`).
+                with_client_token(CreateEventBusInput {
                     name: name.to_string(),
                     ..Default::default()
-                },
+                }),
                 &self.ctx(),
             )
             .await
@@ -1288,7 +1293,7 @@ async fn not_found_messages(harness: &Harness, case: &str, arn: &str) -> Vec<(&'
 
     let error = CreateEventSource::new(Arc::clone(&harness.engine))
         .handle(
-            CreateEventSourceInput {
+            with_client_token(CreateEventSourceInput {
                 name: "orphan-source".to_string(),
                 event_bus_arn: arn.to_string(),
                 configuration: EventSourceConfiguration::AwsServiceEventsConfiguration(
@@ -1301,7 +1306,7 @@ async fn not_found_messages(harness: &Harness, case: &str, arn: &str) -> Vec<(&'
                 description: None,
                 tags: None,
                 client_token: None,
-            },
+            }),
             &harness.ctx(),
         )
         .await
@@ -1320,7 +1325,7 @@ async fn not_found_messages(harness: &Harness, case: &str, arn: &str) -> Vec<(&'
 
     let error = CreateSubscriber::new(Arc::clone(&harness.engine))
         .handle(
-            CreateSubscriberInput {
+            with_client_token(CreateSubscriberInput {
                 name: "orphan-subscriber".to_string(),
                 event_bus_arn: arn.to_string(),
                 invoke_configuration: InvokeConfiguration {
@@ -1329,7 +1334,7 @@ async fn not_found_messages(harness: &Harness, case: &str, arn: &str) -> Vec<(&'
                     ..Default::default()
                 },
                 ..Default::default()
-            },
+            }),
             &harness.ctx(),
         )
         .await

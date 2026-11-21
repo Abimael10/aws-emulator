@@ -51,6 +51,8 @@ use eventsv2::ops::types::{
 };
 use eventsv2::scaffolded::Scaffolded;
 
+use crate::modelled_input_refusal::with_client_token;
+
 /// The region every request below is signed for; it must reach the minted ARNs.
 const REGION: &str = "us-west-2";
 
@@ -170,10 +172,13 @@ impl Harness {
     async fn active_bus(&self, case: &str, name: &str) -> String {
         let arn = CreateEventBus::new(Arc::clone(&self.engine))
             .handle(
-                CreateEventBusInput {
+                // Every create of this service states the idempotency token it requires;
+                // the harness supplies a fresh one, as a code-generated client does
+                // (`crate::modelled_input_refusal::with_client_token`).
+                with_client_token(CreateEventBusInput {
                     name: name.to_string(),
                     ..Default::default()
-                },
+                }),
                 &self.ctx(),
             )
             .await
@@ -207,12 +212,15 @@ impl Harness {
     }
 
     /// `CreateSubscriber` as the operation itself answers it.
+    ///
+    /// A case that means a RETRY states its own token; every other create is given a fresh
+    /// one, which is the member this service requires of a create.
     async fn create(
         &self,
         input: CreateSubscriberInput,
     ) -> Result<CreateSubscriberOutput, Scaffolded<CreateSubscriberErrorModeled>> {
         CreateSubscriber::new(Arc::clone(&self.engine))
-            .handle(input, &self.ctx())
+            .handle(with_client_token(input), &self.ctx())
             .await
     }
 

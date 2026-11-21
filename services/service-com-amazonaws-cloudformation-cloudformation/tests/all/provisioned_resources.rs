@@ -1069,24 +1069,39 @@ fn repository_arn(name: &str) -> String {
     format!("arn:aws:ecr:{REGION}:{ACCOUNT_ID}:repository/{name}")
 }
 
-/// `<registry host>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports
-/// and a container image reference is built on. `Repository$repositoryUri` is "The URI for
-/// the repository. You can use this URI for container image `push` and `pull` operations", a
-/// REFERENCE a container client writes an image address in, so the stack's value is the one
-/// the repository's owning service reported: the host of the registry that holds it
-/// ([`registry_endpoint`]) followed by the repository's name.
-fn repository_uri(name: &str) -> String {
-    format!("{}/{name}", registry_endpoint())
+/// The repository path of `value` when `value` is a URI Amazon ECR ANNOUNCED — the address
+/// that registry publishes for a push and a pull, followed by the repository's name as the
+/// path — and `None` for a value of any other form.
+///
+/// `Repository$repositoryUri` is "The URI for the repository. You can use this URI for
+/// container image `push` and `pull` operations", so it is an address a container client
+/// DIALS: its authority half is one this emulator answers registry requests on, and never a
+/// name under a zone AWS publishes its own endpoints in ([`AWS_ENDPOINT_DNS_SUFFIXES`]),
+/// which resolves nowhere near this process. A repository this stack PROVISIONS reports
+/// whatever that registry answered (`Fn::GetAtt <repository>.RepositoryUri` is read off the
+/// create), so these rows assert the FORM rather than one authority.
+fn announced_repository_path(value: &str) -> Option<&str> {
+    let (authority, path) = value.split_once('/')?;
+    let host = authority.to_ascii_lowercase();
+    let names_aws = AWS_ENDPOINT_DNS_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix));
+    (!authority.is_empty() && !path.is_empty() && !names_aws).then_some(path)
 }
 
-/// The host of the Amazon ECR registry this account owns in the Region this harness signs
-/// for, which every repository URI it reports is built on: the owning account's id, the two
-/// fixed labels of a registry host and the Region, under the commercial partition's DNS
-/// suffix (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
-/// `https://aws_account_id.dkr.ecr.region.amazonaws.com`").
-fn registry_endpoint() -> String {
-    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com")
+/// Whether `value` is the URI Amazon ECR announced for the repository `name`
+/// ([`announced_repository_path`]).
+fn is_repository_uri(value: &str, name: &str) -> bool {
+    announced_repository_path(value) == Some(name)
 }
+
+/// The DNS suffixes AWS publishes its own endpoints under, spelled out here rather than
+/// imported so that an announced address slipping into one of them fails these rows.
+///
+/// Source: `service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`, the tree's one
+/// list of them.
+const AWS_ENDPOINT_DNS_SUFFIXES: [&str; 4] =
+    [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"];
 
 /// `arn:aws:ecs:<region>:<account>:task-definition/<family>:1` — what `Ref` of an
 /// `AWS::ECS::TaskDefinition` returns for the FIRST revision of a family ("the first task
@@ -1275,7 +1290,11 @@ fn cases() -> Vec<Case> {
             .concat(),
             parameters: params(&[("AppName", "shop")]),
             expected: vec![
-                value("RepositoryUri", repository_uri("shop-images")),
+                form(
+                    "RepositoryUri",
+                    "<the address this emulator answers registry requests at>/shop-images",
+                    |value| is_repository_uri(value, "shop-images"),
+                ),
                 value("RepositoryArn", repository_arn("shop-images")),
                 value("RepositoryName", "shop-images".to_string()),
                 value("TaskDefinitionArn", task_definition_arn("shop-task")),
@@ -1302,9 +1321,14 @@ fn cases() -> Vec<Case> {
                 form("LoadBalancerFullName", "app/shop-alb/<id>", |value| {
                     is_load_balancer_full_name(value, "app", "shop-alb")
                 }),
-                value(
+                form(
                     "ContainerImage",
-                    format!("{}:v1", repository_uri("shop-images")),
+                    "<the URI Amazon ECR announced for shop-images>:v1",
+                    |value| {
+                        value
+                            .strip_suffix(":v1")
+                            .is_some_and(|uri| is_repository_uri(uri, "shop-images"))
+                    },
                 ),
             ],
         },
@@ -1369,11 +1393,8 @@ fn cases() -> Vec<Case> {
                     "RepositoryUri",
                     "<the address this emulator answers registry requests at>/warehouse-registry-<id>",
                     |value| {
-                        value
-                            .strip_prefix(&format!(
-                                "{}/warehouse-registry-",
-                                registry_endpoint()
-                            ))
+                        announced_repository_path(value)
+                            .and_then(|path| path.strip_prefix("warehouse-registry-"))
                             .is_some_and(|id| {
                                 !id.is_empty() && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
                             })

@@ -41,6 +41,8 @@ use eventsv2::ops::types::{
     EventBusSummary, ListEventBusesInput, StorageConfiguration, StorageConfigurationOutput,
 };
 
+use crate::modelled_input_refusal::with_client_token;
+
 /// The region this suite signs for.
 const REGION: &str = "us-west-2";
 
@@ -104,9 +106,12 @@ impl Harness {
         OperationContext::new(&self.parts, self.definition.identity(), self.callback.clone())
     }
 
+    /// Create one bus, with the idempotency token this service requires of every create
+    /// supplied when the case states none of its own
+    /// (`crate::modelled_input_refusal::with_client_token`).
     async fn create(&self, case: &str, input: CreateEventBusInput) -> CreateEventBusOutput {
         CreateEventBus::new(Arc::clone(&self.engine))
-            .handle(input, &self.ctx())
+            .handle(with_client_token(input), &self.ctx())
             .await
             .unwrap_or_else(|e| panic!("case {case:?}: CreateEventBus must succeed, got {e:?}"))
     }

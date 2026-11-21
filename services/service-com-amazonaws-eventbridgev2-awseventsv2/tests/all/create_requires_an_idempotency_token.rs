@@ -3,26 +3,34 @@
 //! What this service answers a create that states no `ClientToken`, read where a client
 //! reads the answer: off the `rpcv2Cbor` wire.
 //!
-//! The rule under test: a member the model leaves OPTIONAL is optional on the wire, so no
-//! operation of this service may refuse a request for omitting one. Every operation whose
-//! input models the `@idempotencyToken` `ClientToken` — its three CREATES, and only those
+//! The rule under test: **every create of this service requires the caller to state the
+//! `ClientToken` its input models — a request that states none is refused `400`
+//! `InvalidInputException` with the whole message `ClientToken is required`, and mints
+//! nothing.** The token is what makes a retried create a replay rather than a second
+//! resource, so the service asks the caller for it; the model tags the member
+//! `@idempotencyToken` and not `@required` because a code-generated client fills it in
+//! itself, which is why the requirement is the service's rather than the constraint walk's.
+//! Every operation whose input models the member — its three CREATES, and only those
 //! (`smithy_query(query="operation",operation="CreateEventBus,CreateEventSource,CreateSubscriber,UpdateEventBus,DeleteEventBus")`
 //! shows the member on each create's input shape, tagged `@idempotencyToken` and not
-//! `@required`, and on no update's or delete's) — serves a request that states none and
-//! mints its resource, which the resource's own Describe then resolves. The token buys
-//! idempotency and nothing else: a create that states none keeps no replay record, so a
-//! second create of the same name is the name collision rather than a replay of the first.
+//! `@required`, and on no update's or delete's) — is held to it, while an operation that
+//! models no token is served without one.
 //!
 //! The rows span what the rule generalises over:
 //!
 //! * every create of the service — the bus, the event source on it and the subscriber to it
 //!   — so the rule is not keyed to one operation or one input shape;
 //! * what else the request carries: a bus create naming only the modelled-required member
-//!   and one naming an in-range storage configuration as well, so being served is not keyed
+//!   and one naming an in-range storage configuration as well, so the refusal is not keyed
 //!   to one request shape;
+//! * a create whose OTHER members would be refused too — one naming a bus that does not
+//!   exist — which is refused for the member it states rather than for the token;
 //! * the operations that model no token — a read, a listing, an update and a delete — each
 //!   served without one, so nothing of this service's surface asks for a member it never
 //!   takes.
+//!
+//! Each refusal is followed by the read that proves nothing was minted for it: the create
+//! is repeated with a token and the resource it then mints is the first one of that name.
 //!
 //! The wire harness, the input builders and the refusal decoder are
 //! `modelled_input_refusal.rs`'s, reused rather than copied.
@@ -46,28 +54,45 @@ use eventsv2::ops::types::{
 };
 
 use crate::modelled_input_refusal::{
-    create_bus, create_source, create_subscriber, refusal, rendered, Wire,
+    create_bus, create_source, create_subscriber, refusal, rendered, unminted_arn,
+    with_client_token, Wire, CLIENT_TOKEN_REQUIRED, INVALID_INPUT_EXCEPTION, REGION,
 };
 
-/// The error shape a create of a name already taken answers with, and the whole `Message`
-/// of that class — spelled out here rather than read from the crate, so a reworded refusal
-/// fails this suite.
-const RESOURCE_ALREADY_EXISTS_EXCEPTION: &str = "ResourceAlreadyExistsException";
-const RESOURCE_ALREADY_EXISTS: &str = "Resource already exists";
+/// The error shape a create naming a bus that is not there answers with.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
-/// A `RetentionPeriodInDays` inside the modelled range, used to vary what a tokenless
-/// create carries beside its required member.
+/// A `RetentionPeriodInDays` inside the modelled range, used to vary what a create carries
+/// beside its required member.
 /// Source: `smithy_query(query="shape", shape="StorageConfiguration")` — `@range` 1..365.
 const RETENTION_CEILING: i32 = 365;
 
-/// Every create of this service serves a request that states no `ClientToken` and mints
-/// its resource, whichever create it is and whatever else the request carries — and the
-/// resource it reports is the one the store holds, read back through its own Describe.
+/// Assert one tokenless create was refused for the token and nothing else.
+fn assert_refused_for_the_token(case: &str, status: u16, body: &[u8]) {
+    assert_eq!(
+        status,
+        400,
+        "case {case:?}: a create stating no ClientToken must answer 400, got {status} with \
+         {:?}",
+        rendered(body)
+    );
+    let (code, message) = refusal(case, body);
+    assert_eq!(
+        code, INVALID_INPUT_EXCEPTION,
+        "case {case:?}: expected {INVALID_INPUT_EXCEPTION}, got {code:?} with {message:?}"
+    );
+    assert_eq!(
+        message, CLIENT_TOKEN_REQUIRED,
+        "case {case:?}: expected {CLIENT_TOKEN_REQUIRED:?}, got {message:?}"
+    );
+}
+
+/// Every create of this service refuses a request that states no `ClientToken`, whichever
+/// create it is and whatever else the request carries — and mints nothing for it, which the
+/// create that follows with a token shows by minting the first resource of that name.
 #[tokio::test]
-async fn every_create_is_served_without_the_idempotency_token_the_model_leaves_optional() {
+async fn every_create_refuses_a_request_that_states_no_idempotency_token() {
     let wire = Wire::new();
     let host = wire.active_bus("the host bus", "tokenless-host-bus").await;
-    let mut minted: Vec<String> = vec![host.clone()];
 
     // The bus create, twice: naming only the modelled-required member, and naming an
     // in-range storage configuration as well.
@@ -79,45 +104,27 @@ async fn every_create_is_served_without_the_idempotency_token_the_model_leaves_o
             Some(RETENTION_CEILING),
         ),
     ] {
-        let created = wire
-            .ok::<CreateEventBus<InMemoryEngine>>(
-                case,
-                &CreateEventBusInput {
-                    name: name.to_string(),
-                    storage_configuration: retention.map(|days| StorageConfiguration {
-                        retention_period_in_days: Some(days),
-                    }),
-                    client_token: None,
-                    ..Default::default()
-                },
-            )
+        let tokenless = CreateEventBusInput {
+            name: name.to_string(),
+            storage_configuration: retention.map(|days| StorageConfiguration {
+                retention_period_in_days: Some(days),
+            }),
+            client_token: None,
+            ..Default::default()
+        };
+        let (status, body) = wire
+            .call::<CreateEventBus<InMemoryEngine>>(&tokenless)
             .await;
-        assert_eq!(
-            created.name.as_deref(),
-            Some(name),
-            "case {case:?}: expected the requested name {name:?}, got {:?}",
-            created.name
-        );
-        assert_eq!(
-            created.state.as_deref(),
-            Some("CREATING"),
-            "case {case:?}: expected the bus reported CREATING, got {:?}",
-            created.state
-        );
+        assert_refused_for_the_token(case, status, &body);
+
+        // Nothing was minted for the refused create: the same create carrying a token is
+        // served, so the name was never taken.
+        let created = wire
+            .ok::<CreateEventBus<InMemoryEngine>>(case, &with_client_token(tokenless.clone()))
+            .await;
         let arn = created.event_bus_arn.clone().unwrap_or_else(|| {
             panic!("case {case:?}: expected a minted EventBusArn, got {created:?}")
         });
-        if let Some(days) = retention {
-            assert_eq!(
-                created
-                    .storage_configuration
-                    .as_ref()
-                    .and_then(|storage| storage.retention_period_in_days),
-                Some(days),
-                "case {case:?}: expected RetentionPeriodInDays {days}, got {:?}",
-                created.storage_configuration
-            );
-        }
         let read = wire
             .ok::<DescribeEventBus<InMemoryEngine>>(
                 case,
@@ -132,16 +139,17 @@ async fn every_create_is_served_without_the_idempotency_token_the_model_leaves_o
             "case {case:?}: the stored bus must carry the name the create asked for, got {:?}",
             read.name
         );
-        minted.push(arn);
     }
 
     // The event source create on the live bus.
     let case = "CreateEventSource";
+    let tokenless = create_source("tokenless-plain-source", &host, None);
+    let (status, body) = wire
+        .call::<CreateEventSource<InMemoryEngine>>(&tokenless)
+        .await;
+    assert_refused_for_the_token(case, status, &body);
     let source = wire
-        .ok::<CreateEventSource<InMemoryEngine>>(
-            case,
-            &create_source("tokenless-plain-source", &host, None),
-        )
+        .ok::<CreateEventSource<InMemoryEngine>>(case, &with_client_token(tokenless.clone()))
         .await;
     let source_arn = source.event_source_arn.clone().unwrap_or_else(|| {
         panic!("case {case:?}: expected a minted EventSourceArn, got {source:?}")
@@ -155,26 +163,21 @@ async fn every_create_is_served_without_the_idempotency_token_the_model_leaves_o
         )
         .await;
     assert_eq!(
-        read.name.as_deref(),
-        Some("tokenless-plain-source"),
-        "case {case:?}: the stored source must carry the name the create asked for, got {:?}",
-        read.name
-    );
-    assert_eq!(
         read.event_bus_arn.as_deref(),
         Some(host.as_str()),
         "case {case:?}: the stored source must sit on the bus the create named, got {:?}",
         read.event_bus_arn
     );
-    minted.push(source_arn);
 
     // And the subscriber create on the same bus.
     let case = "CreateSubscriber";
+    let tokenless = create_subscriber("tokenless-plain-subscriber", &host, None);
+    let (status, body) = wire
+        .call::<CreateSubscriber<InMemoryEngine>>(&tokenless)
+        .await;
+    assert_refused_for_the_token(case, status, &body);
     let subscriber = wire
-        .ok::<CreateSubscriber<InMemoryEngine>>(
-            case,
-            &create_subscriber("tokenless-plain-subscriber", &host, None),
-        )
+        .ok::<CreateSubscriber<InMemoryEngine>>(case, &with_client_token(tokenless.clone()))
         .await;
     let subscriber_arn = subscriber.subscriber_arn.clone().unwrap_or_else(|| {
         panic!("case {case:?}: expected a minted SubscriberArn, got {subscriber:?}")
@@ -188,106 +191,77 @@ async fn every_create_is_served_without_the_idempotency_token_the_model_leaves_o
         )
         .await;
     assert_eq!(
-        read.name.as_deref(),
-        Some("tokenless-plain-subscriber"),
-        "case {case:?}: the stored subscriber must carry the name the create asked for, got {:?}",
-        read.name
-    );
-    assert_eq!(
         read.event_bus_arn.as_deref(),
         Some(host.as_str()),
         "case {case:?}: the stored subscriber must sit on the bus the create named, got {:?}",
         read.event_bus_arn
     );
-    minted.push(subscriber_arn);
+}
 
-    // Every tokenless create minted a resource of its own: no two of them share an ARN.
-    let mut distinct = minted.clone();
-    distinct.sort();
-    distinct.dedup();
+/// A tokenless create whose OTHER members name a resource that is not there is refused for
+/// the token it states, which is the input the service reads before it resolves anything —
+/// and the same create carrying a token is then refused for the bus it names.
+#[tokio::test]
+async fn a_tokenless_create_is_refused_before_the_resources_it_names_are_resolved() {
+    let wire = Wire::new();
+    let absent = unminted_arn(REGION, "no-such-bus", "zzzzzzzzzzzzzzzzzzzzzzzzz");
+
+    let case = "CreateEventSource with no ClientToken on a bus that does not exist";
+    let tokenless = create_source("orphan-source", &absent, None);
+    let (status, body) = wire
+        .call::<CreateEventSource<InMemoryEngine>>(&tokenless)
+        .await;
+    assert_refused_for_the_token(case, status, &body);
+
+    let case = "CreateEventSource stating a token on a bus that does not exist";
+    let (status, body) = wire
+        .call::<CreateEventSource<InMemoryEngine>>(&with_client_token(tokenless))
+        .await;
     assert_eq!(
-        distinct.len(),
-        minted.len(),
-        "each tokenless create must mint a resource of its own, got {minted:?}"
+        status, 404,
+        "case {case:?}: a create naming a bus that does not exist must be refused for that \
+         bus, got {status} with {:?}",
+        rendered(&body)
+    );
+    let (code, message) = refusal(case, &body);
+    assert_eq!(
+        code, RESOURCE_NOT_FOUND_EXCEPTION,
+        "case {case:?}: expected {RESOURCE_NOT_FOUND_EXCEPTION}, got {code:?} with {message:?}"
+    );
+    assert!(
+        message.contains("no-such-bus"),
+        "case {case:?}: the refusal must name the bus the request addressed, got {message:?}"
     );
 }
 
-/// A create that states no token keeps NO replay record, so a second create of the same
-/// name is the name collision rather than a replay of the first — on the bus create and on
-/// the subscriber create, which model the same optional member.
+/// A create stating a token mints a resource of its own, and two creates each stating their
+/// own token mint two resources — so the requirement above buys idempotency rather than
+/// collapsing creates onto one resource.
 #[tokio::test]
-async fn a_create_stating_no_token_keeps_no_replay_record() {
+async fn a_create_stating_a_token_mints_a_resource_of_its_own() {
     let wire = Wire::new();
 
-    let case = "a second tokenless CreateEventBus of the same name";
+    let case = "two bus creates, each stating a token of its own";
     let first = wire
-        .ok::<CreateEventBus<InMemoryEngine>>(case, &create_bus("replayless-bus", None))
+        .ok::<CreateEventBus<InMemoryEngine>>(case, &create_bus("tokened-one", Some("token-one")))
         .await;
-    let first_arn = first
-        .event_bus_arn
-        .clone()
-        .unwrap_or_else(|| panic!("case {case:?}: expected a minted EventBusArn, got {first:?}"));
-    let (status, body) = wire
-        .call::<CreateEventBus<InMemoryEngine>>(&create_bus("replayless-bus", None))
-        .await;
-    assert_eq!(
-        status, 409,
-        "case {case:?}: a second create of the same name must collide, got {status} with {:?}",
-        rendered(&body)
-    );
-    let (code, message) = refusal(case, &body);
-    assert_eq!(
-        code, RESOURCE_ALREADY_EXISTS_EXCEPTION,
-        "case {case:?}: expected {RESOURCE_ALREADY_EXISTS_EXCEPTION}, got {code:?} with \
-         {message:?}"
-    );
-    assert_eq!(
-        message, RESOURCE_ALREADY_EXISTS,
-        "case {case:?}: expected {RESOURCE_ALREADY_EXISTS:?}, got {message:?}"
-    );
-
-    // A tokenless create of a name of its own mints a resource of its own rather than
-    // replaying the first.
-    let case = "a tokenless CreateEventBus of another name";
     let second = wire
-        .ok::<CreateEventBus<InMemoryEngine>>(case, &create_bus("replayless-bus-again", None))
+        .ok::<CreateEventBus<InMemoryEngine>>(case, &create_bus("tokened-two", Some("token-two")))
         .await;
     assert_ne!(
-        second.event_bus_arn.as_deref(),
-        Some(first_arn.as_str()),
-        "case {case:?}: a tokenless create must mint its own bus, got {:?}",
-        second.event_bus_arn
+        first.event_bus_arn, second.event_bus_arn,
+        "case {case:?}: each create must mint its own bus, got {:?} twice",
+        first.event_bus_arn
     );
 
-    let case = "a second tokenless CreateSubscriber of the same name";
-    let host = wire.active_bus("the host bus", "replayless-host-bus").await;
-    let subscriber = wire
-        .ok::<CreateSubscriber<InMemoryEngine>>(
-            case,
-            &create_subscriber("replayless-subscriber", &host, None),
-        )
-        .await;
-    assert!(
-        subscriber.subscriber_arn.is_some(),
-        "case {case:?}: expected a minted SubscriberArn, got {subscriber:?}"
-    );
+    let case = "a second create of the same name, stating a token of its own";
     let (status, body) = wire
-        .call::<CreateSubscriber<InMemoryEngine>>(&create_subscriber(
-            "replayless-subscriber",
-            &host,
-            None,
-        ))
+        .call::<CreateEventBus<InMemoryEngine>>(&create_bus("tokened-one", Some("token-three")))
         .await;
     assert_eq!(
         status, 409,
         "case {case:?}: a second create of the same name must collide, got {status} with {:?}",
         rendered(&body)
-    );
-    let (code, message) = refusal(case, &body);
-    assert_eq!(
-        code, RESOURCE_ALREADY_EXISTS_EXCEPTION,
-        "case {case:?}: expected {RESOURCE_ALREADY_EXISTS_EXCEPTION}, got {code:?} with \
-         {message:?}"
     );
 }
 

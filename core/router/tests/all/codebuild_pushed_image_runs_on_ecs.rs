@@ -512,9 +512,12 @@ async fn a_builds_pushed_image_walks_the_build_phases_and_then_runs_on_ecs() {
             .split_once('/')
             .unwrap_or_else(|| panic!("case {suite:?}: {uri:?} names no repository path"));
         assert!(
-            authority.contains(".dkr.ecr.") && uri.ends_with(&format!("/{repository}")),
-            "case {suite:?}: a push and a pull address the published URI, so it names the \
-             registry that holds the repository and the repository itself, got {uri:?}"
+            !authority.is_empty()
+                && !authority.to_ascii_lowercase().ends_with(".amazonaws.com")
+                && uri.ends_with(&format!("/{repository}")),
+            "case {suite:?}: a push and a pull DIAL the published URI, so it names an address \
+             this emulator answers registry requests at and the repository itself, and never \
+             a host AWS serves, which resolves nowhere near this process, got {uri:?}"
         );
         uris.insert(repository, uri);
     }

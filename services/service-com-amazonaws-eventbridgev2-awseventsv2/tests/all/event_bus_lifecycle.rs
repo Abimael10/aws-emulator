@@ -39,6 +39,8 @@ use eventsv2::ops::types::{
     UpdateEventBusOutput,
 };
 
+use crate::modelled_input_refusal::with_client_token;
+
 /// The account segment every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
 
@@ -127,7 +129,7 @@ impl Harness {
     ) -> Result<CreateEventBusOutput, eventsv2::ops::create_event_bus::CreateEventBusError> {
         let parts = parts_signed_for(region);
         CreateEventBus::new(Arc::clone(&self.engine))
-            .handle(input, &self.ctx_signed_for(&parts))
+            .handle(with_client_token(input), &self.ctx_signed_for(&parts))
             .await
     }
 
@@ -150,12 +152,17 @@ impl Harness {
             .expect("the in-memory engine always has this service's store")
     }
 
+    /// Create one bus.
+    ///
+    /// A case that means a RETRY states its own `ClientToken`; every other create is given
+    /// a fresh one (`crate::modelled_input_refusal::with_client_token`), which is the
+    /// member this service requires of a create, as a code-generated client supplies it.
     async fn create(
         &self,
         input: CreateEventBusInput,
     ) -> Result<CreateEventBusOutput, eventsv2::ops::create_event_bus::CreateEventBusError> {
         CreateEventBus::new(Arc::clone(&self.engine))
-            .handle(input, &self.ctx())
+            .handle(with_client_token(input), &self.ctx())
             .await
     }
 

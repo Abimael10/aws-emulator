@@ -26,10 +26,10 @@
 //! `RepositoryUri` attribute resolves to that address — the endpoint this emulator serves the
 //! registry at, which is where a container client pushes and pulls, and what the stack's own
 //! `RepositoryUri` output and Amazon ECR's read must agree on. A template that instead spells
-//! the registry host out of the pseudo parameters and the repository's name spells the
-//! STAND-IN CloudFormation derived for that attribute before the create answered, and a
-//! deployment re-points such a value to the identifier the owning service assigned — so that
-//! image addresses the registry that exists rather than a host nothing here answers for.
+//! the registry host AWS publishes out of the pseudo parameters and the repository's name
+//! spells the STAND-IN CloudFormation derived for that attribute before the create answered,
+//! and a deployment re-points such a value to the address the owning service assigned — so
+//! that image addresses the registry that exists rather than a host nothing here answers for.
 //!
 //! The harness here — the three-service router, the deploy-and-poll, each service's wire call,
 //! the reader of the name the repository was created under and the address the registry is
@@ -297,20 +297,48 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{family}:{revision}")
 }
 
-/// `<registry host>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is
-/// the reference a container client pushes and pulls it by (`Repository$repositoryUri`: "You
-/// can use this URI for container image `push` and `pull` operations"): the host of the
-/// registry that HOLDS it — this account's registry in the Region these suites sign for,
-/// `<account>.dkr.ecr.<region>.amazonaws.com` as the registry URL format AWS documents
-/// spells it — followed by the repository's own name.
+/// The DNS suffixes AWS publishes its own endpoints under, spelled out here rather than
+/// imported so that an address a service of this emulator announces slipping into one of them
+/// fails these suites.
 ///
-/// It is also the URI every row's registered image carries. A declaration that reaches the
-/// repository's `RepositoryUri` attribute resolves to it directly; one that spells the
-/// registry host out of the pseudo parameters and the repository's name spells the STAND-IN
-/// CloudFormation derived for that attribute before the create answered, which the deployment
-/// re-points to the value the owning service assigned — so either way the image names the
-/// registry this emulator serves that repository in, which is where the image is pulled from.
-pub(crate) fn published_repository_uri(repository: &str) -> String {
+/// Source: `service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`, the tree's one
+/// list of them.
+const AWS_ENDPOINT_DNS_SUFFIXES: [&str; 4] =
+    [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"];
+
+/// The repository path of `uri` when `uri` is the URI Amazon ECR ANNOUNCED for a repository
+/// — the address that registry publishes for a push and a pull, followed by the repository's
+/// own name — and `None` for a value of any other form.
+///
+/// `Repository$repositoryUri` is "The URI for the repository. You can use this URI for
+/// container image `push` and `pull` operations", so it is an address a container client
+/// DIALS: its authority half is one this emulator answers registry requests on, and never a
+/// name under a zone AWS publishes its own endpoints in, which resolves nowhere near this
+/// process. A declaration that reaches the repository's `RepositoryUri` attribute resolves to
+/// that address, so the image such a revision carries is pulled from the registry this
+/// emulator serves.
+///
+/// `pub(crate)` for the same reason the rest of this harness is: the sibling
+/// [`super::cloudformation_registry_uri_reaches_every_consumed_property`] reads the same rule
+/// on the properties beside the image, so the form is stated once and the two suites cannot
+/// drift on it.
+pub(crate) fn announced_repository_path(uri: &str) -> Option<&str> {
+    let (authority, path) = uri.split_once('/')?;
+    let host = authority.to_ascii_lowercase();
+    let names_aws = AWS_ENDPOINT_DNS_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix));
+    (!authority.is_empty() && !path.is_empty() && !names_aws).then_some(path)
+}
+
+/// The registry host AWS publishes for this account and Region, followed by `repository`:
+/// the STAND-IN CloudFormation can compose for the repository's `RepositoryUri` attribute
+/// before the owning service's create has answered, which a template may equally spell out
+/// of `${AWS::AccountId}` and `${AWS::Region}` itself.
+///
+/// A deployment re-points such a value to what the create really answered, so no value of a
+/// deployed resource carries it — which is what the rows that spell it assert.
+pub(crate) fn aws_registry_uri(repository: &str) -> String {
     format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{repository}")
 }
 
@@ -581,26 +609,25 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
             );
         }
 
-        // The URI Amazon ECR publishes for the repository: the host of the registry that
-        // holds it, followed by the repository's own name, so a client composes a tag or a
+        // The URI Amazon ECR publishes for the repository: the address it answers registry
+        // requests at, followed by the repository's own name, so a client composes a tag or a
         // digest on what it was handed. The stack publishes one for the
         // repository it created too, and the two must agree.
         let published_uri = held["repositoryUri"].as_str().unwrap_or_default().to_string();
-        let expected_uri = published_repository_uri(&repository);
-        for (reported_by, uri) in [
-            ("Amazon ECR", published_uri.clone()),
-            (
-                "the stack's RepositoryUri output",
-                outputs.get("RepositoryUri").cloned().unwrap_or_default(),
-            ),
-        ] {
-            assert_eq!(
-                uri, expected_uri,
-                "case {:?}: expected the repository URI {reported_by} reports to be \
-                 {expected_uri:?}, got {uri:?}",
-                row.case
-            );
-        }
+        assert_eq!(
+            announced_repository_path(&published_uri),
+            Some(repository.as_str()),
+            "case {:?}: expected Amazon ECR to publish {repository:?} at an address it answers \
+             registry requests at, got {published_uri:?}",
+            row.case
+        );
+        assert_eq!(
+            outputs.get("RepositoryUri").cloned().unwrap_or_default(),
+            published_uri,
+            "case {:?}: expected the stack's RepositoryUri output to be the URI Amazon ECR \
+             reports ({published_uri:?}), got {outputs:?}",
+            row.case
+        );
 
         // The repository policy the declaration carried: set on the repository the create
         // just made, with the intrinsics inside the document resolved.
@@ -653,12 +680,20 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
             row.case
         );
         // However the declaration composed it, the image the revision carries names this
-        // repository through the URI the OWNING service reports for it — the same value the
-        // read above pinned, which is what `${Registry.RepositoryUri}` resolves to — with the
-        // declared tag. A declaration that spelled the registry host itself wrote the very
-        // stand-in CloudFormation had computed for that attribute, so the deployment brought
-        // it into step with what the create answered.
-        let expected_image = format!("{}:{}", published_repository_uri(&repository), row.tag);
+        // repository at the address the OWNING service assigned — the same value the read
+        // above pinned, which is what `${Registry.RepositoryUri}` resolves to — with the
+        // declared tag. A declaration that spelled the registry host AWS publishes out of the
+        // pseudo parameters wrote the very stand-in CloudFormation had computed for that
+        // attribute, so the deployment brought it into step with what the create answered,
+        // and the image addresses the registry that exists rather than a host nothing here
+        // answers for.
+        let expected_image = format!("{published_uri}:{}", row.tag);
+        assert!(
+            expected_image != format!("{}:{}", aws_registry_uri(&repository), row.tag),
+            "case {:?}: the address the create answered must differ from the stand-in, or this \
+             row proves nothing about the re-pointing",
+            row.case
+        );
         // Addressed by the FAMILY alone, which is "the latest ACTIVE revision in that
         // family" — the read that answered `ClientException` while nothing was registered.
         for (addressed, handle) in [

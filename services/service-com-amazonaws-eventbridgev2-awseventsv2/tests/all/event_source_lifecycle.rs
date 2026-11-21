@@ -38,6 +38,8 @@ use eventsv2::ops::types::{
     RevokeResourceInput, UpdateEventSourceInput, UpdateEventSourceOutput,
 };
 
+use crate::modelled_input_refusal::with_client_token;
+
 /// The account segment every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
 
@@ -163,10 +165,13 @@ impl Harness {
     async fn create_bus(&self, name: &str) -> String {
         CreateEventBus::new(Arc::clone(&self.engine))
             .handle(
-                CreateEventBusInput {
+                // Every create of this service states the idempotency token it requires;
+                // the harness supplies a fresh one, as a code-generated client does
+                // (`crate::modelled_input_refusal::with_client_token`).
+                with_client_token(CreateEventBusInput {
                     name: name.to_string(),
                     ..Default::default()
-                },
+                }),
                 &self.ctx(),
             )
             .await
@@ -200,8 +205,10 @@ impl Harness {
         input: CreateEventSourceInput,
     ) -> Result<CreateEventSourceOutput, eventsv2::ops::create_event_source::CreateEventSourceError>
     {
+        // A case that means a RETRY states its own token; every other create is given a
+        // fresh one, which is the member this service requires of a create.
         CreateEventSource::new(Arc::clone(&self.engine))
-            .handle(input, &self.ctx())
+            .handle(with_client_token(input), &self.ctx())
             .await
     }
 

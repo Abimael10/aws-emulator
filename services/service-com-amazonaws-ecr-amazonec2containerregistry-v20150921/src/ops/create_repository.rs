@@ -379,7 +379,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // the last value for it rather than two entries for one key.
                     repo.merge_tags(tags);
 
-                    let repository = repo.to_repository();
+                    // Reported at the address this emulator answers THIS caller's registry
+                    // requests at (`crate::state::registry_address`), which is what the
+                    // repository's `repositoryUri` is published on.
+                    let repository = repo.to_repository(
+                        &crate::state::announced_registry_endpoint(ctx),
+                    );
                     store
                         .repositories
                         .insert(crate::state::repository_key(&region, &name), repo);

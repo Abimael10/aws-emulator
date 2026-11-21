@@ -133,13 +133,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // the scaffold generated the enum from the OPERATION's own `errors` list only.
 #[smithy_macros::operation_error(
     "com.amazonaws.eventbridgev2#CreateEventBus",
-    extra_errors = ["AccessDeniedException", "InternalException"]
+    extra_errors = ["AccessDeniedException", "InternalException", "InvalidInputException"]
 )]
 #[derive(Debug)]
 pub enum CreateEventBusErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
+    InvalidInputException(InvalidInputException),
     InvalidStateException(InvalidStateException),
     InternalException(InternalException),
     LimitExceededException(LimitExceededException),
@@ -204,6 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx);
+        // The idempotency token is what makes a retried create a replay rather than a
+        // second bus, and this service REQUIRES the caller to state it: a create that
+        // carries none is refused here, before the key lookup and before the store is
+        // touched, so nothing is minted for it (`crate::state::client_token_required`).
+        if input.client_token.is_none() {
+            return Err(CreateEventBusErrorModeled::InvalidInputException(
+                crate::state::client_token_required(),
+            )
+            .into());
+        }
         // The key an encryption configuration names has to be one KMS holds: the
         // member's own constraints cannot say whether a key EXISTS, and a bus whose
         // key is not there could encrypt nothing. Asked before the store is
@@ -226,9 +237,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is gone replays nothing and its name is free again. The lookup is per
         // region, because a bus belongs to the region its create named.
         //
-        // The member is the model's `@idempotencyToken` and optional: a request
-        // that states no token asks for no replay, so it falls through to the
-        // mint below and the bus it creates carries no replay record.
+        // The member is stated by every create this service serves (refused
+        // above when it is not), so the lookup below is what every create goes
+        // through.
         if let Some(token) = input.client_token.as_deref() {
             if let Some(bus) = state.bus_by_client_token(&region, token) {
                 if !matches_stored(bus, &input) {

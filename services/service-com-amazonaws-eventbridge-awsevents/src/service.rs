@@ -28,8 +28,8 @@
 //!   generated routing table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. This service words one here: the constraint clauses
-//!   the framework states, with a `@pattern` requirement reported as the model
-//!   spells the expression. See the inline note on that method.
+//!   the framework states, with a `@pattern` requirement reported as the service
+//!   publishes the expression. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -68,10 +68,12 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 ///
 /// Every requirement but two is worded exactly as the framework words it:
 ///
-/// * `@pattern` is reported as the member's modelled expression exactly as the
-///   model spells it (`crate::state::pattern_requirement`): the anchoring is
-///   part of the expression this service matches a value against, so an
-///   expression reported without it would describe values this service refuses.
+/// * `@pattern` is reported as the expression this service PUBLISHES for the
+///   member's shape, which is the modelled expression without the whole-value
+///   anchor pair the model wraps it in (`crate::state::pattern_requirement`): a
+///   caller lifts that expression out of the message and compiles it, so it is the
+///   one the service advertises rather than the model's spelling of it. The CHECK
+///   still uses the model's pattern as written.
 /// * an enum value set is listed in the order this service lists that type's values
 ///   in, which is not the order the model declares them in: the violations are
 ///   restated through [`enum_value_sets`] before they are worded, so the requirement

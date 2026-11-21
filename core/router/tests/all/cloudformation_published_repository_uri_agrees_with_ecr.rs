@@ -38,6 +38,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_wire::{form_encode, opt_element, outputs_of, physical_ids_of};
 
+// The reading of an announced repository URI is the sibling suite's, imported rather than
+// re-derived, so the two cannot drift on what makes an address one this emulator answers at.
+use crate::cloudformation_registry_backed_task_definition::announced_repository_path;
+
 /// The `X-Amz-Target` prefix Amazon ECR's model fixes, and the signing name that routes a
 /// request to it (`sigv4Name: ecr`, service shape `AmazonEC2ContainerRegistry_V20150921`,
 /// awsJson1.1).
@@ -50,24 +54,6 @@ const POLL_ATTEMPTS: usize = 80;
 
 /// The account id every emulated ARN carries (`engine::emulator_account_id`).
 const ACCOUNT: &str = ::engine::EMULATOR_ACCOUNT_ID;
-
-/// The URI Amazon ECR reports a repository at: the host of the registry that HOLDS it —
-/// this account's registry in the Region the stack deployed in, with the DNS suffix that
-/// Region's partition is served under — followed by the repository's own name ("The URI for
-/// the repository. You can use this URI for container image `push` and `pull` operations").
-///
-/// The suffixes are the `dnsSuffix` each partition publishes in the AWS SDK partition
-/// metadata (`endpoints.json`), spelled out here rather than imported so a value composed
-/// with the wrong one fails this suite — which is exactly what a partition of its own shows:
-/// a stand-in spelled for the commercial partition would name another host entirely.
-fn repository_uri(region: &str, repository: &str) -> String {
-    let suffix = match region {
-        region if region.starts_with("cn-") => "amazonaws.com.cn",
-        region if region.starts_with("eusc-") => "amazonaws.eu",
-        _ => "amazonaws.com",
-    };
-    format!("{ACCOUNT}.dkr.ecr.{region}.{suffix}/{repository}")
-}
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly as
 /// `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
@@ -475,14 +461,14 @@ async fn a_stack_publishes_the_repository_values_amazon_ecr_itself_reports() {
             row.case
         );
 
-        // The URI that service reports is the host of the registry that holds the
-        // repository, with the repository's own name as its path.
+        // The URI that service reports is the address it publishes the repository at, with
+        // the repository's own name as its path.
         let held_uri = held["repositoryUri"].as_str().unwrap_or_default().to_string();
-        let expected_uri = repository_uri(row.region, &repository);
         assert_eq!(
-            held_uri, expected_uri,
-            "case {:?}: expected Amazon ECR to report the repository URI {expected_uri:?}, got \
-             {held_uri:?}",
+            announced_repository_path(&held_uri),
+            Some(repository.as_str()),
+            "case {:?}: expected Amazon ECR to report an address it answers registry requests \
+             at followed by {repository:?}, got {held_uri:?}",
             row.case
         );
         assert_eq!(

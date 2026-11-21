@@ -45,6 +45,8 @@ use eventsv2::ops::types::{
 };
 use eventsv2::scaffolded::Scaffolded;
 
+use crate::modelled_input_refusal::with_client_token;
+
 /// The region every request below is signed for; it must reach the minted ARNs.
 const REGION: &str = "us-west-2";
 
@@ -130,10 +132,13 @@ impl Harness {
     async fn active_bus(&self, case: &str, name: &str) -> String {
         let arn = CreateEventBus::new(Arc::clone(&self.engine))
             .handle(
-                CreateEventBusInput {
+                // Every create of this service states the idempotency token it requires;
+                // the harness supplies a fresh one, as a code-generated client does
+                // (`crate::modelled_input_refusal::with_client_token`).
+                with_client_token(CreateEventBusInput {
                     name: name.to_string(),
                     ..Default::default()
-                },
+                }),
                 &self.ctx(),
             )
             .await
@@ -244,7 +249,7 @@ async fn a_name_collision_is_refused_with_the_fixed_wording_of_its_class() {
         ),
     ] {
         let error = CreateEventBus::new(Arc::clone(&harness.engine))
-            .handle(input, &harness.ctx())
+            .handle(with_client_token(input), &harness.ctx())
             .await
             .err()
             .unwrap_or_else(|| panic!("case {case:?}: the second create must be refused"));
@@ -275,7 +280,13 @@ async fn a_name_collision_is_refused_with_the_fixed_wording_of_its_class() {
     // --- event source ------------------------------------------------------
     let taken_source = CreateEventSource::new(Arc::clone(&harness.engine))
         .handle(
-            source_input("collision-taken-source", &bus, "aws.s3", None, None),
+            with_client_token(source_input(
+                "collision-taken-source",
+                &bus,
+                "aws.s3",
+                None,
+                None,
+            )),
             &harness.ctx(),
         )
         .await
@@ -305,7 +316,7 @@ async fn a_name_collision_is_refused_with_the_fixed_wording_of_its_class() {
         ),
     ] {
         let error = CreateEventSource::new(Arc::clone(&harness.engine))
-            .handle(input, &harness.ctx())
+            .handle(with_client_token(input), &harness.ctx())
             .await
             .err()
             .unwrap_or_else(|| panic!("case {case:?}: the second create must be refused"));
@@ -349,12 +360,12 @@ async fn a_name_collision_is_refused_with_the_fixed_wording_of_its_class() {
     };
     let taken_subscriber = CreateSubscriber::new(Arc::clone(&harness.engine))
         .handle(
-            CreateSubscriberInput {
+            with_client_token(CreateSubscriberInput {
                 name: "collision-taken-subscriber".to_string(),
                 event_bus_arn: bus.clone(),
                 invoke_configuration: invoke(),
                 ..Default::default()
-            },
+            }),
             &harness.ctx(),
         )
         .await
@@ -384,7 +395,7 @@ async fn a_name_collision_is_refused_with_the_fixed_wording_of_its_class() {
         ),
     ] {
         let error = CreateSubscriber::new(Arc::clone(&harness.engine))
-            .handle(input, &harness.ctx())
+            .handle(with_client_token(input), &harness.ctx())
             .await
             .err()
             .unwrap_or_else(|| panic!("case {case:?}: the second create must be refused"));

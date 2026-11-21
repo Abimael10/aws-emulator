@@ -26,30 +26,34 @@
 //! consumed in (a scalar member, a value inside a list of structures, a value of a data map
 //! whose keys are the caller's own, an element of a string list, a run inside a longer
 //! sentence), how the declaration composes it (`Fn::GetAtt`, `Fn::Sub`, `Fn::Join`, and the
-//! registry host spelled out of the pseudo parameters and the repository's name — the
-//! spelling that IS the stand-in), whether the template names the repository, whether that
+//! registry host AWS publishes spelled out of the pseudo parameters and the repository's
+//! name — the spelling that IS the stand-in), whether the template names the repository,
+//! whether that
 //! name carries a path segment, and both template spellings (JSON and YAML).
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::cloudformation_registry_backed_task_definition::{
-    build_router, created_repository_name, deploy, ecr, ecs, published_repository_uri,
+    announced_repository_path, aws_registry_uri, build_router, created_repository_name, deploy,
+    ecr, ecs,
 };
 use super::query_wire::outputs_of;
 
-/// The label run every Amazon ECR registry host carries between the owning account's id and
-/// the registry's Region (`aws_account_id.dkr.ecr.region.amazonaws.com`, as
+/// The label run every Amazon ECR registry host AWS publishes carries between the owning
+/// account's id and the registry's Region (`aws_account_id.dkr.ecr.region.amazonaws.com`, as
 /// `ContainerDefinition$image` spells it in its own examples), which is what marks a value of
-/// the registered revision as naming a registry at all.
+/// the registered revision as naming a registry AWS serves rather than the address this
+/// emulator assigned.
 ///
-/// Every such value must name the registry Amazon ECR ASSIGNED the repository
-/// ([`published_repository_uri`]): a value naming any other registry host is a stand-in the
-/// deployment never re-pointed — another account's registry, or another Region's — and no
-/// image pinned to it is one this registry holds.
+/// Every value of the registered revision must name the address Amazon ECR ASSIGNED the
+/// repository ([`announced_repository_path`]): one still naming a registry host AWS publishes
+/// is a stand-in the deployment never re-pointed, and no image pinned to it is one this
+/// registry holds — nothing here answers for that host at all.
 const REGISTRY_LABELS_MARK: &str = ".dkr.ecr.";
 
-/// Whether `text` names an Amazon ECR registry host at all (see [`REGISTRY_LABELS_MARK`]).
+/// Whether `text` names an Amazon ECR registry host AWS publishes at all (see
+/// [`REGISTRY_LABELS_MARK`]).
 fn names_a_registry_host(text: &str) -> bool {
     text.contains(REGISTRY_LABELS_MARK)
 }
@@ -339,10 +343,10 @@ async fn every_property_that_consumes_the_repository_holds_the_address_ecr_assig
             .unwrap_or_default()
             .to_string();
         assert_eq!(
-            assigned,
-            published_repository_uri(&repository),
-            "case {:?}: expected Amazon ECR to publish the repository at the registry that \
-             holds it, got {reported}",
+            announced_repository_path(&assigned),
+            Some(repository.as_str()),
+            "case {:?}: expected Amazon ECR to publish the repository at an address it answers \
+             registry requests at, got {reported}",
             row.case
         );
         assert_eq!(
@@ -350,6 +354,15 @@ async fn every_property_that_consumes_the_repository_holds_the_address_ecr_assig
             Some(assigned.as_str()),
             "case {:?}: expected the stack's RepositoryUri output to be the address Amazon ECR \
              assigned, got {outputs:?}",
+            row.case
+        );
+        // The host AWS publishes for the same repository, which is the stand-in the
+        // deployment had to re-point: no value of the registered revision may carry it.
+        let aws_uri = aws_registry_uri(&repository);
+        assert_ne!(
+            assigned, aws_uri,
+            "case {:?}: the address the create answered must differ from the stand-in, or these \
+             rows prove nothing about the re-pointing",
             row.case
         );
 
@@ -387,8 +400,8 @@ async fn every_property_that_consumes_the_repository_holds_the_address_ecr_assig
             );
         }
 
-        // And every value the revision holds that names a registry at all names the one
-        // Amazon ECR assigned: a stand-in left in any position addresses a repository this
+        // And every value the revision holds that names a registry AWS publishes is a
+        // stand-in the deployment never re-pointed: such a value addresses a repository this
         // registry does not hold, so the whole answer is read rather than only the members
         // named above.
         let mut held = Vec::new();
@@ -399,9 +412,9 @@ async fn every_property_that_consumes_the_repository_holds_the_address_ecr_assig
             .collect();
         assert!(
             standing.is_empty(),
-            "case {:?}: expected every value of the registered revision that names a registry \
-             ({REGISTRY_LABELS_MARK:?}) to name the one Amazon ECR assigned ({assigned:?}), \
-             got {standing:?}",
+            "case {:?}: expected every value of the registered revision to name the address \
+             Amazon ECR assigned ({assigned:?}) and no registry host AWS publishes \
+             ({REGISTRY_LABELS_MARK:?}, the stand-in being {aws_uri:?}), got {standing:?}",
             row.case
         );
     }
