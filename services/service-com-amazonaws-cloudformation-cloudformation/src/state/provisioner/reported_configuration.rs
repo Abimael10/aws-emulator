@@ -521,6 +521,10 @@ impl Provisioner {
                 describe_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_AUTHORIZER_CHILD)
                     .await
             }
+            // Read back by the same ARN the delete addresses the routing rule by.
+            Self::ApiGatewayV2RoutingRule => {
+                describe_apigatewayv2_routing_rule(ctx, region, resource).await
+            }
             Self::CodeCommitRepository => {
                 describe_codecommit_repository(ctx, region, physical_resource_id).await
             }

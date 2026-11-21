@@ -3003,6 +3003,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING,
     APIGATEWAYV2_DOMAIN_NAME,
+    // The ROUTING RULE of such a domain name, publishing the two values API Gateway v2 mints
+    // for one: the ARN that identifies the rule and the id inside it.
+    APIGATEWAYV2_ROUTING_RULE,
     // The three CloudWatch Application Signals types, publishing the read-only values that
     // service reports for each: the objective's ARN and the values it settles, the one instant
     // the account's grouping configuration carries, and the ARN, instant and location hash of

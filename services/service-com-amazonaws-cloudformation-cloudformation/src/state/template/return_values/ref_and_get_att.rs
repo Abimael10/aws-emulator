@@ -704,6 +704,38 @@ pub(crate) fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the routing rule ARN" (the type's primary identifier); Fn::GetAtt:
+        // RoutingRuleArn, RoutingRuleId. API Gateway v2 MINTS the id — a declaration states
+        // the domain the rule is on and the rule itself, never its identifier — and builds the
+        // ARN around that id under the custom domain name the rule lives on
+        // (`/domainnames/{name}/routingrules/{id}`, the resource path every routing-rule
+        // operation is bound at). So both values here are STAND-INS of those forms, over the
+        // domain name the declaration's own `DomainNameArn` names, which
+        // `super::provisioning` re-points at what the create really answered
+        // ([`identity_is_service_assigned`] names this type for it).
+        APIGATEWAYV2_ROUTING_RULE => {
+            let rule_id = api_gateway_assigned_id(APIGATEWAYV2_ROUTING_RULE_ID_SALT, name);
+            let declared_domain = properties
+                .get(crate::state::provisioner::ROUTING_RULE_DOMAIN_NAME_ARN)
+                .and_then(|value| text(value, scope, 0, budget))
+                .unwrap_or_default();
+            let domain_name =
+                crate::state::provisioner::routing_rule_domain_name(&declared_domain).to_string();
+            let arn = ::emulator_server::emulator_arn(
+                APIGATEWAYV2_ARN_NAMESPACE,
+                region,
+                &format!("/domainnames/{domain_name}/routingrules/{rule_id}"),
+            );
+            attributes.insert(
+                crate::state::provisioner::ROUTING_RULE_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            attributes.insert(
+                crate::state::provisioner::ROUTING_RULE_ID_ATTRIBUTE.to_string(),
+                rule_id,
+            );
+            (arn, attributes)
+        }
         // "Ref returns the table name"; Fn::GetAtt: Arn, StreamArn. The stream's own ARN
         // nests inside the table's (`table/<name>/stream/<label>`) and its LABEL is "a
         // timestamp, in ISO 8601 format" the owning service writes when it creates the stream

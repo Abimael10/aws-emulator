@@ -472,6 +472,13 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAYV2_API => &["ApiEndpoint", "ApiId", "ExecuteApiArn"],
         APIGATEWAYV2_API_MAPPING => &["ApiMappingId"],
         APIGATEWAYV2_DOMAIN_NAME => &["DomainNameArn", "RegionalDomainName"],
+        // A routing rule of such a domain name publishes the ARN API Gateway v2 built for it
+        // and the id inside that ARN, both of which these naming rules compute a stand-in for
+        // before the rule exists.
+        APIGATEWAYV2_ROUTING_RULE => &[
+            crate::state::provisioner::ROUTING_RULE_ARN_ATTRIBUTE,
+            crate::state::provisioner::ROUTING_RULE_ID_ATTRIBUTE,
+        ],
         GUARDDUTY_DETECTOR | GUARDDUTY_IP_SET => &["Id"],
         ROUTE53_HEALTH_CHECK => &["HealthCheckId"],
         ROUTE53_HOSTED_ZONE => &["Id"],
@@ -711,6 +718,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type == APIGATEWAYV2_ROUTE
         || resource_type == APIGATEWAYV2_DEPLOYMENT
         || resource_type == APIGATEWAYV2_AUTHORIZER
+        // A ROUTING RULE of a custom domain name is one more: `CreateRoutingRule` takes no
+        // identifier for the rule — a declaration states the domain it is on, its priority,
+        // its conditions and its actions — and answers the id API Gateway v2 minted together
+        // with the ARN it built around that id, which is this type's primary identifier and
+        // the handle `GetRoutingRule`, `PutRoutingRule` and `DeleteRoutingRule` address one
+        // by.
+        || resource_type == APIGATEWAYV2_ROUTING_RULE
         // An Amazon SNS subscription's identity is the ARN `Subscribe` answers with: it
         // carries an id SNS mints per subscription, which no naming rule could compute.
         || resource_type == SNS_SUBSCRIPTION

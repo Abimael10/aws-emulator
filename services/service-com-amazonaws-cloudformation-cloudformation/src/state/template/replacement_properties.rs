@@ -315,6 +315,14 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         | APIGATEWAYV2_STAGE
         | APIGATEWAYV2_AUTHORIZER => &["ApiId"],
         APIGATEWAYV2_DEPLOYMENT => &["ApiId", "StageName"],
+        // A ROUTING RULE exists on the custom domain name its `DomainNameArn` names, and API
+        // Gateway v2 publishes no call that moves one to another domain — the domain is an
+        // `@httpLabel` of every call on a rule, the create included — so a declaration naming
+        // another domain asks for a different rule, which is what that property's "Update
+        // requires: Replacement" says. Every other property of the type is a member of
+        // `PutRoutingRule`, so stating one differently is a change to the rule the stack
+        // already has (`crate::state::provisioner::update_apigatewayv2_routing_rule`).
+        APIGATEWAYV2_ROUTING_RULE => &[crate::state::provisioner::ROUTING_RULE_DOMAIN_NAME_ARN],
         // An AppSync custom domain is served with the certificate it was created with:
         // `certificateArn` is a member of `CreateDomainName`, `UpdateDomainName` takes the
         // description alone, and no other call of that service re-certifies a domain — so a

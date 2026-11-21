@@ -582,6 +582,19 @@ impl Provisioner {
                 ))
                 .await
             }
+            // `PutRoutingRule` ("puts a routing rule") is the one call that changes a routing
+            // rule the custom domain name already holds, and it takes every property of
+            // `AWS::ApiGatewayV2::RoutingRule` but the domain name that addresses it — so a
+            // changed priority, condition set or action list is applied to the rule the stack
+            // created, which keeps the id and the ARN that service minted, rather than
+            // replacing it. Boxed for the reason the arms above are.
+            Self::ApiGatewayV2RoutingRule => {
+                Box::pin(update_apigatewayv2_routing_rule(
+                    ctx, region, resource, declared,
+                ))
+                .await
+                .map(Some)
+            }
             // Each `Update…` takes the entity's whole declared configuration by the id Amplify
             // UI Builder minted for it, in the app environment that is fixed when the entity
             // is made — a declaration restating either replaces the resource instead — so a

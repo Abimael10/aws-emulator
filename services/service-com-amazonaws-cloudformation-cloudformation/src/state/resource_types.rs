@@ -89,6 +89,7 @@ use super::template::{
     AMPLIFYUIBUILDER_FORM, AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH,
     APIGATEWAY_ACCOUNT,
     APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME,
+    APIGATEWAYV2_ROUTING_RULE,
     APPLICATION_SIGNALS_GROUPING_CONFIGURATION, APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG,
     APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE, BACKUP_GATEWAY_HYPERVISOR,
     BCM_DASHBOARD, BCM_SCHEDULED_REPORT,
@@ -235,6 +236,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::ApiGatewayV2::Model",
     "AWS::ApiGatewayV2::Route",
     "AWS::ApiGatewayV2::RouteResponse",
+    // The routing rule of a custom domain name of that control plane, created in the owning
+    // service (`super::provisioner`) like the api and the domain name it sits between.
+    APIGATEWAYV2_ROUTING_RULE,
     "AWS::ApiGatewayV2::Stage",
     "AWS::ApiGatewayV2::VpcLink",
     // AWS AppConfig

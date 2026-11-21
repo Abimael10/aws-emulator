@@ -197,6 +197,16 @@ pub const APIGATEWAYV2_STAGE: &str = "AWS::ApiGatewayV2::Stage";
 pub const APIGATEWAYV2_DEPLOYMENT: &str = "AWS::ApiGatewayV2::Deployment";
 pub const APIGATEWAYV2_AUTHORIZER: &str = "AWS::ApiGatewayV2::Authorizer";
 
+/// The Amazon API Gateway v2 resource type whose resources live inside a CUSTOM DOMAIN NAME:
+/// the routing rule that decides which api a request to that domain is served by.
+///
+/// `AWS::ApiGatewayV2::RoutingRule`: `Ref` returns the rule's ARN — the type's primary
+/// identifier — and `Fn::GetAtt` reads `RoutingRuleArn` and `RoutingRuleId`. API Gateway v2
+/// MINTS both (`CreateRoutingRule` takes no identifier for the rule and answers the id it
+/// assigned together with the ARN it built around it), which is why
+/// [`identity_is_service_assigned`] names this type.
+pub const APIGATEWAYV2_ROUTING_RULE: &str = "AWS::ApiGatewayV2::RoutingRule";
+
 /// How many characters follow the `E` of a CloudFront-assigned identifier.
 ///
 /// CloudFront mints a distribution id, an origin access control id and an origin access
@@ -241,6 +251,7 @@ pub(crate) const APIGATEWAY_VPC_LINK_ID_SALT: &str = "apigateway/vpc-link-id";
 pub(crate) const APIGATEWAY_ACCOUNT_ID_SALT: &str = "apigateway/account-id";
 pub(crate) const APIGATEWAYV2_API_ID_SALT: &str = "apigatewayv2/api-id";
 pub(crate) const APIGATEWAYV2_API_MAPPING_ID_SALT: &str = "apigatewayv2/api-mapping-id";
+pub(crate) const APIGATEWAYV2_ROUTING_RULE_ID_SALT: &str = "apigatewayv2/routing-rule-id";
 pub(crate) const APIGATEWAYV2_DOMAIN_LABEL_SALT: &str = "apigatewayv2/regional-domain-label";
 
 /// An identifier of the shape CloudFront ASSIGNS one in: `E` followed by

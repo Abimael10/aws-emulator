@@ -55,6 +55,16 @@ pub const READ_ONLY_PROPERTIES: &[ReadOnlyProperties] = &[
         resource_type: super::APIGATEWAYV2_API,
         read_only: &["ApiEndpoint", "ApiId", "ExecuteApiArn"],
     },
+    // `AWS::ApiGatewayV2::RoutingRule`: the rule's own id and the ARN API Gateway v2 builds
+    // around it. That service assigns the id when it makes the rule and the ARN carries it, and
+    // neither is a member of `CreateRoutingRule` or `PutRoutingRule`.
+    ReadOnlyProperties {
+        resource_type: super::APIGATEWAYV2_ROUTING_RULE,
+        read_only: &[
+            crate::state::provisioner::ROUTING_RULE_ARN_ATTRIBUTE,
+            crate::state::provisioner::ROUTING_RULE_ID_ATTRIBUTE,
+        ],
+    },
     // `AWS::LakeFormation::PrincipalPermissions`: the two halves of the grant's composite
     // primary identifier, which the type's handler computes from the principal and the
     // resource the declaration names and no create or update accepts.

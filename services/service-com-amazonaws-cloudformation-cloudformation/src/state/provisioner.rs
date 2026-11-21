@@ -479,6 +479,7 @@ use super::template::{
     AOSS_SECURITY_POLICY, AOSS_VPC_ENDPOINT, APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
+    APIGATEWAYV2_ROUTING_RULE,
     APIGATEWAYV2_STAGE, APPLICATION_INSIGHTS_APPLICATION, APPLICATION_INSIGHTS_APPLICATION_PATH,
     APPLICATION_SIGNALS_GROUPING_CONFIGURATION,
     APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG, APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE,
@@ -1140,6 +1141,13 @@ pub(super) enum Provisioner {
     ApiGatewayV2Stage,
     ApiGatewayV2Deployment,
     ApiGatewayV2Authorizer,
+    /// `AWS::ApiGatewayV2::RoutingRule`: a routing rule of a CUSTOM DOMAIN NAME of the same
+    /// control plane, which `CreateRoutingRule` creates on the domain its declaration names,
+    /// `PutRoutingRule` changes and `DeleteRoutingRule` removes. That service MINTS the
+    /// `routingRuleId` and the `routingRuleArn` the type publishes, so both are read off that
+    /// create's own answer and the ARN — the type's primary identifier — is the identity a
+    /// `Ref` resolves to ([`apigatewayv2_routing_rules`]).
+    ApiGatewayV2RoutingRule,
     CodeCommitRepository,
     /// `AWS::CodeArtifact::Domain`: a CodeArtifact domain, which `CreateDomain` creates
     /// under the name the template states and `DeleteDomain` removes.
@@ -1639,6 +1647,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         APIGATEWAYV2_STAGE => Some(Provisioner::ApiGatewayV2Stage),
         APIGATEWAYV2_DEPLOYMENT => Some(Provisioner::ApiGatewayV2Deployment),
         APIGATEWAYV2_AUTHORIZER => Some(Provisioner::ApiGatewayV2Authorizer),
+        APIGATEWAYV2_ROUTING_RULE => Some(Provisioner::ApiGatewayV2RoutingRule),
         CODECOMMIT_REPOSITORY => Some(Provisioner::CodeCommitRepository),
         CODEARTIFACT_DOMAIN => Some(Provisioner::CodeArtifactDomain),
         CODEARTIFACT_REPOSITORY => Some(Provisioner::CodeArtifactRepository),
@@ -2402,6 +2411,12 @@ impl Provisioner {
                     &APIGATEWAYV2_AUTHORIZER_CHILD,
                 )
                 .await
+            }
+            // `AWS::ApiGatewayV2::RoutingRule` publishes `Actions`, `Conditions`,
+            // `DomainNameArn` and `Priority` and no `Tags`: a routing rule is no taggable
+            // resource, so no tags are propagated to one.
+            Self::ApiGatewayV2RoutingRule => {
+                create_apigatewayv2_routing_rule(ctx, region, resource).await
             }
             Self::CodeCommitRepository => {
                 create_codecommit_repository(ctx, region, resource, propagated).await
@@ -3486,6 +3501,12 @@ impl Provisioner {
                 delete_apigatewayv2_child(ctx, region, resource, &APIGATEWAYV2_AUTHORIZER_CHILD)
                     .await
             }
+            // The delete addresses the rule by the ARN API Gateway v2 minted for it, which is
+            // this resource's physical id and carries both of the labels that delete takes:
+            // the custom domain name the rule lives on and the rule's own id.
+            Self::ApiGatewayV2RoutingRule => {
+                delete_apigatewayv2_routing_rule(ctx, region, resource).await
+            }
             Self::CodeCommitRepository => {
                 delete_codecommit_repository(ctx, region, physical_resource_id).await
             }
@@ -4058,6 +4079,14 @@ use iam_identities::*;
 use data_and_storage::*;
 use firehose_delivery_streams::*;
 use emr_resources::*;
+
+/// The Amazon API Gateway v2 ROUTING RULE arms: the rule an `AWS::ApiGatewayV2::RoutingRule`
+/// declares on a custom domain name of that control plane, created there so a client's own
+/// `GetRoutingRule` and `ListRoutingRules` resolve the identity the stack publishes. Visible
+/// to the rest of this service's state because the return-value catalogue reads the
+/// declaration's domain-name ARN through the same reading these arms address the rule by.
+pub(in crate::state) mod apigatewayv2_routing_rules;
+pub(in crate::state) use apigatewayv2_routing_rules::*;
 
 /// The AWS Client VPN family of Amazon EC2 — the endpoint and the ingress authorization rule
 /// of one — whose arms are [`client_vpn`]'s. Visible to the rest of this service's state

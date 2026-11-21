@@ -211,6 +211,10 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         APIGATEWAY_ACCOUNT => "Id",
         APIGATEWAYV2_API => "ApiId",
         APIGATEWAYV2_API_MAPPING => "ApiMappingId",
+        // A ROUTING RULE of a custom domain name, identified by the ARN API Gateway v2 built
+        // for it — "Ref returns the routing rule ARN", the value that carries both halves
+        // every call on a rule takes (the domain name and the rule's own id).
+        APIGATEWAYV2_ROUTING_RULE => crate::state::provisioner::ROUTING_RULE_ARN_ATTRIBUTE,
         // The AWS Transfer Family types, each identified by the ARN its create answers.
         TRANSFER_SERVER => "Arn",
         // The Amazon EKS association, the Batch environments, queues and job definitions, and
