@@ -335,23 +335,31 @@ impl FunctionRecord {
     /// The version is a SEPARATE identity from the unpublished one: it gets its own
     /// `RevisionId`, which is what makes a revision precondition mean one identity rather
     /// than two ("The RevisionId provided does not match the latest RevisionId for the
-    /// Lambda function or alias"), and the revision it was taken from is kept beside it
-    /// as [`FunctionVersionRecord::source_revision_id`]. It also freezes the deployment
-    /// package the function currently holds, because a later `UpdateFunctionCode`
-    /// replaces only the unpublished version's.
+    /// Lambda function or alias"). It also freezes the deployment package the function
+    /// currently holds, because a later `UpdateFunctionCode` replaces only the unpublished
+    /// version's.
+    ///
+    /// Publishing is a CHANGE to the function, so it also leaves the unpublished
+    /// configuration at a fresh `RevisionId` of its own: a revision names one state of the
+    /// function, and the state a caller reads after this call holds a version it did not
+    /// hold before. The revision it is left at is kept beside the version it published as
+    /// [`FunctionVersionRecord::unpublished_revision_id`], so the "nothing changed,
+    /// nothing published" rule can still ask whether anything has changed since.
     pub fn publish_next_version(
         &mut self,
         mut config: FunctionConfig,
         now: SystemTime,
     ) -> Option<u64> {
         let version = self.latest_version.checked_add(1)?;
-        let source_revision_id = ::std::mem::replace(&mut config.revision_id, mint_revision_id());
+        config.revision_id = mint_revision_id();
+        let unpublished_revision_id = mint_revision_id();
+        self.config.revision_id = unpublished_revision_id.clone();
         self.versions.insert(
             version,
             FunctionVersionRecord {
                 version,
                 config,
-                source_revision_id,
+                unpublished_revision_id,
                 code: self.code.clone(),
                 created: iso8601(now),
             },

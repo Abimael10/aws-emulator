@@ -1277,15 +1277,16 @@ pub struct FunctionVersionRecord {
     /// The configuration this version froze, carrying the version's OWN
     /// [`FunctionConfig::revision_id`] (see [`FunctionRecord::publish_next_version`]).
     pub config: FunctionConfig,
-    /// The revision the unpublished configuration was at when this version was
-    /// published.
+    /// The revision this publish LEFT the unpublished configuration at.
     ///
-    /// A published version is a distinct identity with a revision of its own, so the
-    /// revision it was taken FROM is the only thing that can say whether the unpublished
-    /// configuration has changed since — which is the question
-    /// "Lambda doesn't publish a version if the function's configuration and code haven't
-    /// changed since the last version" asks.
-    pub source_revision_id: String,
+    /// Publishing is itself a change to the function, so it leaves the unpublished
+    /// configuration at a fresh revision ([`FunctionRecord::publish_next_version`]), and
+    /// every later change mints another one. So the unpublished configuration still
+    /// standing at this revision is exactly the statement that nothing has changed since
+    /// this version was published — which is the question "Lambda doesn't publish a version
+    /// if the function's configuration and code haven't changed since the last version"
+    /// asks.
+    pub unpublished_revision_id: String,
     /// The deployment package this version froze.
     ///
     /// A version keeps its own copy of the package: `PublishVersion` "Creates a version

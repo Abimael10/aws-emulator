@@ -372,6 +372,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A mismatch is the one failure `PreconditionFailedException` is modelled for,
         // and the refusal is the one fixed sentence naming the readers that report a
         // function configuration's current revision.
+        // "Only update the function if the revision ID matches the ID that's specified."
+        // A mismatch is the one failure `PreconditionFailedException` is modelled for,
+        // and the refusal is the one fixed sentence naming the readers that report a
+        // function configuration's current revision.
         if input
             .revision_id
             .as_deref()
@@ -419,22 +423,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Lambda doesn't publish a version if the function's configuration and code
         // haven't changed since the LAST version." A new revision id is minted on every
-        // change to a function's code or configuration, so the last version froze the
-        // configuration this call would freeze exactly when it was published FROM the
-        // revision the unpublished configuration is at now and carries the same (possibly
-        // overridden) description — and then this call has nothing to add. The version's
-        // own `RevisionId` is a different identity's revision, so the comparison is
-        // against the revision it was published from
-        // (`FunctionVersionRecord::source_revision_id`). The comparison is against the
-        // newest version only, as that sentence says: a configuration an OLDER version
-        // froze has changed since the last one, so publishing it again is a change and
-        // gets its own number. The ceiling below is what bounds the store, not this rule.
+        // change to a function's code or configuration, and publishing leaves the
+        // unpublished configuration at one of its own, so the unpublished configuration
+        // STILL STANDING at the revision the last publish left it at
+        // (`FunctionVersionRecord::unpublished_revision_id`) says exactly that nothing has
+        // changed since that version was published — and then this call has nothing to add,
+        // as long as it would freeze the same (possibly overridden) description. The
+        // comparison is against the newest version only, as that sentence says: a
+        // configuration an OLDER version froze has changed since the last one, so publishing
+        // it again is a change and gets its own number. The ceiling below is what bounds the
+        // store, not this rule.
         let already_published = record
             .versions
             .values()
             .next_back()
             .filter(|published| {
-                published.source_revision_id == record.config.revision_id
+                published.unpublished_revision_id == record.config.revision_id
                     && published.config.description == description
             })
             .map(|published| (published.version.to_string(), published.config.clone()));

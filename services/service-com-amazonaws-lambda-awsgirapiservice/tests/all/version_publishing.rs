@@ -800,10 +800,11 @@ async fn publishing_past_the_version_ceiling_is_refused() {
             .get_mut("crowded")
             .expect("the created function must be stored");
         let created = record.config.last_modified.clone();
-        // Each snapshot is written exactly as `publish_next_version` writes one: taken
-        // FROM the revision the unpublished configuration is at, carrying a revision of
-        // its own, and freezing the package the function holds.
-        let source_revision_id = record.config.revision_id.clone();
+        // Each snapshot is written exactly as `publish_next_version` writes one: carrying a
+        // revision of its own, freezing the package the function holds, and recording the
+        // revision the publish left the unpublished configuration at — which is the one it
+        // still stands at, so nothing has changed since.
+        let unpublished_revision_id = record.config.revision_id.clone();
         let code = record.code.clone();
         let ceiling = u64::try_from(MAX_FUNCTION_VERSIONS).unwrap_or_default();
         for number in 1..=ceiling {
@@ -815,7 +816,7 @@ async fn publishing_past_the_version_ceiling_is_refused() {
                 FunctionVersionRecord {
                     version: number,
                     config,
-                    source_revision_id: source_revision_id.clone(),
+                    unpublished_revision_id: unpublished_revision_id.clone(),
                     code: code.clone(),
                     created: created.clone(),
                 },
