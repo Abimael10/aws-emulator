@@ -240,6 +240,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Vec::with_capacity(input.attributes.len());
         let mut pending_media_bytes: usize = 0;
         for (index, requested) in input.attributes.iter().enumerate() {
+            // `category` is "validated against supported values at runtime", so a value
+            // outside the set the service supports is refused here rather than stored:
+            // a read of a created attribute never reports a category the service cannot
+            // hold. Reported against the entry's own `category` member.
+            if let Some(category) = requested.category.as_deref() {
+                if !crate::state::is_supported_attribute_category(category) {
+                    return Err(
+                        CreateBrandProfileAttributesErrorModeled::ValidationException(
+                            crate::state::invalid_category(
+                                &format!("/attributes/{index}/category"),
+                                category,
+                            ),
+                        )
+                        .into(),
+                    );
+                }
+            }
             let carries_media = crate::state::carries_media(&requested.attribute_type);
             // Which member carries an attribute's content follows from its type:
             // `attributeValue` "applies to attributes of type TEXT. For attributes of
@@ -317,10 +334,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateBrandProfileAttributesErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
-                        message: format!(
-                            "The maximum amount of attribute media ({} bytes) would be exceeded.",
-                            crate::state::MAX_ATTRIBUTE_MEDIA_BYTES
-                        ),
+                        message: crate::state::attribute_media_ceiling_exceeded(),
                     },
                 )
                 .into(),

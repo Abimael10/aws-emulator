@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBrandProfileAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBrandProfileAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBrandProfileAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members a request carries to one stored attribute of one brand profile.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +171,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBrandProfileAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBrandProfileAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBrandProfileAttribute"))
+        // Which attribute changes and what it changes to is read off the input alone:
+        // both identifiers are path labels the deserializer has already bound, and
+        // every other member is a body member, so no request metadata takes part.
+        let _ = ctx;
+        // Every updatable member is optional on its own, so any one of them is enough;
+        // a request carrying none of them asks for no change at all and is refused
+        // before the identifiers are resolved and before anything is written, which is
+        // what leaves the stored attribute — `updatedAt` included — exactly as it was.
+        if input.attribute_value.is_none()
+            && input.attachment_body.is_none()
+            && input.description.is_none()
+            && input.category.is_none()
+        {
+            return Err(
+                UpdateBrandProfileAttributeErrorModeled::ValidationException(
+                    crate::state::nothing_to_update(),
+                )
+                .into(),
+            );
+        }
+        // `category` is "validated against supported values at runtime", so a value
+        // outside the supported set is refused before anything is written and the
+        // stored category stays what it was.
+        if let Some(category) = input.category.as_deref() {
+            if !crate::state::is_supported_attribute_category(category) {
+                return Err(
+                    UpdateBrandProfileAttributeErrorModeled::ValidationException(
+                        crate::state::invalid_category("/category", category),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateBrandProfileAttributeErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // An attribute belongs to one profile, so an identifier that is not one of a
+        // brand profile, or that names no stored profile, is refused against the
+        // PROFILE, reported against the value given. The attribute is addressed under
+        // the id this resolves to — a `BrandProfileIdOrArn` may be either spelling,
+        // and only one of them is the stored key.
+        let brand_profile_id = store
+            .resolve_brand_profile_id(&input.brand_profile_id)
+            .map(str::to_string)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    UpdateBrandProfileAttributeErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    UpdateBrandProfileAttributeErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
+        // How much media the store already holds, read before the profile is borrowed
+        // for writing: the ceiling it is compared against is a ceiling on the whole
+        // store, not on one attribute.
+        let media_held = store.attribute_media_bytes();
+        // The resolution and this write share one lock, so the record the identifier
+        // resolved to is still here; a store that lost it in between has failed on the
+        // server's side rather than on the request's.
+        let Some(profile) = store.brand_profiles.get_mut(&brand_profile_id) else {
+            return Err(
+                UpdateBrandProfileAttributeErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        // This operation "updates ... an existing brand profile attribute", so a name
+        // the profile holds no attribute under is a not-found of the ATTRIBUTE,
+        // reported against the name the request named it by: an update never creates
+        // one.
+        let Some(attribute) = profile.attributes.get_mut(&input.attribute_name) else {
+            return Err(
+                UpdateBrandProfileAttributeErrorModeled::ResourceNotFoundException(
+                    crate::state::brand_profile_attribute_not_found(&input.attribute_name),
+                )
+                .into(),
+            );
+        };
+
+        // Which member carries an attribute's content follows from the type the STORED
+        // attribute has — an update cannot change that type — so a request offering the
+        // other type's member asks for something this attribute cannot hold, and is
+        // refused before any member is applied.
+        let carries_media = crate::state::carries_media(&attribute.attribute_type);
+        if !carries_media && input.attachment_body.is_some() {
+            return Err(
+                UpdateBrandProfileAttributeErrorModeled::ValidationException(
+                    crate::state::member_not_for_attribute_type(
+                        "/attachmentBody",
+                        "attachmentBody",
+                        &attribute.attribute_type,
+                    ),
+                )
+                .into(),
+            );
+        }
+        if carries_media && input.attribute_value.is_some() {
+            return Err(
+                UpdateBrandProfileAttributeErrorModeled::ValidationException(
+                    crate::state::member_not_for_attribute_type(
+                        "/attributeValue",
+                        "attributeValue",
+                        &attribute.attribute_type,
+                    ),
+                )
+                .into(),
+            );
+        }
+        // The supplied media REPLACES what the attribute held, so what the store would
+        // then hold is everything else plus these bytes. Past the ceiling the request is
+        // refused rather than growing the emulator's heap; this operation models no
+        // quota error, so the refusal is stated as the input it is about.
+        let replacement_media = input
+            .attachment_body
+            .clone()
+            .map(crate::state::BrandProfileAttributeMedia::new);
+        if let Some(media) = replacement_media.as_ref() {
+            let held_elsewhere = media_held
+                .saturating_sub(attribute.media.as_ref().map_or(0, |held| held.bytes.len()));
+            if held_elsewhere + media.bytes.len() > crate::state::MAX_ATTRIBUTE_MEDIA_BYTES {
+                return Err(
+                    UpdateBrandProfileAttributeErrorModeled::ValidationException(
+                        ValidationException {
+                            message: crate::state::attribute_media_ceiling_exceeded(),
+                            field_list: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // Only the members the request carries are applied; an omitted member leaves
+        // the stored value as it was, and nothing but those members and `updatedAt`
+        // changes — the attribute keeps its name, its type and the instant it was
+        // created at.
+        if let Some(value) = input.attribute_value {
+            attribute.value = Some(value);
+        }
+        if let Some(media) = replacement_media {
+            attribute.media = Some(media);
+        }
+        if let Some(description) = input.description {
+            attribute.description = Some(description);
+        }
+        if let Some(category) = input.category {
+            attribute.category = Some(category);
+        }
+        attribute.updated_at = now;
+
+        // Reported off the record now in the store, so what the update answers and what
+        // a later read reports are one rendering of one stored attribute. This output
+        // models no `mediaDownloadUrl`, so none is minted here.
+        Ok(UpdateBrandProfileAttributeOutput {
+            attribute_name: attribute.name.clone(),
+            attribute_type: attribute.attribute_type.clone(),
+            attribute_value: attribute.value.clone(),
+            description: attribute.description.clone(),
+            category: attribute.category.clone(),
+            media_content_type: attribute
+                .media
+                .as_ref()
+                .map(|media| media.content_type.clone()),
+            media_size_bytes: attribute.media.as_ref().map(|media| media.size_bytes()),
+            created_at: crate::state::timestamp(attribute.created_at),
+            updated_at: crate::state::timestamp(attribute.updated_at),
+        })
     }
 }

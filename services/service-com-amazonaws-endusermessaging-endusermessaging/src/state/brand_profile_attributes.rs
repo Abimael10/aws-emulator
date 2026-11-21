@@ -170,6 +170,95 @@ pub fn brand_profile_attribute_exists_conflict(
     )
 }
 
+/// The `category` values this service supports.
+///
+/// `BrandProfileAttributeCategory` is modelled as a plain 1..64 string and documented
+/// "Category for the attribute. Validated against supported values at runtime", so the
+/// supported set is not in the model: it is the set the service answers for, listed in
+/// the order its own refusal states it. A value outside it is refused
+/// ([`invalid_category`]) rather than stored, so no read reports a category the service
+/// cannot hold.
+pub const SUPPORTED_ATTRIBUTE_CATEGORIES: [&str; 11] = [
+    "BUSINESS_IDENTITY",
+    "BUSINESS_ADDRESS",
+    "BUSINESS_CONTACT",
+    "MESSAGING_USE_CASE",
+    "OPT_IN_CONSENT",
+    "MESSAGE_CONTENT",
+    "COMPLIANCE_KEYWORDS",
+    "TERMS_AND_POLICY",
+    "BRAND_DISPLAY",
+    "SUPPORTING_DOCUMENT",
+    "OTHER",
+];
+
+/// Whether `category` is one of [`SUPPORTED_ATTRIBUTE_CATEGORIES`].
+///
+/// Compared exactly: the supported values are spelled one way, so a differently cased
+/// spelling of one of them is not a supported value.
+#[must_use]
+pub fn is_supported_attribute_category(category: &str) -> bool {
+    SUPPORTED_ATTRIBUTE_CATEGORIES.contains(&category)
+}
+
+/// `ValidationException` for a `category` outside [`SUPPORTED_ATTRIBUTE_CATEGORIES`],
+/// reported against the member at `pointer` — the JSONPointer of the `category` member
+/// in the request document, which is what `ValidationExceptionField$path` documents.
+///
+/// The fixed text is the `Invalid category '…'. Supported values: …` sentence over the
+/// supported set; its one variable part is the rejected value, taken from the request.
+/// The `fieldList` entry states the same sentence about the member it names, so a
+/// caller sending a list of attributes is told which entry to change.
+#[must_use]
+pub fn invalid_category(pointer: &str, category: &str) -> crate::ops::types::ValidationException {
+    let message = format!(
+        "Invalid category '{category}'. Supported values: {}",
+        SUPPORTED_ATTRIBUTE_CATEGORIES.join(", ")
+    );
+    crate::ops::types::ValidationException {
+        message: message.clone(),
+        field_list: Some(vec![crate::ops::types::ValidationExceptionField {
+            path: pointer.to_string(),
+            message,
+        }]),
+    }
+}
+
+/// `ValidationException` for a request supplying `member` for an attribute whose
+/// `attribute_type` does not take it, reported against the member at `pointer`.
+///
+/// Which member carries an attribute's content follows from its type: `attachmentBody`
+/// is "The binary content for an attribute of type IMAGE or DOCUMENT" and
+/// `attributeValue` "applies to attributes of type TEXT. For attributes of type IMAGE or
+/// DOCUMENT, provide the media through the attachment body instead". The fixed text is
+/// the `… cannot be provided for … attribute` sentence; its variable parts are the
+/// member the request supplied and the stored attribute's own type.
+#[must_use]
+pub fn member_not_for_attribute_type(
+    pointer: &str,
+    member: &str,
+    attribute_type: &str,
+) -> crate::ops::types::ValidationException {
+    let message = format!("{member} cannot be provided for {attribute_type} attribute");
+    crate::ops::types::ValidationException {
+        message: message.clone(),
+        field_list: Some(vec![crate::ops::types::ValidationExceptionField {
+            path: pointer.to_string(),
+            message,
+        }]),
+    }
+}
+
+/// The sentence a request is refused with when it would push the store past
+/// [`MAX_ATTRIBUTE_MEDIA_BYTES`]: one wording of this emulator's own ceiling, whichever
+/// operation would have crossed it.
+#[must_use]
+pub fn attribute_media_ceiling_exceeded() -> String {
+    format!(
+        "The maximum amount of attribute media ({MAX_ATTRIBUTE_MEDIA_BYTES} bytes) would be exceeded."
+    )
+}
+
 /// One slot of the default attribute template: the attribute's name and the type
 /// of value it takes.
 #[derive(Debug, Clone, Copy)]
