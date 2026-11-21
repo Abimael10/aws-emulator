@@ -27,6 +27,9 @@
 //! 4. **A removal removes it.** A deregistered target is no longer reported and cannot be
 //!    deregistered twice, and deleting the WINDOW removes the targets registered with it,
 //!    because a target is only ever addressed through its window.
+//! 5. **The store is bounded per window.** Past the ceiling one window's targets are held
+//!    under, a register is refused `ResourceLimitExceededException` and writes nothing, while
+//!    a removal frees a slot and another window is bounded on its own.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -667,5 +670,104 @@ async fn an_idempotency_token_makes_a_retried_register_the_same_target() {
         (400, "IdempotentParameterMismatch"),
         "case {case:?}: expected one token carrying different members to be refused, got \
          {status} {response}"
+    );
+}
+
+/// RULE 5: the store is BOUNDED by what ONE window holds — past that ceiling a register is
+/// refused `ResourceLimitExceededException`, names the ceiling and the window asked about and
+/// writes nothing; a removal frees a slot, and a second window of the same Region is bounded
+/// on its own.
+///
+/// The ceiling is read from the crate rather than written here, so the case tests the bound
+/// the handler enforces and not a copy of it.
+#[tokio::test]
+async fn a_register_past_the_ceiling_is_refused() {
+    const MAX_TARGETS: usize = service_com_amazonaws_ssm_amazonssm::state::maintenance_window_targets::MAX_TARGETS_PER_WINDOW;
+
+    let router = router();
+    let case = "the ceiling case";
+    let window_id = window(&router, case, REGION, "ceiling-window").await;
+    // Each register states its own criteria, so no two of them are a retry of one another.
+    let body = |window: &str, index: usize| {
+        json!({
+            "WindowId": window,
+            "ResourceType": "INSTANCE",
+            "OwnerInformation": format!("target-{index}"),
+            "Targets": [{ "Key": "tag:Index", "Values": [index.to_string()] }],
+        })
+    };
+    let mut minted: Vec<String> = Vec::new();
+    for index in 0..MAX_TARGETS {
+        minted.push(register_ok(&router, case, REGION, &body(&window_id, index)).await);
+    }
+
+    let (status, response) = register(&router, REGION, &body(&window_id, MAX_TARGETS)).await;
+    assert_eq!(
+        (status, error_code(&response).as_str()),
+        (400, "ResourceLimitExceededException"),
+        "case {case:?}: expected the register past the ceiling to be refused, got {status} \
+         {response}"
+    );
+    assert_eq!(
+        error_message(&response),
+        format!(
+            "This emulator holds at most {MAX_TARGETS} targets for the maintenance window \
+             {window_id}"
+        ),
+        "case {case:?}: expected the refusal to name the ceiling and the window, got {response}"
+    );
+
+    // The refused register wrote nothing: the window still holds exactly the targets the
+    // ceiling admitted, under the ids those registers minted.
+    let reported: Vec<String> = targets_of(&router, case, REGION, &window_id)
+        .await
+        .iter()
+        .map(|target| {
+            target["WindowTargetId"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        reported, minted,
+        "case {case:?}: expected the targets the ceiling admitted and nothing more, got \
+         {reported:?}"
+    );
+
+    // The bound is on what the window HOLDS, not on how many registers ran: deregistering one
+    // frees the slot the next register takes.
+    let (status, response) = call_in_region(
+        &router,
+        REGION,
+        "DeregisterTargetFromMaintenanceWindow",
+        &json!({ "WindowId": window_id, "WindowTargetId": minted[0] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the deregister that frees a slot must be served, got {status} {response}"
+    );
+    let refilled = register_ok(&router, case, REGION, &body(&window_id, MAX_TARGETS)).await;
+    assert!(
+        !minted.contains(&refilled),
+        "case {case:?}: expected the register into the freed slot to mint its own id, got \
+         {refilled:?}"
+    );
+
+    // A second window of the same Region is bounded on its own: the ceiling is per window.
+    let other = window(&router, case, REGION, "other-ceiling-window").await;
+    let elsewhere = register_ok(&router, case, REGION, &body(&other, 0)).await;
+    let held = targets_of(&router, case, REGION, &other).await;
+    assert_eq!(
+        held.len(),
+        1,
+        "case {case:?}: expected the other window to hold the one target registered with it, \
+         got {held:?}"
+    );
+    assert_eq!(
+        held[0]["WindowTargetId"].as_str(),
+        Some(elsewhere.as_str()),
+        "case {case:?}: expected the other window to hold its own target, got {held:?}"
     );
 }
