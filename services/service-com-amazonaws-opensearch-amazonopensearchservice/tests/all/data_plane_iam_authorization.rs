@@ -3,7 +3,7 @@
 //! How a signed request to the address a domain PUBLISHES is authorized, and what the
 //! refusal looks like when it is not.
 //!
-//! Two rules, each over a SET of inputs rather than one recorded call:
+//! Three rules, each over a SET of inputs rather than one recorded call:
 //!
 //! * **a request IAM refuses is answered the way AWS's own authorization layer answers one
 //!   — `403` carrying a `Message` member whose sentence names the principal that signed,
@@ -21,7 +21,14 @@
 //!   data plane, and changes nothing about the domain itself**: its `DomainId`, its ARN and
 //!   the address it publishes stay what they were, and the verdict each principal gets
 //!   follows the policy now stored. The rows swap the two effects in both directions, so
-//!   neither verdict is the one a fixed answer would give.
+//!   neither verdict is the one a fixed answer would give;
+//! * **a statement of that access policy is about the ACTIONS it names and no others, and an
+//!   explicit `Deny` among the statements that apply refuses the request whatever the
+//!   principal's own identity policies allow** — so a `Deny` scoped to one `es:ESHttp*`
+//!   action refuses exactly that action's requests over an identity policy allowing
+//!   `es:ESHttp*` broadly, and replacing the document with one that denies nothing, the
+//!   identity policies untouched, serves the identical request. The rows span the action set
+//!   this surface publishes, each read through the request whose METHOD names it.
 //!
 //! Every case drives the real wire path — an HTTP request through the multi-service router
 //! into the mounted service — and every data-plane request is sent to the address the
@@ -32,7 +39,7 @@
 
 use serde_json::{json, Value};
 
-use super::domain_lifecycle::{Answer, Emulator, REGION, SETTLE_WAIT};
+use super::domain_lifecycle::{settled_domain, Answer, Emulator, REGION};
 use super::published_domain_address::{
     at_address, given_role_policy, given_session, published_endpoint, refusal_message, role_arn,
     session_arn,
@@ -75,14 +82,21 @@ fn identity_deny() -> Value {
     })
 }
 
+/// The resource an access-policy statement scopes to one whole domain: every path under that
+/// domain's own ARN, which is how `AccessPolicies` names one
+/// (`arn:aws:es:<region>:<account>:domain/<name>/*`).
+fn domain_resource(domain: &str) -> String {
+    format!(
+        "arn:aws:es:{REGION}:{}:domain/{domain}/*",
+        ::engine::emulator_account_id()
+    )
+}
+
 /// The domain's access policy: `allowed` allowed and `denied` denied on every path of the
 /// domain, with the third role named nowhere. The resource is the domain's own ARN pattern,
 /// the way an access policy scopes a statement to one domain.
 fn access_policy(domain: &str, allowed: &str, denied: &str) -> String {
-    let resource = format!(
-        "arn:aws:es:{REGION}:{}:domain/{domain}/*",
-        ::engine::emulator_account_id()
-    );
+    let resource = domain_resource(domain);
     json!({
         "Version": "2012-10-17",
         "Statement": [
@@ -141,7 +155,9 @@ async fn given_domain(emulator: &Emulator, domain: &str, policy: &str, case: &st
         "case {case:?}: expected 200 from CreateDomain, got {} with {:?}",
         created.status, created.body
     );
-    tokio::time::sleep(SETTLE_WAIT).await;
+    // The provisioning span is the service's; what this waits for is the CONDITION a client
+    // polls for — the domain reporting itself created with nothing in flight.
+    settled_domain(emulator, domain).await;
     published_endpoint(emulator, domain, case).await
 }
 
@@ -461,7 +477,8 @@ async fn an_access_policy_only_update_repoints_the_data_plane_in_place() {
         );
         // The change the update started is the clock's to settle; the domain keeps serving
         // through it, and the policy now stored is what every later request is decided by.
-        tokio::time::sleep(SETTLE_WAIT).await;
+        // The landing is polled for rather than waited out.
+        settled_domain(&emulator, domain).await;
 
         let read = emulator.describe(domain).await;
         let stored = read.body["DomainStatus"]["AccessPolicies"]
@@ -512,9 +529,9 @@ async fn the_published_address_serves_the_domain_whichever_endpoint_read_it() {
         );
         addresses.push(domain);
     }
-    tokio::time::sleep(SETTLE_WAIT).await;
 
     for domain in addresses {
+        settled_domain(&emulator, domain).await;
         let address = published_endpoint(&emulator, domain, domain).await;
         let banner: Answer = at_address(&emulator, &address, ALLOWED_KEY, "GET", "/", None).await;
         assert_eq!(
@@ -531,5 +548,360 @@ async fn the_published_address_serves_the_domain_whichever_endpoint_read_it() {
             banner.status,
             banner.body
         );
+    }
+}
+
+/// The role the action-scoped rows below are decided for, and the access key id of its
+/// session.
+///
+/// Its own identity policy allows every data-plane action of this service broadly
+/// ([`identity_allow`]), so the only thing left to decide about its requests is the domain's
+/// own access policy — which is the boundary these rows are about.
+const SCOPED_ROLE: &str = "plane-scoped";
+const SCOPED_KEY: &str = "ASIAEXAMPLEPLANESCP1";
+
+/// The index the action probes address.
+const SCOPED_INDEX: &str = "catalog";
+
+/// Seed the session the action-scoped rows sign with, and the broad identity grant its role
+/// carries.
+fn given_scoped_principal(emulator: &Emulator) {
+    given_session(emulator, SCOPED_ROLE, SESSION, SCOPED_KEY);
+    given_role_policy(emulator, SCOPED_ROLE, identity_allow());
+}
+
+/// An access policy that allows [`SCOPED_ROLE`] every data-plane action on every path of
+/// `domain` and explicitly DENIES it the single action `denied` on the same resource.
+fn action_scoped_policy(domain: &str, denied: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": { "AWS": role_arn(SCOPED_ROLE) },
+                "Action": "es:ESHttp*",
+                "Resource": domain_resource(domain),
+            },
+            {
+                "Effect": "Deny",
+                "Principal": { "AWS": role_arn(SCOPED_ROLE) },
+                "Action": denied,
+                "Resource": domain_resource(domain),
+            },
+        ],
+    })
+    .to_string()
+}
+
+/// The SAME document with the `Deny` statement removed and nothing else changed: the repaired
+/// access policy a client replaces a wrongly denying one with.
+fn repaired_policy(domain: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "AWS": role_arn(SCOPED_ROLE) },
+            "Action": "es:ESHttp*",
+            "Resource": domain_resource(domain),
+        }],
+    })
+    .to_string()
+}
+
+/// One request of this surface, and the `es:ESHttp*` action its HTTP METHOD names.
+struct ActionProbe {
+    /// The action the request asks for, as an access-policy statement spells it.
+    action: &'static str,
+    method: &'static str,
+    path: &'static str,
+    /// The request body, as JSON text, for the methods that carry one.
+    body: Option<&'static str>,
+}
+
+/// The probes the action-scoped table is read over: one request per action of this surface,
+/// each the action its method names.
+///
+/// The action set is the one "Actions defined by Amazon OpenSearch Service" publishes for the
+/// HTTP surface of a domain (`es:ESHttpGet`, `es:ESHttpPut`, `es:ESHttpPost`,
+/// `es:ESHttpDelete`, `es:ESHttpHead`) — the same set the sibling rows above read a method's
+/// action from, including `es:ESHttpHead`, which the issue the scoped rows were written for
+/// never cited.
+const ACTION_PROBES: &[ActionProbe] = &[
+    ActionProbe {
+        action: "es:ESHttpGet",
+        method: "GET",
+        path: "/catalog/_doc/probe",
+        body: None,
+    },
+    ActionProbe {
+        action: "es:ESHttpPut",
+        method: "PUT",
+        path: "/catalog/_doc/probe",
+        body: Some(r#"{"title":"probe"}"#),
+    },
+    ActionProbe {
+        action: "es:ESHttpPost",
+        method: "POST",
+        path: "/catalog/_search",
+        body: Some("{}"),
+    },
+    ActionProbe {
+        action: "es:ESHttpDelete",
+        method: "DELETE",
+        path: "/catalog/_doc/probe",
+        body: None,
+    },
+    ActionProbe {
+        action: "es:ESHttpHead",
+        method: "HEAD",
+        path: "/catalog",
+        body: None,
+    },
+];
+
+/// Send one probe to `address` as the action-scoped role's session.
+async fn probed(emulator: &Emulator, address: &str, probe: &ActionProbe) -> Answer {
+    let body = probe.body.map(|body| {
+        serde_json::from_str::<Value>(body)
+            .unwrap_or_else(|failed| panic!("a probe body is JSON: {body:?} ({failed})"))
+    });
+    at_address(
+        emulator,
+        address,
+        SCOPED_KEY,
+        probe.method,
+        probe.path,
+        body,
+    )
+    .await
+}
+
+/// The sentence a resource-policy `Deny` of `action` refuses the scoped role's request with.
+fn scoped_deny_sentence(action: &str) -> String {
+    format!(
+        "User: {} is not authorized to perform: {action} {EXPLICIT_RESOURCE_DENY}",
+        session_arn(SCOPED_ROLE, SESSION)
+    )
+}
+
+/// The clause IAM's refusal names when a RESOURCE-based policy explicitly denied the request.
+const EXPLICIT_RESOURCE_DENY: &str = "with an explicit deny in a resource-based policy";
+
+/// The ONE write the deny-and-repair rule is read through, sent as the scoped role's session:
+/// the identical request before and after the access policy is replaced.
+async fn scoped_write(emulator: &Emulator, address: &str) -> Answer {
+    at_address(
+        emulator,
+        address,
+        SCOPED_KEY,
+        "PUT",
+        &format!("/{SCOPED_INDEX}/_doc/scoped"),
+        Some(json!({ "title": "scoped" })),
+    )
+    .await
+}
+
+/// Install `policy` as the domain's access policy through `UpdateDomainConfig`, and wait for
+/// the change it starts to land — the condition a client polls for, never a fixed stretch of
+/// time.
+async fn given_access_policy(emulator: &Emulator, domain: &str, policy: &str, case: &str) {
+    let updated = emulator
+        .update_config(domain, json!({ "AccessPolicies": policy }))
+        .await;
+    assert_eq!(
+        updated.status, 200,
+        "case {case:?}: expected 200 from UpdateDomainConfig, got {} with {:?}",
+        updated.status, updated.body
+    );
+    settled_domain(emulator, domain).await;
+}
+
+/// RULE: an explicit `Deny` in the domain's access policy refuses the request whatever the
+/// principal's identity policies allow, and a statement scoped to ONE action says nothing
+/// about any other — so a document that denies the write refuses exactly the write, and
+/// replacing it with one that denies nothing, the identity policies untouched, serves the
+/// identical write.
+#[tokio::test]
+async fn a_resource_policy_deny_of_one_action_outranks_a_broad_identity_allow() {
+    let emulator = Emulator::new();
+    given_scoped_principal(&emulator);
+    let domain = "plane-scoped";
+    let created = emulator
+        .create(create_body(
+            domain,
+            &action_scoped_policy(domain, "es:ESHttpPut"),
+        ))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case \"the deny-scoped domain\": expected 200 from CreateDomain, got {} with {:?}",
+        created.status, created.body
+    );
+    settled_domain(&emulator, domain).await;
+    let address = published_endpoint(&emulator, domain, "the deny-scoped domain").await;
+
+    // The write the access policy denies, made by a principal whose own policy allows
+    // `es:ESHttp*` on everything: refused, and named as the resource side's deny.
+    let refused = scoped_write(&emulator, &address).await;
+    assert_eq!(
+        (refused.status, refusal_message(&refused)),
+        (403, scoped_deny_sentence("es:ESHttpPut")),
+        "case \"the denied write\": expected the resource-policy deny of es:ESHttpPut, got {} \
+         with {:?}",
+        refused.status,
+        refused.body
+    );
+    // The statement is about ONE action, so what it does not name is not refused.
+    let health = at_address(
+        &emulator,
+        &address,
+        SCOPED_KEY,
+        "GET",
+        "/_cluster/health",
+        None,
+    )
+    .await;
+    assert_eq!(
+        health.status, 200,
+        "case \"a read the same policy does not deny\": expected the cluster health, got {} \
+         with {:?}",
+        health.status, health.body
+    );
+    // And the refused write wrote nothing: the index it addressed does not exist.
+    let absent = at_address(
+        &emulator,
+        &address,
+        SCOPED_KEY,
+        "GET",
+        &format!("/{SCOPED_INDEX}/_doc/scoped"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        absent.status, 404,
+        "case \"after the denied write\": expected the document never to have been written, \
+         got {} with {:?}",
+        absent.status, absent.body
+    );
+
+    // THE REPAIR: the same document with the `Deny` statement taken out. Nothing about the
+    // principal's identity policies is touched — the grant seeded once above is still the
+    // only one in force on it.
+    given_access_policy(
+        &emulator,
+        domain,
+        &repaired_policy(domain),
+        "the repaired access policy",
+    )
+    .await;
+
+    let written = scoped_write(&emulator, &address).await;
+    assert_eq!(
+        (written.status, written.body["result"].as_str()),
+        (201, Some("created")),
+        "case \"the identical write after the repair\": expected the engine's own answer, got \
+         {} with {:?}",
+        written.status,
+        written.body
+    );
+    let read_back = at_address(
+        &emulator,
+        &address,
+        SCOPED_KEY,
+        "GET",
+        &format!("/{SCOPED_INDEX}/_doc/scoped"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (
+            read_back.status,
+            read_back.body["_source"]["title"].as_str()
+        ),
+        (200, Some("scoped")),
+        "case \"reading back what the repaired policy let through\": expected the document, \
+         got {} with {:?}",
+        read_back.status,
+        read_back.body
+    );
+}
+
+/// RULE (the same one over the whole action set): a `Deny` scoped to one action of this
+/// surface refuses the requests whose METHOD names that action and leaves every other action
+/// of the same principal served, with the identity grant unchanged throughout.
+#[tokio::test]
+async fn a_deny_scoped_to_one_action_refuses_that_action_alone() {
+    let emulator = Emulator::new();
+    given_scoped_principal(&emulator);
+    let domain = "plane-scoped-actions";
+    let created = emulator
+        .create(create_body(domain, &repaired_policy(domain)))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case \"the action-scoped domain\": expected 200 from CreateDomain, got {} with {:?}",
+        created.status, created.body
+    );
+    settled_domain(&emulator, domain).await;
+    let address = published_endpoint(&emulator, domain, "the action-scoped domain").await;
+
+    // The index every probe addresses, written while the policy denies nothing, so a probe's
+    // status is the authorization decision and not an index that was never there.
+    let seeded = at_address(
+        &emulator,
+        &address,
+        SCOPED_KEY,
+        "PUT",
+        &format!("/{SCOPED_INDEX}/_doc/probe"),
+        Some(json!({ "title": "probe" })),
+    )
+    .await;
+    assert!(
+        (200..300).contains(&seeded.status),
+        "case \"seeding the probed index\": expected the write to land, got {} with {:?}",
+        seeded.status,
+        seeded.body
+    );
+
+    for denied in ACTION_PROBES {
+        let case = denied.action;
+        given_access_policy(
+            &emulator,
+            domain,
+            &action_scoped_policy(domain, denied.action),
+            case,
+        )
+        .await;
+
+        for probe in ACTION_PROBES {
+            let probed_action = probe.action;
+            let answered = probed(&emulator, &address, probe).await;
+            if probed_action == denied.action {
+                assert_eq!(
+                    answered.status, 403,
+                    "case {case:?}: expected the denied action {probed_action:?} to be \
+                     refused, got {} with {:?}",
+                    answered.status, answered.body
+                );
+                // A `HEAD` answer carries no body at all, so the sentence is asserted on
+                // every other probe; what a `HEAD` must carry is the status.
+                if probe.method != "HEAD" {
+                    assert_eq!(
+                        refusal_message(&answered),
+                        scoped_deny_sentence(probed_action),
+                        "case {case:?}: expected AWS's own resource-deny sentence for \
+                         {probed_action:?}, got {:?}",
+                        answered.body
+                    );
+                }
+            } else {
+                assert_ne!(
+                    answered.status, 403,
+                    "case {case:?}: a statement about {case:?} says nothing about \
+                     {probed_action:?}, which the identity grant allows, got {} with {:?}",
+                    answered.status, answered.body
+                );
+            }
+        }
     }
 }
