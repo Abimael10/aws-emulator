@@ -864,7 +864,7 @@ pub async fn send(
                 return Ok(response_url);
             }
             let answered: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
-            Err(refusal_of(LAMBDA_SIGNING_NAME, status, &answered))
+            Err(refusal_of(LAMBDA_SIGNING_NAME, Some(&uri), status, &answered))
         }
     }
 }

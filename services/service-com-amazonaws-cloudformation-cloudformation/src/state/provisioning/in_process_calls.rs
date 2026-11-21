@@ -67,7 +67,7 @@ pub(crate) async fn call_json_rpc(
     if (200..300).contains(&status) {
         return Ok(document);
     }
-    Err(refusal_of(signing_name, status, &document))
+    Err(refusal_of(signing_name, None, status, &document))
 }
 
 /// The media type an awsQuery request carries: its parameters are a form body, not a
@@ -160,6 +160,7 @@ pub(crate) async fn call_query_carrying(
         message: sdk_message_of(
             signing_name,
             Some(action),
+            None,
             status,
             &code,
             &xml_element(&document, "Message").unwrap_or_default(),
@@ -254,7 +255,7 @@ async fn rest_json(
     if (200..300).contains(&status) {
         return Ok(document);
     }
-    Err(refusal_of_call(signing_name, operation, status, &document))
+    Err(refusal_of_call(signing_name, operation, Some(uri), status, &document))
 }
 
 /// [`call_rest_json`] for an operation whose input is an `@httpPayload`: the bytes the
@@ -286,7 +287,7 @@ pub(crate) async fn call_rest_payload(
     if (200..300).contains(&status) {
         return Ok(document);
     }
-    Err(refusal_of(signing_name, status, &document))
+    Err(refusal_of(signing_name, Some(uri), status, &document))
 }
 
 /// [`call_rest_payload`] for an operation that both TAKES its input and REPORTS its answer
@@ -326,7 +327,7 @@ pub(crate) async fn call_rest_payload_reporting(
         return Ok(reported);
     }
     let document: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
-    Err(refusal_of(signing_name, status, &document))
+    Err(refusal_of(signing_name, Some(uri), status, &document))
 }
 
 /// Call one REST-XML operation of another emulated service in-process and read the XML
@@ -389,8 +390,10 @@ pub(crate) async fn call_rest_xml(
     let code = xml_element(&document, "Code")
         .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
     Err(Refusal {
-        message: sdk_message(
+        message: sdk_message_of(
             signing_name,
+            None,
+            Some(uri),
             status,
             &code,
             &xml_element(&document, "Message").unwrap_or_default(),
@@ -966,8 +969,18 @@ pub(crate) fn xml_scalar_children(
 ///
 /// The message is the one an SDK of that service would raise ([`sdk_message`]), because what
 /// a resource provider reports is what its own SDK call raised.
-pub(super) fn refusal_of(signing_name: &str, status: u16, document: &Value) -> Refusal {
-    refusal_of_call(signing_name, None, status, document)
+///
+/// `uri` is the path the refused call was made on, which is what says which of the services
+/// sharing one signing name answered it (the prefix-keyed table in
+/// [`super::sdk_diagnostics`]); `None` for a wire that binds every operation to one path,
+/// whose URI tells them apart from nothing.
+pub(super) fn refusal_of(
+    signing_name: &str,
+    uri: Option<&str>,
+    status: u16,
+    document: &Value,
+) -> Refusal {
+    refusal_of_call(signing_name, None, uri, status, document)
 }
 
 /// [`refusal_of`] for a caller that states WHICH operation of that service was refused,
@@ -980,6 +993,7 @@ pub(super) fn refusal_of(signing_name: &str, status: u16, document: &Value) -> R
 pub(super) fn refusal_of_call(
     signing_name: &str,
     operation: Option<&str>,
+    uri: Option<&str>,
     status: u16,
     document: &Value,
 ) -> Refusal {
@@ -995,7 +1009,7 @@ pub(super) fn refusal_of_call(
         .or_else(|| document.get("Message"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let mut message = sdk_message_of(signing_name, operation, status, &code, message);
+    let mut message = sdk_message_of(signing_name, operation, uri, status, &code, message);
     if let Some(parameter) = attributed_parameter(signing_name, operation, document) {
         message = match message.is_empty() {
             true => parameter,

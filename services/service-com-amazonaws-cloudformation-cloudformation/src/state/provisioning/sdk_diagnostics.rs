@@ -24,9 +24,15 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // `AWS::ApiGateway::Deployment` created for a REST API that has no methods carries it
     // (`"<the service's sentence> (Service: ApiGateway, Status Code: 400, Request ID: …)"`,
     // where Amazon Route 53's below carries `(SDK Attempt Count: …)` past the closing
-    // parenthesis). Every type this emulator provisions over this signing name is that
-    // service's or API Gateway v2's ([`provisioning::apigateway_rest_api`]).
-    ("apigateway", "ApiGateway", SdkDiagnostic::Envelope),
+    // parenthesis). This signing name is SHARED with API Gateway v2, whose own surface is
+    // bound under a URI prefix of its own and is therefore named by its own SDK rather than
+    // by this entry ([`SDK_SHARED_NAME_PREFIXES`]); this one answers for the REST control
+    // plane's types ([`provisioning::apigateway_rest_api`]).
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        "ApiGateway",
+        SdkDiagnostic::Envelope,
+    ),
     // AWS AppConfig's SDK names it by that model's own `sdkId`, which is also the
     // `cloudFormationName` the type names of its resources carry
     // (`smithy_query(query="service_info")` on that service's model: `sdkId: "AppConfig"`,
@@ -377,6 +383,69 @@ fn shared_name_service(
         .map(|(_, _, service, shape)| (*service, *shape))
 }
 
+/// The SDK service NAME and diagnostic shape for a call on a signing name SEVERAL services
+/// share whose SURFACES are bound under prefixes of their own, keyed by the prefix the
+/// refused call's URI is below.
+///
+/// [`SDK_SHARED_NAME_SERVICES`] tells the claimants of a shared name apart by the OPERATION
+/// that was called, which answers only where their operation names differ. The two API
+/// Gateway control planes are not such a pair: the REST plane and the v2 plane each publish a
+/// `CreateStage`, a `CreateDeployment`, a `CreateAuthorizer` and a `CreateModel`, so the name
+/// of the call says nothing about which of them served it. The URI does: every operation of
+/// the v2 model is bound below that model's own prefix
+/// ([`crate::state::provisioner::APIGATEWAYV2_URI_PREFIX`]) and no operation of the REST
+/// plane is, so a refused call made under it was that service's and the exception its SDK
+/// raised names that service.
+///
+/// A row here is read BEFORE the signing-name entry, since it describes one particular
+/// surface of a shared name where that entry describes the service the name resolves to
+/// otherwise.
+const SDK_SHARED_NAME_PREFIXES: &[(&str, &str, &str, SdkDiagnostic)] = &[
+    // Amazon API Gateway v2's SDK names it `ApiGatewayV2` — that model's own `sdkId`
+    // (`smithy_query(query="service_info")` on that service's model), which is also the name
+    // the `AWS::ApiGatewayV2::*` type names carry — and words the ATTEMPT-counting shape,
+    // where the REST plane's entry words the bare envelope: read from the recorded
+    // `ResourceStatusReason` of an `AWS::ApiGatewayV2::Integration` whose `SQS-SendMessage`
+    // subtype mapping leaves out a parameter that action requires (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `apigatewayv2__cloudformation__iam__sqs.deploy-\
+    // cfn-apigatewayv2-integration-sqssendmessage-missing-messagebody-rejected`, whose reason
+    // reads `Resource handler returned message: "<the service's sentence> (Service:
+    // ApiGatewayV2, Status Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …,
+    // HandlerErrorCode: InvalidRequest)`).
+    (
+        crate::state::provisioner::API_GATEWAY_SIGNING_NAME,
+        crate::state::provisioner::APIGATEWAYV2_URI_PREFIX,
+        "ApiGatewayV2",
+        SdkDiagnostic::Attempts,
+    ),
+];
+
+/// The service name and shape a call made on `uri` over a SHARED signing name takes
+/// ([`SDK_SHARED_NAME_PREFIXES`]), or `None` for a call on no such surface and for a caller
+/// that states no URI — an RPC wire binds every operation of a service to one path, so the
+/// path of such a call tells its claimants apart from nothing.
+fn shared_name_service_at(
+    signing_name: &str,
+    uri: Option<&str>,
+) -> Option<(&'static str, SdkDiagnostic)> {
+    let uri = uri?;
+    SDK_SHARED_NAME_PREFIXES
+        .iter()
+        .find(|(name, prefix, _, _)| *name == signing_name && uri_is_under(uri, prefix))
+        .map(|(_, _, service, shape)| (*service, *shape))
+}
+
+/// Whether `uri` is the path `prefix` names or one BELOW it.
+///
+/// Matched at a segment boundary, so a surface bound under `/v2` claims `/v2/apis` and
+/// `/v2/apis?x=1` and not a sharing service's path that merely opens with those characters: a
+/// URI prefix names a subtree of paths, not a string.
+fn uri_is_under(uri: &str, prefix: &str) -> bool {
+    uri.strip_prefix(prefix).is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
+    })
+}
+
 /// The PROVIDERS whose diagnostic shape differs from the one their service's entry above
 /// carries, keyed by the OPERATION the provider's refused call named.
 ///
@@ -544,24 +613,39 @@ pub(super) fn sdk_request_ids(signing_name: &str) -> String {
 /// ([`SdkDiagnostic::EnvelopeOnRefusedRequest`]) when the refusal falls in another class.
 ///
 /// `operation` is the called operation as its own model names it, which only a caller that
-/// knows which operation it is making can state ([`call_rest_json_named`]).
+/// knows which operation it is making can state ([`call_rest_json_named`]); `uri` is the path
+/// the call was made on, which is what says which of the services sharing one signing name
+/// served it ([`SDK_SHARED_NAME_PREFIXES`]).
 pub(super) fn sdk_diagnostic(
     signing_name: &str,
     operation: Option<&str>,
+    uri: Option<&str>,
     status: u16,
     code: &str,
 ) -> Option<String> {
-    let (service, shape) = SDK_SERVICE_NAMES
-        .iter()
-        .find(|(name, _, _)| *name == signing_name)
-        .map(|(_, service, shape)| (*service, *shape))
+    // The SURFACE of a shared signing name the call was made on, which names its own service
+    // whatever the name resolves to otherwise.
+    let surface = shared_name_service_at(signing_name, uri);
+    let (service, shape) = surface
+        .or_else(|| {
+            SDK_SERVICE_NAMES
+                .iter()
+                .find(|(name, _, _)| *name == signing_name)
+                .map(|(_, service, shape)| (*service, *shape))
+        })
         // A signing name several services share is identified by the OPERATION that was
         // called, not by the name ([`SDK_SHARED_NAME_SERVICES`]).
         .or_else(|| shared_name_service(signing_name, operation))?;
 
     // The shape the PROVIDER that made this call words, where that service's providers do not
-    // all word the same one ([`SDK_PROVIDER_SHAPES`]).
-    let shape = provider_shape(signing_name, operation).unwrap_or(shape);
+    // all word the same one ([`SDK_PROVIDER_SHAPES`]). Keyed by the operation's name, which
+    // the claimants of a shared signing name can share — so it is not asked for a call a URI
+    // prefix already resolved to one surface, whose own row states what that surface's
+    // provider words.
+    let shape = match surface {
+        Some(_) => shape,
+        None => provider_shape(signing_name, operation).unwrap_or(shape),
+    };
     // The envelope the two comma-separated shapes open with, written once so the two cannot
     // state the service, the status and the call's id differently.
     let envelope = || {
@@ -629,7 +713,7 @@ pub(super) fn sdk_attempt_count(code: &str) -> u32 {
 /// service worded, then that SDK's diagnostic of the call where this crate words one
 /// ([`sdk_diagnostic`]).
 pub(crate) fn sdk_message(signing_name: &str, status: u16, code: &str, message: &str) -> String {
-    sdk_message_of(signing_name, None, status, code, message)
+    sdk_message_of(signing_name, None, None, status, code, message)
 }
 
 /// The member an error DOCUMENT attributes its refusal to, as the wire spells that member:
@@ -679,15 +763,18 @@ pub(super) fn attributed_parameter(
 }
 
 /// [`sdk_message`] for a caller that knows WHICH operation of that service it called, which
-/// is part of the diagnostic some SDKs word ([`SdkDiagnostic::Operation`]).
+/// is part of the diagnostic some SDKs word ([`SdkDiagnostic::Operation`]), and on WHICH URI,
+/// which is what says which of the services sharing one signing name answered it
+/// ([`SDK_SHARED_NAME_PREFIXES`]).
 pub(crate) fn sdk_message_of(
     signing_name: &str,
     operation: Option<&str>,
+    uri: Option<&str>,
     status: u16,
     code: &str,
     message: &str,
 ) -> String {
-    match sdk_diagnostic(signing_name, operation, status, code) {
+    match sdk_diagnostic(signing_name, operation, uri, status, code) {
         Some(diagnostic) if message.is_empty() => diagnostic,
         Some(diagnostic) => format!("{message} {diagnostic}"),
         None => message.to_string(),
