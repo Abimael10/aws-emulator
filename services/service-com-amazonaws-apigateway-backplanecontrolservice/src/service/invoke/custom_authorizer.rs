@@ -58,9 +58,10 @@
 //! `apigateway.amazonaws.com` no invocation of it for this authorizer — earns the
 //! `AUTHORIZER_CONFIGURATION_ERROR` gateway response, and one whose function RAN and
 //! returned something that is not an authorizer output earns `AUTHORIZER_FAILURE`: both are
-//! `500` with `{"message":"Internal server error"}`, which is the envelope API Gateway
-//! reserves for an authorizer that errors, times out or returns a malformed policy. Nothing
-//! admits a request because it merely carried a token.
+//! `500` with the `{"message":null}` body API Gateway answers a call no authorizer decided
+//! with — the gateway sets no error message for that class, so each type's own default
+//! template renders the quoted value of nothing ([`super::AUTHORIZER_CONFIGURATION_ERROR`]).
+//! Nothing admits a request because it merely carried a token.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

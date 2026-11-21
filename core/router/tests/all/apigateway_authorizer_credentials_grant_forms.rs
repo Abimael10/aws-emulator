@@ -13,7 +13,7 @@
 //! resource stated as a wildcard, a role held under a path. The function's own resource policy
 //! is not consulted for such an authorizer, because naming the role is the documented
 //! alternative to it ("to use resource-based permissions on the Lambda function, specify
-//! null"), and the `500` `{"message":"Internal server error"}` envelope API Gateway reserves
+//! null"), and the `500` envelope API Gateway reserves
 //! for an authorizer it cannot invoke is earned only where the permissions in force on the
 //! role do NOT allow that invocation.**
 //!
@@ -91,9 +91,11 @@ const EXPLICIT_DENY: &str = "User is not authorized to access this resource with
                              deny in an identity-based policy";
 const DENIED_STATUS: u16 = 403;
 
-/// The status and the fixed generic body API Gateway answers when it cannot invoke the
-/// authorizer at all. No variable part: the envelope names neither the authorizer nor the role.
-const CONFIGURATION_ERROR: (u16, &str) = (500, r#"{"message":"Internal server error"}"#);
+/// The status and the fixed body API Gateway answers when it cannot invoke the authorizer at
+/// all. No variable part: the envelope names neither the authorizer nor the role, and no error
+/// message is set for that class — so the response type's own default template renders the
+/// `message` member as the JSON literal `null`.
+const CONFIGURATION_ERROR: (u16, &str) = (500, r#"{"message":null}"#);
 
 /// The logical ids every template below declares its function, its api-side role and its api
 /// under.
@@ -616,7 +618,7 @@ async fn assert_legs(router: &MultiServiceRouter, row: &Row, invoke_url: &str) {
         );
         // An admitted call is answered with the integration's own body; a call the returned
         // policy refused with the sentence its gateway response carries; and one whose
-        // authorizer was never invoked with the whole fixed generic envelope.
+        // authorizer was never invoked with the whole fixed envelope, whose message is unset.
         let reported = if status == 200 || !row.decided {
             answered.clone()
         } else {

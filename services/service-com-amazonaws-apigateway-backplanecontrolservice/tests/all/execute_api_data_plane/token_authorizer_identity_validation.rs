@@ -56,9 +56,10 @@ const EXPRESSION: &str = "^Bearer [A-Za-z0-9]+$";
 /// a request refused before the authorizer is invoked is answered with.
 const UNAUTHORIZED: (u16, &str) = (401, r#"{"message":"Unauthorized"}"#);
 
-/// The status and body an authorizer that produced no policy earns: the envelope AWS reserves
-/// for an authorizer that errors, times out or returns a malformed policy.
-const AUTHORIZER_FAILED: (u16, &str) = (500, r#"{"message":"Internal server error"}"#);
+/// The status and body an authorizer that produced no policy earns: AWS sets no error message
+/// for that class, so the gateway response's own default template renders the `message` member
+/// as the JSON literal `null` ([`crate::stage_authorizer_failure_body`] pins the whole class).
+const AUTHORIZER_FAILED: (u16, &str) = (500, r#"{"message":null}"#);
 
 /// The ONE authorizer function every row is decided by: it fails for a token that ends in
 /// `raise` — which is what makes an invocation observable — and otherwise allows the method

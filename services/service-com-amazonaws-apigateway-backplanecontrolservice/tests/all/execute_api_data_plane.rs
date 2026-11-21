@@ -81,6 +81,12 @@ mod canary_release_and_vtl_transformation;
 /// `src/service/invoke.rs`'s own unit test varies the label.
 const REGION: &str = "us-east-1";
 
+/// The body a refusal the gateway sets NO error message for is answered with: the response
+/// type's own default template rendered with the message unset, so the `message` member is the
+/// JSON literal `null`. The whole class is pinned by
+/// [`crate::stage_authorizer_failure_body`]; here it is the answer one row owes.
+const NO_AUTHORIZER_DECISION: &str = r#"{"message":null}"#;
+
 /// One answered invoke: the status line, the headers asserted on, and the body verbatim.
 ///
 /// `pub(crate)` with [`invoke`], so the sibling `test_invoke_method_data_plane_parity`
@@ -1221,7 +1227,9 @@ async fn the_deployed_methods_authorization_decides_which_requests_are_served() 
         path: &'c str,
         headers: &'c [(&'c str, &'c str)],
         expected_status: u16,
-        /// The body for a served call, or the gateway response's `message` for a refusal.
+        /// The body for a served call, the gateway response's `message` for a refusal that
+        /// carries one, and [`NO_AUTHORIZER_DECISION`] for the refusal class that carries
+        /// none.
         expected: &'c str,
     }
     let cases: &[AuthorizationCase] = &[
@@ -1267,7 +1275,7 @@ async fn the_deployed_methods_authorization_decides_which_requests_are_served() 
             path: "/prod/custom",
             headers: &[("auth", "a-token")],
             expected_status: 500,
-            expected: "Internal server error",
+            expected: NO_AUTHORIZER_DECISION,
         },
         AuthorizationCase {
             name: "a method whose authorization type no authorizer can serve",
@@ -1336,6 +1344,15 @@ async fn the_deployed_methods_authorization_decides_which_requests_are_served() 
                 answered.body, case.expected,
                 "case {:?} (GET {path}): expected the body {:?}, got {:?}",
                 case.name, case.expected, answered.body
+            );
+        } else if case.expected == NO_AUTHORIZER_DECISION {
+            // A refusal the gateway sets no error message for carries the JSON literal `null`
+            // under the member, so there is no sentence to read off it: the whole body is
+            // what the rule owes ([`crate::stage_authorizer_failure_body`]).
+            assert_eq!(
+                answered.body, NO_AUTHORIZER_DECISION,
+                "case {:?} (GET {path}): expected the body {NO_AUTHORIZER_DECISION:?}, got {:?}",
+                case.name, answered.body
             );
         } else {
             assert_eq!(

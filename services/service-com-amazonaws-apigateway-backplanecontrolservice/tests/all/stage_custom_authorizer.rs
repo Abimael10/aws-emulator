@@ -10,8 +10,8 @@
 //! keyed by the value the request carried for its `identitySource`, until
 //! `FlushStageAuthorizersCache` drops it. An allowed call runs the method's integration and
 //! is answered with what the integration produced; a refused one earns the `403` API Gateway
-//! refuses it with; a function that produced no policy at all earns the `500` envelope AWS
-//! reserves for an authorizer that errors.
+//! refuses it with; a function that produced no policy at all earns the `500` AWS reserves
+//! for an authorizer that errors, whose body carries no message at all.
 //!
 //! The rows span what the rule generalises over:
 //!
@@ -78,9 +78,11 @@ const HELD_TTL: u32 = 300;
 /// what a call the authorizer was not even invoked for is answered with.
 const UNAUTHORIZED: (u16, &str) = (401, r#"{"message":"Unauthorized"}"#);
 
-/// The status and body an authorizer that produced no policy earns: the envelope AWS
-/// reserves for an authorizer that errors, times out or returns a malformed policy.
-const AUTHORIZER_FAILED: (u16, &str) = (500, r#"{"message":"Internal server error"}"#);
+/// The status and body an authorizer that produced no policy earns: AWS sets no error
+/// message for that class, so the gateway response's own default template renders the
+/// `message` member as the JSON literal `null` ([`crate::stage_authorizer_failure_body`]
+/// pins the whole class).
+const AUTHORIZER_FAILED: (u16, &str) = (500, r#"{"message":null}"#);
 
 /// The sentence a call the returned policy explicitly DENIES is refused with.
 const EXPLICIT_DENY: &str = "User is not authorized to access this resource with an explicit \

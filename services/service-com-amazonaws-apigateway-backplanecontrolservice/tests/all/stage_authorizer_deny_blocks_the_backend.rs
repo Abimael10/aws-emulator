@@ -833,9 +833,11 @@ async fn awaited_backend_line(
         .any(|message| message.contains(&wanted))
 }
 
-/// The body an authorizer whose decision could not be OBTAINED earns: the envelope AWS
-/// reserves for an authorizer that errors, times out or could not be invoked at all.
-const AUTHORIZER_FAILED: (u16, &str) = (500, "Internal server error");
+/// The status and body an authorizer whose decision could not be OBTAINED earns: AWS sets no
+/// error message for that class, so the gateway response's own default template renders the
+/// `message` member as the JSON literal `null` ([`crate::stage_authorizer_failure_body`] pins
+/// the whole class).
+const AUTHORIZER_FAILED: (u16, &str) = (500, r#"{"message":null}"#);
 
 /// What a `MOCK`-backed method answers an admitted call with, so the ROLE rows below observe
 /// the decision and nothing else.
@@ -1179,7 +1181,9 @@ async fn an_authorizer_naming_a_role_is_invoked_under_it_rather_than_by_the_func
                 answered.status,
                 answered.text()
             );
-            let reported = if answered.status == 200 {
+            let reported = if answered.status == 200 || !admitted {
+                // A served call is read by its body, and a call its authorizer left undecided
+                // carries no sentence to read at all — its whole body is the answer owed.
                 answered.text()
             } else {
                 answered.message()

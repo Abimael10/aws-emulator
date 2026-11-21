@@ -53,9 +53,9 @@ use crate::state::DeploymentEntry;
 fn resource_not_found(route: &str, verb: &str) -> GatewayRefusal {
     GatewayRefusal {
         response_type: "RESOURCE_NOT_FOUND",
-        message: Cow::Owned(format!(
+        message: Some(Cow::Owned(format!(
             "No method found matching route {route} for http method {verb}."
-        )),
+        ))),
         error_type: Some("NotFoundException"),
         validation_detail: Cow::Borrowed(""),
         message_member: MESSAGE_MEMBER,

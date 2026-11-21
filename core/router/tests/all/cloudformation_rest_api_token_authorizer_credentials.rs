@@ -12,7 +12,7 @@
 //! trust and permissions admit the call and the function's resource-based policy is not
 //! consulted; "to use resource-based permissions on the Lambda function, specify null", so an
 //! authorizer naming no role is admitted only by the grant on the function. An authorizer
-//! neither admits earns the `500` `{"message":"Internal server error"}` envelope API Gateway
+//! neither admits earns the `500` `{"message":null}` envelope API Gateway
 //! reserves for an authorizer it cannot invoke — and nothing else does.**
 //!
 //! Five crates have to agree for that to hold, which is why this suite lives here rather than
@@ -72,9 +72,10 @@ const EXPLICIT_DENY: &str = "User is not authorized to access this resource with
                              deny in an identity-based policy";
 const DENIED_STATUS: u16 = 403;
 
-/// The status and the fixed generic body API Gateway answers when the authorizer cannot be
-/// invoked at all.
-const CONFIGURATION_ERROR: (u16, &str) = (500, r#"{"message":"Internal server error"}"#);
+/// The status and the fixed body API Gateway answers when the authorizer cannot be invoked at
+/// all: no error message is set for that class, so the gateway response's own default template
+/// renders the `message` member as the JSON literal `null`.
+const CONFIGURATION_ERROR: (u16, &str) = (500, r#"{"message":null}"#);
 
 /// The authorizer function every row deploys: it reads the bearer token out of the `TOKEN`
 /// event it is handed and returns a policy that allows the invoked method for one token and
@@ -562,7 +563,7 @@ async fn assert_legs(router: &MultiServiceRouter, row: &Row, invoke_url: &str) {
         );
         // An admitted call is answered with the integration's own body; a call the returned
         // policy refused with the sentence its gateway response carries; and one whose
-        // authorizer was never invoked with the whole fixed generic envelope.
+        // authorizer was never invoked with the whole fixed envelope, whose message is unset.
         let reported = if status == 200 || !row.decided {
             answered.clone()
         } else {

@@ -6,11 +6,22 @@
 //! THE RULE UNDER TEST, over a SET of such calls rather than one recorded request: every
 //! refusal the `execute-api` endpoint answers through one of the API's gateway responses
 //! names that refusal's exception class in the `x-amzn-errortype` header a client classifies
-//! an answer by, and the class of every refusal whose body is the `Internal server error`
-//! envelope — an integration the stage cannot perform, an authorizer it cannot invoke at
-//! all, and an authorizer whose run produced no decision — is
-//! `InternalServerErrorException`. One envelope, one status, one class: a 5xx left without
-//! the header is an untyped failure, and retry or alarm logic keyed on the class never fires.
+//! an answer by, and WHICH class it is follows the part of the configuration that failed: an
+//! integration the stage cannot perform is an `InternalServerErrorException`, while a call
+//! its AUTHORIZER produced no decision for — one it cannot invoke at all, and one whose run
+//! produced none — is an `AuthorizerConfigurationException`. A 5xx left without the header is
+//! an untyped failure, and retry or alarm logic keyed on the class never fires.
+//!
+//! The BODIES follow the same split, and the rows state each: an integration the stage cannot
+//! perform carries the `Internal server error` sentence, while a call its authorizer left
+//! undecided carries the `{"message":null}` body AWS answers that class with, because the
+//! gateway sets no error message for it ([`crate::stage_authorizer_failure_body`] pins that
+//! half).
+//!
+//! The BODIES differ, and the rows state each: an integration the stage cannot perform carries
+//! the `Internal server error` sentence, while a call its authorizer left undecided carries
+//! the `{"message":null}` body AWS answers that class with, because the gateway sets no error
+//! message for it ([`crate::stage_authorizer_failure_body`] pins that half).
 //!
 //! The rows span what the rule generalises over: WHICH gateway response the refusal is
 //! answered through (`API_CONFIGURATION_ERROR` for the integration half,
@@ -47,16 +58,24 @@ const STAGE: &str = "live";
 /// The header the `x-amzn-errortype` class is read from, lowercased as HTTP names compare.
 const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 
-/// The class every refusal whose body is the `Internal server error` envelope is the wire
-/// form of.
+/// The class a refusal whose cause is the method's own configuration is the wire form of.
 const INTERNAL_SERVER_ERROR_EXCEPTION: &str = "InternalServerErrorException";
+
+/// The class a refusal of a call its AUTHORIZER produced no decision for is the wire form of.
+const AUTHORIZER_CONFIGURATION_EXCEPTION: &str = "AuthorizerConfigurationException";
 
 /// The class of the refusal whose body is `Missing Authentication Token`, which the control
 /// row asserts is unchanged by this rule.
 const MISSING_TOKEN_EXCEPTION: &str = "MissingAuthenticationTokenException";
 
-/// The sentence the uncustomized `Internal server error` envelope carries.
+/// The sentence the uncustomized `Internal server error` envelope carries, which is the body
+/// of every row whose INTEGRATION cannot be performed.
 const CONFIGURATION_ERROR: &str = "Internal server error";
+
+/// The body a call its AUTHORIZER left undecided carries instead: the response type's own
+/// default template rendered with no message set, so the `message` member is the JSON literal
+/// `null` ([`crate::stage_authorizer_failure_body`]).
+const NO_AUTHORIZER_DECISION: &str = r#"{"message":null}"#;
 
 /// The body the served `MOCK` route answers with: what proves a request reached an
 /// integration, so no refusal may carry it.
@@ -157,9 +176,13 @@ struct Unservable<'c> {
     case: &'c str,
     path: String,
     headers: Vec<(&'c str, &'c str)>,
+    /// The body the refusal's own class carries: the `message` sentence of an integration
+    /// that cannot be performed, and `None` for the authorizer class, whose body carries no
+    /// message at all.
+    message: Option<&'c str>,
 }
 
-/// Assert one unservable call: its status, its `message`, its class, and that nothing of an
+/// Assert one unservable call: its status, its body, its class, and that nothing of an
 /// integration's own answer reached the caller.
 async fn assert_internal_error(gateway: &Gateway, api: &str, call: &Unservable<'_>) {
     let answered: Invoked = invoke(gateway, api, "GET", &call.path, &call.headers).await;
@@ -168,18 +191,31 @@ async fn assert_internal_error(gateway: &Gateway, api: &str, call: &Unservable<'
         "case {:?}: expected 500, got {} with {:?}",
         call.case, answered.status, answered.body
     );
-    assert_eq!(
-        answered.message().as_deref(),
-        Some(CONFIGURATION_ERROR),
-        "case {:?}: expected the message {CONFIGURATION_ERROR:?}, got {:?}",
-        call.case,
-        answered.body
-    );
+    match call.message {
+        Some(message) => assert_eq!(
+            answered.message().as_deref(),
+            Some(message),
+            "case {:?}: expected the message {message:?}, got {:?}",
+            call.case,
+            answered.body
+        ),
+        None => assert_eq!(
+            answered.body, NO_AUTHORIZER_DECISION,
+            "case {:?}: expected the body {NO_AUTHORIZER_DECISION:?}, got {:?}",
+            call.case, answered.body
+        ),
+    }
+    // WHICH class follows the same split as the body: the authorizer's own class for a call
+    // it left undecided, and the server-fault one for a method's own configuration.
+    let class = if call.message.is_some() {
+        INTERNAL_SERVER_ERROR_EXCEPTION
+    } else {
+        AUTHORIZER_CONFIGURATION_EXCEPTION
+    };
     assert_eq!(
         answered.header(ERROR_TYPE_HEADER),
-        Some(INTERNAL_SERVER_ERROR_EXCEPTION),
-        "case {:?}: expected the refusal to name the class {INTERNAL_SERVER_ERROR_EXCEPTION:?}, \
-         got {:?}",
+        Some(class),
+        "case {:?}: expected the refusal to name the class {class:?}, got {:?}",
         call.case,
         answered.header(ERROR_TYPE_HEADER)
     );
@@ -278,36 +314,43 @@ async fn every_internal_error_a_deployed_stage_answers_names_its_exception_class
             case: "an AWS_PROXY integration whose function nothing answers for",
             path: format!("/{STAGE}/proxy"),
             headers: Vec::new(),
+            message: Some(CONFIGURATION_ERROR),
         },
         Unservable {
             case: "an AWS_PROXY uri that names no Lambda function invocation path",
             path: format!("/{STAGE}/elsewhere"),
             headers: Vec::new(),
+            message: Some(CONFIGURATION_ERROR),
         },
         Unservable {
             case: "an HTTP_PROXY uri carrying a placeholder nothing maps a path parameter onto",
             path: format!("/{STAGE}/passed-on"),
             headers: Vec::new(),
+            message: Some(CONFIGURATION_ERROR),
         },
         Unservable {
             case: "a MOCK integration with no integration response for the call",
             path: format!("/{STAGE}/unmapped"),
             headers: Vec::new(),
+            message: Some(CONFIGURATION_ERROR),
         },
         Unservable {
             case: "a MOCK request template this emulator does not render",
             path: format!("/{STAGE}/templated"),
             headers: vec![("content-type", JSON)],
+            message: Some(CONFIGURATION_ERROR),
         },
         Unservable {
             case: "a TOKEN authorizer whose authorizerUri names no function to invoke",
             path: format!("/{STAGE}/token-guarded"),
             headers: identity.clone(),
+            message: None,
         },
         Unservable {
             case: "a REQUEST authorizer whose function nothing answers for",
             path: format!("/{STAGE}/request-guarded"),
             headers: identity.clone(),
+            message: None,
         },
     ];
     for call in &unservable {
@@ -352,7 +395,7 @@ async fn every_internal_error_a_deployed_stage_answers_names_its_exception_class
 }
 
 #[tokio::test]
-async fn a_customized_five_xx_gateway_response_still_names_the_internal_server_error_class() {
+async fn a_customized_five_xx_gateway_response_still_names_the_refusals_class() {
     // A developer's `PutGatewayResponse` decides the status code and the body a refusal is
     // answered with; it does not decide which exception the refusal IS. Both ways a
     // customization applies are covered: the response type's own, and the `DEFAULT_5XX`
@@ -404,13 +447,14 @@ async fn a_customized_five_xx_gateway_response_still_names_the_internal_server_e
     }
     deploy(&gateway, &api, STAGE).await;
 
-    for (case, path, headers, status, message) in [
+    for (case, path, headers, status, message, class) in [
         (
             "a customized API_CONFIGURATION_ERROR response",
             format!("/{STAGE}/proxy"),
             Vec::new(),
             503,
             "the backend is not wired",
+            INTERNAL_SERVER_ERROR_EXCEPTION,
         ),
         (
             "an authorizer failure answered through the customized DEFAULT_5XX",
@@ -418,6 +462,7 @@ async fn a_customized_five_xx_gateway_response_still_names_the_internal_server_e
             vec![(IDENTITY_HEADER, IDENTITY_VALUE)],
             521,
             "something of ours broke",
+            AUTHORIZER_CONFIGURATION_EXCEPTION,
         ),
     ] {
         let answered = invoke(&gateway, &api, "GET", &path, &headers).await;
@@ -439,9 +484,8 @@ async fn a_customized_five_xx_gateway_response_still_names_the_internal_server_e
         );
         assert_eq!(
             answered.header(ERROR_TYPE_HEADER),
-            Some(INTERNAL_SERVER_ERROR_EXCEPTION),
-            "case {case:?}: expected the refusal to name the class \
-             {INTERNAL_SERVER_ERROR_EXCEPTION:?}, got {:?}",
+            Some(class),
+            "case {case:?}: expected the refusal to name the class {class:?}, got {:?}",
             answered.header(ERROR_TYPE_HEADER)
         );
     }

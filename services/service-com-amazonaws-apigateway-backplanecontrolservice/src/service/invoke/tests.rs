@@ -307,7 +307,7 @@ fn a_substituted_path_parameter_is_never_scanned_for_another_placeholder() {
 fn a_substituted_gateway_context_value_is_never_scanned_for_another_reference() {
     let refusal = |message: Cow<'static, str>, detail: Cow<'static, str>| GatewayRefusal {
         response_type: DEFAULT_4XX,
-        message,
+        message: Some(message),
         error_type: None,
         validation_detail: detail,
         message_member: MESSAGE_MEMBER,
