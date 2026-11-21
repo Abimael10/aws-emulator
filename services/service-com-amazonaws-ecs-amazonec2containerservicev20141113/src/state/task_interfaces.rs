@@ -81,25 +81,32 @@ pub const INTERFACE_DETACH_LIFECYCLE: [&str; 4] = [
 /// How long Amazon ECS takes over ONE step of [`INTERFACE_DETACH_LIFECYCLE`].
 ///
 /// EMULATOR-CHOSEN, as [`INTERFACE_STEP_SPAN`] is, and one task transition
-/// ([`TRANSITION_SPAN`]) rather than that longer span, for two reasons: releasing the
-/// interface is part of the task's own STOP — Amazon ECS takes these steps before the task is
-/// stopped, which is what a task on its way out is waiting for — so a step of the release is
-/// a step of that stop and the stop as a whole is the sum of them; and no agent has a release
-/// status to acknowledge, which is what makes an ATTACH step the longer one: the only status a
-/// report may name is `ATTACHED` ([`AGENT_REPORT_ATTACHMENT_STATUSES`]), so nothing is waiting
-/// to observe a `DETACHING` and report on it.
+/// ([`TRANSITION_SPAN`]): releasing the interface is part of the task's own STOP — Amazon ECS
+/// takes these steps before the task is stopped, which is what a task on its way out is
+/// waiting for — so a step of the release is a step of that stop and the stop as a whole is
+/// the sum of them.
 pub const INTERFACE_RELEASE_STEP_SPAN: Duration = TRANSITION_SPAN;
 
 /// How long Amazon ECS takes over ONE step of [`INTERFACE_ATTACH_LIFECYCLE`].
 ///
 /// EMULATOR-CHOSEN — AWS publishes no duration for creating and attaching a task's
-/// interface — and deliberately much longer than one task transition
-/// ([`TRANSITION_SPAN`]): the ECS agent ACKNOWLEDGES the status an attachment is in
-/// (`SubmitAttachmentStateChanges`: "Sent to acknowledge that an attachment changed
-/// states"), so every status the interface passes through has to last long enough for an
-/// agent that polls the task to observe it and report on it, not merely to sit between two
-/// reads of the record.
-pub const INTERFACE_STEP_SPAN: Duration = Duration::from_secs(3);
+/// interface — and one task transition ([`TRANSITION_SPAN`]), the span a step of the RELEASE
+/// already takes ([`INTERFACE_RELEASE_STEP_SPAN`]): creating and attaching the interface is
+/// part of the task's own LAUNCH — it is what `PROVISIONING` reports and what the task's
+/// `PENDING` waits for ([`placement_schedule`]) — so a step of the attach is a step of that
+/// launch and the launch as a whole is the sum of them, exactly as the stop is the sum of the
+/// release's.
+///
+/// One transition span is a span a reader really observes each status across: it is the span
+/// every other step of the task's own lifecycle takes, including the `PENDING` an agent
+/// acknowledges with `SubmitTaskStateChange` and the `ATTACHED` it acknowledges with
+/// `SubmitAttachmentStateChanges` ("Sent to acknowledge that an attachment changed states").
+/// It is also short enough that the whole lifecycle of a task — placed, started, its work
+/// done, its interface released, stopped — is a handful of spans, which is what lets a client
+/// run SEVERAL tasks one after another, each waiting out the one before it (the shape a
+/// scenario that hands data from one task to the next over a shared volume takes), and get its
+/// answer inside an ordinary poll budget.
+pub const INTERFACE_STEP_SPAN: Duration = TRANSITION_SPAN;
 
 /// What the clock owes a task the moment it is PLACED: the `lastStatus` it is placed in,
 /// and when each of its next two transitions falls due.

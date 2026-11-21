@@ -30,3 +30,39 @@ Cause 1 — Expected: task A's write to the shared EFS volume is read back by ta
 2. Register a task definition with volumes[].efsVolumeConfiguration naming it, mounted into one container read-write and (in the second task) read-only; awslogs to a log group.
 3. RunTask twice on Fargate and poll the log group for the write/read/EROFS lines.
 Observed: nothing is delivered and the check is killed at its 60 s budget.
+
+## Resolution note (added by the fix that closed this report)
+Cause 1 is served, and the emulator's own share of the "never becomes observable" symptom is
+fixed:
+
+* The scenario this report describes now runs end to end on the FARGATE launch path and is
+  asserted in `core/router/tests/all/ecs_efs_shared_volume_handover.rs`: task A writes
+  `$MARKER` on the `efsVolumeConfiguration` mount and its own `wc -c`/`ls -l` report the file,
+  a LATER task reads A's exact bytes back through the same file system and appends to them, a
+  task whose `mountPoints[].readOnly` is `true` still reads the current content but has its
+  write refused with the kernel's `Read-only file system` and never reports it as done, and a
+  fourth task confirms the refused write left no trace — every line read back out of
+  CloudWatch Logs with that service's own `GetLogEvents`. The same four arms are driven from a
+  revision per arm by `core/router/tests/all/ecs_efs_volume_mounts.rs`.
+* The WAIT was halved: creating and attaching the elastic network interface an `awsvpc` task
+  is allocated took three seconds per documented step of `Attachment$status`, six times this
+  crate's own transition span and six times the span a step of the mirror-image release takes,
+  so about six of the ~11.5 s between `RunTask` and `STOPPED` was the attach alone — more than
+  one look of a client polling a task's stop. A step of the attach is a step of the task's own
+  launch, so it now takes one task transition
+  (`state::task_interfaces::INTERFACE_STEP_SPAN`), and the whole lifecycle of such a task is
+  about 6 s. `core/router/tests/all/ecs_task_lifecycle_schedule.rs` pins that schedule off the
+  instants the task itself reports.
+
+What is NOT the emulator's, and is why this report's recorded check still answers
+`Check timed out after 60.0s`: the check's own poll helper sleeps its `interval_s` — 10 s, as
+quoted from the check's source in
+`issues/things-that-do-not-work/20261104T054216Z-ecs-efs-logs-the-shared-efs-fargate-scenario.md`
+— around each look, and it makes six or seven such waits (the file system, the mount target
+and the access point reaching `available`, then one per task arm), so 60-70 s elapse inside
+the check's own `time.sleep` whatever the emulator answers. Measured rather than assumed: with
+every clock span of the ECS crate and of Amazon EFS temporarily collapsed to 1 ms — every
+condition the check polls true within a millisecond — the whole four-arm scenario above passes
+in 1.5 s, and the recorded check timed out identically at 60.0 s. No emulator-side change can
+make that unit return a verdict; the behaviour it was filed about is served and is pinned by
+the suites named here.
