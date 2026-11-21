@@ -430,22 +430,57 @@ impl IndexedResource {
                     last_reported_at: Some(::aws_smithy_types::DateTime::from(
                         self.last_reported_at,
                     )),
-                    data: Some(::aws_smithy_types::Document::Object(
-                        self.tags
-                            .iter()
-                            .map(|(key, value)| {
-                                (
-                                    key.clone(),
-                                    ::aws_smithy_types::Document::String(value.clone()),
-                                )
-                            })
-                            .collect(),
-                    )),
+                    data: Some(tags_property_data(&self.tags)),
                 }]
             }),
         }
     }
 }
+
+/// The `tags` resource property's `Data` document for one resource's tag set.
+///
+/// `ResourceProperty$Data` is a `@document` whose "content of this field is a JSON object
+/// that varies based on the resource type"
+/// (`smithy_query(query="shape",shape="ResourceProperty")`), and what Resource Explorer
+/// puts in it for the `tags` property is the resource's tag set as a LIST, one entry per
+/// tag, each a structure with the members `Key` and `Value` — the same form every AWS
+/// tagging API reports a tag set in. A client walking a resource's tags iterates that
+/// list and reads those two members, so a flat `{key: value}` object is a document no such
+/// walk can read.
+///
+/// The entries are ordered by tag key, so two reads of one unchanged resource report the
+/// same document (the stored tag set is a hash map, whose iteration order is not stable).
+fn tags_property_data(tags: &HashMap<String, String>) -> ::aws_smithy_types::Document {
+    let mut entries: Vec<(&String, &String)> = tags.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    ::aws_smithy_types::Document::Array(
+        entries
+            .into_iter()
+            .map(|(key, value)| {
+                ::aws_smithy_types::Document::Object(
+                    [
+                        (
+                            TAG_KEY_MEMBER.to_string(),
+                            ::aws_smithy_types::Document::String(key.clone()),
+                        ),
+                        (
+                            TAG_VALUE_MEMBER.to_string(),
+                            ::aws_smithy_types::Document::String(value.clone()),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The member one entry of the [`TAGS_PROPERTY`] document names a tag's key in.
+const TAG_KEY_MEMBER: &str = "Key";
+
+/// The member one entry of the [`TAGS_PROPERTY`] document carries that key's value in.
+const TAG_VALUE_MEMBER: &str = "Value";
 
 /// Per-service state for com-amazonaws-resourceexplorer2-resourceexplorer. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]

@@ -166,10 +166,18 @@ fn own_arn(region: &str, resource: &str) -> String {
 }
 
 /// A timestamp member as seconds since the epoch, for comparing two answers' instants.
+///
+/// Every timestamp member of this model carries `@timestampFormat("date-time")`, so each
+/// one travels as the RFC 3339 date-time string this reads the instant back out of.
 fn epoch(case: &str, value: &Value) -> f64 {
-    value
-        .as_f64()
-        .unwrap_or_else(|| panic!("case {case:?}: expected an epoch timestamp, got {value}"))
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a date-time timestamp, got {value}"));
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: expected an RFC 3339 date-time, got {text:?}: {error}")
+        })
+        .as_secs_f64()
 }
 
 /// Wait out the transient index state, then report what `GetIndex` says.

@@ -1247,7 +1247,7 @@ async fn the_view_filter_intersects_the_query_string() {
     );
     assert_eq!(
         resource["Properties"][0]["Data"],
-        json!({ "env": "prod" }),
-        "the reported tags are the stored ones, got {resource}"
+        json!([{ "Key": "env", "Value": "prod" }]),
+        "the reported tags are the stored ones, as a list of Key/Value entries, got {resource}"
     );
 }

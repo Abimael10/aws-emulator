@@ -192,11 +192,19 @@ fn property_names(view: &Value) -> Vec<String> {
 }
 
 /// A view's `LastUpdatedAt` as a number of seconds, for comparing one read with another.
+///
+/// `View$LastUpdatedAt` carries `@timestampFormat("date-time")`, so it travels as the RFC
+/// 3339 date-time string this reads the instant back out of.
 fn last_updated_at(view: &Value) -> f64 {
     let value = view["LastUpdatedAt"].clone();
-    value
-        .as_f64()
-        .unwrap_or_else(|| panic!("a View carries a numeric LastUpdatedAt, got {value}"))
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("a View carries a date-time LastUpdatedAt, got {value}"));
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("a View's LastUpdatedAt is an RFC 3339 date-time, got {text:?}: {error}")
+        })
+        .as_secs_f64()
 }
 
 /// The two members of a view an update rewrites, as one comparable value.

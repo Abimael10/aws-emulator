@@ -557,8 +557,8 @@ async fn the_index_reports_every_owning_services_resources_in_its_region() {
             );
         }
         assert!(
-            found["LastReportedAt"].is_number() || found["LastReportedAt"].is_string(),
-            "case {:?}: expected a LastReportedAt instant, got {found}",
+            is_date_time(&found["LastReportedAt"]),
+            "case {:?}: expected a LastReportedAt date-time string, got {found}",
             resource.case
         );
     }
@@ -1324,9 +1324,10 @@ async fn the_index_follows_the_owning_services_own_records() {
         "case {case:?}: a view that includes the tags property reports it, got {properties}"
     );
     assert_eq!(
-        properties[0]["Data"]["stage"],
-        json!("test"),
-        "case {case:?}: the reported tags are the owner's own, got {properties}"
+        properties[0]["Data"],
+        json!([{ "Key": "stage", "Value": "test" }]),
+        "case {case:?}: the reported tags are the owner's own, as a list of Key/Value \
+         entries, got {properties}"
     );
 
     // A delete there removes it from the index; the queues beside it stay.
@@ -1476,4 +1477,296 @@ async fn a_query_changes_nothing_a_later_caller_sees() {
         "case {case:?}: a read must leave the index exactly as it was, got {} then {}",
         before.body, after.body
     );
+}
+
+// =====================================================================================
+// The wire FORM of what a query answers: the shapes an SDK client deserializes
+// =====================================================================================
+
+/// Whether `value` is the RFC 3339 / ISO-8601 date-time STRING a member the model marks
+/// `@timestampFormat("date-time")` travels as on this restJson1 service.
+///
+/// The epoch-seconds NUMBER the JSON protocols default to for a timestamp is exactly what
+/// this rejects: an SDK deserializing a `date-time` member runs a date-time parser over it
+/// and does not coerce a bare number. Smithy's `date-time` is RFC 3339 at the `Z` offset,
+/// so the date/time separator and the designator are part of the form.
+fn is_date_time(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        text.contains('T')
+            && text.ends_with('Z')
+            && ::aws_smithy_types::DateTime::from_str(
+                text,
+                ::aws_smithy_types::date_time::Format::DateTime,
+            )
+            .is_ok()
+    })
+}
+
+/// RULE: a timestamp member this model marks `@timestampFormat("date-time")` travels on
+/// the wire as an RFC 3339 date-time STRING, never as the epoch-seconds number the JSON
+/// protocol defaults to.
+///
+/// The rows span the operations and the members the rule covers — every timestamp member
+/// this model declares carries that format: the resource and its reported property
+/// (`Resource$LastReportedAt`, `ResourceProperty$LastReportedAt`, on both query
+/// operations), a view (`View$LastUpdatedAt`, as created and as read back) and an index
+/// (`GetIndexOutput$CreatedAt`/`$LastUpdatedAt`, `CreateIndexOutput$CreatedAt`). The
+/// recorded case — one `ListResources` resource and its `tags` property — is two rows.
+#[tokio::test]
+async fn every_declared_date_time_member_travels_as_a_date_time_string() {
+    let fixture = Fixture::new().await;
+    // (case, the member's value as it reached the wire)
+    let mut reported: Vec<(String, Value)> = Vec::new();
+
+    // The two query operations, which project an indexed resource the same way: the
+    // listing uses the default view, which includes the `tags` property, so each
+    // resource's property carries its own instant beside the resource's.
+    for (operation, request) in [
+        ("ListResources", json!({ "Filters": { "FilterString": "" } })),
+        ("Search", json!({ "QueryString": "" })),
+    ] {
+        let answer = fixture.emulator.explorer(REGION, operation, request).await;
+        let resources = answer.ok(operation)["Resources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {operation:?}: expected a Resources list"))
+            .clone();
+        assert!(
+            !resources.is_empty(),
+            "case {operation:?}: the fixture's index holds resources, got {}",
+            answer.body
+        );
+        for resource in resources {
+            let arn = resource["Arn"].as_str().unwrap_or_default().to_string();
+            reported.push((
+                format!("{operation} Resources[{arn}].LastReportedAt"),
+                resource["LastReportedAt"].clone(),
+            ));
+            let properties = resource["Properties"].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                properties.len(),
+                1,
+                "case {operation:?}: the view includes the {TAGS_PROPERTY} property, so \
+                 {arn} reports it, got {resource}"
+            );
+            for property in properties {
+                reported.push((
+                    format!("{operation} Resources[{arn}].Properties[].LastReportedAt"),
+                    property["LastReportedAt"].clone(),
+                ));
+            }
+        }
+    }
+
+    // The same rule holds on every other member the model marks with the format: a view's
+    // own last-updated instant, on the answer that created it and on the read back, and an
+    // index's created and last-updated instants.
+    let created_view = fixture
+        .emulator
+        .explorer(REGION, "CreateView", json!({ "ViewName": "wire-form" }))
+        .await;
+    reported.push((
+        "CreateView View.LastUpdatedAt".to_string(),
+        created_view.ok("CreateView")["View"]["LastUpdatedAt"].clone(),
+    ));
+    let read_view = fixture
+        .emulator
+        .explorer(
+            REGION,
+            "GetView",
+            json!({ "ViewArn": &fixture.default_view }),
+        )
+        .await;
+    reported.push((
+        "GetView View.LastUpdatedAt".to_string(),
+        read_view.ok("GetView")["View"]["LastUpdatedAt"].clone(),
+    ));
+    let read_index = fixture.emulator.explorer(REGION, "GetIndex", json!({})).await;
+    for member in ["CreatedAt", "LastUpdatedAt"] {
+        reported.push((
+            format!("GetIndex {member}"),
+            read_index.ok("GetIndex")[member].clone(),
+        ));
+    }
+    let third_region = "ap-northeast-1";
+    let created_index = fixture
+        .emulator
+        .explorer(
+            third_region,
+            "CreateIndex",
+            json!({ "ClientToken": third_region }),
+        )
+        .await;
+    reported.push((
+        "CreateIndex CreatedAt".to_string(),
+        created_index.ok("CreateIndex")["CreatedAt"].clone(),
+    ));
+
+    for (case, value) in reported {
+        assert!(
+            is_date_time(&value),
+            "case {case:?}: the model marks this member @timestampFormat(\"date-time\"), so \
+             it must be an RFC 3339 date-time string, got {value}"
+        );
+    }
+}
+
+/// RULE: the `tags` resource property reports a resource's tag set in its `Data` document
+/// as a LIST with one entry per tag, each entry an object carrying the tag's key under
+/// `Key` and its value under `Value` — the form every AWS tagging surface reports a tag
+/// set in, and the one a client walking a resource's tags iterates.
+///
+/// The rows span what the rule generalises over: the NUMBER of tags on the resource (none,
+/// one, several), the ORDER the owning service wrote them in, punctuation in a key, and a
+/// tag whose value is the empty string. Both query operations report the identical
+/// document for one resource, because one projection builds it.
+#[tokio::test]
+async fn the_tags_property_reports_one_key_value_entry_per_tag() {
+    let emulator = Emulator::new();
+    emulator.create_index(REGION).await;
+    let view = emulator
+        .create_view(
+            REGION,
+            json!({
+                "ViewName": "tagged",
+                "IncludedProperties": [{ "Name": TAGS_PROPERTY }],
+            }),
+        )
+        .await;
+    emulator.set_default_view(REGION, &view).await;
+
+    // (case, the queue name, the tag set written through the owning service, the document
+    // the `tags` property must report)
+    let rows: Vec<(&str, &str, Value, Value)> = vec![
+        ("a resource carrying no tags", "untagged", Value::Null, json!([])),
+        (
+            "one tag",
+            "single",
+            json!({ "stage": "prod" }),
+            json!([{ "Key": "stage", "Value": "prod" }]),
+        ),
+        (
+            "three tags, written in another order",
+            "triple",
+            json!({ "team": "payments", "cost:center": "4711", "stage": "prod" }),
+            json!([
+                { "Key": "cost:center", "Value": "4711" },
+                { "Key": "stage", "Value": "prod" },
+                { "Key": "team", "Value": "payments" },
+            ]),
+        ),
+        (
+            "a tag whose value is the empty string",
+            "empty-value",
+            json!({ "stage": "" }),
+            json!([{ "Key": "stage", "Value": "" }]),
+        ),
+    ];
+
+    let mut expected: Vec<(&str, String, Value)> = Vec::new();
+    for (case, name, tags, document) in rows {
+        let (_, arn) = emulator.create_queue(REGION, name, Value::Null, tags).await;
+        expected.push((case, arn, document));
+    }
+
+    for (operation, request) in [
+        ("ListResources", json!({ "Filters": { "FilterString": "service:sqs" } })),
+        ("Search", json!({ "QueryString": "service:sqs" })),
+    ] {
+        let answer = emulator.explorer(REGION, operation, request).await;
+        let resources = answer.ok(operation)["Resources"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {operation:?}: expected a Resources list"))
+            .clone();
+        for (case, arn, document) in &expected {
+            let found = resources
+                .iter()
+                .find(|candidate| candidate["Arn"] == json!(arn))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?} ({operation}): {arn} is not in {}", answer.body)
+                });
+            assert_eq!(
+                found["Properties"][0]["Name"],
+                json!(TAGS_PROPERTY),
+                "case {case:?} ({operation}): the view includes the {TAGS_PROPERTY} \
+                 property, so the resource reports it, got {found}"
+            );
+            assert_eq!(
+                found["Properties"][0]["Data"],
+                *document,
+                "case {case:?} ({operation}): expected the {TAGS_PROPERTY} document \
+                 {document}, got {}",
+                found["Properties"][0]["Data"]
+            );
+        }
+    }
+}
+
+/// RULE: a failure of this service reports its detail text in the body member `message` —
+/// the same member its framework-rendered refusals already carry it in, so a client reads
+/// one member whichever layer answered.
+///
+/// The rows span the failure classes a query earns: the authorization failure a `ViewArn`
+/// that resolves to no view this account holds is answered with (whose text is wholly
+/// fixed for that class), the modelled refusals the operation words itself, and a request
+/// body that breaks a modelled constraint, which the framework refuses before the handler
+/// runs. The recorded case — the 401 — is one row.
+#[tokio::test]
+async fn a_failures_detail_text_is_reported_in_the_message_member() {
+    let fixture = Fixture::new().await;
+    // (case, the request, the status, the error code, the exact text where the class fixes
+    // it)
+    let rows: Vec<(&str, Value, u16, &str, Option<&str>)> = vec![
+        (
+            "a ViewArn that resolves to no view this account holds",
+            json!({ "ViewArn": format!(
+                "arn:aws:resource-explorer-2:{REGION}:{ACCOUNT_ID}:view/ghost/\
+                 0f8c2a1e-5d3b-8a47-9c61-2b7e4d905a13"
+            ) }),
+            401,
+            "UnauthorizedException",
+            Some("Unauthorized"),
+        ),
+        (
+            "a filter string carrying free-form text",
+            json!({ "Filters": { "FilterString": "orders" } }),
+            400,
+            "ValidationException",
+            None,
+        ),
+        (
+            "a page size outside the modelled range",
+            json!({ "MaxResults": 0 }),
+            400,
+            "ValidationException",
+            None,
+        ),
+    ];
+
+    for (case, request, status, code, text) in rows {
+        let answer = fixture
+            .emulator
+            .explorer(REGION, "ListResources", request)
+            .await;
+        answer.failed(case, status, code);
+        let reported = answer.body.get("message").and_then(Value::as_str);
+        assert!(
+            reported.is_some_and(|message| !message.is_empty()),
+            "case {case:?}: the failure must report its text in `message`, got {}",
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("Message"),
+            None,
+            "case {case:?}: this service reports that text in `message` alone, got {}",
+            answer.body
+        );
+        if let Some(expected) = text {
+            assert_eq!(
+                reported,
+                Some(expected),
+                "case {case:?}: expected the fixed text {expected:?}, got {}",
+                answer.body
+            );
+        }
+    }
 }

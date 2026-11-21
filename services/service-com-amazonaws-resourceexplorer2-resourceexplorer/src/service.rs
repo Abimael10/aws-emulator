@@ -66,6 +66,13 @@
 //! A rule the model states only in prose is NOT this answer: it is refused by the
 //! operation that owns it, as the modelled `ValidationException` naming what failed (a
 //! filter string carrying free-form text, an index in a state that forbids the call).
+//!
+//! A sixth seam, `override_protocol`, is the one this service also takes: the codec every
+//! modelled body is read with and written with. See [`wire`] for the two corrections it
+//! carries — the `date-time` timestamp form this model declares, and the body member a
+//! failure reports its detail text in.
+
+pub mod wire;
 
 use service_common::front_door::{FrontDoorTable, INVALID_REQUEST_BODY};
 use service_common::validation::SubmittedEcho;
@@ -107,6 +114,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// — and built from the SAME shared engine, so a wrapped operation reads and writes
     /// the one store.
     front_door: OperationRoutingTable,
+    /// The codec every modelled body of this service is read with and written with, built
+    /// ONCE here because [`Service::override_protocol`] hands back a borrow of `&self` and
+    /// must never build a protocol per request. See [`wire`].
+    protocol: wire::ResourceExplorerRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -172,6 +183,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             front_door: front_door.finish(),
+            protocol: wire::ResourceExplorerRestJson::new(),
         }
     }
 }
@@ -192,6 +204,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,
         }
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every modelled answer of this service — success and failure alike, and the front
+        // door's own refusals, which read the request with the codec resolved here — goes
+        // through this one codec, so no two answers of this service can disagree about the
+        // form a timestamp travels in or the member a failure's text is reported under.
+        Some(&self.protocol)
     }
 
     fn override_operation(
