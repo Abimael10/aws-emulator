@@ -23,6 +23,13 @@
 //!   and the fixed `value` where the catalog publishes one — and an object that
 //!   requires properties names them in its own `required` list. A bare property name is
 //!   not a descriptor.
+//! * The metadata a property carries is the PUBLISHED catalog's own, served as the
+//!   catalog holds it for whichever provider service is addressed: the prose is the
+//!   provider's sentence for that property rather than one built from the property's
+//!   name, an identifier's `pattern` is the provider's own expression — the literal
+//!   prefixes its ids begin with included, where it publishes them — rather than a
+//!   permissive character class, and every key the catalog publishes for a property, the
+//!   per-property `required` flag included, reaches the wire with its own value.
 //! * `ProviderMarketplaceConfiguration.listingId` is the id of the Data Exchange
 //!   LISTING the provider service is subscribed through, which carries the fixed
 //!   `prodview-` prefix, while the data set, revision and asset it resolves to are Data
@@ -33,6 +40,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use regex::Regex;
 use serde_json::Value;
 
 use crate::schema_mapping_workflow_lifecycle::{list_member, string_member, Emulator, Reply, REGION};
@@ -350,6 +358,32 @@ async fn every_documented_provider_populates_the_catalog_in_key_order() {
     );
 }
 
+/// Is `pattern` anchored at both ends, so a caller validating a candidate value with it
+/// accepts only a WHOLE value?
+///
+/// A published pattern anchors its end with `$`, and its start either directly with `^`
+/// or — where the value may begin with any of several literal prefixes — inside every
+/// branch of a LEADING alternation, which is how a provider publishes the prefixes its
+/// identifiers can start with. An alternation anywhere else would let the expression
+/// match mid-value, so it is not anchoring.
+fn is_anchored(pattern: &str) -> bool {
+    if !pattern.ends_with('$') {
+        return false;
+    }
+    if pattern.starts_with('^') {
+        return true;
+    }
+    let Some((alternation, rest)) = pattern
+        .strip_prefix('(')
+        .and_then(|rest| rest.split_once(')'))
+    else {
+        return false;
+    };
+    !alternation.is_empty()
+        && alternation.split('|').all(|branch| branch.starts_with('^'))
+        && !rest.contains('|')
+}
+
 /// What a descriptor may declare as the `type` of the value that goes in a property.
 const PROPERTY_TYPES: [&str; 3] = ["string", "boolean", "object"];
 
@@ -447,7 +481,7 @@ fn check_schema_object(case: &str, path: &str, schema: &Value, seen: &mut Metada
                 .as_str()
                 .unwrap_or_else(|| panic!("case {case:?}: {property_path}.pattern is a regular expression, got {pattern:?}"));
             assert!(
-                pattern.starts_with('^') && pattern.ends_with('$'),
+                is_anchored(pattern),
                 "case {case:?}: {property_path}.pattern must match the whole value, got \
                  {pattern:?}"
             );
@@ -638,4 +672,418 @@ async fn the_marketplace_configuration_reports_the_listing_it_is_subscribed_thro
         listings.len() >= PROVIDERS.len(),
         "every published provider service reports its own listing, got {listings:?}"
     );
+}
+
+/// How the published catalog states that a `providerProperties` payload must carry a
+/// property, which is what the served descriptor has to show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Requiredness {
+    /// The catalog publishes no requiredness: neither the declaring object's `required`
+    /// list nor a `required` key on the property's own descriptor.
+    Unpublished,
+    /// The declaring object names the property in its own JSON Schema `required` list.
+    Listed,
+    /// The property's own descriptor carries a `required` flag with this value — which
+    /// is a KEY a caller reads, so `false` is published rather than left out.
+    Flag(bool),
+}
+
+/// One property of one entry's definition documents, with the metadata the published
+/// catalog carries for it.
+///
+/// Source: the AWS-managed provider-service catalog as this emulator seeds it
+/// (`src/state/provider_catalog.rs`), which is what `GetProviderService` serves for the
+/// addressed `providerName`/`providerServiceName`. These rows span the catalog rather
+/// than one entry: three providers, all three definition documents, properties nested
+/// one and two levels deep, string- and flag-valued ones, and each of the three ways
+/// requiredness is published.
+struct PropertyCase {
+    provider_name: &'static str,
+    provider_service_name: &'static str,
+    /// Which definition document declares it.
+    document: &'static str,
+    /// The member names from the document down to the property.
+    path: &'static [&'static str],
+    /// The catalog's own prose for the property.
+    description: &'static str,
+    /// How the catalog publishes its requiredness.
+    requiredness: Requiredness,
+    /// The `pattern` the catalog publishes for its value, where this row pins the
+    /// expression itself.
+    pattern: Option<&'static str>,
+    /// Values the published `pattern` must ACCEPT — one per form the provider mints.
+    accepted: &'static [&'static str],
+    /// Values it must REJECT, so a caller that validates locally refuses exactly what
+    /// the provider would.
+    rejected: &'static [&'static str],
+}
+
+/// The properties the rule is asserted over.
+const PROPERTY_CASES: &[PropertyCase] = &[
+    // LiveRamp's own identifier: its prose, and the alternation of the literal prefixes
+    // a RampID begins with followed by the character class the rest is drawn from, so a
+    // candidate carrying no such prefix is refused.
+    PropertyCase {
+        provider_name: "liveramp",
+        provider_service_name: "assignment",
+        document: "providerEntityOutputDefinition",
+        path: &["entity", "RAMPID"],
+        description:
+            "LiveRamp's universal identifier that is tied to devices in the LiveRamp Identity Graph",
+        requiredness: Requiredness::Listed,
+        pattern: Some("(^XY|^Xi|^Xc|^Xm|^hY)[a-zA-Z0-9_-]*$"),
+        accepted: &["XYabc123", "Xi_9-Z", "Xc0", "Xm-A", "hYZZZ"],
+        rejected: &["xyabc123", "ZZabc123", "Yh123", "abcXY", "XY abc", "X"],
+    },
+    // The same identifier published by another of that provider's services carries the
+    // same catalog metadata, byte for byte.
+    PropertyCase {
+        provider_name: "liveramp",
+        provider_service_name: "idmapping",
+        document: "providerEntityOutputDefinition",
+        path: &["entity", "RAMPID"],
+        description:
+            "LiveRamp's universal identifier that is tied to devices in the LiveRamp Identity Graph",
+        requiredness: Requiredness::Listed,
+        pattern: Some("(^XY|^Xi|^Xc|^Xm|^hY)[a-zA-Z0-9_-]*$"),
+        accepted: &["XYabc123", "hY0-_Z"],
+        rejected: &["QQabc123", "xyabc123"],
+    },
+    PropertyCase {
+        provider_name: "transunion",
+        provider_service_name: "assignment",
+        document: "providerEntityOutputDefinition",
+        path: &["entity", "TRUAUDIENCE_ID"],
+        description: "TransUnion's persistent identifier for the individual a record resolves to \
+                      in the TruAudience identity graph",
+        requiredness: Requiredness::Listed,
+        pattern: Some("^[a-zA-Z0-9]+$"),
+        accepted: &["A1b2C3", "0123456789abcdefABCDEF"],
+        rejected: &["has-hyphen", "has_underscore", "has space", ""],
+    },
+    PropertyCase {
+        provider_name: "uid2",
+        provider_service_name: "assignment",
+        document: "providerEntityOutputDefinition",
+        path: &["entity", "UID2"],
+        description: "Unified ID 2.0 token issued for the email address or phone number in a \
+                      record",
+        requiredness: Requiredness::Listed,
+        pattern: Some("^[a-zA-Z0-9+/=]+$"),
+        accepted: &["QWxhZGRpbjpvcGVuc2VzYW1l", "abcABC123+/="],
+        rejected: &["under_score", "dash-dash", "with space"],
+    },
+    // The job knobs: the catalog's prose for each, and the `required` flag on the two it
+    // publishes one for — `false`, the key present.
+    PropertyCase {
+        provider_name: "liveramp",
+        provider_service_name: "assignment",
+        document: "providerJobConfiguration",
+        path: &["data_format"],
+        description: "Data format expected by Provider",
+        requiredness: Requiredness::Unpublished,
+        pattern: None,
+        accepted: &[],
+        rejected: &[],
+    },
+    PropertyCase {
+        provider_name: "liveramp",
+        provider_service_name: "assignment",
+        document: "providerJobConfiguration",
+        path: &["include_source_id"],
+        description: "Include UNIQUE_ID in the mappings for creating a job",
+        requiredness: Requiredness::Flag(false),
+        pattern: None,
+        accepted: &[],
+        rejected: &[],
+    },
+    PropertyCase {
+        provider_name: "liveramp",
+        provider_service_name: "assignment",
+        document: "providerJobConfiguration",
+        path: &["prepare_job"],
+        description: "Prepare a job before starting it",
+        requiredness: Requiredness::Flag(false),
+        pattern: None,
+        accepted: &[],
+        rejected: &[],
+    },
+    // The same knobs on another service of that provider.
+    PropertyCase {
+        provider_name: "liveramp",
+        provider_service_name: "assignment-pii",
+        document: "providerJobConfiguration",
+        path: &["prepare_job"],
+        description: "Prepare a job before starting it",
+        requiredness: Requiredness::Flag(false),
+        pattern: None,
+        accepted: &[],
+        rejected: &[],
+    },
+    // Two levels deep: the property inside the job's intermediate-data location.
+    PropertyCase {
+        provider_name: "liveramp",
+        provider_service_name: "idmapping",
+        document: "providerJobConfiguration",
+        path: &["intermediateSourceConfiguration", "intermediateS3Path"],
+        description: "Amazon S3 path under which the intermediate data is written",
+        requiredness: Requiredness::Listed,
+        pattern: None,
+        accepted: &[],
+        rejected: &[],
+    },
+    // The configuration document: a credential handed over as a Secrets Manager secret
+    // ARN, whose published pattern accepts an ARN of that form and nothing else.
+    PropertyCase {
+        provider_name: "liveramp",
+        provider_service_name: "assignment",
+        document: "providerConfigurationDefinition",
+        path: &["client_id"],
+        description: "SecretsManagerclientid",
+        requiredness: Requiredness::Listed,
+        pattern: None,
+        accepted: &["arn:aws:secretsmanager:us-east-1:123456789012:secret:liveramp/client-id"],
+        rejected: &[
+            "liveramp-client-id",
+            "arn:aws:secretsmanager:us-east-1:12345:secret:short-account",
+        ],
+    },
+    PropertyCase {
+        provider_name: "liveramp",
+        provider_service_name: "assignment",
+        document: "providerConfigurationDefinition",
+        path: &["resolution_flow"],
+        description: "Providers resolution flow",
+        requiredness: Requiredness::Unpublished,
+        pattern: None,
+        accepted: &[],
+        rejected: &[],
+    },
+];
+
+/// Walks `path` from a definition document down to one property, answering the object
+/// that DECLARES the property beside the property's own descriptor.
+fn descriptor<'a>(case: &str, document: &'a Value, path: &[&str]) -> (&'a Value, &'a Value) {
+    let (name, parents) = path
+        .split_last()
+        .unwrap_or_else(|| panic!("case {case:?}: a property path names a property"));
+    let mut declaring = document;
+    for parent in parents {
+        declaring = member(case, member(case, declaring, "properties"), parent);
+    }
+    let property = member(case, member(case, declaring, "properties"), name);
+    (declaring, property)
+}
+
+/// How the served descriptor states the requiredness of the property `name` that
+/// `declaring` declares.
+fn served_requiredness(case: &str, declaring: &Value, property: &Value, name: &str) -> Requiredness {
+    let listed = declaring
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|names| names.iter().any(|listed| listed.as_str() == Some(name)));
+    let flag = property.get("required").filter(|value| !value.is_null());
+    match (listed, flag) {
+        (true, None) => Requiredness::Listed,
+        (false, Some(flag)) => Requiredness::Flag(flag.as_bool().unwrap_or_else(|| {
+            panic!("case {case:?}: a property's `required` key is a boolean, got {flag:?}")
+        })),
+        (false, None) => Requiredness::Unpublished,
+        (true, Some(flag)) => panic!(
+            "case {case:?}: {name:?} is both listed by its object and flagged {flag:?} on its own \
+             descriptor"
+        ),
+    }
+}
+
+/// Every property's metadata is the published catalog's own for the addressed provider
+/// service: its prose, its pattern and the way it publishes requiredness — nothing
+/// derived from the property's name, and no published key dropped.
+#[tokio::test]
+async fn definition_property_metadata_is_the_published_catalogs_own() {
+    let emulator = Emulator::new();
+    let entries: BTreeMap<String, Value> = catalog(&emulator)
+        .await
+        .into_iter()
+        .map(|(key, _, read)| (key, read))
+        .collect();
+
+    for expected in PROPERTY_CASES {
+        let key = format!(
+            "{}/{}",
+            expected.provider_name, expected.provider_service_name
+        );
+        let read = entries.get(&key).unwrap_or_else(|| {
+            panic!(
+                "case {key:?}: the catalog publishes this provider service, got {:?}",
+                entries.keys().collect::<Vec<_>>()
+            )
+        });
+        let case = format!("{key} {}.{}", expected.document, expected.path.join("."));
+        let document = member(&case, read, expected.document);
+        let (declaring, property) = descriptor(&case, document, expected.path);
+        let name = expected
+            .path
+            .last()
+            .unwrap_or_else(|| panic!("case {case:?}: a property path names a property"));
+
+        let description = string_member(property, "description");
+        assert_eq!(
+            description, expected.description,
+            "case {case:?}: the description must be the catalog's own prose, got \
+             {description:?}"
+        );
+
+        let served = served_requiredness(&case, declaring, property, name);
+        assert_eq!(
+            served, expected.requiredness,
+            "case {case:?}: the catalog publishes requiredness as {:?}, got {served:?} from \
+             {property:?} in {declaring:?}",
+            expected.requiredness
+        );
+
+        let served_pattern = property
+            .get("pattern")
+            .filter(|value| !value.is_null())
+            .map(|pattern| {
+                pattern
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: a pattern is a regular expression, got {pattern:?}")
+                    })
+                    .to_string()
+            });
+        if let Some(pattern) = expected.pattern {
+            assert_eq!(
+                served_pattern.as_deref(),
+                Some(pattern),
+                "case {case:?}: the catalog publishes the pattern {pattern:?}, got \
+                 {served_pattern:?}"
+            );
+        }
+
+        if !expected.accepted.is_empty() || !expected.rejected.is_empty() {
+            let pattern = served_pattern.clone().unwrap_or_else(|| {
+                panic!("case {case:?}: the property publishes a pattern, got {property:?}")
+            });
+            let expression = Regex::new(&pattern).unwrap_or_else(|error| {
+                panic!("case {case:?}: {pattern:?} is a usable expression, got {error}")
+            });
+            for value in expected.accepted {
+                assert!(
+                    expression.is_match(value),
+                    "case {case:?}: the published pattern {pattern:?} must accept {value:?}"
+                );
+            }
+            for value in expected.rejected {
+                assert!(
+                    !expression.is_match(value),
+                    "case {case:?}: the published pattern {pattern:?} must reject {value:?}"
+                );
+            }
+        }
+    }
+}
+
+/// No property's metadata anywhere in the catalog is synthesized from the property's own
+/// name: the prose does not spell the member name it is declared under, a pattern is
+/// anchored at both ends, and a `required` key is a boolean.
+#[tokio::test]
+async fn no_definition_property_metadata_is_derived_from_its_name() {
+    let emulator = Emulator::new();
+    let mut properties_walked = 0;
+
+    for (case, _, read) in catalog(&emulator).await {
+        for document_name in DEFINITION_DOCUMENTS {
+            let Some(document) = read.get(document_name).filter(|value| !value.is_null()) else {
+                continue;
+            };
+            walk_property_metadata(&case, document_name, document, &mut properties_walked);
+        }
+        if let Some(namespace) = read
+            .get("providerIdNameSpaceConfiguration")
+            .filter(|value| !value.is_null())
+        {
+            for definition_name in [
+                "providerSourceConfigurationDefinition",
+                "providerTargetConfigurationDefinition",
+            ] {
+                let definition = member(&case, namespace, definition_name);
+                walk_property_metadata(&case, definition_name, definition, &mut properties_walked);
+            }
+        }
+    }
+
+    assert!(
+        properties_walked > 0,
+        "the catalog's definition documents must declare properties to walk, got \
+         {properties_walked}"
+    );
+}
+
+/// Checks every property of one schema object, and of the objects under it, against the
+/// no-synthesis rule.
+fn walk_property_metadata(case: &str, path: &str, schema: &Value, walked: &mut usize) {
+    let properties = member(case, schema, "properties")
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case:?}: {path} declares `properties`, got {schema:?}"))
+        .clone();
+    for (name, property) in &properties {
+        let property_path = format!("{path}.properties.{name}");
+        *walked += 1;
+
+        let value_type = string_member(property, "type");
+        match property.get("description").filter(|value| !value.is_null()) {
+            Some(_) => {
+                let description = string_member(property, "description");
+                assert!(
+                    !description.is_empty(),
+                    "case {case:?}: {property_path} must say what it is for, got {property:?}"
+                );
+                assert!(
+                    !description.contains(name.as_str()),
+                    "case {case:?}: {property_path} must carry the catalog's prose rather than a \
+                     sentence built from its own name, got {description:?}"
+                );
+            }
+            // A property whose value a caller fills in says what goes there; a property
+            // that only groups the ones under it (the provider's `entity`) is described
+            // by what it declares.
+            None => assert_eq!(
+                value_type, "object",
+                "case {case:?}: {property_path} must say what it is for, got {property:?}"
+            ),
+        }
+
+        if let Some(pattern) = property.get("pattern").filter(|value| !value.is_null()) {
+            let pattern = pattern.as_str().unwrap_or_else(|| {
+                panic!("case {case:?}: {property_path}.pattern is an expression, got {pattern:?}")
+            });
+            assert!(
+                is_anchored(pattern),
+                "case {case:?}: {property_path}.pattern must match the whole value, got \
+                 {pattern:?}"
+            );
+            if let Err(error) = Regex::new(pattern) {
+                panic!(
+                    "case {case:?}: {property_path}.pattern must be usable by a client that \
+                     validates with it, got {error}"
+                );
+            }
+        }
+
+        if value_type == "object" {
+            // A property holding an object is a schema object itself, so its own
+            // `required` member is the list of properties it requires.
+            walk_property_metadata(case, &property_path, property, walked);
+            continue;
+        }
+        if let Some(required) = property.get("required").filter(|value| !value.is_null()) {
+            assert!(
+                required.is_boolean(),
+                "case {case:?}: {property_path}.required tells a caller whether the key must \
+                 appear, so it is a boolean, got {required:?}"
+            );
+        }
+    }
 }

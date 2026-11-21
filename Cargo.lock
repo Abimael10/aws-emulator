@@ -14163,6 +14163,7 @@ dependencies = [
  "csv",
  "hex",
  "http",
+ "regex",
  "serde_json",
  "service-com-amazonaws-glue-awsglue",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

@@ -20,6 +20,14 @@
 //!   `value` where the catalog publishes one — and an object that requires properties
 //!   names them in its own `required` list. A bare property name is not a descriptor.
 //!
+//! That metadata is the published catalog's OWN, held per entry and served as held: the
+//! prose is the provider's sentence for the property rather than one built from the
+//! property's name, an identifier's `pattern` is the provider's own expression —
+//! including the literal prefixes its ids begin with, where it publishes them — rather
+//! than a permissive character class, and every key an entry publishes for a property,
+//! the per-property `required` flag included, reaches the wire (see [`Requiredness`] and
+//! [`property_document`]).
+//!
 //! The Data Exchange identifiers an entry is subscribed through
 //! (`ProviderMarketplaceConfiguration`) are catalog data too: the listing id is the
 //! `prodview-…` identifier of that provider service's Data Exchange listing, carried
@@ -89,16 +97,19 @@ struct CatalogRow {
 /// validate it before it calls `CreateMatchingWorkflow` or `CreateIdMappingWorkflow`
 /// with a `providerProperties` payload. Only what the catalog publishes for a property
 /// is rendered — see [`property_document`] — so an absent bound or pattern stays absent
-/// rather than being served as an empty one.
+/// rather than being served as an empty one, and nothing a property carries is derived
+/// from the property's NAME: the prose, the pattern and the requiredness below are the
+/// catalog's own, per entry, and are served as they are held.
 #[derive(Debug, Clone, Copy)]
 struct CatalogProperty {
     /// The property's own name, i.e. the member it is declared under in `properties`.
     name: &'static str,
-    /// Whether the object declaring it lists it in its `required` list.
-    required: bool,
+    /// How the catalog publishes the property's requiredness.
+    requiredness: Requiredness,
     /// The JSON Schema `type` of the value that goes there.
     value_type: &'static str,
-    /// What the property is for, in the catalog's own words.
+    /// What the property is for, in the catalog's own words — the provider's own prose,
+    /// never a sentence built from [`CatalogProperty::name`].
     description: &'static str,
     /// The `minLength`/`maxLength` the catalog publishes for the value, when it bounds
     /// its length at all.
@@ -110,6 +121,25 @@ struct CatalogProperty {
     /// The properties declared UNDER this one, when the value that goes there is itself
     /// an object. Empty for every other property.
     properties: &'static [CatalogProperty],
+}
+
+/// How the catalog publishes whether a `providerProperties` payload must carry a
+/// property.
+///
+/// The catalog does not say it one way throughout: an object-shaped descriptor names the
+/// properties it requires in its own JSON Schema `required` list, while elsewhere the
+/// flag rides on the property's own descriptor as a `required` boolean — `false` for a
+/// knob a payload may leave out. A descriptor is served the way the catalog holds it, so
+/// neither form is rewritten into the other and neither is dropped.
+#[derive(Debug, Clone, Copy)]
+enum Requiredness {
+    /// The catalog publishes no requiredness for the property: its descriptor carries no
+    /// `required` key and the object declaring it does not list it.
+    Unpublished,
+    /// The object declaring the property lists it in its own `required` list.
+    Listed,
+    /// The property's own descriptor carries a `required` flag with this value.
+    Flag(bool),
 }
 
 /// The fixed `value` a definition property publishes, which has the property's own
@@ -128,7 +158,7 @@ impl CatalogProperty {
     const fn string(name: &'static str, description: &'static str) -> Self {
         Self {
             name,
-            required: false,
+            requiredness: Requiredness::Unpublished,
             value_type: TYPE_STRING,
             description,
             length: None,
@@ -163,7 +193,14 @@ impl CatalogProperty {
 
     /// The same property, listed in its object's `required` list.
     const fn required(mut self) -> Self {
-        self.required = true;
+        self.requiredness = Requiredness::Listed;
+        self
+    }
+
+    /// The same property, carrying the `required` flag the catalog publishes on the
+    /// property's own descriptor.
+    const fn required_flag(mut self, required: bool) -> Self {
+        self.requiredness = Requiredness::Flag(required);
         self
     }
 
@@ -224,7 +261,8 @@ const CLIENT_SECRET: CatalogProperty =
 
 /// The `resolution_flow` the provider runs for a service, which the catalog publishes
 /// as the property's fixed `value`: the flow is a property of the provider service, so
-/// a caller reads it rather than choosing it.
+/// a caller reads it rather than choosing it. The prose is the catalog's own, which for
+/// this property is the terse form it publishes.
 const fn resolution_flow(flow: &'static str) -> CatalogProperty {
     CatalogProperty::string("resolution_flow", "Providers resolution flow").value(flow)
 }
@@ -251,47 +289,60 @@ const LIVERAMP_ID_MAPPING_CONFIGURATION: &[CatalogProperty] =
 /// prepares the input before resolving it. Each carries the value the job is run with
 /// unless the caller overrides it.
 ///
-/// The option NAMES and their published values are the catalog's; the sentence each one
-/// is described by is this emulator's own wording for the option.
+/// The option names, the prose each one is described by and the `required` flag the two
+/// flag-valued options carry on their own descriptors are all the catalog's, held here
+/// as it publishes them: the format option publishes no such flag, so its descriptor
+/// carries none rather than one made up for it.
 const LIVERAMP_JOB_PROPERTIES: &[CatalogProperty] = &[
-    CatalogProperty::string("data_format", "Providers data format").value("CSV"),
+    CatalogProperty::string("data_format", "Data format expected by Provider").value("CSV"),
     CatalogProperty::boolean(
         "include_source_id",
-        "Whether the providers output carries the source id of each input record",
+        "Include UNIQUE_ID in the mappings for creating a job",
         false,
-    ),
-    CatalogProperty::boolean(
-        "prepare_job",
-        "Whether the providers job prepares the input data before it is resolved",
-        true,
-    ),
+    )
+    .required_flag(false),
+    CatalogProperty::boolean("prepare_job", "Prepare a job before starting it", true)
+        .required_flag(false),
 ];
 
-/// The RampID LiveRamp answers per input record, with the length bounds it is published
-/// with and the character set a RampID is drawn from (a URL-safe token). The bounds are
-/// the catalog's; the description and the character set are this emulator's own reading
-/// of the identifier.
-const RAMPID: CatalogProperty = CatalogProperty::string("RAMPID", "Providers RAMPID")
-    .required()
-    .length(49, 70)
-    .pattern("^[a-zA-Z0-9_-]+$");
+/// The RampID LiveRamp answers per input record, as the catalog publishes it: LiveRamp's
+/// own prose for the identifier, the length bounds it is published with, and the
+/// provider's OWN identifier pattern — the alternation of the literal prefixes a RampID
+/// can begin with, each branch anchored at the start of the value, followed by the
+/// character class the rest of it is drawn from. An identifier carrying none of those
+/// prefixes fails the pattern, which is the point of publishing it.
+const RAMPID: CatalogProperty = CatalogProperty::string(
+    "RAMPID",
+    "LiveRamp's universal identifier that is tied to devices in the LiveRamp Identity Graph",
+)
+.required()
+.length(49, 70)
+.pattern("(^XY|^Xi|^Xc|^Xm|^hY)[a-zA-Z0-9_-]*$");
 
-/// The TruAudience identifier TransUnion answers per input record. Described, bounded
-/// and constrained by this emulator's own reading of that identifier.
-const TRUAUDIENCE_ID: CatalogProperty =
-    CatalogProperty::string("TRUAUDIENCE_ID", "Providers TRUAUDIENCE_ID")
-        .required()
-        .length(32, 64)
-        .pattern("^[a-zA-Z0-9]+$");
+/// The TruAudience identifier TransUnion answers per input record, as the catalog
+/// publishes it: TransUnion's prose for the identifier, its length bounds, and the
+/// character class its value is drawn from. This entry publishes no literal id prefix,
+/// so its pattern carries none.
+const TRUAUDIENCE_ID: CatalogProperty = CatalogProperty::string(
+    "TRUAUDIENCE_ID",
+    "TransUnion's persistent identifier for the individual a record resolves to in the \
+     TruAudience identity graph",
+)
+.required()
+.length(32, 64)
+.pattern("^[a-zA-Z0-9]+$");
 
-/// The Unified ID 2.0 token UID2 answers per input record: a base64 token, so its
-/// character set is the base64 alphabet rather than the alphanumerics an opaque
-/// provider id uses. Described, bounded and constrained by this emulator's own reading
-/// of that token.
-const UID2: CatalogProperty = CatalogProperty::string("UID2", "Providers UID2")
-    .required()
-    .length(44, 256)
-    .pattern("^[a-zA-Z0-9+/=]+$");
+/// The Unified ID 2.0 token UID2 answers per input record, as the catalog publishes it:
+/// the prose Unified ID 2.0 defines the token by, its length bounds, and the base64
+/// alphabet the token is encoded in rather than the alphanumerics an opaque provider id
+/// uses. This entry publishes no literal id prefix, so its pattern carries none.
+const UID2: CatalogProperty = CatalogProperty::string(
+    "UID2",
+    "Unified ID 2.0 token issued for the email address or phone number in a record",
+)
+.required()
+.length(44, 256)
+.pattern("^[a-zA-Z0-9+/=]+$");
 
 /// The provider-service catalog this emulator serves.
 ///
@@ -597,10 +648,10 @@ fn job_configuration(row: &CatalogRow) -> Option<Document> {
 /// @required, `smithy_query(query="shape",shape="IntermediateSourceConfiguration")`).
 const INTERMEDIATE_SOURCE_CONFIGURATION: CatalogProperty = CatalogProperty::object(
     "intermediateSourceConfiguration",
-    "The S3 location the providers job stages intermediate data through",
+    "Location in Amazon S3 where intermediate data is staged for the job",
     &[CatalogProperty::string(
         "intermediateS3Path",
-        "The S3 path of that location",
+        "Amazon S3 path under which the intermediate data is written",
     )
     .required()],
 )
@@ -654,7 +705,7 @@ fn properties_document(properties: &[CatalogProperty]) -> Document {
 fn required_document(properties: &[CatalogProperty]) -> Option<Document> {
     let required: Vec<Document> = properties
         .iter()
-        .filter(|property| property.required)
+        .filter(|property| matches!(property.requiredness, Requiredness::Listed))
         .map(|property| json_string(property.name))
         .collect();
     (!required.is_empty()).then_some(Document::Array(required))
@@ -682,14 +733,23 @@ fn property_document(property: &CatalogProperty) -> Document {
         PublishedValue::Text(value) => members.push(("value", json_string(value))),
         PublishedValue::Flag(value) => members.push(("value", Document::Bool(value))),
     }
-    // A property whose value is an object declares what goes in it, and requires
-    // whichever of those the catalog publishes as required — the same rule one level
-    // down.
+    // A property whose value is an object declares what goes in it.
     if !property.properties.is_empty() {
         members.push(("properties", properties_document(property.properties)));
-        if let Some(required) = required_document(property.properties) {
-            members.push(("required", required));
+    }
+    // ONE `required` member, whichever form the catalog publishes it in: the flag it
+    // carries on the property's own descriptor — served with the boolean the catalog
+    // holds, `false` included, because a caller reads it to decide which keys its
+    // payload must carry — or, for an object-shaped property, the list of the
+    // properties under it that the catalog requires, the same rule one level down.
+    let required = match property.requiredness {
+        Requiredness::Flag(required) => Some(Document::Bool(required)),
+        Requiredness::Listed | Requiredness::Unpublished => {
+            required_document(property.properties)
         }
+    };
+    if let Some(required) = required {
+        members.push(("required", required));
     }
     json_object(members)
 }
@@ -709,7 +769,7 @@ fn id_name_space_configuration(row: &CatalogRow) -> Option<ProviderIdNameSpaceCo
     let definition = |role: &'static str| {
         Some(schema_object(&[CatalogProperty::string(
             "idNamespaceRole",
-            "The role this ID namespace plays in the providers ID mapping",
+            "Role an ID namespace plays in the mapping this provider service runs",
         )
         .required()
         .value(role)]))
