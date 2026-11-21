@@ -15,6 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Which ARN each component operation takes, and how a value that is not one is refused.
 pub mod component_arns;
+/// Which artifacts a component version declares, and where each one's object is downloaded
+/// from.
+pub mod component_artifacts;
 /// The core-device fleet, the client-device associations, and the pieces the
 /// core-device operations share.
 pub mod core_devices;
@@ -25,6 +28,7 @@ pub mod connectivity_info;
 /// The refusals the legacy Greengrass surface answers in the elder envelope.
 pub mod legacy_refusals;
 pub use component_arns::*;
+pub use component_artifacts::*;
 pub use connectivity_info::*;
 pub use core_devices::*;
 pub use legacy_refusals::*;

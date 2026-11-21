@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetComponentVersionArtifact
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetComponentVersionArtifact`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the pre-signed URL a core device downloads one of a component version's
+//! declared artifacts from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetComponentVersionArtifact::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! WHICH artifacts a version has is decided by the recipe `CreateComponentVersion`
+//! persisted, so the lookup reads that document and nothing beside it
+//! (`crate::state::component_artifacts`); a name it declares no artifact under — including
+//! every name, when the ARN names no stored version at all — is the one sentence IoT
+//! Greengrass refuses both halves of that search with.
 //!
 //! ## Shape of an operation
 //!
@@ -164,26 +163,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        use crate::state as st;
+
         // The `arn` this operation takes is judged HERE rather than at the boundary
         // (`skip_validation` on this input): a value outside `ComponentVersionARN` is
         // refused with the sentence IoT Greengrass states about it, not with the
-        // framework's constraint envelope (`crate::state::component_arns`). That refusal
-        // is the operation's answer whether or not the rest of it is written, so it is
-        // decided before the 501 below — a malformed ARN is a bad request, not an
-        // unimplemented one.
-        crate::state::addressed_component_version(&input.arn)
+        // framework's constraint envelope (`st::component_arns`). It is judged before
+        // anything else, which is where the boundary check ran.
+        let (name, version) = st::addressed_component_version(&input.arn)
             .map_err(GetComponentVersionArtifactErrorModeled::ValidationException)?;
-        // Implement `GetComponentVersionArtifact` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetComponentVersionArtifactErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request".
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetComponentVersionArtifact"))
+
+        // IAM decides first, before the catalog is read: a caller whose identity-based
+        // policies do not allow this action on the component version the request names is
+        // refused 403 and learns nothing about whether that version exists
+        // (`st::authorization`). The resource is the ARN the request itself carried.
+        st::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.arn)
+            .map_err(GetComponentVersionArtifactErrorModeled::AccessDeniedException)?;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(GetComponentVersionArtifactErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the greengrassv2 state store is unavailable".to_string(),
+                    retry_after_seconds: 1,
+                },
+            )
+            .into());
+        };
+
+        // The stored recipe is copied out and the shared lock released BEFORE the document
+        // is read: reading it is work proportional to the document, and it must not be done
+        // inside the critical section every other request waits on. This reads the catalog
+        // and writes nothing, so two callers at the same instant are answered the same
+        // artifact.
+        let recipe = {
+            let store = state.lock();
+            store
+                .component_version(&input.arn)
+                .map(|entry| entry.recipe.clone())
+        };
+        let declared = recipe
+            .as_deref()
+            .and_then(|recipe| st::declared_artifact(recipe, &input.artifact_name));
+
+        let Some(artifact) = declared else {
+            // One sentence for a version this account has not published and for a version
+            // that declares no artifact of that name: the search found neither, and AWS
+            // words it as neither.
+            return Err(GetComponentVersionArtifactErrorModeled::ValidationException(
+                ValidationException {
+                    message: st::artifact_not_found_message(
+                        &name,
+                        &version,
+                        &input.artifact_name,
+                    ),
+                    reason: None,
+                    fields: None,
+                },
+            )
+            .into());
+        };
+
+        // The URL leads back to THIS emulator, signed by the framework's own signer, so a
+        // core device that follows it reads the artifact from the object store that holds
+        // it rather than from a host only AWS serves. `s3EndpointType` and
+        // `iotEndpointType` choose between Amazon S3's regional, global and FIPS endpoints,
+        // which are the same one endpoint here, so each names this same object.
+        let path = artifact.path();
+        let request = ::smithy_server_runtime::SignedUrlRequest::new(
+            ::http::Method::GET,
+            S3_SIGNING_NAME,
+            &path,
+        );
+        let signed = ctx
+            .url_signer()
+            .sign(request, ARTIFACT_URL_VALIDITY)
+            .map_err(|error| {
+                // The signer's own diagnosis stays out of the answer: the caller asked for
+                // an artifact, and nothing about the request decides whether this
+                // emulator's endpoint can be signed for.
+                let _ = error;
+                GetComponentVersionArtifactErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "the artifact {} could not be addressed",
+                            input.artifact_name
+                        ),
+                        retry_after_seconds: 1,
+                    },
+                )
+            })?;
+
+        Ok(GetComponentVersionArtifactOutput {
+            pre_signed_url: signed.as_str().to_string(),
+        })
     }
 }
+
+/// The signing name of the service that serves the object an artifact is held as, so the
+/// signed URL verifies against the store that holds it.
+const S3_SIGNING_NAME: &str = "s3";
+
+/// How long a download URL this operation hands out stays valid.
+///
+/// A CHOSEN span: neither the model nor the operation's documentation states one, and it is
+/// long enough for a core device to fetch an artifact it was handed the URL for while short
+/// enough that the URL is not a lasting grant.
+const ARTIFACT_URL_VALIDITY: ::std::time::Duration = ::std::time::Duration::from_secs(5 * 60);

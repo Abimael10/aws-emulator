@@ -22,7 +22,12 @@
 //!   and `Artifacts` — whether or not the submitted document declared them, so a
 //!   client reading one always finds a collection; and
 //! * `GetDeployment` reports the deployment's `components` map and its `tags` map,
-//!   each EMPTY rather than absent when the deployment holds nothing in it.
+//!   each EMPTY rather than absent when the deployment holds nothing in it; and
+//! * `GetComponentVersionArtifact` resolves the artifact a request names against the
+//!   artifact URIs that same stored recipe declares, answering a pre-signed URL for the
+//!   object the matching URI names and refusing a name it declares no object artifact
+//!   under — and every name, when the ARN names no stored version — with the one
+//!   sentence AWS words both halves of that search with.
 //!
 //! Every assertion drives the real `restJson1` front door: the request is built the
 //! way an SDK builds it, dispatched through [`MultiServiceRouter`], and judged on
@@ -103,6 +108,14 @@ fn text(value: &Value, key: &str) -> String {
         .get(key)
         .and_then(Value::as_str)
         .unwrap_or_default()
+        .to_string()
+}
+
+/// The wire error code of a `restJson1` error body.
+fn error_code(body: &Value) -> String {
+    body.get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or("<no __type>")
         .to_string()
 }
 
@@ -532,4 +545,218 @@ async fn get_deployment_reports_the_components_and_tags_maps_it_stored() {
             case.label
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Artifact reads
+// ---------------------------------------------------------------------------
+
+/// The component the artifact rows read, and the version they address.
+const ARTIFACT_COMPONENT: &str = "com.example.WithArtifacts";
+const ARTIFACT_VERSION: &str = "1.0.0";
+
+/// The buckets and keys the recipe below declares its artifacts at. Artifact member names
+/// and nesting come from the IoT Greengrass component recipe reference
+/// (`Manifests[].Artifacts[].Uri`).
+const ARTIFACT_BUCKET: &str = "component-artifact-store";
+const PREFIXED_KEY: &str = "releases/1.0.0/payload.zip";
+const OTHER_BUCKET: &str = "component-artifact-overflow";
+const PLAIN_KEY: &str = "sidecar.jar";
+
+/// `GetComponentVersionArtifact` for `artifact_name` on `arn`: `artifactName` is a GREEDY
+/// label, so a name holding `/` travels as it is written.
+async fn artifact_read(
+    router: &MultiServiceRouter,
+    arn: &str,
+    artifact_name: &str,
+) -> (u16, Value) {
+    get(
+        router,
+        &format!(
+            "/greengrass/v2/components/{}/artifacts/{artifact_name}",
+            encoded_label(arn)
+        ),
+    )
+    .await
+}
+
+/// A recipe whose two manifests declare one object artifact each, plus an entry naming a
+/// container image rather than an object.
+fn artifact_recipe() -> String {
+    format!(
+        "RecipeFormatVersion: '2020-01-25'\n\
+         ComponentName: {ARTIFACT_COMPONENT}\n\
+         ComponentVersion: {ARTIFACT_VERSION}\n\
+         Manifests:\n\
+         \x20 - Platform:\n\
+         \x20     os: linux\n\
+         \x20   Artifacts:\n\
+         \x20     - Uri: \"s3://{ARTIFACT_BUCKET}/{PREFIXED_KEY}\"\n\
+         \x20     - Uri: \"docker://registry.example/image:1\"\n\
+         \x20 - Platform:\n\
+         \x20     os: windows\n\
+         \x20   Artifacts:\n\
+         \x20     - Uri: \"s3://{OTHER_BUCKET}/{PLAIN_KEY}\"\n"
+    )
+}
+
+/// The sentence AWS refuses an artifact read with, written here as the literal AWS answers
+/// rather than read from the implementation.
+fn artifact_not_found(name: &str, version: &str, artifact_name: &str) -> String {
+    format!(
+        "Component ({name}:{version}) or Artifact ({artifact_name}) for account {ACCOUNT} \
+         does not exist"
+    )
+}
+
+#[tokio::test]
+async fn an_artifact_read_answers_from_the_recipe_the_create_persisted() {
+    let router = emulator();
+    let (status, body) = publish(&router, &artifact_recipe()).await;
+    assert_eq!(
+        status, 201,
+        "publishing the artifact fixture must succeed, got {status} {body}"
+    );
+    // A version whose recipe declares no artifact list at all, so the rows span a version
+    // that has artifacts and one that has none.
+    let bare = format!(
+        "RecipeFormatVersion: '2020-01-25'\nComponentName: com.example.Artifactless\n\
+         ComponentVersion: {ARTIFACT_VERSION}\n"
+    );
+    let (status, body) = publish(&router, &bare).await;
+    assert_eq!(
+        status, 201,
+        "publishing the artifactless fixture must succeed, got {status} {body}"
+    );
+
+    // (case, the component, the version, the name asked for, the object path the URL must
+    // address when the artifact is one the recipe declares)
+    let rows: &[(&str, &str, &str, String, Option<String>)] = &[
+        (
+            "the whole section after the scheme",
+            ARTIFACT_COMPONENT,
+            ARTIFACT_VERSION,
+            format!("{ARTIFACT_BUCKET}/{PREFIXED_KEY}"),
+            Some(format!("/{ARTIFACT_BUCKET}/{PREFIXED_KEY}")),
+        ),
+        (
+            "the file name at the end of that section",
+            ARTIFACT_COMPONENT,
+            ARTIFACT_VERSION,
+            "payload.zip".to_string(),
+            Some(format!("/{ARTIFACT_BUCKET}/{PREFIXED_KEY}")),
+        ),
+        (
+            "an artifact declared by a later manifest, in another bucket",
+            ARTIFACT_COMPONENT,
+            ARTIFACT_VERSION,
+            PLAIN_KEY.to_string(),
+            Some(format!("/{OTHER_BUCKET}/{PLAIN_KEY}")),
+        ),
+        (
+            "a name the recipe declares nowhere",
+            ARTIFACT_COMPONENT,
+            ARTIFACT_VERSION,
+            "absent.zip".to_string(),
+            None,
+        ),
+        (
+            "a declared name differing only in case",
+            ARTIFACT_COMPONENT,
+            ARTIFACT_VERSION,
+            "Payload.zip".to_string(),
+            None,
+        ),
+        (
+            "an entry naming a container image rather than an object",
+            ARTIFACT_COMPONENT,
+            ARTIFACT_VERSION,
+            "registry.example/image:1".to_string(),
+            None,
+        ),
+        (
+            "a version whose recipe declares no artifact list",
+            "com.example.Artifactless",
+            ARTIFACT_VERSION,
+            "payload.zip".to_string(),
+            None,
+        ),
+        (
+            "a version of that component that was never published",
+            ARTIFACT_COMPONENT,
+            "2.0.0",
+            "payload.zip".to_string(),
+            None,
+        ),
+        (
+            "a component that was never published",
+            "com.example.Absent",
+            ARTIFACT_VERSION,
+            "payload.zip".to_string(),
+            None,
+        ),
+    ];
+
+    for (case, component, version, artifact_name, object_path) in rows {
+        let arn = version_arn(component, version);
+        let (status, body) = artifact_read(&router, &arn, artifact_name).await;
+        match object_path {
+            Some(path) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: a declared artifact must answer 200, got {status} {body}"
+                );
+                let url = text(&body, "preSignedUrl");
+                assert!(
+                    url.contains(path.as_str()) && url.contains("X-Amz-Signature="),
+                    "case {case:?}: expected a pre-signed URL addressing {path:?}, got {url:?}"
+                );
+                assert!(
+                    !url.contains("amazonaws.com"),
+                    "case {case:?}: the URL must lead back to this emulator, got {url:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: an artifact that does not exist must answer 400, got \
+                     {status} {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "ValidationException",
+                    "case {case:?}: expected ValidationException, got {body}"
+                );
+                assert_eq!(
+                    text(&body, "message"),
+                    artifact_not_found(component, version, artifact_name),
+                    "case {case:?}: expected the sentence AWS states, got {body}"
+                );
+            }
+        }
+    }
+
+    // The read is a REPORT: asking again addresses the same object, and the recipe it
+    // resolved the artifact against is unchanged.
+    let arn = version_arn(ARTIFACT_COMPONENT, ARTIFACT_VERSION);
+    let (status, body) = artifact_read(&router, &arn, "payload.zip").await;
+    assert_eq!(
+        status, 200,
+        "case \"the same read again\": expected 200, got {status} {body}"
+    );
+    assert!(
+        text(&body, "preSignedUrl").contains(&format!("/{ARTIFACT_BUCKET}/{PREFIXED_KEY}")),
+        "case \"the same read again\": expected the same object, got {body}"
+    );
+    let (status, document) = stored_recipe(&router, &arn, "JSON").await;
+    assert_eq!(
+        status, 200,
+        "case \"after the reads\": GetComponent must answer 200, got {status} {document}"
+    );
+    assert!(
+        document.contains(&format!("s3://{ARTIFACT_BUCKET}/{PREFIXED_KEY}"))
+            && document.contains(&format!("s3://{OTHER_BUCKET}/{PLAIN_KEY}")),
+        "case \"after the reads\": the stored recipe must still declare both object \
+         artifacts, got {document:?}"
+    );
 }
