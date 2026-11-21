@@ -1,0 +1,49 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: codedeploy.hook-failure-skips-later-lifecycle-events-and-fails-the-target codedeploy.applicationstop-hook-failure-blocks-redeploy-until-ignored
+Issue-Shape-Id: com.amazonaws.codedeploy#CodeDeploy_20141006
+Issue-Key: codedeploy.hook-failure-skips-later-lifecycle-events-and-fails-the-target|run#40|AssertionError|assert stderr_token in (diag.get("logTail") or ""), (
+Issue-Key: codedeploy.applicationstop-hook-failure-blocks-redeploy-until-ignored|run#38|AssertionError|assert stderr_token in (diag.get("logTail") or ""), (
+Issue-Commit: 0b24c8a0c085aa6aef176e08bc3b570f8e6f01b0
+
+# CodeDeploy lifecycle-event Diagnostics.logTail is always empty on a failed hook: the failing script's stdout/stderr is never captured
+
+> _Note: this issue was identified against the code base at commit `0b24c8a0c085aa6aef176e08bc3b570f8e6f01b0`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+BatchGetDeploymentTargets
+
+## Description
+One net-new root cause, grounded in two Server-platform (EC2) lifecycle checks that now get PAST the gaps open issue 20261121T045802Z-codedeploy-server-platform-in-place-deployments-now-reach.md describes. That issue's Cause 2 says InstanceTarget.lifecycleEvents is EMPTY on every read; in the current replay the list is populated and correct far enough that both checks assert the failed event's status ('Failed'), the later events' status ('Skipped' is reached only after the logTail assert in one check), diagnostics.errorCode ('ScriptFailed') and diagnostics.scriptName (naming the right script from the right bundle) — all of which now pass. Neither that issue nor any other open codedeploy issue carries these two checks' current replay keys (the suite marked neither OWNED nor ALREADY FILED). What remains diverging is one field.
+
+Cause 1 of 1: a lifecycle event whose hook script ran and exited non-zero is reported with diagnostics.errorCode='ScriptFailed' and a correct diagnostics.scriptName, but diagnostics.logTail is empty (''/absent) instead of the tail of that script's output.
+Failing check ids for this cause: codedeploy.hook-failure-skips-later-lifecycle-events-and-fails-the-target, codedeploy.applicationstop-hook-failure-blocks-redeploy-until-ignored.
+
+AWS: Smithy (codedeploy, com.amazonaws.codedeploy#CodeDeploy_20141006) models LifecycleEvent{lifecycleEventName, status: LifecycleEventStatus, startTime, endTime, diagnostics: Diagnostics}, returned on InstanceTarget.lifecycleEvents (BatchGetDeploymentTargets -> deploymentTargets[].instanceTarget) and on instanceSummary.lifecycleEvents (GetDeploymentInstance / BatchGetDeploymentInstances). Diagnostics has members errorCode (LifecycleErrorCode: Success|ScriptMissing|ScriptNotExecutable|ScriptTimedOut|ScriptFailed|UnknownError), scriptName ("The name of the script"), message ("The message associated with the error") and logTail, documented verbatim as "The last portion of the diagnostic log. If available, CodeDeploy returns up to the last 4 KB of the diagnostic log." So for an event whose AppSpec hook script ran and returned non-zero (errorCode ScriptFailed), AWS returns in logTail the tail of that script's own diagnostic log — the stdout/stderr the agent captured while executing that script on the instance, up to 4 KB, truncated from the FRONT so the last bytes (the ones nearest the failure) survive. The content of logTail is not a fixed string: it is whatever the deployed revision's script emitted on that host, so any line the script writes to stdout or stderr before exiting must be findable in it.
+
+Emulator: logTail is empty on every failed lifecycle event. codedeploy.hook-failure-skips-later-lifecycle-events-and-fails-the-target deploys a revision whose BeforeInstall script echoes a token to stderr and exits 1; the emulator reports BeforeInstall Failed with errorCode 'ScriptFailed' and scriptName containing 'before_install.sh' (both correct) but diagnostics.logTail reads '' — the token the script wrote to stderr is absent. codedeploy.applicationstop-hook-failure-blocks-redeploy-until-ignored does the same through the PREVIOUS successful revision's ApplicationStop script (errorCode 'ScriptFailed', scriptName containing 'application_stop.sh', both correct) and diagnostics.logTail again reads ''. The tokens are minted per run inside the replay process and embedded into the revision zip, so no canned or empty logTail can satisfy them — the emulator is synthesising the diagnostics structure from the fact of a non-zero exit rather than from the script's captured output. (The token strings, script paths, instance ids and deployment ids in the replay output are per-run values and are not part of the requirement; the requirement is that whatever the script emitted appears in logTail.)
+
+Why: logTail is the only API surface that tells an operator WHY a hook failed. errorCode+scriptName say which script returned non-zero; the script's own output says what it was doing when it did. A client (console, pipeline step, on-call tooling) that fetches BatchGetDeploymentTargets / GetDeploymentInstance after a failed deployment to surface or parse the failing script's log gets an empty string, so a failure that is fully diagnosable against AWS is undiagnosable here, and any tooling that greps logTail for an error signature silently matches nothing.
+
+Fix: the Server-platform deployment execution path's hook-execution component — the part that runs each AppSpec hooks entry's script on the resolved instance target and records the LifecycleEvent — must capture that script's combined stdout/stderr and store it on the event's Diagnostics (last 4 KB, front-truncated) alongside errorCode and scriptName, and the InstanceTarget.lifecycleEvents / instanceSummary.lifecycleEvents serializers must emit it as diagnostics.logTail. The same capture should back diagnostics.message for the error text.
+
+Traces: codedeploy.hook-failure-skips-later-lifecycle-events-and-fails-the-target, codedeploy.applicationstop-hook-failure-blocks-redeploy-until-ignored.
+
+## Evidence
+Expected (AWS): on a lifecycle event whose hook script ran and exited non-zero, diagnostics = {errorCode: 'ScriptFailed', scriptName: <the script that failed, e.g. the AppSpec hooks entry's location>, message: <error text>, logTail: <up to the last 4 KB of that script's captured stdout/stderr>}. Anything the script wrote to stdout/stderr immediately before exiting is present in logTail.
+
+Actual (emulator):
+  - codedeploy.hook-failure-skips-later-lifecycle-events-and-fails-the-target (check source line 136, assert `stderr_token in (diag.get("logTail") or "")`): "AssertionError: the failed event's diagnostics.logTail does not contain the token this run's script wrote to stderr ('sim2real-stderr-cb574d6b5c22'); it reads ''. The token is generated in this process, so a target that returns a canned or empty logTail cannot produce it". The immediately preceding asserts on the same diagnostics dict passed: status 'Failed', errorCode 'ScriptFailed', scriptName containing 'before_install.sh'.
+  - codedeploy.applicationstop-hook-failure-blocks-redeploy-until-ignored (check source line 149, same assert): "AssertionError: the failed event's diagnostics.logTail does not contain the token revision A's ApplicationStop script wrote to stderr ('sim2real-stop-fail-3f7238236261'); it reads ''. The token is minted in this process and embedded in a zip, so no canned or empty logTail can produce it". Here too the ApplicationStop event already reads 'Failed' with errorCode 'ScriptFailed' and scriptName containing 'application_stop.sh'.
+
+The token values ('sim2real-stderr-cb574d6b5c22', 'sim2real-stop-fail-3f7238236261') are per-run strings minted by the replay process and embedded in the revision bundle — they are the probe, not the requirement. The requirement is that diagnostics.logTail carries the failing script's captured output rather than ''.
+
+## Steps to Reproduce
+1. Create an S3 bucket and put a Server-platform revision zip whose appspec.yml declares a files section plus a BeforeInstall hook whose script writes a unique token to stderr (e.g. `echo "<token>" >&2`) and then `exit 1`.
+2. Create a VPC/subnet and an instance profile allowing SSM + S3 read; ec2:RunInstances one t3.micro instance tagged Key='sim2real-codedeploy-target', Value='<unique>'; wait until it is an Online SSM managed node with the codedeploy-agent unit active.
+3. codedeploy:CreateApplication(computePlatform='Server'); codedeploy:CreateDeploymentGroup with deploymentStyle={IN_PLACE, WITHOUT_TRAFFIC_CONTROL}, deploymentConfigName='CodeDeployDefault.AllAtOnce', ec2TagFilters=[{Key:'sim2real-codedeploy-target', Value:'<unique>', Type:'KEY_AND_VALUE'}].
+4. codedeploy:CreateDeployment with revision {revisionType:'S3', s3Location:{bucket, key:'revision.zip', bundleType:'zip'}}; poll codedeploy:GetDeployment until terminal ('Failed').
+5. codedeploy:ListDeploymentTargets(deploymentId) then codedeploy:BatchGetDeploymentTargets(deploymentId, targetIds); read deploymentTargets[0].instanceTarget.lifecycleEvents and pick the entry with lifecycleEventName='BeforeInstall'.
+6. Observe its diagnostics: errorCode='ScriptFailed' and scriptName naming the script (correct), but logTail='' — the token the script wrote to stderr is nowhere in it. AWS returns the tail of that script's log containing the token.
+7. Variant covering the second check: deploy a revision that SUCCEEDS but whose ApplicationStop script writes a token to stderr and exits 1, then deploy a second revision over the same host. The second deployment fails at ApplicationStop (running the previous successful revision's script); its diagnostics again carry errorCode='ScriptFailed' and the right scriptName with logTail=''.
