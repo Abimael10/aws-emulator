@@ -4935,3 +4935,9 @@ pub use access_associations::*;
 /// policies in force on the account's CloudWatch role — the principal it makes every one of
 /// them as; see that module.
 pub mod log_delivery_role;
+
+/// WHAT THIS EMULATOR ACCEPTS, read off a handle onto it — the one reading both planes that
+/// have to know whether a signature is verified ask; re-exported whole, so a reader still
+/// reaches each name as `crate::state::…`.
+mod serving_emulator;
+pub use serving_emulator::*;

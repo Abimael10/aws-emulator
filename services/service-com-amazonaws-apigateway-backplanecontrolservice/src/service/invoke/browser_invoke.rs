@@ -47,14 +47,29 @@
 //!   answer needs no call outside this service — a `MOCK`, the integration a CORS method is
 //!   wired to, or no integration at all — served over a transport that REACHES NOTHING, so even
 //!   a step that would reach for one is withheld. A page from such a site can therefore drive
-//!   nothing of this emulator beyond the records of the api that admitted it;
+//!   nothing of this emulator beyond the records of the api that admitted it, and the same is
+//!   what a page from a site the declaration does not name gets: the endpoint answers every
+//!   preflight of a CORS-configured resource the static mapping it declares, whoever asked, and
+//!   the browser is what refuses a page the value does not name. A resource whose methods
+//!   declare no origin at all is reached by no page;
 //! * a request NO deployed method serves is admitted too, because what answers it is the stage's
 //!   own refusal, which performs nothing — and the endpoint's recorded behaviour is that it
 //!   answers such a preflight (`403` `Missing Authentication Token`), which is how a browser
 //!   tells a resource that declines a preflight from one that answers it.
 //!
-//! Everything else — a page from a site no method of the resource names, and a page admitted
-//! only by a wildcard to a method whose integration names a backend — is left to the front door,
+//! And one outcome the records do not decide at all: a request whose own CREDENTIAL the stage
+//! will AUTHENTICATE before it performs anything
+//! ([`will_be_authenticated_before_anything_is_performed`]) is served with its integration
+//! performed whatever the declaration says, because `Origin` is no authorization input of a
+//! method — the recorded behaviour of this endpoint is that a SIGNED call is answered by the
+//! integration whichever site the page that sent it was loaded from. Signing needs this
+//! emulator's own secret, which a document a browser loaded from a site does not have, so what
+//! this admits is a client holding those credentials and never a page: the front door's purpose
+//! is kept by the thing that tells the two apart.
+//!
+//! Everything else — a page reaching a resource whose methods declare no origin at all, and a
+//! page admitted only by a wildcard (or by nothing naming its own site) to a method whose
+//! integration names a backend — is left to the front door,
 //! which refuses it exactly as it did before this seam existed.
 //!
 //! The admission is the API's own, not the operator's, because the operator has no say to
@@ -62,7 +77,8 @@
 //! parses no cross-origin option, and nothing in this tree resolves one. Where a browser-facing
 //! data plane of this emulator does admit a page, it is the RESOURCE's own declaration that
 //! admits it (a function URL's `Cors$AllowOrigins`, over the same core reading of a browser's
-//! headers), and that is the rule this follows.
+//! headers, invoking the function behind it over the handle the create that published the
+//! address was serving under), and that is the rule this follows.
 
 use std::sync::Arc;
 
@@ -70,9 +86,9 @@ use ::smithy_server_runtime::ServiceIdentity;
 
 use super::*;
 
-/// The response header whose mapping is a method's statement about which origins its answers
-/// are for: `Access-Control-Allow-Origin`, the header a browser reads a cross-origin answer's
-/// admission from.
+/// The response header whose mapping is a resource's statement that its answers are for pages:
+/// `Access-Control-Allow-Origin`, the header a browser reads a cross-origin answer's admission
+/// from.
 const ALLOW_ORIGIN_HEADER: &str = "Access-Control-Allow-Origin";
 
 /// The `Access-Control-Allow-Origin` value that names every origin.
@@ -157,10 +173,18 @@ enum Admission {
 ///   `Cors$AllowOrigins`, and that address runs the function for a page it names — so the
 ///   method answers it as it answers anybody, with its integration performed over the address
 ///   the deployment carries;
-/// * a declaration naming EVERY origin names no site, so it is nobody's page in particular: it
-///   admits only what this seam has always admitted, a method whose answer needs no call
+/// * a declaration naming EVERY origin names no site, and so does one naming only OTHER sites
+///   than this request's: it is nobody's page in particular, so it admits only what this seam
+///   has always admitted, a method whose answer needs no call
 ///   outside this service ([`performs_no_onward_call`]), served over a transport that reaches
-///   nothing. A page from a site no method names is not admitted at all.
+///   nothing — which is what the endpoint answers every preflight of a CORS-configured resource
+///   with, the static mapping it declares whoever asked. A page reaching a resource whose
+///   methods declare NO origin at all ([`declares_a_contract`]) is not admitted;
+/// * a request whose own CREDENTIAL the stage will AUTHENTICATE before it performs anything
+///   ([`will_be_authenticated_before_anything_is_performed`]) is admitted with its integration
+///   performed whatever the declaration says, because what answers such a call is a client
+///   holding this emulator's own credentials rather than a page, and `Origin` is no
+///   authorization input of a method.
 ///
 /// A request NO deployed method serves is admitted whatever the api declares, because what
 /// answers it is the stage's own refusal — nothing is performed for it, and the endpoint's
@@ -175,13 +199,75 @@ fn admission<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> Optio
         // No deployed method serves it: what answers it is the stage's own refusal.
         return Some(Admission::FromTheRecordsAlone);
     };
-    match declared_for(served.resource, req)? {
-        Declaration::TheOriginItself => Some(Admission::WithTheIntegrationPerformed(
+    // The stage will AUTHENTICATE this request's own credential before it performs anything for
+    // it, so what is answering is a client holding this emulator's own credentials rather than a
+    // page: `Origin` is no authorization input of a method, and the recorded behaviour of this
+    // endpoint is that such a call is answered by the integration whichever site it names.
+    if will_be_authenticated_before_anything_is_performed(&served, req) {
+        return Some(Admission::WithTheIntegrationPerformed(
+            served.deployment.reached_emulator.clone(),
+        ));
+    }
+    match declared_for(served.resource, req) {
+        Some(Declaration::TheOriginItself) => Some(Admission::WithTheIntegrationPerformed(
             served.deployment.reached_emulator.clone(),
         )),
-        Declaration::EveryOrigin => performs_no_onward_call(served.method)
-            .then_some(Admission::FromTheRecordsAlone),
+        // A declaration naming EVERY origin names no site, and so does one naming only OTHER
+        // sites than this request's: either way the api's owner named no page in particular, so
+        // all that is admitted is what the records answer by themselves — which is what the
+        // endpoint answers every preflight of a CORS-configured resource with, the static
+        // mapping whoever asked, read over a transport that reaches nothing. A resource whose
+        // methods declare no origin at all ([`declares_a_contract`]) is reached by no page.
+        Some(Declaration::EveryOrigin) | None => (declares_a_contract(served.resource)
+            && performs_no_onward_call(served.method))
+        .then_some(Admission::FromTheRecordsAlone),
     }
+}
+
+/// Whether the records of `resource` declare a CORS contract at all: one of its deployed methods
+/// SERVES a static `Access-Control-Allow-Origin` literal, whichever origin that literal names.
+///
+/// That is the statement that makes the resource a browser-facing one — its developer configured
+/// it for pages, through the control plane — and it is what the api's own records answering a
+/// request from a site they do not name rests on: the value a preflight is answered with is the
+/// declared one whoever asked, exactly as the mapping says, and the browser is what refuses a
+/// page it does not name. A resource no record of which declares one is reached by no page.
+fn declares_a_contract(resource: &ResourceEntry) -> bool {
+    !declared_allow_origins(resource).is_empty()
+}
+
+/// Whether the stage will AUTHENTICATE the credential `req` carries before it performs anything
+/// for it, which is what makes a request from ANY site one this seam serves in full.
+///
+/// It verifies nothing itself: it answers whether the SERVING will, which is the question the
+/// admission has to put before the serving starts.
+///
+/// Three things have to hold. The method's `authorizationType` must be `AWS_IAM`, the one that
+/// authenticates a caller at all; the request must CARRY a SigV4 credential
+/// ([`super::carries_sigv4_credential`]), since a method that requires one refuses a request
+/// with none before anything else; and this emulator must ACCEPT access keys, read off the very
+/// handle the serving would be given ([`crate::state::accepts_access_keys`], the same reading
+/// [`super::sigv4_authentication`] makes of the handle a named invoke's context carries). Where
+/// all three hold, the serving verifies the signature against the keys this emulator published
+/// and refuses a request not signed with them `403` with no integration performed.
+///
+/// So what this admits is a client holding this emulator's own credentials, whatever origin its
+/// request names — which is the request AWS serves, the `Origin` being no authorization input of
+/// a method — and what it does not admit is a page: a document a browser loaded from a site
+/// cannot sign a request with those credentials, because it does not have them. Where this
+/// emulator accepts no access key the serving verifies nothing, so it could not tell the two
+/// apart, and this answers `false` for every request rather than admitting both.
+fn will_be_authenticated_before_anything_is_performed(
+    served: &ServedBy<'_>,
+    req: &RtRequest,
+) -> bool {
+    served.method.authorization_type == AUTHORIZATION_AWS_IAM
+        && carries_sigv4_credential(req)
+        && served
+            .deployment
+            .reached_emulator
+            .as_ref()
+            .is_some_and(crate::state::accepts_access_keys)
 }
 
 /// What a deployed stage of the resolved api would serve `req` from.
@@ -278,6 +364,7 @@ fn declared_allow_origins(resource: &ResourceEntry) -> Vec<&str> {
 /// call instead of a literal declares no origin, because what it resolves to is not knowable
 /// before the call is served.
 fn method_allow_origins(method: &MethodEntry) -> Vec<&str> {
+    let header = ALLOW_ORIGIN_HEADER;
     let mut declared = Vec::new();
     let Some(integration) = method.integration.as_ref() else {
         return declared;
@@ -294,7 +381,7 @@ fn method_allow_origins(method: &MethodEntry) -> Vec<&str> {
             let Some(name) = key.strip_prefix(METHOD_RESPONSE_HEADER_PREFIX) else {
                 continue;
             };
-            if !name.eq_ignore_ascii_case(ALLOW_ORIGIN_HEADER) {
+            if !name.eq_ignore_ascii_case(header) {
                 continue;
             }
             if by_the_method.is_none_or(|declared| !declared.contains_key(key)) {
@@ -414,9 +501,9 @@ fn serving_transport(admission: Admission) -> ::smithy_server_runtime::EmbeddedE
 }
 
 /// Say ONCE, the first time this seam serves a request, that a browser from another site
-/// reached a deployed stage of this emulator and what it was served from: the admission is the
-/// api's own declaration, so a developer whose api declares an origin learns that pages from it
-/// are being answered, and learns it at a level they see rather than from a missing refusal.
+/// reached a deployed stage of this emulator and what such a request is served on: a developer
+/// whose api declares a CORS contract learns that pages are being answered from it, and learns
+/// it at a level they see rather than from a missing refusal.
 ///
 /// Once per process, because the sentence is about the standing arrangement rather than about
 /// one request, and a per-request line on a data plane a browser drives would bury it.
@@ -426,9 +513,10 @@ fn announce_once() {
         tracing::warn!(
             "a browser is calling a deployed stage of this emulator from another site; such a \
              request is served only where a deployed method of the resource it addresses \
-             declares that origin, it reaches this api's own integration only where a method of \
-             that resource declares THAT SITE itself, and a declaration naming every origin \
-             reaches nothing outside this service"
+             declares that origin or the stage authenticates the credential it carries, it \
+             reaches this api's own integration only where a method of that resource declares \
+             THAT SITE itself or that credential authenticates, and a declaration naming every \
+             origin reaches nothing outside this service"
         );
     });
 }
@@ -620,19 +708,17 @@ mod tests {
     /// named is the api owner's statement about THAT site, the wildcard names no site in
     /// particular, and anything else declares nothing.
     ///
-    /// The rows span what that reading generalises over: the origin itself declared, the
-    /// wildcard, another origin declared (which does not admit this one), a mapping the method
-    /// response does not declare (so nothing is served and nothing is declared), a mapping that
-    /// names a value of the call rather than a literal, another header's mapping, a method
-    /// carrying no integration, the header name spelled in another case (one header, by HTTP's
-    /// own comparison), the opaque origin against the wildcard, and a request carrying no
-    /// origin at all.
+    /// The rows span what that reading generalises over: one site named, the wildcard, a mapping
+    /// the method response does not declare (so nothing is served and nothing is declared), a
+    /// mapping that names a value of the call rather than a literal, another header's mapping, a
+    /// method carrying no integration, and the header name spelled in another case (one header,
+    /// by HTTP's own comparison).
     #[test]
     fn a_resource_declares_what_its_served_mappings_name() {
         const ALLOW_ORIGIN: &str = "method.response.header.Access-Control-Allow-Origin";
-        let cases: [DeclarationRow; 10] = [
+        let cases: [DeclarationRow; 9] = [
             (
-                "the origin itself declared",
+                "one site named",
                 Some((ALLOW_ORIGIN, "'https://app.example'", true)),
                 &[("origin", "https://app.example")],
                 Some(Declaration::TheOriginItself),
@@ -691,12 +777,6 @@ mod tests {
                 "the opaque origin against the wildcard",
                 Some((ALLOW_ORIGIN, "'*'", true)),
                 &[("origin", "null")],
-                None,
-            ),
-            (
-                "no origin at all",
-                Some((ALLOW_ORIGIN, "'*'", true)),
-                &[],
                 None,
             ),
         ];
@@ -865,6 +945,153 @@ mod tests {
             builder = builder.header(*name, *value);
         }
         let request = builder
+            .body(SdkBody::empty())
+            .expect("the test request is well formed");
+        RtRequest::try_from(request).expect("the test request is a runtime request")
+    }
+
+    /// One row of the credential table below: the case, the `authorizationType` the method
+    /// declares, the headers the request carries, and whether it presents a SigV4 credential.
+    type CredentialRow = (
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        bool,
+    );
+
+    /// RULE: the stage will authenticate a cross-origin request's own credential before
+    /// performing anything for it exactly where the method's `authorizationType` is `AWS_IAM`,
+    /// the request CARRIES a SigV4 credential, and the handle the serving would be given vends
+    /// access keys — and for no other request, so one nothing could authenticate is never
+    /// admitted on that strength.
+    ///
+    /// The rows span what the rule generalises over: each `authorizationType` this data plane
+    /// admits a request under, each form a credential travels in (the `Authorization` header a
+    /// signed SDK request carries and the query a presigned URL carries), and a request carrying
+    /// none — each asked of all three states the handle can be in: an emulator that ACCEPTS
+    /// access keys, one that accepts none, and a deployment carrying no handle at all.
+    #[test]
+    fn a_credential_the_stage_will_authenticate_is_what_admits_a_signed_call() {
+        const SIGNED_HEADER: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/\
+                                     execute-api/aws4_request, SignedHeaders=host, Signature=00";
+        let cases: [CredentialRow; 6] = [
+            (
+                "an AWS_IAM method, signed in the Authorization header",
+                AUTHORIZATION_AWS_IAM,
+                &[("authorization", SIGNED_HEADER)],
+                true,
+            ),
+            (
+                "an AWS_IAM method reached with no credential at all",
+                AUTHORIZATION_AWS_IAM,
+                &[],
+                false,
+            ),
+            (
+                "a method that authenticates nobody, signed all the same",
+                AUTHORIZATION_NONE,
+                &[("authorization", SIGNED_HEADER)],
+                true,
+            ),
+            (
+                "a method behind a custom authorizer, signed all the same",
+                "CUSTOM",
+                &[("authorization", SIGNED_HEADER)],
+                true,
+            ),
+            (
+                "a method behind a user pool, signed all the same",
+                AUTHORIZATION_COGNITO_USER_POOLS,
+                &[("authorization", SIGNED_HEADER)],
+                true,
+            ),
+            // The presigned form carries the credential in the query, which the request below
+            // writes into the URI rather than into a header.
+            ("an AWS_IAM method reached as a presigned URL", AUTHORIZATION_AWS_IAM, &[], true),
+        ];
+        // The three states the handle the serving would be given can be in: an emulator that
+        // accepts access keys and therefore verifies the signature, one that accepts none and
+        // so verifies nothing, and a deployment that carries no handle at all.
+        let accepting_keys = authenticating_emulator();
+        let handles: [(&str, Option<::smithy_server_runtime::EmbeddedEmulator>); 3] = [
+            ("an emulator that accepts access keys", Some(accepting_keys)),
+            (
+                "an emulator that accepts none",
+                Some(super::reached_emulator::contained()),
+            ),
+            ("a deployment carrying no handle", None),
+        ];
+        for (case, authorization_type, headers, carries_credential) in cases {
+            let presigned = case.contains("presigned");
+            let req = if presigned {
+                presigned_request()
+            } else {
+                verbed_request("GET", headers)
+            };
+            // What the request itself carries, read through the one reader this plane reads a
+            // presented credential with, which is the half of the rule that does not depend on
+            // the emulator.
+            assert_eq!(
+                carries_sigv4_credential(&req),
+                carries_credential,
+                "case {case:?}: expected the request to carry a credential to be \
+                 {carries_credential}"
+            );
+            for (handle_case, reached) in &handles {
+                let deployment = DeploymentEntry {
+                    reached_emulator: reached.clone(),
+                    ..Default::default()
+                };
+                let method = MethodEntry {
+                    authorization_type: authorization_type.to_string(),
+                    ..Default::default()
+                };
+                let resource = resource_with(&[("GET", method.clone())]);
+                let served = ServedBy {
+                    deployment: &deployment,
+                    resource: &resource,
+                    method: &method,
+                };
+                // Authenticated only where the method requires a credential, the request
+                // carries one, AND the handle vends access keys — which is the first handle
+                // alone.
+                let expected = carries_credential
+                    && authorization_type == AUTHORIZATION_AWS_IAM
+                    && reached
+                        .as_ref()
+                        .is_some_and(crate::state::accepts_access_keys);
+                let actual = will_be_authenticated_before_anything_is_performed(&served, &req);
+                assert_eq!(
+                    actual, expected,
+                    "case {case:?} with {handle_case}: expected the serving to authenticate it \
+                     to be {expected}, got {actual}"
+                );
+            }
+        }
+    }
+
+    /// A handle onto an emulator that ACCEPTS access keys: a router with this process's own
+    /// authenticator registered, which is what vends the credentials a signed request is
+    /// verified against.
+    fn authenticating_emulator() -> ::smithy_server_runtime::EmbeddedEmulator {
+        let mut router = ::smithy_server_runtime::MultiServiceRouter::new();
+        router.set_request_authentication(true);
+        ::smithy_server_runtime::EmbeddedEmulator::from_router(router)
+    }
+
+    /// One presigned invoke: the credential a presigned URL carries in its query string, which
+    /// is the second form a request presents a SigV4 credential in.
+    fn presigned_request() -> RtRequest {
+        let request = ::http::Request::builder()
+            .method("GET")
+            .uri(
+                "https://127.0.0.1:1/_aws/execute-api/abc1230000/live/cors\
+                 ?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+                 &X-Amz-Credential=AKIDEXAMPLE%2F20260101%2Fus-east-1%2Fexecute-api%2Faws4_request\
+                 &X-Amz-Date=20260101T000000Z&X-Amz-SignedHeaders=host&X-Amz-Signature=00",
+            )
+            .header("origin", "https://app.example")
+            .header("sec-fetch-site", "cross-site")
             .body(SdkBody::empty())
             .expect("the test request is well formed");
         RtRequest::try_from(request).expect("the test request is a runtime request")

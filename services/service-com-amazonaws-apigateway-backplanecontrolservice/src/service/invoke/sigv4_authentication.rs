@@ -50,7 +50,7 @@ use std::borrow::Cow;
 use aws_smithy_runtime_api::http::Request as RtRequest;
 use smithy_server_runtime::OperationContext;
 
-use ::emulator_server::{RequestAuthenticator, SigV4Authenticator, VendedCredentials};
+use ::emulator_server::{RequestAuthenticator, SigV4Authenticator};
 
 /// The CANONICAL REQUEST a signature is computed over and the string-to-sign built from it,
 /// which AWS quotes back for a signature that does not match; in a file of its own.
@@ -202,13 +202,12 @@ fn mismatch(req: &RtRequest) -> Unauthenticated {
 }
 
 /// Whether the emulator serving this request authenticates requests at all: the credentials
-/// it ACCEPTS, which the router fills from the authenticators registered on it and leaves
-/// empty when none is.
+/// it ACCEPTS, read off the handle this request's own context carries through the one reading
+/// of it ([`crate::state::accepts_access_keys`]), which the cross-origin admission asks of the
+/// handle it would be served over before anything is served
+/// ([`super::browser_invoke`]) — so neither can differ about whether a signature is verified.
 fn vended(ctx: &OperationContext<'_>) -> bool {
-    ctx.callback()
-        .credentials()
-        .iter()
-        .any(|credential| matches!(credential, VendedCredentials::AwsAccessKey { .. }))
+    crate::state::accepts_access_keys(ctx.callback())
 }
 
 /// `req` as the request parts the emulator's own authenticator reads: the method, the URI

@@ -36,8 +36,8 @@
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. EDITED HERE: it serves the one invoke
 //!   [`Service::override_operation`] deliberately names no operation for — a request a
-//!   browser sent from another site whose resource declares that origin — and otherwise
-//!   returns `None`, so the entry renders the
+//!   browser sent from another site whose resource's own deployed records declare a CORS
+//!   contract — and otherwise returns `None`, so the entry renders the
 //!   protocol-correct default (query -> 400 InvalidAction, awsJson -> 404, …).
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
@@ -89,14 +89,17 @@
 //!   operation is named only for a request the data plane claims, and every modelled
 //!   request keeps resolving through the generated table.
 //! - [`Service::override_routing_error`] serves the ONE invoke that operation is not named
-//!   for: the request a browser sent from another site whose RESOURCE DECLARES ITS ORIGIN —
+//!   for: the request a browser sent from another site whose RESOURCE DECLARES ITS ORIGIN, or
+//!   whose credential the stage will AUTHENTICATE before anything is performed —
 //!   the `OPTIONS` preflight a browser sends before a cross-origin call, and the real request
-//!   that follows it — and the request no deployed method serves, which the stage refuses
+//!   that follows it, which API Gateway enforces no CORS on — and the request no deployed
+//!   method serves, which the stage refuses
 //!   itself. The front door refuses such a request after an operation is named for it and
 //!   before it is run, with no seam to admit one through, so naming none is what routes it to
 //!   this seam — which runs ahead of that refusal. It is served from the same records, by the
-//!   same resolution; its method's own integration is performed only where a method of that
-//!   resource declares THAT SITE itself, over the address the DEPLOYMENT its stage serves
+//!   same resolution; its method's own integration is performed where a method of that
+//!   resource declares THAT SITE itself or the request carries a credential this emulator
+//!   verifies, over the address the DEPLOYMENT its stage serves
 //!   carries, and a declaration naming every origin keeps reaching nothing outside this
 //!   service. Every other cross-site request is named above and refused there as before
 //!   ([`invoke::browser_invoke`]).
@@ -677,14 +680,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // it carries — see that operation's own `auth_schemes`.
         //
         // EXCEPT the invoke the front door would refuse before that operation ran — one a
-        // browser sent from another site whose RESOURCE DECLARES ITS ORIGIN (or that no
+        // browser sent from another site whose RESOURCE DECLARES ITS ORIGIN, or that carries a
+        // credential the stage will AUTHENTICATE before it performs anything (or that no
         // deployed method serves at all, which the stage refuses itself). That is the
         // cross-origin call a CORS contract is made of: the `OPTIONS` preflight a browser sends
         // first, and the real request that follows it. Naming no operation for it is what
         // routes it to `override_routing_error` below, which runs ahead of that refusal and
         // serves it from those same records ([`invoke::browser_invoke`], which also decides how
-        // far it is served: a declaration naming THAT SITE performs the method's integration, a
-        // declaration naming every origin reaches nothing outside this service). Every other
+        // far it is served: a declaration naming THAT SITE, or a credential this emulator
+        // verifies, performs the method's integration, while a declaration naming every origin
+        // reaches nothing outside this service). Every other
         // cross-site request keeps being named here and refused there, exactly as before.
         if invoke::claims_a_cross_origin_browser_request(&*self.engine, req) {
             return None;
@@ -719,7 +724,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // rest -> 501) by returning `None`.
         //
         // With ONE exception: the invoke a browser sent from another site WHOSE RESOURCE
-        // DECLARES ITS ORIGIN, which `override_operation` deliberately leaves unnamed so that
+        // DECLARES ITS ORIGIN, or whose credential the stage will authenticate, which
+        // `override_operation` deliberately leaves unnamed so that
         // it reaches this seam — the one that still answers it, because it runs before the
         // front door refuses such a request. A deployed stage answers the cross-origin call a
         // browser makes of such a resource, so it is served from those records here, over the
