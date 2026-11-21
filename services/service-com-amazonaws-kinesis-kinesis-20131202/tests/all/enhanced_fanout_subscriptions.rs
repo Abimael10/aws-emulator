@@ -16,6 +16,11 @@
 //! `GetRecords`) serves for the same position, because one rule decides where a reader of a
 //! shard starts and what one read of it delivers.
 //!
+//! A `ConsumerARN` is its stream's ARN extended, so the `ShardId` it is given is resolved
+//! inside THAT stream and no other: a shard id only another stream's map carries is refused as
+//! a shard the consumer's stream does not hold, and the refusal leaves the consumer, its
+//! ability to subscribe and both streams' records as they were.
+//!
 //! A subscription holds its shard only while its event stream is LIVE: once that stream has
 //! ended, the consumer's renewal of it — `SubscribeToShard` again for the same `ConsumerARN`
 //! and `ShardId`, from the `ContinuationSequenceNumber` the last event reported — is served
@@ -985,5 +990,204 @@ async fn a_subscription_that_drains_a_closed_shard_reports_its_child_shards() {
         children.len(),
         2,
         "case {case:?}: a split produces two children for the shard it cut, got {children:?}"
+    );
+}
+
+/// The shard ids a stream's map carries, as `ListShards` reports them.
+async fn shard_ids(emulator: &Emulator, case: &str, stream: &str) -> Vec<String> {
+    emulator
+        .ok(case, "ListShards", &json!({ "StreamName": stream }))
+        .await["Shards"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: ListShards answers Shards"))
+        .iter()
+        .map(|shard| {
+            shard["ShardId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case}: a listed shard carries a ShardId"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// Every record the PULL reader still serves out of `stream`, over every shard of its map
+/// read from the horizon.
+async fn retained_by(emulator: &Emulator, case: &str, stream: &str) -> Vec<String> {
+    let mut records = Vec::new();
+    for shard in shard_ids(emulator, case, stream).await {
+        let horizon = json!({ "Type": "TRIM_HORIZON" });
+        records.extend(pulled(emulator, case, stream, &shard, &horizon).await);
+    }
+    records
+}
+
+/// The `ConsumerDescription` a read of `consumer_arn` reports: its ARN and its status.
+async fn described_consumer(
+    emulator: &Emulator,
+    case: &str,
+    consumer_arn: &str,
+) -> (String, String) {
+    let described = emulator
+        .ok(
+            case,
+            "DescribeStreamConsumer",
+            &json!({ "ConsumerARN": consumer_arn }),
+        )
+        .await;
+    let read = |member: &str| {
+        described["ConsumerDescription"][member]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {case}: a consumer description carries {member}, got {described}")
+            })
+            .to_string()
+    };
+    (read("ConsumerARN"), read("ConsumerStatus"))
+}
+
+/// A `ConsumerARN` is its stream's ARN extended, so the `ShardId` of a subscription is
+/// resolved inside THAT stream and no other: a shard id another stream's map carries is, to
+/// the consumer's stream, a shard it does not hold, and is refused with the modelled
+/// `ResourceNotFoundException` (HTTP 400) stating `Shard <shardId> in stream <streamName>
+/// under account <accountId> does not exist` for the stream the `ConsumerARN` resolves to —
+/// whichever position the request named, and leaving the consumer, its ability to subscribe
+/// and both streams' records exactly as they were.
+///
+/// The rows differ along which shard id is asked for (one the other stream's map carries, the
+/// last of that wider map, one of the shape this service mints that neither map carries, and
+/// one of another shape altogether) and along which of the positions the request names, since
+/// the shard the request addresses is resolved before the position inside it is.
+#[tokio::test]
+async fn a_shard_of_another_stream_is_refused_and_changes_nothing() {
+    let emulator = Emulator::new();
+    // The consumer's own stream, one shard wide, and a WIDER stream whose map therefore
+    // carries shard ids the consumer's stream does not.
+    let own = "efo-foreign-own";
+    let other = "efo-foreign-other";
+    active_stream(&emulator, "setup", own, 1).await;
+    active_stream(&emulator, "setup", other, 4).await;
+    let consumer_arn = active_consumer(&emulator, "setup", own, "foreign-shard-probe").await;
+    put(&emulator, "setup", own, "own-record").await;
+    let sequence_number = put(&emulator, "setup", other, "other-record").await;
+
+    // The positive control: the same consumer on a shard its OWN stream holds is served, and
+    // delivers that stream's record.
+    let control = "the consumer's own shard";
+    let event = subscribed_event(
+        &emulator,
+        control,
+        &json!({
+            "ConsumerARN": consumer_arn,
+            "ShardId": FIRST_SHARD,
+            "StartingPosition": { "Type": "TRIM_HORIZON" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        delivered(control, &event),
+        vec!["own-record".to_string()],
+        "case {control:?}: a subscription delivers the records of the stream its ConsumerARN \
+         names, got {event}"
+    );
+
+    let wider_map = shard_ids(&emulator, "setup", other).await;
+    assert_eq!(
+        wider_map.len(),
+        4,
+        "case setup: the wider stream's map carries the shards its create laid down, got \
+         {wider_map:?}"
+    );
+    let account = engine::EMULATOR_ACCOUNT_ID;
+    // (case, the shard id the request names, the position it reads from).
+    let rows: Vec<(&str, String, Value)> = vec![
+        (
+            "a shard the other stream's map carries",
+            wider_map[1].clone(),
+            json!({ "Type": "TRIM_HORIZON" }),
+        ),
+        (
+            "the last shard of that wider map",
+            wider_map[3].clone(),
+            json!({ "Type": "LATEST" }),
+        ),
+        (
+            "a shard id of the shape this service mints that neither map carries",
+            ABSENT_SHARD.to_string(),
+            json!({ "Type": "AT_TIMESTAMP", "Timestamp": 0 }),
+        ),
+        (
+            "a shard id of another shape altogether",
+            "shard-9".to_string(),
+            json!({ "Type": "AT_SEQUENCE_NUMBER", "SequenceNumber": sequence_number }),
+        ),
+    ];
+
+    for (case, shard, position) in rows {
+        let (code, message) = refusal(
+            &emulator,
+            case,
+            "SubscribeToShard",
+            &json!({
+                "ConsumerARN": consumer_arn,
+                "ShardId": shard,
+                "StartingPosition": position,
+            }),
+        )
+        .await;
+        assert_eq!(
+            code, "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {code} with {message:?}"
+        );
+        // Written out here rather than borrowed from the crate, so the wording itself is what
+        // this case pins: the stream named is the one the ConsumerARN resolves to, never the
+        // stream whose map carries the shard.
+        let sentence =
+            format!("Shard {shard} in stream {own} under account {account} does not exist");
+        assert_eq!(
+            message, sentence,
+            "case {case:?}: expected the refusal to state {sentence:?}, got {message:?}"
+        );
+
+        // The refusal established nothing and released nothing: the consumer is the same
+        // consumer, still readable under the same ARN and still ACTIVE.
+        let (described_arn, status) = described_consumer(&emulator, case, &consumer_arn).await;
+        assert_eq!(
+            described_arn, consumer_arn,
+            "case {case:?}: a refused subscription leaves the ConsumerARN as it was, got \
+             {described_arn:?}"
+        );
+        assert_eq!(
+            status, CONSUMER_ACTIVE,
+            "case {case:?}: a refused subscription leaves the consumer {CONSUMER_ACTIVE}, got \
+             {status:?}"
+        );
+    }
+
+    // And nothing the refusals touched moved: the consumer still subscribes to its own shard
+    // and is served that stream's record again, and the record the OTHER stream holds is still
+    // there to be read — a refused subscription read no shard of it.
+    let after = "after the refusals";
+    let event = subscribed_event(
+        &emulator,
+        after,
+        &json!({
+            "ConsumerARN": consumer_arn,
+            "ShardId": FIRST_SHARD,
+            "StartingPosition": { "Type": "TRIM_HORIZON" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        delivered(after, &event),
+        vec!["own-record".to_string()],
+        "case {after:?}: a refused subscription establishes none, so the consumer's own shard \
+         is served again, got {event}"
+    );
+    let retained = retained_by(&emulator, after, other).await;
+    assert_eq!(
+        retained,
+        vec!["other-record".to_string()],
+        "case {after:?}: the other stream's records are untouched by a subscription that \
+         named one of its shard ids, got {retained:?}"
     );
 }
