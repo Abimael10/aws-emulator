@@ -257,3 +257,161 @@ async fn every_tag_operation_answers_an_unresolvable_arn_by_the_endpoint_it_name
         "case \"read the emptied tag set\": expected an empty tag set, got {body:?}"
     );
 }
+
+/// The longest `ResourceARN` the family accepts, from the `@length` the model publishes on the
+/// shape all three operations' `ResourceARN` targets — 1 to 1011 characters
+/// (`smithy_query(query="shape",shape="com.amazonaws.applicationautoscaling#AmazonResourceName")`).
+const MAX_RESOURCE_ARN_CHARS: usize = 1011;
+
+/// The member path a boundary constraint clause names `ResourceARN` by, which is the member's
+/// own name as the wire protocol spells it.
+const RESOURCE_ARN_PATH: &str = "resourceARN";
+
+/// A scalable-target ARN of `account` in the Region serving the request, exactly `chars`
+/// characters long: the id is padded out with characters the modelled `@pattern` admits
+/// (`[a-zA-Z0-9-]`), so LENGTH is the only thing that varies from row to row.
+fn arn_of_length(account: &str, chars: usize) -> String {
+    let mut arn = format!("arn:aws:application-autoscaling:{REGION}:{account}:scalable-target/");
+    assert!(
+        arn.len() < chars,
+        "case {chars:?}: expected room for an id of at least one character after {arn:?}"
+    );
+    while arn.len() < chars {
+        arn.push('a');
+    }
+    arn
+}
+
+/// RULE: which refusal an unresolvable `ResourceARN` earns is decided by the ENDPOINT it names
+/// and by nothing else, so the length of the ARN does not enter into it — up to the published
+/// `@length` maximum of the shape it targets, past which the request never reaches the handler
+/// and is refused at the protocol boundary instead.
+///
+/// The rows walk the published bound: at the maximum, one character inside it and one character
+/// past it, each crossed with an ARN of this endpoint and one of another account, and each asked
+/// on all three operations of the family.
+#[tokio::test]
+async fn the_family_answers_an_unresolvable_arn_alike_up_to_the_published_length_bound() {
+    let emulator = Emulator::empty();
+
+    // A registered target carrying a tag, so the rows below are about the ARN they name and so
+    // the refusals can be shown to have left the store as they found it.
+    let resident = emulator
+        .given_target("dynamodb:table:ReadCapacityUnits", 1, 10)
+        .await;
+    let resident_arn = emulator.target_arn(&resident).await;
+    let (status, body) = emulator
+        .call(
+            "TagResource",
+            json!({"ResourceARN": resident_arn, "Tags": {"env": "sim2real"}}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"tag the resident target\": expected HTTP 200, got {status} with {body:?}"
+    );
+
+    // Inside the bound the answer is the one the rest of this suite holds the family to, whether
+    // the ARN is the longest one the model admits or one character shorter.
+    for chars in [MAX_RESOURCE_ARN_CHARS, MAX_RESOURCE_ARN_CHARS - 1] {
+        for (reason, account, served_here) in [
+            ("an ARN of this endpoint", ACCOUNT, true),
+            ("an ARN of another account", "111122223333", false),
+        ] {
+            let arn = arn_of_length(account, chars);
+            assert_eq!(
+                arn.len(),
+                chars,
+                "case {reason:?}: expected an ARN of {chars} characters, got {}",
+                arn.len()
+            );
+            for (operation, request) in family(&arn) {
+                let case = format!("{reason} of {chars} characters on {operation}");
+                let (status, body) = emulator.call(operation, request).await;
+                assert_eq!(
+                    status, CLIENT_ERROR,
+                    "case {case:?}: expected HTTP {CLIENT_ERROR}, got {status} with {body:?}"
+                );
+                let code = error_code(&body);
+                let message = error_message(&body);
+                let (expected_code, expected_message) = if served_here {
+                    (RESOURCE_NOT_FOUND, TARGET_NOT_FOUND)
+                } else {
+                    (VALIDATION, ACCESS_DENIED)
+                };
+                assert_eq!(
+                    code, expected_code,
+                    "case {case:?}: expected {expected_code}, got {code:?} in {body:?}"
+                );
+                assert_eq!(
+                    message, expected_message,
+                    "case {case:?}: expected {expected_message:?}, got {message:?}"
+                );
+                if served_here {
+                    assert_eq!(
+                        body["ResourceName"],
+                        Value::String(arn.clone()),
+                        "case {case:?}: expected the ARN asked about in ResourceName, got {body:?}"
+                    );
+                } else {
+                    assert!(
+                        body.get("ResourceName").is_none(),
+                        "case {case:?}: expected no resource to be named, got {body:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // One character past the published maximum the request breaks a constraint the MODEL
+    // declares, so it is refused at the protocol boundary — the framework's constraint envelope,
+    // quoting the value submitted, the member it was submitted at and the bound it had to
+    // satisfy — rather than by the resolution that reports a resource absent. An ARN of another
+    // account is refused there too, so the over-long row is about the bound and not about the
+    // endpoint.
+    for (reason, account) in [
+        ("an ARN of this endpoint", ACCOUNT),
+        ("an ARN of another account", "111122223333"),
+    ] {
+        let arn = arn_of_length(account, MAX_RESOURCE_ARN_CHARS + 1);
+        let expected = format!(
+            "1 validation error detected: Value '{arn}' at '{RESOURCE_ARN_PATH}' failed to \
+             satisfy constraint: Member must have length less than or equal to \
+             {MAX_RESOURCE_ARN_CHARS}"
+        );
+        for (operation, request) in family(&arn) {
+            let case = format!("{reason} one character past the bound on {operation}");
+            let (status, body) = emulator.call(operation, request).await;
+            assert_eq!(
+                status, CLIENT_ERROR,
+                "case {case:?}: expected HTTP {CLIENT_ERROR}, got {status} with {body:?}"
+            );
+            let code = error_code(&body);
+            assert_eq!(
+                code, VALIDATION,
+                "case {case:?}: expected {VALIDATION}, got {code:?} in {body:?}"
+            );
+            let message = error_message(&body);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+    }
+
+    // None of those refusals touched the store: the registered target still carries the tag
+    // written before them, so no row passed because the family stopped serving.
+    let (status, body) = emulator
+        .call("ListTagsForResource", json!({"ResourceARN": resident_arn}))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"read the resident target's tags\": expected HTTP 200, got {status} with {body:?}"
+    );
+    assert_eq!(
+        body["Tags"],
+        json!({"env": "sim2real"}),
+        "case \"read the resident target's tags\": expected the refusals to change nothing, got \
+         {body:?}"
+    );
+}
