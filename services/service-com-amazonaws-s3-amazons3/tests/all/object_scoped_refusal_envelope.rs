@@ -293,6 +293,16 @@ fn operation_rows(absent_version: &str) -> Vec<Row> {
             key: HELD_KEY.to_string(),
             version_id: Some(absent_version.to_string()),
         },
+        Row {
+            case: "GetObjectTagging naming a version that is not there",
+            method: "GET",
+            suffix: format!("{HELD_KEY}?tagging&versionId={absent_version}"),
+            headers: Vec::new(),
+            body: "",
+            code: NO_SUCH_VERSION_CODE,
+            key: HELD_KEY.to_string(),
+            version_id: Some(absent_version.to_string()),
+        },
     ];
     // The version-scoped DELETE is NOT among them: `DeleteObject` models no error at all, so
     // a version the bucket holds no entry for is its own no-op success rather than an

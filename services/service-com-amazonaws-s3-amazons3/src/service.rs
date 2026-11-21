@@ -325,16 +325,37 @@ fn addressed_bucket_in<Eng: Send + Sync + 'static>(engine: &Eng, address: &str) 
         .map(|route| route.bucket)
 }
 
-/// Whether `host` carries a BUCKET as its first label, by shape alone: a host of at least
-/// two labels whose first could be a bucket name.
+/// Whether `host` carries a BUCKET as its first label, by shape alone: the label and what
+/// REMAINS of the host behind it, for a host of at least two labels whose first could be a
+/// bucket name.
 ///
 /// Shape is not enough to decide the address — an endpoint's own first label can be
 /// bucket-shaped (`s3-us-east-1.amazonaws.com`, `my-emulator.example.com`) — so
-/// [`addressed_in_host`] is what resolves it, against the buckets this emulator holds.
-fn host_style_label(host: &str) -> Option<&str> {
+/// [`addressed_in_host`] is what resolves it, against the buckets this emulator holds and
+/// against the endpoint the remainder names.
+fn host_style_label(host: &str) -> Option<(&str, &str)> {
     let host = host.rsplit('@').next().unwrap_or(host);
     let (label, rest) = host.split_once('.')?;
-    (!rest.is_empty() && bucket_name_shaped(label)).then_some(label)
+    (!rest.is_empty() && bucket_name_shaped(label)).then_some((label, rest))
+}
+
+/// Whether `host` is an endpoint THIS EMULATOR is reached at: the LOOPBACK interface its
+/// listeners are bound on — which is what a client configured with one local endpoint URL
+/// dials, in any of that interface's spellings — or a host AWS itself publishes an endpoint
+/// at.
+///
+/// What tells a virtual-hosted address from an endpoint whose own first label happens to
+/// name a bucket: a virtual-hosted host is the bucket's label put IN FRONT of the endpoint
+/// the client dials ([`addressed_in_host`]), so a remainder that is itself such an endpoint
+/// is the mark of that form. Both readings are the tree's shared ones
+/// (`service_common::data_plane_addressing::names_the_loopback_interface`, which takes the
+/// loopback zone RFC 6761 reserves and a trailing root dot with it, and
+/// `addresses_an_aws_endpoint`), so this service writes no second rule for which host is an
+/// endpoint; neither reads the environment, so one address resolves one way wherever this
+/// emulator runs.
+fn names_a_served_endpoint(host: &str) -> bool {
+    ::service_common::data_plane_addressing::names_the_loopback_interface(host)
+        || ::service_common::data_plane_addressing::addresses_an_aws_endpoint(host)
 }
 
 /// The ADDRESS a VIRTUAL-HOSTED-STYLE request carries in the first label of `host`, when it
@@ -353,11 +374,25 @@ fn host_style_label(host: &str) -> Option<&str> {
 /// WHICH form a request is in cannot be read off the host's shape alone, because an
 /// endpoint's own first label may be bucket-shaped and an emulator's endpoint is reached
 /// under a name nothing here knows. So it is resolved against the buckets this emulator
-/// HOLDS: the first host label addresses a bucket when it names one of them and the
-/// request's first path segment does not. A path-style request's first path segment names
-/// its bucket, so it is never read out of the host; and where both could (a bucket whose
-/// name is also the endpoint's first label), the PATH wins, which leaves every request that
-/// resolves today resolving the same way.
+/// HOLDS: the first host label addresses a bucket when it names one of them.
+///
+/// A request names its bucket ONCE, so where the HOST names it the whole path is the KEY and
+/// no segment of that path is read as a bucket — "the bucket name is part of the domain name"
+/// in that form. Two things say the host names it:
+///
+/// * what REMAINS of the host behind the label is itself an endpoint this emulator is reached
+///   at ([`names_a_served_endpoint`]), so the label was put in front of that endpoint; or
+/// * the path's first segment addresses no bucket OTHER than the label's — a segment
+///   addressing another bucket is the one reading under which the two halves of the address
+///   contradict each other, and the path is where a path-style request names its bucket, so
+///   such a host is read as an endpoint of its own whose first label happens to be a bucket's
+///   name.
+///
+/// A path segment that is NOT read as the bucket is the first segment of the KEY, whatever
+/// text it carries: reading it as the bucket a second time would consume one segment twice
+/// and drop it from the key the request addressed — which is exactly what a key written under
+/// a prefix named after a bucket carries, the convention a report or an export written back
+/// into its own bucket is named by.
 ///
 /// What a bucket-shaped host label naming a bucket this emulator does NOT hold resolves to
 /// is not decided here: this answers `None` for it, and the seams that read an address
@@ -369,11 +404,21 @@ pub(crate) fn addressed_in_host<'h>(
     path: &str,
     addresses_a_bucket: &dyn Fn(&str) -> bool,
 ) -> Option<&'h str> {
-    let label = host_style_label(host)?;
+    let (label, endpoint) = host_style_label(host)?;
     if !addresses_a_bucket(label) {
         return None;
     }
-    if first_path_segment(path).is_some_and(addresses_a_bucket) {
+    // The host IS the label put in front of an endpoint this emulator is reached at, so the
+    // label is the bucket and the whole path is the key — whatever its first segment names.
+    if names_a_served_endpoint(endpoint) {
+        return Some(label);
+    }
+    // Otherwise what the PATH addresses decides, and only a first segment reaching ANOTHER
+    // bucket than the label does is read as the bucket. Compared as the request spelled each:
+    // a bucket name needs no escaping in a host label or in a path segment, so the two texts
+    // are comparable as they stand.
+    let contradicts_the_host = |segment: &str| segment != label && addresses_a_bucket(segment);
+    if first_path_segment(path).is_some_and(contradicts_the_host) {
         return None;
     }
     Some(label)

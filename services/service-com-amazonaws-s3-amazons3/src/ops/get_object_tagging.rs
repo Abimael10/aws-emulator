@@ -8,6 +8,10 @@
 //! `GetBucketTagging`'s. Reporting only: nothing about the object changes, so a later
 //! caller sees what this one saw.
 //!
+//! A read of an address this bucket holds no object at is a 404 whose document names the key
+//! the request addressed, decoded and whole, through the naming every object-scoped refusal
+//! of this service shares (`crate::scaffolded::OBJECT_SCOPED_ERROR_CODES`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -229,7 +233,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(object) = bucket.addressed_object(&input.key, version_id) else {
             // A `versionId` naming no version of the key is that version's own 404, the way
             // every version-addressed read of this service answers one; a request naming no
-            // version is about the key, which is `NoSuchKey`.
+            // version is about the key, which is `NoSuchKey`. Either document names the
+            // object through the shared object-scoped naming every operation of this service
+            // takes (`crate::scaffolded::OBJECT_SCOPED_ERROR_CODES`): the key the request
+            // addressed, decoded and whole, and the version it named.
             return Err(match version_id {
                 Some(_) => crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::NO_SUCH_VERSION_CODE,
@@ -273,3 +280,5 @@ const TAGGING_READ_METHOD: &str = "GET";
 /// The status a `versionId` naming no version of the key is answered with: `NoSuchVersion`,
 /// the 404 every version-addressed read of this service answers one with.
 const NO_SUCH_VERSION_STATUS: u16 = 404;
+
+
