@@ -33,6 +33,17 @@
 //! * The id-length refusal states the bound in S3's own fixed sentence, and the exclusivity
 //!   refusal of a website configuration states the STATE the conflicting container was in
 //!   rather than the value it carried — neither echoes anything of the request.
+//! * All of those checks are made in ONE fixed order, from the widest statement about the
+//!   request to the narrowest value inside it: the DOCUMENT against the published schema,
+//!   then the BUCKET the path names, then the `Id` the request is addressed by, then the
+//!   payload's own `Id` against it, then the filter PREDICATE, and last the value of the
+//!   export DESTINATION. A request wrong in several ways answers the FIRST fault of that
+//!   order, so a caller repairing one field at a time is never told about a field the
+//!   service has not reached yet.
+//! * The id rule bounds what a PUT may RECORD: neither `GetBucketAnalyticsConfiguration` nor
+//!   `DeleteBucketAnalyticsConfiguration` judges an id's spelling or its length, so an id of
+//!   ANY shape the bucket carries nothing under is the plain not-there refusal
+//!   `NoSuchConfiguration` (HTTP 404) on both.
 //!
 //! Every refusal is followed by a read: a refused put records nothing, so
 //! `GetBucketAnalyticsConfiguration` answers `NoSuchConfiguration` for the id it named.
@@ -40,9 +51,12 @@
 use service_com_amazonaws_s3_amazons3::state::{
     invalid_and_message, BucketArnFault, AND_OPERATOR_TAGS, ANALYTICS_DOCUMENT_REQUIRED_ELEMENTS,
     ANALYTICS_DOCUMENT_SCHEMA, INVALID_AND_CODE, INVALID_CONFIG_ID_CODE, INVALID_CONFIG_ID_MESSAGE,
-    INVALID_DESTINATION_CODE, INVALID_PREFIX_CODE, INVALID_PREFIX_MESSAGE, MALFORMED_XML_CODE,
-    MALFORMED_XML_MESSAGE, MAX_CONFIGURATION_ID_CHARS, MISSING_STORAGE_CLASS_ANALYSIS_CODE,
-    MISSING_STORAGE_CLASS_ANALYSIS_MESSAGE, NO_SUCH_CONFIGURATION_CODE,
+    INVALID_CONFIGURATION_ID_CODE, INVALID_CONFIGURATION_ID_MESSAGE,
+    INVALID_CONFIG_ID_PATTERN_MESSAGE, INVALID_DESTINATION_CODE, INVALID_PREFIX_CODE,
+    INVALID_PREFIX_MESSAGE, MALFORMED_XML_CODE, MALFORMED_XML_MESSAGE,
+    MAX_CONFIGURATION_ID_CHARS, MISSING_STORAGE_CLASS_ANALYSIS_CODE,
+    MISSING_STORAGE_CLASS_ANALYSIS_MESSAGE, NO_SUCH_BUCKET_CODE, NO_SUCH_BUCKET_MESSAGE,
+    NO_SUCH_CONFIGURATION_CODE, NO_SUCH_CONFIGURATION_MESSAGE, NO_SUCH_CONFIGURATION_STATUS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -125,9 +139,15 @@ async fn bucket(router: &MultiServiceRouter, name: &str) {
 
 /// Assert that `answer` is the refusal `(code, message)` at HTTP 400, naming `case`.
 fn refused(case: &str, answer: &Answer, code: &str, message: &str) {
+    answered(case, answer, 400, code, message);
+}
+
+/// Assert that `answer` carries `status`, `code` and `message`, naming `case` and the value
+/// that was actually answered — [`refused`] for the 400 most of the rules above carry.
+fn answered(case: &str, answer: &Answer, status: u16, code: &str, message: &str) {
     assert_eq!(
-        answer.status, 400,
-        "case {case:?}: expected HTTP 400, got {} ({})",
+        answer.status, status,
+        "case {case:?}: expected HTTP {status}, got {} ({})",
         answer.status,
         String::from_utf8_lossy(&answer.body)
     );
@@ -616,5 +636,340 @@ async fn the_id_length_refusal_states_the_published_bound() {
         answer.status,
         String::from_utf8_lossy(&answer.body)
     );
+}
+
+/// A destination written as the BARE bucket name, which is no ARN at all.
+const BARE_NAME_DESTINATION: &str = "analytics-destination";
+
+/// The same destination bucket written as an ARN qualified by a Region, which a bucket ARN
+/// never carries.
+const REGION_QUALIFIED_DESTINATION: &str = "arn:aws:s3:us-west-2::analytics-destination";
+
+/// An id spelled with a character the id rule's own class does not hold.
+const MALFORMED_ID: &str = "bad~id";
+
+/// One row of the refusal-order table: what is wrong with the request, the request itself,
+/// and the one refusal it must answer.
+struct OrderRow {
+    case: &'static str,
+    /// Whether the bucket the request addresses is one this emulator holds: the bucket is
+    /// judged after the document and before everything else, so one row addresses a bucket
+    /// that is not there.
+    bucket_held: bool,
+    /// The `id` query parameter the request is addressed by.
+    id: String,
+    /// The whole request payload.
+    payload: String,
+    /// The status, the code and the message that refusal carries.
+    expected: (u16, &'static str, String),
+}
+
+/// A `<StorageClassAnalysis>` exporting to `destination` under `account`, which is the one
+/// form [`analysis`] cannot spell: `AnalyticsS3BucketDestination$BucketAccountId` is "the
+/// account ID that owns the destination S3 bucket", and the rows below write it EMPTY.
+///
+/// Its children are the ones the published schema declares for that container
+/// (`smithy_query(query="closure",operation="PutBucketAnalyticsConfiguration")`).
+fn analysis_owned_by(destination: &str, account: &str) -> String {
+    format!(
+        "<StorageClassAnalysis><DataExport>\
+         <OutputSchemaVersion>{SCHEMA_VERSION}</OutputSchemaVersion><Destination>\
+         <S3BucketDestination><Format>{EXPORT_FORMAT}</Format>\
+         <BucketAccountId>{account}</BucketAccountId><Bucket>{destination}</Bucket>\
+         </S3BucketDestination></Destination></DataExport></StorageClassAnalysis>"
+    )
+}
+
+/// The refusal-order table: every row is a request at least one check refuses, and the rows
+/// differ along WHICH checks it breaks at once — so each pair pins which of the two is
+/// reported.
+///
+/// The first three rows break one check alone (the later check does fire when it is the only
+/// one broken); every row after them breaks the document, the bucket, the id, the payload's
+/// own id, the filter or the destination in more than one place at once, with the earlier
+/// check's refusal expected.
+fn order_rows() -> Vec<OrderRow> {
+    let long_id = "x".repeat(MAX_CONFIGURATION_ID_CHARS + 1);
+    let bare_name = analysis(BARE_NAME_DESTINATION);
+    let region_qualified = analysis(REGION_QUALIFIED_DESTINATION);
+    let well_formed = analysis(DESTINATION_ARN);
+    let invalid_destination = |fault: BucketArnFault| -> (u16, &'static str, String) {
+        (400, INVALID_DESTINATION_CODE, fault.message())
+    };
+    let malformed_document = || -> (u16, &'static str, String) {
+        (400, MALFORMED_XML_CODE, MALFORMED_XML_MESSAGE.to_string())
+    };
+
+    vec![
+        OrderRow {
+            case: "a destination written as the bare bucket name, and nothing else wrong",
+            bucket_held: true,
+            id: "probe".to_string(),
+            payload: document("probe", "", &bare_name),
+            expected: invalid_destination(BucketArnFault::NotAnArn),
+        },
+        OrderRow {
+            case: "a destination ARN qualified by a Region, and nothing else wrong",
+            bucket_held: true,
+            id: "probe".to_string(),
+            payload: document("probe", "", &region_qualified),
+            expected: invalid_destination(BucketArnFault::RegionQualified),
+        },
+        OrderRow {
+            case: "a destination account id written empty, and nothing else wrong",
+            bucket_held: true,
+            id: "probe".to_string(),
+            payload: document("probe", "", &analysis_owned_by(DESTINATION_ARN, "")),
+            expected: malformed_document(),
+        },
+        OrderRow {
+            case: "an element the schema declares nowhere, over a malformed id and a \
+                   bare-name destination",
+            bucket_held: true,
+            id: MALFORMED_ID.to_string(),
+            payload: document(MALFORMED_ID, "<Favourite>yes</Favourite>", &bare_name),
+            expected: malformed_document(),
+        },
+        OrderRow {
+            case: "a document naming no storage class analysis, over a malformed id",
+            bucket_held: true,
+            id: MALFORMED_ID.to_string(),
+            payload: document(MALFORMED_ID, "", ""),
+            expected: (
+                400,
+                MISSING_STORAGE_CLASS_ANALYSIS_CODE,
+                MISSING_STORAGE_CLASS_ANALYSIS_MESSAGE.to_string(),
+            ),
+        },
+        OrderRow {
+            case: "a bucket this emulator does not hold, over a malformed id and a \
+                   bare-name destination",
+            bucket_held: false,
+            id: MALFORMED_ID.to_string(),
+            payload: document(MALFORMED_ID, "", &bare_name),
+            expected: (404, NO_SUCH_BUCKET_CODE, NO_SUCH_BUCKET_MESSAGE.to_string()),
+        },
+        OrderRow {
+            case: "a malformed id, over a bare-name destination",
+            bucket_held: true,
+            id: MALFORMED_ID.to_string(),
+            payload: document(MALFORMED_ID, "", &bare_name),
+            expected: (
+                400,
+                INVALID_CONFIG_ID_CODE,
+                INVALID_CONFIG_ID_PATTERN_MESSAGE.to_string(),
+            ),
+        },
+        OrderRow {
+            case: "an id past the published maximum, over a Region-qualified destination",
+            bucket_held: true,
+            id: long_id.clone(),
+            payload: document(&long_id, "", &region_qualified),
+            expected: (
+                400,
+                INVALID_CONFIG_ID_CODE,
+                INVALID_CONFIG_ID_MESSAGE.to_string(),
+            ),
+        },
+        OrderRow {
+            case: "an id stated empty, over a bare-name destination",
+            bucket_held: true,
+            id: String::new(),
+            payload: document("", "", &bare_name),
+            expected: (
+                400,
+                INVALID_CONFIGURATION_ID_CODE,
+                INVALID_CONFIGURATION_ID_MESSAGE.to_string(),
+            ),
+        },
+        OrderRow {
+            case: "a malformed id, over a payload Id that is not the one addressed",
+            bucket_held: true,
+            id: MALFORMED_ID.to_string(),
+            payload: document("another-id", "", &well_formed),
+            expected: (
+                400,
+                INVALID_CONFIG_ID_CODE,
+                INVALID_CONFIG_ID_PATTERN_MESSAGE.to_string(),
+            ),
+        },
+        OrderRow {
+            case: "a payload Id that is not the one addressed, over a bare-name destination",
+            bucket_held: true,
+            id: "probe".to_string(),
+            payload: document("another-id", "", &bare_name),
+            expected: malformed_document(),
+        },
+        OrderRow {
+            case: "a prefix predicate stated empty, over a bare-name destination",
+            bucket_held: true,
+            id: "probe".to_string(),
+            payload: document("probe", "<Filter><Prefix></Prefix></Filter>", &bare_name),
+            expected: (
+                400,
+                INVALID_PREFIX_CODE,
+                INVALID_PREFIX_MESSAGE.to_string(),
+            ),
+        },
+        OrderRow {
+            case: "a conjunction of one element, over a bare-name destination",
+            bucket_held: true,
+            id: "probe".to_string(),
+            payload: document(
+                "probe",
+                "<Filter><And><Prefix>logs/</Prefix></And></Filter>",
+                &bare_name,
+            ),
+            expected: (400, INVALID_AND_CODE, invalid_and_message()),
+        },
+        OrderRow {
+            case: "a bare-name destination, over a destination account id written empty",
+            bucket_held: true,
+            id: "probe".to_string(),
+            payload: document("probe", "", &analysis_owned_by(BARE_NAME_DESTINATION, "")),
+            expected: invalid_destination(BucketArnFault::NotAnArn),
+        },
+    ]
+}
+
+/// A request wrong in several ways answers the FIRST check of the put's order, and records
+/// nothing whichever check refused it.
+#[tokio::test]
+async fn a_put_reports_the_first_check_its_request_fails() {
+    let router = router();
+    let name = "analytics-refusal-order";
+    bucket(&router, name).await;
+
+    for row in order_rows() {
+        let addressed = match row.bucket_held {
+            true => name,
+            // A bucket this emulator does not hold: the row addresses one that was never
+            // created.
+            false => "analytics-refusal-order-absent",
+        };
+        let answer = put_analytics(&router, addressed, &row.id, &row.payload).await;
+        let (status, code, message) = &row.expected;
+        answered(row.case, &answer, *status, code, message);
+
+        // Nothing the refused put named was recorded, so the id it addressed still
+        // identifies no configuration. An id stated empty names none to read.
+        if row.bucket_held && !row.id.is_empty() {
+            let read = get_analytics(&router, name, &row.id).await;
+            answered(
+                row.case,
+                &read,
+                NO_SUCH_CONFIGURATION_STATUS,
+                NO_SUCH_CONFIGURATION_CODE,
+                NO_SUCH_CONFIGURATION_MESSAGE,
+            );
+        }
+    }
+
+    // And the bucket's listing names nothing: every row was refused before anything was
+    // written.
+    let listing = send(&router, "GET", &format!("/{name}?analytics"), &[], "").await;
+    let reported = listing.elements("Id");
+    assert!(
+        reported.is_empty(),
+        "case \"after the refusal-order table\": every row was refused, so the listing must \
+         name no configuration, got {reported:?}"
+    );
+
+    // The order lets a request that breaks none of the checks through, which is what makes
+    // each refusal above a statement about that request rather than about the subresource.
+    let accepted = put_analytics(
+        &router,
+        name,
+        "accepted",
+        &document(
+            "accepted",
+            "<Filter><Prefix>logs/</Prefix></Filter>",
+            &analysis(DESTINATION_ARN),
+        ),
+    )
+    .await;
+    assert_eq!(
+        accepted.status,
+        204,
+        "case \"a request no check refuses\": expected HTTP 204, got {} ({})",
+        accepted.status,
+        String::from_utf8_lossy(&accepted.body)
+    );
+    let read = get_analytics(&router, name, "accepted").await;
+    assert_eq!(
+        read.element("Id").as_deref(),
+        Some("accepted"),
+        "case \"a request no check refuses\": expected the read to report the id it was \
+         recorded under, got {:?}",
+        read.element("Id")
+    );
+}
+
+/// Neither the read nor the delete judges the id it names: an id of ANY shape the bucket
+/// carries nothing under is the plain not-there refusal on both.
+///
+/// The rows differ along what the PUT's id rule generalises over — each kind of character
+/// outside its class, and a length one past the published maximum and far past it — plus an
+/// id the rule admits that was simply never recorded.
+#[tokio::test]
+async fn a_read_and_a_delete_never_judge_the_id_they_name() {
+    let router = router();
+    let name = "analytics-unjudged-ids";
+    bucket(&router, name).await;
+
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "an id the rule admits, never recorded",
+            "export7".to_string(),
+        ),
+        ("an id spelled with a tilde", MALFORMED_ID.to_string()),
+        ("an id spelled with a colon", "has:colon".to_string()),
+        (
+            "an id spelled with a percent-encoded space",
+            "has%20space".to_string(),
+        ),
+        (
+            "an id spelled with a percent-encoded slash",
+            "has%2Fslash".to_string(),
+        ),
+        (
+            "an id spelled with a percent-encoded non-ASCII letter",
+            "caf%C3%A9".to_string(),
+        ),
+        (
+            "an id one character past the published maximum",
+            "x".repeat(MAX_CONFIGURATION_ID_CHARS + 1),
+        ),
+        (
+            "an id far past the published maximum",
+            "x".repeat(MAX_CONFIGURATION_ID_CHARS * 4),
+        ),
+    ];
+
+    for (case, id) in rows {
+        let read = get_analytics(&router, name, &id).await;
+        answered(
+            case,
+            &read,
+            NO_SUCH_CONFIGURATION_STATUS,
+            NO_SUCH_CONFIGURATION_CODE,
+            NO_SUCH_CONFIGURATION_MESSAGE,
+        );
+        let deleted = send(
+            &router,
+            "DELETE",
+            &format!("/{name}?analytics&id={id}"),
+            &[],
+            "",
+        )
+        .await;
+        answered(
+            case,
+            &deleted,
+            NO_SUCH_CONFIGURATION_STATUS,
+            NO_SUCH_CONFIGURATION_CODE,
+            NO_SUCH_CONFIGURATION_MESSAGE,
+        );
+    }
 }
 
