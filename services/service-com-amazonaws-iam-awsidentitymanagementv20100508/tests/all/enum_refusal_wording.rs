@@ -47,7 +47,7 @@ struct EnumCase {
 /// `src/service/refusal_clauses.rs`.
 const POLICY_SCOPE: &[&str] = &["All", "Local", "AWS"];
 const GLOBAL_ENDPOINT_TOKEN_VERSION: &[&str] = &["v2Token", "v1Token"];
-const CREDENTIAL_STATUS: &[&str] = &["Expired", "Active", "Inactive"];
+pub(crate) const CREDENTIAL_STATUS: &[&str] = &["Expired", "Active", "Inactive"];
 
 /// The admissible sets of the other enums under test, each in the model's declaration
 /// order (`smithy_query(query="shape",
@@ -62,7 +62,7 @@ const CREDENTIAL_STATUS: &[&str] = &["Expired", "Active", "Inactive"];
 const POLICY_USAGE: &[&str] = &["PermissionsPolicy", "PermissionsBoundary"];
 const ASSIGNMENT_STATUS: &[&str] = &["Assigned", "Unassigned", "Any"];
 const ENTITY_TYPE: &[&str] = &["User", "Role", "Group", "LocalManagedPolicy", "AWSManagedPolicy"];
-const KEY_ENCODING: &[&str] = &["SSH", "PEM"];
+pub(crate) const KEY_ENCODING: &[&str] = &["SSH", "PEM"];
 
 /// A signing-certificate id the request's own member constraints admit (`certificateIdType`,
 /// length 24..128, pattern `^[\w]+$`).
@@ -81,7 +81,7 @@ const ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
 const SSH_PUBLIC_KEY_ID: &str = "APKAEIBAERJR2EXAMPLE";
 
 /// The clause this service states for a value outside an enumerated set.
-fn expected_message(member: &str, admissible: &[&str]) -> String {
+pub(crate) fn expected_message(member: &str, admissible: &[&str]) -> String {
     format!(
         "1 validation error detected: Value at '{member}' failed to satisfy constraint: \
          Member must satisfy enum value set: [{}]",

@@ -566,6 +566,15 @@ async fn provisioned(router: &MultiServiceRouter, identifier: &str, secret: &str
         tokio::time::sleep(POLL_INTERVAL).await;
     };
 
+    // The endpoint a client reads off the control plane is THIS cluster's: a published name
+    // carries the identifier of the cluster it belongs to, which is what tells two clusters'
+    // endpoints apart, while an address literal names the interface alone.
+    assert!(
+        address.parse::<std::net::IpAddr>().is_ok()
+            || address.starts_with(&format!("{identifier}.")),
+        "the published endpoint must name the cluster {identifier:?}, got {address:?}"
+    );
+
     let minted = dispatch(
         router,
         "secretsmanager",
