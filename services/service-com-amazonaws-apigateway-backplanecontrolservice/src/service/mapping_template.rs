@@ -62,6 +62,9 @@ use ::service_common::velocity_template::Expr;
 
 /// Reading the directives a template is performed for: `#set` and the conditional family.
 mod directives;
+/// The methods a reference may CALL on the value it reached — this plane's policy over the
+/// shared reading of the language's value methods.
+mod value_methods;
 
 /// What a mapping template's references are rendered against: one call, as the method
 /// request and the stage present it.
@@ -955,25 +958,67 @@ impl Render<'_> {
     /// The VALUE `reference` names, or the reference itself when this emulator resolves
     /// none.
     ///
+    /// A reference may CALL a method on the value it has reached — `$input.path('$.x').length()`,
+    /// `$name.toUpperCase()` — because the values a mapping template reads are Java objects and
+    /// such a call is a method of the TYPE the selected value has, not of the variable the
+    /// reference opened with. So the steps are split: the leading ones name a value of this call
+    /// ([`Self::evaluated_steps`]) and the trailing calls this plane answers on a value are
+    /// applied to it in order ([`value_methods`]). A reference carrying a call neither the
+    /// variable surface nor that policy answers stays unresolved, exactly as before.
+    fn evaluated(&mut self, reference: &Reference) -> Result<::serde_json::Value, Unrendered> {
+        let (steps, calls) = value_methods::split(&reference.steps);
+        let mut value = self.evaluated_steps(&reference.variable, steps, &reference.source)?;
+        for (method, arguments) in calls {
+            // The argument, where the method takes one: resolved against this same call, as
+            // every other method's argument is.
+            let argument = match arguments {
+                [] => None,
+                _ => Some(self.one_argument(arguments)?.ok_or_else(|| Unrendered {
+                    reason: format!(
+                        "it names {}, whose {method} is called with arguments this emulator \
+                         does not read",
+                        reference.source
+                    ),
+                })?),
+            };
+            value = value_methods::called(&value, method, argument.as_deref()).ok_or_else(|| {
+                Unrendered {
+                    reason: format!(
+                        "it names {}, and {method} is no method this emulator evaluates over \
+                         the value it reached",
+                        reference.source
+                    ),
+                }
+            })?;
+            self.spend(weight(&value))?;
+        }
+        Ok(value)
+    }
+
+    /// The VALUE the variable `variable` and the steps `steps` name, or the reason this
+    /// emulator resolves none. `source` is the reference as the template wrote it, for the
+    /// reason a caller reports.
+    ///
     /// Every variable below is one API Gateway documents a mapping template against, or one
     /// this template's own `#set` bound; every method is one that variable documents. A
     /// reference outside that set is answered as unresolved rather than rendered as
     /// something close to it.
-    fn evaluated(
+    fn evaluated_steps(
         &mut self,
-        reference: &Reference,
+        variable: &str,
+        steps: &[Step],
+        source: &str,
     ) -> Result<::serde_json::Value, Unrendered> {
         let text = ::serde_json::Value::String;
         let unresolved = || Unrendered {
             reason: format!(
-                "it names {}, which this emulator resolves no value of this call for",
-                reference.source
+                "it names {source}, which this emulator resolves no value of this call for"
             ),
         };
-        match reference.variable.as_str() {
+        match variable {
             // "$input" — "represents the method request payload and parameters to be
             // processed by the mapping template".
-            "input" => match reference.steps.as_slice() {
+            "input" => match steps {
                 // `$input.body` — "returns the raw request payload as a string".
                 [Step::Member(member)] if member == "body" => {
                     let bytes = self
@@ -992,8 +1037,7 @@ impl Render<'_> {
                         .map(|payload| text(payload.to_string()))
                         .map_err(|_| Unrendered {
                             reason: format!(
-                                "it names {}, and this call's payload is not text",
-                                reference.source
+                                "it names {source}, and this call's payload is not text"
                             ),
                         })
                 }
@@ -1055,7 +1099,7 @@ impl Render<'_> {
             // the same entry. A name the stage defines no value for resolves to nothing at
             // all, which is how the rest of this data plane reads a reference to one.
             "stageVariables" => {
-                let name = match reference.steps.as_slice() {
+                let name = match steps {
                     [Step::Member(name)] => name.clone(),
                     [Step::Call(method, arguments)] if method == "get" => {
                         self.one_argument(arguments)?.ok_or_else(unresolved)?
@@ -1073,8 +1117,8 @@ impl Render<'_> {
             // members this call has a value for resolve, with the one exception the
             // `authorizer` map below states.
             "context" => {
-                let mut named = Vec::with_capacity(reference.steps.len());
-                for step in &reference.steps {
+                let mut named = Vec::with_capacity(steps.len());
+                for step in steps {
                     match step {
                         Step::Member(name) => named.push(name.clone()),
                         // `get('name')` is the method a MAP of the context is read by, which
@@ -1116,7 +1160,7 @@ impl Render<'_> {
             // string escape by the rule that language's own grammar gives
             // ([`escaped_as_javascript`]); every other `$util` method (`parseJson`,
             // `validateProperty`) stays unresolved, for the reason the module docs give.
-            "util" => match reference.steps.as_slice() {
+            "util" => match steps {
                 [Step::Call(method, arguments)] => {
                     let argument = self.one_argument(arguments)?.ok_or_else(unresolved)?;
                     self.spend(argument.len())?;
@@ -1183,8 +1227,8 @@ impl Render<'_> {
                 // The keys the reference walks are read first: an argument of a call is
                 // itself resolved against this call, which the walk below holds no borrow
                 // for.
-                let mut keys = Vec::with_capacity(reference.steps.len());
-                for step in &reference.steps {
+                let mut keys = Vec::with_capacity(steps.len());
+                for step in steps {
                     match step {
                         Step::Member(name) => keys.push(name.clone()),
                         Step::Call(method, arguments) if method == "get" => {

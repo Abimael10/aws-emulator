@@ -215,17 +215,14 @@ async fn a_payload_over_the_documented_limit_is_refused_before_the_integration()
             // Refused at the edge: the integration never ran, so none of its body is in the
             // answer, and the answer is the endpoint's own — stated with a text media type,
             // which the api's own customization of the 4xx class does not reach.
-            // The sentence API Gateway documents for the condition, under the media type the
-            // endpoint declares for this refusal. Its EXACT bytes on AWS are not available
-            // from the recording this issue carries — the replay withholds every recorded
-            // value but a wire step's error code — so what is pinned here is the rendering
-            // rule (that sentence, as text, with none of the api's records in it), not a
-            // byte string read off a capture.
+            // The sentence API Gateway answers an over-sized payload with: fixed text that
+            // names the LIMIT it enforced, which is the one variable part of it (the
+            // published REST API payload quota, written out here independently of the crate).
             assert_eq!(
                 answered.text(),
-                "Request Too Long",
-                "case {case:?}: expected the over-sized-payload sentence as text under the \
-                 media type the refusal declares, got {:?}",
+                format!("HTTP content length exceeded {PAYLOAD_LIMIT} bytes."),
+                "case {case:?}: expected the over-sized-payload sentence naming the enforced \
+                 limit, as text under the media type the refusal declares, got {:?}",
                 answered.text()
             );
             assert_eq!(

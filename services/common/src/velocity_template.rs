@@ -16,14 +16,16 @@
 //! [`Parse`]) — text, references, the `#set` assignment, the `#if` / `#elseif` / `#else` /
 //! `#end` conditional, the `#foreach` loop, `#break`, `#stop`, the `##` and `#* … *#`
 //! comments, the `#[[ … ]]#` block that is written out unparsed, the expression grammar and
-//! the line break a directive's own line ends with — and the VALUE model its operators are
-//! defined over ([`truthy`], [`equal`], [`ordering`], [`arithmetic`], [`rendered`],
-//! [`number`]), which is JSON because a template's values are the ones its call carries.
+//! the line break a directive's own line ends with — and the VALUE model its operators and
+//! METHODS are defined over ([`truthy`], [`equal`], [`ordering`], [`arithmetic`], [`rendered`],
+//! [`number`], [`method`]), which is JSON because a template's values are the ones its call
+//! carries.
 //!
 //! Each service drives it from its own renderer: it walks the [`Node`]s this produces,
-//! resolves a [`Reference`] against its own surface, and decides its own answer for one it
-//! cannot resolve. Nothing here reads a store, a request or the clock, and nothing here
-//! executes anything the template says beyond the operators above.
+//! resolves a [`Reference`] against its own surface, decides WHICH of the value methods it
+//! answers, and decides its own answer for a reference or a call it does not. Nothing here
+//! reads a store, a request or the clock, and nothing here executes anything the template says
+//! beyond the operators and methods above.
 //!
 //! BOUNDS. The text is caller-supplied, so the parse is bounded rather than as deep as that
 //! text nests: every block, every expression and every operator of a chain is one level
@@ -1042,6 +1044,221 @@ pub fn empty_object() -> Json {
     Json::Object(JsonMap::new())
 }
 
+/// Call `name` on `target` with `args`, and answer what it returned — `None` for a method
+/// that returns nothing.
+///
+/// The METHODS of the language's value model, which is the Java one: an object is a `Map`, an
+/// array a `List`, and a string its own scalar, so what a reference may call on a value it
+/// reached are the `Map`, `List` and `String` members. They are defined over the values a call
+/// carries and nothing else, so they live here beside the operators rather than in each
+/// service that renders a template: a service decides WHICH of them it answers (its own
+/// policy) and what it does with a call this does not answer, not what one of them comes to.
+///
+/// `target` is borrowed MUTABLY because the collection methods of the language mutate the
+/// value they are called on: `put` and `add` are how a template builds up a map or a list it
+/// has in hand. A caller that resolves values immutably answers none of those.
+pub fn method(target: &mut Json, name: &str, args: &[Json]) -> Result<Option<Json>, String> {
+    let arg = |index: usize| args.get(index).cloned().unwrap_or(Json::Null);
+    let text = |index: usize| match args.get(index) {
+        Some(Json::String(text)) => text.clone(),
+        Some(other) => rendered(other),
+        None => String::new(),
+    };
+    match (&mut *target, name) {
+        // The members of a `Map`.
+        (Json::Object(map), "get") => Ok(Some(map.get(&text(0)).cloned().unwrap_or(Json::Null))),
+        (Json::Object(map), "put") => Ok(map.insert(text(0), arg(1))),
+        (Json::Object(map), "putAll") => {
+            if let Json::Object(entries) = arg(0) {
+                for (key, value) in entries {
+                    map.insert(key, value);
+                }
+            }
+            Ok(None)
+        }
+        (Json::Object(map), "remove") => Ok(map.remove(&text(0))),
+        (Json::Object(map), "containsKey") => Ok(Some(Json::Bool(map.contains_key(&text(0))))),
+        (Json::Object(map), "keySet") => Ok(Some(Json::Array(
+            map.keys().map(|key| Json::String(key.clone())).collect(),
+        ))),
+        (Json::Object(map), "values") => Ok(Some(Json::Array(map.values().cloned().collect()))),
+        // An entry of an `entrySet` is read as `$entry.key` / `$entry.value`, which is what
+        // the two members of each object below are.
+        (Json::Object(map), "entrySet") => Ok(Some(Json::Array(
+            map.iter()
+                .map(|(key, value)| {
+                    let mut entry = JsonMap::new();
+                    entry.insert("key".to_string(), Json::String(key.clone()));
+                    entry.insert("value".to_string(), value.clone());
+                    Json::Object(entry)
+                })
+                .collect(),
+        ))),
+        (Json::Object(map), "size") => Ok(Some(count(map.len()))),
+        (Json::Object(map), "isEmpty") => Ok(Some(Json::Bool(map.is_empty()))),
+        (Json::Object(map), "clear") => {
+            map.clear();
+            Ok(None)
+        }
+        // The members of a `List`.
+        (Json::Array(list), "add") => {
+            match args.len() {
+                // `add(index, element)` inserts, `add(element)` appends.
+                2 => {
+                    let at = index_of(&arg(0), list.len())?;
+                    list.insert(at, arg(1));
+                    Ok(None)
+                }
+                _ => {
+                    list.push(arg(0));
+                    Ok(Some(Json::Bool(true)))
+                }
+            }
+        }
+        (Json::Array(list), "addAll") => {
+            if let Json::Array(appended) = arg(0) {
+                list.extend(appended);
+            }
+            Ok(Some(Json::Bool(true)))
+        }
+        (Json::Array(list), "get") => {
+            let at = index_of(&arg(0), list.len().saturating_sub(1))?;
+            Ok(Some(list.get(at).cloned().unwrap_or(Json::Null)))
+        }
+        (Json::Array(list), "set") => {
+            let at = index_of(&arg(0), list.len().saturating_sub(1))?;
+            let replaced = list.get(at).cloned();
+            if let Some(slot) = list.get_mut(at) {
+                *slot = arg(1);
+            }
+            Ok(replaced)
+        }
+        (Json::Array(list), "remove") => {
+            let at = index_of(&arg(0), list.len().saturating_sub(1))?;
+            Ok((at < list.len()).then(|| list.remove(at)))
+        }
+        (Json::Array(list), "contains") => Ok(Some(Json::Bool(
+            list.iter().any(|element| equal(Some(element), Some(&arg(0)))),
+        ))),
+        (Json::Array(list), "indexOf") => Ok(Some(count_or_absent(
+            list.iter()
+                .position(|element| equal(Some(element), Some(&arg(0)))),
+        ))),
+        (Json::Array(list), "size") => Ok(Some(count(list.len()))),
+        (Json::Array(list), "isEmpty") => Ok(Some(Json::Bool(list.is_empty()))),
+        (Json::Array(list), "clear") => {
+            list.clear();
+            Ok(None)
+        }
+        // The members of a `String`.
+        (Json::String(subject), "length" | "size") => Ok(Some(count(subject.chars().count()))),
+        (Json::String(subject), "isEmpty") => Ok(Some(Json::Bool(subject.is_empty()))),
+        (Json::String(subject), "toUpperCase") => Ok(Some(Json::String(subject.to_uppercase()))),
+        (Json::String(subject), "toLowerCase") => Ok(Some(Json::String(subject.to_lowercase()))),
+        (Json::String(subject), "trim") => Ok(Some(Json::String(subject.trim().to_string()))),
+        (Json::String(subject), "substring") => {
+            let characters: Vec<char> = subject.chars().collect();
+            let from = index_of(&arg(0), characters.len())?;
+            let to = match args.len() {
+                0 | 1 => characters.len(),
+                _ => index_of(&arg(1), characters.len())?,
+            };
+            let Some(selected) = characters.get(from..to) else {
+                return Err(format!("{OUTSIDE_THE_STRING} {from}..{to}"));
+            };
+            Ok(Some(Json::String(selected.iter().collect())))
+        }
+        (Json::String(subject), "replace" | "replaceAll") => {
+            Ok(Some(Json::String(subject.replace(&text(0), &text(1)))))
+        }
+        (Json::String(subject), "split") => Ok(Some(Json::Array(
+            subject
+                .split(text(0).as_str())
+                .map(|part| Json::String(part.to_string()))
+                .collect(),
+        ))),
+        (Json::String(subject), "contains") => Ok(Some(Json::Bool(subject.contains(&text(0))))),
+        (Json::String(subject), "startsWith") => {
+            Ok(Some(Json::Bool(subject.starts_with(&text(0)))))
+        }
+        (Json::String(subject), "endsWith") => Ok(Some(Json::Bool(subject.ends_with(&text(0))))),
+        (Json::String(subject), "indexOf") => {
+            Ok(Some(count_or_absent(subject.find(&text(0)).map(|at| {
+                subject.get(..at).map_or(at, |head| head.chars().count())
+            }))))
+        }
+        (Json::String(subject), "concat") => Ok(Some(Json::String(format!("{subject}{}", text(0))))),
+        (Json::String(subject), "equals") => Ok(Some(Json::Bool(
+            Some(subject.as_str()) == args.first().and_then(Json::as_str),
+        ))),
+        (Json::String(subject), "equalsIgnoreCase") => Ok(Some(Json::Bool(
+            args.first()
+                .and_then(Json::as_str)
+                .is_some_and(|other| subject.eq_ignore_ascii_case(other)),
+        ))),
+        (Json::String(subject), "charAt") => {
+            let at = index_of(&arg(0), subject.chars().count())?;
+            Ok(Some(
+                subject
+                    .chars()
+                    .nth(at)
+                    .map_or(Json::Null, |character| Json::String(character.to_string())),
+            ))
+        }
+        // Every value renders as text, which is what `toString` answers.
+        (value, "toString") => Ok(Some(Json::String(rendered(value)))),
+        (value, _) => Err(format!("{NO_SUCH_METHOD}{name} on {}", kind_of(value))),
+    }
+}
+
+/// Whether `name` is a method [`method`] can call on `target` with no arguments, which is what
+/// a property reference falls back to: `$list.size` is the `size()` of a list, as Velocity's
+/// own property lookup reads it.
+#[must_use]
+pub fn is_zero_argument_method(target: &Json, name: &str) -> bool {
+    matches!(
+        (target, name),
+        (
+            Json::Object(_) | Json::Array(_) | Json::String(_),
+            "size" | "isEmpty" | "keySet" | "values" | "entrySet" | "length"
+        ) | (Json::String(_), "toUpperCase" | "toLowerCase" | "trim")
+    )
+}
+
+/// A collection's size as the value a template carries.
+fn count(size: usize) -> Json {
+    Json::Number(i64::try_from(size).unwrap_or(i64::MAX).into())
+}
+
+/// An index a search answers with, or `-1` for the search that found nothing — which is
+/// what `indexOf` answers in the language this emulates.
+fn count_or_absent(found: Option<usize>) -> Json {
+    found.map_or(Json::Number((-1).into()), count)
+}
+
+/// One index argument as an offset into a collection of `len` elements.
+fn index_of(value: &Json, len: usize) -> Result<usize, String> {
+    let Some(index) = value.as_i64() else {
+        return Err(format!("{NOT_AN_INDEX} {}", rendered(value)));
+    };
+    usize::try_from(index)
+        .ok()
+        .filter(|at| *at <= len)
+        .ok_or_else(|| format!("{NOT_AN_INDEX} {index}"))
+}
+
+/// What a value IS, as a fault names it.
+fn kind_of(value: &Json) -> &'static str {
+    match value {
+        Json::Null => "null",
+        Json::Bool(_) => "a boolean",
+        Json::Number(_) => "a number",
+        Json::String(_) => "a string",
+        Json::Array(_) => "a list",
+        Json::Object(_) => "a map",
+    }
+}
+
 /// The sentences a template fault states.
 pub const UNEXPECTED_DIRECTIVE: &str =
     "This template closes a block it never opened: #end, #else or #elseif with no #if or \
@@ -1056,6 +1273,9 @@ pub const TOO_DEEP: &str = "This template nests deeper than this endpoint parses
 pub const NOT_COMPARABLE: &str = "These two values cannot be compared.";
 pub const NOT_ARITHMETIC: &str = "These two values cannot be combined with";
 pub const DIVIDE_BY_ZERO: &str = "This expression divides by zero.";
+pub const OUTSIDE_THE_STRING: &str = "This substring is outside the string:";
+pub const NOT_AN_INDEX: &str = "This is not an index into the value:";
+pub const NO_SUCH_METHOD: &str = "No such method: ";
 
 #[cfg(test)]
 mod tests {

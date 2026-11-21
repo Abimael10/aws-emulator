@@ -70,6 +70,12 @@ mod lambda_event_invocation_type;
 #[path = "execute_api_data_plane/token_authorizer_identity_validation.rs"]
 mod token_authorizer_identity_validation;
 
+/// WHICH RELEASE of an api one request to a stage carrying a CANARY is served from, and what a
+/// non-proxy `HTTP` integration's request and response templates make of a real body, in their
+/// own file beside this one, declared as the siblings above are.
+#[path = "execute_api_data_plane/canary_release_and_vtl_transformation.rs"]
+mod canary_release_and_vtl_transformation;
+
 /// The region the invoke host is addressed in. Any region is served — the host's region
 /// label is not matched against a list — so one is enough to drive the data plane, and
 /// `src/service/invoke.rs`'s own unit test varies the label.

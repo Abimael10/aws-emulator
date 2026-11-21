@@ -261,6 +261,9 @@
 //! cluster holds — it reports what the integration answers for the records as they stand.
 
 pub mod aws_integration;
+/// WHICH release of the api one request to a stage is served from: the stage's own
+/// deployment, or the CANARY it carries beside it with its own stage-variable overrides.
+mod canary_release;
 pub mod cognito_user_pools;
 mod custom_authorizer;
 pub mod execute_api_authorization;
@@ -659,7 +662,7 @@ impl GatewayRefusal {
     /// Every gateway response the API renders is `application/json` — that is the content
     /// type its own default template is keyed by ([`JSON_CONTENT_TYPE`]). The one exception
     /// is the refusal the EDGE takes before the api's records are read at all
-    /// ([`REQUEST_TOO_LARGE`]), which the endpoint states with the media type a recorded
+    /// ([`request_too_large`]), which the endpoint states with the media type a recorded
     /// over-sized invoke was answered with.
     fn content_type(&self) -> &'static str {
         if self.response_type == REQUEST_TOO_LARGE_TYPE {
@@ -816,23 +819,27 @@ pub const MAX_REQUEST_PAYLOAD_BYTES: usize = 10_485_760;
 
 /// The request's payload is larger than [`MAX_REQUEST_PAYLOAD_BYTES`]: `413` through
 /// `REQUEST_TOO_LARGE` ([`crate::state::default_gateway_status_code`] gives that type's own
-/// status), carrying the sentence API Gateway documents for that condition, under the media
-/// type the endpoint declares for this refusal ([`EDGE_REFUSAL_CONTENT_TYPE`]) — so the body
-/// is that sentence as text rather than the JSON envelope a gateway response of an api
-/// renders.
+/// status), carrying the sentence API Gateway answers an over-sized payload with, under the
+/// media type the endpoint declares for this refusal ([`EDGE_REFUSAL_CONTENT_TYPE`]) — so the
+/// body is that sentence as text rather than the JSON envelope a gateway response of an api
+/// renders. The sentence's one variable part is the LIMIT that was enforced (`limit`,
+/// [`MAX_REQUEST_PAYLOAD_BYTES`] for a REST API), so a client that reads the bound out of the
+/// refusal reads the bound that refused it.
 ///
 /// Refused at the EDGE, with the api's own records unread and the stage, the route, the
 /// authorization, the validator and the integration never reached: the limit is on what the
 /// endpoint ADMITS, so it cannot depend on what the api or the method declares — and a
 /// developer's customization of a gateway response, which is a record OF an api, therefore
 /// does not reach it.
-const REQUEST_TOO_LARGE: GatewayRefusal = GatewayRefusal {
-    response_type: REQUEST_TOO_LARGE_TYPE,
-    message: Cow::Borrowed("Request Too Long"),
-    error_type: None,
-    validation_detail: Cow::Borrowed(""),
-    message_member: MESSAGE_MEMBER,
-};
+fn request_too_large(limit: usize) -> GatewayRefusal {
+    GatewayRefusal {
+        response_type: REQUEST_TOO_LARGE_TYPE,
+        message: Cow::Owned(format!("HTTP content length exceeded {limit} bytes.")),
+        error_type: None,
+        validation_detail: Cow::Borrowed(""),
+        message_member: MESSAGE_MEMBER,
+    }
+}
 
 /// The refusal a request whose payload is over [`MAX_REQUEST_PAYLOAD_BYTES`] earns, or
 /// `None` for one within it.
@@ -844,7 +851,7 @@ const REQUEST_TOO_LARGE: GatewayRefusal = GatewayRefusal {
 /// is admitted: the limit refuses a payload that IS over it rather than one that might be.
 fn oversized_payload(req: &RtRequest) -> Option<GatewayRefusal> {
     let sent = req.body().bytes()?.len();
-    (sent > MAX_REQUEST_PAYLOAD_BYTES).then_some(REQUEST_TOO_LARGE)
+    (sent > MAX_REQUEST_PAYLOAD_BYTES).then(|| request_too_large(MAX_REQUEST_PAYLOAD_BYTES))
 }
 
 /// The gateway response type a payload the method's `Model` does not admit is answered
@@ -867,7 +874,7 @@ const BAD_REQUEST_PARAMETERS_TYPE: &str = "BAD_REQUEST_PARAMETERS";
 const VALIDATION_RESPONSE_TYPES: [&str; 2] = [BAD_REQUEST_BODY_TYPE, BAD_REQUEST_PARAMETERS_TYPE];
 
 /// The gateway response type an over-sized payload is refused through; see
-/// [`REQUEST_TOO_LARGE`].
+/// [`request_too_large`].
 const REQUEST_TOO_LARGE_TYPE: &str = "REQUEST_TOO_LARGE";
 
 /// The method's request validator declares `validateRequestBody` and the request's payload
@@ -1667,7 +1674,13 @@ async fn serving<Eng: Send + Sync + 'static>(
             let Some(stage) = api.stages.get(stage_name) else {
                 break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
             };
-            let Some(deployment) = api.deployments.get(&stage.deployment_id) else {
+            // WHICH release of the api this request is served from: the stage's own
+            // deployment, or the canary's where the draw for this request fell in the share
+            // its `percentTraffic` diverts ([`canary_release`]). Decided before the route is
+            // matched, because the deployment is what the path and the verb are matched
+            // against, and it carries the `$stageVariables` map in force for the request.
+            let release = canary_release::released(stage, canary_release::traffic_draw());
+            let Some(deployment) = api.deployments.get(&release.deployment_id) else {
                 break 'planned Planned::answered(refusal_response(Some(api), FORBIDDEN));
             };
 
@@ -1829,12 +1842,13 @@ async fn serving<Eng: Send + Sync + 'static>(
                 },
             };
             let method_arn = call_of.method_arn();
-            // The stage's own variables, read ONCE for this request: the integration's
+            // The variables in force for this request, read ONCE: the integration's
             // configuration is resolved against them ([`with_stage_variables`]) and a
-            // mapping template of the call renders `$stageVariables` from them, so the map
-            // is cloned out of the stored record a single time. A stage the member was
-            // never set on carries none, which is the empty map to resolve against.
-            let stage_variables = stage.variables.clone().unwrap_or_default();
+            // mapping template of the call renders `$stageVariables` from them. They are the
+            // STAGE's own map — a stage the member was never set on carries none, which is the
+            // empty map to resolve against — with the canary's `stageVariableOverrides`
+            // applied over it where the canary is serving this request ([`canary_release`]).
+            let stage_variables = release.stage_variables.clone();
 
             let mut context = call_context(
                 &api.id,
@@ -2078,6 +2092,9 @@ async fn serving<Eng: Send + Sync + 'static>(
                     break 'planned Planned::answered(refusal_response(Some(api), refusal));
                 }
             };
+            // A request the CANARY is serving reads and fills the stage's cluster only where
+            // the canary says it uses it ([`canary_release::ServedRelease::uses_stage_cache`]).
+            let caching = caching.filter(|_| release.uses_stage_cache);
 
             // The integration is what answers, and it is READ here and PERFORMED below, after
             // the payload check: the step list this module opens with has the request
