@@ -92,10 +92,10 @@ const BRANCH_ROWS: &[BranchRow] = &[
     },
     BranchRow {
         platform_name: "GlassFish",
-        branch_name: "Preconfigured Docker - GlassFish 5.0 running on 64bit Amazon Linux 2",
+        branch_name: "Preconfigured Docker - GlassFish 5.0 with Java 8 running on 64bit Amazon Linux",
         lifecycle_state: "Retired",
         branch_order: 10000,
-        supported_tiers: &["WebServer/Standard"],
+        supported_tiers: &["WebServer/Standard", "Worker/SQS/HTTP"],
     },
 ];
 

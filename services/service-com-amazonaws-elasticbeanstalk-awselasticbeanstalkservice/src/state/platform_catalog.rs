@@ -561,6 +561,9 @@ const RELEASE_WINDOWS_2025: &str = "2.20.0";
 const RELEASE_WINDOWS_2022: &str = "2.18.0";
 /// See [`RELEASE_WINDOWS_2025`].
 const RELEASE_WINDOWS_2019: &str = "2.16.0";
+/// See [`RELEASE_WINDOWS_2025`]: the generation whose branches have deprecated,
+/// which stays at the release it last received.
+const RELEASE_WINDOWS_2016: &str = "2.12.0";
 /// See [`RELEASE_DOTNET_AL2023`].
 const RELEASE_DOCKER_AL2023: &str = "4.2.0";
 /// See [`RELEASE_DOTNET_AL2023`].
@@ -669,6 +672,20 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
     SolutionStack {
         branch_name: "IIS 10.0 running on 64bit Windows Server Core 2019",
         platform_version: RELEASE_WINDOWS_2019,
+        permitted_file_types: &["zip"],
+        platform_category: ".NET",
+        programming_languages: &[(".NET", "")],
+    },
+    SolutionStack {
+        branch_name: "IIS 10.0 running on 64bit Windows Server 2016",
+        platform_version: RELEASE_WINDOWS_2016,
+        permitted_file_types: &["zip"],
+        platform_category: ".NET",
+        programming_languages: &[(".NET", "")],
+    },
+    SolutionStack {
+        branch_name: "IIS 10.0 running on 64bit Windows Server Core 2016",
+        platform_version: RELEASE_WINDOWS_2016,
         permitted_file_types: &["zip"],
         platform_category: ".NET",
         programming_languages: &[(".NET", "")],
@@ -829,6 +846,27 @@ pub const SOLUTION_STACKS: &[SolutionStack] = &[
     },
     // Tomcat: a Tomcat platform deploys a `war`.
     SolutionStack {
+        branch_name: "Tomcat 11 with Corretto 25 running on 64bit Amazon Linux 2023",
+        platform_version: RELEASE_TOMCAT_AL2023,
+        permitted_file_types: &["war", "zip"],
+        platform_category: "Tomcat",
+        programming_languages: &[("Java", "25")],
+    },
+    SolutionStack {
+        branch_name: "Tomcat 11 with Corretto 21 running on 64bit Amazon Linux 2023",
+        platform_version: RELEASE_TOMCAT_AL2023,
+        permitted_file_types: &["war", "zip"],
+        platform_category: "Tomcat",
+        programming_languages: &[("Java", "21")],
+    },
+    SolutionStack {
+        branch_name: "Tomcat 11 with Corretto 17 running on 64bit Amazon Linux 2023",
+        platform_version: RELEASE_TOMCAT_AL2023,
+        permitted_file_types: &["war", "zip"],
+        platform_category: "Tomcat",
+        programming_languages: &[("Java", "17")],
+    },
+    SolutionStack {
         branch_name: "Tomcat 10.1 with Corretto 21 running on 64bit Amazon Linux 2023",
         platform_version: RELEASE_TOMCAT_AL2023,
         permitted_file_types: &["war", "zip"],
@@ -945,9 +983,9 @@ pub(super) const RETIRED: &str = BRANCH_LIFECYCLE_RETIRED;
 /// the value set a `LifecycleState` filter draws from; it reaches the wire
 /// capitalized through [`reported_branch_lifecycle_state`]. The tier lists cover
 /// both of [`SUPPORTED_TIERS`]: a Linux platform runs web server and worker
-/// environments, a Windows platform and a preconfigured-Docker platform only the
-/// web server tier, and a platform whose branch is not a runtime an application
-/// is deployed on at all (the Packer builder) supports NO tier.
+/// environments, a Windows platform only the web server tier, and a platform
+/// whose branch is not a runtime an application is deployed on at all (the
+/// Packer builder) supports NO tier.
 #[allow(clippy::type_complexity)]
 pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] = &[
     // .NET on Linux.
@@ -979,18 +1017,14 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         11000,
         BOTH_TIERS,
     ),
-    (
-        ".NET Core on Linux",
-        ".NET 6 running on 64bit Amazon Linux 2",
-        RETIRED,
-        10100,
-        BOTH_TIERS,
-    ),
+    // The Amazon Linux 2 generation of this platform published ONE branch, the
+    // unversioned `.NET Core` one, published alongside the oldest Amazon Linux
+    // 2023 branch and so carrying the same ordinal.
     (
         ".NET Core on Linux",
         ".NET Core running on 64bit Amazon Linux 2",
         RETIRED,
-        10000,
+        11000,
         BOTH_TIERS,
     ),
     // .NET on Windows Server: no worker tier runs on Windows.
@@ -1025,29 +1059,60 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
     (
         ".NET on Windows Server",
         "IIS 10.0 running on 64bit Windows Server 2019",
-        DEPRECATED,
+        SUPPORTED,
         10000,
         WEB_SERVER_ONLY,
     ),
     (
         ".NET on Windows Server",
         "IIS 10.0 running on 64bit Windows Server Core 2019",
-        DEPRECATED,
+        SUPPORTED,
         9900,
         WEB_SERVER_ONLY,
     ),
     (
         ".NET on Windows Server",
         "IIS 10.0 running on 64bit Windows Server 2016",
-        RETIRED,
+        DEPRECATED,
         9800,
         WEB_SERVER_ONLY,
     ),
     (
         ".NET on Windows Server",
         "IIS 10.0 running on 64bit Windows Server Core 2016",
-        RETIRED,
+        DEPRECATED,
         9700,
+        WEB_SERVER_ONLY,
+    ),
+    // The Windows Server generations behind the IIS 10.0 ones, retired whole:
+    // each generation published its Server and (from 2012 R2) its Server Core
+    // edition, under the IIS version that generation shipped.
+    (
+        ".NET on Windows Server",
+        "IIS 8.5 running on 64bit Windows Server 2012 R2",
+        RETIRED,
+        9600,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
+        "IIS 8.5 running on 64bit Windows Server Core 2012 R2",
+        RETIRED,
+        9500,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
+        "IIS 8 running on 64bit Windows Server 2012",
+        RETIRED,
+        9400,
+        WEB_SERVER_ONLY,
+    ),
+    (
+        ".NET on Windows Server",
+        "IIS 7.5 running on 64bit Windows Server 2008 R2",
+        RETIRED,
+        9300,
         WEB_SERVER_ONLY,
     ),
     // Docker: the Docker platform publishes the single-container Docker branch
@@ -1066,6 +1131,15 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         11500,
         BOTH_TIERS,
     ),
+    // The Amazon Linux 2 generation published a PREVIEW branch beside the
+    // general one, so both carry that generation's ordinal.
+    (
+        "Docker",
+        "(BETA) Docker running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
     (
         "Docker",
         "Docker running on 64bit Amazon Linux 2",
@@ -1077,14 +1151,7 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         "Docker",
         "ECS running on 64bit Amazon Linux 2",
         RETIRED,
-        11000,
-        BOTH_TIERS,
-    ),
-    (
-        "Docker",
-        "Docker running on 64bit Amazon Linux",
-        RETIRED,
-        10000,
+        10500,
         BOTH_TIERS,
     ),
     (
@@ -1094,34 +1161,44 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         10000,
         BOTH_TIERS,
     ),
-    // GlassFish: a legacy preconfigured-Docker platform, retired whole.
+    (
+        "Docker",
+        "Docker running on 64bit Amazon Linux",
+        RETIRED,
+        9000,
+        BOTH_TIERS,
+    ),
+    // GlassFish: a legacy preconfigured-Docker platform, retired whole. A
+    // branch name states the application server's version AND the Java version
+    // it runs, and the operating system as the catalog publishes it (`64bit
+    // Debian`, with no distribution code name).
     (
         "GlassFish",
-        "Preconfigured Docker - GlassFish 5.0 running on 64bit Amazon Linux 2",
+        "Preconfigured Docker - GlassFish 5.0 with Java 8 running on 64bit Amazon Linux",
         RETIRED,
         10000,
-        WEB_SERVER_ONLY,
+        BOTH_TIERS,
     ),
     (
         "GlassFish",
-        "Preconfigured Docker - GlassFish 5.0 running on 64bit Amazon Linux",
+        "Preconfigured Docker - GlassFish 4.1 with Java 8 running on 64bit Amazon Linux",
         RETIRED,
         9900,
-        WEB_SERVER_ONLY,
+        BOTH_TIERS,
     ),
     (
         "GlassFish",
-        "Preconfigured Docker - GlassFish 4.1 running on 64bit Debian jessie",
+        "Preconfigured Docker - GlassFish 4.1 with Java 8 running on 64bit Debian",
         RETIRED,
         9800,
-        WEB_SERVER_ONLY,
+        BOTH_TIERS,
     ),
     (
         "GlassFish",
-        "Preconfigured Docker - GlassFish 4.0 running on 64bit Debian jessie",
+        "Preconfigured Docker - GlassFish 4.0 with Java 7 running on 64bit Debian",
         RETIRED,
         9700,
-        WEB_SERVER_ONLY,
+        BOTH_TIERS,
     ),
     // Go. The Amazon Linux 2 generation shipped a preview branch beside the
     // general one, so both carry that generation's ordinal.
@@ -1155,64 +1232,74 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
     ),
     (
         "Go",
-        "Preconfigured Docker - Go 1.4 running on 64bit Debian jessie",
+        "Preconfigured Docker - Go 1.4 running on 64bit Debian",
         RETIRED,
         9900,
-        WEB_SERVER_ONLY,
+        BOTH_TIERS,
     ),
-    // Java SE (Corretto): the Amazon Linux 2023 and Amazon Linux 2 generations.
     (
-        "Corretto",
+        "Go",
+        "Preconfigured Docker - Go 1.3 running on 64bit Debian",
+        RETIRED,
+        9800,
+        BOTH_TIERS,
+    ),
+    // Java: ONE platform holds every Java SE branch Elastic Beanstalk has
+    // published — the current Corretto branches on Amazon Linux 2023, the
+    // Corretto generation on Amazon Linux 2 behind them, and the legacy `Java
+    // <n>` branches on Amazon Linux the Corretto ones replaced.
+    (
+        "Java",
         "Corretto 25 running on 64bit Amazon Linux 2023",
         SUPPORTED,
-        12400,
+        11400,
         BOTH_TIERS,
     ),
     (
-        "Corretto",
+        "Java",
         "Corretto 21 running on 64bit Amazon Linux 2023",
         SUPPORTED,
-        12300,
+        11300,
         BOTH_TIERS,
     ),
     (
-        "Corretto",
+        "Java",
         "Corretto 17 running on 64bit Amazon Linux 2023",
         SUPPORTED,
-        12200,
+        11200,
         BOTH_TIERS,
     ),
     (
-        "Corretto",
+        "Java",
         "Corretto 11 running on 64bit Amazon Linux 2023",
         SUPPORTED,
-        12100,
-        BOTH_TIERS,
-    ),
-    (
-        "Corretto",
-        "Corretto 8 running on 64bit Amazon Linux 2023",
-        SUPPORTED,
-        12000,
-        BOTH_TIERS,
-    ),
-    (
-        "Corretto",
-        "Corretto 11 running on 64bit Amazon Linux 2",
-        RETIRED,
         11100,
         BOTH_TIERS,
     ),
     (
-        "Corretto",
-        "Corretto 8 running on 64bit Amazon Linux 2",
-        RETIRED,
+        "Java",
+        "Corretto 8 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
         11000,
         BOTH_TIERS,
     ),
-    // Java: the legacy Java SE branches the Corretto platform replaced are
-    // published under their own platform name, the way the legacy
-    // preconfigured-Docker runtimes are platforms of their own.
+    // The Amazon Linux 2 generation of the same platform.
+    (
+        "Java",
+        "Corretto 11 running on 64bit Amazon Linux 2",
+        RETIRED,
+        10300,
+        BOTH_TIERS,
+    ),
+    (
+        "Java",
+        "Corretto 8 running on 64bit Amazon Linux 2",
+        RETIRED,
+        10200,
+        BOTH_TIERS,
+    ),
+    // The Amazon Linux generation, whose branches named the Java version
+    // itself rather than the Corretto distribution.
     (
         "Java",
         "Java 8 running on 64bit Amazon Linux",
@@ -1277,6 +1364,16 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         11200,
         BOTH_TIERS,
     ),
+    // Node.js: the Amazon Linux 2 generation published PREVIEW branches beside
+    // the general ones, and the oldest generation ran on 32-bit as well as
+    // 64-bit Amazon Linux.
+    (
+        "Node.js",
+        "(BETA) Node.js 12 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11100,
+        BOTH_TIERS,
+    ),
     (
         "Node.js",
         "Node.js 12 running on 64bit Amazon Linux 2",
@@ -1288,6 +1385,13 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         "Node.js",
         "Node.js 10 running on 64bit Amazon Linux 2",
         RETIRED,
+        11100,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "(BETA) Node.js 10 running on 64bit Amazon Linux 2",
+        RETIRED,
         11000,
         BOTH_TIERS,
     ),
@@ -1296,6 +1400,13 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         "Node.js running on 64bit Amazon Linux",
         RETIRED,
         10000,
+        BOTH_TIERS,
+    ),
+    (
+        "Node.js",
+        "Node.js running on 32bit Amazon Linux",
+        RETIRED,
+        9900,
         BOTH_TIERS,
     ),
     // PHP.
@@ -1348,11 +1459,27 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         11300,
         BOTH_TIERS,
     ),
+    // The Amazon Linux 2 generation published a PREVIEW branch beside each
+    // general one, so the two carry that branch's ordinal.
+    (
+        "PHP",
+        "(BETA) PHP 7.4 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11200,
+        BOTH_TIERS,
+    ),
     (
         "PHP",
         "PHP 7.4 running on 64bit Amazon Linux 2",
         RETIRED,
         11200,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
+        "(BETA) PHP 7.3 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11100,
         BOTH_TIERS,
     ),
     (
@@ -1364,44 +1491,60 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
     ),
     (
         "PHP",
-        "PHP 7.2 running on 64bit Amazon Linux 2",
+        "(BETA) PHP 7.2 running on 64bit Amazon Linux 2",
         RETIRED,
         11000,
         BOTH_TIERS,
     ),
     (
         "PHP",
+        "PHP 7.2 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    // The Amazon Linux generation, whose newest branch carries that
+    // generation's highest ordinal.
+    (
+        "PHP",
+        "PHP 7.3 running on 64bit Amazon Linux",
+        RETIRED,
+        10000,
+        BOTH_TIERS,
+    ),
+    (
+        "PHP",
         "PHP 7.2 running on 64bit Amazon Linux",
         RETIRED,
-        10400,
+        9900,
         BOTH_TIERS,
     ),
     (
         "PHP",
         "PHP 7.1 running on 64bit Amazon Linux",
         RETIRED,
-        10300,
+        9800,
         BOTH_TIERS,
     ),
     (
         "PHP",
         "PHP 7.0 running on 64bit Amazon Linux",
         RETIRED,
-        10200,
+        9700,
         BOTH_TIERS,
     ),
     (
         "PHP",
         "PHP 5.6 running on 64bit Amazon Linux",
         RETIRED,
-        10100,
+        9600,
         BOTH_TIERS,
     ),
     (
         "PHP",
         "PHP 5.4 running on 64bit Amazon Linux",
         RETIRED,
-        10000,
+        9500,
         BOTH_TIERS,
     ),
     // Packer: the platform whose one branch is the builder Elastic Beanstalk
@@ -1449,57 +1592,66 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         "Python",
         "Python 3.9 running on 64bit Amazon Linux 2023",
         RETIRED,
-        13100,
+        13000,
         BOTH_TIERS,
     ),
+    // The Amazon Linux 2 generation, one ordinal band per runtime version, with
+    // a PREVIEW branch beside the general 3.7 one.
     (
         "Python",
         "Python 3.8 running on 64bit Amazon Linux 2",
-        RETIRED,
-        12200,
-        BOTH_TIERS,
-    ),
-    (
-        "Python",
-        "Python 3.7 running on 64bit Amazon Linux 2",
-        RETIRED,
-        12100,
-        BOTH_TIERS,
-    ),
-    (
-        "Python",
-        "Python 3.6 running on 64bit Amazon Linux 2",
         RETIRED,
         12000,
         BOTH_TIERS,
     ),
     (
         "Python",
-        "Python 3.6 running on 64bit Amazon Linux",
-        RETIRED,
-        11200,
-        BOTH_TIERS,
-    ),
-    (
-        "Python",
-        "Python 3.4 running on 64bit Amazon Linux",
-        RETIRED,
-        11100,
-        BOTH_TIERS,
-    ),
-    (
-        "Python",
-        "Python 2.7 running on 64bit Amazon Linux",
+        "(BETA) Python 3.7 running on 64bit Amazon Linux 2",
         RETIRED,
         11000,
         BOTH_TIERS,
     ),
     (
         "Python",
-        "Preconfigured Docker - Python 3.4 running on 64bit Debian jessie",
+        "Python 3.7 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.6 running on 64bit Amazon Linux 2",
         RETIRED,
         10000,
-        WEB_SERVER_ONLY,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.6 running on 64bit Amazon Linux",
+        RETIRED,
+        9900,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 3.4 running on 64bit Amazon Linux",
+        RETIRED,
+        9800,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Python 2.7 running on 64bit Amazon Linux",
+        RETIRED,
+        9700,
+        BOTH_TIERS,
+    ),
+    (
+        "Python",
+        "Preconfigured Docker - Python 3.4 running on 64bit Debian",
+        RETIRED,
+        9600,
+        BOTH_TIERS,
     ),
     // Ruby, whose Amazon Linux generation published one branch per application
     // server (Puma, Passenger Standalone) rather than one per runtime version.
@@ -1538,11 +1690,13 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         12000,
         BOTH_TIERS,
     ),
+    // The Amazon Linux 2 generation published a PREVIEW branch beside each
+    // general one, so the two carry that branch's ordinal.
     (
         "Ruby",
-        "Ruby 3.0 running on 64bit Amazon Linux 2",
+        "(BETA) Ruby 2.7 running on 64bit Amazon Linux 2",
         RETIRED,
-        11300,
+        11200,
         BOTH_TIERS,
     ),
     (
@@ -1554,9 +1708,23 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
     ),
     (
         "Ruby",
+        "(BETA) Ruby 2.6 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11100,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
         "Ruby 2.6 running on 64bit Amazon Linux 2",
         RETIRED,
         11100,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "(BETA) Ruby 2.5 running on 64bit Amazon Linux 2",
+        RETIRED,
+        11000,
         BOTH_TIERS,
     ),
     (
@@ -1566,68 +1734,92 @@ pub(super) const MANAGED_PLATFORM_BRANCHES: &[(&str, &str, &str, i32, &[&str])] 
         11000,
         BOTH_TIERS,
     ),
+    // The Amazon Linux generation, whose branch names LEAD with the application
+    // server the runtime is served behind, and whose newest branch carries that
+    // generation's highest ordinal.
     (
         "Ruby",
-        "Ruby 2.6 with Puma running on 64bit Amazon Linux",
-        RETIRED,
-        10400,
-        BOTH_TIERS,
-    ),
-    (
-        "Ruby",
-        "Ruby 2.6 with Passenger Standalone running on 64bit Amazon Linux",
-        RETIRED,
-        10300,
-        BOTH_TIERS,
-    ),
-    (
-        "Ruby",
-        "Ruby 2.4 with Puma running on 64bit Amazon Linux",
-        RETIRED,
-        10200,
-        BOTH_TIERS,
-    ),
-    (
-        "Ruby",
-        "Ruby 2.4 with Passenger Standalone running on 64bit Amazon Linux",
-        RETIRED,
-        10100,
-        BOTH_TIERS,
-    ),
-    (
-        "Ruby",
-        "Ruby 2.3 with Puma running on 64bit Amazon Linux",
+        "Puma with Ruby 2.6 running on 64bit Amazon Linux",
         RETIRED,
         10000,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Passenger Standalone with Ruby 2.6 running on 64bit Amazon Linux",
+        RETIRED,
+        9900,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Puma with Ruby 2.4 running on 64bit Amazon Linux",
+        RETIRED,
+        9800,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Passenger Standalone with Ruby 2.4 running on 64bit Amazon Linux",
+        RETIRED,
+        9700,
+        BOTH_TIERS,
+    ),
+    (
+        "Ruby",
+        "Puma with Ruby 2.3 running on 64bit Amazon Linux",
+        RETIRED,
+        9600,
         BOTH_TIERS,
     ),
     // Tomcat: a branch names its servlet container AND the JDK it runs on.
     (
         "Tomcat",
+        "Tomcat 11 with Corretto 25 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12800,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 11 with Corretto 21 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12700,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
+        "Tomcat 11 with Corretto 17 running on 64bit Amazon Linux 2023",
+        SUPPORTED,
+        12600,
+        BOTH_TIERS,
+    ),
+    (
+        "Tomcat",
         "Tomcat 10.1 with Corretto 21 running on 64bit Amazon Linux 2023",
         SUPPORTED,
-        12300,
+        12500,
         BOTH_TIERS,
     ),
     (
         "Tomcat",
         "Tomcat 10.1 with Corretto 17 running on 64bit Amazon Linux 2023",
         SUPPORTED,
-        12200,
+        12400,
         BOTH_TIERS,
     ),
     (
         "Tomcat",
         "Tomcat 9 with Corretto 11 running on 64bit Amazon Linux 2023",
         SUPPORTED,
-        12100,
+        12300,
         BOTH_TIERS,
     ),
     (
         "Tomcat",
         "Tomcat 9 with Corretto 8 running on 64bit Amazon Linux 2023",
         SUPPORTED,
-        12000,
+        12200,
         BOTH_TIERS,
     ),
     (

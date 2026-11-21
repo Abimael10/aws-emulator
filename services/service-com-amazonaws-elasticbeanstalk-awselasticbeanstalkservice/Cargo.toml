@@ -104,6 +104,9 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one suite module per `tests/all/<name>.rs`, so the single `all` test
+# target needs no hand-written list of them.
+automod = { workspace = true }
 # The source-bundle suite mounts the S3 service beside Elastic Beanstalk on one engine,
 # because CreateApplicationVersion and CreatePlatformVersion download the archive their
 # request names by calling object storage in process.

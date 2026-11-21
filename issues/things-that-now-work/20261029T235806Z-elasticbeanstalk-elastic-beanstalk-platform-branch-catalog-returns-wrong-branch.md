@@ -11,6 +11,8 @@ Issue-Commit: beb9379647f6ddd981e0914c2206ccd791a0c1ce
 
 # Elastic Beanstalk platform-branch catalog returns wrong branch names, lifecycle states and orders (10 causes)
 
+> _Resolved for causes 1, 2, 3, 4 and 6 (the `.NET Core on Linux`, `.NET on Windows Server`, `Docker`, `GlassFish`, `Go` and `Node.js` platform filters — fixture steps task#1 to task#5 and task#7 replay clean). The remaining inventory DEPTH of the `Java`, `PHP`, `Python`, `Ruby` and `Tomcat` filters (causes 5, 7, 8, 9 and 10 — their lists are shorter than the recorded ones) is re-filed, with this report's replay key and the analysis of what was already tried, as `issues/things-that-do-not-work/20261116T120000Z-elasticbeanstalk-listplatformbranches-still-omits-older-generations-of-five-platforms.md`, so the part that is not working yet is not recorded as working._
+
 > _Note: this issue was identified against the code base at commit `beb9379647f6ddd981e0914c2206ccd791a0c1ce`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

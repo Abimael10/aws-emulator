@@ -155,6 +155,48 @@ pub(crate) fn filter_params(
     params
 }
 
+/// The step the service issues `BranchOrder` in within a platform: the recorded
+/// ordinals of every platform run in hundreds (…, 11200, 11100, 11000, …).
+pub(crate) const BRANCH_ORDER_STEP: i32 = 100;
+
+/// One row of a published-inventory table: a branch of the catalog and what the
+/// catalog states about it. Shared by the suites that pin catalog entries, so
+/// each of them spells that expectation the one way.
+pub(crate) struct CatalogRow {
+    pub(crate) platform_name: &'static str,
+    pub(crate) branch_name: &'static str,
+    /// The REPORTED (capitalized) life-cycle state.
+    pub(crate) lifecycle_state: &'static str,
+    pub(crate) branch_order: i32,
+    /// Whether the branch runs worker environments as well as web server ones.
+    pub(crate) both_tiers: bool,
+}
+
+impl CatalogRow {
+    /// The `SupportedTierList` this row expects: both documented tiers, or the
+    /// web server one alone.
+    pub(crate) fn expected_tiers(&self) -> Vec<String> {
+        expected_tiers(self.both_tiers)
+    }
+}
+
+/// The `SupportedTierList` a branch reports: both documented tiers, or the web
+/// server one alone.
+pub(crate) fn expected_tiers(both_tiers: bool) -> Vec<String> {
+    match both_tiers {
+        true => TIERS.iter().map(|tier| (*tier).to_string()).collect(),
+        false => vec![TIERS[0].to_string()],
+    }
+}
+
+/// The branches of `platform`, as the server reports them for a
+/// `PlatformName = <platform>` filter.
+pub(crate) async fn of_platform(emulator: &Emulator, platform: &str) -> Vec<Branch> {
+    let params = filter_params(0, "PlatformName", "=", &[platform.to_string()]);
+    let answer = list(emulator, &params).await;
+    branches(&answer, platform)
+}
+
 /// The documented semantics of ONE filter term, restated independently of the
 /// implementation: `Attribute Operator Values[1]` for the single-value
 /// operators, and a logical union over the values for `in` / `not_in`.

@@ -36,26 +36,9 @@ use std::collections::BTreeMap;
 
 use crate::lifecycle::{elements, Emulator};
 use crate::platform_branches::{
-    branches, filter_params, full_catalog, list, reported, Branch, LIFECYCLE_STATES,
-    REPORTED_LIFECYCLE_STATES, TIERS,
+    branches, filter_params, full_catalog, list, of_platform, reported, Branch, CatalogRow,
+    BRANCH_ORDER_STEP, LIFECYCLE_STATES, REPORTED_LIFECYCLE_STATES, TIERS,
 };
-
-/// The step AWS issues `BranchOrder` in within a platform: the recorded
-/// ordinals of every platform run in hundreds (…, 11200, 11100, 11000, …), two
-/// branches published together sharing one ordinal.
-const BRANCH_ORDER_STEP: i32 = 100;
-
-/// One row of the catalog table below: a branch of the published inventory,
-/// with the life-cycle state and the ordinal AWS publishes it under.
-struct CatalogRow {
-    platform_name: &'static str,
-    branch_name: &'static str,
-    /// The REPORTED (capitalized) life-cycle state.
-    lifecycle_state: &'static str,
-    branch_order: i32,
-    /// Whether the branch runs worker environments as well as web server ones.
-    both_tiers: bool,
-}
 
 /// Branches of Elastic Beanstalk's published platform inventory, one per shape
 /// of catalog entry, NONE of them a branch a divergence report cited.
@@ -69,10 +52,10 @@ struct CatalogRow {
 /// platform that has retired whole.
 const CATALOG_ROWS: &[CatalogRow] = &[
     CatalogRow {
-        platform_name: "Corretto",
+        platform_name: "Java",
         branch_name: "Corretto 21 running on 64bit Amazon Linux 2023",
         lifecycle_state: "Supported",
-        branch_order: 12300,
+        branch_order: 11300,
         both_tiers: true,
     },
     CatalogRow {
@@ -105,20 +88,15 @@ const CATALOG_ROWS: &[CatalogRow] = &[
     },
     CatalogRow {
         platform_name: "GlassFish",
-        branch_name: "Preconfigured Docker - GlassFish 4.1 running on 64bit Debian jessie",
+        branch_name: "Preconfigured Docker - GlassFish 4.1 with Java 8 running on 64bit Debian",
         lifecycle_state: "Retired",
         branch_order: 9800,
-        both_tiers: false,
+        both_tiers: true,
     },
 ];
 
-/// The branches of `platform`, as the server reports them for a
-/// `PlatformName = <platform>` filter.
-async fn of_platform(emulator: &Emulator, platform: &str) -> Vec<Branch> {
-    let params = filter_params(0, "PlatformName", "=", &[platform.to_string()]);
-    let answer = list(emulator, &params).await;
-    branches(&answer, platform)
-}
+// The branches of one platform are read through `of_platform`, the one reader
+// the catalog suites share.
 
 /// The text of the first `<tag>` in `xml`, or `""` when there is none.
 fn field(xml: &str, tag: &str) -> String {
@@ -323,11 +301,7 @@ async fn the_published_catalog_holds_the_branches_aws_publishes() {
             "case {case:?}: unexpected BranchOrder, got {}",
             branch.branch_order
         );
-        let expected_tiers: Vec<String> = if row.both_tiers {
-            TIERS.iter().map(|tier| (*tier).to_string()).collect()
-        } else {
-            vec![TIERS[0].to_string()]
-        };
+        let expected_tiers: Vec<String> = row.expected_tiers();
         assert_eq!(
             branch.supported_tiers, expected_tiers,
             "case {case:?}: unexpected SupportedTierList, got {:?}",
