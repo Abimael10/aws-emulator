@@ -10,8 +10,9 @@
 //! * a member in the JSON request BODY is reported by the clause the body-schema validator
 //!   states for that class, in brackets: the regular expression and the string that did not
 //!   match it for a `@pattern`, the value and both lengths for a `@length` maximum on a
-//!   string, the property counts for one on a map — wherever in the body that member sits,
-//!   at the top level or nested inside a structure;
+//!   string, the property counts for one on a map, the bound and the submitted number for a
+//!   `@range` — wherever in the body that member sits, at the top level or nested inside a
+//!   structure;
 //! * a member carried OUTSIDE the body has no body-schema clause: a `@httpQuery` value that
 //!   is EMPTY where the model requires at least one character never arrives as a parameter
 //!   at all, and the refusal names the member alone;
@@ -33,6 +34,9 @@ use crate::pipe_update::create_body;
 
 const ROLE: &str = "arn:aws:iam::000000000000:role/pipes-role";
 const SOURCE_SQS: &str = "arn:aws:sqs:us-west-2:000000000000:orders";
+const SOURCE_KINESIS: &str = "arn:aws:kinesis:us-west-2:000000000000:stream/events";
+const SOURCE_DDB: &str =
+    "arn:aws:dynamodb:us-west-2:000000000000:table/orders/stream/2026-01-01T00:00:00.000";
 const TARGET_LAMBDA: &str = "arn:aws:lambda:us-west-2:000000000000:function:handler";
 
 /// The modelled `@pattern` of each member a row below gets wrong. Source:
@@ -506,6 +510,218 @@ async fn a_pipe_name_outside_its_pattern_is_reported_as_the_services_own_documen
             );
         }
     }
+}
+
+/// One row of the numeric-range table: the source parameter a value is sent for, and the
+/// `@range` its own shape declares.
+struct Ranged {
+    case: &'static str,
+    /// The `Source` the parameters belong to, so the row at the BOUND is a configuration the
+    /// pipe could be created with.
+    source: &'static str,
+    /// The `SourceParameters` member the parameters travel in.
+    container: &'static str,
+    /// The numeric member itself.
+    member: &'static str,
+    /// Its published bounds.
+    min: i64,
+    max: i64,
+}
+
+/// The `CreatePipe` body a numeric-range row sends: the three required members and one
+/// source parameter carrying `value`.
+///
+/// A STREAM source cannot be configured without the position it reads from, so the row's
+/// parameters carry it; the value under test is the only thing outside its bound.
+fn ranged_body(source: &str, container: &str, member: &str, value: i64) -> Value {
+    let mut parameters = json!({ member: value });
+    if container.ends_with("StreamParameters") && member != "StartingPosition" {
+        parameters["StartingPosition"] = json!("LATEST");
+    }
+    let mut body = minimal_body(source, TARGET_LAMBDA);
+    body["SourceParameters"] = json!({ container: parameters });
+    body
+}
+
+/// RULE: a NUMBER in the request body outside the `@range` its member's shape declares is
+/// refused with the bracketed clause the body-schema validator states for that class —
+/// naming the bound the value broke and the number the caller submitted — whichever member
+/// carried it, whichever structure the member sits in and whichever operation sent it; a
+/// number AT either bound is inside the range and is not refused.
+///
+/// The rows differ along what the rule generalises over: which member and so which range
+/// (`BatchSize`, `ParallelizationFactor`, a batching window, a record age, a retry count),
+/// which structure it sits in (each source's own parameters), which bound the value broke
+/// (below the minimum and above the maximum), and whether the range's minimum is one, zero
+/// or negative — so the clause states the model's bound and not a sign.
+///
+/// The ranges are the model's own. Source:
+/// `smithy_query(query="shape",shape="PipeSourceKinesisStreamParameters,PipeSourceDynamoDBStreamParameters,PipeSourceSqsQueueParameters")`
+/// — `BatchSize` -> `LimitMax10000` `@range(1, 10000)`, `ParallelizationFactor` ->
+/// `LimitMax10` `@range(1, 10)`, `MaximumBatchingWindowInSeconds` `@range(0, 300)`,
+/// `MaximumRecordAgeInSeconds` `@range(-1, 604800)`, `MaximumRetryAttempts` ->
+/// `MaximumRetryAttemptsESM` `@range(-1, 10000)`.
+#[tokio::test]
+async fn a_body_number_outside_its_range_states_the_bound_and_the_value() {
+    let rows = [
+        Ranged {
+            case: "kinesisparallelizationfactor",
+            source: SOURCE_KINESIS,
+            container: "KinesisStreamParameters",
+            member: "ParallelizationFactor",
+            min: 1,
+            max: 10,
+        },
+        Ranged {
+            case: "kinesisbatchsize",
+            source: SOURCE_KINESIS,
+            container: "KinesisStreamParameters",
+            member: "BatchSize",
+            min: 1,
+            max: 10_000,
+        },
+        Ranged {
+            case: "kinesisrecordage",
+            source: SOURCE_KINESIS,
+            container: "KinesisStreamParameters",
+            member: "MaximumRecordAgeInSeconds",
+            min: -1,
+            max: 604_800,
+        },
+        Ranged {
+            case: "kinesisretryattempts",
+            source: SOURCE_KINESIS,
+            container: "KinesisStreamParameters",
+            member: "MaximumRetryAttempts",
+            min: -1,
+            max: 10_000,
+        },
+        Ranged {
+            case: "dynamodbparallelizationfactor",
+            source: SOURCE_DDB,
+            container: "DynamoDBStreamParameters",
+            member: "ParallelizationFactor",
+            min: 1,
+            max: 10,
+        },
+        Ranged {
+            case: "sqsbatchingwindow",
+            source: SOURCE_SQS,
+            container: "SqsQueueParameters",
+            member: "MaximumBatchingWindowInSeconds",
+            min: 0,
+            max: 300,
+        },
+        Ranged {
+            case: "sqsbatchsize",
+            source: SOURCE_SQS,
+            container: "SqsQueueParameters",
+            member: "BatchSize",
+            min: 1,
+            max: 10_000,
+        },
+    ];
+
+    for row in rows {
+        let router = router();
+        // One past each published bound: the clause states the bound the value broke.
+        let below = row.min - 1;
+        let case = format!("{}-below-the-minimum", row.case);
+        let refused = create(
+            &router,
+            row.case,
+            ranged_body(row.source, row.container, row.member, below),
+        )
+        .await;
+        assert_refused(
+            &case,
+            &refused,
+            &format!(
+                "[numeric instance is lower than the required minimum (minimum: {}, found: \
+                 {below})]",
+                row.min
+            ),
+        );
+        let described = describe(&router, row.case).await;
+        assert_eq!(
+            described.status, 404,
+            "case {case:?}: a refused CreatePipe must have stored no pipe, got {described:?}"
+        );
+
+        let above = row.max + 1;
+        let case = format!("{}-above-the-maximum", row.case);
+        let refused = create(
+            &router,
+            row.case,
+            ranged_body(row.source, row.container, row.member, above),
+        )
+        .await;
+        assert_refused(
+            &case,
+            &refused,
+            &format!(
+                "[numeric instance is greater than the required maximum (maximum: {}, found: \
+                 {above})]",
+                row.max
+            ),
+        );
+
+        // AT each bound the value is inside the range, so the create is accepted: the rule
+        // is about a number outside the range and not about the member carrying one.
+        for (edge, value) in [("minimum", row.min), ("maximum", row.max)] {
+            let name = format!("{}at{edge}", row.case);
+            let accepted = create(
+                &router,
+                &name,
+                ranged_body(row.source, row.container, row.member, value),
+            )
+            .await;
+            assert_eq!(
+                accepted.status,
+                200,
+                "case {name:?}: {value} is inside the range of {}, so the create must be \
+                 accepted, got {accepted:?}",
+                row.member
+            );
+        }
+    }
+
+    // The SAME clause from the other operation that carries these members, so what decides
+    // the wording is the class of constraint and not the operation.
+    let router = router();
+    let live = "rangedlive";
+    let mut body = minimal_body(SOURCE_KINESIS, TARGET_LAMBDA);
+    body["SourceParameters"] = json!({
+        "KinesisStreamParameters": {"StartingPosition": "LATEST", "ParallelizationFactor": 2},
+    });
+    let created = create(&router, live, body).await;
+    assert_eq!(
+        created.status, 200,
+        "the fixture pipe must be created, got {created:?}"
+    );
+    let refused = call(
+        &router,
+        "PUT",
+        &format!("/v1/pipes/{live}"),
+        Some(json!({
+            "RoleArn": ROLE,
+            "SourceParameters": {"KinesisStreamParameters": {"ParallelizationFactor": 0}},
+        })),
+        REGION,
+    )
+    .await;
+    assert_refused(
+        "UpdatePipe parallelizationfactor-below-the-minimum",
+        &refused,
+        "[numeric instance is lower than the required minimum (minimum: 1, found: 0)]",
+    );
+    let described = describe(&router, live).await;
+    assert_eq!(
+        described.member("SourceParameters")["KinesisStreamParameters"]["ParallelizationFactor"],
+        json!(2),
+        "a refused UpdatePipe must leave the stored configuration where it was, got \
+         {described:?}"
+    );
 }
 
 /// RULE: a request that satisfies every modelled constraint is NOT refused — the front door

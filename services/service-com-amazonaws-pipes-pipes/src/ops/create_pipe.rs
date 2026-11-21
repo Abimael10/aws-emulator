@@ -391,6 +391,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // making was asked for too, so the reason is the user-initiated one from here
             // until a failed move replaces it with its own.
             state_reason: Some(crate::state::USER_INITIATED_STATE_REASON.to_string()),
+            // A pipe whose source is read PER SHARD is created with a READER of that source,
+            // which has processed no record yet; one over any other source, and one whose
+            // creation cannot be completed, is created with none
+            // ([`crate::state::initial_processing_result`]).
+            processing_result: unservable
+                .is_none()
+                .then(|| crate::state::initial_processing_result(&input.source))
+                .flatten(),
             source: input.source.clone(),
             source_parameters: input.source_parameters.clone(),
             enrichment: input.enrichment.clone(),

@@ -160,7 +160,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use ::serde_json::{json, Value};
 
-use super::{pipe_state, ComAmazonawsPipesPipesState, PipeRecord};
+use super::{ComAmazonawsPipesPipesState, PipeRecord};
 use crate::ops::types::{PipeSourceParameters, PipeTargetParameters};
 
 mod called_service;
@@ -238,20 +238,10 @@ const MAX_RECEIVE_PER_CALL: i32 = 10;
 /// batch and never a dropped record.
 const MAX_RECORDS_PER_BATCH: usize = 1_000;
 
-/// The `BatchSize` a pipe whose source parameters name none polls with.
-///
-/// The model declares no `@default` on the member (only its `@range`), so this is the
-/// default EventBridge Pipes documents for an Amazon SQS source — ten records per batch,
-/// the same default the Amazon SQS event-source polling of a Lambda function has. A pipe
-/// that wants one record per batch says `BatchSize: 1`.
-const DEFAULT_BATCH_SIZE: usize = 10;
-
-/// The `BatchSize` a DynamoDB-stream source polls with when its parameters name none.
-///
-/// The model declares no `@default` here either, so this is the default EventBridge Pipes
-/// documents for a stream source — 100 records per batch, the same default the DynamoDB
-/// Streams event-source polling of a Lambda function has.
-const DEFAULT_STREAM_BATCH_SIZE: usize = 100;
+/// The `BatchSize` a pipe whose source parameters name none polls with: the one value a
+/// read of the pipe reports as in force, so the batch the poller takes and the batch the
+/// pipe reports are the same number ([`super::DEFAULT_BATCH_SIZE`]).
+const DEFAULT_BATCH_SIZE: usize = super::DEFAULT_BATCH_SIZE as usize;
 
 /// `BatchSize`'s own `@range`, from `PipeSourceSqsQueueParameters` in
 /// `smithy-model/com-amazonaws-pipes-pipes.json`.
@@ -622,6 +612,15 @@ async fn poll_pipe(
                 match moved {
                     Batch::Moved { events } => {
                         metrics.count(super::metrics::EVENT_COUNT_METRIC, events);
+                        // What the pass came to is the poller's reading of it, which is what
+                        // a read of a pipe over a source read per shard reports
+                        // (`PipeRecord::reported_state_reason`): this one processed the
+                        // records it polled.
+                        note_processing_result(
+                            &state,
+                            &pipe_name,
+                            super::RECORDS_PROCESSED_STATE_REASON,
+                        );
                         failures = 0;
                     }
                     Batch::Idle => {
@@ -735,6 +734,20 @@ async fn poll_pipe(
                 }
             }
         }
+    }
+}
+
+/// Record on the pipe's own record what a pass over its source came to, so a read of the
+/// pipe reports its poller's reading rather than the lifecycle reason that put it in the
+/// state it is in ([`super::PipeRecord::reported_state_reason`]).
+fn note_processing_result(
+    state: &::engine::ServiceState<ComAmazonawsPipesPipesState>,
+    pipe: &str,
+    result: &str,
+) {
+    let mut store = state.lock();
+    if let Some(record) = store.pipes.get_mut(pipe) {
+        record.note_processing_result(result);
     }
 }
 
@@ -854,12 +867,10 @@ fn next_pass(store: &mut ComAmazonawsPipesPipesState, claim: &mut PollerClaim) -
         };
     }
     // The states a pipe is in while a move it is already making lands. A pipe that is
-    // on its way to RUNNING keeps its poller; everything else ends it.
-    let towards_running = matches!(
-        pipe.current_state.as_str(),
-        pipe_state::CREATING | pipe_state::STARTING | pipe_state::UPDATING
-    ) && pipe.desired_state == super::requested_state::RUNNING;
-    if towards_running {
+    // on its way to RUNNING keeps its poller; everything else ends it. The one reading of
+    // that question is the record's own (`PipeRecord::moves_towards_running`), so the pass
+    // decided here and the reason a read of the pipe reports cannot drift apart.
+    if pipe.moves_towards_running() {
         return match resolve_run(pipe) {
             Ok(run) => Pass::Settling(Box::new(run)),
             // A configuration that cannot be resolved has no source position to take up
@@ -3629,7 +3640,7 @@ fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
                 },
                 batch_size: stream.batch_size,
                 window_seconds: stream.maximum_batching_window_in_seconds,
-                default_batch_size: DEFAULT_STREAM_BATCH_SIZE,
+                default_batch_size: DEFAULT_BATCH_SIZE,
                 retry_attempts: stream.maximum_retry_attempts,
             }
         }
@@ -3661,7 +3672,7 @@ fn resolve_run(pipe: &PipeRecord) -> Result<RunningPipe, String> {
                 },
                 batch_size: stream.batch_size,
                 window_seconds: stream.maximum_batching_window_in_seconds,
-                default_batch_size: DEFAULT_STREAM_BATCH_SIZE,
+                default_batch_size: DEFAULT_BATCH_SIZE,
                 retry_attempts: stream.maximum_retry_attempts,
             }
         }

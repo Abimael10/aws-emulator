@@ -27,12 +27,23 @@
 //!    the template renders: a string field, a number compared numerically, a negation, a
 //!    member of the envelope beside the data, a whole decoded document, and a payload that
 //!    spells no document at all.
+//! 3. A read of such a pipe reports the configuration its source is polled under and the
+//!    reason it is in the state it is in: the `BatchSize` the pipe was configured with or
+//!    the one in force where it named none, and — because a pipe over a source read PER
+//!    SHARD is created with a READER of that source — what that reader has processed, rather
+//!    than the lifecycle move that put the pipe where it is. The rows differ along the batch
+//!    size configured, the position read from, the state the caller asked for, and whether
+//!    the reader has processed a batch.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_pipes_pipes::state::{
+    DEFAULT_BATCH_SIZE as DEFAULT_BATCH_SIZE_I32, NO_RECORDS_PROCESSED_STATE_REASON,
+    RECORDS_PROCESSED_STATE_REASON,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::pipe_body_paths::canonical;
@@ -50,6 +61,23 @@ const BUDGET: Duration = Duration::from_secs(25);
 
 /// The `CurrentState` a pipe that is reading its source rests in.
 const RUNNING: &str = "RUNNING";
+
+/// The `CurrentState` a pipe its caller asked not to run rests in. Source: `PipeState` in
+/// `smithy-model/com-amazonaws-pipes-pipes.json`.
+const STOPPED: &str = "STOPPED";
+
+/// The smallest batch a pipe may be configured to poll. Source:
+/// `smithy_query(query="shape",shape="PipeSourceKinesisStreamParameters")` — `BatchSize`
+/// targets `LimitMax10000`, `@range(min: 1, max: 10000)`.
+const BATCH_SIZE_MIN: i64 = 1;
+
+/// The most records an Amazon SQS target takes in ONE delivery, which is what caps the batch
+/// a pipe with such a target may poll (`SendMessageBatch` takes ten entries per call).
+const SQS_TARGET_BATCH_CAP: i64 = 10;
+
+/// The batch size a read of a pipe reports where its source parameters name none, read from
+/// the crate rather than restated here (`state::DEFAULT_BATCH_SIZE`).
+const DEFAULT_BATCH_SIZE: i64 = DEFAULT_BATCH_SIZE_I32 as i64;
 
 /// How far in the future the position of the row that must read nothing lies. Far enough
 /// that a record put while the row runs is well before it however slow or fast the host is.
@@ -195,15 +223,23 @@ async fn create_pipe(router: &MultiServiceRouter, name: &str, body: Value) -> Re
 
 /// Wait until the pipe `name` reports it RUNS, which is the state it reads its source in.
 async fn wait_until_running(router: &MultiServiceRouter, name: &str) {
+    settled_in(router, name, RUNNING).await;
+}
+
+/// Wait until the pipe `name` reports it rests in `state`, and answer what that read said.
+///
+/// A LOOK AGAIN until the state holds, never a fixed pause: the move a lifecycle call owes
+/// lands on the service's own clock.
+async fn settled_in(router: &MultiServiceRouter, name: &str, state: &str) -> Reply {
     let deadline = Instant::now() + BUDGET;
     loop {
         let described = describe(router, name).await;
-        if described.string("CurrentState") == RUNNING {
-            return;
+        if described.string("CurrentState") == state {
+            return described;
         }
         assert!(
             Instant::now() < deadline,
-            "case {name:?}: expected the pipe to reach {RUNNING}, got {described:?}"
+            "case {name:?}: expected the pipe to reach {state}, got {described:?}"
         );
         tokio::time::sleep(LOOK_AGAIN).await;
     }
@@ -604,6 +640,218 @@ async fn a_running_kinesis_sourced_pipe_delivers_every_record_it_covers() {
             extra.is_empty(),
             "case {case:?}: expected no further delivery, got {extra:?}"
         );
+    }
+}
+
+/// One row of the reported-configuration table: what a pipe's Kinesis source parameters
+/// name, and the state its caller asks it to be in.
+struct Reported {
+    case: &'static str,
+    /// `BatchSize` as the creation configures it, or `None` for a configuration that names
+    /// none — where the value in force is the one the service polls with.
+    batch_size: Option<i64>,
+    /// `StartingPosition`: the member a stream source cannot be configured without.
+    starting_position: &'static str,
+    /// The `DesiredState` the creation asks for, which is the state the pipe comes to rest
+    /// in.
+    desired_state: &'static str,
+    /// The `StateReason` that pipe therefore reports: the reading of the reader its creation
+    /// stood up over the stream, whatever state its caller asked it to be in.
+    state_reason: &'static str,
+}
+
+/// RULE: a read of a pipe reports the configuration its source is polled under and the
+/// reason the pipe is in the state it is in — `SourceParameters.<source>.BatchSize` is the
+/// value the pipe was configured with, or the one in force where its parameters name none,
+/// and a pipe created with a READER of its source (one read per shard) reports what that
+/// reader has processed in place of the lifecycle reason that put it where it is.
+///
+/// The rows differ along what the rule generalises over: whether the configuration names a
+/// batch size and which value it names (none, the smallest a batch may be, one between, the
+/// largest this target takes in one delivery), the position the pipe reads its shards from,
+/// and the state its caller asked for — running and stopped alike, because the reader is the
+/// pipe's from its creation and neither state has had a record off the stream.
+#[tokio::test]
+async fn a_read_of_a_stream_sourced_pipe_reports_its_batch_size_and_its_readers_reading() {
+    let rows = [
+        Reported {
+            case: "no-batch-size-running",
+            batch_size: None,
+            starting_position: "LATEST",
+            desired_state: RUNNING,
+            state_reason: NO_RECORDS_PROCESSED_STATE_REASON,
+        },
+        Reported {
+            case: "batch-size-at-its-minimum",
+            batch_size: Some(BATCH_SIZE_MIN),
+            starting_position: "TRIM_HORIZON",
+            desired_state: RUNNING,
+            state_reason: NO_RECORDS_PROCESSED_STATE_REASON,
+        },
+        Reported {
+            case: "batch-size-at-the-targets-cap",
+            batch_size: Some(SQS_TARGET_BATCH_CAP),
+            starting_position: "LATEST",
+            desired_state: RUNNING,
+            state_reason: NO_RECORDS_PROCESSED_STATE_REASON,
+        },
+        Reported {
+            case: "no-batch-size-stopped",
+            batch_size: None,
+            starting_position: "TRIM_HORIZON",
+            desired_state: STOPPED,
+            state_reason: NO_RECORDS_PROCESSED_STATE_REASON,
+        },
+        Reported {
+            case: "batch-size-between-the-bounds-stopped",
+            batch_size: Some(5),
+            starting_position: "LATEST",
+            desired_state: STOPPED,
+            state_reason: NO_RECORDS_PROCESSED_STATE_REASON,
+        },
+    ];
+
+    for row in rows {
+        let router = emulator();
+        let case = row.case;
+        let stream = given_stream(&router, case, 1).await;
+        let (_url, target) = given_queue(&router, case, false).await;
+
+        let mut parameters = json!({ "StartingPosition": row.starting_position });
+        if let Some(configured) = row.batch_size {
+            parameters["BatchSize"] = json!(configured);
+        }
+        let created = create_pipe(
+            &router,
+            case,
+            json!({
+                "Source": stream,
+                "Target": target,
+                "RoleArn": ROLE,
+                "DesiredState": row.desired_state,
+                "SourceParameters": { "KinesisStreamParameters": parameters },
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePipe must succeed, got {created:?}"
+        );
+
+        let described = settled_in(&router, case, row.desired_state).await;
+        let reported = &described.member("SourceParameters")["KinesisStreamParameters"];
+        let expected = row.batch_size.unwrap_or(DEFAULT_BATCH_SIZE);
+        assert_eq!(
+            reported.get("BatchSize"),
+            Some(&json!(expected)),
+            "case {case:?}: expected the batch size in force ({expected}), got {reported:?}"
+        );
+        assert_eq!(
+            reported.get("StartingPosition"),
+            Some(&json!(row.starting_position)),
+            "case {case:?}: expected the configured position, got {reported:?}"
+        );
+        assert_eq!(
+            described.string("StateReason"),
+            row.state_reason,
+            "case {case:?}: a pipe its caller asked to be {} reports its reader's reading \
+             {}, got {described:?}",
+            row.desired_state,
+            row.state_reason
+        );
+    }
+}
+
+/// RULE, over the other reading the same member has: once a pass of the pipe's reader HAS
+/// processed the records it polled, that is what the pipe reports — the reason follows what
+/// the reader did and is not a constant. A later stop asks for no further pass, so the result
+/// of the last one still stands.
+#[tokio::test]
+async fn a_pipe_whose_reader_processed_its_batch_reports_that_reading() {
+    let router = emulator();
+    let case = "poller-processed-a-batch";
+    let stream = given_stream(&router, case, 1).await;
+    let (url, target) = given_queue(&router, case, false).await;
+    let created = create_pipe(
+        &router,
+        case,
+        json!({
+            "Source": stream,
+            "Target": target,
+            "RoleArn": ROLE,
+            "DesiredState": RUNNING,
+            "SourceParameters": {
+                "KinesisStreamParameters": {
+                    "StartingPosition": "TRIM_HORIZON",
+                    "BatchSize": 1,
+                    "MaximumBatchingWindowInSeconds": 0,
+                },
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: CreatePipe must succeed, got {created:?}"
+    );
+    wait_until_running(&router, case).await;
+    let described = describe(&router, case).await;
+    assert_eq!(
+        described.string("StateReason"),
+        NO_RECORDS_PROCESSED_STATE_REASON,
+        "case {case:?}: nothing has been put on the stream yet, got {described:?}"
+    );
+
+    put_records(&router, &stream, case, &[("orders", "processed-1")]).await;
+    let delivered = delivered(&router, &url, case, 1).await;
+    assert_eq!(
+        delivered.len(),
+        1,
+        "case {case:?}: expected the record to reach the target, got {delivered:?}"
+    );
+    // The reading is taken by LOOKING AGAIN until it holds: what the pass came to is written
+    // by the poller, so the read that sees it is the one taken after it.
+    wait_until_reason(&router, case, RECORDS_PROCESSED_STATE_REASON).await;
+
+    // And a stop asks the pipe for no further pass, so the result of the last one stands:
+    // the member reports what the reader processed, not whether it is reading now.
+    let stopped = call(
+        &router,
+        "POST",
+        &format!("/v1/pipes/{case}/stop"),
+        None,
+        REGION,
+    )
+    .await;
+    assert_eq!(
+        stopped.status, 200,
+        "case {case:?}: StopPipe must succeed, got {stopped:?}"
+    );
+    let described = settled_in(&router, case, STOPPED).await;
+    assert_eq!(
+        described.string("StateReason"),
+        RECORDS_PROCESSED_STATE_REASON,
+        "case {case:?}: a stopped pipe still reports what its reader processed, got \
+         {described:?}"
+    );
+}
+
+/// Wait until the pipe `name` reports `reason` as its `StateReason`.
+///
+/// A LOOK AGAIN until it holds, never a fixed pause: what a pass of the poller came to is
+/// written by that poller, so the read that sees it is one taken after it.
+async fn wait_until_reason(router: &MultiServiceRouter, name: &str, reason: &str) {
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        let described = describe(router, name).await;
+        if described.string("StateReason") == reason {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {name:?}: expected the pipe to report the reason {reason:?}, got {described:?}"
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
     }
 }
 

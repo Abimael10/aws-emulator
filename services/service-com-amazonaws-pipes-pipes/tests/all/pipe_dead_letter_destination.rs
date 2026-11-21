@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_pipes_pipes::state::pipe_state::{
     CREATE_FAILED, RUNNING, START_FAILED, UPDATE_FAILED,
 };
-use service_com_amazonaws_pipes_pipes::state::USER_INITIATED_STATE_REASON;
+use service_com_amazonaws_pipes_pipes::state::NO_RECORDS_PROCESSED_STATE_REASON;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::pipe_bring_up::settled;
@@ -303,10 +303,13 @@ async fn create_pipe_fails_a_pipe_whose_dead_letter_destination_is_no_queue_or_t
                 "case {:?}: expected the StateReason to name {arn}, got {reason:?}",
                 row.case
             ),
+            // A pipe over a source read PER SHARD reports what its poller made of its last
+            // pass once it rests in RUNNING, and nothing has been put on the stream yet.
             _ => assert_eq!(
-                reason, USER_INITIATED_STATE_REASON,
-                "case {:?}: a completed creation rests in the state its caller asked for, so \
-                 its StateReason is {USER_INITIATED_STATE_REASON}, got {reason:?}",
+                reason, NO_RECORDS_PROCESSED_STATE_REASON,
+                "case {:?}: a completed creation rests in RUNNING over a stream whose records \
+                 it has processed none of, so its StateReason is \
+                 {NO_RECORDS_PROCESSED_STATE_REASON}, got {reason:?}",
                 row.case
             ),
         }
@@ -488,9 +491,10 @@ async fn every_lifecycle_write_refuses_a_dead_letter_destination_that_is_no_queu
         let reason = described.string("StateReason");
         if row.settles_in == RUNNING {
             assert_eq!(
-                reason, USER_INITIATED_STATE_REASON,
-                "case {:?}: a completed write rests in the state its caller asked for, so its \
-                 StateReason is {USER_INITIATED_STATE_REASON}, got {reason:?}",
+                reason, NO_RECORDS_PROCESSED_STATE_REASON,
+                "case {:?}: a completed write rests in RUNNING over a stream whose records it \
+                 has processed none of, so its StateReason is \
+                 {NO_RECORDS_PROCESSED_STATE_REASON}, got {reason:?}",
                 row.case
             );
         } else {

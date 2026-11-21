@@ -43,6 +43,20 @@ const OPTIONAL_CREATE_MEMBERS: &[&str] = &[
     "KmsKeyIdentifier",
 ];
 
+/// The `SourceParameters` members whose source type this service POLLS a source of, so a
+/// read of a pipe configured under one of them reports the batch size in force. Source: the
+/// source types `state::SOURCE_TYPE_MEMBERS` reports an effective batch size for.
+const POLLED_SOURCE_PARAMETERS: &[&str] = &[
+    "SqsQueueParameters",
+    "KinesisStreamParameters",
+    "DynamoDBStreamParameters",
+];
+
+/// The batch size a read reports where a polled source's parameters name none, read from the
+/// crate rather than restated here.
+const DEFAULT_BATCH_SIZE: i64 =
+    service_com_amazonaws_pipes_pipes::state::DEFAULT_BATCH_SIZE as i64;
+
 /// One emulator holding only this service, reached exactly as the router reaches it.
 pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -207,6 +221,32 @@ pub(crate) fn required_source_parameters(source: &str) -> Option<Value> {
 
 pub(crate) async fn describe(router: &MultiServiceRouter, name: &str) -> Reply {
     call(router, "GET", &format!("/v1/pipes/{name}"), None, REGION).await
+}
+
+/// `configured` as a read of the pipe REPORTS it: the parameters of a source this service
+/// POLLS carry the batch size in force (`state::DEFAULT_BATCH_SIZE`) where the request named
+/// none, because a read reports the configuration the pipe is polled under and not a record
+/// of which members its create request mentioned.
+///
+/// The three members named are the source types this service polls a source of; the whole
+/// projection, every source type and every container, has its own table in
+/// `tests/all/pipe_reported_configuration.rs`.
+pub(crate) fn with_batch_size_in_force(configured: &Value) -> Value {
+    let mut reported = configured.clone();
+    let Some(containers) = reported.as_object_mut() else {
+        return reported;
+    };
+    for (member, parameters) in containers.iter_mut() {
+        if !POLLED_SOURCE_PARAMETERS.contains(&member.as_str()) {
+            continue;
+        }
+        if let Some(members) = parameters.as_object_mut() {
+            members
+                .entry("BatchSize")
+                .or_insert(json!(DEFAULT_BATCH_SIZE));
+        }
+    }
+    reported
 }
 
 pub(crate) async fn list(router: &MultiServiceRouter, query: &str) -> Reply {
@@ -384,6 +424,19 @@ async fn describe_pipe_reports_every_member_create_pipe_stored() {
             } else {
                 expected
             };
+            // A read reports the configuration the pipe is POLLED under, so the source's own
+            // parameters carry the batch size in force beside the members the request named.
+            if member == "SourceParameters" {
+                let reported = with_batch_size_in_force(expected);
+                assert_eq!(
+                    described.member(member),
+                    &reported,
+                    "case {name:?}: DescribePipe must report {member} as the pipe is polled \
+                     under ({reported}), got {:?}",
+                    described.member(member)
+                );
+                continue;
+            }
             assert_eq!(
                 described.member(member),
                 expected,

@@ -43,13 +43,10 @@ const TARGET_LAMBDA: &str = "arn:aws:lambda:us-west-2:000000000000:function:hand
 const BATCH_SIZE_MIN: i64 = 1;
 const BATCH_SIZE_MAX: i64 = 10_000;
 
-/// The `BatchSize` a source of each kind polls with when its parameters name none, as this
-/// service's records report it: `state::DEFAULT_SQS_BATCH_SIZE` for an Amazon SQS queue and
-/// `state::DEFAULT_STREAM_BATCH_SIZE` for a stream.
-const DEFAULT_SQS_BATCH_SIZE: i64 =
-    service_com_amazonaws_pipes_pipes::state::DEFAULT_SQS_BATCH_SIZE as i64;
-const DEFAULT_STREAM_BATCH_SIZE: i64 =
-    service_com_amazonaws_pipes_pipes::state::DEFAULT_STREAM_BATCH_SIZE as i64;
+/// The `BatchSize` a source polls with when its parameters name none, as this service's
+/// records report it (`state::DEFAULT_BATCH_SIZE`) — ONE value whatever the source is.
+const DEFAULT_BATCH_SIZE: i64 =
+    service_com_amazonaws_pipes_pipes::state::DEFAULT_BATCH_SIZE as i64;
 
 /// One row of the reported-configuration table.
 struct Row {
@@ -74,7 +71,7 @@ fn rows() -> Vec<Row> {
             case: "sqs-source-nothing-configured",
             source: SOURCE_SQS,
             configured: json!({}),
-            source_parameters: json!({"SqsQueueParameters": {"BatchSize": DEFAULT_SQS_BATCH_SIZE}}),
+            source_parameters: json!({"SqsQueueParameters": {"BatchSize": DEFAULT_BATCH_SIZE}}),
             enrichment_parameters: json!({}),
             target_parameters: json!({}),
             tags: json!({}),
@@ -113,7 +110,7 @@ fn rows() -> Vec<Row> {
             }),
             source_parameters: json!({
                 "SqsQueueParameters": {
-                    "BatchSize": DEFAULT_SQS_BATCH_SIZE,
+                    "BatchSize": DEFAULT_BATCH_SIZE,
                     "MaximumBatchingWindowInSeconds": 30,
                 },
             }),
@@ -133,7 +130,7 @@ fn rows() -> Vec<Row> {
             }),
             source_parameters: json!({
                 "FilterCriteria": {"Filters": [{"Pattern": "{\"body\":[{\"prefix\":\"a\"}]}"}]},
-                "SqsQueueParameters": {"BatchSize": DEFAULT_SQS_BATCH_SIZE},
+                "SqsQueueParameters": {"BatchSize": DEFAULT_BATCH_SIZE},
             }),
             enrichment_parameters: json!({}),
             target_parameters: json!({}),
@@ -166,7 +163,7 @@ fn rows() -> Vec<Row> {
             source_parameters: json!({
                 "DynamoDBStreamParameters": {
                     "StartingPosition": "LATEST",
-                    "BatchSize": DEFAULT_STREAM_BATCH_SIZE,
+                    "BatchSize": DEFAULT_BATCH_SIZE,
                 },
             }),
             enrichment_parameters: json!({}),
@@ -192,15 +189,18 @@ fn rows() -> Vec<Row> {
             tags: json!({}),
         },
         Row {
-            // A source kind this emulator polls no source of: there is no batch size in
-            // force to report, so the stored configuration is reported exactly as written.
-            case: "kinesis-stream-source-is-reported-as-written",
+            // A stream source of the other kind: the batch size in force is reported for
+            // every source this service polls, not for some of them.
+            case: "kinesis-stream-source-without-a-batch-size",
             source: SOURCE_KINESIS,
             configured: json!({
                 "SourceParameters": {"KinesisStreamParameters": {"StartingPosition": "LATEST"}},
             }),
             source_parameters: json!({
-                "KinesisStreamParameters": {"StartingPosition": "LATEST"},
+                "KinesisStreamParameters": {
+                    "StartingPosition": "LATEST",
+                    "BatchSize": DEFAULT_BATCH_SIZE,
+                },
             }),
             enrichment_parameters: json!({}),
             target_parameters: json!({}),
@@ -330,7 +330,7 @@ async fn an_update_that_replaces_a_container_is_reported_with_the_batch_size_in_
             json!({"SqsQueueParameters": {"MaximumBatchingWindowInSeconds": 5}}),
             json!({
                 "SqsQueueParameters": {
-                    "BatchSize": DEFAULT_SQS_BATCH_SIZE,
+                    "BatchSize": DEFAULT_BATCH_SIZE,
                     "MaximumBatchingWindowInSeconds": 5,
                 },
             }),
@@ -345,7 +345,7 @@ async fn an_update_that_replaces_a_container_is_reported_with_the_batch_size_in_
             json!({"FilterCriteria": {"Filters": []}}),
             json!({
                 "FilterCriteria": {"Filters": []},
-                "SqsQueueParameters": {"BatchSize": DEFAULT_SQS_BATCH_SIZE},
+                "SqsQueueParameters": {"BatchSize": DEFAULT_BATCH_SIZE},
             }),
         ),
     ];

@@ -51,7 +51,9 @@
 //! `[ECMA 262 regex "<pattern>" does not match input string "<value>"]` for a `@pattern`,
 //! `[string "<value>" is too long (length: <n>, maximum allowed: <max>)]` for a `@length`
 //! maximum on a string, `[object has too many properties (found <n> but schema requires at
-//! most <max>)]` for one on a map. The clause quotes the value the CALLER submitted, which
+//! most <max>)]` for one on a map, and `[numeric instance is lower than the required minimum
+//! (minimum: <min>, found: <value>)]` — or its maximum mirror — for a number outside a
+//! `@range`. The clause quotes the value the CALLER submitted, which
 //! is why the wording happens in [`FrontDoor`], per operation, where the request can be
 //! re-read: the `override_refusal` seam is handed the violations alone, and the framework's
 //! own violation carries an elided rendering of a long value.
@@ -107,7 +109,8 @@ use service_common::front_door::binds_to_body;
 use service_common::no_content_responses::without_content;
 use service_common::validation::{refusing_violations_with_echoes, SubmittedEcho};
 use service_common::validation_message::{
-    map_entry_count, pattern_mismatch, string_too_long, too_many_properties,
+    map_entry_count, numeric_above_maximum, numeric_below_minimum, pattern_mismatch,
+    string_too_long, too_many_properties,
 };
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
@@ -568,8 +571,8 @@ fn pipe_name_field(violation: &Violation) -> Option<crate::ops::types::Validatio
 /// validator states the clause for the VALUE and the class, not for the path. The one
 /// exception is a TAG's content, which the resource-tagging layer in front of this service
 /// owns and words itself ([`tag_content_clause`]). A class that layer has no recorded
-/// sentence for (a `@length` MINIMUM on a body string, a `@range`, an enum, an absent
-/// `@required` member) keeps the framework's own wording rather than being given one here.
+/// sentence for (a `@length` MINIMUM on a body string, an enum, an absent `@required`
+/// member) keeps the framework's own wording rather than being given one here.
 fn clause(
     input_schema: &::aws_smithy_schema::Schema,
     violation: &Violation,
@@ -600,6 +603,17 @@ fn clause(
         (SubmittedEcho::Unrendered, ViolationKind::MaxLength(max)) => {
             let found = map_entry_count(violation.value.as_deref()?)?;
             Some(too_many_properties(found, *max))
+        }
+        // A NUMBER outside the `@range` its member's shape declares: the schema validator
+        // reports the bound the value broke and the number the request carried, each stated
+        // as its own text — the bound as the model writes it and the value as it was sent.
+        // Both bounds, for every numeric member of every operation: a value under the
+        // minimum and one over the maximum break the same kind of rule.
+        (SubmittedEcho::Rendered(value), ViolationKind::MinValue(min)) => {
+            Some(numeric_below_minimum(value, min))
+        }
+        (SubmittedEcho::Rendered(value), ViolationKind::MaxValue(max)) => {
+            Some(numeric_above_maximum(value, max))
         }
         _ => None,
     }

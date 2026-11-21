@@ -7,7 +7,8 @@
 //! RULE: a pipe's `StateReason` says how it came to be in the state it is in, and every read
 //! that carries the member reports the pipe's OWN reason — so each entry of a listing carries
 //! the same reason a read of that one pipe reports: the user-initiated token for a state its
-//! caller drove it into, and the sentence saying why for a move that could not be completed.
+//! caller drove it into, the sentence saying why for a move that could not be completed, and
+//! its poller's reading for a pipe running over a source read per shard.
 //!
 //! `tests/all/pipe_state_reason.rs` is the table over the lifecycle calls and listing shapes
 //! of pipes that all rest where their caller asked them to, and `tests/all/pipe_bring_up.rs`
@@ -25,7 +26,9 @@ use service_com_amazonaws_pipes_pipes::state::execution_role::SERVICE_PRINCIPAL;
 use service_com_amazonaws_pipes_pipes::state::pipe_state::{
     CREATE_FAILED, RUNNING, START_FAILED, STOPPED,
 };
-use service_com_amazonaws_pipes_pipes::state::USER_INITIATED_STATE_REASON;
+use service_com_amazonaws_pipes_pipes::state::{
+    NO_RECORDS_PROCESSED_STATE_REASON, USER_INITIATED_STATE_REASON,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::pipe_bring_up::{create_pipe, delete_queue, every_call, reason_says, settled};
@@ -49,6 +52,10 @@ const PAGE_BUDGET: usize = 16;
 pub(crate) enum Reason {
     /// The pipe rests where its caller asked it to: the fixed user-initiated token.
     UserInitiated,
+    /// The pipe rests in `RUNNING` over a source read PER SHARD whose records its poller
+    /// has processed none of: the poller's own reading rather than the move that put the
+    /// pipe there.
+    PollerIdle,
     /// A move that could not be completed: the sentence names the source the pipe could not
     /// poll and carries `mentions` beside it, saying what stopped it.
     Failure {
@@ -76,6 +83,12 @@ pub(crate) fn assert_reason(case: &str, read: &str, reported: Option<&str>, expe
             reason, USER_INITIATED_STATE_REASON,
             "case {case:?}: expected {read} to report the user-initiated reason \
              {USER_INITIATED_STATE_REASON} for a state the caller drove, got {reason:?}"
+        ),
+        Reason::PollerIdle => assert_eq!(
+            reason, NO_RECORDS_PROCESSED_STATE_REASON,
+            "case {case:?}: expected {read} to report the poller's reading \
+             {NO_RECORDS_PROCESSED_STATE_REASON} for a pipe running over a stream whose \
+             records it has processed none of, got {reason:?}"
         ),
         Reason::Failure {
             source_arn,
@@ -482,8 +495,10 @@ fn described_reason<'reads>(reads: &'reads [(&str, String)], case: &str) -> &'re
 #[tokio::test]
 async fn every_modelled_query_returns_each_listed_pipes_own_reason() {
     let router = router();
-    // The endpoints are the forms this service's own filter table spans; the pipes rest in
-    // states their CALLER drove them into, so each reports the user-initiated reason.
+    // The endpoints are the forms this service's own filter table spans. Each pipe rests in a
+    // state its CALLER drove it into, so it reports the user-initiated reason — except the
+    // one running over a source read PER SHARD, which reports what its poller made of its
+    // last pass over a stream nothing has been put on.
     let fixture = [
         Wired {
             case: "listed-kafka-cycled",
@@ -561,6 +576,21 @@ async fn every_modelled_query_returns_each_listed_pipes_own_reason() {
         }
     }
 
+    // What each pipe of the fixture has to report, by the state it rests in and the source
+    // it reads: a pipe RUNNING over a Kinesis stream is read per shard, so its reason is its
+    // poller's reading rather than the move that put it there.
+    let expected_reason = |case: &str| -> Reason {
+        let pipe = fixture
+            .iter()
+            .find(|pipe| pipe.case == case)
+            .unwrap_or_else(|| panic!("case {case:?}: the listing returned no fixture pipe"));
+        if pipe.rests_in == RUNNING && pipe.source.starts_with("arn:aws:kinesis:") {
+            Reason::PollerIdle
+        } else {
+            Reason::UserInitiated
+        }
+    };
+
     // What a read of ONE pipe reports once every move has landed: the state it settled in
     // and the reason that state was reached by. The listings below are then asserted to
     // report the SAME reason for the same pipe.
@@ -579,7 +609,7 @@ async fn every_modelled_query_returns_each_listed_pipes_own_reason() {
             case,
             "DescribePipe",
             reported.member("StateReason").as_str(),
-            &Reason::UserInitiated,
+            &expected_reason(case),
         );
         described.push((case, reported.string("StateReason")));
     }
@@ -662,7 +692,7 @@ async fn every_modelled_query_returns_each_listed_pipes_own_reason() {
                 case,
                 &format!("the {listing:?} listing"),
                 reported,
-                &Reason::UserInitiated,
+                &expected_reason(case),
             );
             let one_pipe = described_reason(&described, case);
             assert_eq!(
@@ -686,7 +716,7 @@ async fn every_modelled_query_returns_each_listed_pipes_own_reason() {
         );
         for case in &every_pipe {
             let reported = reason_for(&walked, case);
-            assert_reason(case, &walk, reported, &Reason::UserInitiated);
+            assert_reason(case, &walk, reported, &expected_reason(case));
             let one_pipe = described_reason(&described, case);
             assert_eq!(
                 reported,

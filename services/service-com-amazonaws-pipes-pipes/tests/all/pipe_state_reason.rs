@@ -13,6 +13,10 @@
 //! moment the call lands and for as long as the pipe rests there, by every read that
 //! carries the member.
 //!
+//! Every pipe below reads an Amazon SQS QUEUE, which is not a source read per shard: a pipe
+//! over one that is reports its poller's reading instead, which is the table of
+//! `tests/all/pipe_kinesis_stream_source.rs`.
+//!
 //! The tables span the class that rule generalises over: which lifecycle call drove the
 //! state, which state it drove the pipe into, whether the move is still in flight or has
 //! settled, and the shape of the read (`DescribePipe`, an unpaged listing, a filtered one,

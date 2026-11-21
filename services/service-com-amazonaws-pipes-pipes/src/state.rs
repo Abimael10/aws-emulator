@@ -75,6 +75,17 @@ pub const TRANSIENT_PIPE_STATES: &[&str] = &[
     pipe_state::UPDATING,
 ];
 
+/// The `PipeState` values that mean "the move this pipe was making could not be completed"
+/// — the terminal states a failed move settles in, each named by the move that failed.
+///
+/// A pipe in one of these is not running and is not on its way to running, so nothing polls
+/// its source, and what it reports about itself is the sentence saying what stopped it.
+pub const FAILED_PIPE_STATES: &[&str] = &[
+    pipe_state::CREATE_FAILED,
+    pipe_state::START_FAILED,
+    pipe_state::UPDATE_FAILED,
+];
+
 /// The states a caller may ask a pipe to be in (`RequestedPipeState`), plus the
 /// `DELETED` that only a response reports (`RequestedPipeStateDescribeResponse`).
 /// Source: those two enums in `smithy-model/com-amazonaws-pipes-pipes.json`.
@@ -580,23 +591,15 @@ pub fn target_batch_size_cap(target: &str) -> Option<(&str, i32)> {
         .map(|(_, cap)| (vendor, *cap))
 }
 
-/// The `BatchSize` an Amazon SQS queue source polls with when its parameters name none, as
-/// a read of the pipe reports it.
+/// The `BatchSize` a pipe polls its source with when that source's parameters name none,
+/// as a read of the pipe reports it and as the poller in [`data_plane`] reads the source
+/// with.
 ///
-/// The model declares no `@default` on the member (only its `@range`), so this is the
-/// default EventBridge Pipes documents for an Amazon SQS source — ten records per batch,
-/// the same default the Amazon SQS event-source polling of a Lambda function has, and the
-/// same default the poller in [`data_plane`] reads a queue source with.
-pub const DEFAULT_SQS_BATCH_SIZE: i32 = 10;
-
-/// The `BatchSize` a stream source polls with when its parameters name none, as a read of
-/// the pipe reports it.
-///
-/// The model declares no `@default` here either, so this is the default EventBridge Pipes
-/// documents for a stream source — 100 records per batch, the same default the DynamoDB
-/// Streams event-source polling of a Lambda function has, and the same default the poller
-/// in [`data_plane`] reads a stream source with.
-pub const DEFAULT_STREAM_BATCH_SIZE: i32 = 100;
+/// Not one of the `BatchSize` members declares a `@default` (each declares only its
+/// `@range`), so the value in force where a configuration names none is the service's own,
+/// and it is ONE value whatever the source is: a queue source and a stream source both poll
+/// ten records per batch. A pipe that wants another number says so.
+pub const DEFAULT_BATCH_SIZE: i32 = 10;
 
 /// The batch size a pipe's source parameters configure, whichever source type they are
 /// for: every `PipeSource*Parameters` shape that can batch carries the same `BatchSize`
@@ -746,17 +749,22 @@ pub struct SourceTypeMember {
     /// name and the field that holds it are paired, so a rule about the member reads it
     /// off the table rather than naming the field again.
     pub carried: fn(&PipeSourceParameters) -> bool,
+    /// Whether a source of this type is read PER SHARD, which is the scope the model gives
+    /// `ParallelizationFactor` — "the number of batches to process concurrently from each
+    /// shard" — and which only the two stream parameter shapes carry. A pipe over such a
+    /// source reports what its poller made of its last pass as the reason it is running
+    /// ([`PipeRecord::reported_state_reason`]).
+    pub per_shard: bool,
     /// Report the `BatchSize` a source of this type POLLS WITH onto this member of a
     /// configuration a read is about to report, so a reader sees the value in force rather
     /// than nothing where the request named none ([`PipeRecord::reported_source_parameters`]).
     ///
     /// A no-op where the configuration already names one, and where this emulator polls no
     /// source of that type: there is no value in force to report then, so the stored
-    /// configuration is reported exactly as it was written. The two that do poll report the
-    /// default their poller uses ([`DEFAULT_SQS_BATCH_SIZE`],
-    /// [`DEFAULT_STREAM_BATCH_SIZE`]), and only the one member whose shape can be
-    /// synthesized (`omittable`) is added to a configuration that lacks it — the others
-    /// declare a `@required` member this has no value for.
+    /// configuration is reported exactly as it was written. Every type that IS polled
+    /// reports the default its poller uses ([`DEFAULT_BATCH_SIZE`]), and only the one member
+    /// whose shape can be synthesized (`omittable`) is added to a configuration that lacks
+    /// it — the others declare a `@required` member this has no value for.
     pub report_effective_batch_size: fn(&mut PipeSourceParameters),
 }
 
@@ -784,17 +792,23 @@ pub const SOURCE_TYPE_MEMBERS: &[SourceTypeMember] = &[
         member: "KinesisStreamParameters",
         source_type: "kinesis",
         omittable: false,
+        per_shard: true,
         carried: |parameters| parameters.kinesis_stream_parameters.is_some(),
-        report_effective_batch_size: |_| {},
+        report_effective_batch_size: |parameters| {
+            if let Some(stream) = parameters.kinesis_stream_parameters.as_mut() {
+                stream.batch_size.get_or_insert(DEFAULT_BATCH_SIZE);
+            }
+        },
     },
     SourceTypeMember {
         member: "DynamoDBStreamParameters",
         source_type: "dynamodb",
         omittable: false,
+        per_shard: true,
         carried: |parameters| parameters.dynamo_db_stream_parameters.is_some(),
         report_effective_batch_size: |parameters| {
             if let Some(stream) = parameters.dynamo_db_stream_parameters.as_mut() {
-                stream.batch_size.get_or_insert(DEFAULT_STREAM_BATCH_SIZE);
+                stream.batch_size.get_or_insert(DEFAULT_BATCH_SIZE);
             }
         },
     },
@@ -802,19 +816,21 @@ pub const SOURCE_TYPE_MEMBERS: &[SourceTypeMember] = &[
         member: "SqsQueueParameters",
         source_type: PIPES_SERVICE_SQS,
         omittable: true,
+        per_shard: false,
         carried: |parameters| parameters.sqs_queue_parameters.is_some(),
         report_effective_batch_size: |parameters| {
             parameters
                 .sqs_queue_parameters
                 .get_or_insert_with(Default::default)
                 .batch_size
-                .get_or_insert(DEFAULT_SQS_BATCH_SIZE);
+                .get_or_insert(DEFAULT_BATCH_SIZE);
         },
     },
     SourceTypeMember {
         member: "ActiveMQBrokerParameters",
         source_type: "mq",
         omittable: false,
+        per_shard: false,
         carried: |parameters| parameters.active_mq_broker_parameters.is_some(),
         report_effective_batch_size: |_| {},
     },
@@ -822,6 +838,7 @@ pub const SOURCE_TYPE_MEMBERS: &[SourceTypeMember] = &[
         member: "RabbitMQBrokerParameters",
         source_type: "mq",
         omittable: false,
+        per_shard: false,
         carried: |parameters| parameters.rabbit_mq_broker_parameters.is_some(),
         report_effective_batch_size: |_| {},
     },
@@ -829,6 +846,7 @@ pub const SOURCE_TYPE_MEMBERS: &[SourceTypeMember] = &[
         member: "ManagedStreamingKafkaParameters",
         source_type: "kafka",
         omittable: false,
+        per_shard: false,
         carried: |parameters| parameters.managed_streaming_kafka_parameters.is_some(),
         report_effective_batch_size: |_| {},
     },
@@ -836,6 +854,7 @@ pub const SOURCE_TYPE_MEMBERS: &[SourceTypeMember] = &[
         member: "SelfManagedKafkaParameters",
         source_type: SELF_MANAGED_KAFKA,
         omittable: false,
+        per_shard: false,
         carried: |parameters| parameters.self_managed_kafka_parameters.is_some(),
         report_effective_batch_size: |_| {},
     },
@@ -1044,8 +1063,31 @@ pub const STATE_SETTLE_DELAY: Duration = Duration::from_millis(500);
 ///
 /// Recorded behaviour: a pipe resting in the state its caller asked for reports this
 /// FIXED token. It says HOW the pipe reached its state, so it is neither read from the
-/// request nor minted per call.
+/// request nor minted per call. A pipe that has a READER of its source reports that reader's
+/// reading instead, which is what such a pipe says about itself
+/// ([`PipeRecord::reported_state_reason`]).
 pub const USER_INITIATED_STATE_REASON: &str = "USER_INITIATED";
+
+/// The `StateReason` a pipe whose source reader has processed no record of that source
+/// reports: that reader's reading of what it has processed, which is nothing.
+///
+/// Recorded behaviour, as a FIXED sentence with no variable part: it is what a pipe over a
+/// source read PER SHARD reports from its creation — such a pipe is created with a reader of
+/// that source — until a pass of its poller has processed records. A pipe created with no
+/// such reader reports the lifecycle reason throughout
+/// ([`PipeRecord::reported_state_reason`]).
+pub const NO_RECORDS_PROCESSED_STATE_REASON: &str = "No records processed";
+
+/// The same reader's reading once a pass HAS processed the records it polled: the result of
+/// that attempt.
+///
+/// NOT recorded for this service: what IS recorded is the reading above, the one a reader
+/// that has processed nothing reports. This is the word this emulator's other reader of the
+/// same kind uses for a pass that delivered its batch (the event-source-mapping surface of
+/// `services/service-com-amazonaws-lambda-awsgirapiservice`), and it is what the reading
+/// moves to when a pass of this pipe's poller has delivered its batch — so what a read of the
+/// pipe says follows what its reader did rather than standing at one sentence for ever.
+pub const RECORDS_PROCESSED_STATE_REASON: &str = "OK";
 
 /// A state move the clock owes a pipe: at `due_at` its `CurrentState` becomes `to`, and
 /// its `StateReason` becomes `reason` — why the pipe is in the state the move left it in.
@@ -1057,6 +1099,36 @@ pub struct PendingTransition {
     pub to: String,
     /// The `StateReason` the pipe carries once it has settled, if the move has one.
     pub reason: Option<String>,
+}
+
+impl PendingTransition {
+    /// Whether this move lands in a state a FAILED move settles in
+    /// ([`FAILED_PIPE_STATES`]): the lifecycle call that owes it was accepted but could not
+    /// be completed, so nothing it would have brought up is there.
+    pub fn lands_in_failure(&self) -> bool {
+        FAILED_PIPE_STATES.contains(&self.to.as_str())
+    }
+}
+
+/// The reading a pipe over `source` is created with, or `None` for a pipe that is created
+/// with no reader of its source.
+///
+/// A pipe whose source is read PER SHARD is created WITH a reader of that source — which is
+/// why the position such a source is read from is fixed at creation and no update shape can
+/// move it — and that reader has processed no record yet, which is what the pipe reports
+/// until a pass of its poller moves the reading on
+/// ([`PipeRecord::reported_state_reason`]).
+pub fn initial_processing_result(source: &str) -> Option<String> {
+    source_is_read_per_shard(source).then(|| NO_RECORDS_PROCESSED_STATE_REASON.to_string())
+}
+
+/// Whether a source of the type `source` names is read PER SHARD, per the one table that
+/// pairs a source type with its parameters ([`SourceTypeMember::per_shard`]).
+pub fn source_is_read_per_shard(source: &str) -> bool {
+    let source_type = source_type_of(source);
+    SOURCE_TYPE_MEMBERS
+        .iter()
+        .any(|entry| entry.source_type == source_type && entry.per_shard)
 }
 
 /// The move owed to the clock when a lifecycle call starts a transition into `to`.
@@ -1115,6 +1187,13 @@ pub struct PipeRecord {
     pub kms_key_identifier: Option<String>,
     /// The move the clock owes this pipe, if any. See [`STATE_SETTLE_DELAY`].
     pub pending: Option<PendingTransition>,
+    /// What the READER of this pipe's source has made of it, for a pipe that has one: the
+    /// reading a read of the pipe reports as the reason it is in the state it is in
+    /// ([`Self::reported_state_reason`]). A pipe over a source read per shard is created with
+    /// a reader that has processed nothing ([`initial_processing_result`]); the passes its
+    /// poller makes move the reading on, and a move that could not be completed leaves it
+    /// with no reader at all. Nothing a request carries reaches it.
+    pub processing_result: Option<String>,
 }
 
 impl PipeRecord {
@@ -1128,10 +1207,72 @@ impl PipeRecord {
         self.state_reason = Some(USER_INITIATED_STATE_REASON.to_string());
     }
 
+    /// Record what the READER of this pipe's source made of a pass over it, so a read of the
+    /// pipe reports that reading rather than the lifecycle reason that put the pipe in the
+    /// state it is in ([`Self::reported_state_reason`]).
+    ///
+    /// Only a pipe that HAS such a reader has a reading to move on: a pipe whose source is
+    /// not read per shard reports the reason its own last move carries whatever its poller
+    /// did with that source.
+    pub fn note_processing_result(&mut self, result: &str) {
+        if let Some(reading) = self.processing_result.as_mut() {
+            *reading = result.to_string();
+        }
+    }
+
+    /// Forget that reading: the pipe has no reader of its source any more, so it reports the
+    /// reason its own last move carries. What tears a reader down is a move that could not be
+    /// completed ([`Self::settle`]), which brought nothing up in the first place.
+    fn forget_processing_result(&mut self) {
+        self.processing_result = None;
+    }
+
+    /// Whether this pipe is mid-move towards `RUNNING`: in a transient state its caller asked
+    /// to end there. The one reading of that question, so the pass the poller decides and
+    /// what a read of the pipe reports cannot drift apart.
+    pub fn moves_towards_running(&self) -> bool {
+        matches!(
+            self.current_state.as_str(),
+            pipe_state::CREATING | pipe_state::STARTING | pipe_state::UPDATING
+        ) && self.desired_state == requested_state::RUNNING
+    }
+
+    /// The reason this pipe reports for being in the state it is in NOW.
+    ///
+    /// A pipe that HAS a reader of its source reports what that reader has made of it
+    /// ([`Self::processing_result`]): a pipe over a source read PER SHARD is created with
+    /// one — which is why the position such a source is read from is fixed at creation and no
+    /// update can move it — so from then on what the pipe says about itself is what has been
+    /// processed, and the passes its poller makes are what move that reading on. Every other
+    /// pipe reports the reason its own last move carries: one over a source that is not read
+    /// per shard, and one whose move could not be completed, which brought no reader up at
+    /// all.
+    ///
+    /// The reading is NOT conditioned on the pipe polling at this instant: recorded behaviour
+    /// reports it for a pipe that is not reading its source then — a pipe its caller asked
+    /// for a run state it is resting in, with nothing having come off the stream — and the
+    /// member states the result of the reader's LAST attempt, which a later move does not
+    /// undo.
+    ///
+    /// The ONE reading of the member, so `DescribePipe` and the summary `ListPipes` returns
+    /// cannot report one pipe's reason two ways.
+    pub fn reported_state_reason(&self) -> Option<String> {
+        self.processing_result
+            .clone()
+            .or_else(|| self.state_reason.clone())
+    }
+
     /// Put the pipe into `transient` now and owe it the move to `settled`.
+    ///
+    /// A move that brings the pipe UP stands its reader of its source back up where an
+    /// earlier failed move tore it down; a pipe that already has one keeps the reading it
+    /// has, because what that reader processed is not undone by a later move.
     pub fn begin_transition(&mut self, transient: &str, settled: &str) {
         self.current_state = transient.to_string();
         self.note_user_initiated();
+        if settled == pipe_state::RUNNING && self.processing_result.is_none() {
+            self.processing_result = initial_processing_result(&self.source);
+        }
         self.pending = Some(pending_transition(settled));
     }
 
@@ -1153,12 +1294,18 @@ impl PipeRecord {
     /// The `StateReason` is the settled move's own: a move that failed installs the
     /// sentence saying why, and one the caller drove installs
     /// [`USER_INITIATED_STATE_REASON`], because the reason describes how the pipe came to
-    /// be in the state it is in now and not how it came to be in an earlier one.
+    /// be in the state it is in now and not how it came to be in an earlier one. A move that
+    /// failed brought nothing up, so the pipe is left with no reader of its source either and
+    /// the sentence saying what stopped it is what it reports
+    /// ([`Self::reported_state_reason`]).
     pub fn settle(&mut self, now: Instant) {
         let settled = match &self.pending {
             Some(pending) if now >= pending.due_at => pending.clone(),
             _ => return,
         };
+        if settled.lands_in_failure() {
+            self.forget_processing_result();
+        }
         self.current_state = settled.to;
         self.state_reason = settled.reason;
         self.pending = None;
@@ -1201,7 +1348,7 @@ impl PipeRecord {
             arn: Some(self.arn.clone()),
             desired_state: Some(self.desired_state.clone()),
             current_state: Some(self.current_state.clone()),
-            state_reason: self.state_reason.clone(),
+            state_reason: self.reported_state_reason(),
             creation_time: Some(timestamp(self.creation_time)),
             last_modified_time: Some(timestamp(self.last_modified_time)),
             source: Some(self.source.clone()),

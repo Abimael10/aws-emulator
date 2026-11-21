@@ -214,7 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: pipe.description.clone(),
             desired_state: Some(pipe.desired_state.clone()),
             current_state: Some(pipe.current_state.clone()),
-            state_reason: pipe.state_reason.clone(),
+            // The reason the pipe is in its current state, as the ONE reading of it: for a
+            // pipe resting in RUNNING over a source read per shard that is its poller's own
+            // reading rather than the lifecycle move that put it there. See
+            // `crate::state::PipeRecord::reported_state_reason`.
+            state_reason: pipe.reported_state_reason(),
             source: Some(pipe.source.clone()),
             // The configuration containers a pipe read reports ARE the pipe's
             // configuration, not a record of which members its create request mentioned,
