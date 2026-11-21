@@ -193,19 +193,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the default version is one of the versions the document holds, so a number it
         // holds no version of names none to make the default and nothing moves. A number
         // too large to count a version is such a number.
+        //
+        // The refusal is the sentence Systems Manager words for a default-version switch
+        // that names no version this document holds: fixed text around the NAME and the
+        // VERSION the request carried ([`crate::state::document_version_not_found_message`]),
+        // and nothing read out of the store. The document's latest version number belongs
+        // to the different sentence a version READ (`GetDocument`) is refused with.
         let requested = input.document_version.as_str();
         let Some(selected) = requested
             .parse::<u64>()
             .ok()
             .and_then(|version| record.version(version))
         else {
-            let latest_version = record.latest_version();
             return Err(
                 UpdateDocumentDefaultVersionErrorModeled::InvalidDocumentVersion(
                     InvalidDocumentVersion {
-                        message: Some(format!(
-                            "Document version: {requested} is invalid, latest version is \
-                             {latest_version}"
+                        message: Some(crate::state::document_version_not_found_message(
+                            &input.name,
+                            requested,
                         )),
                     },
                 )

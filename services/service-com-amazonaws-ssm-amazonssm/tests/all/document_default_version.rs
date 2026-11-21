@@ -399,53 +399,156 @@ async fn the_default_version_is_the_one_the_last_call_named() {
     }
 }
 
+/// How a default-version switch states that the document holds no version of the number
+/// the request named: fixed text — `Document with name `, ` with version `,
+/// ` does not exist.` — around the NAME and the VERSION the request carried, with nothing
+/// of the store interpolated.
+fn switch_version_not_found(name: &str, document_version: &str) -> String {
+    format!("Document with name {name} with version {document_version} does not exist.")
+}
+
+/// How a version READ states the same miss: a DIFFERENT sentence, which names the number
+/// asked for and the document's own latest version instead of the document's name.
+fn read_version_not_found(document_version: &str, latest_version: usize) -> String {
+    format!("Document version: {document_version} is invalid, latest version is {latest_version}")
+}
+
+/// `GetDocument` for one version selector, asserting it was refused, and returning
+/// `(status, body)`.
+async fn get_refused(
+    router: &MultiServiceRouter,
+    name: &str,
+    document_version: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "GetDocument",
+        &json!({ "Name": name, "DocumentVersion": document_version }),
+    )
+    .await
+}
+
+/// One refusal row: a document holding `held` versions whose default is `default_version`,
+/// and a version number it holds none of.
+struct Refused<'a> {
+    case: &'a str,
+    name: &'a str,
+    /// How many versions the document holds when the refused switch is made.
+    held: usize,
+    /// The version that is the document's default when the refused switch is made.
+    default_version: usize,
+    /// A version number the document holds none of.
+    requested: &'a str,
+}
+
 /// A number the document holds no version of names none to make the default: the call is
-/// refused with `InvalidDocumentVersion` and the default stays where it was.
+/// refused with `InvalidDocumentVersion`, its message is fixed text around the name and the
+/// version the REQUEST carried, and the default stays where it was.
+///
+/// The rows differ along everything the sentence must not depend on — the document's name,
+/// how many versions it holds, which of them is its default, and how far past them the
+/// requested number is — and each row also reads the same number back through
+/// `GetDocument`, whose refusal keeps its own, distinct sentence.
 #[tokio::test]
 async fn a_version_the_document_has_not_got_is_refused() {
     let router = router();
-    let name = "RefusedVersionDocument";
-    create_ok(
-        &router,
-        "the first version",
-        &json!({ "Name": name, "Content": command_json("one") }),
-    )
-    .await;
-    update_ok(
-        &router,
-        "the second version",
-        &json!({ "Name": name, "Content": command_json("two") }),
-    )
-    .await;
-    switch_ok(&router, "the default in force", name, "2").await;
+    let rows = [
+        Refused {
+            case: "the version one past the latest, on a document defaulting to its latest",
+            name: "RefusedVersionDocument",
+            held: 2,
+            default_version: 2,
+            requested: "3",
+        },
+        Refused {
+            case: "a version far past the latest",
+            name: "RefusedFarVersionDocument",
+            held: 2,
+            default_version: 2,
+            requested: "97",
+        },
+        Refused {
+            case: "a number no version could count",
+            name: "Refused.Huge_Version-Document",
+            held: 1,
+            default_version: 1,
+            requested: "99999999999999999999999999",
+        },
+        Refused {
+            case: "a five-version document whose default is a middle version",
+            name: "RefusedMiddleDefaultDocument",
+            held: 5,
+            default_version: 3,
+            requested: "6",
+        },
+        Refused {
+            case: "the version after a single-version document's only one",
+            name: "Ref",
+            held: 1,
+            default_version: 1,
+            requested: "2",
+        },
+    ];
 
-    // Each row is a number this document holds no version of: one past the latest, far
-    // past it, and one too large to count any version at all.
-    for (case, requested) in [
-        ("the version one past the latest", "3"),
-        ("a version far past the latest", "97"),
-        (
-            "a number no version could count",
-            "99999999999999999999999999",
-        ),
-    ] {
+    for row in rows {
+        let case = row.case;
+        let name = row.name;
+        let requested = row.requested;
+        create_ok(
+            &router,
+            case,
+            &json!({ "Name": name, "Content": command_json("one") }),
+        )
+        .await;
+        for revision in 1..row.held {
+            update_ok(
+                &router,
+                case,
+                &json!({ "Name": name, "Content": command_json(&format!("revision {revision}")) }),
+            )
+            .await;
+        }
+        if row.default_version != 1 {
+            switch_ok(&router, case, name, &row.default_version.to_string()).await;
+        }
+
         let (status, response) = switch(&router, name, requested).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
             (400, "InvalidDocumentVersion"),
             "case {case}: {requested} names no version, got {status} {response}"
         );
-        // The refusal names what was asked for and the version the document holds, around
-        // text that is otherwise fixed.
+        // The refusal names the document the switch was asked of and the version it was
+        // asked for, around text that is otherwise fixed.
         assert_eq!(
             error_message(&response),
-            format!("Document version: {requested} is invalid, latest version is 2"),
-            "case {case}: got {response}"
+            switch_version_not_found(name, requested),
+            "case {case}: expected {}, got {response}",
+            switch_version_not_found(name, requested)
         );
+        // A version READ of the same number is refused with its own sentence, so the two
+        // refusals stay tellable apart by their message. A read's `DocumentVersion` is
+        // stated at eight characters at most, so a longer number is refused at the
+        // boundary and never reaches that handler: the cross-check runs on the rows the
+        // read admits.
+        if requested.len() <= 8 {
+            let (read_status, read) = get_refused(&router, name, requested).await;
+            assert_eq!(
+                (read_status, error_code(&read).as_str()),
+                (400, "InvalidDocumentVersion"),
+                "case {case}: a read of {requested} is refused too, got {read_status} {read}"
+            );
+            assert_eq!(
+                error_message(&read),
+                read_version_not_found(requested, row.held),
+                "case {case}: expected {}, got {read}",
+                read_version_not_found(requested, row.held)
+            );
+        }
         let described = describe_ok(&router, case, name, None).await;
         assert_eq!(
             described["DefaultVersion"],
-            json!("2"),
+            json!(row.default_version.to_string()),
             "case {case}: a refused call moves no default, got {described}"
         );
     }

@@ -1855,6 +1855,19 @@ pub fn document_not_found_message(name: &str) -> String {
     format!("Document with name {name} does not exist.")
 }
 
+/// How this service states that the document a call named holds no version of the number
+/// the call asked for, when the refusal names BOTH the document and that number.
+///
+/// `InvalidDocumentVersion` is "the document version isn't valid or doesn't exist" (its
+/// own documentation), and the sentence is fixed text around the two values the request
+/// carried: `Document with name <name> with version <version> does not exist.`. Both
+/// variable parts are echoed from the request and nothing is read out of the store for it
+/// — the document's own latest version number belongs to the sentence a version READ is
+/// refused with, not to this one.
+pub fn document_version_not_found_message(name: &str, document_version: &str) -> String {
+    format!("Document with name {name} with version {document_version} does not exist.")
+}
+
 /// How this service states that the name a `CreateDocument` asked for is already held.
 ///
 /// `DocumentAlreadyExists` is "the specified document already exists" (its own
