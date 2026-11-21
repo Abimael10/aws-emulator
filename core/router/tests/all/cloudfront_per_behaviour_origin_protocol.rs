@@ -27,6 +27,12 @@
 //! ORDERED one matched, which origin the matched behaviour names, and which protocol policy
 //! that origin carries — every combination of the two, over paths the stage itself serves,
 //! so a leg that is not served is the origin connection failing and nothing else.
+//!
+//! WHICH behaviour a viewer path matches is the other half of the same rule, and the forms
+//! `CacheBehavior$PathPattern` is written in are spanned by
+//! [`super::cloudfront_apigateway_behavior_origin_protocol`] beside this suite, which reads
+//! them through this one's harness: its origins, its distribution builder and its reader of an
+//! answer, raised to the crate below for that reason.
 
 use std::collections::HashMap;
 
@@ -46,21 +52,21 @@ const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
 /// The id of the origin the distribution addresses over TLS, and of the one it addresses
 /// over plaintext. Both name the SAME stage, so the only thing that differs between the two
 /// legs is the protocol policy the matched behaviour's origin carries.
-const SECURE_ORIGIN: &str = "stage-over-tls";
-const PLAINTEXT_ORIGIN: &str = "stage-over-plaintext";
+pub(crate) const SECURE_ORIGIN: &str = "stage-over-tls";
+pub(crate) const PLAINTEXT_ORIGIN: &str = "stage-over-plaintext";
 
 /// The resource paths the stage serves, each answering a document that names the path it was
 /// served for.
-const PROBE: &str = "probe";
-const UNDER_BROKEN: &str = "broken/probe";
-const UNDER_MIRROR: &str = "mirror/probe";
+pub(crate) const PROBE: &str = "probe";
+pub(crate) const UNDER_BROKEN: &str = "broken/probe";
+pub(crate) const UNDER_MIRROR: &str = "mirror/probe";
 
 /// The member of the stage's document that names which resource answered.
 const LABEL: &str = "label";
 
 /// What the viewer has to be answered for one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Expected {
+pub(crate) enum Expected {
     /// The origin's own answer, carrying the document the named resource serves.
     Served(&'static str),
     /// No origin response exists, which CloudFront relays as a bad gateway or a gateway
@@ -124,7 +130,7 @@ const ROWS: &[Row] = &[
 /// Every resource is created before the deployment, so the one stage serves all of them: a
 /// path a row's origin fetch cannot reach is therefore a path the stage itself would have
 /// served.
-async fn deployed_api_serving(
+pub(crate) async fn deployed_api_serving(
     router: &smithy_server_runtime::MultiServiceRouter,
     paths: &[&str],
 ) -> String {
@@ -243,7 +249,7 @@ fn origin(id: &str, api: &str, policy: &str) -> String {
 /// default behaviour naming `default_origin` and one ordered behaviour per
 /// `(PathPattern, TargetOriginId)` row of `behaviors`. Answers the distribution's
 /// `(id, DomainName)`.
-async fn create_distribution(
+pub(crate) async fn create_distribution(
     router: &smithy_server_runtime::MultiServiceRouter,
     case: &str,
     caller_reference: &str,
@@ -312,6 +318,65 @@ fn label(answer: &Answer) -> String {
         .to_string()
 }
 
+/// Dial one viewer path of the distribution published at `domain` and read the answer against
+/// what `expected` says. One reader, because every row of this suite and of
+/// [`super::cloudfront_apigateway_behavior_origin_protocol`] asks the same question of an
+/// answer.
+pub(crate) async fn check_leg(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    domain: &str,
+    path: &str,
+    expected: Expected,
+) {
+    let answer = view(router, "https", domain, path, &[]).await;
+    match expected {
+        Expected::Served(served) => {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the stage's answer through the edge, got {} with {:?}",
+                answer.status,
+                answer.text()
+            );
+            assert_eq!(
+                label(&answer),
+                served,
+                "case {case:?}: expected the document {served:?} serves, got {:?}",
+                answer.text()
+            );
+            assert_eq!(
+                answer.header("x-cache"),
+                "Miss from cloudfront",
+                "case {case:?}: expected the answer to be reported as the origin's, got \
+                 X-Cache {:?}",
+                answer.header("x-cache")
+            );
+        }
+        Expected::OriginUnreachable => {
+            assert!(
+                matches!(answer.status, 502 | 504),
+                "case {case:?}: expected a bad gateway or a gateway timeout for an origin \
+                 connection CloudFront cannot complete, got {} with {:?}",
+                answer.status,
+                answer.text()
+            );
+            assert!(
+                label(&answer).is_empty() && !answer.text().contains(LABEL),
+                "case {case:?}: an origin CloudFront could not reach must leak none of the \
+                 stage's document, got {:?}",
+                answer.text()
+            );
+            assert_eq!(
+                answer.header("x-cache"),
+                "Error from cloudfront",
+                "case {case:?}: expected the answer to be reported as CloudFront's own, got \
+                 X-Cache {:?}",
+                answer.header("x-cache")
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_matched_behaviour_names_the_origin_whose_protocol_policy_governs_the_fetch() {
     let router = emulator();
@@ -355,52 +420,6 @@ async fn the_matched_behaviour_names_the_origin_whose_protocol_policy_governs_th
         } else {
             &plaintext_default
         };
-        let answer = view(&router, "https", domain, row.path, &[]).await;
-        match row.expected {
-            Expected::Served(path) => {
-                assert_eq!(
-                    answer.status, 200,
-                    "case {case:?}: expected the stage's answer through the edge, got {} with \
-                     {:?}",
-                    answer.status,
-                    answer.text()
-                );
-                assert_eq!(
-                    label(&answer),
-                    path,
-                    "case {case:?}: expected the document {path:?} serves, got {:?}",
-                    answer.text()
-                );
-                assert_eq!(
-                    answer.header("x-cache"),
-                    "Miss from cloudfront",
-                    "case {case:?}: expected the answer to be reported as the origin's, got \
-                     X-Cache {:?}",
-                    answer.header("x-cache")
-                );
-            }
-            Expected::OriginUnreachable => {
-                assert!(
-                    matches!(answer.status, 502 | 504),
-                    "case {case:?}: expected a bad gateway or a gateway timeout for an origin \
-                     connection CloudFront cannot complete, got {} with {:?}",
-                    answer.status,
-                    answer.text()
-                );
-                assert!(
-                    label(&answer).is_empty() && !answer.text().contains(LABEL),
-                    "case {case:?}: an origin CloudFront could not reach must leak none of the \
-                     stage's document, got {:?}",
-                    answer.text()
-                );
-                assert_eq!(
-                    answer.header("x-cache"),
-                    "Error from cloudfront",
-                    "case {case:?}: expected the answer to be reported as CloudFront's own, got \
-                     X-Cache {:?}",
-                    answer.header("x-cache")
-                );
-            }
-        }
+        check_leg(&router, case, domain, row.path, row.expected).await;
     }
 }
