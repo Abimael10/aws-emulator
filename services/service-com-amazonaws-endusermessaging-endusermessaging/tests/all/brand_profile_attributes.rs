@@ -403,14 +403,14 @@ fn batches() -> Vec<(&'static str, Vec<Attribute>)> {
     vec![
         (
             "one TEXT attribute with a value",
-            vec![Attribute::text("Company Name", Some("Example Corp"))],
+            vec![Attribute::text("Trading Name", Some("Example Corp"))],
         ),
         (
             "TEXT attributes with and without every optional member",
             vec![
-                Attribute::text("Contact Email", Some("ops@example.test"))
+                Attribute::text("Escalation Email", Some("ops@example.test"))
                     .described("Where to reach us", "BUSINESS_CONTACT"),
-                Attribute::text("Address Line 2", Some("")),
+                Attribute::text("Delivery Instructions", Some("")),
                 Attribute::text("Legal Name", None),
             ],
         ),
@@ -995,7 +995,7 @@ async fn deleting_the_profile_takes_its_attributes_with_it() {
         .create_attributes(
             &profile,
             batch(&[
-                Attribute::text("Company Name", Some("Example Corp")),
+                Attribute::text("Trading Name", Some("Example Corp")),
                 Attribute::media("Logo", "IMAGE", Some(PNG)),
             ]),
         )
@@ -1070,7 +1070,7 @@ async fn deleting_an_attribute_removes_it_and_the_media_it_held() {
     let cases: Vec<(&str, Attribute)> = vec![
         (
             "a TEXT attribute with a value",
-            Attribute::text("Company Name", Some("Example Corp")),
+            Attribute::text("Trading Name", Some("Example Corp")),
         ),
         (
             "a TEXT attribute with no value",
@@ -1078,7 +1078,7 @@ async fn deleting_an_attribute_removes_it_and_the_media_it_held() {
         ),
         (
             "a TEXT attribute carrying every optional member",
-            Attribute::text("Contact Email", Some("ops@example.test"))
+            Attribute::text("Escalation Email", Some("ops@example.test"))
                 .described("Where to reach us", "BUSINESS_CONTACT"),
         ),
         (
@@ -1541,19 +1541,19 @@ async fn an_update_is_what_every_later_read_reports() {
         },
         Update {
             case: "an inline value written over the one the create stored",
-            created: Attribute::text("Company Name", Some("Old Corp")),
+            created: Attribute::text("Trading Name", Some("Old Corp")),
             change: json!({ "attributeValue": "New Corp" }),
             expected: vec![("attributeValue", json!("New Corp"))],
         },
         Update {
             case: "an empty inline value, at the modelled length floor",
-            created: Attribute::text("Address Line 2", Some("Suite 7")),
+            created: Attribute::text("Delivery Instructions", Some("Suite 7")),
             change: json!({ "attributeValue": "" }),
             expected: vec![("attributeValue", json!(""))],
         },
         Update {
             case: "every updatable member of a TEXT attribute at once",
-            created: Attribute::text("Contact Email", Some("ops@example.test")),
+            created: Attribute::text("Escalation Email", Some("ops@example.test")),
             change: json!({
                 "attributeValue": "support@example.test",
                 "description": "Where to reach us",

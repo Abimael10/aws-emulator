@@ -31,7 +31,16 @@
 //!   re-created under the same name is reported again with the value the request
 //!   supplied;
 //! * `maxResults` outside its modelled range is refused, and paging the list — by
-//!   any page size, to exhaustion — changes nothing a later caller sees.
+//!   any page size, to exhaustion — changes nothing a later caller sees;
+//! * every slot of the template is addressable by its own name the moment the
+//!   profile exists — readable, and updatable through
+//!   `UpdateBrandProfileAttribute`, whose answer and every later read report one
+//!   stored record carrying the slot's seeded type;
+//! * an `attributeName` differing from a seeded one only in case names no attribute:
+//!   both readers and the update refuse it with `ResourceNotFoundException` and the
+//!   refused update writes nothing;
+//! * every slot's `attributeType` and `category` are reported by the list as well as
+//!   by the single-attribute read, and a create naming a seeded slot conflicts.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -41,7 +50,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_endusermessaging_endusermessaging::state::{
-    BRAND_PROFILE_RESOURCE_TYPE, DEFAULT_BRAND_PROFILE_ATTRIBUTES,
+    carries_media, BRAND_PROFILE_RESOURCE_TYPE, DEFAULT_BRAND_PROFILE_ATTRIBUTES,
 };
 use service_com_amazonaws_endusermessaging_endusermessaging::EmulatedService;
 
@@ -171,6 +180,21 @@ impl Emulator {
     async fn delete(&self, id_or_arn: &str) -> Reply {
         self.call("DELETE", &format!("/v1/brand-profiles/{id_or_arn}"), None)
             .await
+    }
+
+    /// `UpdateBrandProfileAttribute` on one attribute of one profile: `PUT` of the
+    /// members to apply, at the very URI the read addresses the attribute by.
+    async fn update_attribute(&self, id_or_arn: &str, name: &str, body: Value) -> Reply {
+        self.call(
+            "PUT",
+            &format!(
+                "/v1/brand-profiles/{}/attributes/{}",
+                path_label(id_or_arn),
+                attribute_segment(name)
+            ),
+            Some(body),
+        )
+        .await
     }
 
     async fn list_attributes(&self, id_or_arn: &str, query: &str) -> Reply {
@@ -599,6 +623,34 @@ async fn a_token_this_service_never_issued_is_refused() {
     }
 }
 
+/// The description and category every update row below writes, so what was written
+/// is distinguishable from what the template seeded.
+const WRITTEN_DESCRIPTION: &str = "written by the test";
+
+/// A supported `category` no slot of the template is seeded with, so a row that
+/// writes it proves the write landed. One of the values the service supports
+/// (`SUPPORTED_ATTRIBUTE_CATEGORIES`).
+const WRITTEN_CATEGORY: &str = "OTHER";
+
+/// The message this service refuses an `attributeName` it holds no attribute under
+/// with. `BrandProfileAttributeName` is `@sensitive`, so the name is reported in the
+/// `resourceId` member rather than in the message.
+const ATTRIBUTE_NOT_FOUND_MESSAGE: &str =
+    "Resource not found - ResourceType=\"brand-profile-attribute\"";
+
+/// `name` with the case of every letter flipped.
+fn swapped_case(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn the_attribute_list_refuses_a_max_results_outside_the_modelled_range() {
     let em = Emulator::new();
@@ -865,6 +917,322 @@ async fn a_listed_attribute_can_be_deleted_and_recreated_with_a_value() {
             "case {case}: the stored type is the one supplied, got {:?}",
             read.body
         );
+    }
+}
+
+/// The spellings of `name` that differ from it ONLY in case: all upper, all lower,
+/// and every letter flipped. A name carrying no letter at all has none.
+fn case_variants(name: &str) -> Vec<String> {
+    let mut variants = vec![
+        name.to_ascii_uppercase(),
+        name.to_ascii_lowercase(),
+        swapped_case(name),
+    ];
+    variants.retain(|variant| variant != name);
+    variants.sort();
+    variants.dedup();
+    variants
+}
+
+#[tokio::test]
+async fn every_seeded_default_attribute_is_addressable_by_its_name() {
+    let em = Emulator::new();
+    let created = em.create_named("default-template-addressing").await;
+    let id = created.string("brandProfileId");
+
+    // The rows are every slot of the service's default template, which differ in the
+    // form of the name (single word and several words), in `attributeType` and in
+    // `category`: each one is addressable by its own name the moment the profile
+    // exists.
+    for slot in DEFAULT_BRAND_PROFILE_ATTRIBUTES {
+        let case = format!("attributeName={:?}", slot.name);
+
+        let read = em.get_attribute(&id, slot.name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: a seeded default attribute is readable by its name, got {} / {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.string("attributeName"),
+            slot.name,
+            "case {case}: the read reports the name it was addressed by, got {:?}",
+            read.body
+        );
+        assert_eq!(
+            read.string("attributeType"),
+            slot.attribute_type,
+            "case {case}: the read reports the template's type, got {:?}",
+            read.body
+        );
+        assert_eq!(
+            read.string("category"),
+            slot.category,
+            "case {case}: the read reports the template's category, got {:?}",
+            read.body
+        );
+        assert!(
+            read.member("attributeValue").is_null(),
+            "case {case}: a seeded slot holds no value until one is written, got {:?}",
+            read.body
+        );
+
+        // Only the members this slot's type takes are written: a media type takes its
+        // content through `attachmentBody` rather than `attributeValue`, which the
+        // service decides by the same reading the handlers use
+        // (`state::carries_media`). Every slot the template holds today is `TEXT`, so
+        // this keeps the rows driven by the template rather than by that fact.
+        let written_value = (!carries_media(slot.attribute_type))
+            .then(|| format!("{} of the test brand", slot.name));
+        let mut change = json!({
+            "description": WRITTEN_DESCRIPTION,
+            "category": WRITTEN_CATEGORY,
+        });
+        if let Some(ref value) = written_value {
+            change["attributeValue"] = json!(value);
+        }
+        let updated = em.update_attribute(&id, slot.name, change).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case}: a seeded default attribute is updatable by its name, got {} / {:?}",
+            updated.status, updated.body
+        );
+        assert_eq!(
+            updated.string("attributeName"),
+            slot.name,
+            "case {case}: the update reports the name it was addressed by, got {:?}",
+            updated.body
+        );
+        assert_eq!(
+            updated.string("attributeType"),
+            slot.attribute_type,
+            "case {case}: an update never changes the slot's type, got {:?}",
+            updated.body
+        );
+        assert_eq!(
+            updated.string("description"),
+            WRITTEN_DESCRIPTION,
+            "case {case}: the update reports the description it wrote, got {:?}",
+            updated.body
+        );
+        assert_eq!(
+            updated.string("category"),
+            WRITTEN_CATEGORY,
+            "case {case}: the update reports the category it wrote, got {:?}",
+            updated.body
+        );
+        assert_eq!(
+            updated.member("attributeValue").as_str().map(str::to_string),
+            written_value,
+            "case {case}: the update reports the value it wrote, got {:?}",
+            updated.body
+        );
+        assert_eq!(
+            updated.member("createdAt"),
+            created.member("createdAt"),
+            "case {case}: an update keeps the instant the create seeded the slot at, got {:?}",
+            updated.body
+        );
+        assert!(
+            updated.number("updatedAt") >= updated.number("createdAt"),
+            "case {case}: updatedAt is never before createdAt, got {:?}",
+            updated.body
+        );
+
+        // Round trip: the update's own answer and the reader report one stored record.
+        let reread = em.get_attribute(&id, slot.name).await;
+        assert_eq!(
+            reread.status, 200,
+            "case {case}: the updated attribute is still readable, got {} / {:?}",
+            reread.status, reread.body
+        );
+        for member in [
+            "attributeName",
+            "attributeType",
+            "attributeValue",
+            "description",
+            "category",
+            "createdAt",
+            "updatedAt",
+        ] {
+            assert_eq!(
+                reread.member(member),
+                updated.member(member),
+                "case {case}: the read must report the update's {member}, got {:?} vs {:?}",
+                reread.body,
+                updated.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_attribute_name_differing_only_in_case_names_no_attribute() {
+    let em = Emulator::new();
+    let created = em.create_named("case-sensitive-names").await;
+    let id = created.string("brandProfileId");
+
+    for slot in DEFAULT_BRAND_PROFILE_ATTRIBUTES {
+        let stored = em.get_attribute(&id, slot.name).await;
+        assert_eq!(
+            stored.status, 200,
+            "the seeded {:?} must be readable by its own name, got {} / {:?}",
+            slot.name, stored.status, stored.body
+        );
+
+        for variant in case_variants(slot.name) {
+            let case = format!("attributeName={variant:?}, seeded as {:?}", slot.name);
+            let read = em.get_attribute(&id, &variant).await;
+            let updated = em
+                .update_attribute(
+                    &id,
+                    &variant,
+                    json!({ "attributeValue": "written through the wrong case" }),
+                )
+                .await;
+            for (operation, refused) in [("read", read), ("update", updated)] {
+                assert_eq!(
+                    refused.status, 404,
+                    "case {case}: the {operation} of a differently cased name finds nothing, \
+                     got {} / {:?}",
+                    refused.status, refused.body
+                );
+                assert_eq!(
+                    refused.error.as_deref(),
+                    Some("ResourceNotFoundException"),
+                    "case {case}: unexpected error code on the {operation}, got {:?}",
+                    refused.error
+                );
+                assert_eq!(
+                    refused.string("message"),
+                    ATTRIBUTE_NOT_FOUND_MESSAGE,
+                    "case {case}: unexpected message on the {operation}, got {:?}",
+                    refused.body
+                );
+                assert_eq!(
+                    refused.string("resourceId"),
+                    variant,
+                    "case {case}: the refusal states the name it was asked for on the \
+                     {operation}, got {:?}",
+                    refused.body
+                );
+            }
+
+            // A refused update writes nothing: the attribute the request did not name
+            // is exactly as it was.
+            let after = em.get_attribute(&id, slot.name).await;
+            assert_eq!(
+                after.body, stored.body,
+                "case {case}: a refused update leaves the stored attribute alone, got {:?}",
+                after.body
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_list_projects_every_slot_with_its_type_and_category() {
+    let em = Emulator::new();
+    let created = em.create_named("template-projection").await;
+    let id = created.string("brandProfileId");
+
+    let listed = em.all_attributes("template", &id, None).await;
+    // The count the create reported is checked against what the reader actually
+    // pages, not against the template constant, so it cannot agree with the handler
+    // by construction.
+    assert_eq!(
+        created.number("attributesCreated"),
+        listed.len() as f64,
+        "attributesCreated reports the number of default attributes the create seeded, \
+         and the list pages exactly those, got {:?} vs {listed:?}",
+        created.body
+    );
+    assert_eq!(
+        listed.len(),
+        DEFAULT_BRAND_PROFILE_ATTRIBUTES.len(),
+        "the list pages the whole template, got {listed:?}"
+    );
+    for slot in DEFAULT_BRAND_PROFILE_ATTRIBUTES {
+        let case = format!("attributeName={:?}", slot.name);
+        let summary = listed
+            .iter()
+            .find(|item| item["attributeName"] == json!(slot.name))
+            .unwrap_or_else(|| panic!("case {case}: the list reports no such slot, got {listed:?}"));
+        assert_eq!(
+            summary["attributeType"],
+            json!(slot.attribute_type),
+            "case {case}: the summary reports the template's type, got {summary:?}"
+        );
+        assert_eq!(
+            summary["category"],
+            json!(slot.category),
+            "case {case}: the summary reports the template's category, got {summary:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn creating_an_attribute_under_a_seeded_name_conflicts() {
+    let em = Emulator::new();
+    let created = em.create_named("seeded-names-are-taken").await;
+    let id = created.string("brandProfileId");
+
+    // `attributeName` "is unique within a brand profile", and a seeded slot already
+    // holds its name, so asking to create one is asking for a state the profile
+    // cannot be in. The rows are every slot of the template, each asked for both on
+    // its own and beside an entry that would otherwise be created — the batch is
+    // atomic, so neither lands.
+    for slot in DEFAULT_BRAND_PROFILE_ATTRIBUTES {
+        let seeded = em.get_attribute(&id, slot.name).await;
+        assert_eq!(
+            seeded.status, 200,
+            "the seeded {:?} must be readable by its own name, got {} / {:?}",
+            slot.name, seeded.status, seeded.body
+        );
+        let entry = json!({
+            "attributeName": slot.name,
+            "attributeType": slot.attribute_type,
+        });
+        let alone = vec![entry.clone()];
+        let beside_a_new_one = vec![
+            json!({ "attributeName": "Loyalty Program", "attributeType": "TEXT" }),
+            entry,
+        ];
+        for (shape, batch) in [("alone", alone), ("beside a new entry", beside_a_new_one)] {
+            let case = format!("attributeName={:?} {shape}", slot.name);
+            let refused = em.create_attributes(&id, batch).await;
+            assert_eq!(
+                refused.status, 409,
+                "case {case}: a seeded name is already taken, got {} / {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error.as_deref(),
+                Some("ConflictException"),
+                "case {case}: unexpected error code, got {:?}",
+                refused.error
+            );
+            assert_eq!(
+                refused.string("resourceId"),
+                slot.name,
+                "case {case}: the refusal states the name it was asked for, got {:?}",
+                refused.body
+            );
+            // Nothing of the batch landed: the seeded slot is as it was, and the entry
+            // that would have been created does not exist.
+            assert_eq!(
+                em.get_attribute(&id, slot.name).await.body,
+                seeded.body,
+                "case {case}: the refused create leaves the seeded slot alone"
+            );
+            let other = em.get_attribute(&id, "Loyalty Program").await;
+            assert_eq!(
+                other.status, 404,
+                "case {case}: the batch is atomic, so its other entry was not created, \
+                 got {} / {:?}",
+                other.status, other.body
+            );
+        }
     }
 }
 

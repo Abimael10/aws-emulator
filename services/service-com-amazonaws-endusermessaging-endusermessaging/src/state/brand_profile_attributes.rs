@@ -259,44 +259,85 @@ pub fn attribute_media_ceiling_exceeded() -> String {
     )
 }
 
-/// One slot of the default attribute template: the attribute's name and the type
-/// of value it takes.
+/// One slot of the default attribute template: the attribute's name, the type of
+/// value it takes and the category it is grouped under.
 #[derive(Debug, Clone, Copy)]
 pub struct DefaultBrandProfileAttribute {
     /// The seeded `attributeName`, within `BrandProfileAttributeName`'s
-    /// `@length(1..256)` and `^[A-Za-z0-9_ -]*[A-Za-z0-9_-][A-Za-z0-9_ -]*$` pattern.
+    /// `@length(1..256)` and `^[A-Za-z0-9_ -]*[A-Za-z0-9_-][A-Za-z0-9_ -]*$` pattern
+    /// — which admits the interior spaces these names carry.
     pub name: &'static str,
     /// The seeded `attributeType`, one of
     /// [`crate::ops::types::BRAND_PROFILE_ATTRIBUTE_TYPE_VALUES`].
     pub attribute_type: &'static str,
+    /// The seeded `category`, one of [`SUPPORTED_ATTRIBUTE_CATEGORIES`]: a default
+    /// attribute is classified by the service that seeded it, so every reader of one
+    /// reports the member rather than leaving it unset.
+    pub category: &'static str,
 }
 
 /// The default attribute template seeded into every brand profile this service
-/// creates.
+/// creates: the service's own default attribute names, with the type each one takes
+/// and the category it is grouped under.
 ///
-/// One slot per kind of brand identity information `CreateBrandProfile` documents a
-/// profile as holding — company information, addresses, compliance documents and
-/// logos — typed as that documentation types them: an inline `TEXT` value for the
-/// company details, and uploaded media for the document and the logo
-/// (`BrandProfileAttributeType` documents `IMAGE`/`DOCUMENT` as the uploaded-media
-/// types). Each slot is created empty: the template is the set of names a profile
-/// starts with, and a value arrives with the request that sets one.
+/// `CreateBrandProfile`'s `attributesCreated` is "The number of default attributes
+/// that were created for the brand profile", so the names here are the service's,
+/// not a profile's: a caller addresses a default attribute by its service name right
+/// after the create (`GetBrandProfileAttribute`, `UpdateBrandProfileAttribute` and
+/// `DeleteBrandProfileAttribute` all key on `attributeName`, and nothing else
+/// addresses one). The model does not enumerate the template, so each slot below is
+/// a default attribute the service's own `ListBrandProfileAttributes` answer reports
+/// for a freshly created profile — its name, its `attributeType` and its `category`
+/// as that answer gives them — kept in the order `attributeName` sorts in, which is
+/// the order the list reports and the order a `BTreeMap` keyed by name pages.
+///
+/// Each slot is created empty: the template is the set of names, types and
+/// categories a profile starts with, and a value arrives with the request that sets
+/// one.
+///
+/// PARTIAL: only the slots below are evidenced, and the service's own template holds
+/// more of them, so a profile created here carries fewer default attributes than the
+/// service seeds — which is what `attributesCreated` and the attribute list then
+/// report, because both are computed from this template rather than from a count of
+/// their own. Completing it is tracked by
+/// `issues/.../endusermessaging-createbrandprofile-attributescreated-undercounts-the-service-default-attribute.md`;
+/// a slot is added here only with the name, type and category the service's own
+/// answer gives it, never invented to reach a count.
 pub const DEFAULT_BRAND_PROFILE_ATTRIBUTES: &[DefaultBrandProfileAttribute] = &[
     DefaultBrandProfileAttribute {
-        name: "CompanyName",
+        name: "Address Line 2",
         attribute_type: "TEXT",
+        category: "BUSINESS_ADDRESS",
     },
     DefaultBrandProfileAttribute {
-        name: "CompanyAddress",
+        name: "Business Type",
         attribute_type: "TEXT",
+        category: "BUSINESS_IDENTITY",
     },
     DefaultBrandProfileAttribute {
-        name: "ComplianceDocument",
-        attribute_type: "DOCUMENT",
+        name: "Business Vertical",
+        attribute_type: "TEXT",
+        category: "BUSINESS_IDENTITY",
     },
     DefaultBrandProfileAttribute {
-        name: "BrandLogo",
-        attribute_type: "IMAGE",
+        name: "City",
+        attribute_type: "TEXT",
+        category: "BUSINESS_ADDRESS",
+    },
+    DefaultBrandProfileAttribute {
+        name: "Company Address",
+        attribute_type: "TEXT",
+        category: "BUSINESS_ADDRESS",
+    },
+    DefaultBrandProfileAttribute {
+        name: "Company Name",
+        attribute_type: "TEXT",
+        category: "BUSINESS_IDENTITY",
+    },
+    DefaultBrandProfileAttribute {
+        name: "Contact Email",
+        attribute_type: "TEXT",
+        category: "BUSINESS_CONTACT",
     },
 ];
 
@@ -316,7 +357,7 @@ pub fn default_brand_profile_attributes(
                     attribute_type: slot.attribute_type.to_string(),
                     value: None,
                     description: None,
-                    category: None,
+                    category: Some(slot.category.to_string()),
                     media: None,
                     client_token: None,
                     created_at,
