@@ -674,12 +674,18 @@ fn opened_pass<Eng: Send + Sync + 'static>(
 
 /// Steps 3 and 4 of a pass: fold what its checks observed into the registrations they were
 /// about, and append the datapoints the due series are published as.
+///
+/// Before either, the pass settles what the HOSTS behind this store's `instance` registrations
+/// owe it: a registration whose instance Amazon EC2 reports terminating is one the load
+/// balancer gives up ([`super::host_lifecycle`]), so it is not counted, checked or forwarded to
+/// any longer. That write is the clock's, which is why it is made here and on no read path.
 fn closed_pass<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<ElbState>,
     observations: &[(String, TargetKey, Option<Observed>)],
     opened: &OpenPass,
 ) {
+    super::host_lifecycle::settle_gone_hosts(engine, state, opened.now);
     let published = {
         let mut store = state.lock();
         fold_observations(&mut store, observations, opened.now);

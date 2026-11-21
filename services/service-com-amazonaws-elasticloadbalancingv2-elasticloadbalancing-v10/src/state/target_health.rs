@@ -163,7 +163,7 @@ const MAX_HEALTH_CHECK_TIMEOUT_SECONDS: i32 = 120;
 ///
 /// The addition is CHECKED: a span the clock cannot represent an end for is due at once,
 /// so no arithmetic on a caller-configured duration can end a request in a panic.
-fn due_at(now: SystemTime, span: Duration) -> SystemTime {
+pub(super) fn due_at(now: SystemTime, span: Duration) -> SystemTime {
     now.checked_add(span).unwrap_or(now)
 }
 

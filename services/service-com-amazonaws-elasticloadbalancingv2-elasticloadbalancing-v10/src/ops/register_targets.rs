@@ -455,17 +455,38 @@ async fn resolve_targets(
                 crate::state::network::InstanceTargets::Resolved(instances) => {
                     // "... is not in the same VPC as the target group": compared only
                     // where both VPCs are known, because a value neither side reports
-                    // cannot disagree.
+                    // cannot disagree. EVERY target of the request the group's VPC does not
+                    // hold is named, in the order the request named them — the refusal is
+                    // worded about the targets the caller has to correct and about the one
+                    // network the group is in, and about where each target does live it says
+                    // nothing ([`crate::state::targets_not_in_target_group_vpc_message`]).
                     if let Some(vpc_id) = vpc_id {
-                        if let Some((id, elsewhere)) = instances.iter().find_map(|(id, vpc)| {
-                            vpc.as_deref()
-                                .filter(|holding| *holding != vpc_id)
-                                .map(|holding| (id, holding))
-                        }) {
-                            return Err(invalid_target(format!(
-                                "The target '{id}' is in VPC {elsewhere}, not in VPC \
-                                 {vpc_id} of the target group"
-                            )));
+                        // What EC2 reported for each id, indexed once, so the walk of the
+                        // request below costs a lookup per target rather than a scan.
+                        let held: std::collections::BTreeMap<&str, Option<&str>> = instances
+                            .iter()
+                            .map(|(id, vpc)| (id.as_str(), vpc.as_deref()))
+                            .collect();
+                        let mut elsewhere: Vec<&str> = Vec::new();
+                        for target in targets {
+                            let id = target.id.as_str();
+                            let outside = held
+                                .get(id)
+                                .copied()
+                                .flatten()
+                                .is_some_and(|holding| holding != vpc_id);
+                            // One target named twice is one target the group's VPC does not
+                            // hold, so the refusal names it once.
+                            if outside && !elsewhere.contains(&id) {
+                                elsewhere.push(id);
+                            }
+                        }
+                        if !elsewhere.is_empty() {
+                            return Err(invalid_target(
+                                crate::state::targets_not_in_target_group_vpc_message(
+                                    vpc_id, elsewhere,
+                                ),
+                            ));
                         }
                     }
                     unresolved()

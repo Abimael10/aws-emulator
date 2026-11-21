@@ -169,6 +169,27 @@ pub fn invalid_instance_targets_message<'a>(ids: impl IntoIterator<Item = &'a st
     )
 }
 
+/// The message a registration of targets that live OUTSIDE the target group's own VPC is
+/// refused with: the VPC the group names, and the targets of the request that are not in it,
+/// each quoted, in the order the request named them.
+///
+/// Elastic Load Balancing words this refusal about the TARGETS the caller has to correct and
+/// about the ONE network the group is in — the group's own `VpcId`, read from the store — and
+/// states nothing about where each target does live: the VPC a target of another network sits
+/// in is not part of the verdict, which is that the group's VPC does not hold it. The sibling
+/// of [`invalid_instance_targets_message`], and worded the same way: the offending ids as a
+/// list, however many of them one request carries.
+pub fn targets_not_in_target_group_vpc_message<'a>(
+    vpc_id: &str,
+    ids: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let quoted: Vec<String> = ids.into_iter().map(|id| format!("'{id}'")).collect();
+    format!(
+        "The following targets are not in the target group VPC '{vpc_id}': {}",
+        quoted.join(", ")
+    )
+}
+
 /// Which resource of this service a caller-supplied ARN member names.
 ///
 /// One variant per kind whose ARN a caller hands this API as the resource an operation
