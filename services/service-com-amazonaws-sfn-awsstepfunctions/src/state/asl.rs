@@ -1924,6 +1924,18 @@ const SINGLE_STATE_NAME: &str = "TheStateUnderTest";
 /// the name and the JSON pointer the enclosing machine was declared under, neither of
 /// which the request carries ([`about_the_single_state`]).
 pub fn validate_single_state(definition: &str) -> Result<(), String> {
+    validate_single_state_with(definition, BTreeSet::new())
+}
+
+/// [`validate_single_state`] with `given` already in scope for the state under test:
+/// `TestState`'s `variables` are "variables set up as part of the test", which the
+/// state reads exactly as a state of a definition reads what a state before it
+/// assigned, so a read of one is resolved rather than reported as a variable the
+/// definition defines nowhere.
+pub fn validate_single_state_with(
+    definition: &str,
+    given: BTreeSet<String>,
+) -> Result<(), String> {
     let Ok(state) = serde_json::from_str::<Value>(definition) else {
         // A definition that is not JSON at all is refused in the same words whichever
         // form it was sent in, by the walk that words every other definition refusal.
@@ -1966,6 +1978,7 @@ pub fn validate_single_state(definition: &str) -> Result<(), String> {
     // position the walk judges it at, so what is reported about it follows the request
     // rather than the parse's sorting of the names.
     let mut found = Diagnosis::until_first_error()
+        .with_variables(given)
         .ordered_by(MemberOrder::within(&inside_the_single_state(), definition));
     diagnose_machine(
         &machine,

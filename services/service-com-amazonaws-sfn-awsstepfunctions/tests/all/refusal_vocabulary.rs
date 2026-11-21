@@ -48,7 +48,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
     missing_version_qualifier_message, pattern_violation_message, resource_not_found_message,
     routing_weight_sum_message, ALIAS_NAME_PATTERN, RESOURCE_DOES_NOT_EXIST,
-    UPDATE_NAMES_NO_MEMBER,
+    UPDATE_ENCRYPTION_NEEDS_DEFINITION, UPDATE_NAMES_NO_MEMBER,
 };
 
 use crate::error_messages::{failure, MODEL};
@@ -939,9 +939,11 @@ async fn test_state_names_where_the_input_stopped_and_withholds_the_input() {
 /// one naming none of them is the modelled `MissingRequiredParameter` stating the
 /// alternatives.
 ///
-/// The rows differ along WHICH member the update names — each of the five on its own
-/// — and the refused rows along what a request that changes nothing carries beside
-/// the ARN.
+/// The rows differ along WHICH member the update names — each of the four the refusal
+/// names as the alternatives, on its own — and the refused rows along what a request
+/// that names none of them carries beside the ARN: nothing, a member that is not a
+/// change to the state machine (`publish`), and the one member this call STORES that is
+/// not one of the alternatives (`encryptionConfiguration`).
 #[tokio::test]
 async fn an_update_naming_one_member_it_can_change_is_served() {
     let emulator = Emulator::new();
@@ -971,8 +973,12 @@ async fn an_update_naming_one_member_it_can_change_is_served() {
             json!({ "tracingConfiguration": { "enabled": true } }),
         ),
         (
-            "the encryption configuration",
+            // The encryption configuration is stored by this call too, but it is not
+            // one of the alternatives the rule admits, so the row names it beside one
+            // that is.
+            "the encryption configuration beside the definition",
             json!({
+                "definition": OTHER_DEFINITION,
                 "encryptionConfiguration": {
                     "type": "CUSTOMER_MANAGED_KMS_KEY",
                     "kmsKeyId": key,
@@ -1028,6 +1034,46 @@ async fn an_update_naming_one_member_it_can_change_is_served() {
             message,
             "Either the definition, the role ARN, the LoggingConfiguration, or the \
              TracingConfiguration must be specified",
+            "case {case:?}: unexpected construction of the refusal"
+        );
+    }
+
+    // And the one member this call stores that it may not take ALONE: the key an
+    // encryption configuration names is what seals the definition, so a request moving
+    // the encryption without naming the definition is the same modelled error stating
+    // that condition instead.
+    for (case, body) in [
+        (
+            "an encryption configuration alone",
+            json!({
+                "stateMachineArn": &machine,
+                "encryptionConfiguration": { "type": "AWS_OWNED_KEY" },
+            }),
+        ),
+        (
+            "an encryption configuration beside a member that is not the definition",
+            json!({
+                "stateMachineArn": &machine,
+                "roleArn": format!("{ROLE_ARN}-again"),
+                "encryptionConfiguration": { "type": "AWS_OWNED_KEY" },
+            }),
+        ),
+    ] {
+        let (status, code, message) = failure(&emulator, case, "UpdateStateMachine", &body).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "MissingRequiredParameter"),
+            "case {case:?}: expected 400 MissingRequiredParameter, got {status} {code} with \
+             message {message:?}"
+        );
+        assert_eq!(
+            message, UPDATE_ENCRYPTION_NEEDS_DEFINITION,
+            "case {case:?}: expected the message {UPDATE_ENCRYPTION_NEEDS_DEFINITION:?}, got \
+             {message:?}"
+        );
+        assert_eq!(
+            message,
+            "The definition must be specified when updating the EncryptionConfiguration",
             "case {case:?}: unexpected construction of the refusal"
         );
     }

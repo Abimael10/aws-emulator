@@ -699,14 +699,25 @@ async fn a_variable_no_run_certainly_assigned_is_reported_per_field() {
             vec![("/States/Ran/Output", "m")],
         ),
         (
-            "a JSONPath reference field reading a variable nothing assigns",
+            // The JSONata form of the read, over a variable only ONE path to the
+            // reading state assigns: the expression EVALUATES to nothing on the other
+            // path, which is the warning. A field the language RESOLVES a path at is an
+            // ERROR instead — `definition_static_rules` is the rule for that.
+            "a JSONata expression reading a variable only one branch assigns",
             json!({
-                "StartAt": "A",
+                "QueryLanguage": "JSONata",
+                "StartAt": "C",
                 "States": {
-                    "A": { "Type": "Pass", "Parameters": { "x.$": "$alpha" }, "End": true },
+                    "C": {
+                        "Type": "Choice",
+                        "Choices": [{ "Condition": "{% $states.input.go %}", "Next": "S" }],
+                        "Default": "J",
+                    },
+                    "S": { "Type": "Pass", "Assign": { "alpha": 1 }, "Next": "J" },
+                    "J": { "Type": "Pass", "Output": "{% $alpha %}", "End": true },
                 },
             }),
-            vec![("/States/A/Parameters/x.$", "alpha")],
+            vec![("/States/J/Output", "alpha")],
         ),
         (
             "a JSONPath reference field reading a variable a preceding state assigns",

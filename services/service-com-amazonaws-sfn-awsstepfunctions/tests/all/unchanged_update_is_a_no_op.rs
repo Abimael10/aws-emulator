@@ -69,8 +69,14 @@ async fn an_update_that_asks_for_nothing_new_moves_nothing() {
             json!({ "tracingConfiguration": { "enabled": false } }),
         ),
         (
+            // An update that names only an `encryptionConfiguration` names none of the
+            // members this call requires at least one of (`refusal_vocabulary` is that
+            // rule), so the row names it beside the definition the record already has.
             "the encryption configuration it is effectively on",
-            json!({ "encryptionConfiguration": { "type": "AWS_OWNED_KEY" } }),
+            json!({
+                "definition": HELLO_DEFINITION,
+                "encryptionConfiguration": { "type": "AWS_OWNED_KEY" },
+            }),
         ),
         (
             "every one of them at once",

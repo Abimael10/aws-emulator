@@ -82,12 +82,21 @@ pub const NO_PATH: &str = "NO_PATH";
 /// — a WARNING: a `Pass` state's `Result` is its literal result.
 pub const PASS_RESULT_IS_STATIC: &str = "PASS_RESULT_IS_STATIC";
 
-/// `POSSIBLY_UNDEFINED_VARIABLE`: a field reads a variable that some run of the
-/// definition can reach that field without having assigned — a WARNING, because the
-/// read resolves to nothing rather than preventing the definition from being created.
-/// The model's list of codes is not closed ("might add new diagnostics in the
-/// future"), so a code it does not list is still a code the service reports.
+/// `POSSIBLY_UNDEFINED_VARIABLE`: a JSONata expression reads a variable that some run
+/// of the definition can reach that expression without having assigned — a WARNING,
+/// because the expression EVALUATES to nothing rather than preventing the definition
+/// from being created. It is told from [`UNDEFINED_VARIABLE`], which is the same read
+/// at a field the language RESOLVES a path at. The model's list of codes is not closed
+/// ("might add new diagnostics in the future"), so a code it does not list is still a
+/// code the service reports.
 pub const POSSIBLY_UNDEFINED_VARIABLE: &str = "POSSIBLY_UNDEFINED_VARIABLE";
+
+/// `UNDEFINED_VARIABLE`: a field the language RESOLVES a path at names a variable the
+/// scope reaching that field may not hold — an ERROR, because the reference is resolved
+/// rather than evaluated, so there is nothing for the language to resolve it against.
+/// The model's list of codes is not closed, so a code it does not list is still a code
+/// the service reports.
+pub const UNDEFINED_VARIABLE: &str = "UNDEFINED_VARIABLE";
 
 /// The most diagnostics `ValidateStateMachineDefinition` reports in one call, which
 /// is also what it reports when the request asks for none in particular
@@ -364,6 +373,158 @@ pub fn field_not_supported_message(field: &str) -> String {
     format!("Field '{}' is not supported", echoed(field))
 }
 
+/// [`field_not_supported_message`], followed by the field the definition probably
+/// MEANT where the one it wrote is a near miss of a field `declared` names.
+///
+/// A field the language does not declare is most often a misspelling of one it does,
+/// and the service says which: a caller is told the field it meant rather than only
+/// that the one it wrote is unknown. The opening is the RECORDED sentence
+/// ([`field_not_supported_message`]); the suggestion after it is this service's own
+/// wording for the hint the issue records it giving — no recording of that half is at
+/// hand, so a later reader can tell it from the sentence before it. The suggestion is
+/// the field's own name, read off the closed set the object is judged against, so every
+/// position with such a set — a state machine object, a state, a retrier, a catcher, a
+/// `Choice` rule, a `Map`'s own objects — suggests out of its OWN fields and no list of
+/// names is written for it.
+pub fn unsupported_field_message(field: &str, declared: &[&str]) -> String {
+    match near_miss(field, declared) {
+        Some(meant) => format!("{}. Did you mean '{meant}'?", field_not_supported_message(field)),
+        None => field_not_supported_message(field),
+    }
+}
+
+/// The field of `declared` that `field` is a NEAR MISS of, or `None` when it is a near
+/// miss of none of them.
+///
+/// A near miss is a name ONE edit away from a declared field — a character changed,
+/// one added, one dropped or two adjacent ones swapped — or one that differs from it in
+/// CASE alone, which are the ways a field name is mistyped. The first such field of the
+/// set is suggested; the sets are written in the order the language's schema states
+/// them, so a name that is one edit from two of them suggests the earlier.
+///
+/// Each comparison is refused before it is made for a name whose LENGTH is more than
+/// one away from the declared field's ([`differs_by_one_edit`]), so the work of judging
+/// one caller-chosen key is bounded by the declared names rather than by the key: no
+/// definition can ask for a comparison of its own size.
+fn near_miss<'a>(field: &str, declared: &[&'a str]) -> Option<&'a str> {
+    declared
+        .iter()
+        .copied()
+        .find(|known| differs_by_one_edit(field, known))
+}
+
+/// Whether `written` is ONE edit away from `declared`, or differs from it only in case.
+///
+/// Four edits, which are the ways one name is mistyped: a character substituted, one
+/// inserted, one dropped, and two adjacent ones transposed. A name EQUAL to the
+/// declared field is no misspelling of it, so it is not one.
+fn differs_by_one_edit(written: &str, declared: &str) -> bool {
+    if written == declared {
+        return false;
+    }
+    if written.eq_ignore_ascii_case(declared) {
+        return true;
+    }
+    // A name whose length is more than one from the declared field's cannot be one
+    // edit from it, which is also what keeps the walk below bounded by the DECLARED
+    // name rather than by the caller's key.
+    let written: Vec<char> = written.chars().take(MAX_ECHOED_CHARS + 1).collect();
+    let declared: Vec<char> = declared.chars().collect();
+    if written.len().abs_diff(declared.len()) > 1 {
+        return false;
+    }
+    let Some(first) = (0..written.len().min(declared.len()))
+        .find(|index| written[*index] != declared[*index])
+    else {
+        // One is a prefix of the other, and their lengths differ by one: the longer
+        // carries one character the shorter does not.
+        return true;
+    };
+    match written.len().cmp(&declared.len()) {
+        // The same length: the character at the mismatch was substituted, or it and
+        // the one after it were swapped.
+        ::std::cmp::Ordering::Equal => {
+            written[first + 1..] == declared[first + 1..]
+                || (written.get(first + 1) == declared.get(first)
+                    && written.get(first) == declared.get(first + 1)
+                    && written[first + 2..] == declared[first + 2..])
+        }
+        // One character longer: it carries one the declared field does not.
+        ::std::cmp::Ordering::Greater => written[first + 1..] == declared[first..],
+        // One character shorter: it is missing one the declared field carries.
+        ::std::cmp::Ordering::Less => written[first..] == declared[first + 1..],
+    }
+}
+
+/// The fields the Amazon States Language declares on ONE rule of a `Choice` state's
+/// `Choices` array, in the order its schema states them.
+///
+/// The UNION of what the two query languages declare for a rule, exactly as a state's
+/// own set is ([`state_fields`]): a JSONPath rule names the value it tests (`Variable`)
+/// and ONE comparator, a JSONata rule carries a `Condition`, and either may nest rules
+/// under `And`, `Or` and `Not`, say where the execution goes (`Next`), assign variables
+/// and build its own output. The comparators are the language's own catalogue — the
+/// three string, numeric, boolean and timestamp families, each with the `*Path` form
+/// that READS its operand from the state's input, the `StringMatches` glob, and the
+/// presence and type tests — from the Amazon States Language's "Choice Rules"; the set
+/// is CLOSED, so a name outside it is reported as the unsupported field it is
+/// ([`unsupported_field_message`], which suggests the comparator a misspelling of one
+/// of them was meant to be).
+const CHOICE_RULE_FIELDS: &[&str] = &[
+    "And",
+    "Assign",
+    "BooleanEquals",
+    "BooleanEqualsPath",
+    "Comment",
+    "Condition",
+    "IsBoolean",
+    "IsNull",
+    "IsNumeric",
+    "IsPresent",
+    "IsString",
+    "IsTimestamp",
+    "Next",
+    "Not",
+    "NumericEquals",
+    "NumericEqualsPath",
+    "NumericGreaterThan",
+    "NumericGreaterThanEquals",
+    "NumericGreaterThanEqualsPath",
+    "NumericGreaterThanPath",
+    "NumericLessThan",
+    "NumericLessThanEquals",
+    "NumericLessThanEqualsPath",
+    "NumericLessThanPath",
+    "Or",
+    "Output",
+    "StringEquals",
+    "StringEqualsPath",
+    "StringGreaterThan",
+    "StringGreaterThanEquals",
+    "StringGreaterThanEqualsPath",
+    "StringGreaterThanPath",
+    "StringLessThan",
+    "StringLessThanEquals",
+    "StringLessThanEqualsPath",
+    "StringLessThanPath",
+    "StringMatches",
+    "TimestampEquals",
+    "TimestampEqualsPath",
+    "TimestampGreaterThan",
+    "TimestampGreaterThanEquals",
+    "TimestampGreaterThanEqualsPath",
+    "TimestampGreaterThanPath",
+    "TimestampLessThan",
+    "TimestampLessThanEquals",
+    "TimestampLessThanEqualsPath",
+    "TimestampLessThanPath",
+    "Variable",
+];
+
+/// The members of a `Choice` rule that carry RULES of their own, and so are walked as
+/// rules rather than read as a comparator's operand.
+const NESTED_RULE_MEMBERS: &[&str] = &["And", "Not", "Or"];
+
 /// The fields the Amazon States Language declares on a state of each type, in the
 /// order its schema states them.
 ///
@@ -611,6 +772,10 @@ pub fn state_name_too_long_message(name: &str) -> String {
 /// any type owes.
 pub const STATE_TYPE_MEMBER: &str = "Type";
 
+/// The member a `Task` state names its work with: "a Task state must set the Resource
+/// field to the ARN of the activity or task".
+pub const RESOURCE_MEMBER: &str = "Resource";
+
 /// What a schema diagnostic says about a state whose `Type` is not one of the state
 /// types the Amazon States Language defines: the member, and the values it admits.
 ///
@@ -732,6 +897,154 @@ pub fn minimum_value_message(minimum: &str) -> String {
     format!("Minimum value is {minimum}")
 }
 
+/// What a schema diagnostic says about a figure the definition wrote ABOVE the largest
+/// value the language documents for it.
+///
+/// The mirror of [`minimum_value_message`], worded like it and in the same place: a
+/// bound is a bound whichever end of the range it is, so the two sentences differ only
+/// in the end they name.
+pub fn maximum_value_message(maximum: &str) -> String {
+    format!("Maximum value is {maximum}")
+}
+
+/// One figure the Amazon States Language BOUNDS: the member it is written at, and the
+/// ends of the range the language documents for it, each paired with that end as the
+/// language writes it (which is what the diagnostic about it states).
+///
+/// A value outside either end is a schema error of the object that carries it,
+/// reported at the figure itself ([`diagnose_figures`]): the definition declares work
+/// the service cannot do — a wait of a negative length, a retry interval that goes
+/// backwards, a concurrency below none at all — so it is refused where it is submitted
+/// rather than failing every execution of the state machine it would have created.
+struct Bounded {
+    member: &'static str,
+    minimum: Option<(f64, &'static str)>,
+    maximum: Option<(f64, &'static str)>,
+}
+
+/// A figure bounded BELOW only, which is how the language documents most of them.
+const fn at_least(member: &'static str, minimum: f64, stated: &'static str) -> Bounded {
+    Bounded {
+        member,
+        minimum: Some((minimum, stated)),
+        maximum: None,
+    }
+}
+
+/// The figures a `Wait` state declares.
+///
+/// "Seconds: A time, in seconds, to wait before beginning the state specified in the
+/// Next field" — a duration, so it is not negative, and a wait of none is a wait the
+/// language admits.
+const WAIT_FIGURES: &[Bounded] = &[at_least("Seconds", 0.0, "0")];
+
+/// The figures a `Task` state declares.
+///
+/// "TimeoutSeconds: If the task runs longer than the specified seconds, this state
+/// fails" and "HeartbeatSeconds: If more time than the specified seconds elapses
+/// between heartbeats from the task, this state fails" — each a number of SECONDS, so
+/// neither is negative.
+const TASK_FIGURES: &[Bounded] = &[
+    at_least("TimeoutSeconds", 0.0, "0"),
+    at_least("HeartbeatSeconds", 0.0, "0"),
+];
+
+/// The figures a `Map` state declares.
+///
+/// "MaxConcurrency: [...] Its default value is 0, which places no limit on
+/// concurrency", so none is admitted and less than none is not;
+/// "ToleratedFailureCount: [...] the number of failed items" is a count, and
+/// "ToleratedFailurePercentage: [...] the percentage of failed items" is a percentage,
+/// which is bounded at both ends.
+const MAP_FIGURES: &[Bounded] = &[
+    at_least("MaxConcurrency", 0.0, "0"),
+    at_least("ToleratedFailureCount", 0.0, "0"),
+    Bounded {
+        member: "ToleratedFailurePercentage",
+        minimum: Some((0.0, "0")),
+        maximum: Some((100.0, "100")),
+    },
+];
+
+/// The figures a state machine OBJECT declares: "TimeoutSeconds: the maximum number of
+/// seconds an execution of the state machine can run", a number of seconds for the same
+/// reason a `Task`'s own bounds are.
+const MACHINE_FIGURES: &[Bounded] = &[at_least("TimeoutSeconds", 0.0, "0")];
+
+/// The figures one `Retry` retrier declares.
+///
+/// From the language's error-handling rules: "IntervalSeconds [...] represents the
+/// number of seconds before the first retry attempt" and "MaxDelaySeconds [...] the
+/// maximum amount of time [...] to wait between retry attempts" are each a number of
+/// SECONDS; "MaxAttempts [...] the maximum number of retry attempts (default 3). A
+/// value of 0 means the error [...] is never retried" is a count, so none is admitted;
+/// and "BackoffRate [...] The value must be greater than or equal to 1.0", a rate below
+/// which would SHRINK the interval it is documented to grow — the one figure here whose
+/// own bound the language states as something other than "not negative".
+const RETRIER_FIGURES: &[Bounded] = &[
+    at_least("IntervalSeconds", 0.0, "0"),
+    at_least("MaxAttempts", 0.0, "0"),
+    at_least("MaxDelaySeconds", 0.0, "0"),
+    at_least(BACKOFF_RATE_MEMBER, MIN_BACKOFF_RATE, MIN_BACKOFF_RATE_STATED),
+];
+
+/// Which figures an object of this kind of state declares, for the one checker below:
+/// a type the language does not define declares none, exactly as it declares no fields.
+fn bounded_figures(state_type: &str) -> &'static [Bounded] {
+    match state_type {
+        "Wait" => WAIT_FIGURES,
+        "Task" => TASK_FIGURES,
+        "Map" => MAP_FIGURES,
+        _ => &[],
+    }
+}
+
+/// The bound rules of ONE object of the definition: each figure it writes that the
+/// language bounds and the object wrote outside that bound, reported at the figure
+/// itself.
+///
+/// A figure is judged only where the object DECLARES it (`declared`, the object's own
+/// closed field set): a member the object cannot carry is reported as the unsupported
+/// field it is rather than twice, and a member whose value is not a number at all
+/// carries no figure to bound. Both ends are judged, so one figure can state only the
+/// end it broke.
+fn diagnose_figures(
+    object: &Map<String, Value>,
+    figures: &[Bounded],
+    declared: &[&str],
+    here: &str,
+    into: &mut Diagnosis,
+) {
+    for figure in figures {
+        if !declared.contains(&figure.member) {
+            continue;
+        }
+        let Some(written) = object.get(figure.member).and_then(Value::as_f64) else {
+            continue;
+        };
+        let at_figure = at(&nested_at(here, format_args!("/{}", figure.member)), "");
+        if let Some((minimum, stated)) = figure.minimum {
+            if written < minimum {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at_figure.clone(),
+                    minimum_value_message(stated),
+                ));
+                continue;
+            }
+        }
+        if let Some((maximum, stated)) = figure.maximum {
+            if written > maximum {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at_figure,
+                    maximum_value_message(stated),
+                ));
+            }
+        }
+    }
+}
+
 /// The member a retrier grows its interval by on each attempt.
 const BACKOFF_RATE_MEMBER: &str = "BackoffRate";
 
@@ -797,6 +1110,66 @@ const EXCLUSIVE_FIELD_GROUPS: &[&[&str]] = &[
 /// naming the same work — which is why the one the diagnostic names is the first.
 const PROCESSOR_FIELDS_OF_A_MAP: &[&str] = &["ItemProcessor", "Iterator"];
 
+/// The fields the Amazon States Language declares on each object a `Map` state carries
+/// BESIDE its processor, in the order its schema states them, paired with the member
+/// that carries it.
+///
+/// Each set is CLOSED like every other object's here, and the source is the language's
+/// own "Map state" schema: a `ProcessorConfig` says how the processor runs (`Mode`, and
+/// the `ExecutionType` a distributed one runs its children as); an `ItemReader` names
+/// the dataset the items are read from (`Resource`, the `ReaderConfig` describing the
+/// dataset's own format, and the payload the read is made with under either query
+/// language); an `ItemBatcher` says how the items are grouped (`MaxItemsPerBatch`,
+/// `MaxInputBytesPerBatch`, each with the `*Path` that reads it, and the `BatchInput`
+/// every batch carries); and a `ResultWriter` names where the results are written
+/// (`Resource`, its payload, and the `WriterConfig` describing the output).
+///
+/// A field outside the set of the object it is written in is reported as the
+/// unsupported field it is ([`unsupported_field_message`], which suggests the field a
+/// misspelling of one of these was meant to be), exactly as a state's own is.
+const MAP_OBJECT_FIELDS: &[(&str, &[&str])] = &[
+    ("ProcessorConfig", &["ExecutionType", "Mode"]),
+    (
+        "ItemReader",
+        &["Arguments", "Parameters", "ReaderConfig", "Resource"],
+    ),
+    (
+        "ReaderConfig",
+        &[
+            "CSVDelimiter",
+            "CSVHeaderLocation",
+            "CSVHeaders",
+            "InputType",
+            "MaxItems",
+            "MaxItemsPath",
+        ],
+    ),
+    (
+        "ItemBatcher",
+        &[
+            "BatchInput",
+            "MaxInputBytesPerBatch",
+            "MaxInputBytesPerBatchPath",
+            "MaxItemsPerBatch",
+            "MaxItemsPerBatchPath",
+        ],
+    ),
+    (
+        "ResultWriter",
+        &["Arguments", "Parameters", "Resource", "WriterConfig"],
+    ),
+    ("WriterConfig", &["OutputType", "Transformation"]),
+];
+
+/// The fields the language declares on the object `member` carries, or `None` for a
+/// member whose value is not such an object ([`MAP_OBJECT_FIELDS`]).
+fn declared_object_fields(member: &str) -> Option<&'static [&'static str]> {
+    MAP_OBJECT_FIELDS
+        .iter()
+        .find(|(name, _)| *name == member)
+        .map(|(_, fields)| *fields)
+}
+
 /// What a schema diagnostic says about an entry of an `ErrorEquals` that is not an
 /// error NAME.
 pub const ERROR_NAME_MESSAGE: &str = "'ErrorEquals' must name errors as strings";
@@ -808,12 +1181,38 @@ pub const ERROR_NAME_MESSAGE: &str = "'ErrorEquals' must name errors as strings"
 /// at.
 pub const MISSING_END_STATE_MESSAGE: &str = "Workflow has no terminal state";
 
-/// What a diagnostic says about a variable a field reads and nothing reaching that
-/// field assigns: the variable, quoted.
+/// What a diagnostic says about a variable a JSONata expression reads and the scope
+/// reaching it may not hold: the variable, quoted.
 ///
 /// RECORDED text. The name is the caller's own, so it is clipped by [`echoed`].
 pub fn possibly_undefined_variable_message(name: &str) -> String {
     format!("Variable '{}' is possibly not defined.", echoed(name))
+}
+
+/// What a diagnostic says about a variable a field the language RESOLVES a path at
+/// names and the scope reaching that field may not hold: the REFERENCE as the field
+/// wrote it (`$name`, which is how the JSONPath half of the language spells a variable
+/// read), quoted, and that it is not defined.
+///
+/// RECORDED text, and the counterpart of [`possibly_undefined_variable_message`]: that
+/// one is about a read a run may or may not resolve, and this one about a path there is
+/// nothing to resolve against.
+pub fn undefined_variable_message(name: &str) -> String {
+    format!("The variable '${}' is not defined.", echoed(name))
+}
+
+/// What a diagnostic says about an `Assign` block whose KEY is not a name a state could
+/// assign a variable under ([`super::is_variable_name`]).
+///
+/// RECORDED text: the service states the KEY it could not read as a variable name — the
+/// one value in the sentence — and then the rule that name broke. ONE sentence, so the
+/// name a `TestState` request supplies and the name a definition assigns are refused in
+/// the same words.
+pub fn invalid_variable_name_message(name: &str) -> String {
+    format!(
+        "Invalid variable name '{}': the variable name contains invalid characters.",
+        echoed(name)
+    )
 }
 
 /// Everything ONE walk of a definition found: the diagnostics it reports, and
@@ -855,6 +1254,18 @@ pub struct Diagnosis {
     /// the definition through it, so what it reports follows the submitted document
     /// rather than the parse's sorting of the names.
     order: MemberOrder,
+    /// The WORKFLOW TYPE the definition is being judged as, which the rules that depend
+    /// on it read ([`Self::express`]): the Amazon States Language is one language for
+    /// both types, and what differs is the work a state machine of each type can
+    /// perform. `CreateStateMachine`'s own `type` (defaulting to
+    /// [`crate::state::STATE_MACHINE_TYPE_STANDARD`], as that member documents) is what
+    /// decides it, so a walk told nothing judges a definition as the default type.
+    workflow_type: &'static str,
+    /// The variables already in scope for the definition being judged, which no state
+    /// of it assigns: `TestState`'s `variables` are "variables set up as part of the
+    /// test", so a state under test reads them exactly as it reads what a state before
+    /// it assigned. A walk told of none judges every read against the definition alone.
+    given: BTreeSet<String>,
 }
 
 /// A walk with every budget of it unspent.
@@ -871,6 +1282,8 @@ impl Default for Diagnosis {
             scope_visits: MAX_SCOPE_VISITS,
             parses: MAX_PARSED_EXPRESSIONS,
             order: MemberOrder::none(),
+            workflow_type: crate::state::STATE_MACHINE_TYPE_STANDARD,
+            given: BTreeSet::new(),
         }
     }
 }
@@ -936,6 +1349,32 @@ impl Diagnosis {
     /// That order, for the walk to read one object's members through.
     pub(super) fn order(&self) -> &MemberOrder {
         &self.order
+    }
+
+    /// This walk, judging the definition as a state machine of the workflow type
+    /// `workflow_type` — [`crate::state::STATE_MACHINE_TYPE_STANDARD`] or
+    /// [`crate::state::STATE_MACHINE_TYPE_EXPRESS`].
+    pub(super) fn for_workflow_type(mut self, workflow_type: &'static str) -> Self {
+        self.workflow_type = workflow_type;
+        self
+    }
+
+    /// Whether the definition is being judged as an EXPRESS state machine, which is
+    /// what the rules about the work each workflow type can perform read.
+    pub(super) fn express(&self) -> bool {
+        self.workflow_type == crate::state::STATE_MACHINE_TYPE_EXPRESS
+    }
+
+    /// This walk, with `given` already in scope for every state it judges.
+    pub(super) fn with_variables(mut self, given: BTreeSet<String>) -> Self {
+        self.given = given;
+        self
+    }
+
+    /// Whether `name` is one of the variables the REQUEST supplied, which a read of it
+    /// resolves against however the definition assigns it.
+    pub(super) fn given_variable(&self, name: &str) -> bool {
+        self.given.contains(name)
     }
 
     /// Whether this walk reports WARNINGS at all: the lints that cost a walk of their
@@ -1025,12 +1464,43 @@ pub(super) const SUBJECT_SEPARATOR: &str = ", ";
 /// because it is valid ASL: what cannot be run surfaces at execution time, as a
 /// `FAILED` execution, not as a rejected create.
 pub fn validate(definition: &str) -> Result<(), String> {
-    let stated: Vec<String> = collect(definition, Diagnosis::errors_only())
-        .diagnostics
-        .iter()
-        .filter(|found| found.is_error())
-        .map(Diagnostic::stated)
-        .collect();
+    validate_as(definition, crate::state::STATE_MACHINE_TYPE_STANDARD)
+}
+
+/// [`validate`] for a definition being created as a state machine of the workflow type
+/// `workflow_type`.
+///
+/// The Amazon States Language is ONE language for both workflow types, and what differs
+/// is the work a state machine of each type can perform: an integration pattern only
+/// the STANDARD type serves ([`diagnose_task_resource`]) is a defect of the definition
+/// where the type being created cannot perform it, so the type is part of what the
+/// definition is judged against. Every other rule reads it not at all, which is why
+/// [`validate`] — the reader for a definition whose type is the default — is the same
+/// walk.
+pub fn validate_as(definition: &str, workflow_type: &'static str) -> Result<(), String> {
+    validate_with(definition, workflow_type, BTreeSet::new())
+}
+
+/// [`validate_as`] with `given` already in scope for every state of the definition:
+/// `TestState`'s `variables` are supplied with the request, so a state machine
+/// definition it tests one state OF reads them like any other variable in scope
+/// ([`validate_single_state_with`] is the same reading for a lone state).
+pub fn validate_with(
+    definition: &str,
+    workflow_type: &'static str,
+    given: BTreeSet<String>,
+) -> Result<(), String> {
+    let stated: Vec<String> = collect(
+        definition,
+        Diagnosis::errors_only()
+            .for_workflow_type(workflow_type)
+            .with_variables(given),
+    )
+    .diagnostics
+    .iter()
+    .filter(|found| found.is_error())
+    .map(Diagnostic::stated)
+    .collect();
     if stated.is_empty() {
         return Ok(());
     }
@@ -1058,7 +1528,18 @@ pub fn validate(definition: &str) -> Result<(), String> {
 /// value it quotes by [`MAX_ECHOED_CHARS`], so no cost that is the product of the
 /// state count and the nesting can be built from a caller's definition.
 pub fn diagnose(definition: &str) -> Diagnosis {
-    collect(definition, Diagnosis::default())
+    diagnose_as(definition, crate::state::STATE_MACHINE_TYPE_STANDARD)
+}
+
+/// [`diagnose`] for a definition judged as a state machine of the workflow type
+/// `workflow_type`, which `ValidateStateMachineDefinition`'s own `type` member names
+/// ("The target type of state machine for this definition") and which
+/// [`validate_as`] judges a create against.
+pub fn diagnose_as(definition: &str, workflow_type: &'static str) -> Diagnosis {
+    collect(
+        definition,
+        Diagnosis::default().for_workflow_type(workflow_type),
+    )
 }
 
 /// [`diagnose`] into the walk `found` describes: every problem, only the errors — or,
@@ -1175,11 +1656,23 @@ pub(super) fn diagnose_machine(
             into.push(error(
                 SCHEMA_VALIDATION_FAILED,
                 object.clone(),
-                field_not_supported_message(field),
+                unsupported_field_message(field, machine_fields(processor)),
             ));
         }
     }
     let states = document.get("States").and_then(Value::as_object);
+    // The figures a state machine OBJECT writes that the language bounds, judged by the
+    // one checker every bounded figure of a definition is judged by.
+    diagnose_figures(
+        document,
+        MACHINE_FIGURES,
+        machine_fields(processor),
+        prefix,
+        into,
+    );
+    // And the OBJECTS it carries whose own fields the language declares — a `Map`
+    // state's processor carries the `ProcessorConfig` that says how it runs.
+    diagnose_declared_objects(document, machine_fields(processor), prefix, into);
     // A field the object DOES carry is judged on its own: that it is absent is
     // already stated above, so what is left to say about it is its value.
     let mut start_at: Option<&str> = None;
@@ -1226,15 +1719,12 @@ pub(super) fn diagnose_machine(
     // than of one state.
     let named = named_states(states, start_at);
     // Which variables each state of THIS machine can count on having been assigned
-    // by the time it runs, which is what its own reads are judged against. Built
-    // once per machine, before any state is judged, because it is a property of the
-    // whole graph rather than of one state; only a walk that reports WARNINGS needs
-    // it ([`POSSIBLY_UNDEFINED_VARIABLE`] is one).
-    let scopes = if into.warnings_wanted() {
-        Scopes::of(states, start_at, outer, into)
-    } else {
-        Scopes::none()
-    };
+    // by the time it runs, and which ones it assigns at all, which is what its own
+    // reads are judged against. Built once per machine, before any state is judged,
+    // because it is a property of the whole graph rather than of one state: a read
+    // nothing in scope assigns is an ERROR, so every walk needs it and not only one
+    // reporting WARNINGS.
+    let scopes = Scopes::of(states, start_at, outer, into);
     // Whether the machine declares a state that ENDS an execution, read before the
     // states are judged and reported after them: the diagnostic is about the machine,
     // so it follows the ones about its states.
@@ -1465,13 +1955,36 @@ fn diagnose_state<'a>(
             into.push(error(
                 SCHEMA_VALIDATION_FAILED,
                 at(&here, ""),
-                field_not_supported_message(field),
+                unsupported_field_message(field, state_fields(state_type)),
             ));
         }
     }
     // What the state does with a failure of its own work, for a type that declares
     // it.
     diagnose_error_handlers(state, state_type, &here, into);
+    // The figures the state writes that the language BOUNDS, each judged where its
+    // own type declares it ([`bounded_figures`]).
+    diagnose_figures(
+        state,
+        bounded_figures(state_type),
+        state_fields(state_type),
+        &here,
+        into,
+    );
+    // What a `Task` state's work IS, judged against the workflow type the definition
+    // is being created as: an integration PATTERN this workflow type cannot perform is
+    // work no execution of it could ever do.
+    diagnose_task_resource(state, state_type, &here, into);
+    // The rules a `Choice` state's own rules must satisfy: each is an object whose
+    // fields the language declares.
+    if state_type == "Choice" {
+        diagnose_choice_rules(state.get("Choices"), &here, "Choices", MAX_EXPRESSION_DEPTH, into);
+    }
+    // And the OBJECTS a state carries beside its own members, whose fields the language
+    // declares as closely as it declares a state's ([`MAP_OBJECT_FIELDS`]): a field
+    // outside one of those sets is reported as the unsupported field it is, located at
+    // the object that carries it.
+    diagnose_declared_objects(state, state_fields(state_type), &here, into);
     // The fields the language declares as ALTERNATIVES, of which a state may carry
     // one.
     diagnose_exclusive_fields(state, state_type, &here, into);
@@ -1584,16 +2097,37 @@ fn diagnose_state<'a>(
     // because the language evaluates a state's assignments before the output they
     // feed; everything else it may read is what reaching this state already assigned.
     let own = assigned_variables(state);
-    if into.warnings_wanted() {
-        // POSSIBLY_UNDEFINED_VARIABLE: one diagnostic per FIELD that reads a
-        // variable nothing reaching that field assigns, which is the granularity
-        // `location` documents (`/States/<StateName>/<FieldName>`), reported in the
-        // order the state writes those fields.
-        let reads = variable_reads(state, &here, into.order());
-        for (field, read) in reads {
-            if own.contains(&read) || scopes.holds(declared, &read) {
-                continue;
-            }
+    // The ASSIGNMENTS themselves: a block of them is an object, and each name it
+    // assigns is a name the language admits for a variable.
+    diagnose_assignments(state, state_type, &here, into);
+    // One diagnostic per FIELD that reads a variable the scope reaching it may not
+    // hold, which is the granularity `location` documents
+    // (`/States/<StateName>/<FieldName>`), reported in the order the state writes those
+    // fields — of the code and the severity the FIELD that reads it decides:
+    //
+    // * a field the language RESOLVES a path at ([`reads_a_path`]: the `*Path` family,
+    //   a payload template's reference field, a `Choice` rule's `Variable`) names the
+    //   variable as the first term of that path, so a path naming one the state cannot
+    //   count on is an ERROR ([`UNDEFINED_VARIABLE`]) — there is nothing for the
+    //   language to resolve it against;
+    // * every other read is a term of a JSONata expression, which EVALUATES to nothing
+    //   where the scope does not hold the name and fails the state that reads it then
+    //   (`States.QueryEvaluationError`), so it is the WARNING the definition is still
+    //   created with ([`POSSIBLY_UNDEFINED_VARIABLE`]).
+    let reads = variable_reads(state, &here, into.order());
+    for (field, (read, reference_field)) in reads {
+        if own.contains(&read) || scopes.holds(declared, &read) || into.given_variable(&read) {
+            continue;
+        }
+        if reference_field {
+            into.push(error(
+                UNDEFINED_VARIABLE,
+                at(&here, &field),
+                undefined_variable_message(&read),
+            ));
+            continue;
+        }
+        if into.warnings_wanted() {
             into.push(warning(
                 POSSIBLY_UNDEFINED_VARIABLE,
                 at(&here, &field),
@@ -1624,7 +2158,16 @@ fn diagnose_state<'a>(
                 // A processor is the one position the language declares
                 // `ProcessorConfig` at.
                 true,
-                outer,
+                // A processor the state runs in DISTRIBUTED mode is a scope BOUNDARY:
+                // each of its items "starts a child workflow execution", which begins
+                // with the variables such an execution begins with — none — so a state
+                // inside it inherits nothing the enclosing scope assigned, whatever
+                // that scope holds. The INLINE mode runs the processor inside this
+                // execution, which is what inherits.
+                match distributed_processor(processor) {
+                    true => Outer::Nothing,
+                    false => outer,
+                },
                 into,
             );
         }
@@ -1642,6 +2185,188 @@ fn diagnose_state<'a>(
             );
         }
     }
+}
+
+/// Whether `processor` is one a `Map` state runs in DISTRIBUTED mode, which is the one
+/// thing its `ProcessorConfig` says that the rules here read: an item of such a
+/// processor "starts a child workflow execution", so what it inherits from the scope
+/// around it is what a new execution inherits.
+///
+/// Read as the walk that RUNS a `Map` state reads it (`super`'s own `map_processor`),
+/// mode names compared without regard to case, so the create-time analysis and the run
+/// cannot disagree about which processors are a scope boundary.
+fn distributed_processor(processor: &Value) -> bool {
+    processor
+        .get("ProcessorConfig")
+        .and_then(|config| config.get("Mode"))
+        .and_then(Value::as_str)
+        .is_some_and(|mode| mode.eq_ignore_ascii_case(DISTRIBUTED_MODE))
+}
+
+/// The `ProcessorConfig` mode that runs each item of a `Map` state's processor as a
+/// child workflow execution of its own.
+const DISTRIBUTED_MODE: &str = "DISTRIBUTED";
+
+/// The RULE rules of one `Choice` state: every entry of the array that holds its rules
+/// is an object, and every field of such an entry is one the language declares on a
+/// rule ([`CHOICE_RULE_FIELDS`]).
+///
+/// The rules nested under `And`, `Or` and `Not` are judged the same way and at their own
+/// positions, `depth` bounding the nesting this follows exactly as every other
+/// caller-shaped tree here is bounded. A field the language does not declare is reported
+/// as the unsupported field it is, with the field it is a near miss of suggested
+/// ([`unsupported_field_message`]) — a misspelled comparator is a rule that can never
+/// decide anything, so it is refused where it is submitted rather than failing every
+/// execution that reaches the state.
+fn diagnose_choice_rules(
+    rules: Option<&Value>,
+    here: &str,
+    member: &str,
+    depth: usize,
+    into: &mut Diagnosis,
+) {
+    let Some(depth) = depth.checked_sub(1) else {
+        return;
+    };
+    let Some(rules) = rules else {
+        return;
+    };
+    // A member holding a LIST of rules that is not one, and the one member that holds a
+    // single rule (`Not`), are read as what they are: `Choices` being an array at all is
+    // the state's own schema rule, reported where that array is read.
+    let entries: Vec<&Value> = match rules.as_array() {
+        Some(entries) => entries.iter().collect(),
+        None if member == "Not" => vec![rules],
+        None => return,
+    };
+    for (index, entry) in entries.into_iter().enumerate() {
+        let at_entry = match rules.is_array() {
+            true => element_at(here, member, index),
+            false => nested_at(here, format_args!("/{member}")),
+        };
+        let Some(entry) = entry.as_object() else {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(&at_entry, ""),
+                entry_object_message(member),
+            ));
+            continue;
+        };
+        for (field, value) in into.order().members(&at_entry, entry) {
+            if !CHOICE_RULE_FIELDS.contains(&field.as_str()) {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&at_entry, ""),
+                    unsupported_field_message(field, CHOICE_RULE_FIELDS),
+                ));
+                continue;
+            }
+            if NESTED_RULE_MEMBERS.contains(&field.as_str()) {
+                diagnose_choice_rules(Some(value), &at_entry, field, depth, into);
+            }
+        }
+    }
+}
+
+/// The OBJECT rules of one state: every object it carries whose fields the language
+/// declares ([`MAP_OBJECT_FIELDS`]) carries only those fields, and so does every such
+/// object nested inside one of them.
+///
+/// `declared` is the state's own closed field set, so an object written at a member the
+/// state's type does not declare at all is not judged here: that it is there is already
+/// reported, and what it holds says nothing more about a state that cannot carry it.
+/// The objects are judged in the order the definition writes them — the queue is drained
+/// from the FRONT, so what is reported about one object follows what is reported about
+/// the object written before it — and each diagnostic is located at the object that
+/// carries the field, which is the position a client has to look at.
+fn diagnose_declared_objects(
+    state: &Map<String, Value>,
+    declared: &[&str],
+    here: &str,
+    into: &mut Diagnosis,
+) {
+    let mut pending: ::std::collections::VecDeque<(String, &'static [&'static str], &Value)> =
+        ::std::collections::VecDeque::new();
+    for member in into.order().names(here, state) {
+        if !declared.contains(&member.as_str()) {
+            continue;
+        }
+        if let Some((fields, value)) = declared_object_fields(member).zip(state.get(member)) {
+            pending.push_back((
+                nested_at(here, format_args!("/{}", echoed(member))),
+                fields,
+                value,
+            ));
+        }
+    }
+    while let Some((at_object, fields, value)) = pending.pop_front() {
+        let Some(members) = value.as_object() else {
+            continue;
+        };
+        for field in into.order().names(&at_object, members) {
+            if !fields.contains(&field.as_str()) {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&at_object, ""),
+                    unsupported_field_message(field, fields),
+                ));
+                continue;
+            }
+            // An object nested inside this one is judged by its own set, exactly as
+            // this one is judged by the state's, and after the objects beside it.
+            if let Some((nested, value)) = declared_object_fields(field).zip(members.get(field)) {
+                pending.push_back((
+                    nested_at(&at_object, format_args!("/{}", echoed(field))),
+                    nested,
+                    value,
+                ));
+            }
+        }
+    }
+}
+
+/// The INTEGRATION-PATTERN rule of one `Task` state: the pattern its `Resource` asks
+/// for must be one the workflow type this definition is being created as can perform.
+///
+/// An integration pattern is what FINISHES a task: the run-a-job pattern (`.sync`)
+/// waits for a job the call started to reach an end state, and the callback pattern
+/// (`.waitForTaskToken`) waits for an answer from outside the execution. Both are
+/// served for the STANDARD workflow type alone — an EXPRESS execution is a single
+/// at-most-once run with no durable state to suspend — so a definition asking for one
+/// inside an EXPRESS state machine declares work no execution of that state machine
+/// could ever do, and is refused where it is submitted rather than failing every
+/// execution at that state.
+///
+/// Reported under the code every defect of the language's SCHEMA is reported under
+/// ([`SCHEMA_VALIDATION_FAILED`]), located at the member that asked for the pattern,
+/// and worded by the one sentence this service states each unsupported pattern with
+/// ([`super::EXPRESS_RUN_A_JOB_UNSUPPORTED`], [`super::EXPRESS_CALLBACK_UNSUPPORTED`]),
+/// so the create-time refusal and the data plane's own cannot word one rule two ways.
+fn diagnose_task_resource(
+    state: &Map<String, Value>,
+    state_type: &str,
+    here: &str,
+    into: &mut Diagnosis,
+) {
+    if state_type != "Task" || !into.express() {
+        return;
+    }
+    let Some(resource) = state.get(RESOURCE_MEMBER).and_then(Value::as_str) else {
+        return;
+    };
+    let unsupported = match crate::state::integration::named_pattern(resource) {
+        Some(crate::state::integration::RUN_A_JOB_PATTERN)
+        | Some(crate::state::integration::RUN_A_JOB_PATTERN_2) => {
+            super::EXPRESS_RUN_A_JOB_UNSUPPORTED
+        }
+        Some(crate::state::integration::CALLBACK_PATTERN) => super::EXPRESS_CALLBACK_UNSUPPORTED,
+        _ => return,
+    };
+    into.push(error(
+        SCHEMA_VALIDATION_FAILED,
+        at(here, &format!("/{RESOURCE_MEMBER}")),
+        unsupported,
+    ));
 }
 
 /// The ALTERNATIVE-field rule of one state: of a group of fields the language declares
@@ -1748,7 +2473,7 @@ fn diagnose_error_handlers(
                     into.push(error(
                         SCHEMA_VALIDATION_FAILED,
                         at(&at_entry, ""),
-                        field_not_supported_message(field),
+                        unsupported_field_message(field, fields),
                     ));
                 }
             }
@@ -1808,25 +2533,12 @@ fn diagnose_error_handlers(
             }
             // A retrier's own figures carry NUMBERS the language bounds, so one the
             // definition wrote outside its bound is a schema error of this entry,
-            // reported at the figure itself: the rate the interval grows by is bounded
-            // below, since a rate under it would shrink the interval it grows. The
-            // figure is judged only where the entry DECLARES it — a catcher carries no
-            // such member, and one written there is reported as the unsupported field
-            // it is above rather than twice.
-            let backoff_rate = entry
-                .get(BACKOFF_RATE_MEMBER)
-                .filter(|_| fields.contains(&BACKOFF_RATE_MEMBER))
-                .and_then(Value::as_f64);
-            if backoff_rate.is_some_and(|rate| rate < MIN_BACKOFF_RATE) {
-                into.push(error(
-                    SCHEMA_VALIDATION_FAILED,
-                    at(
-                        &nested_at(&at_entry, format_args!("/{BACKOFF_RATE_MEMBER}")),
-                        "",
-                    ),
-                    minimum_value_message(MIN_BACKOFF_RATE_STATED),
-                ));
-            }
+            // reported at the figure itself ([`RETRIER_FIGURES`], judged by the one
+            // checker every bounded figure of a definition is judged by). Each is
+            // judged only where the entry DECLARES it: a catcher carries none of them,
+            // and one written there is reported as the unsupported field it is above
+            // rather than twice.
+            diagnose_figures(entry, RETRIER_FIGURES, fields, &at_entry, into);
         }
     }
 }
@@ -1940,16 +2652,6 @@ pub(super) struct Scopes<'a> {
 }
 
 impl<'a> Scopes<'a> {
-    /// A machine whose variables are not judged at all: what a walk that reports no
-    /// WARNING needs, since the lint this feeds is one.
-    fn none() -> Self {
-        Self {
-            assigned: BTreeMap::new(),
-            masks: BTreeMap::new(),
-            outer: Outer::Nothing,
-        }
-    }
-
     /// Follow each variable `states` assigns through the transition graph from
     /// `start_at`, with `outer` already in scope.
     ///
@@ -2121,6 +2823,72 @@ struct Assignments {
     caught: Vec<BTreeSet<String>>,
 }
 
+/// The ASSIGNMENT rules of one state: every block of assignments it declares is a JSON
+/// OBJECT, and every name it assigns is a name the language admits for a variable.
+///
+/// "Assign […] store values in variables" is a block of name-to-value members, so a
+/// value of any other shape declares no assignment at all, and a KEY the language
+/// cannot read as a variable name declares a variable nothing could ever read: both are
+/// defects of the submitted definition, reported at the block that carries them. A
+/// JSONPath block spells a member read from a path as `"<name>.$"`, so the suffix is
+/// dropped before the name is judged, exactly as the scope analysis reads it
+/// ([`assignments`]).
+///
+/// The blocks are the state's OWN and each `Catch` catcher's, which are the two
+/// positions the language declares assignments at; the member is judged only for a
+/// state whose TYPE declares it, since a block written where the type carries no
+/// `Assign` is reported as the unsupported field it is.
+fn diagnose_assignments(
+    state: &Map<String, Value>,
+    state_type: &str,
+    here: &str,
+    into: &mut Diagnosis,
+) {
+    if !state_fields(state_type).contains(&ASSIGN_MEMBER) {
+        return;
+    }
+    let catchers = state
+        .get(CATCH_MEMBER)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let mut blocks: Vec<(String, &Value)> = Vec::new();
+    if let Some(block) = state.get(ASSIGN_MEMBER) {
+        blocks.push((nested_at(here, format_args!("/{ASSIGN_MEMBER}")), block));
+    }
+    for (index, catcher) in catchers.iter().enumerate() {
+        if let Some(block) = catcher.get(ASSIGN_MEMBER) {
+            blocks.push((
+                nested_at(
+                    &element_at(here, CATCH_MEMBER, index),
+                    format_args!("/{ASSIGN_MEMBER}"),
+                ),
+                block,
+            ));
+        }
+    }
+    for (at_block, block) in blocks {
+        let Some(assigned) = block.as_object() else {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(&at_block, ""),
+                format!("'{ASSIGN_MEMBER}' must be a JSON object of variables"),
+            ));
+            continue;
+        };
+        for name in into.order().names(&at_block, assigned) {
+            let declared = name.strip_suffix(".$").unwrap_or(name);
+            if !super::is_variable_name(declared) {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&at_block, ""),
+                    invalid_variable_name_message(declared),
+                ));
+            }
+        }
+    }
+}
+
 /// [`Assignments`] of one state.
 fn assignments(state: &Map<String, Value>) -> Assignments {
     let names = |block: Option<&Value>| -> BTreeSet<String> {
@@ -2181,8 +2949,8 @@ fn variable_reads(
     state: &Map<String, Value>,
     state_at: &str,
     order: &MemberOrder,
-) -> Vec<(String, String)> {
-    let mut found: BTreeSet<(String, String)> = BTreeSet::new();
+) -> Vec<(String, (String, bool))> {
+    let mut found: BTreeSet<(String, String, bool)> = BTreeSet::new();
     let roots: Vec<(String, &Value, bool)> = state
         .iter()
         .filter(|(member, _)| !NESTED_MACHINE_MEMBERS.contains(&member.as_str()))
@@ -2190,7 +2958,7 @@ fn variable_reads(
             (
                 nested_at("", format_args!("/{}", echoed(member))),
                 value,
-                member.ends_with(".$"),
+                reads_a_path(member),
             )
         })
         .collect();
@@ -2203,13 +2971,35 @@ fn variable_reads(
             scan_expression(text, &mut names);
         }
         for name in names {
-            found.insert((path.to_string(), name));
+            found.insert((path.to_string(), name, reference_field));
         }
     });
-    let mut reads: Vec<(String, String)> = found.into_iter().collect();
+    let mut reads: Vec<(String, (String, bool))> = found
+        .into_iter()
+        .map(|(path, name, reference_field)| (path, (name, reference_field)))
+        .collect();
     order.paths(state_at, &mut reads);
     reads
 }
+
+/// Whether the value of the state member `member` is a PATH the language resolves,
+/// rather than a literal or an expression it evaluates.
+///
+/// The two ways the JSONPath half of the Amazon States Language writes a path at a
+/// member of a state: the `*Path` family, whose value IS the path the member reads its
+/// figure or its document from, and the reference field (`"<name>.$"`), which is how a
+/// payload template says that a member it renders is read from one. A `Choice` rule's
+/// `Variable` names the value its comparator tests the same way.
+///
+/// What this decides is whether a `$name` term written there is a variable the language
+/// RESOLVES — so a variable nothing in scope assigns is an error rather than an
+/// expression that evaluates to nothing ([`diagnose_state`]).
+fn reads_a_path(member: &str) -> bool {
+    member.ends_with(".$") || member.ends_with("Path") || member == CHOICE_VARIABLE_MEMBER
+}
+
+/// The member a JSONPath `Choice` rule names the value it tests with.
+const CHOICE_VARIABLE_MEMBER: &str = "Variable";
 
 /// The query language `declared` names, `None` when the member is absent, or why it
 /// is not a query language the Amazon States Language defines.
@@ -2373,6 +3163,39 @@ fn diagnose_jsonata_state(
             continue;
         }
         let shown = echoed(member);
+        // A member the language declares as a DOCUMENT the state builds carries a JSON
+        // object, or one JSONata expression that evaluates to one: "Arguments […] used
+        // to pass information to the API actions of connected resources" is such a
+        // member, and a value of any other shape builds no document at all.
+        if DOCUMENT_MEMBERS.contains(&member.as_str())
+            && !(value.is_object() || value.is_string())
+        {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(here, &format!("/{shown}")),
+                document_member_message(member),
+            ));
+        }
+        // Every field of this member whose text OPENS a JSONata expression without
+        // being one: the language embeds an expression as the WHOLE value of a field,
+        // between `{%` and `%}`, so a value that carries those marks anywhere else is
+        // neither the expression it reads as nor the literal it would otherwise be.
+        // Reported before the parse below, which is about the expression INSIDE those
+        // marks. A member whose value NAMES something — a state, a type, a language, a
+        // comment — holds no expression at all, so its text is left as written.
+        if !NAMING_MEMBERS.contains(&member.as_str()) {
+            for (field, text) in malformed_expressions(
+                value,
+                &nested_at(here, format_args!("/{shown}")),
+                into.order(),
+            ) {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(here, &format!("/{shown}{field}")),
+                    malformed_expression_message(&text),
+                ));
+            }
+        }
         // The expressions of this member are PARSED first: a field whose text the
         // language cannot parse at all could never be evaluated, whatever data a run
         // reaches it with, so it is a defect of the submitted definition rather than an
@@ -2522,6 +3345,84 @@ fn fields_reading(
     found
 }
 
+/// The members a state builds a DOCUMENT in: a JSON object, or one JSONata expression
+/// evaluating to one.
+///
+/// `Arguments` is the member a JSONata `Task`, `Map` or `Parallel` hands its work
+/// ("Arguments […] used to pass information to the API actions of connected
+/// resources"), `ItemSelector` the document a `Map` projects each item through, and
+/// `Assign` the block of variables a state assigns — whose own rule
+/// ([`diagnose_assignments`]) is the stricter one, so it is not listed here.
+const DOCUMENT_MEMBERS: &[&str] = &[ARGUMENTS_MEMBER, ITEM_SELECTOR_MEMBER];
+
+/// What a schema diagnostic says about such a member the definition wrote as something
+/// else: the member, and the two shapes the language declares for it.
+fn document_member_message(member: &str) -> String {
+    format!(
+        "'{}' must be a JSON object or a JSONata expression",
+        echoed(member)
+    )
+}
+
+/// Every FIELD inside `value` whose text CARRIES the marks a JSONata expression is
+/// embedded between without BEING one such expression: the path from the member that
+/// carries `value` down to that field, paired with the text itself.
+///
+/// The language embeds an expression as the WHOLE value of a field, opened with `{%`
+/// and closed with `%}` — so text that opens one and does not close it, closes one it
+/// never opened, carries anything outside the marks, or carries a second pair inside
+/// them is a defect of the language's SCHEMA for that field and not the literal the
+/// field would otherwise hold. It is told from [`unparsed_fields`], which is about the
+/// expression INSIDE a well-formed pair.
+///
+/// The list is in the order the definition writes those fields, read off `order` for
+/// the member at `member_at`, exactly as [`fields_reading`]'s is.
+fn malformed_expressions(
+    value: &Value,
+    member_at: &str,
+    order: &MemberOrder,
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    walk_fields(vec![(String::new(), value, false)], |path, text, _| {
+        if is_malformed_expression(text) {
+            found.push((path.to_string(), echoed(text)));
+        }
+    });
+    found.sort();
+    order.paths(member_at, &mut found);
+    found
+}
+
+/// Whether `text` carries the marks an embedded JSONata expression is delimited by
+/// without being one whole expression between them.
+fn is_malformed_expression(text: &str) -> bool {
+    let text = text.trim();
+    let opens = text.contains(EXPRESSION_OPEN);
+    if !opens && !text.contains(EXPRESSION_CLOSE) {
+        return false;
+    }
+    let Some(inner) = text
+        .strip_prefix(EXPRESSION_OPEN)
+        .and_then(|rest| rest.strip_suffix(EXPRESSION_CLOSE))
+    else {
+        return true;
+    };
+    inner.contains(EXPRESSION_OPEN) || inner.contains(EXPRESSION_CLOSE)
+}
+
+/// The marks the Amazon States Language embeds a JSONata expression between.
+const EXPRESSION_OPEN: &str = "{%";
+const EXPRESSION_CLOSE: &str = "%}";
+
+/// What a diagnostic says about such a field: the text, quoted, and the form an
+/// embedded expression takes.
+fn malformed_expression_message(text: &str) -> String {
+    format!(
+        "'{text}' is not a JSONata expression: an expression is the whole value of the field, \
+         opened with '{EXPRESSION_OPEN}' and closed with '{EXPRESSION_CLOSE}'"
+    )
+}
+
 /// Visit every string `roots` carries, with the path from its root down to it and
 /// whether it is the value of a JSONPath reference field (a member whose name ends in
 /// `.$`), which is what makes a string a reference rather than a literal.
@@ -2609,9 +3510,11 @@ const NAMING_MEMBERS: &[&str] = &[
     "Type",
 ];
 
-/// The WARNINGS a state written in JSONPath can carry: each one is a value that
+/// The WARNINGS a state written in JSONPath can carry — each one is a value that
 /// READS as a path or an intrinsic invocation where the language takes a literal, so
-/// the definition is created and the value is used verbatim.
+/// the definition is created and the value is used verbatim — and the one ERROR about
+/// the other direction: a field whose NAME makes its value a path, holding text that is
+/// neither a path nor an intrinsic invocation ([`diagnose_reference_fields`]).
 fn diagnose_jsonpath_state(
     name: &str,
     state: &Map<String, Value>,
@@ -2619,6 +3522,21 @@ fn diagnose_jsonpath_state(
     here: &str,
     into: &mut Diagnosis,
 ) {
+    // A `"<name>.$"` member is READ from the state's data, so what it holds has to be
+    // something the language can read: the payload templates the state renders and the
+    // variables it assigns are where such a member is written.
+    for member in into.order().names(here, state) {
+        if !PAYLOAD_TEMPLATE_MEMBERS.contains(&member.as_str()) && member != ASSIGN_MEMBER {
+            continue;
+        }
+        if let Some(declared) = state.get(member) {
+            diagnose_reference_fields(
+                declared,
+                &nested_at(here, format_args!("/{}", echoed(member))),
+                into,
+            );
+        }
+    }
     // PASS_RESULT_IS_STATIC: "Attempt to use a path in the result of a pass state".
     if state_type == "Pass" {
         if let Some(result) = state.get("Result").and_then(Value::as_str) {
@@ -2704,6 +3622,83 @@ fn diagnose_jsonpath_state(
 fn looks_like_a_path(text: &str) -> bool {
     text.starts_with('$')
 }
+
+/// The REFERENCE-FIELD rule of one object a JSONPath state declares: a member whose
+/// name ends in `.$` is READ from the state's data, so what it holds is a path or an
+/// invocation of an intrinsic function and never a literal.
+///
+/// "To use a path in a payload template, the field name must end with `.$`" — the
+/// suffix is how the language says the value is to be EVALUATED, so a member carrying
+/// it and holding anything else (a plain string, a number, an object) asks for an
+/// evaluation of something that is not an expression, which no run could perform. It is
+/// the mirror of the [`NO_DOLLAR`] warning, and an ERROR for the reason that one is
+/// not: there the field is used as the literal it is, here there is nothing to use.
+///
+/// The whole object is walked, so a reference field nested inside a payload template is
+/// judged exactly as a top-level one is, with its own position reported; the walk is
+/// ITERATIVE and drains its queue from the FRONT, so the fields are judged in the order
+/// the definition writes them, and every path is built through [`nested_at`], like every
+/// other walk here.
+fn diagnose_reference_fields(declared: &Value, at_object: &str, into: &mut Diagnosis) {
+    let mut pending: ::std::collections::VecDeque<(String, &Value)> =
+        ::std::collections::VecDeque::from([(at_object.to_string(), declared)]);
+    while let Some((path, value)) = pending.pop_front() {
+        match value {
+            Value::Object(members) => {
+                for (member, value) in into.order().members(&path, members) {
+                    let here = nested_at(&path, format_args!("/{}", echoed(member)));
+                    let reads_a_path = member.ends_with(".$");
+                    if reads_a_path && !value.as_str().is_some_and(reads_as_an_expression) {
+                        into.push(error(
+                            SCHEMA_VALIDATION_FAILED,
+                            at(&here, ""),
+                            reference_field_message(member),
+                        ));
+                        continue;
+                    }
+                    if !reads_a_path {
+                        pending.push_back((here, value));
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    pending.push_back((indexed_at(&path, index), item));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What a schema diagnostic says about such a field: the field, and the two things its
+/// value may be.
+///
+/// RECORDED text. The field is the caller's own JSON key, so it is clipped by
+/// [`echoed`] like every other caller value a diagnostic quotes.
+fn reference_field_message(field: &str) -> String {
+    format!(
+        "The value for the field '{}' must be a valid JSONPath or intrinsic function expression",
+        echoed(field)
+    )
+}
+
+/// Whether `text` is written as something the language EVALUATES: a reference path, or
+/// an invocation of an intrinsic function.
+///
+/// The two forms the language spells an evaluated value in, read off the text's
+/// OPENING: a path starts at the state's data or at the context object
+/// ([`looks_like_a_path`]), and every intrinsic the language defines is named
+/// `States.<Name>`. Whether the invocation itself is well formed — its arguments
+/// closed, its name one this service carries — is not decided here: that is what
+/// evaluating it answers, and a definition carrying such an invocation is created and
+/// fails at the state that evaluates it.
+fn reads_as_an_expression(text: &str) -> bool {
+    looks_like_a_path(text) || text.starts_with(INTRINSIC_PREFIX)
+}
+
+/// What every intrinsic function the Amazon States Language defines is named with.
+const INTRINSIC_PREFIX: &str = "States.";
 
 /// Whether `text` reads as an intrinsic-function invocation, which the language
 /// spells `States.<Name>(<arguments>)`.

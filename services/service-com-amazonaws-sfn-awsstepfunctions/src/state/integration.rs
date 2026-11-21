@@ -2291,13 +2291,47 @@ const EPOCH_MILLIS_MEMBERS: &[(&str, &[&str])] = &[
 /// The suffix a `Resource` names the run-a-job integration pattern with, and the
 /// revision of it that parses the job's own output
 /// (`arn:aws:states:::states:startExecution.sync:2`).
-const RUN_A_JOB_PATTERN: &str = "sync";
-const RUN_A_JOB_PATTERN_2: &str = "sync:2";
+pub const RUN_A_JOB_PATTERN: &str = "sync";
+pub const RUN_A_JOB_PATTERN_2: &str = "sync:2";
 
 /// The `.waitForTaskToken` pattern, whose outcome is a `SendTaskSuccess` or
 /// `SendTaskFailure` from outside the execution rather than a job this emulator
 /// polls.
-const CALLBACK_PATTERN: &str = "waitForTaskToken";
+pub const CALLBACK_PATTERN: &str = "waitForTaskToken";
+
+/// Which of the three patterns above `named` is — the text a `Resource` writes after
+/// its action — or `None` for text naming none of them.
+///
+/// THE reading of that suffix: [`read`] asks it of the text after the action it parsed
+/// out of a `Resource` (and refuses what this answers `None` for), and
+/// [`named_pattern`] asks it of a `Resource` whose action it finds in the text, so the
+/// pattern a task's call is performed under and the pattern a definition is JUDGED for
+/// are decided by one function.
+fn pattern_after_a_dot(named: &str) -> Option<&'static str> {
+    [RUN_A_JOB_PATTERN, RUN_A_JOB_PATTERN_2, CALLBACK_PATTERN]
+        .into_iter()
+        .find(|pattern| *pattern == named)
+}
+
+/// The integration PATTERN `resource` names after its action, read from the TEXT
+/// alone: one of the three above, or `None` for a `Resource` that names no pattern.
+///
+/// It is read from the text rather than through [`read`] because it is asked of a
+/// definition before any call is resolved ([`super::asl::diagnose_task_resource`] asks
+/// which patterns a workflow type can perform): a `Resource` naming an integration this
+/// emulator cannot perform still names the pattern it asked for. The ACTION it reads the
+/// suffix of is the last colon-delimited field the pattern could follow — which is the
+/// field `read` parses the action out of — and the suffix itself is read by the one
+/// function that reads it ([`pattern_after_a_dot`]).
+pub fn named_pattern(resource: &str) -> Option<&'static str> {
+    let opens = resource.find('.')?;
+    let action = match resource[..opens].rfind(':') {
+        Some(field) => &resource[field + 1..],
+        None => resource,
+    };
+    let (_, named) = action.split_once('.')?;
+    pattern_after_a_dot(named)
+}
 
 /// Whether `resource` asks for the callback (`.waitForTaskToken`) pattern.
 ///
@@ -2798,7 +2832,10 @@ pub fn read(resource: &str) -> Result<Call, String> {
     }
     // "<action>.sync", "<action>.sync:2" and "<action>.waitForTaskToken" name an
     // integration PATTERN after the action: the action is what is called either way,
-    // and the pattern says what finishes the task.
+    // and the pattern says what finishes the task. WHICH of the three it is, is
+    // [`pattern_after_a_dot`]'s answer, so this reading and the create-time one
+    // ([`named_pattern`]) cannot disagree, and text naming none of them is refused
+    // below.
     let (action, pattern) = match action.split_once('.') {
         Some((action, pattern)) => (action, Some(pattern)),
         None => (action, None),
@@ -2825,9 +2862,9 @@ pub fn read(resource: &str) -> Result<Call, String> {
     // The run-a-job pattern is performed for the integrations [`RUN_A_JOB`] names
     // the reporting and stopping calls of; the callback pattern waits for a
     // `SendTaskSuccess` nothing inside the execution makes.
-    let (job, parsed_output, callback) = match pattern {
+    let (job, parsed_output, callback) = match pattern.map(|named| (named, pattern_after_a_dot(named))) {
         None => (None, false, false),
-        Some(pattern @ (RUN_A_JOB_PATTERN | RUN_A_JOB_PATTERN_2)) => {
+        Some((pattern, Some(RUN_A_JOB_PATTERN | RUN_A_JOB_PATTERN_2))) => {
             let starts = format!("{service}:{action}");
             let job = RUN_A_JOB
                 .iter()
@@ -2844,8 +2881,8 @@ pub fn read(resource: &str) -> Result<Call, String> {
         }
         // The callback pattern's call is the same call the request-response form
         // makes; what differs is that its answer does not finish the task.
-        Some(pattern) if pattern == CALLBACK_PATTERN => (None, false, true),
-        Some(pattern) => {
+        Some((_, Some(CALLBACK_PATTERN))) => (None, false, true),
+        Some((pattern, _)) => {
             return Err(format!(
                 "'{shown}' names '{}', which is not one of this service's integration patterns, \
                  so nothing was run for it",

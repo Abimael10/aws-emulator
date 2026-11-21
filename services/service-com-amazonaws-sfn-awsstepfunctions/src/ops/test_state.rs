@@ -297,17 +297,6 @@ const VARIABLES_NOT_JSON: &str = "The value of 'variables' is not valid JSON.";
 /// being `@sensitive`, it is not quoted either.
 const VARIABLES_NOT_AN_OBJECT: &str = "The value of 'variables' must be a valid JSON object.";
 
-/// What this operation answers for a `variables` object whose KEY is not a name a state
-/// could have assigned a variable under ([`crate::state::asl::is_variable_name`]).
-///
-/// RECORDED text: the document parsed, so what the refusal states is the KEY it could
-/// not read as a variable name — the one value in the sentence — and then the rule that
-/// name broke. A variable name is the caller's own text, which is why it is the only
-/// part of the `@sensitive` document the refusal quotes.
-fn invalid_variable_name(name: &str) -> String {
-    format!("Invalid variable name '{name}': the variable name contains invalid characters.")
-}
-
 /// The validation mode a `mock` that names none is judged at: "If no value is
 /// specified, the default value is `STRICT`."
 const DEFAULT_FIELD_VALIDATION_MODE: &str = "STRICT";
@@ -594,7 +583,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(text) => match serde_json::from_str::<Value>(text) {
                 Ok(Value::Object(fields)) => {
                     if let Some(name) = fields.keys().find(|name| !asl::is_variable_name(name)) {
-                        return Err(refuse(invalid_variable_name(name)));
+                        return Err(refuse(asl::invalid_variable_name_message(name)));
                     }
                     Some(Value::Object(fields))
                 }
@@ -647,14 +636,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // definition of this service is refused in, and without one it "accepts the
         // definition of a single state", which is refused in ITS own terms — a state
         // object is not a state machine, so nothing about the refusal describes one.
+        // The variables the REQUEST supplied are in scope for the state under test
+        // ("variables set up as part of the test"), so the definition is judged with
+        // their names already assigned: a read of one is resolved rather than reported
+        // as a variable the definition defines nowhere.
+        let given: ::std::collections::BTreeSet<String> = variables
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(|fields| fields.keys().cloned().collect())
+            .unwrap_or_default();
         match input.state_name {
-            Some(_) => asl::validate(&input.definition).map_err(invalid_definition),
-            None => asl::validate_single_state(&input.definition).map_err(|about_the_state| {
-                TestStateErrorModeled::InvalidDefinition(InvalidDefinition {
-                    message: Some(about_the_state),
-                })
-                .into()
-            }),
+            Some(_) => asl::validate_with(
+                &input.definition,
+                crate::state::STATE_MACHINE_TYPE_STANDARD,
+                given,
+            )
+            .map_err(invalid_definition),
+            None => {
+                asl::validate_single_state_with(&input.definition, given).map_err(
+                    |about_the_state| {
+                        TestStateErrorModeled::InvalidDefinition(InvalidDefinition {
+                            message: Some(about_the_state),
+                        })
+                        .into()
+                    },
+                )
+            }
         }?;
 
         // Which state is under test, and the name it carries.

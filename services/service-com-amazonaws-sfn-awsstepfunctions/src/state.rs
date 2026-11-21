@@ -2947,37 +2947,6 @@ pub fn resource_not_found_message(resource_arn: &str) -> String {
 /// a caller reads the refused resource from there rather than out of the sentence.
 pub const RESOURCE_DOES_NOT_EXIST: &str = "Request references a resource that does not exist.";
 
-/// What the modelled `ValidationException` says when the weights of a routing
-/// configuration do not add up to [`ROUTING_WEIGHT_TOTAL`].
-///
-/// RECORDED text: the service states the RULE the configuration broke — "the sum of
-/// the weights in the routing configuration must be equal to 100" — and then lists,
-/// in brackets, the weights the request submitted, in the order it listed them, so a
-/// caller sees which numbers it sent. The listed values are the request's own; the
-/// total they add up to is not stated, because the weights are what the caller has
-/// to change.
-pub fn routing_weight_sum_message(weights: &[i32]) -> String {
-    format!(
-        "Sum of routing configuration weights must equal {ROUTING_WEIGHT_TOTAL}. Received: [{}]",
-        weights
-            .iter()
-            .map(i32::to_string)
-            .collect::<Vec<String>>()
-            .join(", ")
-    )
-}
-
-/// What the modelled `ResourceNotFound` says when a routing configuration names a
-/// state machine version that was never published.
-///
-/// The alias operations do not resolve a routing configuration entry by a generic
-/// resource lookup: the rule being enforced is the one the routing configuration
-/// itself carries — every entry must reference a version that already exists — so
-/// the refusal states THAT rule, in a sentence of its own that no value of the
-/// request appears in. RECORDED text.
-pub const ROUTING_CONFIGURATION_VERSION_NOT_FOUND: &str =
-    "Routing configuration must contain state machine version ARNs that already exist.";
-
 /// What the modelled `ActivityWorkerLimitExceeded` says: the activity whose pollers
 /// are all open, and the number of them.
 ///
@@ -3225,6 +3194,21 @@ pub const UPDATE_NAMES_NO_MEMBER: &str = "Either the definition, the role ARN, t
                                           LoggingConfiguration, or the TracingConfiguration must \
                                           be specified";
 
+/// What the modelled `MissingRequiredParameter` says when an `UpdateStateMachine` moves
+/// the state machine's ENCRYPTION onto another configuration without naming the
+/// definition.
+///
+/// RECORDED text, and a FIXED sentence naming the two members. It is what the service
+/// answers an update that carries an `encryptionConfiguration` and no definition, and it
+/// is the SENTENCE that says which condition that is: it names the definition alone,
+/// where this error's other sentence ([`UPDATE_NAMES_NO_MEMBER`]) names the four members
+/// an update may name instead of it. So the condition is about the pair — the definition
+/// and every execution's data are what the key seals, and the service is handed the
+/// document it is to seal in the same request — and not about the alternatives, which is
+/// why a request naming another of them beside the configuration is this refusal too.
+pub const UPDATE_ENCRYPTION_NEEDS_DEFINITION: &str =
+    "The definition must be specified when updating the EncryptionConfiguration";
+
 /// What the modelled `ValidationException` says when an `UpdateStateMachineAlias` names
 /// no member that would change the alias.
 ///
@@ -3235,6 +3219,18 @@ pub const UPDATE_NAMES_NO_MEMBER: &str = "Either the definition, the role ARN, t
 /// value of the request.
 pub const ALIAS_UPDATE_NAMES_NO_MEMBER: &str =
     "Either description or routing configuration must be specified";
+
+/// What the modelled `ValidationException` says when a request names a version
+/// description without asking for a version to be published.
+///
+/// RECORDED text, and a FIXED sentence carrying no value of the request: the service
+/// states the rule in its own words — the DESCRIPTION, spelled as English rather than
+/// as the member name — and both operations that take the pair (`CreateStateMachine`
+/// and `UpdateStateMachine`, whose `versionDescription` documents "You can only set
+/// the description if the publish parameter is set to true") state it from here, so
+/// the two cannot word one rule differently.
+pub const VERSION_DESCRIPTION_WITHOUT_PUBLISH: &str =
+    "Version description can only be set when publish is true";
 
 /// `ActivityDoesNotExist`'s, for [`resource_error_message`]. The error's own name
 /// under the rule above — the condition in spaced Title Case, then the ARN the
@@ -4234,39 +4230,44 @@ pub fn pattern_violation_message(member: &str, pattern: &str, value: &str) -> St
     })
 }
 
+/// What the modelled `InvalidArn` says about a value submitted where a ROLE ARN was
+/// required: the fixed opening, then the value exactly as the request submitted it.
+///
+/// RECORDED text, and the one thing the refusal states: the service names the member
+/// class it could not read an ARN for — the role — and quotes what it was handed,
+/// without a diagnosis of its own about which component of the ARN failed. It is
+/// therefore worded apart from [`invalid_arn_message`], which is the envelope for an
+/// ARN of THIS service that an operation resolves a resource through, and every
+/// operation taking a `roleArn` reads this one ([`invalid_role_arn_reason`]).
+pub fn invalid_role_arn_message(submitted: &str) -> String {
+    format!("Invalid Role Arn: '{submitted}'")
+}
+
 /// Why `role_arn` is not the ARN of an IAM role, or `None` when it is — the
 /// modelled `InvalidArn` ("The provided Amazon Resource Name (ARN) is not valid"),
-/// whose message is the "Invalid Arn: '<diagnosis>'" envelope the service builds
-/// from the request.
+/// whose message is [`invalid_role_arn_message`] over the value the request sent.
 ///
 /// `roleArn` is the only ARN `CreateStateMachine` takes, and the operation models
 /// `InvalidArn`, so the ARN is checked before anything is stored: it is "the Amazon
 /// Resource Name (ARN) of the IAM role to use for this state machine", so it has to
 /// be an ARN, and an IAM `role/` ARN at that. Its length (1..256) is modelled.
+///
+/// Every one of those conditions is reported by the ONE sentence above: what the
+/// refusal states is the value it could not read a role ARN out of, so a caller is
+/// told which member it has to fix and sees its own text back, rather than a
+/// component-by-component diagnosis the service does not state here.
 pub fn invalid_role_arn_reason(role_arn: &str) -> Option<String> {
-    if !role_arn.starts_with("arn:") {
-        return Some(format!("Invalid Arn: 'Invalid ARN prefix: {role_arn}'"));
-    }
     let fields: Vec<&str> = role_arn.splitn(6, ':').collect();
-    let malformed = fields.len() < 6
-        || fields[1].is_empty()
-        || fields[2].is_empty()
-        || fields[5].is_empty();
-    if malformed {
-        return Some(format!("Invalid Arn: 'Invalid ARN: {role_arn}'"));
-    }
     // IAM is a global service, so an IAM ARN carries no region, and a role is the
     // `role/<path><name>` resource.
-    let is_role = fields[2] == "iam"
+    let is_role = role_arn.starts_with("arn:")
+        && fields.len() == 6
+        && !fields[1].is_empty()
+        && fields[2] == "iam"
         && fields[5]
             .strip_prefix("role/")
             .is_some_and(|name| !name.is_empty());
-    if !is_role {
-        return Some(format!(
-            "Invalid Arn: 'Expected the ARN {role_arn} to be an IAM role ARN.'"
-        ));
-    }
-    None
+    (!is_role).then(|| invalid_role_arn_message(role_arn))
 }
 ///
 /// From the operation's own documentation: "CreateStateMachine's idempotency check
@@ -4889,6 +4890,8 @@ pub mod target_resource_policy;
 pub mod xml_answer;
 pub mod xray_tracing;
 mod pagination;
+mod routing_rules;
+pub use routing_rules::*;
 pub use pagination::*;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

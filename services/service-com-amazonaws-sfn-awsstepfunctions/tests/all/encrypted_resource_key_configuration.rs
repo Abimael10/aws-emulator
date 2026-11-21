@@ -316,6 +316,9 @@ async fn an_update_onto_an_unusable_key_is_refused_and_changes_nothing() {
 
     let request = json!({
         "stateMachineArn": machine,
+        // Beside the configuration under test: an update names at least one of the
+        // members this call requires, which an `encryptionConfiguration` is not one of.
+        "definition": HELLO_DEFINITION,
         "encryptionConfiguration": customer_managed(&key)
     });
     let (status, answer) = chain.call(&SFN, "UpdateStateMachine", &request).await;
@@ -1377,7 +1380,12 @@ async fn an_update_replaces_the_whole_encryption_configuration() {
     ];
 
     for (case, update, expected) in rows {
-        let mut request = json!({ "stateMachineArn": machine });
+        // Every update names at least one of the members this call requires — the
+        // definition here — beside the configuration under test: an
+        // `encryptionConfiguration` is a member this call stores but not one of the
+        // alternatives the rule admits (`refusal_vocabulary` is that rule). A row
+        // naming its own definition replaces this one.
+        let mut request = json!({ "stateMachineArn": machine, "definition": HELLO_DEFINITION });
         for (member, value) in update.as_object().expect("the row's members") {
             request[member] = value.clone();
         }
@@ -1486,7 +1494,14 @@ async fn a_refused_update_replaces_no_part_of_the_configuration() {
             .call(
                 &SFN,
                 "UpdateStateMachine",
-                &json!({ "stateMachineArn": machine, "encryptionConfiguration": encryption }),
+                // The definition is named beside the configuration under test so the
+                // request is an update at all: an `encryptionConfiguration` is not one
+                // of the members this call requires at least one of.
+                &json!({
+                    "stateMachineArn": machine,
+                    "definition": HELLO_DEFINITION,
+                    "encryptionConfiguration": encryption,
+                }),
             )
             .await;
         assert_eq!(

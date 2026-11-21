@@ -297,7 +297,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if let Err(diagnostic) = crate::state::asl::validate(&input.definition) {
+        // The definition is judged as a state machine of the type being created: the
+        // Amazon States Language is one language for both workflow types, and what a
+        // state machine of each type can PERFORM is not the same, so the type is part
+        // of what a definition is valid against (`crate::state::asl::validate_as`).
+        // The value is the one checked above, as a `'static` the walk reads.
+        let workflow_type = match sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS {
+            true => crate::state::STATE_MACHINE_TYPE_EXPRESS,
+            false => crate::state::STATE_MACHINE_TYPE_STANDARD,
+        };
+        if let Err(diagnostic) = crate::state::asl::validate_as(&input.definition, workflow_type) {
             return Err(CreateStateMachineErrorModeled::InvalidDefinition(
                 InvalidDefinition {
                     message: Some(crate::state::resource_error_message(
@@ -429,7 +438,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateStateMachineErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(
-                        "versionDescription can only be set when publish is true".to_string(),
+                        crate::state::VERSION_DESCRIPTION_WITHOUT_PUBLISH.to_string(),
                     ),
                     reason: None,
                 },

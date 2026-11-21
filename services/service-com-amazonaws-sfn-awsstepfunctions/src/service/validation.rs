@@ -14,16 +14,17 @@
 //! ([`::service_common::validation_message::aws_validation_refusal_withholding_with`]),
 //! which is the framework's envelope over the framework's clauses with the two
 //! differences AWS states: the value half dropped from a clause that states none
-//! — a collection's `@length`, and a member whose value the refusal WITHHOLDS —
-//! and the `@pattern` expression quoted as this service's recordings show it,
-//! which is the model's own spelling, anchors and all. WHICH members are
+//! — a member whose value the refusal WITHHOLDS — and the `@pattern` expression
+//! quoted as this service's recordings show it, which is the expression the whole
+//! value must match ([`PATTERNS_PUBLISHED_AS_DECLARED`] names the shapes this
+//! service publishes with the model's anchors instead). WHICH members are
 //! withheld is read off this service's MODEL
 //! ([`::service_common::sensitive_members::WithheldMembers`]), so nothing here
 //! lists a member name and the decision cannot fall behind a model that grows a
 //! `@sensitive` one.
 //!
-//! What is left for this module is TWO differences, which no shared entry point
-//! can make for it. First, Step Functions echoes a rejected value as the member's
+//! What is left for this module is the differences no shared entry point can make
+//! for it. First, Step Functions echoes a rejected value as the member's
 //! MODELLED TYPE renders it. A member whose target shape is a Smithy
 //! `float`/`double` renders with a fractional part (`150` -> `150.0`), where an
 //! integral member (`integer`, `long`) renders without one — and Rust's own
@@ -32,15 +33,21 @@
 //! integer's spelling. Second, the ENUM VALUE SET a clause advertises is listed
 //! in the order this service states that enum's values in, which is not the
 //! order the model declares its members in ([`STATED_ENUM_VALUE_SETS`], applied
-//! through the shared wording's own seam for such a table). The
+//! through the shared wording's own seam for such a table). Third, a clause about
+//! a LIST member quotes the list the request submitted, which the framework's walk
+//! replaced with a summary of its size (the shared restoring rule states the one
+//! such list the summary determines, the EMPTY one). Fourth, the clauses of ONE
+//! member are stated with its `@pattern` requirement FIRST, which is the order
+//! this service's recordings show for a value breaking several constraints. The
 //! violations are re-rendered that way and then handed to the shared wording, so
 //! the envelope, the clauses, the member paths, the requirements and the
 //! withholding are all stated in one place.
 //!
 //! Nothing here is keyed to an operation or to a particular value: each rule is
 //! applied to whatever [`Violation`] the walk produces — one by the member's
-//! modelled type, one by the value SET the violation carries — so each holds for
-//! every constrained member of every operation of this service.
+//! modelled type, one by the value SET the violation carries, one by the summary
+//! the walk wrote and one by the constraint CLASS — so each holds for every
+//! constrained member of every operation of this service.
 //!
 //! The structural fix is still owed upstream — a `Violation` carrying the
 //! member's modelled numeric kind, or a framework that renders a value per
@@ -186,6 +193,16 @@ const MOCK_RESPONSE_VALIDATION_MODES: (&[&str], &[&str]) = (
     &["STRICT", "NONE", "PRESENT"],
 );
 
+/// The order this service states the `StateMachineType` value set in, paired with the
+/// values the model declares.
+///
+/// RECORDED text: the model declares the enum's members in another order
+/// (`smithy_query(query="shape",shape="StateMachineType")` -> `STANDARD | EXPRESS`),
+/// and the order a refusal ADVERTISES is the service's own rather than the model's
+/// declaration order — which is the order the value set reaches this seam in.
+const STATE_MACHINE_TYPES: (&[&str], &[&str]) =
+    (&["STANDARD", "EXPRESS"], &["EXPRESS", "STANDARD"]);
+
 /// Every enum value set this service states in an order of its own, as the shared
 /// wording reads such a table
 /// ([`::service_common::validation_message::StatedEnumValueSets`]).
@@ -200,14 +217,38 @@ const STATED_ENUM_VALUE_SETS: &::service_common::validation_message::StatedEnumV
         INSPECTION_LEVELS,
         EXECUTION_STATUSES,
         MOCK_RESPONSE_VALIDATION_MODES,
+        STATE_MACHINE_TYPES,
     ];
 
+/// The `@pattern` expressions this service PUBLISHES exactly as its model declares
+/// them, anchors included.
+///
+/// Every other expression is quoted as the expression the whole value must match, with
+/// the model's own whole-value anchors dropped
+/// ([`::service_common::validation::unanchored_unless_published_as_declared`]): that is
+/// what a `clientToken` clause is recorded quoting (`[!-~]+` for the model's
+/// `^[!-~]+$`). The alias-name shape is recorded quoted as DECLARED, so it is named
+/// here — keyed by the expression, which belongs to the SHAPE, so every member
+/// targeting it is quoted alike. The CHECK is always the model's pattern as written;
+/// only the quoting differs.
+const PATTERNS_PUBLISHED_AS_DECLARED: &[&str] = &[crate::state::ALIAS_NAME_PATTERN];
+
 /// `violation` as THIS SERVICE states it: its value in the member's modelled type
-/// ([`in_modelled_type`]) and its enum value set in the order the service advertises
-/// that enum's values in ([`STATED_ENUM_VALUE_SETS`], through the shared seam).
+/// ([`in_modelled_type`]), the COLLECTION it submitted quoted where that collection is
+/// determined by the walk's own summary of it, and its enum value set in the order the
+/// service advertises that enum's values in ([`STATED_ENUM_VALUE_SETS`], through the
+/// shared seam).
+///
+/// The collection half is the shared restoring rule
+/// ([`::service_common::validation_message::quoting_an_empty_submitted_collection`]):
+/// AWS quotes the value a clause is about even where that value is a list, and an EMPTY
+/// list is the one a layer holding the violations alone can state, since the walk's
+/// `0 items` summary determines it completely.
 fn as_this_service_states_it(violation: &Violation) -> Violation {
     ::service_common::validation_message::in_stated_enum_order(
-        &in_modelled_type(violation),
+        &::service_common::validation_message::quoting_an_empty_submitted_collection(
+            in_modelled_type(violation),
+        ),
         STATED_ENUM_VALUE_SETS,
     )
 }
@@ -221,8 +262,15 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
     let Refusal::Invalid(violations) = refusal else {
         return None;
     };
+    // The clauses of ONE member are stated with its `@pattern` requirement first: the
+    // expression is the shape of the value and every other requirement is a bound on
+    // it, which is the order this service's recordings show for a member breaking
+    // several constraints. The MEMBERS stay where the walk found them.
     let in_modelled_types: Vec<Violation> =
-        violations.iter().map(as_this_service_states_it).collect();
+        ::service_common::validation_message::in_pattern_first_order(violations)
+            .into_iter()
+            .map(as_this_service_states_it)
+            .collect();
     let mut stated = shared_wording(&in_modelled_types)?;
     // A member whose bound is a payload SIZE states the requirement about that size
     // rather than the character-length sentence the framework states for every other
@@ -242,11 +290,16 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
 fn shared_wording(violations: &[Violation]) -> Option<Refused> {
     ::service_common::validation_message::aws_validation_refusal_withholding_with(
         &Refusal::Invalid(violations.to_vec()),
-        // The expression a `@pattern` clause advertises is the model's own, as
-        // the framework already quotes it: this service is recorded stating the
-        // alias-name pattern with the anchors the model writes, so only the
-        // value half below is restated.
-        |pattern| pattern.to_string(),
+        // The expression a `@pattern` clause advertises is the one the whole value
+        // must match, which is the model's text without the whole-value anchors it
+        // writes around it — except for the shapes this service publishes as
+        // declared ([`PATTERNS_PUBLISHED_AS_DECLARED`]).
+        |pattern| {
+            ::service_common::validation::unanchored_unless_published_as_declared(
+                pattern,
+                PATTERNS_PUBLISHED_AS_DECLARED,
+            )
+        },
         |path| WITHHELD_MEMBERS.withholds_value(path),
     )
 }

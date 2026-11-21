@@ -30,6 +30,20 @@ Issue-Commit: 4d67debdc5b6a4a4b59f91b6ecdc4b307fee9666
 
 # stepfunctions: 10 net-new causes — CreateStateMachine/UpdateStateMachine/alias/validate accept invalid input and word their rejections wrongly
 
+## Resolution
+
+Causes 1, 5, 6, 7 and 8 are closed, and so are three of cause 9's four renderings
+(the `type` value set on both operations, and the `clientToken` clause's order and
+its unanchored expression) — the refusals, their codes and their messages are now
+the service's, over the rules the fix states, and 14 of this report's 23 recorded
+units replay clean.
+
+What is NOT closed is recorded on its own, with the units that still diverge, in
+`issues/things-that-do-not-work/20261121T143000Z-stepfunctions-definition-validation-and-list-clause-remainder.md`:
+cause 2's `.waitForTaskToken` unit, cause 3, cause 4, cause 8's `TestState`
+unknown-integration unit, cause 9's non-empty list rendering, and two of cause 10's
+four classes.
+
 > _Note: this issue was identified against the code base at commit `4d67debdc5b6a4a4b59f91b6ecdc4b307fee9666`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

@@ -284,8 +284,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You must include at least one of definition or roleArn or you will
         // receive a MissingRequiredParameter error." The error's own message names
-        // the whole set of members an update may name alone — the definition, the
-        // role ARN, the logging configuration and the tracing configuration — and
+        // the whole set of members an update may name alone
+        // ([`crate::state::UPDATE_NAMES_NO_MEMBER`]) — the definition, the role ARN,
+        // the logging configuration and the tracing configuration — and
         // `encryptionConfiguration` is a member this call stores too, so a request
         // naming any ONE of them asks for a change and is served. A request naming
         // none of them asks for no change at all, which is what this error reports;
@@ -305,12 +306,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // And one of those members is not one an update may name ALONE: the key an
+        // `encryptionConfiguration` names is what seals this state machine's
+        // definition, so the service is handed the definition it is to seal in the
+        // same request. A request that moves the encryption and names no definition is
+        // the same modelled error, stating THAT condition — the sentence names the
+        // definition by itself, where the one above names the four members an update
+        // may name instead of it, so the condition holds whichever of those the request
+        // carried beside the configuration
+        // ([`crate::state::UPDATE_ENCRYPTION_NEEDS_DEFINITION`]).
+        if input.encryption_configuration.is_some() && input.definition.is_none() {
+            return Err(UpdateStateMachineErrorModeled::MissingRequiredParameter(
+                MissingRequiredParameter {
+                    message: Some(crate::state::UPDATE_ENCRYPTION_NEEDS_DEFINITION.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The same input rules `CreateStateMachine` applies, from the same place:
         // the structural rules of the Amazon States Language, an ARN that names an
         // IAM role, and the two configuration structures whose members must agree
         // with each other.
         if let Some(definition) = input.definition.as_deref() {
-            if let Err(diagnostic) = crate::state::asl::validate(definition) {
+            // The definition is judged as a state machine of the type this record IS:
+            // "You cannot update the type of a state machine", so the type the
+            // definition has to be valid against is the stored one, read for that one
+            // value and released before anything else (`crate::state::asl::validate_as`
+            // is what reads it). An ARN this store holds nothing for is refused below as
+            // the state machine it does not name, so such a request is judged against
+            // the default type and never created.
+            let workflow_type = {
+                let store = state.lock();
+                match store
+                    .state_machines
+                    .get(&input.state_machine_arn)
+                    .is_some_and(|machine| {
+                        machine.sm_type == crate::state::STATE_MACHINE_TYPE_EXPRESS
+                    }) {
+                    true => crate::state::STATE_MACHINE_TYPE_EXPRESS,
+                    false => crate::state::STATE_MACHINE_TYPE_STANDARD,
+                }
+            };
+            if let Err(diagnostic) = crate::state::asl::validate_as(definition, workflow_type) {
                 return Err(UpdateStateMachineErrorModeled::InvalidDefinition(
                     InvalidDefinition {
                         // The same construction `CreateStateMachine` reports a
@@ -432,7 +470,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateStateMachineErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(
-                        "versionDescription can only be set when publish is true".to_string(),
+                        crate::state::VERSION_DESCRIPTION_WITHOUT_PUBLISH.to_string(),
                     ),
                     reason: None,
                 },

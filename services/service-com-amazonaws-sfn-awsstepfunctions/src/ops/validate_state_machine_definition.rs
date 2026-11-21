@@ -172,12 +172,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The modelled constraints are already refused before this handler runs:
         // `definition` (len 1..1048576), `maxResults` (range 0..100) and the
         // `severity`/`type` enums. What is computed here is what the definition
-        // itself says — `type` changes no rule below, because the Amazon States
-        // Language structure this service validates is the same for both workflow
-        // types.
+        // itself says, judged as the workflow type the request names — `type` is
+        // "the target type of state machine for this definition. The default is
+        // STANDARD" — since the Amazon States Language is one language for both
+        // types and what differs is the work a state machine of each type can
+        // perform.
         //
         // The diagnostics come from the ONE walk `CreateStateMachine` and
-        // `UpdateStateMachine` refuse a definition with (`crate::state::asl::validate`
+        // `UpdateStateMachine` refuse a definition with (`crate::state::asl::validate_as`
         // states every error that walk reports), so "The result value will be OK when
         // your workflow definition can be successfully created or updated" holds by
         // construction rather than by two validators agreeing.
@@ -188,9 +190,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request timeout and shutdown keep working while a 1 MiB definition is being
         // walked. The definition is MOVED onto that thread rather than copied: it is
         // the one member of the request the walk reads.
+        let workflow_type = match input.r#type.as_deref()
+            == Some(crate::state::STATE_MACHINE_TYPE_EXPRESS)
+        {
+            true => crate::state::STATE_MACHINE_TYPE_EXPRESS,
+            false => crate::state::STATE_MACHINE_TYPE_STANDARD,
+        };
         let definition = input.definition;
-        let Ok(found) =
-            ::tokio::task::spawn_blocking(move || crate::state::asl::diagnose(&definition)).await
+        let Ok(found) = ::tokio::task::spawn_blocking(move || {
+            crate::state::asl::diagnose_as(&definition, workflow_type)
+        })
+        .await
         else {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::INTERPRETER_UNAVAILABLE,

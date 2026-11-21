@@ -6,37 +6,27 @@
 //! `MultiServiceRouter`.
 //!
 //! The rule under test: the run-a-job pattern is served for the STANDARD workflow type
-//! only. A definition whose `Task` state asks for it is ACCEPTED at create time
-//! whatever the type — it is valid Amazon States Language — and an EXPRESS execution of
-//! it then fails AT that state with `States.Runtime`, carrying the service's own
-//! refusal of the pattern and the name of the state that asked for it, having started
-//! no job: the integration's own call is never made. The same definition run as a
-//! STANDARD workflow starts its job and parks at it, which is the other side of the
-//! same rule.
+//! only, so a definition whose `Task` state asks for it is REFUSED where it is
+//! submitted as an EXPRESS state machine — `InvalidDefinition`, stating the service's
+//! own refusal of the pattern at the `Resource` that asked for it — and no state
+//! machine is created. The same definition created as a STANDARD workflow starts its
+//! job and parks at it, which is the other side of the same rule.
 //!
 //! The rows differ along what the rule generalises over: the revision of the pattern
 //! the `Resource` asks for (`.sync` and `.sync:2`), the INTEGRATION it asks it of (a
 //! nested execution, whose calls this service serves itself, and an Athena query,
-//! whose service is not even mounted here — so a row that reached the call could not
-//! answer at all), the name of the offending state, and how the execution was started
-//! (`StartSyncExecution`, and `StartExecution` on the same EXPRESS machine).
+//! whose service is not even mounted here), and the name of the offending state.
 //!
 //! The harness (`Emulator`, `create_machine`, `string`) is the one
-//! `state_machine_lifecycle` builds, `create_express` is `sync_execution`'s and the
-//! history reader is `execution_history`'s; `tests/all.rs` is this binary's crate
-//! root, so each is reached through `crate::<suite>`.
+//! `state_machine_lifecycle` builds and the history reader is `execution_history`'s;
+//! `tests/all/main.rs` picks this file up, so each is reached through `crate::<suite>`.
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_sfn_awsstepfunctions::state::asl::{
-    EXPRESS_RUN_A_JOB_UNSUPPORTED, RUNTIME_ERROR,
-};
+use service_com_amazonaws_sfn_awsstepfunctions::state::asl::EXPRESS_RUN_A_JOB_UNSUPPORTED;
 
 use crate::execution_history::history;
-use crate::state_machine_lifecycle::{
-    create_machine, string, Emulator, PAST_THE_EXECUTION_DELAY,
-};
-use crate::sync_execution::create_express;
+use crate::state_machine_lifecycle::{create_machine, string, Emulator, ROLE_ARN};
 
 /// One row of the refusal table: the case, the state name, and the `Resource` that
 /// state's run-a-job `Task` names.
@@ -76,10 +66,10 @@ async fn started_count(emulator: &Emulator, machine_arn: &str) -> usize {
         .map_or(0, Vec::len)
 }
 
-/// An EXPRESS execution of a definition that asks for the run-a-job pattern fails at
-/// the state that asked, naming it, and starts nothing.
+/// Creating an EXPRESS state machine from a definition that asks for the run-a-job
+/// pattern is refused, naming the pattern, and creates nothing.
 #[tokio::test]
-async fn an_express_execution_refuses_a_run_a_job_task_and_starts_no_job() {
+async fn an_express_create_refuses_a_run_a_job_task() {
     let rows: [RefusalRow; 4] = [
         (
             "a nested execution through the pattern's first revision",
@@ -92,14 +82,14 @@ async fn an_express_execution_refuses_a_run_a_job_task_and_starts_no_job() {
             "arn:aws:states:::states:startExecution.sync:2",
         ),
         (
-            "a state of another name, which the refusal must name instead",
+            "a state of another name, which the refusal must locate instead",
             "RunTheChildWorkflow",
             "arn:aws:states:::states:startExecution.sync",
         ),
         (
-            // Athena is not mounted beside this service here, so a row that got as
-            // far as the integration's own call could not have answered at all: the
-            // refusal is the workflow type's, decided before anything is called.
+            // Athena is not mounted beside this service here, so the refusal cannot be
+            // anything the integration itself answered: it is the workflow type's,
+            // decided before anything is called.
             "another integration's run-a-job pattern entirely",
             "RunQuery",
             "arn:aws:states:::athena:startQueryExecution.sync",
@@ -110,77 +100,54 @@ async fn an_express_execution_refuses_a_run_a_job_task_and_starts_no_job() {
     let child_arn = create_machine(&emulator, "express-sync-child", CHILD).await;
     for (index, (case, state, resource)) in rows.into_iter().enumerate() {
         let definition = parent_definition(state, resource, &child_arn);
-        let express = create_express(&emulator, &format!("express-sync-{index}"), &definition).await;
-
-        // The SYNCHRONOUS start answers the outcome itself.
-        let answered = emulator
-            .ok(
-                "StartSyncExecution",
-                &json!({ "stateMachineArn": express, "name": format!("sync-{index}") }),
+        let name = format!("express-sync-{index}");
+        let (status, body) = emulator
+            .call(
+                "CreateStateMachine",
+                &json!({
+                    "name": &name,
+                    "definition": definition,
+                    "roleArn": ROLE_ARN,
+                    "type": "EXPRESS",
+                }),
             )
             .await;
         assert_eq!(
-            answered.get("status").and_then(Value::as_str),
-            Some("FAILED"),
-            "case {case:?}: expected FAILED, got {answered:?}"
+            (status, body.get("__type").and_then(Value::as_str)),
+            (400, Some("InvalidDefinition")),
+            "case {case:?}: expected 400 InvalidDefinition, got {status} with {body:?}"
         );
-        assert_eq!(
-            answered.get("error").and_then(Value::as_str),
-            Some(RUNTIME_ERROR),
-            "case {case:?}: expected {RUNTIME_ERROR}, got {answered:?}"
-        );
-        let cause = string(&answered, "cause");
+        let message = string(&body, "message");
         assert!(
-            cause.contains(EXPRESS_RUN_A_JOB_UNSUPPORTED),
-            "case {case:?}: expected the cause to state {EXPRESS_RUN_A_JOB_UNSUPPORTED:?}, got \
-             {cause:?}"
+            message.contains(EXPRESS_RUN_A_JOB_UNSUPPORTED),
+            "case {case:?}: expected the refusal to state {EXPRESS_RUN_A_JOB_UNSUPPORTED:?}, got \
+             {message:?}"
         );
         assert!(
-            cause.contains(&format!("'{state}'")),
-            "case {case:?}: expected the cause to name the state '{state}', got {cause:?}"
+            message.contains(&format!("/States/{state}/Resource")),
+            "case {case:?}: expected the refusal to locate the Resource that asked, got \
+             {message:?}"
         );
-
-        // And the ASYNCHRONOUS start of the same EXPRESS machine reaches the same
-        // outcome: the refusal belongs to the workflow type, not to the call that
-        // started it. An EXPRESS execution is not reported by `DescribeExecution`, so
-        // what it ended as is read off the store the start wrote.
-        let started = emulator
-            .ok(
-                "StartExecution",
-                &json!({ "stateMachineArn": express, "name": format!("async-{index}") }),
+        // Nothing was created: the name is free, which the STANDARD type takes.
+        let (created, answered) = emulator
+            .call(
+                "CreateStateMachine",
+                &json!({
+                    "name": &name,
+                    "definition": &definition,
+                    "roleArn": ROLE_ARN,
+                }),
             )
             .await;
-        let execution_arn = string(&started, "executionArn");
-        std::thread::sleep(PAST_THE_EXECUTION_DELAY);
-        let (status, error, async_cause) = {
-            let store = emulator.store();
-            let mut store = store.lock();
-            store.settle(std::time::SystemTime::now());
-            let execution = store
-                .executions
-                .get(&execution_arn)
-                .unwrap_or_else(|| panic!("case {case:?}: expected the execution to be stored"));
-            (
-                execution.status.clone(),
-                execution.error.clone(),
-                execution.cause.clone().unwrap_or_default(),
-            )
-        };
         assert_eq!(
-            (status.as_str(), error.as_deref()),
-            ("FAILED", Some(RUNTIME_ERROR)),
-            "case {case:?}: expected an asynchronous EXPRESS execution to fail the same way, got \
-             {status} / {error:?}"
-        );
-        assert!(
-            async_cause.contains(EXPRESS_RUN_A_JOB_UNSUPPORTED) && async_cause.contains(&format!("'{state}'")),
-            "case {case:?}: expected the same refusal from the asynchronous start, got \
-             {async_cause:?}"
+            created, 200,
+            "case {case:?}: expected the refused create to have stored nothing, got {created} \
+             with {answered:?}"
         );
     }
 
-    // Nothing was started for the child: the refusal is decided before the
-    // integration's own call, so no execution of it exists.
+    // Nothing was started for the child either: no execution of a refused definition
+    // exists to have called it.
     assert_eq!(
         started_count(&emulator, &child_arn).await,
         0,

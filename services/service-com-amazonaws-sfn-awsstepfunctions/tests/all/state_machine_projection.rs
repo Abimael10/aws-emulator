@@ -309,8 +309,12 @@ async fn describe_reports_the_variables_each_state_references() {
             json!({ "Call": ["count", "suffix"] }),
         ),
         (
+            // The variable the reference field names is ASSIGNED by the state before
+            // it: a JSONPath reference naming one nothing in scope assigns is a
+            // definition no create accepts (`definition_graph_diagnostics` is that
+            // rule), so a definition that reports such a reference assigns it.
             "a JSONPath reference field beside a path and the context",
-            r#"{"StartAt":"Path","States":{"Path":{"Type":"Pass","Parameters":{"greeting.$":"$hello","from.$":"$.input.x","run.$":"$$.Execution.Name"},"End":true}}}"#
+            r#"{"StartAt":"Set","States":{"Set":{"Type":"Pass","Assign":{"hello.$":"$.input.x"},"Next":"Path"},"Path":{"Type":"Pass","Parameters":{"greeting.$":"$hello","from.$":"$.input.x","run.$":"$$.Execution.Name"},"End":true}}}"#
                 .to_string(),
             json!({ "Path": ["hello"] }),
         ),

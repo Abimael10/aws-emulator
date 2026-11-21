@@ -3256,14 +3256,17 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
 ///
 /// The rules of a routing configuration's own shape, in the order the service judges
 /// them: each entry names a state machine VERSION of this service in the endpoint's
-/// region, "if you specify the ARN of a second version, it must belong to the same
-/// state machine as the first version", and "the sum of the weights in the routing
-/// configuration must be equal to 100".
+/// region, no two entries name the SAME version ("an array of objects that specify up
+/// to two state machine versions" — a configuration that names one version twice
+/// specifies one version and shifts no traffic between them), "if you specify the ARN
+/// of a second version, it must belong to the same state machine as the first version",
+/// and "the sum of the weights in the routing configuration must be equal to 100".
 fn routing_shape(
     routing: &[RoutingConfigurationListItem],
     endpoint_region: &str,
 ) -> Result<String, RoutingRejection> {
     let mut owner: Option<String> = None;
+    let mut named: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
     for item in routing {
         let arn = item.state_machine_version_arn.as_str();
         let parsed =
@@ -3277,17 +3280,26 @@ fn routing_shape(
             .filter(|_| parsed.label().is_none())
             .and_then(qualifier_version);
         if version.is_none() {
-            return Err(RoutingRejection::InvalidRouting(format!(
-                "{arn} is not the ARN of a state machine version"
-            )));
+            return Err(RoutingRejection::InvalidRouting(
+                routing_not_a_version_message(routing),
+            ));
+        }
+        // Each entry of the configuration is a SHARE of the traffic for one version,
+        // so two entries naming one version declare two shares of the same thing and
+        // the configuration says which of them is that version's in neither. The
+        // refusal states the rule and then the ARNs the request submitted, in the order
+        // it wrote them.
+        if !named.insert(arn) {
+            return Err(RoutingRejection::InvalidRouting(
+                routing_duplicate_version_message(routing),
+            ));
         }
         let machine = version_state_machine(arn);
         match owner.as_deref() {
             Some(first) if first != machine => {
-                return Err(RoutingRejection::InvalidRouting(format!(
-                    "every version of a routing configuration must belong to one state \
-                     machine, got {first} and {machine}"
-                )))
+                return Err(RoutingRejection::InvalidRouting(
+                    routing_one_state_machine_message(routing),
+                ))
             }
             Some(_) => {}
             None => owner = Some(machine.to_string()),

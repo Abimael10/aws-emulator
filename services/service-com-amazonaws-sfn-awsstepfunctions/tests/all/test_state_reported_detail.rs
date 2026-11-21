@@ -687,9 +687,9 @@ async fn the_state_types_test_state_does_not_test_are_refused_in_its_own_words()
 ///
 /// Rows vary along the rejected value (a name of its own, one differing from a
 /// permitted value only in case, and the empty string) and along the ENUM:
-/// `InspectionLevel` and `ExecutionStatus`, whose stated orders this service's refusals
-/// fix, and `StateMachineType` and `ExecutionRedriveFilter`, which it states no order
-/// for and which are therefore listed as the model declares them.
+/// `InspectionLevel`, `ExecutionStatus` and `StateMachineType`, whose stated orders this
+/// service's refusals fix, and `ExecutionRedriveFilter`, which it states no order for
+/// and which is therefore listed as the model declares it.
 #[tokio::test]
 async fn an_advertised_enum_value_set_is_listed_in_the_order_the_service_states_it() {
     // RECORDED for `InspectionLevel`; the model declares it `INFO | DEBUG | TRACE`
@@ -699,10 +699,9 @@ async fn an_advertised_enum_value_set_is_listed_in_the_order_the_service_states_
     // FAILED | TIMED_OUT | ABORTED | PENDING_REDRIVE`
     // (`smithy_query(query="shape",shape="ExecutionStatus")`).
     const EXECUTION_STATUSES: &str = "[SUCCEEDED, TIMED_OUT, PENDING_REDRIVE, ABORTED, FAILED, RUNNING]";
-    // `StateMachineType`, as the model declares it
-    // (`smithy_query(query="shape",shape="StateMachineType")` -> `STANDARD | EXPRESS`):
-    // this service states no order of its own for it.
-    const MACHINE_TYPES: &str = "[STANDARD, EXPRESS]";
+    // RECORDED for `StateMachineType`; the model declares it the other way round
+    // (`smithy_query(query="shape",shape="StateMachineType")` -> `STANDARD | EXPRESS`).
+    const MACHINE_TYPES: &str = "[EXPRESS, STANDARD]";
     // `ExecutionRedriveFilter`, likewise as the model declares it
     // (`smithy_query(query="shape",shape="ExecutionRedriveFilter")` -> `REDRIVEN |
     // NOT_REDRIVEN`).
@@ -761,7 +760,7 @@ async fn an_advertised_enum_value_set_is_listed_in_the_order_the_service_states_
             REDRIVE_FILTERS,
         ),
         (
-            "an enum this service states no order for",
+            "an enum this service states its own order for, on another operation",
             "CreateStateMachine",
             json!({
                 "name": "listed-enum-order",

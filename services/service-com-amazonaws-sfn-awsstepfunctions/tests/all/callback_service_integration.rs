@@ -27,7 +27,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
-    asl::{EXPRESS_CALLBACK_UNSUPPORTED, RUNTIME_ERROR, TIMEOUT_ERROR},
+    asl::{RUNTIME_ERROR, TIMEOUT_ERROR},
     read_task_token, EVENT_EXECUTION_FAILED, EVENT_TASK_SUBMITTED, EVENT_TASK_SUCCEEDED,
     EVENT_TASK_TIMED_OUT,
 };
@@ -845,11 +845,13 @@ async fn a_bound_that_ran_out_reports_its_error_name_and_no_cause() {
 
 /// A callback task the execution cannot WAIT at is not run: the state fails with
 /// ASL's `States.Runtime` and a cause that says what was not run, and no call is made
-/// for it.
+/// for it — and where the WORKFLOW TYPE is what cannot wait, the definition is refused
+/// before any state machine is created at all.
 ///
-/// The rows are the places an execution has nowhere to wait: an EXPRESS workflow,
-/// which waits for no answer from outside, and a `Map` iteration or a `Parallel`
-/// branch, each of which is walked to its own end inside the enclosing state's turn.
+/// The rows are the places an execution has nowhere to wait: a `Map` iteration or a
+/// `Parallel` branch, each of which is walked to its own end inside the enclosing
+/// state's turn. An EXPRESS workflow, which waits for no answer from outside, is the
+/// create-time half of the same rule and is asserted on its own below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_callback_task_the_execution_cannot_wait_at_is_not_run() {
     let inner = json!({
@@ -863,14 +865,7 @@ async fn a_callback_task_the_execution_cannot_wait_at_is_not_run() {
     });
     // (case, the state machine type, the definition, the key no item may appear under,
     //  what the cause must state)
-    let rows: [(&str, &str, Value, &str, &str); 3] = [
-        (
-            "an EXPRESS workflow, which waits for no answer from outside",
-            "EXPRESS",
-            definition(Integration::PutItem, "express", "", &json!({})),
-            "express",
-            EXPRESS_CALLBACK_UNSUPPORTED,
-        ),
+    let rows: [(&str, &str, Value, &str, &str); 2] = [
         (
             "a Map iteration, which is walked to its own end",
             "STANDARD",
@@ -969,4 +964,31 @@ async fn a_callback_task_the_execution_cannot_wait_at_is_not_run() {
             "case {case:?}: no call may be made for a task nothing can wait at"
         );
     }
+
+    // The WORKFLOW TYPE that can wait for nothing is the create-time half of the rule:
+    // an EXPRESS state machine asking for the callback pattern is refused where it is
+    // submitted, so no execution of one exists to make the call. What the refusal
+    // STATES is pinned by `definition_static_rules`.
+    let case = "an EXPRESS workflow, which waits for no answer from outside";
+    let (status, code) = chain
+        .sfn_err(
+            "CreateStateMachine",
+            &json!({
+                "name": "unwaitable-express",
+                "definition": definition(Integration::PutItem, "express", "", &json!({}))
+                    .to_string(),
+                "roleArn": ROLE_ARN,
+                "type": "EXPRESS",
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "InvalidDefinition"),
+        "case {case:?}: expected 400 InvalidDefinition, got {status} {code}"
+    );
+    assert!(
+        chain.item(TABLE, "express").await.is_none(),
+        "case {case:?}: no call may be made for a definition no state machine was created from"
+    );
 }

@@ -26,6 +26,7 @@ use serde_json::{json, Value};
 use crate::execution_history::history;
 use crate::state_machine_lifecycle::{
     create_machine, describe_execution, start_execution, Emulator, PAST_THE_EXECUTION_DELAY,
+    ROLE_ARN,
 };
 
 /// Run `definition` over `input` and describe the execution once it has settled.
@@ -34,6 +35,28 @@ async fn ran(emulator: &Emulator, name: &str, definition: &Value, input: &str) -
     let execution = start_execution(emulator, &machine, "only", input).await;
     ::tokio::time::sleep(PAST_THE_EXECUTION_DELAY).await;
     describe_execution(emulator, &execution).await
+}
+
+/// Create a state machine from `definition`, requiring the create to be REFUSED, and
+/// report the status and error code it answered.
+async fn create_refused(emulator: &Emulator, name: &str, definition: &str) -> (u16, String) {
+    let (status, body) = emulator
+        .call(
+            "CreateStateMachine",
+            &json!({ "name": name, "definition": definition, "roleArn": ROLE_ARN }),
+        )
+        .await;
+    assert_ne!(
+        status, 200,
+        "case {name}: expected the create to be refused, got 200 with {body:?}"
+    );
+    (
+        status,
+        body.get("__type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
 }
 
 /// The `output` of a described execution, parsed.
@@ -373,6 +396,12 @@ async fn a_comparator_the_data_does_not_fit_does_not_match() {
 
 /// A STRUCTURAL defect of a choice rule still fails the execution: the rule says
 /// nothing that can be decided about any data, so it is not a non-match.
+///
+/// These are the defects the language's SCHEMA admits — every field is one the language
+/// declares on a rule — so the state machine is created and the defect surfaces when the
+/// rule is evaluated. A rule carrying a field the language declares on no rule at all
+/// (a misspelled or invented comparator) is refused where it is submitted instead, which
+/// is the other half of the rule and is asserted below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_structurally_broken_choice_rule_still_fails_the_execution() {
     // (case, the rule, the input)
@@ -383,18 +412,13 @@ async fn a_structurally_broken_choice_rule_still_fails_the_execution() {
             r#"{"n":3}"#,
         ),
         (
-            "a comparator name the language does not define",
-            json!({ "Variable": "$.n", "NumericBetween": 3, "Next": "Matched" }),
+            "a rule naming no value to test at all",
+            json!({ "NumericEquals": 3, "Next": "Matched" }),
             r#"{"n":3}"#,
         ),
         (
-            "an ordering the language does not define over booleans",
-            json!({ "Variable": "$.flag", "BooleanLessThan": true, "Next": "Matched" }),
-            r#"{"n":3,"flag":true}"#,
-        ),
-        (
-            "a comparator the language does not define at all",
-            json!({ "Variable": "$.n", "Approximately": 3, "Next": "Matched" }),
+            "a rule naming a value and no comparator for it",
+            json!({ "Variable": "$.n", "Next": "Matched" }),
             r#"{"n":3}"#,
         ),
     ];
@@ -420,6 +444,46 @@ async fn a_structurally_broken_choice_rule_still_fails_the_execution() {
             described.get("error").and_then(Value::as_str),
             Some("States.Runtime"),
             "case {case:?}: expected States.Runtime, got {described:?}"
+        );
+    }
+
+    // A field the language declares on no rule is refused at the create: the schema of
+    // a rule is closed, so such a rule could decide nothing for any data.
+    for (index, (case, rule)) in [
+        (
+            "a comparator name the language does not define",
+            json!({ "Variable": "$.n", "NumericBetween": 3, "Next": "Matched" }),
+        ),
+        (
+            "an ordering the language does not define over booleans",
+            json!({ "Variable": "$.flag", "BooleanLessThan": true, "Next": "Matched" }),
+        ),
+        (
+            "a comparator the language does not define at all",
+            json!({ "Variable": "$.n", "Approximately": 3, "Next": "Matched" }),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let definition = json!({
+            "StartAt": "Pick",
+            "States": {
+                "Pick": { "Type": "Choice", "Choices": [rule], "Default": "Fell" },
+                "Matched": { "Type": "Pass", "End": true },
+                "Fell": { "Type": "Pass", "End": true }
+            }
+        });
+        let (status, code) = create_refused(
+            &emulator,
+            &format!("choice-unknown-{index}"),
+            &definition.to_string(),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidDefinition"),
+            "case {case:?}: expected 400 InvalidDefinition, got {status} {code}"
         );
     }
 }

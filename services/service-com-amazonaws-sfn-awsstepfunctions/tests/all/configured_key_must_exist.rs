@@ -90,6 +90,10 @@ async fn a_configuration_on_an_absent_key_is_refused_by_every_operation() {
                 "UpdateStateMachine",
                 json!({
                     "stateMachineArn": &machine,
+                    // Named beside the configuration under test: an update must carry
+                    // at least one of the members its own rule admits, which an
+                    // `encryptionConfiguration` is not one of.
+                    "definition": HELLO_DEFINITION,
                     "encryptionConfiguration": customer_managed(&reference),
                 }),
             ),

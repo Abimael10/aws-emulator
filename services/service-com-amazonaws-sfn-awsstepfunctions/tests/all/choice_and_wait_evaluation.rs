@@ -31,6 +31,8 @@
 //! `execution_interpreter`'s; `tests/all.rs` is this binary's crate root, so both are
 //! reached through `crate::<suite>`.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::asl::{MAX_WAIT_SECONDS, RUNTIME_ERROR};
@@ -467,10 +469,13 @@ async fn a_state_members_failure_names_the_member_the_definition_wrote() {
     // duration (`Seconds`/`SecondsPath`, `Timestamp`/`TimestampPath`) and a `Map`
     // state's concurrency (`MaxConcurrency`/`MaxConcurrencyPath`), which is a member
     // the issue did not cite — with every way their value can fail to be one the member
-    // accepts: a negative figure, a non-numeric string, a fraction, a figure past the
-    // longest wait, a string that denotes no instant, a value of the wrong JSON type,
-    // and a path the input carries no value for. (The member catalog is the Amazon
-    // States Language's own for each state type.)
+    // accepts AT RUN TIME: a path resolving to a negative figure, a non-numeric string,
+    // a fraction, a figure past the longest wait, a string that denotes no instant, a
+    // value of the wrong JSON type, and a path the input carries no value for. A figure
+    // the definition WRITES outside the bound the language documents for it is refused
+    // at the create instead (`definition_static_rules` is that rule), so no row here
+    // writes one. (The member catalog is the Amazon States Language's own for each
+    // state type.)
     let rows: Vec<(&str, Value, String, &str, &str)> = vec![
         (
             "SecondsPath resolving to a negative figure",
@@ -506,13 +511,6 @@ async fn a_state_members_failure_names_the_member_the_definition_wrote() {
             "{}".to_string(),
             "SecondsPath",
             "Seconds",
-        ),
-        (
-            "Seconds written as a negative figure",
-            json!({"Type":"Wait","Seconds":-1,"End":true}),
-            "{}".to_string(),
-            "Seconds",
-            "SecondsPath",
         ),
         (
             "Seconds written as a string",
@@ -581,10 +579,9 @@ async fn a_state_members_failure_names_the_member_the_definition_wrote() {
             create_machine(&emulator, &format!("state-member-{index}"), &definition).await;
         started.push(start_execution(&emulator, &machine, "only", input).await);
     }
-    std::thread::sleep(PAST_THE_EXECUTION_DELAY);
 
     for ((case, _, _, member, other), execution) in rows.iter().zip(started) {
-        let described = describe_execution(&emulator, &execution).await;
+        let described = settled(&emulator, case, &execution).await;
         assert_eq!(
             (
                 described.get("status").and_then(Value::as_str),
@@ -607,6 +604,31 @@ async fn a_state_members_failure_names_the_member_the_definition_wrote() {
             "case {case:?}: expected the cause to name {member:?} alone, not the other member \
              {other:?} of the pair, got {cause:?}"
         );
+    }
+}
+
+/// The record of `execution_arn` once it has left `RUNNING`, looked for again until it
+/// has or a generous deadline passes.
+///
+/// The wait is for the CONDITION — the execution settling — so a host that settles one
+/// quickly spends none of the deadline and a loaded one is not cut short: nothing here
+/// measures how fast the host runs.
+async fn settled(emulator: &Emulator, case: &str, execution_arn: &str) -> Value {
+    /// How often the execution is looked at again, and how long it is waited for at all.
+    const POLL: Duration = Duration::from_millis(25);
+    const DEADLINE: Duration = Duration::from_secs(120);
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let described = describe_execution(emulator, execution_arn).await;
+        if described.get("status").and_then(Value::as_str) != Some("RUNNING") {
+            return described;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the execution to settle, got {described:?}"
+        );
+        tokio::time::sleep(POLL).await;
     }
 }
 
