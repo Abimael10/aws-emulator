@@ -98,6 +98,28 @@ pub(crate) async fn refused(
     uri: &str,
     body: &str,
 ) -> (u16, String, serde_json::Value) {
+    let (status, class, document) = served(router, method, uri, body).await;
+    let parsed = if document.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(&document)
+            .unwrap_or_else(|e| panic!("{method} {uri}: body is not JSON ({e}): {document}"))
+    };
+    (status, class, parsed)
+}
+
+/// Dispatch a call and read back its status, the error CLASS the answer names, and its body
+/// AS SERVED: the bytes, rather than a parse of them.
+///
+/// The one dispatch of this suite and its siblings; [`refused`] is this with the body parsed.
+/// A case whose subject is WHICH DOCUMENT was serialized — an empty JSON object against an
+/// absent body, a member a parse would normalise away — reads it here instead.
+pub(crate) async fn served(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> (u16, String, String) {
     let response = router.dispatch(request(method, uri, body)).await;
     let status = response.status().as_u16();
     let class = response
@@ -107,17 +129,14 @@ pub(crate) async fn refused(
         .map(::service_common::error_type_locator::header_shape_named)
         .unwrap_or_default()
         .to_string();
-    let parsed = if response.body().is_empty() {
-        serde_json::Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|e| {
-            panic!(
-                "{method} {uri}: body is not JSON ({e}): {}",
-                String::from_utf8_lossy(response.body())
-            )
-        })
+    let document = match std::str::from_utf8(response.body()) {
+        Ok(text) => text.to_string(),
+        Err(error) => panic!(
+            "{method} {uri}: the answer is not UTF-8 ({error}): {}",
+            String::from_utf8_lossy(response.body())
+        ),
     };
-    (status, class, parsed)
+    (status, class, document)
 }
 
 /// Percent-encode the reserved characters an ARN `resourceIdentifier` or a base64
