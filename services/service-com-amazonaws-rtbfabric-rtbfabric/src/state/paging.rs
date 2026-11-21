@@ -10,7 +10,7 @@
 //! drift apart about what a page is, and a rule fixed for one walk is fixed for
 //! every walk.
 
-use super::encode_next_token;
+use super::{encode_next_token, PageTokenKey, Walk};
 
 /// The page size a request that states no usable `maxResults` gets.
 ///
@@ -52,9 +52,12 @@ pub fn page_size(requested: Option<i32>, cap: Option<i32>) -> usize {
 /// of a record, `resume_after` is the cursor a caller's token decoded to — the walk
 /// continues strictly after it — and the returned token is issued only while
 /// records remain after this page, so a caller stops paging exactly when the
-/// enumeration is exhausted.
+/// enumeration is exhausted. `walk` is which enumeration this is, and travels inside
+/// the token so that only this walk resumes from it; `key` is the store's own secret
+/// the token is authenticated under, so a caller cannot assemble a cursor of its own.
 pub fn page_of<'records, Record>(
-    operation: &str,
+    key: &PageTokenKey,
+    walk: &Walk,
     ordered: &'records [Record],
     cursor_of: impl Fn(&Record) -> &str,
     resume_after: Option<&str>,
@@ -70,7 +73,7 @@ pub fn page_of<'records, Record>(
     let next_token = (end < ordered.len())
         .then(|| {
             page.last()
-                .map(|last| encode_next_token(operation, cursor_of(last), now))
+                .map(|last| encode_next_token(key, walk, cursor_of(last), now))
         })
         .flatten();
     (page, next_token)
@@ -78,12 +81,15 @@ pub fn page_of<'records, Record>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::decode_next_token;
+    use super::super::{decode_next_token, PageTokenKey, Walk};
     use super::{page_of, page_size, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
     use ::std::time::{Duration, SystemTime};
 
-    /// The operation a walk is scoped to, as a handler passes it.
-    const OPERATION: &str = "ListResponderGateways";
+    /// The walk a page is taken over, as a handler names it: this one is scoped to the
+    /// whole service, so the operation alone identifies it.
+    fn operation() -> Walk {
+        Walk::of("ListResponderGateways")
+    }
 
     /// The instant a token is issued at, fixed so nothing here depends on the wall
     /// clock.
@@ -131,6 +137,7 @@ mod tests {
     #[test]
     fn a_walk_reports_every_record_once_and_stops_when_it_is_exhausted() {
         let records: Vec<String> = (0..7).map(|n| format!("rtb-gw-{n}")).collect();
+        let key = PageTokenKey::new();
 
         for (case, stored, per_page) in [
             ("an empty store", 0usize, 3usize),
@@ -146,7 +153,8 @@ mod tests {
             let mut pages = 0usize;
             loop {
                 let (reported, next_token) = page_of(
-                    OPERATION,
+                    &key,
+                    &operation(),
                     ordered,
                     |id: &String| id.as_str(),
                     resume_after.as_deref(),
@@ -162,7 +170,7 @@ mod tests {
                 match next_token {
                     Some(token) => {
                         resume_after = Some(
-                            decode_next_token(OPERATION, &token, issued_at())
+                            decode_next_token(&key, &operation(), &token, issued_at())
                                 .expect("a token this walk issued is one it resumes from"),
                         );
                     }

@@ -35,7 +35,8 @@ pub use certificates::{
 };
 pub use external_links::{OutboundExternalLink, CONNECTIVITY_TYPE_PUBLIC_EGRESS};
 pub use page_tokens::{
-    decode_next_token, encode_next_token, TokenRefusal, MAX_TOKEN_LENGTH, TOKEN_LIFETIME,
+    decode_next_token, encode_next_token, PageTokenKey, TokenRefusal, Walk, MAX_TOKEN_LENGTH,
+    TOKEN_LIFETIME,
 };
 pub use paging::{page_of, page_size, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};
 pub use routing_rules::{
@@ -421,6 +422,12 @@ pub struct ComAmazonawsRtbfabricRtbfabricState {
     /// Monotonic source of the id suffixes this emulator instance mints, so no
     /// two gateways or links ever share an id.
     pub next_id: u64,
+    /// The secret this store's `nextToken`s are authenticated under, drawn from the
+    /// system's randomness when the store is created and never reported
+    /// ([`PageTokenKey`], whose own `Debug` renders nothing of it). It is what lets a
+    /// paginated read tell a token one of its walks ISSUED from one a caller
+    /// assembled or another store minted.
+    pub page_tokens: PageTokenKey,
 }
 
 impl ComAmazonawsRtbfabricRtbfabricState {

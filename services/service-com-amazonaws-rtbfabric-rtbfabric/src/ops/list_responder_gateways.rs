@@ -158,13 +158,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would have found it.
         let store = state.lock();
 
+        // Nothing narrows this listing: it walks every responder gateway the store
+        // holds, so the operation alone identifies the walk its token belongs to.
+        let walk = crate::state::Walk::of(Self::NAME);
+        // Taken off the store before the ids this call reports are borrowed:
+        // `PageTokenKey` is `Copy`, so the key travels by value.
+        let token_key = store.page_tokens;
+
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_next_token(Self::NAME, token, now).map_err(|refusal| {
-                    ListResponderGatewaysErrorModeled::ValidationException(ValidationException {
-                        message: refusal.message(Self::NAME),
-                    })
-                })?,
+                crate::state::decode_next_token(&token_key, &walk, token, now).map_err(
+                    |refusal| {
+                        ListResponderGatewaysErrorModeled::ValidationException(
+                            ValidationException {
+                                message: refusal.message(Self::NAME),
+                            },
+                        )
+                    },
+                )?,
             ),
             None => None,
         };
@@ -186,7 +197,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handed out is this service's one page walk, shared with every other
         // listing of it.
         let (page, next_token) = crate::state::page_of(
-            Self::NAME,
+            &token_key,
+            &walk,
             &gateway_ids,
             |id: &&str| id,
             resume_after.as_deref(),

@@ -1870,6 +1870,155 @@ async fn a_link_listing_token_this_operation_never_issued_is_refused() {
     );
 }
 
+#[tokio::test]
+async fn a_link_listing_token_is_refused_by_every_gateway_but_the_one_whose_walk_issued_it() {
+    let case = "a link listing token replayed on another gateway";
+    let fabric = Fabric::new();
+    let row = &ROWS[0];
+
+    // Link ids are minted from a monotonic counter, so the hub built first holds the
+    // lower ids. Replaying a token one way puts the foreign cursor BELOW every link
+    // of the addressed gateway (a page that would be cut short), the other way ABOVE
+    // all of them (a page that would be empty): both directions are rows below.
+    let early = fabric.hub_with_links(case, row, 3, "cross-early").await;
+    let late = fabric.hub_with_links(case, row, 3, "cross-late").await;
+
+    // A gateway that is an end of exactly one link — a hub's peer — and one that is
+    // an end of none, so the rows also differ in how much the addressed gateway has
+    // to report.
+    let (_, peer_of_early) = early.links[0].clone();
+    let (status, lone) = fabric
+        .send(
+            "POST",
+            "/requester-gateway",
+            Some(row.requester_body("cross-lone")),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected CreateRequesterGateway to answer 200, got {status} {lone:?}"
+    );
+    let lone_id = text(&lone, "gatewayId");
+
+    // Each hub's own token, taken one page into its own walk so a cursor exists at
+    // all; with three links, a page of one leaves that walk more to report.
+    let (_, early_token) = fabric
+        .list_links(case, &early.gateway_id, Some(1), None)
+        .await;
+    let early_token = early_token
+        .unwrap_or_else(|| panic!("case {case:?}: expected a token with links left on the first hub"));
+    let (_, late_token) = fabric
+        .list_links(case, &late.gateway_id, Some(1), None)
+        .await;
+    let late_token = late_token.unwrap_or_else(|| {
+        panic!("case {case:?}: expected a token with links left on the second hub")
+    });
+
+    // The refusal a token no walk of this service issued already gets, read off the
+    // wire: a token belonging to ANOTHER gateway's walk is refused the same way,
+    // rather than being read as a cursor into the addressed gateway's links.
+    let (status, unrecognised) = fabric
+        .send(
+            "GET",
+            &format!("/gateway/{}/links/?nextToken=not-a-token", early.gateway_id),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected a token this listing never issued to be refused with 400, got {status} {unrecognised:?}"
+    );
+    let expected_type = unrecognised["__type"].clone();
+    let expected_message = text(&unrecognised, "message");
+
+    // A token assembled for the addressed gateway's own walk, but not by this store:
+    // the cursor is authenticated under a secret the store never reveals, so a value
+    // with a minted token's every other property is still not one this walk issued.
+    let elsewhere = service_com_amazonaws_rtbfabric_rtbfabric::state::encode_next_token(
+        &service_com_amazonaws_rtbfabric_rtbfabric::state::PageTokenKey::new(),
+        &service_com_amazonaws_rtbfabric_rtbfabric::state::Walk::within(
+            "ListLinks",
+            &[early.gateway_id.as_str()],
+        ),
+        &early.links[0].0,
+        std::time::SystemTime::now(),
+    );
+
+    for (token_case, gateway_id, token) in [
+        (
+            "a cursor above every link of the addressed gateway",
+            &early.gateway_id,
+            &late_token,
+        ),
+        (
+            "a cursor below every link of the addressed gateway",
+            &late.gateway_id,
+            &early_token,
+        ),
+        (
+            "a cursor replayed on a peer that is an end of one link",
+            &peer_of_early,
+            &early_token,
+        ),
+        (
+            "a cursor replayed on a gateway that is an end of no link",
+            &lone_id,
+            &early_token,
+        ),
+        (
+            "this very walk's scope under another store's secret",
+            &early.gateway_id,
+            &elsewhere,
+        ),
+    ] {
+        let (status, body) = fabric
+            .send(
+                "GET",
+                &format!("/gateway/{gateway_id}/links/?nextToken={token}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {token_case:?}: expected {token:?}, which gateway {gateway_id:?} never issued, to be refused with 400, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["__type"], expected_type,
+            "case {token_case:?}: expected the same refusal as a token this listing never issued ({expected_type:?}), got {:?}",
+            body["__type"]
+        );
+        assert_eq!(
+            text(&body, "message"),
+            expected_message,
+            "case {token_case:?}: expected {expected_message:?}, got {:?}",
+            body["message"]
+        );
+    }
+
+    // Scoping a token to the gateway whose walk issued it refuses the foreign
+    // tokens above without narrowing what a walk of its own listing reports: each
+    // gateway still pages its own links, once each and in order.
+    for (walk_case, gateway_id, expected) in [
+        ("the first hub", &early.gateway_id, early.link_ids()),
+        ("the second hub", &late.gateway_id, late.link_ids()),
+        (
+            "a peer that is an end of one link",
+            &peer_of_early,
+            vec![early.links[0].0.clone()],
+        ),
+    ] {
+        let pages = fabric.walk_links(walk_case, gateway_id, Some(1)).await;
+        let walked: Vec<String> = pages
+            .iter()
+            .flat_map(|(entries, _)| entries.iter().map(|entry| text(entry, "linkId")))
+            .collect();
+        assert_eq!(
+            walked, expected,
+            "case {walk_case:?}: expected its own walk to report every link once in id order, got {walked:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Outbound external links: `CreateOutboundExternalLink` and
 // `GetOutboundExternalLink`.

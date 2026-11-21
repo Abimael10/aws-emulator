@@ -186,13 +186,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // This listing is addressed to one gateway, so it walks only that gateway's
+        // links: the gateway identifies the walk beside the operation name, and a
+        // cursor into one gateway's enumeration is not an index into another's. A
+        // token any other walk issued is therefore refused rather than resumed from.
+        let walk = crate::state::Walk::within(Self::NAME, &[input.gateway_id.as_str()]);
+        // Taken off the store before the records this call reports are borrowed:
+        // `PageTokenKey` is `Copy`, so the key travels by value.
+        let token_key = store.page_tokens;
+
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(
-                crate::state::decode_next_token(Self::NAME, token, now).map_err(|refusal| {
-                    ListLinksErrorModeled::ValidationException(ValidationException {
-                        message: refusal.message(Self::NAME),
-                    })
-                })?,
+                crate::state::decode_next_token(&token_key, &walk, token, now).map_err(
+                    |refusal| {
+                        ListLinksErrorModeled::ValidationException(ValidationException {
+                            message: refusal.message(Self::NAME),
+                        })
+                    },
+                )?,
             ),
             None => None,
         };
@@ -217,7 +228,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handed out is this service's one page walk, shared with every other
         // listing of it.
         let (reported, next_token) = crate::state::page_of(
-            Self::NAME,
+            &token_key,
+            &walk,
             &mine,
             |link: &&crate::state::Link| link.link_id.as_str(),
             resume_after.as_deref(),
