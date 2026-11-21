@@ -310,9 +310,26 @@ async fn a_static_parameter_change_reaches_the_engine_only_after_a_reboot() {
             }),
         )
         .await;
+    // The table is still THERE, which is the columns the catalogue describes for
+    // it; `TableName` only echoes the path the request asked about, so it says
+    // nothing about what survived the restart.
+    let columns: Vec<String> = described["ColumnList"]
+        .as_array()
+        .map(|columns| {
+            columns
+                .iter()
+                .map(|column| column["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
     assert_eq!(
-        described["TableName"], "kept",
+        columns,
+        vec!["id".to_string(), "name".to_string()],
         "a restart leaves the cluster's tables where they were: {described}"
+    );
+    assert_eq!(
+        described["TableName"], json!(format!("{DATABASE}..kept")),
+        "the described path is the one the request named: {described}"
     );
     let kept = harness
         .one_value("the data a restart kept", cluster, "SELECT id FROM kept")

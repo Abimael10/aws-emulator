@@ -415,8 +415,9 @@ async fn a_column_of_a_schema_of_its_own_reports_that_schema() {
             "case {schema}: expected the columns of {schema}.regions, got {described}"
         );
         assert_eq!(
-            described["TableName"], json!("regions"),
-            "case {schema}: the described table is named without its schema, got {described}"
+            described["TableName"], json!(format!("dev.{schema}.regions")),
+            "case {schema}: the described path carries the schema it was asked about, so the \
+             two same-named tables are told apart, got {described}"
         );
         for column in list(&described, "ColumnList") {
             assert_eq!(

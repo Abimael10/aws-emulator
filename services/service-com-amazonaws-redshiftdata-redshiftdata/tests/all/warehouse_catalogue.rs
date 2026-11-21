@@ -310,9 +310,11 @@ async fn describe_table_reads_the_provisioned_databases_catalogue() {
             "case {label}: a table the database does not hold describes no column, got \
              {described}"
         );
-        assert!(
-            described.get("TableName").is_none(),
-            "case {label}: no table was described, so none is named, got {described}"
+        assert_eq!(
+            described["TableName"],
+            json!(format!("{}..absent_table", row.provisioned)),
+            "case {label}: the empty answer still names the path it was asked about, with an \
+             empty component for the schema the request did not name, got {described}"
         );
 
         // A database the warehouse holds no database of that name for is the

@@ -989,9 +989,10 @@ async fn describe_table_reports_the_columns_a_table_declares() {
         request["Table"] = json!(table);
         request["Schema"] = json!("public");
         let described = emulator.ok("DescribeTable", &request).await;
+        let path = format!("dev.public.{table}");
         assert_eq!(
-            described["TableName"], json!(table),
-            "case {ddl}: expected TableName {table}, got {described}"
+            described["TableName"], json!(path),
+            "case {ddl}: expected TableName {path}, got {described}"
         );
         let reported = list(&described, "ColumnList");
         assert_eq!(
@@ -1055,9 +1056,10 @@ async fn describe_table_reports_the_columns_a_table_declares() {
         expected,
         "naming no table describes every table of the database, got {all}"
     );
-    assert!(
-        all.get("TableName").is_none(),
-        "a request naming no table reports no single table name, got {all}"
+    assert_eq!(
+        all["TableName"], json!("dev.."),
+        "a request naming neither a schema nor a table still reports the path it asked \
+         about, got {all}"
     );
 }
 
@@ -1182,9 +1184,15 @@ async fn describe_table_refuses_what_the_catalog_does_not_hold() {
             "case {label}: a name the catalog matches nothing for describes no column, got \
              {described}"
         );
-        assert!(
-            described.get("TableName").is_none(),
-            "case {label}: no table was described, so no table is named, got {described}"
+        let path = format!(
+            "dev.{}.{}",
+            request["Schema"].as_str().unwrap_or_default(),
+            request["Table"].as_str().unwrap_or_default()
+        );
+        assert_eq!(
+            described["TableName"], json!(path),
+            "case {label}: the empty answer still names the path it was asked about \
+             ({path}), got {described}"
         );
     }
 

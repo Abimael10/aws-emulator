@@ -6,7 +6,9 @@
 //! narrow the catalogue on the part of a relation's name they filter, and a
 //! name the catalogue holds nothing for describes no column, which is a
 //! successful empty `ColumnList`; only a warehouse or a database that does not
-//! exist is the missing resource.
+//! exist is the missing resource. `TableName` states WHICH path the answer is
+//! about, composed from the request's own `Database`, `Schema` and `Table`
+//! selectors, so it is reported whether or not the catalogue matched anything.
 //! A reporting operation — it
 //! reads the catalog of a database some statement already created and writes
 //! nothing, not even the database itself.
@@ -409,22 +411,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end = offset.saturating_add(page_size).min(columns.len());
 
         Ok(DescribeTableOutput {
-            // The table the request named, as the catalog spells it; a request
-            // that named none describes several tables, so it reports no single
-            // table name and the columns carry their own.
-            table_name: table
-                .is_some()
-                .then(|| {
-                    described
-                        .first()
-                        .map(|described| crate::state::split_relation(&described.table).1.to_string())
-                })
-                .flatten(),
+            // What the request asked ABOUT, not what the catalogue happened to
+            // hold for it: the member states the path this answer describes, so
+            // it is composed from the request's own selectors and is reported
+            // whether or not any relation matched — which is what lets the
+            // empty-`ColumnList` answer above still say which path is empty.
+            table_name: Some(requested_path(
+                &connection.database,
+                schema.as_deref(),
+                table.as_deref(),
+            )),
             column_list: Some(columns[offset..end].to_vec()),
             next_token: (end < columns.len())
                 .then(|| encode_cursor(&cursor_kind, u64::try_from(end).unwrap_or(u64::MAX))),
         })
     }
+}
+
+/// The path a `DescribeTable` request asked about, as its `TableName` reports
+/// it: the request's own `Database`, `Schema` and `Table` selectors joined with
+/// dots, carrying an EMPTY component wherever the request gave no selector —
+/// so a request naming no schema reports the degenerate
+/// `<database>..<table>` form rather than a path of fewer parts.
+///
+/// The composition is the REQUEST's, never the catalogue's: `TableName` is the
+/// only place the response states what it describes, so it identifies its
+/// subject the same way for a name the catalogue holds a relation of and for
+/// one it holds nothing of, and two same-named tables of different schemas are
+/// told apart by the path each answer carries.
+fn requested_path(database: &str, schema: Option<&str>, table: Option<&str>) -> String {
+    format!(
+        "{database}.{}.{}",
+        schema.unwrap_or_default(),
+        table.unwrap_or_default()
+    )
 }
 
 /// Refuse the request as invalid, with the `ValidationException` this operation
