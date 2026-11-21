@@ -157,6 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             crate::state::ASYNC_VERB_DELETE,
             &input.account_id,
+            &input.details.name,
             &input.client_token,
             &crate::state::delete_details_fingerprint(&input.details),
         );

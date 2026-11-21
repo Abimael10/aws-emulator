@@ -3363,28 +3363,34 @@ pub const ASYNC_VERB_DELETE: &str = "delete";
 pub const ASYNC_VERB_PUT_POLICY: &str = "put-policy";
 
 /// The ARN of an asynchronous Multi-Region Access Point request: the
-/// `async-request/mrap/<verb>/<id>` resource in this service's ARN namespace
-/// (`s3`, per the model's `awsService.arnNamespace`), in the Region the request
-/// was signed for — which satisfies the modelled `AsyncRequestTokenARN` pattern
-/// `^arn:.+$`.
+/// `async-request/mrap/<verb>/<name>-<id>` resource in this service's ARN
+/// namespace (`s3`, per the model's `awsService.arnNamespace`), in the Region
+/// the request was signed for — which satisfies the modelled
+/// `AsyncRequestTokenARN` pattern `^arn:.+$`.
 ///
-/// The id is the UUID every service-assigned identifier of this service is
-/// shaped as ([`uuid_from_digest`]), carrying a digest of the request's own
-/// identity — the verb, the account, the caller's `ClientToken` and the details
-/// it submitted — so one request has ONE token: a byte-identical retry is
-/// handed the token the first call returned, which is what an
-/// `@idempotencyToken` asks for ("guarantee that requests are unique"), and two
-/// different requests never share a token. The account segment comes from
-/// [`::emulator_server::emulator_arn`], the single source of truth for the
-/// canonical emulator account.
+/// The token NAMES THE WORK it was handed out for, so the trailing segment
+/// carries the Multi-Region Access Point the request is about (`name`, the one
+/// the request submitted in its `Details`) ahead of a per-request identifier: a
+/// client holding a token can tell which access point the asynchronous request
+/// belongs to, and correlate a poll result with the create, delete or policy
+/// put it made, without being handed back an identifier unrelated to anything
+/// it sent.
 ///
-/// The VALUE is this service's own to mint and no caller may depend on a
-/// particular one: what a token must do is name ONE request, which is what the
-/// `DescribeMultiRegionAccessPointOperation` route resolves it as.
+/// The identifier after it is the UUID every service-assigned identifier of
+/// this service is shaped as ([`uuid_from_digest`]), carrying a digest of the
+/// request's own identity — the verb, the account, the caller's `ClientToken`
+/// and the details it submitted — so one request has ONE token: a
+/// byte-identical retry is handed the token the first call returned, which is
+/// what an `@idempotencyToken` asks for ("guarantee that requests are unique"),
+/// and two requests that differ in anything, two creates of one name under
+/// different client tokens included, never share a token. The account segment
+/// comes from [`::emulator_server::emulator_arn`], the single source of truth
+/// for the canonical emulator account.
 pub fn async_request_token_arn(
     region: &str,
     verb: &str,
     account_id: &str,
+    name: &str,
     client_token: &str,
     details: &str,
 ) -> String {
@@ -3393,7 +3399,11 @@ pub fn async_request_token_arn(
     let digest =
         sha2::Sha256::digest(format!("{verb}\n{account_id}\n{client_token}\n{details}").as_bytes());
     let id = uuid_from_digest(&digest);
-    ::emulator_server::emulator_arn("s3", region, &format!("async-request/mrap/{verb}/{id}"))
+    ::emulator_server::emulator_arn(
+        "s3",
+        region,
+        &format!("async-request/mrap/{verb}/{name}-{id}"),
+    )
 }
 
 /// A `CreateMultiRegionAccessPoint` request's details as one string, for

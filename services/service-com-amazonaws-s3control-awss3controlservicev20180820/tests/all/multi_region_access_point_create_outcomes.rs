@@ -337,7 +337,7 @@ async fn a_create_over_buckets_it_cannot_associate_fails_its_request_and_publish
             row.case, created.status, created.body
         );
         let token = created.text("RequestTokenARN").unwrap_or_default();
-        assert_token_shape(row.case, &token, row.region, "create");
+        assert_token_shape(row.case, &token, row.region, "create", row.name);
         submitted.push(token);
     }
 

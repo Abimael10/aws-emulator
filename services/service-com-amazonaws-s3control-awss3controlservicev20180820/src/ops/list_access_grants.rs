@@ -272,8 +272,9 @@ fn matches_every_filter(
 }
 
 /// The listing entry for one grant: every member `ListAccessGrantEntry` declares, from the
-/// record the create wrote — the same facts `GetAccessGrant` reports, less the usage limit,
-/// which the listing's entry shape does not carry.
+/// record the create wrote — the same facts `GetAccessGrant` reports, the grant's usage
+/// limit included, so a client reading a grant off a listing finds everything a read of
+/// that grant reports.
 fn entry_of(record: &crate::state::AccessGrantRecord) -> ListAccessGrantEntry {
     ListAccessGrantEntry {
         created_at: Some(record.created_at),
@@ -285,5 +286,6 @@ fn entry_of(record: &crate::state::AccessGrantRecord) -> ListAccessGrantEntry {
         access_grants_location_configuration: record.location_configuration.clone(),
         grant_scope: Some(record.grant_scope.clone()),
         application_arn: record.application_arn.clone(),
+        usage_limit: Some(record.usage_limit),
     }
 }

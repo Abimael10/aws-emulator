@@ -364,12 +364,20 @@ fn assert_alias_shape(case: &str, alias: &str) {
     );
 }
 
-/// Assert that `token` is a request token ARN for `verb` in `region`: the
-/// `async-request/mrap/<verb>/<id>` resource under the emulator's canonical
-/// account, with a UUID id.
-pub(crate) fn assert_token_shape(case: &str, token: &str, region: &str, verb: &str) {
+/// Assert that `token` is a request token ARN for `verb` on the Multi-Region
+/// Access Point `name` in `region`: the
+/// `async-request/mrap/<verb>/<name>-<id>` resource under the emulator's
+/// canonical account, naming the access point the request was about ahead of a
+/// UUID request id.
+pub(crate) fn assert_token_shape(
+    case: &str,
+    token: &str,
+    region: &str,
+    verb: &str,
+    name: &str,
+) {
     let prefix = format!(
-        "arn:aws:s3:{region}:{}:async-request/mrap/{verb}/",
+        "arn:aws:s3:{region}:{}:async-request/mrap/{verb}/{name}-",
         ::emulator_server::emulator_account_id()
     );
     let id = token.strip_prefix(&prefix).unwrap_or_else(|| {
@@ -422,7 +430,7 @@ async fn create_then_get_reports_the_stored_access_point_for_every_shape_of_crea
             case.case, created.status, created.body
         );
         let token = created.text("RequestTokenARN").unwrap_or_default();
-        assert_token_shape(case.case, &token, case.region, "create");
+        assert_token_shape(case.case, &token, case.region, "create", case.name);
         tokens.insert(token.clone());
 
         assert_eq!(
@@ -851,6 +859,41 @@ async fn a_byte_identical_retry_is_handed_the_first_token_and_creates_nothing() 
     }
 }
 
+/// How long a poll waits for a transition the clock owes before it gives up:
+/// far beyond the span the service holds a Multi-Region Access Point in a
+/// transient status, so a loaded host has room to be slow.
+const RELEASE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll waits between two looks at the condition it waits on.
+const RELEASE_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The read of the access point `name` once the clock owes its release.
+///
+/// Looks again until the record is gone — the CONDITION the delete leaves
+/// pending — or until [`RELEASE_DEADLINE`] has passed, so the test waits on
+/// what it is about rather than on how fast the host runs.
+async fn released_access_point(
+    emulator: &Emulator,
+    case: &str,
+    region: &str,
+    account: &str,
+    name: &str,
+) -> Reply {
+    let deadline = std::time::Instant::now() + RELEASE_DEADLINE;
+    loop {
+        let read = get(emulator, region, account, name).await;
+        if read.status != 200 {
+            return read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the clock to release the deleted access point, got body {}",
+            read.body
+        );
+        tokio::time::sleep(RELEASE_INTERVAL).await;
+    }
+}
+
 #[tokio::test]
 async fn a_delete_releases_the_access_point_once_the_clock_owes_it() {
     let emulator = Emulator::start();
@@ -878,7 +921,7 @@ async fn a_delete_releases_the_access_point_once_the_clock_owes_it() {
             case.case, deleted.status, deleted.body
         );
         let token = deleted.text("RequestTokenARN").unwrap_or_default();
-        assert_token_shape(case.case, &token, case.region, "delete");
+        assert_token_shape(case.case, &token, case.region, "delete", case.name);
         assert_eq!(
             leaf(&leaves_of(&read.body), "AccessPoint/Status"),
             Some(STATUS_DELETING.to_string()),
@@ -889,10 +932,11 @@ async fn a_delete_releases_the_access_point_once_the_clock_owes_it() {
         tokens.push(token);
     }
 
-    std::thread::sleep(settled_wait());
-
     for (case, token) in cases.iter().zip(&tokens) {
-        let read = get(&emulator, case.region, case.account, case.name).await;
+        // Waiting on the CONDITION the clock owes — the record released — not
+        // on a span of wall clock.
+        let read = released_access_point(&emulator, case.case, case.region, case.account, case.name)
+            .await;
         assert_eq!(
             read.status, 404,
             "case {:?}: expected the released access point to be gone, got {} with body {}",
