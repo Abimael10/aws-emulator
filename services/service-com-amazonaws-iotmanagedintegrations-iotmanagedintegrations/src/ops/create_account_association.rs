@@ -11,7 +11,10 @@
 //! authenticate at the third-party platform, which no clock in this emulator performs —
 //! and its `OAuthAuthorizationUrl` is the authorization request that end user completes,
 //! built from that destination's own OAuth configuration
-//! (`crate::state::o_auth_authorization_url`). A
+//! (`crate::state::o_auth_authorization_url`). A destination still waiting for an
+//! authorization flow it already started to be completed takes no second create: that is
+//! the modelled `ConflictException`, carrying this resource's own fixed sentence
+//! (`crate::state::ACCOUNT_ASSOCIATION_CONFLICT_REASON`) and writing nothing. A
 //! retry carrying the same `ClientToken` replays the first call's answer.
 //!
 //! ## Shape of an operation
@@ -230,6 +233,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: Some(crate::state::absent_reference_message(
                         crate::state::CONNECTOR_DESTINATION_RESOURCE_NAME,
                     )),
+                },
+            )
+            .into());
+        }
+
+        // A create STARTS an authorization flow: it answers the authorization request the
+        // end user completes at the third-party platform, and that flow is outstanding
+        // until they do. A connector destination waiting for one flow to be completed
+        // cannot start a second, so a create naming a destination this region already holds
+        // an association with an outstanding flow for is the modelled conflict rather than a
+        // second record — the caller finishes or deletes the association it already has.
+        // The reason is this resource's own fixed sentence
+        // (`crate::state::ACCOUNT_ASSOCIATION_CONFLICT_REASON`): it names the resource class
+        // and quotes nothing of the request or of the stored record. The refusal writes
+        // nothing, so the association already outstanding keeps its identifier, its state
+        // and its authorization URL.
+        if store
+            .outstanding_account_association_for_destination(
+                &region,
+                &input.connector_destination_id,
+            )
+            .is_some()
+        {
+            return Err(CreateAccountAssociationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::ACCOUNT_ASSOCIATION_CONFLICT_REASON.to_string()),
                 },
             )
             .into());

@@ -880,13 +880,16 @@ fn assert_element_arn_carries_its_id<'a>(
 /// Create [`RESOURCES_PER_COLLECTION`] resources of `collection` through the wire, answering
 /// the identifiers the creates minted in creation order.
 async fn seed(router: &MultiServiceRouter, collection: &Collection) -> Vec<String> {
-    let prerequisite = match collection.prerequisite {
-        Prerequisite::Nothing => String::new(),
-        Prerequisite::ConnectorDestination => connector_destination(router).await,
-    };
-
     let mut minted: Vec<String> = Vec::new();
     for n in 0..RESOURCES_PER_COLLECTION {
+        // Each resource is created against its OWN prerequisite: a connector destination
+        // holds one account association whose authorization flow is outstanding at a time,
+        // so a second create against the same destination is a conflict rather than another
+        // record.
+        let prerequisite = match collection.prerequisite {
+            Prerequisite::Nothing => String::new(),
+            Prerequisite::ConnectorDestination => connector_destination(router).await,
+        };
         let case = format!("{} create #{n}", collection.case);
         let reply = call(
             router,

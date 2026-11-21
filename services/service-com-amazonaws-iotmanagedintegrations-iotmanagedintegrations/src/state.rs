@@ -856,6 +856,18 @@ impl AccountAssociation {
         self.association_state == ASSOCIATION_STATE_DELETING
     }
 
+    /// Whether the authorization flow this record is in is still OUTSTANDING: its end user
+    /// has not finished authenticating at the third-party platform, so the authorization
+    /// request this record names is still the one in force ([`INITIAL_ASSOCIATION_STATE`]).
+    ///
+    /// Every other state the model declares is one the flow has already LEFT — it succeeded,
+    /// it failed, its refresh token expired, or the record is on its way out of the store —
+    /// so only this one occupies the connector destination it was created against
+    /// ([`ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState::outstanding_account_association_for_destination`]).
+    pub fn has_outstanding_authorization(&self) -> bool {
+        self.association_state == INITIAL_ASSOCIATION_STATE
+    }
+
     /// Put this association back into its authorization flow, which is what starting a
     /// refresh of it DOES: its authorization and connection status are re-established from
     /// scratch, so the record carries the in-progress state again
@@ -1537,6 +1549,30 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
         self.account_associations
             .get(id)
             .filter(|association| association.region == region)
+    }
+
+    /// The account association `region` holds against the connector destination
+    /// `connector_destination_id` whose authorization flow is still OUTSTANDING, if any —
+    /// the earliest such record, so the answer does not depend on map iteration order.
+    ///
+    /// A connector destination carries at most ONE outstanding authorization flow: the
+    /// create that starts a flow answers the authorization request its end user completes,
+    /// so a destination already waiting for one to be completed cannot start a second
+    /// ([`AccountAssociation::has_outstanding_authorization`]). This is what a create
+    /// consults before minting a record, the way
+    /// [`Self::event_log_configuration_for_target`] serves the create beside it.
+    pub fn outstanding_account_association_for_destination(
+        &self,
+        region: &str,
+        connector_destination_id: &str,
+    ) -> Option<&AccountAssociation> {
+        self.account_association_order
+            .iter()
+            .filter_map(|id| self.account_association_in(region, id))
+            .find(|association| {
+                association.connector_destination_id == connector_destination_id
+                    && association.has_outstanding_authorization()
+            })
     }
 
     /// The credential locker `region`'s endpoint holds under `id`, if any. A locker
@@ -2797,6 +2833,18 @@ pub fn account_association_not_refreshable_message(association_state: &str) -> S
          authorization cannot be refreshed"
     )
 }
+
+/// The one sentence this service states when a create would start a second authorization
+/// flow against a connector destination that is still waiting for one to be completed.
+///
+/// It is FIXED text, the way the recorded duplicate create is refused: it names the resource
+/// class only and interpolates nothing — not the destination the request named, and not the
+/// identifier or state of the association already outstanding — so every duplicate is
+/// refused the same way. The sentence belongs to this resource's own backend, which spells
+/// the class in title case and ends with a full stop, where a name-addressed resource's
+/// duplicate is worded through [`already_exists_message`].
+pub const ACCOUNT_ASSOCIATION_CONFLICT_REASON: &str =
+    "Account Association conflicts with existing record.";
 
 /// How a CREATE states that the resource it was to mint is already there: the resource as
 /// the sentence's subject, and that it exists.

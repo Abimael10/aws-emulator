@@ -348,8 +348,6 @@ async fn a_refresh_starts_a_new_authorization_flow_from_every_state_that_admits_
     let router = emulator_over(Arc::clone(&engine));
 
     let auth_url = "https://partner.example.com/oauth2/authorize";
-    let destination =
-        connector_destination_in(&router, REGION, "the destination", oauth(auth_url, None)).await;
 
     // Every state the model declares except the deleting one, which admits no new flow and
     // is the subject of its own case below. Each row also says whether the record carries
@@ -369,6 +367,11 @@ async fn a_refresh_starts_a_new_authorization_flow_from_every_state_that_admits_
 
     for (state, error_message) in rows {
         let case = format!("state {state}");
+        // Each row's association is created against its OWN destination: a destination holds
+        // one association whose authorization flow is outstanding at a time, so a create
+        // against a destination that already has one is refused.
+        let destination =
+            connector_destination_in(&router, REGION, &case, oauth(auth_url, None)).await;
         let (id, _) = association_in(
             &router,
             REGION,
@@ -749,10 +752,19 @@ async fn a_refresh_touches_only_the_association_it_names() {
         oauth("https://partner.example.com/oauth2/authorize", None),
     )
     .await;
+    // The association left alone is created against its OWN destination: a destination holds
+    // one association whose authorization flow is outstanding at a time.
+    let other_destination = connector_destination_in(
+        &router,
+        REGION,
+        "another destination",
+        oauth("https://partner.example.com/oauth2/authorize", None),
+    )
+    .await;
     let (refreshed, _) =
         association_in(&router, REGION, "refreshed", &destination, json!({})).await;
     let (untouched, _) =
-        association_in(&router, REGION, "untouched", &destination, json!({})).await;
+        association_in(&router, REGION, "untouched", &other_destination, json!({})).await;
 
     // The association that is left alone has the error message of a failed flow, which no
     // refresh of ANOTHER association may clear.

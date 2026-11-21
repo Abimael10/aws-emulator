@@ -36,6 +36,7 @@ use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::state::
     INITIAL_ASSOCIATION_STATE,
 };
 use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::EmulatedService;
+use service_com_amazonaws_iotmanagedintegrations_iotmanagedintegrations::ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState as ServiceState;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region the test's requests are signed for unless a case names another.
@@ -119,10 +120,16 @@ impl Reply {
 /// A router holding one `iotmanagedintegrations` service over a fresh shared engine: the
 /// same assembly `core/router` performs, with one service mounted.
 fn emulator() -> MultiServiceRouter {
+    emulator_over(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// [`emulator`] over an engine the caller keeps a handle to, so a case can put a stored
+/// record in a state no implemented operation reaches.
+fn emulator_over(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // The signature itself is not under test here, so requests are unauthenticated.
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(Arc::new(engine::InMemoryEngine::new())));
+    router.register_service(EmulatedService::new(engine));
     router
 }
 
@@ -514,16 +521,18 @@ async fn a_list_pages_over_the_store_in_insertion_order() {
         empty.member("NextToken")
     );
 
-    // Seven records, so the page sizes below divide the store evenly and unevenly. They
-    // are spread over two connector destinations, so insertion order is not the order of
-    // the destinations they point at.
-    let destinations = [
-        connector_destination(&router).await,
-        connector_destination(&router).await,
-    ];
+    // Seven records, so the page sizes below divide the store evenly and unevenly. Each is
+    // created against its OWN connector destination — a destination holds one association
+    // whose authorization flow is outstanding at a time — and the destinations are taken in
+    // an order of their own, so insertion order is not the order the destinations they point
+    // at were created in.
+    let mut destinations: Vec<String> = Vec::new();
+    for _ in 0..7usize {
+        destinations.push(connector_destination(&router).await);
+    }
     let mut inserted: Vec<String> = Vec::new();
-    for n in 0..7usize {
-        let reply = create(&router, minimal(&destinations[n % destinations.len()])).await;
+    for (n, which) in [3usize, 0, 5, 1, 6, 2, 4].iter().enumerate() {
+        let reply = create(&router, minimal(&destinations[*which])).await;
         inserted.push(accepted_id(&format!("seed-{n}"), &reply));
     }
 
@@ -598,7 +607,8 @@ async fn a_list_pages_over_the_store_in_insertion_order() {
 /// destination, by equality, and pages the same way an unfiltered list does.
 #[tokio::test]
 async fn a_list_filters_by_connector_destination_id() {
-    let router = emulator();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_over(Arc::clone(&engine));
 
     // Three destinations seeded through the API, with the records spread over them: one
     // destination holding several records, one holding a single record, and one holding
@@ -614,6 +624,18 @@ async fn a_list_filters_by_connector_destination_id() {
         let destination = seeded[*which].clone();
         let reply = create(&router, minimal(&destination)).await;
         let id = accepted_id(&format!("seed-{n} for {destination}"), &reply);
+        // A destination holds ONE association whose authorization flow is still outstanding,
+        // so the flow of each record is retired before the next create against the same
+        // destination — the state the flow an end user completed leaves behind, and the
+        // state the records of a destination that has associated several accounts carry.
+        {
+            let handle = engine.state::<ServiceState>();
+            let mut store = handle.lock();
+            store
+                .account_association_in_mut(REGION, &id)
+                .unwrap_or_else(|| panic!("seed-{n}: the created association is stored"))
+                .association_state = "ASSOCIATION_SUCCEEDED".to_string();
+        }
         per_destination.push((destination, id));
     }
 
@@ -692,8 +714,10 @@ async fn a_list_filters_by_connector_destination_id() {
 #[tokio::test]
 async fn a_max_results_outside_the_modelled_range_is_refused() {
     let router = emulator();
-    let destination = connector_destination(&router).await;
+    // Each record is created against its own connector destination: a destination holds one
+    // association whose authorization flow is outstanding at a time.
     for n in 0..3u32 {
+        let destination = connector_destination(&router).await;
         let reply = create(&router, minimal(&destination)).await;
         accepted_id(&format!("seed-{n}"), &reply);
     }
@@ -742,8 +766,10 @@ async fn a_max_results_outside_the_modelled_range_is_refused() {
 #[tokio::test]
 async fn a_next_token_this_service_never_issued_is_refused() {
     let router = emulator();
-    let destination = connector_destination(&router).await;
+    // Each record is created against its own connector destination: a destination holds one
+    // association whose authorization flow is outstanding at a time.
     for n in 0..3u32 {
+        let destination = connector_destination(&router).await;
         let reply = create(&router, minimal(&destination)).await;
         accepted_id(&format!("seed-{n}"), &reply);
     }
