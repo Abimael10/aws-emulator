@@ -106,8 +106,8 @@ use ::std::sync::Arc;
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 use super::integration::{
-    access_request, Activities, Api, Call, Denied, Failed, Family, Handovers, MapRuns, RoleGate,
-    TASK_FAILED_ERROR,
+    access_request, Activities, Api, Call, Denied, ExpressMachines, Failed, Family, Handovers,
+    MapRuns, RoleGate, TASK_FAILED_ERROR,
 };
 
 /// The GLOBAL service principal Step Functions assumes a state machine's execution
@@ -472,6 +472,10 @@ pub struct Acting {
     /// What answers whether this emulator holds the activity a `Task` state's
     /// `Resource` names ([`super::activity_resources::activities`]).
     pub activities: Option<Activities>,
+    /// What answers whether a state machine a nested-execution task names is of the
+    /// EXPRESS workflow type ([`super::express_machines::express_machines`]), which is
+    /// what decides how such a task RUNS its child.
+    pub express_machines: Option<ExpressMachines>,
 }
 
 /// Debug without disclosing anything either closure reads: a connection holds
@@ -485,6 +489,7 @@ impl ::std::fmt::Debug for Acting {
             .field("handovers", &self.handovers.is_some())
             .field("map_runs", &self.map_runs.is_some())
             .field("activities", &self.activities.is_some())
+            .field("express_machines", &self.express_machines.is_some())
             .field("signing", &self.signing.is_some())
             .finish()
     }
@@ -534,6 +539,7 @@ pub fn acting<Eng: Send + Sync + 'static>(
         // carries the Map Runs it is continuing ([`Acting::map_runs`]).
         map_runs: None,
         activities: super::activity_resources::activities(engine),
+        express_machines: super::express_machines::express_machines(engine),
         signing,
     }
 }

@@ -570,7 +570,7 @@ impl Interpreter<'_> {
         if recorded {
             return;
         }
-        let location = super::super::jsonata::take_failed_field();
+        let location = super::super::jsonata::take_failed_field().map(clip_location);
         let evaluation_failed = Step {
             event_type: super::super::EVENT_EVALUATION_FAILED,
             state_name: Some(name.to_string()),
@@ -1194,13 +1194,27 @@ impl Interpreter<'_> {
             JSONATA => match state.get(ARGUMENTS_MEMBER) {
                 Some(template) => {
                     let bindings = self.bindings(effective, context, None, None);
-                    super::super::jsonata::render(
+                    let built = super::super::jsonata::render(
                         template,
                         ARGUMENTS_MEMBER,
                         &bindings,
                         &mut self.jsonata_budget(),
                     )
-                    .map_err(jsonata_failure)
+                    .map_err(jsonata_failure)?;
+                    // `Arguments` is the DOCUMENT the work is handed — "a collection of
+                    // key-value pairs" — so a whole-field expression that produced a
+                    // value of any other kind names no request for the call to make.
+                    // That is this state's own refusal rather than the expression
+                    // misevaluating: the expression produced a value, and the member
+                    // cannot carry it.
+                    if !built.is_object() {
+                        return Err(runtime(referenced_value_must_be(
+                            ARGUMENTS_MEMBER,
+                            "a JSON object",
+                            &built,
+                        )));
+                    }
+                    Ok(built)
                 }
                 None => Ok(effective.clone()),
             },
@@ -1447,17 +1461,25 @@ impl Interpreter<'_> {
 
     /// The context object (`$$`) a state reads: the run's own members, plus the state
     /// it is being read in and the `Map` item being iterated, when there is one.
+    ///
+    /// `$$.State` carries the members the service supplies for the attempt being run:
+    /// the state's name and the instant it was entered always, and `RetryCount` only
+    /// once a `Retry` has re-run it ([`with_retry_count`]). A state on its first
+    /// attempt has been retried no times, so the member is ABSENT from the document a
+    /// query over `$$` reads rather than present as a zero.
     pub(super) fn context_for(&self, scope: &Scope, name: &str, at: Duration) -> Value {
         let mut context = self.base_context.clone();
         if let Some(object) = context.as_object_mut() {
-            object.insert(
-                "State".to_string(),
-                serde_json::json!({
-                    "Name": name,
-                    "EnteredTime": iso(self.start + at),
-                    "RetryCount": self.retry_count,
-                }),
+            let mut state = Map::new();
+            state.insert("Name".to_string(), serde_json::json!(name));
+            state.insert(
+                "EnteredTime".to_string(),
+                serde_json::json!(iso(self.start + at)),
             );
+            if self.retry_count > 0 {
+                state.insert("RetryCount".to_string(), serde_json::json!(self.retry_count));
+            }
+            object.insert("State".to_string(), Value::Object(state));
             if let Some(item) = &scope.map_item {
                 object.insert("Map".to_string(), serde_json::json!({ "Item": item }));
             }
@@ -1713,33 +1735,6 @@ impl Interpreter<'_> {
         }
     }
 
-    /// The event one attempt of a run-a-job task failed to START its job with: "the
-    /// task submission failed", which is a different event from the failure of a task
-    /// whose work ran — and the same event a request-response task records when ITS
-    /// call failed, because for that pattern the call IS the work.
-    pub(super) fn push_submit_failure(
-        &mut self,
-        state_name: &str,
-        work: &WorkEvents,
-        failure: &Failure,
-        after: Duration,
-        call: &super::super::integration::Call,
-    ) {
-        if call.job.is_none() || failure.name() == TIMEOUT_ERROR {
-            self.push_task_failure(state_name, work, failure, after);
-            return;
-        }
-        let mut details = work.naming();
-        details.error = failure.error.clone();
-        details.cause = failure.cause.clone();
-        self.push_detailed(
-            super::super::EVENT_TASK_SUBMIT_FAILED,
-            state_name,
-            after,
-            details,
-        );
-    }
-
     /// What the job a run-a-job task started ENDED as, placed as that state's own
     /// outcome.
     ///
@@ -1905,6 +1900,13 @@ impl Interpreter<'_> {
         context: &Value,
     ) -> Result<Option<String>, Failure> {
         if let Some(literal) = state.get(member) {
+            // `Error` and `Cause` are OPTIONAL members, so one written as JSON null
+            // declares no value for the state to fail with: null is the absence of a
+            // value rather than a value of the wrong type, and the execution surfaces
+            // the same absent error an omitted member does.
+            if literal.is_null() {
+                return Ok(None);
+            }
             // The member is a string in both languages, so a JSONata expression
             // written in it is held to that type and diagnosed where it produced
             // something else or nothing at all.
@@ -2490,6 +2492,18 @@ impl Interpreter<'_> {
                 Ok(request) => request,
                 Err(failure) => return (Err(failure), at),
             };
+            // WHICH call this attempt makes, for a task that starts a nested execution:
+            // an EXPRESS child is RUN by the call that starts it, because that workflow
+            // type has no execution-scoped read for the pattern's own reporting call to
+            // poll ([`super::super::integration::run_child_synchronously`]). Decided
+            // from the child THIS attempt's request names, before anything is handed
+            // over, so the events below name the work this attempt really did.
+            let call = match super::super::integration::nested_child(&call, &request)
+                .filter(|child| me.tasks.express_child(child))
+            {
+                Some(_) => super::super::integration::run_child_synchronously(&call),
+                None => call.clone(),
+            };
             // Each attempt hands the work over and starts it again, so each writes
             // its own pair of events, carrying the document THAT attempt built and
             // the bounds the state declared for it.
@@ -2525,7 +2539,7 @@ impl Interpreter<'_> {
             // each transition: a run that has asked for more work than it may do makes
             // no further call (and a `Retry` cannot keep making them).
             if let Some(failure) = me.out_of_work() {
-                me.push_submit_failure(name, &work, &failure, at, &call);
+                me.push_task_failure(name, &work, &failure, at);
                 return (Err(failure), at);
             }
             // And so is the waiting this run may still do: a run that has spent it does
@@ -2544,7 +2558,7 @@ impl Interpreter<'_> {
                         MAX_CALL_WAIT_DURATION.as_secs()
                     )),
                 };
-                me.push_submit_failure(name, &work, &failure, at, &call);
+                me.push_task_failure(name, &work, &failure, at);
                 return (Err(failure), at);
             }
             // The PUBLICATION a `Task` state makes is this service's own call: the entries
@@ -2632,14 +2646,46 @@ impl Interpreter<'_> {
                     .and_then(Value::as_str)
                     .map(str::to_string)
             });
+            // Whether the call this attempt made has ALREADY run its job to
+            // completion, which is what decides whether the task parks at one
+            // ([`super::super::integration::ran_to_completion`]).
+            let ran_to_completion = super::super::integration::ran_to_completion(&call);
             let attempt = match answered {
                 // The result is a document a state carries, so it is measured
                 // against the same ceiling every state's document is measured
                 // against.
                 Ok(answer) => {
-                    let result = super::super::integration::reported_result(&call, &answer);
-                    match measure_payload(&result, work.produced_by()) {
-                        Ok(_bytes) => Ok(result),
+                    // A call that ran its job to completion answers the JOB's own
+                    // report, so what the task ended as is read out of it exactly as
+                    // the poll of a parked job reads it ([`RunAJob::outcome_of`]): a
+                    // job that did its work makes the task succeed with that report,
+                    // and one that ended without doing it makes the task fail with the
+                    // same cause a polled job's failure carries.
+                    let read = match call.job.filter(|_| ran_to_completion) {
+                        Some(job) => match job.outcome_of(&answer, call.parsed_output) {
+                            Some(Ok(report)) => {
+                                Ok(super::super::integration::task_result(&report))
+                            }
+                            Some(Err(cause)) => Err(Failure {
+                                error: Some(TASK_FAILED_ERROR.to_string()),
+                                cause: Some(cause),
+                            }),
+                            // The answer carries no status of the run at all, so
+                            // nothing is known about what the child did: the task
+                            // reports that rather than a result nothing stated.
+                            None => Err(runtime(format!(
+                                "state '{name}': the '{}' call of {} answered no status for the \
+                                 child execution it ran, so nothing was reported for it",
+                                call.operation, call.api.sdk_id
+                            ))),
+                        },
+                        None => Ok(super::super::integration::reported_result(&call, &answer)),
+                    };
+                    match read {
+                        Ok(result) => match measure_payload(&result, work.produced_by()) {
+                            Ok(_bytes) => Ok(result),
+                            Err(failure) => Err(failure),
+                        },
                         Err(failure) => Err(failure),
                     }
                 }
@@ -2650,6 +2696,27 @@ impl Interpreter<'_> {
             // outcome, read below once the submission has been recorded.
             let mut finished: Option<Result<Value, Failure>> = None;
             match (&attempt, call.job) {
+                // The call SUBMITTED the job and ran it to its end: the task is
+                // finished by that one call, so what it answered is recorded as the
+                // task's submission ("the response from a resource when a task has
+                // started") and the outcome event says what the job ended as — rather
+                // than the walk parking at a job nothing can report.
+                (outcome, Some(_)) if ran_to_completion => {
+                    me.push_detailed(
+                        super::super::EVENT_TASK_SUBMITTED,
+                        name,
+                        at,
+                        work.naming(),
+                    );
+                    match outcome {
+                        Ok(result) => {
+                            let mut details = work.naming();
+                            details.output = Some(result.to_string());
+                            me.push_detailed(work.succeeded(), name, at, details);
+                        }
+                        Err(failure) => me.push_task_failure(name, &work, failure, at),
+                    }
+                }
                 // A run-a-job integration's call STARTED a job: the task is not
                 // finished, so what the call answered is recorded as the task's
                 // SUBMISSION ("the response from a resource when a task has
@@ -2661,7 +2728,7 @@ impl Interpreter<'_> {
                              started cannot be reported and nothing was run for it",
                             call.operation, call.api.sdk_id, job.job_id
                         ));
-                        me.push_submit_failure(name, &work, &failure, at, &call);
+                        me.push_task_failure(name, &work, &failure, at);
                         return (Err(failure), at);
                     };
                     let mut details = work.naming();
@@ -2757,12 +2824,14 @@ impl Interpreter<'_> {
                     }
                 }
                 // The call itself FAILED, so the work was never submitted: that failure
-                // is the task's, and an answer the token happened to collect before it
-                // (the handover above ended either way) reports an outcome of work this
-                // state never handed over.
-                (Err(failure), _) => {
-                    me.push_submit_failure(name, &work, failure, at, &call)
-                }
+                // is the task's own — RECORDED: a starting call the invoked service
+                // REFUSED closes the attempt under the family's own failure event, the
+                // one every other failure of this state's work is recorded under
+                // ([`WorkEvents::failed`]), because nothing was submitted and the
+                // refusal IS what the task ended as. An answer the token happened to
+                // collect before it (the handover above ended either way) reports an
+                // outcome of work this state never handed over.
+                (Err(failure), _) => me.push_task_failure(name, &work, failure, at),
             }
             // The span that call really took belongs to the event that CLOSED this
             // attempt: the work ran for exactly that span, and a walk OFFSET cannot

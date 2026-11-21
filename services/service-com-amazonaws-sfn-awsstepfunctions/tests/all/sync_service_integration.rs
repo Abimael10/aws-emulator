@@ -36,8 +36,7 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
     integration::{read, RUN_A_JOB},
-    EVENT_EXECUTION_ABORTED, EVENT_TASK_FAILED, EVENT_TASK_SUBMITTED, EVENT_TASK_SUBMIT_FAILED,
-    EVENT_TASK_SUCCEEDED,
+    EVENT_EXECUTION_ABORTED, EVENT_TASK_FAILED, EVENT_TASK_SUBMITTED, EVENT_TASK_SUCCEEDED,
 };
 
 use crate::execution_history::history;
@@ -424,8 +423,9 @@ async fn stopping_an_execution_parked_at_a_job_stops_that_job() {
 ///
 /// The rows vary what makes the starting call fail — a request the service refuses,
 /// and a request naming a resource it does not hold — and each must end the execution
-/// `FAILED` under the service's own error code, with the submission recorded as having
-/// failed rather than as having happened.
+/// `FAILED` under the service's own error code, with the refusal recorded as the
+/// TASK's own failure (nothing was submitted, so the refusal is what the task ended
+/// as) and no submission claimed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_job_that_could_not_be_started_reports_the_services_own_refusal() {
     let absent = format!("arn:aws:states:{REGION}:000000000000:stateMachine:no-such-machine");
@@ -477,10 +477,10 @@ async fn a_job_that_could_not_be_started_reports_the_services_own_refusal() {
             "case {case:?}: expected {expected}, got {settled:?}"
         );
         assert!(
-            event(&emulator, &execution_arn, EVENT_TASK_SUBMIT_FAILED)
+            event(&emulator, &execution_arn, EVENT_TASK_FAILED)
                 .await
                 .is_some(),
-            "case {case:?}: expected a {EVENT_TASK_SUBMIT_FAILED} event in the history"
+            "case {case:?}: expected a {EVENT_TASK_FAILED} event in the history"
         );
         assert!(
             event(&emulator, &execution_arn, EVENT_TASK_SUBMITTED)

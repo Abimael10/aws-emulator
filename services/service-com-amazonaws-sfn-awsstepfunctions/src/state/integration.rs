@@ -2375,6 +2375,15 @@ pub type Handovers = ::std::sync::Arc<dyn CallbackHandovers>;
 /// and only asks.
 pub type Activities = ::std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Whether the STATE MACHINE an ARN names is of the EXPRESS workflow type, for the
+/// walk that reaches a `Task` state whose nested-execution integration names it.
+///
+/// The two workflow types are reported differently, so which one the child is decides
+/// how the task runs it ([`run_child_synchronously`]). The state machines live in this
+/// service's own store and are reached through the engine the operation holds
+/// ([`super::express_machines`]), so the walk knows nothing of either and only asks.
+pub type ExpressMachines = ::std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// The Map Run a Distributed Map state of the execution being walked is ALREADY
 /// running, for a walk that CONTINUES an attempt rather than beginning one.
 ///
@@ -2693,6 +2702,20 @@ pub trait Tasks: Send + Sync {
     /// before.
     fn activity(&self, _arn: &str) -> bool {
         true
+    }
+
+    /// Whether the state machine `arn` names is of the EXPRESS workflow type, for a
+    /// `Task` state whose nested-execution integration must know how to run the child
+    /// it names ([`ExpressMachines`]).
+    ///
+    /// Asked BEFORE the child is started, because it decides which call starts it: an
+    /// Express child has no execution-scoped read for the run-a-job pattern's own
+    /// reporting call to poll, so the task runs that child to completion in the call
+    /// that starts it ([`run_child_synchronously`]). The default answers that it is
+    /// not, for a walk with no store to ask — which is evidence of nothing, so the
+    /// pattern is performed exactly as it was before.
+    fn express_child(&self, _arn: &str) -> bool {
+        false
     }
 }
 
@@ -3156,14 +3179,90 @@ pub fn describing(
     job_id: &str,
     naming: &JobNaming,
 ) -> (Call, Value) {
+    let mut call = pattern_call(api, family, job.describe);
+    // What this call ANSWERS is what the task reports as its result, so the instants
+    // in it are rendered as every other value a task reads from a call is: in the
+    // SDK's own date type, whole epoch milliseconds ([`in_epoch_millis`]).
+    call.epoch_millis = job.instants_at;
     (
-        pattern_call(api, family, job.describe),
+        call,
         job_request(
             job.describe_member,
             Value::String(job_id.to_string()),
             naming,
         ),
     )
+}
+
+/// The INTEGRATION a nested execution of a state machine is started through, as the
+/// optimized family names it.
+const NESTED_EXECUTION_INTEGRATION: &str = "states:startExecution";
+
+/// The operation that runs a nested EXPRESS execution to COMPLETION in the call that
+/// starts it: "Starts a Synchronous Express state machine execution".
+const SYNCHRONOUS_CHILD_OPERATION: &str = "StartSyncExecution";
+
+/// The access request the call that runs an EXPRESS child to completion is subject to:
+/// `states:StartExecution` on the child's state machine.
+///
+/// The permission is the nested-execution INTEGRATION's, whichever of this service's
+/// calls the emulator runs the child with — the state's `Resource` names starting a
+/// child execution, and that is what the execution role is asked for.
+static SYNCHRONOUS_CHILD_TARGET: TargetResource = TargetResource {
+    integration: NESTED_EXECUTION_INTEGRATION,
+    action: Some("states:StartExecution"),
+    member: "StateMachineArn",
+    default: None,
+    named: TargetNaming::Arn,
+    denied: None,
+};
+
+/// The state machine a nested-execution run-a-job call would start a child of, as its
+/// `request` names it; `None` for every other call.
+///
+/// Read BEFORE the call is made, because which workflow type that child is decides
+/// which call runs it ([`run_child_synchronously`]).
+#[must_use]
+pub fn nested_child(call: &Call, request: &Value) -> Option<String> {
+    let job = call.job?;
+    if job.starts != NESTED_EXECUTION_INTEGRATION {
+        return None;
+    }
+    call.targets?.named_in(request)
+}
+
+/// `call` as the call that runs its child to COMPLETION, for the nested-execution
+/// run-a-job call it is.
+///
+/// An EXPRESS child's execution ARN carries the resource type `DescribeExecution`
+/// refuses — "This API action is not supported by EXPRESS state machines" — so the job
+/// the run-a-job pattern would poll cannot be reported at all. What the pattern
+/// promises is that the task ends when the CHILD does, and this service's own API runs
+/// an Express state machine to completion in ONE call, answering the same record of
+/// the run that the report of a STANDARD child carries. So that is the call such a
+/// task makes, and what it answers IS the job's report
+/// ([`ran_to_completion`]): the task is not parked at a job, and what the child ended
+/// as is read out of that one answer exactly as the poll of a parked job reads it.
+#[must_use]
+pub fn run_child_synchronously(call: &Call) -> Call {
+    let mut synchronous = call.clone();
+    synchronous.operation = SYNCHRONOUS_CHILD_OPERATION.to_string();
+    // The access request stays the integration's own, and the resource it is over is
+    // still the child's state machine.
+    synchronous.targets = Some(&SYNCHRONOUS_CHILD_TARGET);
+    // The answer IS the job's report rather than the literal SDK response of a call
+    // that merely started one, so it carries the instants that report carries, in the
+    // SDK's own date type, and no response envelope.
+    synchronous.epoch_millis = call.job.map_or(&[], |job| job.instants_at);
+    synchronous.sdk_envelope = false;
+    synchronous
+}
+
+/// Whether `call` has already run its job to completion by the time it answers
+/// ([`run_child_synchronously`]), which is what tells the task not to park at a job.
+#[must_use]
+pub fn ran_to_completion(call: &Call) -> bool {
+    call.job.is_some() && call.operation == SYNCHRONOUS_CHILD_OPERATION
 }
 
 /// The call that STOPS the job `job` started under `job_id`, and its request.
@@ -3390,6 +3489,10 @@ struct Dispatcher {
     /// What answers whether this emulator holds the activity a `Task` state's
     /// `Resource` names ([`Activities`]); `None` for a walk with no store to ask.
     activities: Option<Activities>,
+    /// What answers whether a state machine a nested-execution task names is of the
+    /// EXPRESS workflow type ([`ExpressMachines`]); `None` for a walk with no store to
+    /// ask.
+    express_machines: Option<ExpressMachines>,
 }
 
 /// What decides whether the execution role a walk runs as may make one integration
@@ -3616,6 +3719,12 @@ impl Tasks for Dispatcher {
             .as_ref()
             .is_none_or(|activities| activities(arn))
     }
+
+    fn express_child(&self, arn: &str) -> bool {
+        self.express_machines
+            .as_ref()
+            .is_some_and(|express| express(arn))
+    }
 }
 
 /// Run `work` — one interpretation of a definition — on a blocking thread, serving
@@ -3681,6 +3790,7 @@ where
     let handed = acting.handovers;
     let resumed_map_runs = acting.map_runs;
     let known_activities = acting.activities;
+    let express_machines = acting.express_machines;
     // WHO the calls of this walk are made as: a session of the state machine's
     // execution role, which is the identity Step Functions does an execution's work as
     // ([`super::execution_role_session`]).
@@ -3693,6 +3803,7 @@ where
             handovers: handed,
             map_runs: resumed_map_runs,
             activities: known_activities,
+            express_machines,
         };
         work(&dispatcher)
     });
@@ -3807,8 +3918,8 @@ pub fn chain_depth(ctx: &smithy_server_runtime::OperationContext<'_>) -> u8 {
 }
 
 /// The document a `Task` state REPORTS as the result of its integration call:
-/// `answer`'s top-level members under the spelling a service integration's result is
-/// written in, which is PascalCase.
+/// `answer`'s members under the spelling a service integration's result is written in,
+/// which is PascalCase.
 ///
 /// The result of a service integration is the invoked operation's response document,
 /// and a `Task` state reads it in the integration's own convention whatever the
@@ -3816,20 +3927,39 @@ pub fn chain_depth(ctx: &smithy_server_runtime::OperationContext<'_>) -> u8 {
 /// or a later state's path reads `$.ExecutionArn` of an operation whose own member is
 /// `executionArn`. The wire spelling belongs to the call, not to the result.
 ///
-/// Only the TOP level is re-spelled, for the reason [`wire_request`] gives: below it
-/// a response carries a caller's own DATA beside the operation's members — the
-/// attributes of an item, the output document of a child execution — and data is
-/// never re-spelled.
+/// Only the operation's OWN members are re-spelled, for the reason [`wire_request`]
+/// gives: a response also carries a caller's own DATA — the attributes of an item, the
+/// output document of a child execution — and data is never re-spelled. What tells the
+/// two apart below the top level is the wire TYPE DISCRIMINATOR
+/// ([`crate::service::wire`]): a nested object carrying one is a structure of the
+/// invoked model, so its own members are re-spelled too, while a document the response
+/// carries is reported exactly as it came back. The discriminator itself is the
+/// protocol's tag rather than a member of the response, so it is not part of the
+/// result at any level.
 pub fn task_result(answer: &Value) -> Value {
     let Some(members) = answer.as_object() else {
         return answer.clone();
     };
     let mut reported = Map::new();
     for (member, value) in members {
-        reported.insert(MemberCase::Pascal.spell(member), value.clone());
+        if member == TYPE_DISCRIMINATOR {
+            continue;
+        }
+        let value = match value {
+            Value::Object(nested) if nested.contains_key(TYPE_DISCRIMINATOR) => {
+                task_result(value)
+            }
+            other => other.clone(),
+        };
+        reported.insert(MemberCase::Pascal.spell(member), value);
     }
     Value::Object(reported)
 }
+
+/// The key the wire protocol names a structure's own shape in
+/// ([`crate::service::wire::SWF_BASE_MODEL_NAMESPACE`]), which is what tells a
+/// structure of the invoked model from a document the response carries.
+const TYPE_DISCRIMINATOR: &str = "__type";
 
 /// The document a `Task` state REPORTS as the result of `call`, which depends on what
 /// its `Resource` named.

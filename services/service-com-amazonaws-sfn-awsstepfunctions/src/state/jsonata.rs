@@ -25,12 +25,12 @@
 //!
 //! A TEMPLATE — an `Output`, an `Assign`, a `Task`'s `Arguments` — builds a document
 //! out of whatever its members produce, and a member whose expression produced nothing
-//! is left out of it ([`render`]). A FIELD holds ONE value the language requires a
-//! type of — a `Choice` rule's boolean `Condition`, a `Wait`'s numeric `Seconds`, a
-//! `Map`'s array of `Items`, a `Fail`'s string `Error` — so a field whose expression
-//! produced another type, or produced nothing, is reported rather than carried
-//! ([`typed`]). The diagnosis is the service's own: the expression as the definition
-//! wrote it, the field of the definition it is written in, and the types.
+//! has no value for its place in that document ([`render`]). A FIELD holds ONE value the
+//! language requires a type of — a `Choice` rule's boolean `Condition`, a `Wait`'s
+//! numeric `Seconds`, a `Map`'s array of `Items`, a `Fail`'s string `Error` — so a field
+//! whose expression produced another type, or produced nothing, is reported rather than
+//! carried ([`typed`]). Either way the diagnosis is the service's own: the expression as
+//! the definition wrote it, the field of the definition it is written in, and the types.
 //!
 //! ## What an expression reads
 //!
@@ -271,8 +271,8 @@ pub fn parse_diagnostic(text: &str) -> Option<String> {
 /// Evaluate the expression `text` carries, and report the value it produced.
 ///
 /// `Ok(None)` is an expression that resolved to NOTHING, which the language's own
-/// `undefined` is: a field whose expression produces nothing carries no value, so the
-/// caller drops the member rather than writing a null the definition did not ask for.
+/// `undefined` is: the caller decides what a field or a template member with no value
+/// at all is reported as.
 ///
 /// The evaluation is charged to `budget` BEFORE it is made — which is also what hands
 /// the seam the time it may run for — and what remains of the visit's allowance is the
@@ -333,9 +333,15 @@ fn evaluate(
 ///
 /// One rule, applied to every node: a string that is one whole expression is replaced
 /// by what that expression produced, and every other value is the literal it is
-/// written as. An object member whose expression produced NOTHING is left out of the
-/// result, which is what the language does with `undefined`; an array element that
-/// produced nothing is left out for the same reason.
+/// written as.
+///
+/// RECORDED: an expression that produced NOTHING — the language's own `undefined` —
+/// is a query-evaluation failure wherever it is written, the template's own value as
+/// much as one member or one element of it, because the document the state would put
+/// out has no value for that place. It is diagnosed exactly as a typed field's
+/// expression that produced nothing is ([`typed`]), naming the member or element it is
+/// written in, so the state fails instead of putting out a document the definition did
+/// not ask for.
 ///
 /// Every member — the literal ones included — is spent from `budget` as it is built,
 /// and every expression is charged to it, so what ONE visit to a state renders is
@@ -363,12 +369,12 @@ fn render_at(
         )));
     };
     match node {
-        Value::String(text) if is_expression(text) => Ok(in_field(
-            evaluate(text, bindings, budget),
-            text,
-            field,
-        )?
-        .unwrap_or(Value::Null)),
+        Value::String(text) if is_expression(text) => {
+            match in_field(evaluate(text, bindings, budget), text, field)? {
+                Some(value) => Ok(value),
+                None => Err(misevaluated(text, field, RETURNED_NOTHING)),
+            }
+        }
         Value::Array(items) => {
             let mut rendered = Vec::with_capacity(items.len());
             for (index, item) in items.iter().enumerate() {
@@ -378,10 +384,9 @@ fn render_at(
                 let at = element_field(field, index);
                 match item {
                     Value::String(text) if is_expression(text) => {
-                        if let Some(value) =
-                            in_field(evaluate(text, bindings, budget), text, &at)?
-                        {
-                            rendered.push(value);
+                        match in_field(evaluate(text, bindings, budget), text, &at)? {
+                            Some(value) => rendered.push(value),
+                            None => return Err(misevaluated(text, &at, RETURNED_NOTHING)),
                         }
                     }
                     other => rendered.push(render_at(other, &at, bindings, depth, budget)?),
@@ -398,10 +403,11 @@ fn render_at(
                 let at = member_field(field, member);
                 match child {
                     Value::String(text) if is_expression(text) => {
-                        if let Some(value) =
-                            in_field(evaluate(text, bindings, budget), text, &at)?
-                        {
-                            rendered.insert(member.clone(), value);
+                        match in_field(evaluate(text, bindings, budget), text, &at)? {
+                            Some(value) => {
+                                rendered.insert(member.clone(), value);
+                            }
+                            None => return Err(misevaluated(text, &at, RETURNED_NOTHING)),
                         }
                     }
                     other => {

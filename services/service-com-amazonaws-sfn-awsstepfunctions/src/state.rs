@@ -794,6 +794,30 @@ pub const STOP_RESERVE_BYTES: usize = 2 * (asl::MAX_ERROR_BYTES + asl::MAX_CAUSE
 /// the default."
 pub const DEFAULT_PAGE_SIZE: usize = 100;
 
+/// The DATA one page of an execution's history carries, beyond which the page ends
+/// early and a `nextToken` continues it.
+///
+/// `maxResults` "is only an upper limit. The actual number of results returned per
+/// call might be fewer than the specified maximum": a page of history is bounded by
+/// the size of the response as well as by the event count, because one event carries
+/// the input or the output of a state and those are bounded only by what a state may
+/// produce. So a page of large-payload events ends at this many bytes of event data
+/// however few events that is, and the rest of the history is handed out through the
+/// cursor exactly as a page cut short by `maxResults` is.
+pub const MAX_HISTORY_PAGE_BYTES: usize = 1024 * 1024;
+
+/// The bytes of one history event this API reports: the event's own data, which is
+/// what [`MAX_HISTORY_PAGE_BYTES`] bounds a page by.
+///
+/// The event's identity and its timestamps are a fixed cost shared by every event and
+/// are not what makes one page large; what varies is the state's data and the strings
+/// the event's own detail carries.
+pub fn history_event_bytes(event: &HistoryEvent) -> usize {
+    event.event_type.len()
+        + event.state_name.as_ref().map_or(0, String::len)
+        + event.details.measure()
+}
+
 /// The most bytes one of this service's generated ARNs holds, which is the maximum
 /// the modelled `Arn` shape (len 1..256) carries: every ARN this emulator mints is
 /// built from a state machine name, an execution name and a Map state label, each of
@@ -4745,6 +4769,7 @@ pub mod callbacks;
 pub mod encryption;
 pub mod events;
 pub mod execution_role_session;
+pub mod express_machines;
 pub mod http_task;
 pub mod integration;
 pub mod item_batcher;

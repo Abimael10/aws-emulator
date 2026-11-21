@@ -67,6 +67,21 @@ pub struct RunAJob {
     /// rather than of the run the identifier names. Named in the integration's own
     /// PascalCase, and empty for a job its identifier names on its own.
     pub names_job_with: &'static [&'static str],
+    /// The members of the REPORTING call's response that carry an INSTANT, which the
+    /// task's result renders in the SDK's own date type — whole epoch milliseconds,
+    /// exactly as the STARTING call's response does
+    /// ([`EPOCH_MILLIS_MEMBERS`]). Empty for an integration whose report carries none
+    /// at its top level.
+    pub instants_at: &'static [&'static str],
+    /// The members of the job's own document the FAILURE cause does not carry, named
+    /// as the reporting call's response spells them.
+    ///
+    /// RECORDED: the cause a failed job's task reports is the invoked service's report
+    /// of the job with the job's own INPUT redacted — a nested execution's `input` and
+    /// the detail that says whether it was included — because that cause travels into
+    /// the parent's history and its failure, where the data the child was handed is not
+    /// repeated. Empty for an integration whose report carries no such document.
+    pub redacted_in_cause: &'static [&'static str],
     /// Where the resource the pattern's OWN calls are taken on is named, for the
     /// access request each is subject to ([`JobTarget`]); `None` for an integration
     /// whose target resource is not stated, whose calls are then made as before.
@@ -198,8 +213,19 @@ impl RunAJob {
         let reported = self.reported(answer, parsed_output);
         match self.finished(&status)? {
             true => Some(Ok(reported)),
-            false => Some(Err(task_result(&reported).to_string())),
+            false => Some(Err(task_result(&self.redacted(reported)).to_string())),
         }
+    }
+
+    /// `reported` without the members a failure's cause does not carry
+    /// ([`RunAJob::redacted_in_cause`]).
+    fn redacted(&self, mut reported: Value) -> Value {
+        if let Some(members) = reported.as_object_mut() {
+            for member in self.redacted_in_cause {
+                members.remove(*member);
+            }
+        }
+        reported
     }
 
     /// The document the task reports as its result: what the reporting call said about
@@ -288,6 +314,13 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // `DescribeExecution` and `StopExecution` each name the execution by its own
         // ARN alone.
         names_job_with: &[],
+        // `DescribeExecution` reports the instants the execution began and ended at,
+        // "the date the execution is started" and "stopped".
+        instants_at: &["startDate", "stopDate"],
+        // The cause a failed child's task reports carries what the child ENDED as
+        // without the input it was handed: `input` and the `inputDetails` that says
+        // whether it was included.
+        redacted_in_cause: &["input", "inputDetails"],
         // Both of those calls are taken on the EXECUTION the start minted, whose ARN
         // is the identifier it answered.
         acts_on: Some(JobTarget::Identifier),
@@ -319,6 +352,11 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         // `GetQueryExecution` and `StopQueryExecution` each name the query by its own
         // id alone.
         names_job_with: &[],
+        // `GetQueryExecution` carries the query's instants nested inside
+        // `QueryExecution.Status`, which is not a member of the report's top level.
+        instants_at: &[],
+        // The report of a query carries no document of the query's own.
+        redacted_in_cause: &[],
         // Both of those calls are taken on the WORKGROUP the query runs in, which the
         // starting request named ([`TARGET_RESOURCES`]).
         acts_on: Some(JobTarget::Started("athena:startQueryExecution")),
@@ -354,6 +392,11 @@ pub const RUN_A_JOB: &[RunAJob] = &[
         stop_member: "JobRunIds",
         stops_in_batch: true,
         names_job_with: &["JobName"],
+        // `GetJobRun` carries the run's instants inside the `JobRun` it answers with,
+        // which is not a member of the report's top level.
+        instants_at: &[],
+        // The report of a job run carries no document of the run's own.
+        redacted_in_cause: &[],
         // Both of those calls are taken on the JOB the run belongs to, which the
         // starting request named ([`TARGET_RESOURCES`]).
         acts_on: Some(JobTarget::Started("glue:startJobRun")),

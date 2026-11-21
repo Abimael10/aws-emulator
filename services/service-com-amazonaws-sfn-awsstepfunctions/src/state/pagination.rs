@@ -124,10 +124,13 @@ pub fn history_page_offset(
         return None;
     }
     let offset = history_cursor(cursor, total, read.reverse_order);
-    let boundary = read.page > 0 && offset.is_multiple_of(read.page);
-    if offset == 0 || offset >= total || !boundary {
+    if offset == 0 || offset >= total {
         return None;
     }
+    // A page of this read ends at `maxResults` events or at the data one page carries
+    // ([`MAX_HISTORY_PAGE_BYTES`]), whichever came first, so the positions its pages
+    // begin at are the ones it HANDED OUT rather than the multiples of its page size:
+    // `handed_out` is how far each read of this history has got.
     let reached = handed_out.iter().find(|remembered| remembered.of(read))?;
     (offset <= reached.offset).then_some(offset)
 }

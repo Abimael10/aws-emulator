@@ -608,6 +608,18 @@ pub(super) fn compare(
             })?;
             let operand = select(path, input, context)
                 .map_err(|failure| choice_path_failure(failure, path))?;
+            // The `*Path` form READS this comparator's own operand out of the
+            // document, so the value it selects has to be one the comparator can read
+            // as an operand at all: no comparator reads one from null, and the
+            // timestamp families read an instant out of a STRING. A path that selects
+            // such a value leaves the rule undecidable — reported the way a condition
+            // path that references a value that is not there is
+            // ([`invalid_choice_condition_path`]) — rather than deciding it does not
+            // match, which is what a value of a type the family merely does not
+            // compare (a numeral written as a string under a numeric comparator) is.
+            if !readable_operand(family, &operand) {
+                return Err(runtime(invalid_choice_condition_path(path)));
+            }
             (family, operand)
         }
         None => (operator, operand.clone()),
@@ -669,6 +681,24 @@ pub(super) fn compare(
         return Ok(comparison.holds_for(left.cmp(&right)));
     }
     Err(undefined())
+}
+
+/// Whether the value a `Choice` comparator's `*Path` operand selected is one that
+/// comparator can READ as its operand.
+///
+/// `family` is the comparator without its `Path` suffix, which is the family that
+/// decides what reading an operand means: the timestamp families compare the instants
+/// their operands denote, and an instant is written as a string, so a value of any
+/// other type names no instant to compare against. Null is no operand for any family:
+/// it is the absence of a value rather than a value of some type.
+fn readable_operand(family: &str, operand: &Value) -> bool {
+    if operand.is_null() {
+        return false;
+    }
+    if family.starts_with("Timestamp") {
+        return operand.is_string();
+    }
+    true
 }
 
 /// One of the five comparisons ASL's `String*`, `Numeric*` and `Timestamp*` comparator

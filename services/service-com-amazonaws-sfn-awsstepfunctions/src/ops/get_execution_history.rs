@@ -328,6 +328,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let events: Vec<HistoryEvent> = ordered
             .into_iter()
             .skip(offset)
+            // "The actual number of results returned per call might be fewer than the
+            // specified maximum": a page is bounded by the DATA its events carry as
+            // well as by `maxResults`, so it ends at whichever bound is reached first
+            // (`crate::state::MAX_HISTORY_PAGE_BYTES`). The first event of a page is
+            // always carried, however large it is, so every event of a history is
+            // reachable through the cursors.
+            .scan(0_usize, |carried, stored| {
+                let bytes = crate::state::history_event_bytes(&stored);
+                if *carried > 0
+                    && carried.saturating_add(bytes) > crate::state::MAX_HISTORY_PAGE_BYTES
+                {
+                    return None;
+                }
+                *carried = carried.saturating_add(bytes);
+                Some(stored)
+            })
             .take(read.page)
             .map(|stored| projected(&stored, execution, with_data))
             .collect();

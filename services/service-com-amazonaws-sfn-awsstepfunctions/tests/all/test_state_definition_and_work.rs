@@ -456,8 +456,10 @@ async fn an_expression_that_parses_is_evaluated_rather_than_refused() {
     // (case, the Output expression, the status the state ends in)
     let cases: [(&str, &str, &str); 3] = [
         ("an expression that computes a value", "{% $states.input.value + 1 %}", "SUCCEEDED"),
-        // It parses and resolves to nothing, which is a document the state carries.
-        ("an expression reading an absent member", "{% $states.input.absent %}", "SUCCEEDED"),
+        // It parses and resolves to NOTHING, which is the state's own query-evaluation
+        // failure (`States.QueryEvaluationError`) rather than the definition being
+        // invalid: the expression was evaluated, which is what this rule is about.
+        ("an expression reading an absent member", "{% $states.input.absent %}", "FAILED"),
         // It parses and THROWS when evaluated, which is the state failing rather than
         // the definition being invalid.
         ("an expression that throws over its data", "{% $states.input.name + 1 %}", "FAILED"),

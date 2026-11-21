@@ -3007,6 +3007,32 @@ fn clip_cause(cause: String) -> String {
     cause[..end].to_string()
 }
 
+/// The characters the modelled `EvaluationFailureLocation` (0..256) carries, which is
+/// what an `EvaluationFailed` event reports "the location of the field in the state in
+/// which the evaluation error occurred" through
+/// (`smithy_query(query="shape",shape="EvaluationFailedEventDetails")`) — the same cap
+/// every other location this crate reports is held to ([`MAX_LOCATION_CHARS`]).
+///
+/// RECORDED: the field an expression is written in is addressed by the members around
+/// it (`Output/detail/why`, `Assign/variable/k/k`), and a definition — bounded only at
+/// the modelled 1 MiB — chooses those member names, so a path that does not fit the
+/// member is reported as the BASE FIELD of the state it is written in (`Assign`,
+/// `Output`, `Arguments`) rather than as a path cut mid-way: the location still says
+/// which field of the state failed, and the execution still fails on the expression. A
+/// base field name longer than the member carries is held to it like every other
+/// location ([`clipped`]).
+fn clip_location(location: String) -> String {
+    if location.chars().count() <= MAX_LOCATION_CHARS {
+        return location;
+    }
+    let base = location
+        .split('/')
+        .next()
+        .unwrap_or(location.as_str())
+        .to_string();
+    clipped(&base, MAX_LOCATION_CHARS)
+}
+
 /// One run, with the terminal history event the execution ends on appended.
 fn terminal(
     mut steps: Vec<Step>,
@@ -4040,9 +4066,18 @@ fn errors_match(entry: &Map<String, Value>, error: &str) -> bool {
         })
 }
 
-/// `context` with `$$.State.RetryCount` set to the attempt the state is on.
+/// `context` with `$$.State.RetryCount` set to the attempt the state is on, for an
+/// attempt a `Retry` re-ran.
+///
+/// RECORDED: the member is supplied only once the state HAS been retried, so the
+/// attempt a state is on is written into the context object only for an attempt after
+/// the first and the member stays absent otherwise — the shape
+/// [`Interpreter::context_for`] builds.
 fn with_retry_count(context: &Value, attempt: u64) -> Value {
     let mut context = context.clone();
+    if attempt == 0 {
+        return context;
+    }
     if let Some(state) = context.get_mut("State").and_then(Value::as_object_mut) {
         state.insert("RetryCount".to_string(), json!(attempt));
     }
