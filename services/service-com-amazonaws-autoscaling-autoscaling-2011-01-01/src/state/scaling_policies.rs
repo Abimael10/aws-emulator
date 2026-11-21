@@ -93,6 +93,31 @@ pub const DEFAULT_DISABLE_SCALE_IN: bool = false;
 /// `PredictiveScalingConfiguration$Mode`: "Defaults to ForecastOnly if not specified."
 pub const DEFAULT_PREDICTIVE_SCALING_MODE: &str = "ForecastOnly";
 
+/// How many metric specifications ONE predictive scaling policy may be stored with: "This is
+/// an array, but we currently only support a single metric specification. That is, you can
+/// specify a target value and a single metric pair, or a target value and one scaling metric
+/// and one load metric." (`PredictiveScalingConfiguration$MetricSpecifications`).
+///
+/// The member carries no modelled length, so the put checks it — which is also what BOUNDS
+/// the forecast a policy publishes ([`super::predictive_forecast`]): a forecast is one series
+/// per specification, so the work and the answer of a read are the specifications the policy
+/// holds times the hours the request asked for, and this is the cap on the first of those two.
+pub const MAX_PREDICTIVE_METRIC_SPECIFICATIONS: usize = 1;
+
+/// The sentence a put stating more specifications than
+/// [`MAX_PREDICTIVE_METRIC_SPECIFICATIONS`] is refused with: the one sentence this service
+/// states for a list member past the bound it has to satisfy
+/// ([`super::too_many_items_message`]), naming the member by the wire path the configuration
+/// carries it at.
+#[must_use]
+pub fn too_many_metric_specifications_message(count: usize) -> String {
+    super::too_many_items_message(
+        count,
+        "predictiveScalingConfiguration.metricSpecifications",
+        MAX_PREDICTIVE_METRIC_SPECIFICATIONS,
+    )
+}
+
 /// What a predictive-scaling policy may do to the group's maximum capacity when the put
 /// names no `MaxCapacityBreachBehavior`, from
 /// `PredictiveScalingConfiguration$MaxCapacityBreachBehavior`: "Defaults to
@@ -586,23 +611,33 @@ pub fn policy_alarm_name(group_name: &str, alarm_id: &str, kind: AlarmKind) -> S
     )
 }
 
-/// The series one alarm of a target-tracking policy grades: where it lives in CloudWatch,
-/// which statistic of it is graded, and with which dimensions.
+/// The series a policy reads: where it lives in CloudWatch, which statistic of it is read,
+/// and with which dimensions.
+///
+/// Shared by both readers of a policy's own series — the alarms a target-tracking policy is
+/// driven by ([`tracked_series`]) and the load a predictive scaling policy is forecast from
+/// ([`super::predictive_forecast::load_series`]) — so one series is addressed once.
 #[derive(Debug, Clone)]
-struct TrackedSeries {
-    namespace: String,
-    metric_name: String,
-    statistic: String,
-    unit: Option<String>,
-    period: i32,
-    dimensions: Vec<(String, String)>,
+pub struct TrackedSeries {
+    /// The CloudWatch namespace the series lives in.
+    pub namespace: String,
+    /// The metric's name.
+    pub metric_name: String,
+    /// The statistic of it that is read.
+    pub statistic: String,
+    /// The unit the observations carry, when the specification states one.
+    pub unit: Option<String>,
+    /// How wide one window of the read is, in seconds.
+    pub period: i32,
+    /// The dimensions the series is published under.
+    pub dimensions: Vec<(String, String)>,
 }
 
 /// The CloudWatch namespace Amazon EC2 publishes an instance metric under.
-const EC2_METRIC_NAMESPACE: &str = "AWS/EC2";
+pub const EC2_METRIC_NAMESPACE: &str = "AWS/EC2";
 
 /// The namespace an Application Load Balancer publishes its request counts under.
-const APPLICATION_ELB_METRIC_NAMESPACE: &str = "AWS/ApplicationELB";
+pub const APPLICATION_ELB_METRIC_NAMESPACE: &str = "AWS/ApplicationELB";
 
 /// The dimension an Amazon EC2 metric of a whole Auto Scaling group is published under.
 const GROUP_NAME_DIMENSION: &str = "AutoScalingGroupName";
@@ -692,7 +727,8 @@ fn tracked_series(
 /// `app/<name>/<id>/targetgroup/<name>/<id>`
 /// (`PredefinedMetricSpecification$ResourceLabel`), and the request-count-per-target
 /// series is published under those two resources.
-fn resource_label_dimensions(resource_label: &str) -> Vec<(String, String)> {
+#[must_use]
+pub fn resource_label_dimensions(resource_label: &str) -> Vec<(String, String)> {
     let mut dimensions = Vec::new();
     if let Some((load_balancer, target_group)) = resource_label.split_once("/targetgroup/") {
         dimensions.push(("LoadBalancer".to_string(), load_balancer.to_string()));

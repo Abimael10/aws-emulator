@@ -29,6 +29,19 @@
 //! store is reported on its own ([`ScheduledActionRefusal::error_code`]) rather than
 //! refusing the actions beside it.
 //!
+//! # The name a batch entry may take
+//!
+//! A scheduled action's NAME is its identity within its group, and a name the group already
+//! holds is held by an action a batch did not state: so an entry of a batch can only CREATE
+//! an action, and a name already taken — by an action the group holds, or by an earlier entry
+//! of the same call — is a CONFLICT rather than an update
+//! ([`super::AutoScalingState::first_taken_scheduled_action_name`],
+//! [`scheduled_action_already_exists_message`]). The conflict is found before any entry of
+//! the call is committed, so such a call writes NOTHING: the action the name belongs to keeps
+//! the definition it had, and every entry of the call — the free names beside the taken one
+//! included — is reported under `FailedScheduledUpdateGroupActions`. Restating a held action
+//! WHOLE is what `PutScheduledUpdateGroupAction` is for, and its upsert is unaffected.
+//!
 //! # What the action carries
 //!
 //! `Time` "is no longer used" (`PutScheduledUpdateGroupActionType$Time`) — it is the legacy
@@ -61,7 +74,7 @@
 //! occurrence of its recurrence, resolved when the action is stored — so a read reports what
 //! the store holds and two reads of one action report the same instant.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use ::aws_smithy_types::DateTime;
@@ -270,6 +283,34 @@ impl StoredScheduledAction {
 }
 
 impl super::AutoScalingState {
+    /// The first name of `action_names`, in the order the request states them, that a
+    /// scheduled action could not be CREATED under on `group_name` because the name is
+    /// already taken — by an action the group already holds, or by an earlier entry of this
+    /// same list.
+    ///
+    /// A scheduled action's name is its identity within its group, so a call that CREATES
+    /// one can only create a name the group does not hold yet; this is the check a batch is
+    /// taken against ([`MAX_SCHEDULED_ACTIONS_PER_GROUP`]'s sibling rule, stated in this
+    /// module's header). `None` when every name is free, and `None` for a name no group
+    /// answers to: the caller resolves the group and refuses that with its own absent-group
+    /// sentence.
+    #[must_use]
+    pub fn first_taken_scheduled_action_name(
+        &self,
+        group_name: &str,
+        action_names: &[String],
+    ) -> Option<String> {
+        let group = self.groups.get(group_name)?;
+        let mut stated: BTreeSet<&str> = BTreeSet::new();
+        action_names
+            .iter()
+            .find(|name| {
+                group.scheduled_actions.contains_key(name.as_str())
+                    || !stated.insert(name.as_str())
+            })
+            .cloned()
+    }
+
     /// Create or replace the scheduled action `action_name` of `group_name`, per the upsert
     /// rule in this module's own documentation, and answer the action as it now stands.
     ///
@@ -315,6 +356,36 @@ impl super::AutoScalingState {
                 .insert(action_name.to_string(), stored.clone());
         }
         Ok(Some(stored))
+    }
+
+    /// Delete the scheduled actions `action_names` names from `group_name`, and answer the
+    /// names that could not be deleted, in the order the request states them.
+    ///
+    /// A name the group does not hold names no action to delete, so it is answered back for
+    /// the caller to report; a name the request states TWICE names one action, which this
+    /// call deletes once. Deleting a name the group holds is all a delete does — the group's
+    /// own bounds and instances are untouched, because a scheduled action is a future change
+    /// and not a current one.
+    pub fn delete_scheduled_actions(
+        &mut self,
+        group_name: &str,
+        action_names: &[String],
+    ) -> Vec<String> {
+        let Some(group) = self.groups.get_mut(group_name) else {
+            return action_names.to_vec();
+        };
+        let mut deleted: BTreeSet<&str> = BTreeSet::new();
+        let mut absent: Vec<String> = Vec::new();
+        for action_name in action_names {
+            if group.scheduled_actions.remove(action_name.as_str()).is_some()
+                || deleted.contains(action_name.as_str())
+            {
+                deleted.insert(action_name.as_str());
+            } else {
+                absent.push(action_name.clone());
+            }
+        }
+        absent
     }
 }
 
@@ -407,11 +478,41 @@ impl ScheduledActionRefusal {
     #[must_use]
     pub fn error_code(&self) -> &'static str {
         if self.is_quota() {
-            "LimitExceeded"
+            LIMIT_EXCEEDED_ERROR_CODE
         } else {
-            "ValidationError"
+            VALIDATION_ERROR_CODE
         }
     }
+}
+
+/// The wire error code a per-action report carries for a request about a scheduled action
+/// this store has no record of, and for every other defect of what the request carries: the
+/// code this service answers such a request with as its own error
+/// ([`crate::scaffolded::Scaffolded::validation_error`]).
+pub const VALIDATION_ERROR_CODE: &str = "ValidationError";
+
+/// The wire error code a per-action report carries for a resource QUOTA: the `awsQueryError`
+/// code of the `LimitExceededFault` the writers of a scheduled action model.
+pub const LIMIT_EXCEEDED_ERROR_CODE: &str = "LimitExceeded";
+
+/// The most scheduled action NAMES one call may state: "The names of the scheduled actions to
+/// delete. The maximum number allowed is 50."
+/// (`BatchDeleteScheduledActionType$ScheduledActionNames`) — the same bound a put is held to
+/// per call, on the member the delete states its actions in.
+#[must_use]
+pub fn too_many_scheduled_action_names_in_one_call_message(count: usize) -> String {
+    super::too_many_items_message(count, "scheduledActionNames", MAX_SCHEDULED_ACTIONS_PER_CALL)
+}
+
+/// The sentence a request naming a scheduled action the group does not hold is answered with.
+///
+/// The `<subject> not found - <detail>` shape this service states its absent-resource
+/// refusals in ([`super::absent_group_message`]), for the resource word the model names a
+/// scheduled action by. The action name, taken verbatim from the request, is its only
+/// variable part.
+#[must_use]
+pub fn absent_scheduled_action_message(action_name: &str) -> String {
+    format!("Scheduled action name not found - Scheduled action {action_name} not found")
 }
 
 /// The sentence a put stating none of the three sizes is refused with: the rule as the
@@ -445,13 +546,35 @@ pub const INVALID_TIME_ZONE_MESSAGE: &str =
      Database";
 
 /// The sentence a put that would take a group past [`MAX_SCHEDULED_ACTIONS_PER_GROUP`] is
-/// refused with, in the same shape this service states its other per-group ceilings in: the
-/// fixed sentence and the ceiling the caller has to come back under.
+/// refused with: Amazon EC2 Auto Scaling's own sentence for the scheduled-action cap, whose
+/// one variable part is the per-group limit in force — fixed text otherwise, down to the
+/// closing period.
 #[must_use]
 pub fn too_many_scheduled_actions_message() -> String {
     format!(
-        "You have already reached the limit of {MAX_SCHEDULED_ACTIONS_PER_GROUP} scheduled \
-         actions per Auto Scaling group"
+        "The maximum limit of {MAX_SCHEDULED_ACTIONS_PER_GROUP} scheduled actions has been \
+         reached."
+    )
+}
+
+/// The wire error code a per-action report carries for a name the group already holds: the
+/// `awsQueryError` code of the `AlreadyExistsFault` both writers of a scheduled action model
+/// (`smithy_query(query="shape",shape="AlreadyExistsFault")`), so the conflict reads the same
+/// whether it is reported as a call's own error or per action inside a batch's answer.
+pub const ALREADY_EXISTS_ERROR_CODE: &str = "AlreadyExists";
+
+/// The sentence a request that would CREATE a scheduled action under a name the group
+/// already holds is refused with.
+///
+/// The shape this service states its already-exists refusals in — the resource word, that a
+/// resource of this name is already held, then the detail naming it — the same `<subject>
+/// … - <detail>` shape its absent-resource refusals carry. The action name, taken verbatim
+/// from the request, is its only variable part.
+#[must_use]
+pub fn scheduled_action_already_exists_message(action_name: &str) -> String {
+    format!(
+        "ScheduledUpdateGroupAction by this name already exists - A scheduled action with the \
+         name {action_name} already exists"
     )
 }
 

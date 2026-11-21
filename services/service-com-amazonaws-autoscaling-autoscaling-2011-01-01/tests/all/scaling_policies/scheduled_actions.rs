@@ -1071,8 +1071,8 @@ async fn a_quota_is_answered_as_the_modelled_limit_exceeded_fault() {
             400,
             "LimitExceeded",
             format!(
-                "You have already reached the limit of {MAX_SCHEDULED_ACTIONS_PER_GROUP} \
-                 scheduled actions per Auto Scaling group"
+                "The maximum limit of {MAX_SCHEDULED_ACTIONS_PER_GROUP} scheduled actions has \
+                 been reached."
             )
             .as_str()
         ),

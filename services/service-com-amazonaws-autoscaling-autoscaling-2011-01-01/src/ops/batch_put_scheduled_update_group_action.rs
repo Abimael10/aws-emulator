@@ -14,6 +14,12 @@
 //! be created or updated, including an error message") rather than refusing the actions
 //! beside it.
 //!
+//! An entry of this call CREATES an action, so a `ScheduledActionName` the group already
+//! holds — or one an earlier entry of the same call states — is a CONFLICT: the call commits
+//! nothing and reports EVERY entry of the batch under
+//! `FailedScheduledUpdateGroupActions`, carrying the already-exists code and sentence
+//! ([`crate::state::scheduled_actions`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -213,6 +219,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "refused: no such group",
                 );
                 return Err(absent_group());
+            }
+
+            // Every name the call states, in the order it states them: an entry of a batch
+            // CREATES an action, so a name already taken is a conflict and not an update
+            // ([`crate::state::scheduled_actions`]). The conflict is found before any entry
+            // is committed, so the call writes nothing and every entry of it — the free
+            // names beside the taken one included — is reported as failed, carrying the
+            // conflict that rejected the call.
+            let stated: Vec<String> = requested
+                .iter()
+                .map(|request| request.scheduled_action_name.clone())
+                .collect();
+            if let Some(taken) = state.first_taken_scheduled_action_name(&group_name, &stated) {
+                let message = crate::state::scheduled_action_already_exists_message(&taken);
+                crate::state::audit(
+                    ctx.parts(),
+                    Self::NAME,
+                    &group_name,
+                    "refused: a scheduled action of this name is already held",
+                );
+                return Ok(BatchPutScheduledUpdateGroupActionOutput {
+                    failed_scheduled_update_group_actions: Some(
+                        stated
+                            .into_iter()
+                            .map(|action_name| FailedScheduledUpdateGroupActionRequest {
+                                scheduled_action_name: action_name,
+                                error_code: Some(
+                                    crate::state::ALREADY_EXISTS_ERROR_CODE.to_string(),
+                                ),
+                                error_message: Some(message.clone()),
+                            })
+                            .collect(),
+                    ),
+                });
             }
 
             let mut written: Vec<String> = Vec::with_capacity(requested.len());

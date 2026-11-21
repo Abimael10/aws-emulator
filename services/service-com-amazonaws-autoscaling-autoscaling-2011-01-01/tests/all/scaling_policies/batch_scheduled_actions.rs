@@ -14,9 +14,13 @@
 //! 1. One call puts EVERY action it states, each stated whole, and the read then reports all
 //!    of them against the group the call named, carrying the members each action stated; a
 //!    call that could store every action it stated reports no failed action at all.
-//! 2. The batch is the same upsert as the single put, into the same collection: a call naming
-//!    an action the group already holds REPLACES that definition and keeps the identity minted
-//!    when the action was created — whichever of the two operations created it.
+//! 2. An entry of the batch CREATES an action in the collection both writers of a scheduled
+//!    action write, so a `ScheduledActionName` already taken — by an action the group holds,
+//!    whichever operation created it, or by an earlier entry of the same call — is a
+//!    CONFLICT: the call commits nothing, reports every entry it stated under
+//!    `FailedScheduledUpdateGroupActions` with the already-exists code and sentence, and
+//!    leaves each held action with the definition and the identity it had. Restating a held
+//!    action is `PutScheduledUpdateGroupAction`'s upsert, which still replaces it whole.
 //! 3. An action the call could not store is reported on its own under
 //!    `FailedScheduledUpdateGroupActions` ("the names of the scheduled actions that could not
 //!    be created or updated, including an error message"), under the wire error code of its
@@ -432,11 +436,11 @@ async fn one_call_puts_every_action_it_states() {
     }
 }
 
-/// RULE 2: the batch upserts into the ONE collection both writers of a scheduled action
-/// write: a call naming a held action replaces its definition and keeps the identity minted
-/// when it was created, whichever operation created it.
+/// RULE 2: an entry of the batch CREATES an action, so a name already taken is a conflict
+/// that writes nothing and reports every entry of the call — while the single put's upsert
+/// still replaces a held action whole and keeps its identity.
 #[tokio::test]
-async fn a_batch_put_replaces_a_held_action_and_keeps_its_identity() {
+async fn a_batch_put_cannot_take_a_name_the_group_already_holds() {
     let group = "batch-upsert";
     let router = given_group(group).await;
 
@@ -490,8 +494,9 @@ async fn a_batch_put_replaces_a_held_action_and_keeps_its_identity() {
         created
     };
 
-    // One call restating both definitions WHOLE — a recurrence and a different size, with no
-    // desired capacity at all — beside an action the group does not hold yet.
+    // One call restating both held definitions WHOLE, beside an action the group does not
+    // hold yet: a name already taken is a conflict, so the call commits nothing and reports
+    // every entry it stated — the free name beside the taken ones included.
     let failed = batch_served(
         &router,
         "restating both definitions",
@@ -512,24 +517,52 @@ async fn a_batch_put_replaces_a_held_action_and_keeps_its_identity() {
         ],
     )
     .await;
-    assert!(
-        failed.is_empty(),
-        "the update must store every action it restated, got {failed:?}"
+    assert_eq!(
+        failed,
+        vec![
+            conflict_report("from-single-put", "from-single-put"),
+            conflict_report("from-batch-put", "from-single-put"),
+            conflict_report("new-in-the-update", "from-single-put"),
+        ],
+        "expected every entry of the conflicting call to be reported, got {failed:?}"
     );
 
-    let names = held_names(&router, "after the update", group).await;
+    // A name the CALL ITSELF states twice is taken by its own earlier entry, which is the
+    // same conflict.
+    let failed = batch_served(
+        &router,
+        "one call stating one name twice",
+        group,
+        &[
+            (
+                "stated-twice",
+                vec![("StartTime", "2037-01-01T00:00:00Z"), ("MinSize", "1")],
+            ),
+            (
+                "stated-twice",
+                vec![("StartTime", "2038-01-01T00:00:00Z"), ("MinSize", "2")],
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(
+        failed,
+        vec![
+            conflict_report("stated-twice", "stated-twice"),
+            conflict_report("stated-twice", "stated-twice"),
+        ],
+        "expected a call stating one name twice to report the conflict, got {failed:?}"
+    );
+
+    let names = held_names(&router, "after the conflicting calls", group).await;
     assert_eq!(
         names,
-        vec![
-            "from-batch-put".to_string(),
-            "from-single-put".to_string(),
-            "new-in-the-update".to_string()
-        ],
-        "expected the update to add one action and replace two, got {names:?}"
+        vec!["from-batch-put".to_string(), "from-single-put".to_string()],
+        "expected a conflicting call to write nothing, got {names:?}"
     );
 
     for (name, arn) in &created {
-        let action = held_action(&router, "after the update", group, name)
+        let action = held_action(&router, "after the conflicting calls", group, name)
             .await
             .unwrap_or_else(|| panic!("the read reports no action {name:?}"));
         let reported = tag_value(&action, "ScheduledActionARN");
@@ -539,22 +572,80 @@ async fn a_batch_put_replaces_a_held_action_and_keeps_its_identity() {
              {reported:?}"
         );
         assert!(
-            tag_value(&action, "DesiredCapacity").is_empty(),
-            "expected the update of {name:?} to replace its definition rather than merge into \
-             it, got {action}"
+            !tag_value(&action, "DesiredCapacity").is_empty(),
+            "expected {name:?} to keep the definition it was created with, got {action}"
         );
     }
-    let replaced = held_action(&router, "after the update", group, "from-single-put")
+
+    // The upsert of a HELD action is the single put's: it states the action whole, so the
+    // capacity the action was created with is gone and the identity is the one it was
+    // created with.
+    let (status, code, message) = {
+        let (status, body) = query(
+            &router,
+            "PutScheduledUpdateGroupAction",
+            &[
+                ("AutoScalingGroupName", group),
+                ("ScheduledActionName", "from-single-put"),
+                ("Recurrence", "30 0 1 1,6,12 *"),
+                ("MinSize", "1"),
+            ],
+        )
+        .await;
+        (
+            status,
+            tag_value(&body, "Code"),
+            xml_unescape(&tag_value(&body, "Message")),
+        )
+    };
+    assert_eq!(
+        status, 200,
+        "the single put must replace the held action, got {status} with {code:?} {message:?}"
+    );
+    let replaced = held_action(&router, "after the single put", group, "from-single-put")
         .await
         .expect("the read reports the replaced action");
     assert_eq!(
         (
             tag_value(&replaced, "Recurrence"),
-            tag_value(&replaced, "MinSize")
+            tag_value(&replaced, "MinSize"),
+            tag_value(&replaced, "DesiredCapacity"),
+            tag_value(&replaced, "ScheduledActionARN"),
         ),
-        ("30 0 1 1,6,12 *".to_string(), "1".to_string()),
-        "expected the update to state the action whole, got {replaced}"
+        (
+            "30 0 1 1,6,12 *".to_string(),
+            "1".to_string(),
+            String::new(),
+            created
+                .iter()
+                .find(|(name, _)| name == "from-single-put")
+                .map(|(_, arn)| arn.clone())
+                .unwrap_or_default(),
+        ),
+        "expected the single put to state the action whole and keep its identity, got \
+         {replaced}"
     );
+}
+
+/// The whole message a call naming an action the group already holds is reported with: the
+/// shape this service states an already-exists refusal in, naming the action whose name was
+/// taken. Written out here rather than taken from the crate.
+fn already_exists_message(action_name: &str) -> String {
+    format!(
+        "ScheduledUpdateGroupAction by this name already exists - A scheduled action with the \
+         name {action_name} already exists"
+    )
+}
+
+/// One entry of the report a conflicting call answers with: the entry's own name, the
+/// `awsQueryError` code of the already-exists fault, and the sentence naming the action whose
+/// name was taken.
+fn conflict_report(entry: &str, taken: &str) -> (String, String, String) {
+    (
+        entry.to_string(),
+        "AlreadyExists".to_string(),
+        already_exists_message(taken),
+    )
 }
 
 /// RULE 3: an action the call could not store is reported on its own, under the wire error

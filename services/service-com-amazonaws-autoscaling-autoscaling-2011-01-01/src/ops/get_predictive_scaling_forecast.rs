@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPredictiveScalingForecast
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPredictiveScalingForecast`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPredictiveScalingForecast::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the forecast of a predictive scaling policy: the hourly load each of the policy's
+//! metric specifications is forecast to see, and the minimum capacity those loads need the
+//! group to hold. Both are computed from the observations the account's own CloudWatch store
+//! holds for the metrics the policy names, through the one forecast this service has
+//! ([`crate::state::predictive_forecast`]).
+//!
+//! The policy a request names is resolved against the group it names, and a name that
+//! resolves to a policy of any other `PolicyType` names nothing this operation can answer
+//! for, so it is refused before any observation is read.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +91,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::predictive_forecast as forecast;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -158,18 +161,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPredictiveScalingForecast` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPredictiveScalingForecastErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPredictiveScalingForecast"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetPredictiveScalingForecastErrorModeled::ResourceContentionFault(
+                    ResourceContentionFault {
+                        message: Some(
+                            "the Auto Scaling store is not mounted on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let group_name = input.auto_scaling_group_name;
+        let policy_name = input.policy_name;
+
+        // Whether IAM lets this caller read THIS group's forecast, decided against the
+        // group's own ARN before anything is read ([`crate::service::authorization`]).
+        if let Some(refusal) = crate::service::authorization::group_action_refusal(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &group_name,
+        ) {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &group_name,
+                "refused: not authorized",
+            );
+            return Err(refusal);
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let start_time = crate::state::from_date_time(input.start_time);
+        let end_time = crate::state::from_date_time(input.end_time);
+        // The span the request asks for, taken against the rules its own two members state
+        // ([`crate::state::predictive_forecast::time_range_refusal`]) BEFORE the store is
+        // locked and before a single observation is read: a forecast is one value per hour of
+        // that span, so how long it is decides how much work this read is and it is a fact of
+        // the REQUEST — like every other per-call bound of this service.
+        if let Some(refusal) = forecast::time_range_refusal(start_time, end_time, now) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
+        }
+
+        // What the forecast is computed FROM is read out under the store's lock and the lock
+        // is then released: the policy and the group's own bounds are all it needs, so no
+        // other request to this service waits behind a forecast.
+        let (bounds, policy) = {
+            let mut state = store.lock();
+            state.materialize_due(&*self.engine, now);
+
+            // A scaling policy belongs to a group, so the group is resolved first: a request
+            // naming no stored group is refused for the group whatever policy it names.
+            let Some(group) = state.groups.get(&group_name) else {
+                crate::state::audit(
+                    ctx.parts(),
+                    Self::NAME,
+                    &group_name,
+                    "refused: no such group",
+                );
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::absent_group_message(&group_name),
+                ));
+            };
+            let bounds = forecast::GroupCapacityBounds::of(group);
+            let key = crate::state::PolicyKey {
+                auto_scaling_group_name: group_name.clone(),
+                policy_name: policy_name.clone(),
+            };
+            let Some(policy) = state.scaling_policies.get(&key) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::policy_execution::absent_policy_message(&policy_name),
+                ));
+            };
+            // This operation reports the forecast OF a predictive scaling policy, so a name
+            // that resolves to a policy of any other type names nothing it can answer for —
+            // checked before a single observation is read.
+            if !forecast::is_predictive_scaling(policy) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    forecast::not_a_predictive_scaling_policy_message(&policy_name),
+                ));
+            }
+            (bounds, policy.clone())
+        };
+
+        // The forecast the policy publishes, computed from the observations the account's
+        // own CloudWatch store holds for the metrics the policy names
+        // ([`crate::state::predictive_forecast`]). A specification naming a form the
+        // forecast cannot compute is answered as that unimplemented form rather than with a
+        // number aggregated some other way.
+        let computed = forecast::forecast(
+            &*self.engine,
+            &group_name,
+            bounds,
+            &policy,
+            start_time,
+            end_time,
+        )
+        .map_err(|refusal| {
+            crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "{} {}",
+                Self::NAME,
+                refusal.unimplemented_form()
+            ))
+        })?;
+
+        crate::state::audit(
+            ctx.parts(),
+            Self::NAME,
+            &format!("{group_name}/{policy_name}"),
+            "forecast reported",
+        );
+        Ok(GetPredictiveScalingForecastOutput {
+            load_forecast: computed.load,
+            capacity_forecast: computed.capacity,
+            // "The time the forecast was made", which is this read.
+            update_time: crate::state::to_date_time(now),
+        })
     }
 }

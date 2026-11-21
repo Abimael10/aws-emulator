@@ -501,10 +501,22 @@ fn check_policy_input(
         check_target_tracking_configuration(configuration)?;
     }
     // "Required if the policy type is PredictiveScaling."
-    if members.predictive && input.predictive_scaling_configuration.is_none() {
-        return Err(refuse(policies::member_must_not_be_null_message(
-            "predictiveScalingConfiguration",
-        )));
+    if members.predictive {
+        let Some(configuration) = input.predictive_scaling_configuration.as_ref() else {
+            return Err(refuse(policies::member_must_not_be_null_message(
+                "predictiveScalingConfiguration",
+            )));
+        };
+        // How many metric specifications ONE such policy may hold
+        // ([`policies::MAX_PREDICTIVE_METRIC_SPECIFICATIONS`]): the member carries no
+        // modelled length, and a policy's specifications are what the forecast it publishes
+        // is computed per, so the bound is checked where the policy is WRITTEN.
+        let stated = configuration.metric_specifications.len();
+        if stated > policies::MAX_PREDICTIVE_METRIC_SPECIFICATIONS {
+            return Err(refuse(policies::too_many_metric_specifications_message(
+                stated,
+            )));
+        }
     }
     Ok(())
 }

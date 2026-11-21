@@ -197,6 +197,13 @@ pub mod scaling_policies;
 
 pub use scaling_policies::{PolicyKey, StoredScalingPolicy};
 
+/// The forecast a predictive scaling policy publishes — what
+/// `GetPredictiveScalingForecast` reports — computed from the CloudWatch observations of the
+/// metrics the policy names.
+pub mod predictive_forecast;
+
+pub use predictive_forecast::not_a_predictive_scaling_policy_message;
+
 /// The recurring schedule a scheduled action states — the crontab expression its
 /// `Recurrence` is written in and the IANA zone its `TimeZone` names — and the next instant
 /// such a schedule fires at.
@@ -208,11 +215,14 @@ pub mod recurrence;
 pub mod scheduled_actions;
 
 pub use scheduled_actions::{
-    invalid_recurrence_message, scheduled_action_arn,
+    absent_scheduled_action_message, invalid_recurrence_message,
+    scheduled_action_already_exists_message, scheduled_action_arn,
+    too_many_scheduled_action_names_in_one_call_message,
     too_many_scheduled_actions_in_one_call_message, too_many_scheduled_actions_message,
     ScheduledActionPut, ScheduledActionRefusal, ScheduledActions, StoredScheduledAction,
-    END_TIME_MESSAGE, INVALID_TIME_ZONE_MESSAGE, MAX_SCHEDULED_ACTIONS_PER_CALL,
-    MAX_SCHEDULED_ACTIONS_PER_GROUP, SIZE_REQUIRED_MESSAGE,
+    ALREADY_EXISTS_ERROR_CODE, END_TIME_MESSAGE, INVALID_TIME_ZONE_MESSAGE,
+    LIMIT_EXCEEDED_ERROR_CODE, MAX_SCHEDULED_ACTIONS_PER_CALL, MAX_SCHEDULED_ACTIONS_PER_GROUP,
+    SIZE_REQUIRED_MESSAGE, VALIDATION_ERROR_CODE,
 };
 
 /// Performing one of those policies — `ExecutePolicy` — which policy a request names, the
@@ -3920,6 +3930,23 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+}
+
+/// Convert a wire timestamp a request states to a stored instant: the inverse of
+/// [`to_date_time`].
+///
+/// An instant at or before the epoch — which no clock reports and no request this service
+/// answers states — reads as the epoch itself rather than failing the call.
+#[must_use]
+pub fn from_date_time(time: ::aws_smithy_types::DateTime) -> SystemTime {
+    let since_epoch = time.as_secs_f64();
+    if !since_epoch.is_finite() || since_epoch <= 0.0 {
+        return SystemTime::UNIX_EPOCH;
+    }
+    Duration::try_from_secs_f64(since_epoch)
+        .ok()
+        .and_then(|since_epoch| SystemTime::UNIX_EPOCH.checked_add(since_epoch))
+        .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
 /// `at` as RFC 3339 UTC text truncated to the second, which is the precision this service
