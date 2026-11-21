@@ -361,28 +361,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what the resolution hands back. Resolved against that service's own records
         // BEFORE this service's store is locked, which is the lock order
         // [`crate::state::auto_scaling_group_binding`] documents.
-        let auto_scaling_group_provider = match crate::state::auto_scaling_group_binding(
+        // The resolution is MADE here, under that lock order, and what it says is not acted
+        // on until the `cluster` this request names has been resolved below: the cluster is
+        // the scope the whole call acts in, so a request naming a cluster this account does
+        // not hold is refused for the cluster whatever else it references — the same reading
+        // every other cross-service resolution in this crate is answered under (`RunTask`'s
+        // subnets, `CreateService`'s target groups and service registries).
+        let bound_group = crate::state::auto_scaling_group_binding(
             &*self.engine,
             &region,
             input.auto_scaling_group_provider.as_ref(),
-        ) {
-            Ok(bound) => bound.as_ref().map(
-                // The members the request left out of the binding are the ones Amazon ECS
-                // applies its own values to, so the provider is stored with them in place
-                // ([`crate::state::stored_auto_scaling_group_provider`]) — which is what
-                // every read of it reports and what a repeat of this create is compared
-                // against.
-                crate::state::stored_auto_scaling_group_provider,
-            ),
-            Err(message) => {
-                return Err(
-                    CreateCapacityProviderErrorModeled::ClientException(ClientException {
-                        message: Some(message.to_string()),
-                    })
-                    .into(),
-                )
-            }
-        };
+        );
+        // The members the request left out of the binding are the ones Amazon ECS applies
+        // its own values to, so the provider is stored with them in place
+        // ([`crate::state::stored_auto_scaling_group_provider`]) — which is what every read
+        // of it reports and what a repeat of this create is compared against.
+        let auto_scaling_group_provider = bound_group
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(crate::state::stored_auto_scaling_group_provider);
         // The group this request binds the provider onto, as the stored provider will
         // report it.
         let requested_group = auto_scaling_group_provider
@@ -391,28 +389,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Creating the provider MUTATES that group — Amazon ECS marks it as its own to
         // manage ([`crate::state::mark_group_managed`]) — so the call needs the Auto Scaling
         // action that write performs on it, and a caller without it is refused before
-        // anything is created.
-        if let Some(group_arn) = requested_group.as_deref() {
-            if let Some(message) =
-                crate::state::auto_scaling_tag_refusal(&*self.engine, ctx, group_arn)
-            {
-                return Err(
-                    CreateCapacityProviderErrorModeled::AccessDeniedException(
-                        AccessDeniedException {
-                            message: Some(message.to_string()),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        }
+        // anything is created. The policies in force are read here, beside the resolution
+        // the action is about and under the same lock order, and the refusal is answered
+        // with it, after the cluster.
+        let withheld_tag_action = requested_group.as_deref().and_then(|group_arn| {
+            crate::state::auto_scaling_tag_refusal(&*self.engine, ctx, group_arn)
+        });
 
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        // A deleted cluster is not one this provider can be scoped to ("The cluster has
-        // been deleted"), so a tombstone is refused too — as the inactive cluster it is,
-        // which is what tells it apart from a name that never existed.
+        // The `cluster` a request names is the scope it acts in, so it is resolved FIRST,
+        // before any other resource the request references. A deleted cluster is not one
+        // this provider can be scoped to ("The cluster has been deleted"), so a tombstone is
+        // refused too — as the inactive cluster it is, which is what tells it apart from a
+        // name that never existed.
         if let Some(cluster_name) = cluster_name.as_deref() {
             if !guard.has_active_cluster(cluster_name) {
                 return Err(
@@ -426,6 +417,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
+        }
+
+        // The cluster is resolved, so what the Auto Scaling reads above answered is acted on
+        // now: a reference naming a group that service holds none of in this Region binds the
+        // provider onto no capacity at all, and a caller who may not tag the group it does
+        // name cannot have the provider either.
+        if let Err(message) = bound_group {
+            return Err(
+                CreateCapacityProviderErrorModeled::ClientException(ClientException {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
+        }
+        if let Some(message) = withheld_tag_action {
+            return Err(
+                CreateCapacityProviderErrorModeled::AccessDeniedException(AccessDeniedException {
+                    message: Some(message.to_string()),
+                })
+                .into(),
+            );
         }
 
         // `CreateManagedInstancesProviderConfiguration` is what the request carries and

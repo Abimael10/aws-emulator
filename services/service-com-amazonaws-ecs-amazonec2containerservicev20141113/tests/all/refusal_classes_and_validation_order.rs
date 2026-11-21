@@ -25,6 +25,11 @@
 //!    (`ecs-{hookType}-{id}`, the id spelled as a UUID); a hookId naming a hook of that
 //!    rollout whose action has already been taken asks for an action that has already
 //!    happened, so it is answered and changes nothing.
+//! 5. The `cluster` a request names is the SCOPE it acts in, so it is resolved before any
+//!    other resource the request references: a request naming a cluster this account does
+//!    not hold earns `ClusterNotFoundException` whatever else it names, and the refusal the
+//!    other resource would have earned is what the same request gets once the cluster is
+//!    there.
 //!
 //! Every case goes through the same front door a client uses, so nothing reaches into the
 //! state struct and a response that is not computed from persisted state cannot pass.
@@ -32,6 +37,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::capacity_providers::{group_arn, managed_instances};
 // The rollout a PAUSE hook belongs to is read back, waited for and picked apart through the
 // sibling suite that owns those readers, rather than copied here.
 use crate::continue_service_deployment_validation::{
@@ -942,3 +948,292 @@ async fn the_action_on_a_hook_is_taken_once_and_a_repeat_changes_nothing() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// 5. The cluster a request names is resolved before anything else it references
+// ---------------------------------------------------------------------------
+
+/// The modelled error code a `cluster` that resolves to nothing is answered in.
+const CLUSTER_NOT_FOUND_CODE: &str = "ClusterNotFoundException";
+
+/// `ClusterNotFoundException$message` for a reference that resolves to no cluster record
+/// (`state`'s `CLUSTER_NOT_FOUND_MESSAGE`): fixed text, naming nothing from the request.
+const CLUSTER_NOT_FOUND: &str = "Cluster not found.";
+
+/// The same error's message for a cluster this account still holds as the record a delete
+/// left behind (`state`'s `CLUSTER_INACTIVE_MESSAGE`) — the sentence that tells a deleted
+/// cluster apart from one this account never held.
+const CLUSTER_INACTIVE: &str = "The referenced cluster was inactive.";
+
+/// The refusal an `autoScalingGroupProvider` naming a group Amazon EC2 Auto Scaling holds
+/// none of earns (`state`'s `AUTO_SCALING_GROUP_NOT_FOUND_MESSAGE`) — the refusal the rows
+/// below must NOT be answered with while their cluster is missing, and the one the same
+/// request earns once it is there.
+const GROUP_NOT_FOUND: &str = "The specified Auto Scaling group does not exist. Specify a \
+                               valid Auto Scaling group and try again.";
+
+/// The refusal a reference naming no capacity provider of the account earns (`state`'s
+/// `CAPACITY_PROVIDER_MISSING_MESSAGE`).
+const PROVIDER_MISSING: &str = "The specified capacity provider does not exist. Specify a \
+                                valid name or ARN and try again.";
+
+/// The group a provider of the setup already scales, and the one nothing does.
+const BOUND_GROUP: &str = "asg-bound";
+const FREE_GROUP: &str = "asg-held";
+
+/// The capacity provider the setup creates, so a row can name one the account really holds.
+const HELD_PROVIDER: &str = "boundprovider";
+
+/// One row of the cluster-resolution table: an operation of the capacity-provider family and
+/// the members it carries BESIDE the `cluster`, which the test fills in per cluster state.
+struct ClusterFirstCase {
+    case: &'static str,
+    operation: &'static str,
+    request: fn() -> Value,
+}
+
+/// The rows differ along the OPERATION and along what else the request references — a group
+/// the account holds none of, one it holds, one another provider already scales, capacity
+/// Amazon ECS would stand up, a provider name nothing holds, and one it does — because the
+/// rule is about which of the two resolutions answers first, not about any one of them.
+fn cluster_first_rows() -> Vec<ClusterFirstCase> {
+    vec![
+        ClusterFirstCase {
+            case: "a create over a group the account holds none of",
+            operation: "CreateCapacityProvider",
+            request: || {
+                json!({
+                    "name": "ghostcluster",
+                    "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-nowhere" },
+                })
+            },
+        },
+        ClusterFirstCase {
+            case: "a create over a group the account does hold",
+            operation: "CreateCapacityProvider",
+            request: || {
+                json!({
+                    "name": "heldgroup",
+                    "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn(FREE_GROUP) },
+                })
+            },
+        },
+        ClusterFirstCase {
+            case: "a create over a group another provider already scales",
+            operation: "CreateCapacityProvider",
+            request: || {
+                json!({
+                    "name": "boundgroup",
+                    "autoScalingGroupProvider": { "autoScalingGroupArn": BOUND_GROUP },
+                })
+            },
+        },
+        ClusterFirstCase {
+            case: "a create of capacity Amazon ECS would stand up",
+            operation: "CreateCapacityProvider",
+            request: || {
+                json!({ "name": "standsup", "managedInstancesProvider": managed_instances() })
+            },
+        },
+        ClusterFirstCase {
+            case: "a create under a name the account already holds",
+            operation: "CreateCapacityProvider",
+            request: || {
+                json!({
+                    "name": HELD_PROVIDER,
+                    "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-nowhere" },
+                })
+            },
+        },
+        ClusterFirstCase {
+            case: "a describe of a provider nothing holds",
+            operation: "DescribeCapacityProviders",
+            request: || json!({ "capacityProviders": ["nosuchprovider"] }),
+        },
+        ClusterFirstCase {
+            case: "a describe of every provider in the cluster's scope",
+            operation: "DescribeCapacityProviders",
+            request: || json!({}),
+        },
+        ClusterFirstCase {
+            case: "an update of a provider nothing holds",
+            operation: "UpdateCapacityProvider",
+            request: || {
+                json!({
+                    "name": "nosuchprovider",
+                    "autoScalingGroupProvider": { "managedScaling": { "status": "DISABLED" } },
+                })
+            },
+        },
+        ClusterFirstCase {
+            case: "an update of a provider the account does hold",
+            operation: "UpdateCapacityProvider",
+            request: || {
+                json!({
+                    "name": HELD_PROVIDER,
+                    "autoScalingGroupProvider": { "managedScaling": { "status": "DISABLED" } },
+                })
+            },
+        },
+        ClusterFirstCase {
+            case: "an association of a provider nothing holds",
+            operation: "PutClusterCapacityProviders",
+            request: || {
+                json!({
+                    "capacityProviders": ["nosuchprovider"],
+                    "defaultCapacityProviderStrategy": [],
+                })
+            },
+        },
+        ClusterFirstCase {
+            case: "an association of a provider the account does hold",
+            operation: "PutClusterCapacityProviders",
+            request: || {
+                json!({
+                    "capacityProviders": [HELD_PROVIDER],
+                    "defaultCapacityProviderStrategy": [],
+                })
+            },
+        },
+    ]
+}
+
+#[tokio::test]
+async fn the_cluster_a_request_names_is_resolved_before_what_else_it_references() {
+    let router = service();
+    let setup = "setup";
+    create_auto_scaling_group(&router, FREE_GROUP, setup).await;
+    create_auto_scaling_group(&router, BOUND_GROUP, setup).await;
+    // A provider over one of those groups, so a row can name a provider — and a group —
+    // the account really holds.
+    ok(
+        &router,
+        "CreateCapacityProvider",
+        json!({
+            "name": HELD_PROVIDER,
+            "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn(BOUND_GROUP) },
+        }),
+        setup,
+    )
+    .await;
+    // The cluster every control row acts in, and the tombstone a delete leaves behind.
+    create_cluster(&router, "resolved", setup).await;
+    create_cluster(&router, "deleted", setup).await;
+    ok(&router, "DeleteCluster", json!({ "cluster": "deleted" }), setup).await;
+
+    // Every row, against a reference that resolves to NO cluster record and against the
+    // record a delete left: the same error code either way, and the sentence that says
+    // which of the two states the cluster is in.
+    for (cluster, expected_message) in [
+        ("nosuchcluster", CLUSTER_NOT_FOUND),
+        ("deleted", CLUSTER_INACTIVE),
+    ] {
+        for row in cluster_first_rows() {
+            let case = format!("{} in {cluster:?}", row.case);
+            let mut request = (row.request)();
+            request["cluster"] = json!(cluster);
+            let (code, message) = refusal(&router, row.operation, request, &case).await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                (CLUSTER_NOT_FOUND_CODE, expected_message),
+                "case {case:?}: expected the cluster to be resolved first, got {code} with \
+                 {message:?}"
+            );
+        }
+    }
+
+    // Nothing above was written: a refused call leaves the account holding exactly the
+    // providers it held, so the rows were refused rather than half-applied.
+    let case = "the refused calls created no provider";
+    let described = ok(&router, "DescribeCapacityProviders", json!({}), case).await;
+    let names: Vec<String> = list(&described, "capacityProviders", case)
+        .iter()
+        .map(|provider| string(provider, "name", case))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "FARGATE".to_string(),
+            "FARGATE_SPOT".to_string(),
+            HELD_PROVIDER.to_string()
+        ],
+        "case {case:?}: expected only the provider the setup created, got {described}"
+    );
+
+    // The CONTROLS: with the cluster there, the very resources the rows named earn their own
+    // refusals — so what the rows proved is the ORDER, not that these conditions go
+    // unreported.
+    let case = "a create over a group the account holds none of, in a cluster that is there";
+    let (code, message) = refusal(
+        &router,
+        "CreateCapacityProvider",
+        json!({
+            "name": "ghostgroup",
+            "cluster": "resolved",
+            "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-nowhere" },
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (CLIENT_EXCEPTION, GROUP_NOT_FOUND),
+        "case {case:?}: expected the group's own refusal, got {code} with {message:?}"
+    );
+
+    let case = "an update of a provider nothing holds, in a cluster that is there";
+    let (code, message) = refusal(
+        &router,
+        "UpdateCapacityProvider",
+        json!({
+            "name": "nosuchprovider",
+            "cluster": "resolved",
+            "autoScalingGroupProvider": { "managedScaling": { "status": "DISABLED" } },
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (CLIENT_EXCEPTION, PROVIDER_MISSING),
+        "case {case:?}: expected the provider's own refusal, got {code} with {message:?}"
+    );
+
+    let case = "an association of a provider nothing holds, in a cluster that is there";
+    let (code, message) = refusal(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": "resolved",
+            "capacityProviders": ["nosuchprovider"],
+            "defaultCapacityProviderStrategy": [],
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        code, INVALID_PARAMETER,
+        "case {case:?}: expected the association's own refusal, got {code} with {message:?}"
+    );
+
+    // And the create the first row asked for is ACCEPTED once it names the cluster that is
+    // there: the refusals above were about the cluster, not about the request's own shape.
+    let case = "the create the rows asked for, in a cluster that is there";
+    let created = ok(
+        &router,
+        "CreateCapacityProvider",
+        json!({
+            "name": "heldgroup",
+            "cluster": "resolved",
+            "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn(FREE_GROUP) },
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        string(&created["capacityProvider"], "name", case),
+        "heldgroup",
+        "case {case:?}: expected the provider the create was asked for, got {created}"
+    );
+}
+
