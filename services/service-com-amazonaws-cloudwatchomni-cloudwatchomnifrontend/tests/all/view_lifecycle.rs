@@ -26,7 +26,15 @@
 //!   and paged at `maxResults` with a `nextToken` that resumes where the page stopped;
 //! * `DeleteView` releases the view its name identifies, so the name resolves to nothing
 //!   and is free again, and a name the store holds nothing under is a 404;
-//! * `@idempotencyToken` replays return the original view rather than minting a second.
+//! * `@idempotencyToken` replays return the original view rather than minting a second;
+//! * `UpdateView` is a PARTIAL update of the persisted view: every member the request
+//!   carries replaces the stored one, every member it omits — the identity, the ARN, the
+//!   ownership category and `createdAt` among them — keeps exactly what it held, and the
+//!   patched record is what `GetView` answers afterwards. A new `definition` is held to
+//!   the same rule the create holds one to, so a definition that is not one SQL query is
+//!   the same `ValidationException` (400) with the same message and writes nothing at
+//!   all, and a name the store holds nothing under is the 404. These rows are driven over
+//!   the rpcv2Cbor wire, so what a real client reads is what is asserted.
 //!
 //! Each assertion names its case and the actual value, so a failure identifies the row
 //! of the table that broke.
@@ -49,8 +57,9 @@ use omni::ops::get_view::{GetView, GetViewError};
 use omni::ops::list_views::{ListViews, ListViewsError};
 use omni::ops::types::{
     CreateViewInput, CreateViewOutput, DeleteViewInput, DeleteViewOutput, GetViewInput,
-    GetViewOutput, ListViewsInput, ListViewsOutput, CREATE_VIEW_INPUT_SCHEMA,
-    GET_VIEW_INPUT_SCHEMA, LIST_VIEWS_INPUT_SCHEMA, VIEW_TYPE_VALUES,
+    GetViewOutput, ListViewsInput, ListViewsOutput, UpdateViewInput, UpdateViewOutput,
+    CREATE_VIEW_INPUT_SCHEMA, GET_VIEW_INPUT_SCHEMA, LIST_VIEWS_INPUT_SCHEMA,
+    UPDATE_VIEW_INPUT_SCHEMA, VIEW_TYPE_VALUES,
 };
 use omni::scaffolded::Scaffolded;
 use omni::state::{
@@ -986,5 +995,406 @@ async fn a_deleted_view_resolves_to_nothing_and_frees_its_name() {
         omni.delete_view(&view_name("never-created")).await,
         404,
         "ResourceNotFoundException",
+    );
+}
+
+/// Patch a view over the rpcv2Cbor wire, requiring the modelled success, and answer with
+/// the record the operation reported.
+async fn patched_over_the_wire(
+    omni: &Omni,
+    case: &str,
+    input: &UpdateViewInput,
+) -> UpdateViewOutput {
+    let (status, body) = omni
+        .over_the_wire("UpdateView", UPDATE_VIEW_INPUT_SCHEMA, input)
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "case {case:?}: UpdateView over the wire answered {status}: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let codec = CborCodec::default();
+    let mut deserializer = codec.create_deserializer(&body);
+    UpdateViewOutput::deserialize(&mut deserializer).unwrap_or_else(|error| {
+        panic!("case {case:?}: the UpdateView response does not deserialize: {error:?}")
+    })
+}
+
+/// The view the store holds under `name`, read back over the same wire.
+async fn read_over_the_wire(omni: &Omni, case: &str, name: &str) -> GetViewOutput {
+    let (status, body) = omni
+        .over_the_wire(
+            "GetView",
+            GET_VIEW_INPUT_SCHEMA,
+            &GetViewInput {
+                name: name.to_string(),
+            },
+        )
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "case {case:?}: GetView over the wire answered {status}: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let codec = CborCodec::default();
+    let mut deserializer = codec.create_deserializer(&body);
+    GetViewOutput::deserialize(&mut deserializer).unwrap_or_else(|error| {
+        panic!("case {case:?}: the GetView response does not deserialize: {error:?}")
+    })
+}
+
+/// One row of the partial-update table: the view the store starts with, the members the
+/// patch carries, and what the view must hold once the patch has been applied.
+struct ViewPatch {
+    case: &'static str,
+    suffix: &'static str,
+    initial_definition: String,
+    initial_description: Option<String>,
+    patch_definition: Option<String>,
+    patch_description: Option<String>,
+    expected_definition: String,
+    expected_description: Option<String>,
+}
+
+/// The patches the partial-update rule has to hold for.
+///
+/// The rows differ along WHICH subset of the two updatable members the request carries —
+/// `description` alone, `definition` alone, both, neither — and along the FORM of the new
+/// definition and the SIZE of the new description, because the rule is about the members
+/// the request carries rather than about the values they take. `ViewDescription`'s
+/// `@length(..1024)` is what the longest row is sized at.
+fn view_patches() -> Vec<ViewPatch> {
+    vec![
+        ViewPatch {
+            case: "the description alone, leaving the definition and the identity as they were",
+            suffix: "patch-description-only",
+            initial_definition: "SELECT * FROM logs".to_string(),
+            initial_description: Some("first".to_string()),
+            patch_definition: None,
+            patch_description: Some("second".to_string()),
+            expected_definition: "SELECT * FROM logs".to_string(),
+            expected_description: Some("second".to_string()),
+        },
+        ViewPatch {
+            case: "the description alone onto a view that carried none",
+            suffix: "patch-description-added",
+            initial_definition: "SELECT 1".to_string(),
+            initial_description: None,
+            patch_definition: None,
+            patch_description: Some("added".to_string()),
+            expected_definition: "SELECT 1".to_string(),
+            expected_description: Some("added".to_string()),
+        },
+        ViewPatch {
+            case: "the longest description the model admits",
+            suffix: "patch-description-longest",
+            initial_definition: "SELECT 1".to_string(),
+            initial_description: Some("first".to_string()),
+            patch_definition: None,
+            patch_description: Some("d".repeat(1024)),
+            expected_definition: "SELECT 1".to_string(),
+            expected_description: Some("d".repeat(1024)),
+        },
+        ViewPatch {
+            case: "the definition alone, replaced by an aggregate query",
+            suffix: "patch-definition-aggregate",
+            initial_definition: "SELECT * FROM logs".to_string(),
+            initial_description: Some("kept".to_string()),
+            patch_definition: Some(
+                "SELECT service, count(*) AS errors FROM logs GROUP BY service".to_string(),
+            ),
+            patch_description: None,
+            expected_definition: "SELECT service, count(*) AS errors FROM logs GROUP BY service"
+                .to_string(),
+            expected_description: Some("kept".to_string()),
+        },
+        ViewPatch {
+            case: "the definition alone, replaced by a set operation",
+            suffix: "patch-definition-set-operation",
+            initial_definition: "SELECT * FROM logs".to_string(),
+            initial_description: None,
+            patch_definition: Some("SELECT id FROM logs UNION SELECT id FROM spans".to_string()),
+            patch_description: None,
+            expected_definition: "SELECT id FROM logs UNION SELECT id FROM spans".to_string(),
+            expected_description: None,
+        },
+        ViewPatch {
+            case: "the definition alone, replaced by a common table expression",
+            suffix: "patch-definition-cte",
+            initial_definition: "SELECT 1".to_string(),
+            initial_description: Some("kept".to_string()),
+            patch_definition: Some(
+                "WITH errors AS (SELECT * FROM logs WHERE level = 'ERROR') SELECT count(*) FROM \
+                 errors"
+                    .to_string(),
+            ),
+            patch_description: None,
+            expected_definition:
+                "WITH errors AS (SELECT * FROM logs WHERE level = 'ERROR') SELECT count(*) FROM \
+                 errors"
+                    .to_string(),
+            expected_description: Some("kept".to_string()),
+        },
+        ViewPatch {
+            case: "both members at once",
+            suffix: "patch-both",
+            initial_definition: "SELECT 1".to_string(),
+            initial_description: Some("first".to_string()),
+            patch_definition: Some("SELECT count(*) FROM spans".to_string()),
+            patch_description: Some("second".to_string()),
+            expected_definition: "SELECT count(*) FROM spans".to_string(),
+            expected_description: Some("second".to_string()),
+        },
+        ViewPatch {
+            case: "neither member, so the whole view comes through",
+            suffix: "patch-neither",
+            initial_definition: "SELECT * FROM logs".to_string(),
+            initial_description: Some("kept".to_string()),
+            patch_definition: None,
+            patch_description: None,
+            expected_definition: "SELECT * FROM logs".to_string(),
+            expected_description: Some("kept".to_string()),
+        },
+        ViewPatch {
+            case: "the values the view already holds",
+            suffix: "patch-unchanged",
+            initial_definition: "SELECT * FROM logs".to_string(),
+            initial_description: Some("kept".to_string()),
+            patch_definition: Some("SELECT * FROM logs".to_string()),
+            patch_description: Some("kept".to_string()),
+            expected_definition: "SELECT * FROM logs".to_string(),
+            expected_description: Some("kept".to_string()),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_patch_replaces_the_members_it_carries_and_leaves_every_other_member_as_it_was() {
+    let omni = Omni::new();
+
+    for row in view_patches() {
+        let case = row.case;
+        let name = view_name(row.suffix);
+        let created = omni
+            .create_view(&CreateViewInput {
+                description: row.initial_description.clone(),
+                ..create_input(&name, &row.initial_definition)
+            })
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: CreateView failed: {error:?}"));
+
+        let patched = patched_over_the_wire(
+            &omni,
+            case,
+            &UpdateViewInput {
+                name: name.clone(),
+                definition: row.patch_definition.clone(),
+                description: row.patch_description.clone(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            (patched.definition.as_str(), patched.description.as_deref()),
+            (
+                row.expected_definition.as_str(),
+                row.expected_description.as_deref()
+            ),
+            "case {case:?}: the patched view is {patched:?}"
+        );
+        // The members `UpdateView`'s input cannot even name: the identity, the ARN, the
+        // ownership category and the instant the view was created.
+        assert_eq!(
+            (
+                patched.name.as_str(),
+                patched.arn.as_str(),
+                patched.r#type.as_str(),
+                patched.created_at
+            ),
+            (
+                created.name.as_str(),
+                created.arn.as_str(),
+                VIEW_TYPE_USER,
+                created.created_at
+            ),
+            "case {case:?}: a member the patch cannot name was changed, got {patched:?} from \
+             {created:?}"
+        );
+        assert!(
+            patched.updated_at.secs() >= patched.created_at.secs(),
+            "case {case:?}: updatedAt {:?} precedes createdAt {:?}",
+            patched.updated_at,
+            patched.created_at
+        );
+
+        // The write reached the store the reader answers from, and left ONE view there.
+        let read = read_over_the_wire(&omni, case, &name).await;
+        assert_eq!(
+            (
+                read.name.as_str(),
+                read.definition.as_str(),
+                read.description.as_deref(),
+                read.r#type.as_str(),
+                read.arn.as_str(),
+                read.created_at,
+                read.updated_at
+            ),
+            (
+                patched.name.as_str(),
+                patched.definition.as_str(),
+                patched.description.as_deref(),
+                patched.r#type.as_str(),
+                patched.arn.as_str(),
+                patched.created_at,
+                patched.updated_at
+            ),
+            "case {case:?}: GetView did not answer the record the patch persisted, got {read:?}"
+        );
+        let listed = omni
+            .list_views(&ListViewsInput::default())
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: ListViews failed: {error:?}"));
+        assert_eq!(
+            listed
+                .items
+                .iter()
+                .filter(|item| item.name == name)
+                .count(),
+            1,
+            "case {case:?}: the patch must leave one view under its name, got {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_patched_definition_that_is_not_one_sql_query_is_refused_and_writes_nothing() {
+    let omni = Omni::new();
+    // The view every row starts from, and the description it starts with: a refused patch
+    // has to leave both exactly as they are.
+    let stored_definition = "SELECT service, count(*) AS errors FROM logs GROUP BY service";
+
+    for (index, (case, candidate)) in NOT_ONE_QUERY.iter().enumerate() {
+        let name = view_name(&format!("patch-refused-{index}"));
+        omni.create_view(&CreateViewInput {
+            description: Some("kept".to_string()),
+            ..create_input(&name, stored_definition)
+        })
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: CreateView failed: {error:?}"));
+
+        let (status, body) = omni
+            .over_the_wire(
+                "UpdateView",
+                UPDATE_VIEW_INPUT_SCHEMA,
+                &UpdateViewInput {
+                    name: name.clone(),
+                    definition: Some((*candidate).to_string()),
+                    // The same request asks for a new description too: a refused patch
+                    // writes NEITHER member.
+                    description: Some("second".to_string()),
+                },
+            )
+            .await;
+        let (code, message) = error_envelope(case, &body);
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: the wire must answer 400 ValidationException, got {status} {code:?}: \
+             {message:?}"
+        );
+        assert!(
+            message.starts_with(INVALID_VIEW_DEFINITION)
+                || message == VIEW_DEFINITION_MUST_BE_A_SELECT_QUERY
+                || message == VIEW_DEFINITION_MUST_BE_ONE_STATEMENT,
+            "case {case:?}: the refusal must be one of the definition rule's three forms, got \
+             {message:?}"
+        );
+
+        // A new definition is held to the SAME rule a created one is, so the create
+        // refuses this text with the same status, code and message.
+        let (create_status, create_body) = omni
+            .over_the_wire(
+                "CreateView",
+                CREATE_VIEW_INPUT_SCHEMA,
+                &create_input(&view_name(&format!("create-refused-{index}")), candidate),
+            )
+            .await;
+        let (create_code, create_message) = error_envelope(case, &create_body);
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (
+                create_status,
+                create_code.as_str(),
+                create_message.as_str()
+            ),
+            "case {case:?}: UpdateView refused this definition differently from CreateView"
+        );
+
+        let read = read_over_the_wire(&omni, case, &name).await;
+        assert_eq!(
+            (read.definition.as_str(), read.description.as_deref()),
+            (stored_definition, Some("kept")),
+            "case {case:?}: the refused patch changed the view, got {read:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_patch_of_a_name_the_store_holds_nothing_under_is_the_modelled_404() {
+    let omni = Omni::new();
+    let live = view_name("patch-live");
+    omni.create_view(&CreateViewInput {
+        description: Some("kept".to_string()),
+        ..create_input(&live, "SELECT 1")
+    })
+    .await
+    .expect("the live view is created");
+
+    // Rows span the `ViewName` class (`@length(6..256)`,
+    // `^view\.[a-z0-9][a-z0-9_-]{0,250}$`, from
+    // `smithy_query(query="shape",shape="ViewName")`): the shortest name the model
+    // admits, one carrying the punctuation the pattern allows, one whose first character
+    // is a digit, and the longest name the model admits.
+    for (case, name) in [
+        ("the shortest name the model admits", view_name("a")),
+        ("a name with punctuation", view_name("no_such-view")),
+        ("a name starting with a digit", view_name("0-errors")),
+        (
+            "the longest name the model admits",
+            format!("view.{}", "v".repeat(251)),
+        ),
+    ] {
+        // The template: the fixed "View not found: " and the name the request carried —
+        // unquoted, with no trailing period, as every operation that reports a missing
+        // view words it.
+        let expected = format!("View not found: {name}");
+        let (status, body) = omni
+            .over_the_wire(
+                "UpdateView",
+                UPDATE_VIEW_INPUT_SCHEMA,
+                &UpdateViewInput {
+                    name: name.clone(),
+                    definition: Some("SELECT count(*) FROM logs".to_string()),
+                    description: Some("second".to_string()),
+                },
+            )
+            .await;
+        let (code, message) = error_envelope(case, &body);
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (404, "ResourceNotFoundException", expected.as_str()),
+            "case {case:?}: the wire must answer 404 ResourceNotFoundException with \
+             {expected:?}, got {status} {code:?}: {message:?}"
+        );
+    }
+
+    // None of the refusals touched the view the store does hold.
+    let read = read_over_the_wire(&omni, "the live view", &live).await;
+    assert_eq!(
+        (read.definition.as_str(), read.description.as_deref()),
+        ("SELECT 1", Some("kept")),
+        "a patch of a name the store holds nothing under changed the live view: {read:?}"
     );
 }
