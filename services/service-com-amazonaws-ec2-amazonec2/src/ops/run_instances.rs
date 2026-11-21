@@ -43,6 +43,12 @@
 //! created. An entry for any OTHER device neither moves the root device nor creates a volume
 //! of its own here.
 //!
+//! The MOVES every instance of a launch then makes are published as they fall due: an
+//! instance's state change is an event of the account's default EventBridge bus
+//! ([`crate::state::InstanceStateNotification`]), so the `pending` the launch answers and the
+//! `running` — or the `terminated` an unusable volume key owes it — reach a client watching
+//! the bus without it calling EC2 again.
+//!
 //! An `ImageId` may name a Systems Manager parameter instead of an AMI — "alternatively, you
 //! can specify a Systems Manager parameter […] The Systems Manager parameter will resolve to
 //! an AMI ID on launch", written `resolve:ssm:<parameter>` — so such a value is resolved
@@ -1619,9 +1625,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what makes a host carrying an instance refuse to be released under it.
         store.resync_dedicated_host_instances();
 
-        store
+        // The moves every instance of this launch makes, published for whatever watches
+        // instances: the `pending` it is in now and the state the clock owes it — `running`,
+        // or the `terminated` a volume that cannot be encrypted owes it — each when that move
+        // falls due ([`crate::state::InstanceStateNotification`]). Rendered from the STORED
+        // instances, so what is published is what the store settled on, and handed on below
+        // with the guard already given back: a lock of this store is never held while another
+        // service is called.
+        let launched: Vec<String> = store
+            .reservations
+            .get(&reservation_id)
+            .map(|reservation| reservation.instance_ids.clone())
+            .unwrap_or_default();
+        let moves =
+            store.instance_state_change_notifications(&launched, ::std::time::Instant::now());
+        let answer = store
             .whole_reservation_view(&reservation_id)
-            .ok_or_else(|| Scaffolded::internal_error("the launched reservation was not stored"))
+            .ok_or_else(|| Scaffolded::internal_error("the launched reservation was not stored"));
+        drop(store);
+        let answer = answer?;
+        for notification in moves {
+            notification.publish_when_due(state.clone(), ctx.callback().clone());
+        }
+        Ok(answer)
     }
 }
 

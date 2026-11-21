@@ -704,7 +704,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // describe reports rather than about one this handler merely built — its launch
         // errors included, which are derived from what each pool was asked for and what the
         // instance store holds for it.
-        fleet_created(&store, &fleet_id, &zones)
+        let answer = fleet_created(&store, &fleet_id, &zones);
+
+        // The moves the instances this fleet PLACED make, published for whatever watches
+        // instances: the `pending` each is in now and the `running` the clock owes it, each
+        // when that move falls due ([`crate::state::InstanceStateNotification`]) — an
+        // instance a fleet launched moves exactly as one a caller launched does, so it is
+        // announced the same way. Rendered from the STORED instances and handed on with the
+        // guard already given back: a lock of this store is never held while another service
+        // is called.
+        let launched: Vec<String> = placed
+            .iter()
+            .map(|instance| instance.instance_id.clone())
+            .collect();
+        let moves =
+            store.instance_state_change_notifications(&launched, ::std::time::Instant::now());
+        drop(store);
+        for notification in moves {
+            notification.publish_when_due(state.clone(), ctx.callback().clone());
+        }
+
+        answer
     }
 }
 

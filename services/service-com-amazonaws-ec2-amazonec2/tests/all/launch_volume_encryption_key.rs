@@ -73,8 +73,11 @@ const INVALID_KEY_STATE_MESSAGE: &str =
 const RUNNING: &str = "running";
 const TERMINATED: &str = "terminated";
 
-/// The state every launch answers with, which is what a settling poll waits to leave.
+/// The state every launch answers with, and the state an instance on its way out passes
+/// through: the two a settling poll waits to leave, neither of them a state an instance stays
+/// in.
 const PENDING: &str = "pending";
+const SHUTTING_DOWN: &str = "shutting-down";
 
 /// How long a poll keeps looking for the move the clock owes an instance before it gives up: a
 /// generous multiple of the service's own span, so a loaded host is never the reason a case
@@ -290,12 +293,12 @@ async fn settled(
                 reason.and_then(|reason| child_text(reason, "message")),
             )
         };
-        if reading.0 != PENDING {
+        if reading.0 != PENDING && reading.0 != SHUTTING_DOWN {
             return reading;
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: {instance_id} must leave {PENDING}, last answer {body}"
+            "case {case:?}: {instance_id} must settle, last answer {body}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }

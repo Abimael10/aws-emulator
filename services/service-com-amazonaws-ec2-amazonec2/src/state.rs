@@ -3105,6 +3105,10 @@ mod launch_volume_keys;
 /// EventBridge bus. Everything it declares is re-exported below, so a handler reaches it as
 /// `crate::state::VolumeNotification` like any other primitive of this module.
 mod volume_notifications;
+/// The event every change of an INSTANCE's state is published as, onto that same bus.
+/// Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::InstanceStateNotification` like any other primitive of this module.
+mod instance_state_notifications;
 mod local_gateways_and_filter_patterns;
 pub mod outpost_lags;
 mod service_link_virtual_interfaces;
@@ -3166,6 +3170,7 @@ pub use tag_descriptions::*;
 pub use volume_encryption::*;
 pub use launch_volume_keys::*;
 pub use volume_notifications::*;
+pub use instance_state_notifications::*;
 pub use volumes::*;
 pub use import_image_tasks_and_verified_access::*;
 pub use export_image_tasks::*;

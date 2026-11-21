@@ -9,6 +9,52 @@
 
 use super::*;
 
+impl InstanceRecord {
+    /// The state the clock owes an instance that has just reached `state`, or `None` when
+    /// `state` is the end of the move it was making.
+    ///
+    /// The ONE statement of the one pair of instance states that CHAINS: `shutting-down` is
+    /// not a state an instance stays in — an instance that is going is `terminated` a
+    /// transition span later — so a move INTO it owes that second move, exactly as the
+    /// termination a caller asks for records both halves at once
+    /// ([`ComAmazonawsEc2Amazonec2State::begin_instance_termination`]). Every other move
+    /// stands alone: the state a stop, a start or a launch owes is the end of what that call
+    /// owed.
+    ///
+    /// Read by the clock, which records the second move as it applies the first
+    /// ([`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]), and by
+    /// [`Self::owed_transitions`], so what is published about an instance and what the store
+    /// then does to it cannot disagree.
+    #[must_use]
+    pub fn state_after(state: InstanceStateName) -> Option<InstanceStateName> {
+        (state == InstanceStateName::ShuttingDown).then_some(InstanceStateName::Terminated)
+    }
+
+    /// Every state the clock still owes this instance, in the order it will reach them, each
+    /// with the instant that move falls due.
+    ///
+    /// The move recorded on the instance ([`InstanceRecord::pending_transition`]) followed by
+    /// the rest of the chain it starts ([`Self::state_after`]), one transition span apart — so
+    /// a reader that has to know where an instance is HEADED, and not only where it is, reads
+    /// it in one place. Empty for an instance the clock owes nothing.
+    #[must_use]
+    pub fn owed_transitions(&self) -> Vec<(InstanceStateName, Instant)> {
+        let mut owed: Vec<(InstanceStateName, Instant)> = Vec::new();
+        let Some(pending) = self.pending_transition.as_ref() else {
+            return owed;
+        };
+        let mut state = pending.to;
+        let mut due_at = pending.due_at;
+        owed.push((state, due_at));
+        while let Some(next) = Self::state_after(state) {
+            state = next;
+            due_at += TRANSITION_DELAY;
+            owed.push((state, due_at));
+        }
+        owed
+    }
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// A fresh, unused `r-` reservation id.
     pub fn mint_reservation_id(&mut self) -> String {
@@ -499,8 +545,8 @@ impl ComAmazonawsEc2Amazonec2State {
                 .pending_transition
                 .as_ref()
                 .filter(|pending| now >= pending.due_at)
-                .map(|pending| (pending.to, pending.reason.clone()));
-            if let Some((state, reason)) = due {
+                .map(|pending| (pending.to, pending.due_at, pending.reason.clone()));
+            if let Some((state, due_at, reason)) = due {
                 instance.state = state;
                 instance.pending_transition = None;
                 // The reason the move was made FOR, where the move carried one: it is the
@@ -508,6 +554,16 @@ impl ComAmazonawsEc2Amazonec2State {
                 // transition is applied rather than while the instance was still on its way.
                 if let Some(reason) = reason {
                     instance.state_reason = Some(reason);
+                }
+                // The SECOND half of a move that chains: an instance that has just begun
+                // shutting down is `terminated` a span later, whether or not anybody calls
+                // again ([`InstanceRecord::state_after`], the one statement of that pair).
+                if let Some(next) = InstanceRecord::state_after(state) {
+                    instance.pending_transition = Some(PendingTransition {
+                        to: next,
+                        due_at: due_at + TRANSITION_DELAY,
+                        reason: None,
+                    });
                 }
                 // A completed termination releases the instance's primary private address:
                 // the interface that held it goes at this same instant (below), so EC2 has

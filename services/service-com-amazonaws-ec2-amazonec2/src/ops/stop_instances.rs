@@ -231,6 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut changes: Vec<InstanceStateChange> = Vec::new();
+        // The instances this call really MOVED, which are the ones whose moves it publishes:
+        // one already stopping or stopped moved nowhere here and announces nothing.
+        let mut moved: Vec<String> = Vec::new();
         for instance_id in &instance_ids {
             let Some(instance) = store.instances.get_mut(instance_id) else {
                 continue;
@@ -251,12 +254,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     INSTANCE_STATE_REASON_USER_INITIATED_SHUTDOWN.to_string(),
                     INSTANCE_STATE_REASON_MESSAGE_USER_INITIATED_SHUTDOWN.to_string(),
                 ));
+                moved.push(instance_id.clone());
             }
             changes.push(InstanceStateChange {
                 instance_id: Some(instance_id.clone()),
                 previous_state: Some(previous.view()),
                 current_state: Some(instance.state.view()),
             });
+        }
+
+        // The moves this call made, published for whatever watches instances: the `stopping`
+        // each instance is in now and the `stopped` the clock owes it, each when that move
+        // falls due ([`crate::state::InstanceStateNotification`]). Rendered from the STORED
+        // instances and handed on below with the guard already given back: a lock of this
+        // store is never held while another service is called.
+        let announced = store
+            .instance_state_change_notifications(&moved, ::std::time::Instant::now());
+        drop(store);
+        for notification in announced {
+            notification.publish_when_due(state.clone(), ctx.callback().clone());
         }
 
         Ok(StopInstancesOutput {

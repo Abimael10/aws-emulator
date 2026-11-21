@@ -9,8 +9,9 @@
 //! key of the account at all — produces no data key and the volume cannot come into
 //! existence. A launch's root volume is the volume its instance boots from, so an instance
 //! whose volumes cannot be created never runs: Amazon EC2 accepts the launch, answers the
-//! `pending` instance it minted, and then takes that instance back under the state reason
-//! that says why ([`INVALID_KMS_KEY_STATE_CODE`]) — which is what a client watching the
+//! `pending` instance it minted, and then takes that instance back — `shutting-down` and then
+//! `terminated`, the pair every instance leaving makes — under the state reason that says why
+//! ([`INVALID_KMS_KEY_STATE_CODE`]) — which is what a client watching the
 //! instance repairs, on the key or on the launch parameters.
 //!
 //! The judgement is KMS's and is made at the instant of the LAUNCH, so a launch made after
@@ -98,11 +99,13 @@ impl ComAmazonawsEc2Amazonec2State {
     /// volumes were to be encrypted under refused their data key (`refusal`).
     ///
     /// The instance stays in the `pending` state the launch answered with — the launch itself
-    /// was accepted — and the clock owes it `terminated` instead of `running`, with the state
-    /// reason that says why recorded as that move is applied
-    /// ([`Self::materialize_due_transitions`]). So a caller that reads straight after the
-    /// launch still sees the instance coming up and a caller that waits sees it terminated
-    /// with the reason, whether or not anybody called in between.
+    /// was accepted — and the clock owes it the SHUTDOWN instead of `running`: `shutting-down`,
+    /// carrying the state reason that says why as that move is applied, and then `terminated`
+    /// one span later, the pair every instance that leaves on its way out makes
+    /// ([`Self::materialize_due_transitions`], which completes it). So a caller that reads
+    /// straight after the launch still sees the instance coming up, one that reads while it is
+    /// going sees `shutting-down` with the reason, and one that waits sees it `terminated` —
+    /// whether or not anybody called in between.
     ///
     /// The volumes that launch created go with it, withdrawn at the same instant they would
     /// have reached `available` — exactly as the volume of a `CreateVolume` under such a key
@@ -131,7 +134,7 @@ impl ComAmazonawsEc2Amazonec2State {
         );
         let (code, message) = invalid_kms_key_state_reason();
         instance.pending_transition = Some(
-            PendingTransition::starting_now(InstanceStateName::Terminated)
+            PendingTransition::starting_now(InstanceStateName::ShuttingDown)
                 .reporting(code, message),
         );
         // The guest never comes up: the instance it would have booted on is on its way out.
