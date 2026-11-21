@@ -7,6 +7,33 @@ Issue-Commit: b11785bf9bf8af57a00ad7e4d814b1c5f1d66117
 
 # apigateway__dynamodb__iam__lambda: the REST API IAM-authorization lifecycle never completes — the debug scenario hangs out its budget with no verdict
 
+> _Resolution: the cause as REPORTED — "one of the phases blocks on a poll that is never
+> satisfied (a deployed stage that never becomes servable, or a control-plane read that never
+> reports the deployed method), rather than being refused" — is not present at this commit, and
+> `core/router/tests/all/apigateway_iam_authorization_debug_lifecycle.rs` now pins what the
+> report says AWS does, over one estate and end to end: `GetResources` keys each resource's
+> `resourceMethods` by the verbs put on it (embedding the `Method` only where `embed=methods`
+> asks for it, and reporting no map for a resource carrying none), `GetMethod` reports the
+> method's `authorizationType`, IAM's `ListRoles`/`ListRolePolicies`/`GetRolePolicy`/`GetRole`
+> report the execution role and its inline document, the deployed stage either serves the
+> request or refuses it `403` with the IAM authorization sentence for that principal and method
+> ARN (and `Missing Authentication Token` for a request carrying no credential),
+> `TestInvokeMethod` answers its status/body/log/latency envelope, the function's log group holds
+> the run's records until a `DeleteLogGroup` takes it away — after which the next
+> `DescribeLogGroups` reports nothing and a second delete is refused
+> `ResourceNotFoundException`, which is what lets a teardown that reaps a log group until it is
+> gone STOP — and every delete of the estate is answered its modelled success with the record
+> gone from the next read. No call of the lifecycle is refused or left unanswered: the whole
+> sequence, including the teardown, settles in under 10 s against the assembled emulator.
+> What remains of the recorded failure is the harness's own WALL CLOCK: this five-phase scenario
+> (deploy, setup, solve, cleanup, destroy), whose client-side `_await` helper sleeps 3 s between
+> probes and which the recorded run cut off inside `_reap_log_group`, does not finish inside the
+> 60 s cap, and the report states no AWS-published latency for any of it — so no AWS rule fixes
+> it, and the replay of this check will keep timing out until a later change makes the whole
+> lifecycle fit the cap. The emulator-side spans the lifecycle does pay are the ones the
+> project's own transition rule requires (a created DynamoDB table reaching `ACTIVE`, a created
+> function reaching `Active`), so there is nothing here to shorten._
+
 > _Note: this issue was identified against the code base at commit `b11785bf9bf8af57a00ad7e4d814b1c5f1d66117`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
