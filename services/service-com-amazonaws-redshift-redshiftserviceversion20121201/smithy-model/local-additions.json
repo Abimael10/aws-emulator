@@ -1,0 +1,186 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.redshift#Cluster": {
+      "type": "structure",
+      "members": {
+        "ClusterIdentifier": { "target": "com.amazonaws.redshift#String" },
+        "NodeType": { "target": "com.amazonaws.redshift#String" },
+        "ClusterStatus": { "target": "com.amazonaws.redshift#String" },
+        "ClusterAvailabilityStatus": { "target": "com.amazonaws.redshift#String" },
+        "ModifyStatus": { "target": "com.amazonaws.redshift#String" },
+        "MasterUsername": { "target": "com.amazonaws.redshift#String" },
+        "DBName": { "target": "com.amazonaws.redshift#String" },
+        "Endpoint": { "target": "com.amazonaws.redshift#Endpoint" },
+        "ClusterCreateTime": { "target": "com.amazonaws.redshift#TStamp" },
+        "AutomatedSnapshotRetentionPeriod": { "target": "com.amazonaws.redshift#Integer" },
+        "ManualSnapshotRetentionPeriod": { "target": "com.amazonaws.redshift#Integer" },
+        "ClusterSecurityGroups": {
+          "target": "com.amazonaws.redshift#ClusterSecurityGroupMembershipList"
+        },
+        "VpcSecurityGroups": {
+          "target": "com.amazonaws.redshift#VpcSecurityGroupMembershipList"
+        },
+        "ClusterParameterGroups": {
+          "target": "com.amazonaws.redshift#ClusterParameterGroupStatusList"
+        },
+        "ClusterSubnetGroupName": { "target": "com.amazonaws.redshift#String" },
+        "VpcId": { "target": "com.amazonaws.redshift#String" },
+        "AvailabilityZone": { "target": "com.amazonaws.redshift#String" },
+        "PreferredMaintenanceWindow": { "target": "com.amazonaws.redshift#String" },
+        "PendingModifiedValues": { "target": "com.amazonaws.redshift#PendingModifiedValues" },
+        "ClusterVersion": { "target": "com.amazonaws.redshift#String" },
+        "AllowVersionUpgrade": { "target": "com.amazonaws.redshift#Boolean" },
+        "NumberOfNodes": { "target": "com.amazonaws.redshift#Integer" },
+        "PubliclyAccessible": { "target": "com.amazonaws.redshift#Boolean" },
+        "Encrypted": { "target": "com.amazonaws.redshift#Boolean" },
+        "RestoreStatus": { "target": "com.amazonaws.redshift#RestoreStatus" },
+        "DataTransferProgress": { "target": "com.amazonaws.redshift#DataTransferProgress" },
+        "HsmStatus": { "target": "com.amazonaws.redshift#HsmStatus" },
+        "ClusterSnapshotCopyStatus": {
+          "target": "com.amazonaws.redshift#ClusterSnapshotCopyStatus"
+        },
+        "ClusterPublicKey": { "target": "com.amazonaws.redshift#String" },
+        "ClusterNodes": { "target": "com.amazonaws.redshift#ClusterNodesList" },
+        "ElasticIpStatus": { "target": "com.amazonaws.redshift#ElasticIpStatus" },
+        "ClusterRevisionNumber": { "target": "com.amazonaws.redshift#String" },
+        "Tags": { "target": "com.amazonaws.redshift#TagList" },
+        "KmsKeyId": { "target": "com.amazonaws.redshift#String" },
+        "EnhancedVpcRouting": { "target": "com.amazonaws.redshift#Boolean" },
+        "IamRoles": { "target": "com.amazonaws.redshift#ClusterIamRoleList" },
+        "PendingActions": { "target": "com.amazonaws.redshift#PendingActionsList" },
+        "MaintenanceTrackName": { "target": "com.amazonaws.redshift#String" },
+        "ElasticResizeNumberOfNodeOptions": { "target": "com.amazonaws.redshift#String" },
+        "DeferredMaintenanceWindows": {
+          "target": "com.amazonaws.redshift#DeferredMaintenanceWindowsList"
+        },
+        "SnapshotScheduleIdentifier": { "target": "com.amazonaws.redshift#String" },
+        "SnapshotScheduleState": { "target": "com.amazonaws.redshift#ScheduleState" },
+        "ExpectedNextSnapshotScheduleTime": { "target": "com.amazonaws.redshift#TStamp" },
+        "ExpectedNextSnapshotScheduleTimeStatus": { "target": "com.amazonaws.redshift#String" },
+        "NextMaintenanceWindowStartTime": { "target": "com.amazonaws.redshift#TStamp" },
+        "ResizeInfo": { "target": "com.amazonaws.redshift#ResizeInfo" },
+        "AvailabilityZoneRelocationStatus": { "target": "com.amazonaws.redshift#String" },
+        "AvailabilityZoneRelocation": { "target": "com.amazonaws.redshift#String" },
+        "AzDisasterRecoveryStatus": { "target": "com.amazonaws.redshift#String" },
+        "IsMaintenanceWindowActivated": { "target": "com.amazonaws.redshift#Boolean" },
+        "ClusterNamespaceArn": { "target": "com.amazonaws.redshift#String" },
+        "TotalStorageCapacityInMegaBytes": { "target": "com.amazonaws.redshift#LongOptional" },
+        "AquaConfiguration": { "target": "com.amazonaws.redshift#AquaConfiguration" },
+        "DefaultIamRoleArn": { "target": "com.amazonaws.redshift#String" },
+        "ReservedNodeExchangeStatus": {
+          "target": "com.amazonaws.redshift#ReservedNodeExchangeStatus"
+        },
+        "CustomDomainName": { "target": "com.amazonaws.redshift#String" },
+        "CustomDomainCertificateArn": { "target": "com.amazonaws.redshift#String" },
+        "CustomDomainCertificateExpiryDate": { "target": "com.amazonaws.redshift#TStamp" },
+        "MasterPasswordSecretArn": { "target": "com.amazonaws.redshift#String" },
+        "MasterPasswordSecretKmsKeyId": { "target": "com.amazonaws.redshift#String" },
+        "IpAddressType": { "target": "com.amazonaws.redshift#String" },
+        "MultiAZ": { "target": "com.amazonaws.redshift#String" },
+        "MultiAZSecondary": { "target": "com.amazonaws.redshift#SecondaryClusterInfo" },
+        "LakehouseRegistrationStatus": { "target": "com.amazonaws.redshift#String" },
+        "CatalogArn": { "target": "com.amazonaws.redshift#String" },
+        "ExtraComputeForAutomaticOptimization": { "target": "com.amazonaws.redshift#String" },
+        "LoggingPublishStatus": { "target": "com.amazonaws.redshift#LoggingPublishStatus" }
+      }
+    },
+    "com.amazonaws.redshift#String": {
+      "type": "string",
+      "traits": { "smithy.api#length": { "min": 0, "max": 2147483647 } }
+    },
+    "com.amazonaws.redshift#Boolean": { "type": "boolean" },
+    "com.amazonaws.redshift#Integer": { "type": "integer" },
+    "com.amazonaws.redshift#LongOptional": { "type": "long" },
+    "com.amazonaws.redshift#TStamp": { "type": "timestamp" },
+    "com.amazonaws.redshift#ScheduleState": {
+      "type": "enum",
+      "members": {
+        "MODIFYING": {
+          "target": "smithy.api#Unit",
+          "traits": { "smithy.api#enumValue": "MODIFYING" }
+        },
+        "ACTIVE": {
+          "target": "smithy.api#Unit",
+          "traits": { "smithy.api#enumValue": "ACTIVE" }
+        },
+        "FAILED": {
+          "target": "smithy.api#Unit",
+          "traits": { "smithy.api#enumValue": "FAILED" }
+        }
+      }
+    },
+    "com.amazonaws.redshift#ClusterSecurityGroupMembershipList": {
+      "type": "list",
+      "member": {
+        "target": "com.amazonaws.redshift#ClusterSecurityGroupMembership",
+        "traits": { "smithy.api#xmlName": "ClusterSecurityGroup" }
+      }
+    },
+    "com.amazonaws.redshift#VpcSecurityGroupMembershipList": {
+      "type": "list",
+      "member": {
+        "target": "com.amazonaws.redshift#VpcSecurityGroupMembership",
+        "traits": { "smithy.api#xmlName": "VpcSecurityGroup" }
+      }
+    },
+    "com.amazonaws.redshift#ClusterParameterGroupStatusList": {
+      "type": "list",
+      "member": {
+        "target": "com.amazonaws.redshift#ClusterParameterGroupStatus",
+        "traits": { "smithy.api#xmlName": "ClusterParameterGroup" }
+      }
+    },
+    "com.amazonaws.redshift#ClusterNodesList": {
+      "type": "list",
+      "member": { "target": "com.amazonaws.redshift#ClusterNode" }
+    },
+    "com.amazonaws.redshift#TagList": {
+      "type": "list",
+      "member": {
+        "target": "com.amazonaws.redshift#Tag",
+        "traits": { "smithy.api#xmlName": "Tag" }
+      }
+    },
+    "com.amazonaws.redshift#ClusterIamRoleList": {
+      "type": "list",
+      "member": {
+        "target": "com.amazonaws.redshift#ClusterIamRole",
+        "traits": { "smithy.api#xmlName": "ClusterIamRole" }
+      }
+    },
+    "com.amazonaws.redshift#PendingActionsList": {
+      "type": "list",
+      "member": { "target": "com.amazonaws.redshift#String" }
+    },
+    "com.amazonaws.redshift#DeferredMaintenanceWindowsList": {
+      "type": "list",
+      "member": {
+        "target": "com.amazonaws.redshift#DeferredMaintenanceWindow",
+        "traits": { "smithy.api#xmlName": "DeferredMaintenanceWindow" }
+      }
+    },
+    "com.amazonaws.redshift#Endpoint": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#PendingModifiedValues": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#RestoreStatus": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#DataTransferProgress": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#HsmStatus": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#ClusterSnapshotCopyStatus": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#ElasticIpStatus": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#ResizeInfo": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#AquaConfiguration": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#ReservedNodeExchangeStatus": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#SecondaryClusterInfo": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#LoggingPublishStatus": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#ClusterSecurityGroupMembership": {
+      "type": "structure",
+      "members": {}
+    },
+    "com.amazonaws.redshift#VpcSecurityGroupMembership": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#ClusterParameterGroupStatus": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#ClusterNode": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#Tag": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#ClusterIamRole": { "type": "structure", "members": {} },
+    "com.amazonaws.redshift#DeferredMaintenanceWindow": { "type": "structure", "members": {} }
+  }
+}

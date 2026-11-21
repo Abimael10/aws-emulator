@@ -23,6 +23,10 @@ pub mod authorize_snapshot_access_types;
 pub mod batch_delete_cluster_snapshots_types;
 pub mod batch_modify_cluster_snapshots_types;
 pub mod cancel_resize_types;
+/// The `Cluster` shape, generated from the overlay model beside the snapshot
+/// because Amazon Redshift answers with three members the snapshot does not
+/// declare (see `smithy-model/LOCAL-ADDITIONS.md`).
+pub mod cluster_types;
 pub mod copy_cluster_snapshot_types;
 pub mod create_authentication_profile_types;
 pub mod create_cluster_parameter_group_types;
@@ -180,6 +184,8 @@ pub use batch_delete_cluster_snapshots_types::*;
 pub use batch_modify_cluster_snapshots_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use cancel_resize_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use cluster_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use copy_cluster_snapshot_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

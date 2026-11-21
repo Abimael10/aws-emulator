@@ -3184,17 +3184,36 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
 
 /// One `TaggedResource` per tag of one resource: the tag, the resource's ARN and
 /// the resource's type, which is what `DescribeTags` reports a tag as.
-fn tagged_resource_entries<'a>(
+///
+/// The entries of one resource are ordered by TAG KEY, not by the order the tags
+/// were written: a resource's tags are a set keyed by the tag key — "if you
+/// specify a key that already exists for the resource, the value for that key
+/// will be updated" (`smithy_query(query="doc", operation="CreateTags")`), so one
+/// key names one tag — and this report enumerates that set in its keys' order.
+/// What a tag read answers therefore depends only on which tags a resource
+/// carries, never on the order of the calls that put them there, which is what
+/// the recorded `DescribeTags` answer this emulator is measured against reports:
+/// a parameter group's two tags come back in their keys' order, the reverse of
+/// the order the recorded run wrote them in.
+///
+/// The resource's own record keeps its tags in the order it was given them (see
+/// [`tags_with`], where a key already on the resource keeps its position), so
+/// this ordering is the report's, not the store's.
+fn tagged_resource_entries(
     resource_type: &'static str,
     arn: String,
-    tags: &'a [crate::ops::types::Tag],
-) -> impl Iterator<Item = crate::ops::types::TaggedResource> + 'a {
-    tags.iter()
-        .map(move |tag| crate::ops::types::TaggedResource {
+    tags: &[crate::ops::types::Tag],
+) -> Vec<crate::ops::types::TaggedResource> {
+    let mut reported: Vec<&crate::ops::types::Tag> = tags.iter().collect();
+    reported.sort_by(|left, right| left.key.cmp(&right.key));
+    reported
+        .into_iter()
+        .map(|tag| crate::ops::types::TaggedResource {
             tag: Some(tag.clone()),
             resource_name: Some(arn.clone()),
             resource_type: Some(resource_type.to_string()),
         })
+        .collect()
 }
 
 /// The `ClusterAvailabilityStatus` of a cluster that can serve queries: "Available - The

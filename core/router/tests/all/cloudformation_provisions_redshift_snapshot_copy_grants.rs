@@ -192,6 +192,21 @@ async fn create_key(router: &MultiServiceRouter, description: &str) -> (String, 
     (key_id, arn)
 }
 
+/// The key identifier Key Management Service resolves `named` to, read from its own
+/// `DescribeKey`: the ONE key id behind a key id, a key ARN, an alias name or an alias ARN,
+/// which is what a snapshot copy grant reports for the value a declaration named.
+async fn resolved_key_id(router: &MultiServiceRouter, case: &str, named: &str) -> String {
+    let (status, described) = kms(router, "DescribeKey", &json!({ "KeyId": named })).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected DescribeKey to resolve {named:?}, got {status} with {described}"
+    );
+    described["KeyMetadata"]["KeyId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no KeyId in {described}"))
+        .to_string()
+}
+
 /// The `<SnapshotCopyGrant>` Amazon Redshift reports for `name`, or the refusal it answered.
 async fn describe_grant(router: &MultiServiceRouter, name: &str) -> (u16, String) {
     redshift(
@@ -279,11 +294,12 @@ struct Declared {
     expected_key: ExpectedKey,
 }
 
-/// Which key a row's grant must come out covering.
+/// Which key a row's grant must come out covering. Whatever form the declaration names it in,
+/// the grant reports the key IDENTIFIER Key Management Service resolved.
 enum ExpectedKey {
     /// The key the row's own template named, by the id KMS minted for it.
     KeyId,
-    /// The same key, named by its ARN.
+    /// The same key, named in the template by its ARN.
     KeyArn,
     /// No key stated at all, which is the account's default key.
     Default,
@@ -474,15 +490,19 @@ async fn a_deployed_stack_publishes_the_grant_redshift_holds() {
                 Some(name.as_str()),
                 "case {case:?}: expected the grant to carry the published name, got {grant}"
             );
-            let expected_key = match declared.expected_key {
+            let named_key = match declared.expected_key {
                 ExpectedKey::KeyId => key_id.clone(),
                 ExpectedKey::KeyArn => key_arn.clone(),
                 ExpectedKey::Default => DEFAULT_KEY.to_string(),
             };
+            // A grant covers ONE key, so it reports the identifier Key Management Service
+            // resolved for the value the declaration named rather than that value's form.
+            let expected_key = resolved_key_id(&router, case, &named_key).await;
             assert_eq!(
                 opt_element(grant, "KmsKeyId").as_deref(),
                 Some(expected_key.as_str()),
-                "case {case:?}: expected the grant to cover {expected_key:?}, got {grant}"
+                "case {case:?}: expected the grant to cover {expected_key:?}, the key \
+                 {named_key:?} resolves to, got {grant}"
             );
         }
     }

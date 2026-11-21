@@ -4,15 +4,19 @@
 //!
 //! Inserts a new snapshot copy grant into this service's store and reports it
 //! back: the name as given, the Key Management Service key it permits Amazon
-//! Redshift to use — the account's default key when the request names none —
-//! and the tags the request carried. A second create under the same name is
-//! refused with `SnapshotCopyGrantAlreadyExistsFault` and overwrites nothing.
+//! Redshift to use — reported by the key IDENTIFIER KMS resolves, and the
+//! account's default key when the request names none — and the tags the request
+//! carried. A second create under the same name is refused with
+//! `SnapshotCopyGrantAlreadyExistsFault` and overwrites nothing.
 //!
 //! A `KmsKeyId` the request NAMES is resolved against Key Management Service
 //! before anything is written: the grant's whole purpose is to let Amazon
 //! Redshift use that key, so a value KMS reports it cannot read names no key
 //! this grant could ever permit, and the request is refused with
-//! `InvalidParameterValue` (HTTP 400) with nothing stored.
+//! `InvalidParameterValue` (HTTP 400) with nothing stored. The grant then
+//! carries the key id KMS reported rather than the handle the request spelled —
+//! a key id, a key ARN, an alias name and an alias ARN all name one key, and the
+//! grant reports that one key.
 //!
 //! ## Shape of an operation
 //!
@@ -158,8 +162,11 @@ impl<Eng> CreateSnapshotCopyGrant<Eng> {
 /// What Key Management Service answered about the `KmsKeyId` this request named.
 #[derive(Debug)]
 enum KeyLookup {
-    /// KMS reported the key: it exists and this caller can read it.
-    Resolved,
+    /// KMS reported the key: it exists and this caller can read it. The value is
+    /// the key IDENTIFIER KMS resolved the request's value to — the same key id
+    /// `DescribeKey` reports for it, which is what the grant then carries,
+    /// whatever form the request named the key in.
+    Resolved(String),
     /// KMS reported that the value names no key it can resolve — the key does not
     /// exist, the value is not a key identifier KMS can read at all, or this caller
     /// may not read it. The reason it gave travels for the operator-visible log.
@@ -210,10 +217,12 @@ fn kms_client(
 
 /// Ask Key Management Service about `kms_key_id`.
 ///
-/// `DescribeKey` is the read that answers the only question this operation has about
-/// the value: whether it names a key KMS can resolve for this caller, whatever form
-/// the request gave it in — a key id, a key ARN, an alias name or an alias ARN are
-/// all identifiers `DescribeKey` accepts, so nothing here inspects the string itself.
+/// `DescribeKey` is the read that answers both questions this operation has about
+/// the value: whether it names a key KMS can resolve for this caller, whatever
+/// form the request gave it in — a key id, a key ARN, an alias name or an alias
+/// ARN are all identifiers `DescribeKey` accepts, so nothing here inspects the
+/// string itself — and, for one it resolves, the key IDENTIFIER behind that form,
+/// which is what a grant reports.
 ///
 /// The answer is a definite negative only when KMS names one of
 /// [`KEY_NEGATIVE_KMS_ERROR_CODES`] with a client status: those codes say the key
@@ -234,7 +243,22 @@ async fn describe_kms_key(
         ));
     };
     let err = match client.describe_key().key_id(kms_key_id).send().await {
-        Ok(_) => return KeyLookup::Resolved,
+        Ok(answer) => {
+            // The identifier of the key KMS resolved. A key it reports without one
+            // resolves to nothing this operation could store, so the value the
+            // request named stands — the same fallback an indeterminate lookup
+            // takes.
+            return match answer
+                .key_metadata()
+                .map(|metadata| metadata.key_id().to_string())
+            {
+                Some(key_id) => KeyLookup::Resolved(key_id),
+                None => KeyLookup::Indeterminate(
+                    "Key Management Service reported no key metadata for this KmsKeyId"
+                        .to_string(),
+                ),
+            };
+        }
         Err(err) => err,
     };
     let reason = ::aws_smithy_types::error::display::DisplayErrorContext(&err).to_string();
@@ -396,38 +420,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refusal);
         }
 
-        // The key the grant would permit Amazon Redshift to use, resolved against
-        // Key Management Service before anything is written: a value KMS cannot
-        // read for this caller names no key a copied snapshot could ever be
-        // encrypted under, so the grant is refused and nothing is stored. A request
-        // that names NO key has no value to resolve — it gets the account's default
-        // key below.
-        if let Some(kms_key_id) = input.kms_key_id.as_deref() {
-            let region = st::request_region(ctx);
-            match describe_kms_key(ctx, &region, kms_key_id).await {
-                KeyLookup::Resolved => {}
-                KeyLookup::Unresolvable(reason) => {
+        // The key the grant permits Amazon Redshift to use, resolved against Key
+        // Management Service before anything is written: a value KMS cannot read
+        // for this caller names no key a copied snapshot could ever be encrypted
+        // under, so the grant is refused and nothing is stored. A request that
+        // names NO key asks for the account's default key, which callers name by
+        // its alias, so that alias is the value resolved.
+        //
+        // What the grant CARRIES is the identifier KMS resolved, not the value the
+        // request spelled: `DescribeKey` takes a key id, a key ARN, an alias name
+        // or an alias ARN and reports the one key id behind them, and a client
+        // that looks the grant's key up in KMS, or compares two grants, needs that
+        // one identifier rather than whichever handle a caller happened to use.
+        // When KMS gives no answer about the value, there is no identifier to
+        // report and the value the request named stands.
+        let named_key = input
+            .kms_key_id
+            .clone()
+            .unwrap_or_else(|| st::DEFAULT_SNAPSHOT_COPY_GRANT_KMS_KEY.to_string());
+        let region = st::request_region(ctx);
+        let kms_key_id = match describe_kms_key(ctx, &region, &named_key).await {
+            KeyLookup::Resolved(key_id) => key_id,
+            KeyLookup::Unresolvable(reason) => {
+                // Only a key the REQUEST named can be refused for not resolving:
+                // a caller that named none asked for whatever key the account
+                // defaults to, and cannot be told its own request is bad.
+                if input.kms_key_id.is_some() {
                     ::tracing::debug!(
-                        kms_key_id,
+                        kms_key_id = named_key,
                         error = %reason,
                         "KMS reports this KmsKeyId names no readable key; refusing the grant"
                     );
                     return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
                         format!(
-                            "Unable to create snapshot copy grant. The KMS key '{kms_key_id}' does not exist or is inaccessible."
+                            "Unable to create snapshot copy grant. The KMS key '{named_key}' does not exist or is inaccessible."
                         ),
                     ));
                 }
-                // Visible to an operator: an indeterminate lookup is accepted, so
-                // without this line it would be indistinguishable from a key KMS
-                // resolved.
-                KeyLookup::Indeterminate(reason) => ::tracing::warn!(
-                    kms_key_id,
+                ::tracing::warn!(
+                    kms_key_id = named_key,
                     error = %reason,
-                    "KMS gave no answer about this KmsKeyId; accepting it"
-                ),
+                    "KMS resolved no key for the account's default Redshift alias; reporting the alias"
+                );
+                named_key.clone()
             }
-        }
+            // Visible to an operator: an indeterminate lookup is accepted, so
+            // without this line it would be indistinguishable from a key KMS
+            // resolved.
+            KeyLookup::Indeterminate(reason) => {
+                ::tracing::warn!(
+                    kms_key_id = named_key,
+                    error = %reason,
+                    "KMS gave no answer about this KmsKeyId; accepting it as named"
+                );
+                named_key.clone()
+            }
+        };
 
         let mut store = state.lock();
         if let Some(refusal) = refusal_from_state(&store, &input.snapshot_copy_grant_name) {
@@ -435,17 +483,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The record every later `DescribeSnapshotCopyGrants` reports verbatim:
-        // the name the request carried, the key it named — the account's default
-        // key when it named none — and the tags it carried (an empty list when
-        // it carried none, which is what the grant then has).
+        // the name the request carried, the KEY IDENTIFIER Key Management Service
+        // resolved for the key it named — the account's default key when it named
+        // none — and the tags it carried (an empty list when it carried none,
+        // which is what the grant then has).
         let grant = SnapshotCopyGrant {
             snapshot_copy_grant_name: Some(input.snapshot_copy_grant_name.clone()),
-            kms_key_id: Some(
-                input
-                    .kms_key_id
-                    .clone()
-                    .unwrap_or_else(|| st::DEFAULT_SNAPSHOT_COPY_GRANT_KMS_KEY.to_string()),
-            ),
+            kms_key_id: Some(kms_key_id),
             tags: Some(tags),
         };
         store.snapshot_copy_grants.push(grant.clone());

@@ -463,14 +463,17 @@ pub fn default_vpc_security_group_id(vpc_id: &str) -> String {
 /// reports by this id rather than by an ARN.
 pub const AWS_OWNED_KMS_KEY: &str = "AWS_OWNED_KMS_KEY";
 
-/// The `KmsKeyId` a snapshot copy grant carries when its create named none.
+/// The key a snapshot copy grant permits Amazon Redshift to use when its create
+/// named none.
 ///
 /// Source: `smithy_query(query="doc", shape="CreateSnapshotCopyGrantMessage",
 /// member="KmsKeyId")` — "If no key is specified, the default key is used." The
 /// default key of a Redshift account is the Amazon Web Services managed key for
-/// this service, which callers name by its alias, so that alias is the key such
-/// a grant permits Redshift to use. Resolved once at CREATE time and stored on
-/// the grant, so every later read of it reports the same key.
+/// this service, which callers name by this alias — so this is the value the
+/// create resolves against Key Management Service when the request names no key,
+/// and what the grant carries is the key IDENTIFIER that lookup reports (see
+/// `ops/create_snapshot_copy_grant.rs`). Resolved once at CREATE time and stored
+/// on the grant, so every later read of it reports the same key.
 pub const DEFAULT_SNAPSHOT_COPY_GRANT_KMS_KEY: &str = "alias/aws/redshift";
 
 /// What a `PendingModifiedValues$MasterUserPassword` carries while an admin

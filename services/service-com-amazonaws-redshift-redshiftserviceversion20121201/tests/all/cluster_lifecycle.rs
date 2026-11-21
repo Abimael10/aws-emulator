@@ -733,6 +733,45 @@ impl Emulator {
             .to_string()
     }
 
+    /// The key IDENTIFIER Key Management Service resolves `key_id` to, read from
+    /// KMS's own `DescribeKey` — the key id of whatever form the value takes (a
+    /// key id, a key ARN, an alias name or an alias ARN all name one key).
+    ///
+    /// A suite asserting what Redshift reports about a key reads the expected
+    /// value from the service that OWNS the key rather than building it here.
+    ///
+    /// Panics unless [`Emulator::with_kms`] built this emulator, and unless KMS
+    /// resolves the value — there is nothing to compare against otherwise.
+    pub(crate) async fn kms_key_id_of(&self, region: &str, key_id: &str) -> String {
+        let body = serde_json::json!({ "KeyId": key_id }).to_string();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri(format!("https://kms.{region}.amazonaws.com/"))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", "TrentService.DescribeKey")
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/kms/aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+                ),
+            )
+            .body(bytes::Bytes::from(body))
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let body = String::from_utf8_lossy(response.body()).into_owned();
+        assert_eq!(
+            status, 200,
+            "case \"resolve {key_id} through KMS\": expected status 200, got {status} with body {body}"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("DescribeKey answers a JSON body");
+        parsed["KeyMetadata"]["KeyId"]
+            .as_str()
+            .expect("DescribeKey reports the key's id")
+            .to_string()
+    }
+
     /// Seed a snapshot Redshift took on its OWN schedule.
     ///
     /// Nothing in this slice mints one — `CreateClusterSnapshot` is documented to

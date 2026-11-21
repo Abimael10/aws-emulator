@@ -74,6 +74,22 @@ fn tagged_arns_in(xml: &str) -> Vec<String> {
     all_text(xml, "ResourceName")
 }
 
+/// `pairs` in the order a `DescribeTags` answer reports ONE resource's tags: the
+/// order of their keys, whatever order the writes that put them there went in.
+///
+/// A resource's own record keeps the write order — a key already on it keeps its
+/// position and takes the new value — and the tag REPORT does not, so a case
+/// states the pairs it expects and this puts them in the order the report lists
+/// them.
+fn tag_report_order(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut ordered: Vec<(String, String)> = pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+    ordered.sort_by(|left, right| left.0.cmp(&right.0));
+    ordered
+}
+
 /// One `(name, value)` form parameter list, owned so a case can build it.
 type Params = Vec<(String, String)>;
 
@@ -265,8 +281,8 @@ async fn tags_round_trip_through_every_resource_type_an_arn_names() {
             case.case, case.arn, tagged.status, tagged.body
         );
 
-        // Read back through DescribeTags: the pairs persisted, in request order,
-        // against this resource's ARN and type.
+        // Read back through DescribeTags: the pairs persisted, in the order the
+        // report lists them (their keys'), against this resource's ARN and type.
         let reported = describe_tags_of(&emulator, &case.arn).await;
         assert_eq!(
             reported.status, 200,
@@ -276,13 +292,13 @@ async fn tags_round_trip_through_every_resource_type_an_arn_names() {
         let expected = vec![
             (
                 case.resource_type.to_string(),
-                "owner".to_string(),
-                "analytics".to_string(),
+                "environment".to_string(),
+                "test".to_string(),
             ),
             (
                 case.resource_type.to_string(),
-                "environment".to_string(),
-                "test".to_string(),
+                "owner".to_string(),
+                "analytics".to_string(),
             ),
         ];
         assert_eq!(
@@ -453,10 +469,7 @@ async fn a_key_the_resource_already_carries_is_updated_in_place() {
         );
         let reported = describe_tags_of(&emulator, &arn).await;
         let persisted = tags_in(&reported.body);
-        let expected: Vec<(String, String)> = expected
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect();
+        let expected = tag_report_order(&expected);
         assert_eq!(
             persisted, expected,
             "case {case}: expected {expected:?}, got {persisted:?}"
@@ -548,6 +561,14 @@ async fn a_tag_outside_the_published_restrictions_is_refused_and_persists_nothin
         }
     }
 
+    // The tags the admitted rows left on the resource, in the order the report
+    // lists them.
+    let accepted = tag_report_order(
+        &accepted
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>(),
+    );
     let persisted = tags_in(&describe_tags_of(&emulator, &arn).await.body);
     assert_eq!(
         persisted, accepted,
@@ -745,10 +766,7 @@ async fn deleting_tags_removes_only_the_named_keys() {
             deleted.status, deleted.body
         );
         let persisted = tags_in(&describe_tags_of(&emulator, &arn).await.body);
-        let expected: Vec<(String, String)> = expected
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect();
+        let expected = tag_report_order(&expected);
         assert_eq!(
             persisted, expected,
             "case {case}: expected {expected:?}, got {persisted:?}"
@@ -901,8 +919,11 @@ async fn describe_tags_selects_by_resource_type_and_by_tag() {
         Vec<(&'a str, &'a str, &'a str)>,
     );
     let cluster_tags = vec![
-        ("cluster", "owner", "admin"),
+        // One resource's entries are reported in their KEYS' order, whatever
+        // order its tags were written in, so `environment` comes first (see
+        // [`tag_report_order`]).
         ("cluster", "environment", "test"),
+        ("cluster", "owner", "admin"),
     ];
     let group_tags = vec![("parametergroup", "owner", "tester")];
     let both = || -> Vec<(&str, &str, &str)> {
@@ -1220,4 +1241,123 @@ async fn describe_tags_pages_inside_its_documented_max_records_window() {
         "case no MaxRecords: expected a Marker for the remaining entries, got body {}",
         unasked.body
     );
+}
+
+/// A resource's tags are reported in their KEYS' order, whatever order the calls
+/// that wrote them went in.
+///
+/// A resource's tags are a set keyed by the tag key — one key names one tag, which
+/// is why writing a key the resource already carries updates it — so what this
+/// report answers depends on which tags the resource carries and not on the
+/// history of the calls that put them there. Asserted over a table whose rows
+/// differ in the order the keys were written (descending, ascending, shuffled), in
+/// how many keys there are, in how many calls wrote them, and in the type of the
+/// resource carrying them.
+#[tokio::test]
+async fn a_resources_tags_are_reported_in_their_keys_order() {
+    let emulator = Emulator::new();
+
+    // (case, the calls that write the tags, in order)
+    type OrderCase<'a> = (&'a str, Vec<Vec<(&'a str, &'a str)>>);
+    let cases: Vec<OrderCase> = vec![
+        ("one tag", vec![vec![("solo", "only")]]),
+        (
+            "two keys written in descending order",
+            vec![vec![("owner", "simparity"), ("env", "sandbox")]],
+        ),
+        (
+            "two keys written in ascending order",
+            vec![vec![("env", "sandbox"), ("owner", "simparity")]],
+        ),
+        (
+            "five keys written shuffled",
+            vec![vec![
+                ("zone", "b"),
+                ("env", "sandbox"),
+                ("team", "analytics"),
+                ("asset", "warehouse"),
+                ("owner", "simparity"),
+            ]],
+        ),
+        (
+            "a key written last that sorts first",
+            vec![
+                vec![("owner", "simparity"), ("team", "analytics")],
+                vec![("asset", "warehouse")],
+            ],
+        ),
+        (
+            "a key updated after a later key was added",
+            vec![
+                vec![("owner", "first"), ("env", "sandbox")],
+                vec![("owner", "second")],
+            ],
+        ),
+    ];
+
+    for (index, (case, calls)) in cases.into_iter().enumerate() {
+        // Two resource types, so the ordering is the report's rule and not one
+        // type's storage: the cluster rows and the parameter-group rows alternate.
+        let (arn, seed) = if index % 2 == 0 {
+            let identifier = format!("tag-order-cluster-{index}");
+            (seeded_cluster(&emulator, &identifier).await, None)
+        } else {
+            let name = format!("tag-order-group-{index}");
+            (
+                state::parameter_group_arn(&name, REGION),
+                Some((
+                    "CreateClusterParameterGroup",
+                    vec![
+                        ("ParameterGroupName".to_string(), name.clone()),
+                        ("ParameterGroupFamily".to_string(), "redshift-1.0".to_string()),
+                        ("Description".to_string(), "a group a case tags".to_string()),
+                    ],
+                )),
+            )
+        };
+        if let Some((action, params)) = seed {
+            let created = emulator.call(action, &borrowed(&params)).await;
+            assert_eq!(
+                created.status, 200,
+                "case {case}: expected the seeding {action} to answer 200, got {} with body {}",
+                created.status, created.body
+            );
+        }
+
+        // The tags the resource carries once every call has been made: a key
+        // written twice keeps the later value.
+        let mut carried: Vec<(String, String)> = Vec::new();
+        for call in &calls {
+            let written = create_tags(&emulator, &arn, call).await;
+            assert_eq!(
+                written.status, 200,
+                "case {case}: expected CreateTags to answer 200, got {} with body {}",
+                written.status, written.body
+            );
+            for (key, value) in call {
+                match carried.iter_mut().find(|(carried, _)| carried == key) {
+                    Some(entry) => entry.1 = (*value).to_string(),
+                    None => carried.push(((*key).to_string(), (*value).to_string())),
+                }
+            }
+        }
+
+        let reported = describe_tags_of(&emulator, &arn).await;
+        assert_eq!(
+            reported.status, 200,
+            "case {case}: expected DescribeTags to answer 200, got {} with body {}",
+            reported.status, reported.body
+        );
+        let expected = tag_report_order(
+            &carried
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let persisted = tags_in(&reported.body);
+        assert_eq!(
+            persisted, expected,
+            "case {case}: expected {expected:?}, got {persisted:?}"
+        );
+    }
 }

@@ -128,6 +128,60 @@ pub fn populate_derived_members(
     if let Some(window) = cluster.preferred_maintenance_window.as_deref() {
         cluster.next_maintenance_window_start_time = next_maintenance_window_start(window, now);
     }
+    // Whether that window is in force right now, which is the other thing a
+    // client reads about a cluster's maintenance (see
+    // [`maintenance_window_activated`]).
+    cluster.is_maintenance_window_activated = Some(maintenance_window_activated(cluster, now));
+
+    // Availability Zone relocation, reported through all three of the members
+    // Amazon Redshift carries it on. One stored value feeds them, so no answer
+    // can report a cluster as relocatable and not recoverable — see
+    // [`availability_zone_relocation_status`] for where the value comes from and
+    // `smithy-model/LOCAL-ADDITIONS.md` for why two of the three are declared in
+    // the overlay model rather than in the snapshot.
+    let relocation = cluster
+        .availability_zone_relocation_status
+        .clone()
+        .unwrap_or_else(|| availability_zone_relocation_status(None));
+    cluster.availability_zone_relocation_status = Some(relocation.clone());
+    cluster.availability_zone_relocation = Some(relocation.clone());
+    cluster.az_disaster_recovery_status = Some(relocation);
+}
+
+/// Whether a cluster's preferred maintenance window is ACTIVATED — that is, in
+/// force — at `now`, which is what `Cluster$IsMaintenanceWindowActivated`
+/// reports.
+///
+/// A cluster has a window to maintain it in from the moment it is created:
+/// `smithy_query(query="doc", shape="CreateClusterMessage",
+/// member="PreferredMaintenanceWindow")` — "If you do not specify a maintenance
+/// window, Amazon Redshift assigns a 30-minute maintenance window" — so the
+/// window is activated unless something SUSPENDS it. The one thing that does is a
+/// deferral: `smithy_query(query="doc", operation="ModifyClusterMaintenance")`
+/// takes `DeferMaintenance` with a start and an end, and "`DeferMaintenance`
+/// false takes the deferral off, so the cluster's maintenance happens in its
+/// preferred window again". A deferral therefore deactivates the window for the
+/// span it covers, and only for that span: one that has not begun, and one that
+/// has already ended, leaves the window in force.
+pub fn maintenance_window_activated(cluster: &Cluster, now: ::aws_smithy_types::DateTime) -> bool {
+    if cluster.preferred_maintenance_window.is_none() {
+        return false;
+    }
+    let now = now.secs();
+    !cluster
+        .deferred_maintenance_windows
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|deferral| {
+            let begun = deferral
+                .defer_maintenance_start_time
+                .is_none_or(|at| at.secs() <= now);
+            let over = deferral
+                .defer_maintenance_end_time
+                .is_some_and(|at| at.secs() <= now);
+            begun && !over
+        })
 }
 
 /// `Cluster$MultiAZ` for a cluster deployed in TWO Availability Zones, and for

@@ -98,6 +98,13 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                         next_maintenance_window_start(window, wall);
                 }
             }
+            // Whether that window is ACTIVATED is derived the same way, from the
+            // deferral the cluster carries against the same clock: a deferral
+            // whose span is over leaves the window in force again, and one whose
+            // span has begun suspends it, both due at this instant whether or not
+            // anybody called.
+            stored.cluster.is_maintenance_window_activated =
+                Some(maintenance_window_activated(&stored.cluster, wall));
         }
         for stored in &mut self.snapshots {
             if stored.snapshot.status.as_deref() == Some(STATUS_CREATING)
@@ -1639,8 +1646,9 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// one, and to the resources `filter` selects.
     ///
     /// The entries follow [`Self::resource_slots`], with the tags of one resource
-    /// in the order it carries them, so the `Marker` cursor a page hands out
-    /// stays a resumable offset into one sequence.
+    /// in their KEYS' order ([`tagged_resource_entries`]), so the `Marker` cursor
+    /// a page hands out stays a resumable offset into one sequence whatever order
+    /// the tags were written in.
     ///
     /// The `TagKeys` / `TagValues` filter selects RESOURCES, not single tags:
     /// `smithy_query(query="doc", shape="DescribeTagsMessage", member="TagKeys")`
@@ -1688,7 +1696,7 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         if !filter.matches(tags) {
             return Some(Vec::new());
         }
-        Some(tagged_resource_entries(segment, arn, tags).collect())
+        Some(tagged_resource_entries(segment, arn, tags))
     }
 
     /// Record, on every cluster configured with the parameter group `group_name`,
