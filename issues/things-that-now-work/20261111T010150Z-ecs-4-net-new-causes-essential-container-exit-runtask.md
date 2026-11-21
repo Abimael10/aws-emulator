@@ -11,6 +11,29 @@ Issue-Commit: dff6e291e5e6489707888b0049fa49b367909ca3
 
 # 4 net-new causes: essential-container exit, RunTask command/environment overrides and UpdateTaskProtection expiration all never resolve
 
+## Resolution
+
+Causes 1-3 (the essential-container exit stopping the task and its sidecar, the `RunTask`
+`containerOverrides.command` exit code, and the `containerOverrides.environment` override)
+are FIXED: their checks replay as passed against the ECS container data plane the emulator
+now runs.
+
+Cause 4 (`UpdateTaskProtection` re-applied with the same `expiresInMinutes`) is DECLINED, as
+a per-run clock value whose rule the emulator already implements: every call that turns
+protection on stores the instant that call was made plus the period it named (120 minutes
+when it names none), replacing any expiry the task held, and every read answers that one
+stored instant — pinned over the periods the member publishes by
+`services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/tests/all/task_protection_scale_in.rs::protecting_a_task_resets_its_expiry_from_the_call_that_protected_it`.
+Its check cannot report that: it calls `UpdateTaskProtection(protectionEnabled=true,
+expiresInMinutes=10)` 12 s in, with its service task already RUNNING, is answered that
+call's instant + 600 s, and then holds for over 56 s polling `GetTaskProtection` every ~2 s
+and asserting the date does not drift — which the emulator satisfies, each read answering
+the same instant — so its own 60 s budget kills it before the SECOND
+`UpdateTaskProtection` call is ever made. The hold runs on the check's own clock: with the
+task reaching RUNNING in under a second and the whole ECS setup in 2 s, the check still
+spends the rest of its budget in the same hold. No emulator change shortens it, and nothing
+of this cause is left for the emulator to implement.
+
 > _Note: this issue was identified against the code base at commit `dff6e291e5e6489707888b0049fa49b367909ca3`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

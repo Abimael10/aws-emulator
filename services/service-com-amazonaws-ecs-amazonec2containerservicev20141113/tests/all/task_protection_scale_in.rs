@@ -19,23 +19,37 @@
 //! >    the same whether the cluster the request names exists or not. A request whose
 //! >    identifiers agree is resolved, and a cluster this account does not hold is then the
 //! >    `ClusterNotFoundException` that condition states.
+//! > 3. Every `UpdateTaskProtection` that turns protection ON stores the instant THAT CALL
+//! >    was made plus the period it named — `expiresInMinutes` is "the duration for task
+//! >    protection in minutes", and the task is "automatically protected for 120 minutes"
+//! >    when the member is absent — replacing whatever expiry the task already held, because
+//! >    "the `expiresInMinutes` property is always reset when you invoke this operation for a
+//! >    task that already has `protectionEnabled` set to true". That ONE stored instant is
+//! >    what every read reports (`ProtectedTask$expirationDate`, "the epoch time when
+//! >    protection for the task will expire"): the answering call's own and every later
+//! >    `GetTaskProtection`, which never moves it on its own, so a second call made later
+//! >    answers a LATER date and taking protection off leaves no date at all.
 //!
 //! The first table spans WHICH of a service's tasks is protected (the one the scheduler
-//! would otherwise pick, one it would not, and all of them) and the second spans the two
-//! operations, both forms of the cluster reference, and whether the named cluster exists.
+//! would otherwise pick, one it would not, and all of them), the second spans the two
+//! operations, both forms of the cluster reference, and whether the named cluster exists, and
+//! the third spans the periods a call may name — both published bounds, a value inside them,
+//! the default's own value and the absent member — each applied to a task that is already
+//! protected as well as to one that is not.
 //!
 //! Nothing here reaches into the state struct: every value asserted is read back through
 //! `DescribeTasks`, `ListTasks` and `GetTaskProtection`.
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
     cluster_with_capacity, list, ok, refusal, register_definition, service, string, ACCOUNT,
     SIGNED_REGION,
 };
+use crate::list_service_deployments::epoch_seconds;
 
 /// The cluster every service below runs in, and a second cluster that EXISTS so a
 /// cross-cluster identifier can be weighed against a cluster that resolves.
@@ -141,25 +155,31 @@ async fn service_running(
     }
 }
 
-/// Turn protection on or off for `tasks` of `service_name`'s cluster, asserting the call
-/// reports what it stored.
-async fn protect(
+/// Turn protection on or off for `tasks` of `service_name`'s cluster, naming
+/// `expiresInMinutes` when `minutes` carries one, asserting the call reports what it stored.
+///
+/// Answers the epoch this machine read BEFORE the call, the `protectedTasks` the call
+/// reported, and the epoch it read AFTER it — the window the call's own instant lies inside,
+/// whatever else the machine was doing, which is what an expiry read off the answer is
+/// weighed against ([`assert_expiry_of_call`]).
+async fn protect_tasks(
     router: &MultiServiceRouter,
     tasks: &[String],
     enabled: bool,
+    minutes: Option<i64>,
     case: &str,
-) {
-    let updated = ok(
-        router,
-        "UpdateTaskProtection",
-        json!({
-            "cluster": CLUSTER,
-            "tasks": tasks,
-            "protectionEnabled": enabled,
-        }),
-        case,
-    )
-    .await;
+) -> (f64, Vec<Value>, f64) {
+    let mut request = json!({
+        "cluster": CLUSTER,
+        "tasks": tasks,
+        "protectionEnabled": enabled,
+    });
+    if let Some(minutes) = minutes {
+        request["expiresInMinutes"] = json!(minutes);
+    }
+    let before = epoch_seconds();
+    let updated = ok(router, "UpdateTaskProtection", request, case).await;
+    let after = epoch_seconds();
     let reported = list(&updated, "protectedTasks", case);
     assert_eq!(
         reported.len(),
@@ -173,6 +193,13 @@ async fn protect(
             "case {case:?}: the protection the call stored is what it reports, got {updated}"
         );
     }
+    (before, reported, after)
+}
+
+/// Turn protection on or off for `tasks` of `service_name`'s cluster for the period Amazon
+/// ECS protects a task for when a call names none.
+async fn protect(router: &MultiServiceRouter, tasks: &[String], enabled: bool, case: &str) {
+    protect_tasks(router, tasks, enabled, None, case).await;
 }
 
 /// Reduce the service's desired count, asserting the call keeps the count it was given.
@@ -473,4 +500,189 @@ async fn a_task_protection_call_whose_identifiers_disagree_is_refused_for_the_id
         !string(&protected[0], "taskArn", case).is_empty(),
         "case {case:?}: the reported task names itself, got {read}"
     );
+}
+
+/// The periods one row of the expiry table names, as `(the `expiresInMinutes` the request
+/// carries, the minutes the task is then protected for)`.
+///
+/// The member's own published range — "You can specify a value from 1 minute to up to 2,880
+/// minutes (48 hours)" — at both of its bounds and at a value inside them, beside the
+/// member's own default, which the same doc states: "If you don't specify the time, then the
+/// task is automatically protected for 120 minutes (2 hours)"
+/// (`smithy_query(query="doc",shape="UpdateTaskProtectionRequest",member="expiresInMinutes")`).
+const PERIODS: [(Option<i64>, i64); 5] = [
+    (None, 120),
+    (Some(1), 1),
+    (Some(10), 10),
+    (Some(120), 120),
+    (Some(2880), 2880),
+];
+
+/// Turn protection on for `task_arn` for `requested` minutes through the shared protection
+/// call ([`protect_tasks`]), answering the epoch this machine read BEFORE the call, the
+/// `expirationDate` the call reported, and the epoch it read AFTER it.
+async fn protect_for(
+    router: &MultiServiceRouter,
+    task_arn: &str,
+    requested: Option<i64>,
+    case: &str,
+) -> (f64, f64, f64) {
+    let tasks = [task_arn.to_string()];
+    let (before, reported, after) =
+        protect_tasks(router, &tasks, true, requested, case).await;
+    let expiry = reported[0]["expirationDate"].as_f64().unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: a protected task reports when its protection expires, got {:?}",
+            reported[0]
+        )
+    });
+    (before, expiry, after)
+}
+
+/// What `GetTaskProtection` reports for `task_arn`: whether protection is on and the epoch
+/// it expires at.
+async fn read_protection(
+    router: &MultiServiceRouter,
+    task_arn: &str,
+    case: &str,
+) -> (bool, Option<f64>) {
+    let read = ok(
+        router,
+        "GetTaskProtection",
+        json!({ "cluster": CLUSTER, "tasks": [task_arn] }),
+        case,
+    )
+    .await;
+    let reported = list(&read, "protectedTasks", case);
+    assert_eq!(
+        reported.len(),
+        1,
+        "case {case:?}: the one task named must be answered, got {read}"
+    );
+    (
+        reported[0]["protectionEnabled"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("case {case:?}: expected protectionEnabled, got {read}")),
+        reported[0]["expirationDate"].as_f64(),
+    )
+}
+
+/// How far a reported epoch may sit outside the window the call was bracketed by: the
+/// instants a response reports are truncated to the millisecond
+/// (`state::reported_instant`), and the floats cross the wire as decimal text, so one
+/// millisecond and the rounding either side of it is allowed for — never a share of the
+/// period itself.
+const EPOCH_ROUNDING: f64 = 0.002;
+
+/// Assert that `expiry` is the instant of a call bracketed by `before`..=`after` plus
+/// `minutes`, which holds however long the machine took over the call.
+fn assert_expiry_of_call(case: &str, minutes: i64, before: f64, expiry: f64, after: f64) {
+    let period = (minutes * 60) as f64;
+    assert!(
+        expiry >= before + period - EPOCH_ROUNDING,
+        "case {case:?}: expected an expiry at least {minutes} minute(s) past the instant \
+         before the call ({}), got {expiry}",
+        before + period
+    );
+    assert!(
+        expiry <= after + period + EPOCH_ROUNDING,
+        "case {case:?}: expected an expiry at most {minutes} minute(s) past the instant \
+         after the call ({}), got {expiry}",
+        after + period
+    );
+}
+
+#[tokio::test]
+async fn protecting_a_task_resets_its_expiry_from_the_call_that_protected_it() {
+    let router = service();
+    let case = "setup";
+    cluster_with_capacity(&router, CLUSTER, case).await;
+    register_definition(&router, FAMILY, case).await;
+    let arns = service_running(&router, "protectexpiry", 1, case).await;
+    let task_arn = arns
+        .first()
+        .cloned()
+        .expect("the service runs the one task it was asked for");
+
+    for (requested, minutes) in PERIODS {
+        let case = format!("expiresInMinutes {requested:?}");
+        let case = case.as_str();
+
+        // The period the call named, measured off the call itself rather than off any
+        // instant a previous row left on the task: each row runs against a task the row
+        // before it protected for a different period, so an expiry that was KEPT rather
+        // than reset passes no row but the one whose period it was set by.
+        let (before, first, after) = protect_for(&router, &task_arn, requested, case).await;
+        assert_expiry_of_call(case, minutes, before, first, after);
+
+        // That one stored instant is what a READ reports, and reading does not move it:
+        // `GetTaskProtection` is a report, so two reads of an untouched protection answer
+        // the same date.
+        for read in 1..=2 {
+            let case = format!("{case}, read {read}");
+            let case = case.as_str();
+            let (enabled, expiry) = read_protection(&router, &task_arn, case).await;
+            assert!(
+                enabled,
+                "case {case:?}: the protection the update stored is still on"
+            );
+            assert_eq!(
+                expiry,
+                Some(first),
+                "case {case:?}: a read reports the instant the update stored, unmoved"
+            );
+        }
+
+        // And the SAME period asked for again is reset from the LATER call's own instant, so
+        // the date it answers is strictly later than the one before it. Looked for in a loop
+        // rather than after a wait: what the rule turns on is that the date follows the call,
+        // so the test re-asks until the clock it is read against has moved.
+        let deadline = Instant::now() + POLL_BUDGET;
+        let later = loop {
+            let (before, again, after) = protect_for(&router, &task_arn, requested, case).await;
+            assert_expiry_of_call(case, minutes, before, again, after);
+            assert!(
+                again >= first,
+                "case {case:?}: a re-applied period never moves the expiry backwards, got \
+                 {again} after {first}"
+            );
+            if again > first {
+                break again;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected a later call with the same period to answer a later \
+                 expiry than {first}, got {again}"
+            );
+            ::tokio::time::sleep(POLL_INTERVAL).await;
+        };
+        let (enabled, expiry) = read_protection(&router, &task_arn, case).await;
+        assert!(
+            enabled,
+            "case {case:?}: the task is still protected after the second call"
+        );
+        assert_eq!(
+            expiry,
+            Some(later),
+            "case {case:?}: a read reports the instant the LAST update stored"
+        );
+    }
+
+    // "Specify true to mark a task for protection and false to unset protection": the task a
+    // period was just stored for holds no expiry at all once protection is taken off, and a
+    // later call protects it again from that call's own instant.
+    let case = "protection taken off";
+    protect(&router, std::slice::from_ref(&task_arn), false, case).await;
+    let (enabled, expiry) = read_protection(&router, &task_arn, case).await;
+    assert!(
+        !enabled,
+        "case {case:?}: a task whose protection was unset reports it off"
+    );
+    assert_eq!(
+        expiry, None,
+        "case {case:?}: a task that is not protected has no expiry to report"
+    );
+    let case = "protected again after being unset";
+    let (before, again, after) = protect_for(&router, &task_arn, Some(1), case).await;
+    assert_expiry_of_call(case, 1, before, again, after);
 }
