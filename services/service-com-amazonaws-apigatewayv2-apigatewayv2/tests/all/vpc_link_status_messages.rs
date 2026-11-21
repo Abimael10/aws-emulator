@@ -22,7 +22,9 @@
 //! two published EC2 id forms each uses, how many security groups the link carries,
 //! whether it carries tags, and the length of its name — none of which the sentence may
 //! depend on. The recorded case that filed the issue (a settled link listed by
-//! `GetVpcLinks`) is one row read through one of the four readers.
+//! `GetVpcLinks`) is one row read through one of the four readers, and one case reads a
+//! listing that holds the account's links in several statuses at once, which is how a
+//! client meets a settled link among the rest of its estate.
 
 use std::collections::BTreeMap;
 
@@ -274,6 +276,97 @@ async fn every_reader_reports_the_published_sentence_for_the_status_it_reports()
             "expected the cases to observe {status:?}, got {seen:?}"
         );
     }
+    assert_one_distinct_sentence_per_status(&seen);
+}
+
+/// RULE: the collection reader pairs EVERY link it lists with the sentence for that link's
+/// OWN status, in one answer holding links the clock has moved to different statuses — which
+/// is how a client reads a settled link out of a listing of the account's estate.
+#[tokio::test]
+async fn the_collection_reader_pairs_each_listed_link_with_its_own_status() {
+    let emulator = emulator();
+    let case = "a listing holding links in several statuses";
+
+    let mut seen = SentencePerStatus::new();
+    // Nothing of any request, and no minted id, may be interpolated into a sentence — and
+    // in one listing that is every link's values, not just the one being read.
+    let mut forbidden: Vec<String> = Vec::new();
+    let mut created = Vec::new();
+    for row in rows() {
+        let (status, link) = call(&emulator, "POST", VPC_LINKS, Some(row.request.clone())).await;
+        assert_eq!(
+            status, 201,
+            "case {:?}: expected 201 from CreateVpcLink, got {status} {link}",
+            row.case
+        );
+        let vpc_link_id = as_str(&link, "vpcLinkId");
+        forbidden.extend(row.carries_nothing_of.clone());
+        forbidden.push(vpc_link_id.clone());
+        created.push(vpc_link_id);
+    }
+
+    // Each link's provisioning is a transition the clock owes: the read is repeated until
+    // the link reports it has settled, never timed.
+    for vpc_link_id in &created {
+        read_until(
+            &emulator,
+            case,
+            &format!("{VPC_LINKS}/{vpc_link_id}"),
+            |body| as_str(body, "vpcLinkStatus") == AVAILABLE,
+        )
+        .await;
+    }
+
+    // One of the settled links is taken away and one more is created, so the account holds
+    // links the clock is still moving beside the ones it has finished with.
+    let going = created.first().expect("the table creates a link").clone();
+    let (status, accepted) = call(&emulator, "DELETE", &format!("{VPC_LINKS}/{going}"), None).await;
+    assert_eq!(
+        status, 202,
+        "case {case:?}: expected 202 from DeleteVpcLink, got {status} {accepted}"
+    );
+    let fresh_name = "status-listing-fresh";
+    let (status, fresh) = call(
+        &emulator,
+        "POST",
+        VPC_LINKS,
+        Some(json!({ "name": fresh_name, "subnetIds": ["subnet-0a1b2c3d"] })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateVpcLink, got {status} {fresh}"
+    );
+    forbidden.push(fresh_name.to_string());
+    forbidden.push(as_str(&fresh, "vpcLinkId"));
+
+    let (status, body) = call(&emulator, "GET", VPC_LINKS, None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from GetVpcLinks, got {status} {body}"
+    );
+    let items = body
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut settled = 0usize;
+    for item in &items {
+        if assert_pair(case, "GetVpcLinks", item, &forbidden, &mut seen) == AVAILABLE {
+            settled += 1;
+        }
+    }
+
+    // Which status the delete and the fresh create are caught in depends on when the clock
+    // comes due, so only what is independent of that is asserted: every link the table
+    // settled but the one being taken away is listed as settled, reporting the one sentence.
+    let expected_settled = rows().len() - 1;
+    assert!(
+        settled >= expected_settled,
+        "case {case:?}: expected at least {expected_settled} of the listed links to report \
+         {AVAILABLE}, got {settled} of {} in {body}",
+        items.len()
+    );
     assert_one_distinct_sentence_per_status(&seen);
 }
 

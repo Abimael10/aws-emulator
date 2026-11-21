@@ -15,6 +15,12 @@
 //! >
 //! > The resolution belongs to the WRITE: a REST API or stage that comes or goes afterwards
 //! > does not move an already-stored page until the next write resolves the endpoint again.
+//! >
+//! > That refusal carries the whole MODELLED identity a client reads: HTTP 400, the shape
+//! > `BadRequestException` both in the `x-amzn-errortype` header a restJson1 client resolves
+//! > an error type from and in the body, the one sentence above with no part of the request
+//! > interpolated into it, and no page — so a client is told there is nothing to publish and
+//! > no endpoint address to publish it at.
 //!
 //! Every REST API and stage a row names was created through the service that OWNS them
 //! (`apigateway:CreateRestApi`, `apigateway:PutMethod`, `apigateway:CreateDeployment`),
@@ -33,8 +39,8 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::ComAmazonawsApigatewayv2Api
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{
-    as_str, call, carries_nothing, emulator_with_rest_apis_and_engine, error_code, read_until,
-    rest_endpoint,
+    as_str, call, call_reading_headers, carries_nothing, emulator_with_rest_apis_and_engine,
+    error_code, read_until, rest_endpoint,
 };
 use crate::product_rest_endpoint_page_lifecycle::{invoke_url, pages_of, product, REGION};
 
@@ -409,4 +415,331 @@ async fn the_endpoint_is_resolved_by_the_write_and_a_later_write_resolves_it_aga
         early_before,
         "case {early:?}: a refused patch must leave the stored page unchanged"
     );
+}
+
+/// The response header a restJson1 client resolves the error SHAPE of a refusal from, which
+/// is what an SDK maps the answer onto its own error type with.
+const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
+
+/// The modelled shape a write naming an endpoint the account does not have is refused with.
+const UNRESOLVED_SHAPE: &str = "BadRequestException";
+
+/// The shape name [`ERROR_TYPE_HEADER`] carries, without any namespace or URI prefix a
+/// protocol may qualify it with — read from the HEADER alone, never from the body, since the
+/// header is the one an SDK resolves the error type from.
+fn error_type_header(headers: &http::HeaderMap) -> String {
+    headers
+        .get(ERROR_TYPE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .rsplit(['#', '/'])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Assert the WHOLE identity of one refused write: what [`assert_refused`] asserts of the
+/// status and the body, plus the shape named in [`ERROR_TYPE_HEADER`], the sentence carrying
+/// none of `carries_nothing_of`, and the answer announcing no page at all.
+///
+/// A client validating its portal wiring reads all of it: the status to know the request was
+/// rejected, the header to map the failure onto a modelled error, the sentence to know why,
+/// and the absence of a page to know there is nothing to publish.
+fn assert_refusal_identity(
+    case: &str,
+    writer: &str,
+    status: u16,
+    headers: &http::HeaderMap,
+    body: &Value,
+    carries_nothing_of: &[String],
+) {
+    assert_refused(case, status, body);
+    assert_eq!(
+        error_type_header(headers),
+        UNRESOLVED_SHAPE,
+        "case {case:?} ({writer}): expected {UNRESOLVED_SHAPE} in {ERROR_TYPE_HEADER}, got \
+         {:?}",
+        headers.get(ERROR_TYPE_HEADER)
+    );
+    let message = as_str(body, "message");
+    for value in carries_nothing_of {
+        assert!(
+            !message.contains(value.as_str()),
+            "case {case:?} ({writer}): the sentence is fixed text with no variable parts, \
+             but {message:?} carries {value:?}"
+        );
+    }
+    // A refused write announces NO page: a client is told nothing it could publish, and in
+    // particular no endpoint address.
+    for member in [
+        "displayContent",
+        "productRestEndpointPageId",
+        "productRestEndpointPageArn",
+        "restEndpointIdentifier",
+        "status",
+    ] {
+        assert!(
+            carries_nothing(body, member),
+            "case {case:?} ({writer}): a refused write must report no {member}, got {body}"
+        );
+    }
+}
+
+/// What the REST API half of one row's identifier names.
+enum NamedRestApi {
+    /// A REST API the account HOLDS: one is created for the row through the service that
+    /// owns REST APIs with this stage deployed on it, and the identifier names the id that
+    /// service minted.
+    Held { deployed_stage: &'static str },
+    /// A `restApiId` the account holds nothing under, in the form given.
+    Unheld(String),
+}
+
+/// One identifier that resolves to no REST endpoint of the account.
+struct UnresolvableRow {
+    case: &'static str,
+    api: NamedRestApi,
+    /// The `stage` the identifier names — the other half of the pair that has to resolve.
+    stage: String,
+    method: &'static str,
+    path: &'static str,
+}
+
+/// The identifiers the refusal is asserted over.
+///
+/// They differ along what the rule generalises over: which half of the pair fails to resolve
+/// (the REST API, or the stage of an API the account does hold), the LENGTH and form of the
+/// `restApiId` (including the modelled minimum and maximum of `__stringMin1Max50`) and of
+/// the `stage` (`__stringMin1Max128`), whether the named stage differs from a deployed one
+/// only in case, and which method and path of the endpoint the page would document — none of
+/// which takes part in the resolution. Member constraints are from
+/// `smithy_query(query="shape", shape="IdentifierParts")`.
+fn unresolvable_rows() -> Vec<UnresolvableRow> {
+    vec![
+        UnresolvableRow {
+            case: "a restApiId the account holds nothing under, in the ten-character form \
+                   the owner of REST APIs mints",
+            api: NamedRestApi::Unheld("nosuchapi1".to_string()),
+            stage: "prod".to_string(),
+            method: "GET",
+            path: "/orders",
+        },
+        UnresolvableRow {
+            case: "a one-character restApiId (the modelled minimum) the account holds \
+                   nothing under",
+            api: NamedRestApi::Unheld("q".to_string()),
+            stage: "beta".to_string(),
+            method: "POST",
+            path: "/",
+        },
+        UnresolvableRow {
+            case: "a restApiId at the modelled 50-character maximum the account holds \
+                   nothing under",
+            api: NamedRestApi::Unheld("z".repeat(50)),
+            stage: "prod".to_string(),
+            method: "PUT",
+            path: "/accounts/{accountId}/orders/{proxy+}",
+        },
+        UnresolvableRow {
+            case: "a stage the account's own REST API has no stage under",
+            api: NamedRestApi::Held {
+                deployed_stage: "prod",
+            },
+            stage: "beta".to_string(),
+            method: "DELETE",
+            path: "/orders/{orderId}",
+        },
+        UnresolvableRow {
+            case: "a stage differing from the deployed one only in case",
+            api: NamedRestApi::Held {
+                deployed_stage: "prod",
+            },
+            stage: "PROD".to_string(),
+            method: "GET",
+            path: "/orders",
+        },
+        UnresolvableRow {
+            case: "a stage at the modelled 128-character maximum",
+            api: NamedRestApi::Held {
+                deployed_stage: "v1",
+            },
+            stage: "s".repeat(128),
+            method: "PATCH",
+            path: "/orders",
+        },
+        UnresolvableRow {
+            case: "a stage named like the default one of an HTTP api",
+            api: NamedRestApi::Held {
+                deployed_stage: "v1",
+            },
+            stage: "$default".to_string(),
+            method: "GET",
+            path: "/orders",
+        },
+    ]
+}
+
+/// RULE: a write naming an endpoint the account does not have is refused with the MODELLED
+/// `BadRequestException` identity a client reads — 400, the shape in the error-type header
+/// and in the body, and the one fixed sentence — and announces no page.
+#[tokio::test]
+async fn an_unresolvable_identifier_is_refused_with_the_modelled_error_identity() {
+    let (emulator, engine) = emulator_with_engine();
+    let product_id = product(&emulator, "Refusal identity").await;
+    let collection = pages_of(&product_id);
+
+    for row in unresolvable_rows() {
+        let case = row.case;
+        let rest_api_id = match &row.api {
+            NamedRestApi::Held { deployed_stage } => {
+                rest_api_with_stage(&emulator, case, deployed_stage).await
+            }
+            NamedRestApi::Unheld(id) => id.clone(),
+        };
+        let parts = json!({
+            "restApiId": rest_api_id,
+            "stage": row.stage,
+            "method": row.method,
+            "path": row.path
+        });
+
+        let held_before = page_count(&engine, &product_id);
+        let (status, headers, refused) = call_reading_headers(
+            &emulator,
+            "POST",
+            &collection,
+            Some(json!({ "restEndpointIdentifier": { "identifierParts": parts } })),
+        )
+        .await;
+        assert_refusal_identity(
+            case,
+            "CreateProductRestEndpointPage",
+            status,
+            &headers,
+            &refused,
+            &[rest_api_id, row.stage.clone()],
+        );
+        assert_eq!(
+            page_count(&engine, &product_id),
+            held_before,
+            "case {case:?}: a refused create must persist no page"
+        );
+    }
+
+    // The contrast: the same request against an endpoint the account HAS is served, and the
+    // answer names no error class at all.
+    let served = "the REST API and the stage the account holds";
+    let rest_api_id = rest_api_with_stage(&emulator, served, "prod").await;
+    let (status, headers, created) = call_reading_headers(
+        &emulator,
+        "POST",
+        &collection,
+        Some(json!({
+            "restEndpointIdentifier": {
+                "identifierParts": {
+                    "restApiId": rest_api_id,
+                    "stage": "prod",
+                    "method": "GET",
+                    "path": "/orders"
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {served:?}: expected 201 from CreateProductRestEndpointPage, got {status} \
+         {created}"
+    );
+    assert!(
+        headers.get(ERROR_TYPE_HEADER).is_none(),
+        "case {served:?}: a served write names no error class, got {:?}",
+        headers.get(ERROR_TYPE_HEADER)
+    );
+}
+
+/// How the account STOPS holding the endpoint a stored page documents.
+struct GoneEndpointRow {
+    case: &'static str,
+    /// The stage deployed on the row's REST API, and the one its page documents.
+    stage: &'static str,
+    /// Whether the whole REST API is deleted, rather than just that stage of it.
+    delete_the_api: bool,
+}
+
+/// RULE: the same identity is what a PATCH is refused with, whichever way the account
+/// stopped holding the endpoint the page documents — the stage went away, or the whole REST
+/// API did — and the stored page does not move.
+#[tokio::test]
+async fn a_patch_is_refused_with_the_same_identity_once_the_endpoint_is_gone() {
+    let (emulator, _engine) = emulator_with_engine();
+    let product_id = product(&emulator, "Refusal identity of a patch").await;
+    let collection = pages_of(&product_id);
+
+    for row in [
+        GoneEndpointRow {
+            case: "the stage the page documents was deleted",
+            stage: "prod",
+            delete_the_api: false,
+        },
+        GoneEndpointRow {
+            case: "the whole REST API the page documents was deleted",
+            stage: "v1",
+            delete_the_api: true,
+        },
+    ] {
+        let case = row.case;
+        let rest_api_id = rest_api_with_stage(&emulator, case, row.stage).await;
+        let (status, created) = create_page(
+            &emulator,
+            &collection,
+            json!({
+                "restApiId": rest_api_id,
+                "stage": row.stage,
+                "method": "GET",
+                "path": "/orders"
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201 from CreateProductRestEndpointPage, got {status} \
+             {created}"
+        );
+        let uri = format!("{collection}/{}", as_str(&created, "productRestEndpointPageId"));
+        let before = settled_page(&emulator, case, &uri).await;
+
+        if row.delete_the_api {
+            let (status, body) =
+                call(&emulator, "DELETE", &format!("/restapis/{rest_api_id}"), None).await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: expected the owner of REST APIs to accept DeleteRestApi, got \
+                 {status} {body}"
+            );
+        } else {
+            delete_stage(&emulator, &rest_api_id, row.stage).await;
+        }
+
+        let (status, headers, patched) = call_reading_headers(
+            &emulator,
+            "PATCH",
+            &uri,
+            Some(json!({ "tryItState": "ENABLED" })),
+        )
+        .await;
+        assert_refusal_identity(
+            case,
+            "UpdateProductRestEndpointPage",
+            status,
+            &headers,
+            &patched,
+            &[rest_api_id, row.stage.to_string()],
+        );
+        assert_eq!(
+            read(&emulator, case, &uri).await,
+            before,
+            "case {case:?}: a refused patch must leave the stored page unchanged"
+        );
+    }
 }
