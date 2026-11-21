@@ -21,20 +21,69 @@
 //! `integration_failure_error_names` builds, because its task's call has to be served
 //! by a mounted service for real.
 
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 
 use crate::execution_history::history;
+use crate::integration_failure_error_names::Emulator as WithTargets;
 use crate::state_machine_lifecycle::{
-    create_machine, describe_execution, start_execution, Emulator, PAST_THE_EXECUTION_DELAY,
-    ROLE_ARN,
+    create_machine, describe_execution, start_execution, Emulator, ROLE_ARN,
 };
+
+/// Long enough for any outcome the clock owed an execution to have become due,
+/// whatever else the host is running.
+///
+/// Nothing below measures how long anything took: this only bounds how long a
+/// look-again loop keeps looking, so a slow host makes a loop go round more often
+/// rather than changing what it observes.
+const PATIENCE: Duration = Duration::from_secs(60);
+
+/// How long to leave between two looks at a condition that is not there yet.
+const BETWEEN_LOOKS: Duration = Duration::from_millis(25);
+
+/// The execution `execution_arn` describes as once it has left `RUNNING`, looked at
+/// again until it has or [`PATIENCE`] has passed.
+async fn settled(emulator: &Emulator, case: &str, execution_arn: &str) -> Value {
+    let began = Instant::now();
+    loop {
+        let described = describe_execution(emulator, execution_arn).await;
+        if described.get("status").and_then(Value::as_str) != Some("RUNNING") {
+            return described;
+        }
+        assert!(
+            began.elapsed() < PATIENCE,
+            "case {case:?}: expected a terminal status within {PATIENCE:?}, last saw {described}"
+        );
+        ::tokio::time::sleep(BETWEEN_LOOKS).await;
+    }
+}
+
+/// As [`settled`], over the harness that mounts the services a `Task` state's
+/// integration call is really served by.
+async fn settled_with_targets(emulator: &WithTargets, case: &str, execution_arn: &str) -> Value {
+    let began = Instant::now();
+    loop {
+        let described = emulator
+            .sfn("DescribeExecution", &json!({ "executionArn": execution_arn }))
+            .await;
+        if described["status"].as_str() != Some("RUNNING") {
+            return described;
+        }
+        assert!(
+            began.elapsed() < PATIENCE,
+            "case {case:?}: expected a terminal status within {PATIENCE:?}, last saw {described}"
+        );
+        ::tokio::time::sleep(BETWEEN_LOOKS).await;
+    }
+}
 
 /// Run `definition` over `input` and describe the execution once it has settled.
 async fn ran(emulator: &Emulator, name: &str, definition: &Value, input: &str) -> Value {
     let machine = create_machine(emulator, name, &definition.to_string()).await;
     let execution = start_execution(emulator, &machine, "only", input).await;
-    ::tokio::time::sleep(PAST_THE_EXECUTION_DELAY).await;
-    describe_execution(emulator, &execution).await
+    settled(emulator, name, &execution).await
 }
 
 /// Create a state machine from `definition`, requiring the create to be REFUSED, and
@@ -153,8 +202,7 @@ async fn a_choice_rules_own_assign_is_the_selected_rules() {
         let machine =
             create_machine(&emulator, &format!("choice-assign-{index}"), &router.to_string()).await;
         let execution = start_execution(&emulator, &machine, "only", input).await;
-        ::tokio::time::sleep(PAST_THE_EXECUTION_DELAY).await;
-        let described = describe_execution(&emulator, &execution).await;
+        let described = settled(&emulator, case, &execution).await;
         assert_eq!(
             described.get("status").and_then(Value::as_str),
             Some("SUCCEEDED"),
@@ -563,8 +611,7 @@ async fn a_number_keeps_the_digits_it_was_written_with() {
     for (index, (case, definition, input, expected)) in rows.into_iter().enumerate() {
         let machine = create_machine(&emulator, &format!("digits-{index}"), &definition).await;
         let execution = start_execution(&emulator, &machine, "only", &input).await;
-        ::tokio::time::sleep(PAST_THE_EXECUTION_DELAY).await;
-        let described = describe_execution(&emulator, &execution).await;
+        let described = settled(&emulator, case, &execution).await;
         assert_eq!(
             described.get("status").and_then(Value::as_str),
             Some("SUCCEEDED"),
@@ -590,10 +637,6 @@ async fn a_number_keeps_the_digits_it_was_written_with() {
 /// takes over SUCCEEDS, and the parent's run-a-job task succeeds with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_catch_in_a_child_state_machine_recovers_that_execution() {
-    use std::time::{Duration, Instant};
-
-    use crate::integration_failure_error_names::Emulator as WithTargets;
-
     /// The name the mounted DynamoDB service's refusal is reported under.
     const REFUSED: &str = "DynamoDB.ResourceNotFoundException";
 
@@ -642,6 +685,9 @@ async fn a_catch_in_a_child_state_machine_recovers_that_execution() {
         ("its second revision, which parses the child's output", ".sync:2"),
     ];
 
+    // The child executions earlier rows started, so each row waits for a child of its
+    // OWN rather than reading whichever one `ListExecutions` happens to put first.
+    let mut already_started: HashSet<String> = HashSet::new();
     for (index, (case, suffix)) in rows.into_iter().enumerate() {
         let parent = json!({
             "QueryLanguage": "JSONata",
@@ -683,20 +729,7 @@ async fn a_catch_in_a_child_state_machine_recovers_that_execution() {
 
         // A run-a-job parent is parked at the child until it ends, so the parent's own
         // outcome arrives a few poll intervals after the child's.
-        let began = Instant::now();
-        let described = loop {
-            let described = emulator
-                .sfn("DescribeExecution", &json!({ "executionArn": execution }))
-                .await;
-            if described["status"].as_str() != Some("RUNNING") {
-                break described;
-            }
-            assert!(
-                began.elapsed() < Duration::from_secs(20),
-                "case {case:?}: expected a terminal status, got {described}"
-            );
-            ::tokio::time::sleep(Duration::from_millis(25)).await;
-        };
+        let described = settled_with_targets(&emulator, case, &execution).await;
         assert_eq!(
             described["status"].as_str(),
             Some("SUCCEEDED"),
@@ -705,21 +738,51 @@ async fn a_catch_in_a_child_state_machine_recovers_that_execution() {
 
         // And the CHILD execution the task started really recovered: its own
         // `DescribeExecution` says so, with the document its catcher built.
-        let children = emulator
-            .sfn("ListExecutions", &json!({ "stateMachineArn": &child_arn }))
-            .await;
-        let child_execution = children["executions"]
-            .as_array()
-            .and_then(|executions| executions.first())
-            .and_then(|execution| execution["executionArn"].as_str())
-            .unwrap_or_else(|| panic!("case {case:?}: expected a child execution in {children}"))
-            .to_string();
-        let child_described = emulator
-            .sfn(
-                "DescribeExecution",
-                &json!({ "executionArn": child_execution }),
-            )
-            .await;
+        //
+        // The PARENT's outcome says nothing about the child's here: the plain
+        // integration hands the child off and ends, so the child's own outcome is owed
+        // to the clock independently of it. This row's child execution is therefore
+        // looked for and looked at again until one no earlier row started is listed and
+        // has left `RUNNING` — the condition this step waits on — rather than read once
+        // right after the parent.
+        let began = Instant::now();
+        let (child_execution, child_described) = loop {
+            let children = emulator
+                .sfn("ListExecutions", &json!({ "stateMachineArn": &child_arn }))
+                .await;
+            let listed: Vec<String> = children["executions"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|execution| execution["executionArn"].as_str())
+                .filter(|arn| !already_started.contains(*arn))
+                .map(str::to_string)
+                .collect();
+            let mut found = None;
+            for child_execution in listed {
+                let child_described = emulator
+                    .sfn(
+                        "DescribeExecution",
+                        &json!({ "executionArn": &child_execution }),
+                    )
+                    .await;
+                if child_described["status"].as_str() != Some("RUNNING") {
+                    found = Some((child_execution, child_described));
+                    break;
+                }
+            }
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(
+                began.elapsed() < PATIENCE,
+                "case {case:?}: expected a settled child execution within {PATIENCE:?}, \
+                 last saw {children}"
+            );
+            ::tokio::time::sleep(BETWEEN_LOOKS).await;
+        };
+        already_started.insert(child_execution);
         assert_eq!(
             child_described["status"].as_str(),
             Some("SUCCEEDED"),
@@ -738,10 +801,6 @@ async fn a_catch_in_a_child_state_machine_recovers_that_execution() {
 /// takes it over and the parent carries on at the catcher's `Next`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_catch_on_a_run_a_job_task_recovers_a_failed_child() {
-    use std::time::{Duration, Instant};
-
-    use crate::integration_failure_error_names::Emulator as WithTargets;
-
     let emulator = WithTargets::new();
     // The child carries NO catcher of its own, so its failure is what the parent's
     // task has to answer for.
@@ -833,20 +892,7 @@ async fn a_catch_on_a_run_a_job_task_recovers_a_failed_child() {
             .unwrap_or_else(|| panic!("case {case:?}: no executionArn in {started}"))
             .to_string();
 
-        let began = Instant::now();
-        let described = loop {
-            let described = emulator
-                .sfn("DescribeExecution", &json!({ "executionArn": execution }))
-                .await;
-            if described["status"].as_str() != Some("RUNNING") {
-                break described;
-            }
-            assert!(
-                began.elapsed() < Duration::from_secs(20),
-                "case {case:?}: expected a terminal status, got {described}"
-            );
-            ::tokio::time::sleep(Duration::from_millis(25)).await;
-        };
+        let described = settled_with_targets(&emulator, case, &execution).await;
         assert_eq!(
             described["status"].as_str(),
             Some("SUCCEEDED"),
@@ -873,8 +919,6 @@ async fn a_catch_on_a_run_a_job_task_recovers_a_failed_child() {
 /// than over one of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_catch_reading_the_error_output_recovers_the_execution() {
-    use crate::integration_failure_error_names::Emulator as WithTargets;
-
     /// The name the mounted DynamoDB service's refusal of a write to a table nobody
     /// created is reported under, for an OPTIMIZED `Resource`.
     const REFUSED: &str = "DynamoDB.ResourceNotFoundException";
@@ -1184,10 +1228,7 @@ async fn a_catch_reading_the_error_output_recovers_the_execution() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: no executionArn in {started}"))
             .to_string();
-        ::tokio::time::sleep(PAST_THE_EXECUTION_DELAY).await;
-        let described = emulator
-            .sfn("DescribeExecution", &json!({ "executionArn": execution }))
-            .await;
+        let described = settled_with_targets(&emulator, case, &execution).await;
         assert_eq!(
             described["status"].as_str(),
             Some("SUCCEEDED"),
