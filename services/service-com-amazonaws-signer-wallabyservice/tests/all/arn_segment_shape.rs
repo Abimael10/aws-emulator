@@ -24,6 +24,15 @@
 //! ceiling, outside the character class, not the minted form) as against how it
 //! misses the ARN's own shape (an empty segment, a segment too many, a missing
 //! one, a value that is no ARN).
+//!
+//! One case is the operation's POSITIVE CONTROL: a read of an endpoint holding no
+//! record at all, whose five `@required` members each satisfy their modelled
+//! constraints, is answered 200 with `revokedEntities` present and empty — the
+//! operation models no not-found channel, so a well-formed ARN naming a resource
+//! this endpoint holds nothing for is an entity that is simply not revoked. Its
+//! rows walk the ARN's partition, region and account and its length inside `Arn`'s
+//! modelled band (the 2048-byte ceiling included), plus how many entries
+//! `certificateHashes` carries.
 
 use std::sync::Arc;
 
@@ -173,6 +182,44 @@ fn job_arn_for(job_id: &str) -> String {
     format!("arn:aws:signer:{REGION}:{ACCOUNT_ID}:/signing-jobs/{job_id}")
 }
 
+/// The ceiling of the band an `Arn` member is bounded by
+/// (`smithy_query(query="shape",shape="Arn")`: `@length(min: 20, max: 2048)` and no
+/// pattern), so a value of exactly this many bytes is one the request may carry
+/// and the shape rule has to answer.
+const ARN_MAX_LENGTH: usize = 2048;
+
+/// A signing-profile version ARN of exactly `total` bytes: the padding goes in the
+/// NAME segment, so the value stays ARN-shaped however long it is.
+fn profile_version_arn_of_length(total: usize) -> String {
+    let fixed = profile_version_arn("", "aaaaaaaaaa").len();
+    assert!(
+        total > fixed,
+        "a {total}-byte profile version ARN leaves no name segment (the form itself is \
+         {fixed} bytes)"
+    );
+    let arn = profile_version_arn(&"n".repeat(total - fixed), "aaaaaaaaaa");
+    assert_eq!(arn.len(), total, "the built ARN must be {total} bytes long");
+    arn
+}
+
+/// A signing-job ARN of exactly `total` bytes, padded in the id segment.
+fn job_arn_of_length(total: usize) -> String {
+    let fixed = job_arn_for("").len();
+    assert!(
+        total > fixed,
+        "a {total}-byte job ARN leaves no id segment (the form itself is {fixed} bytes)"
+    );
+    let arn = job_arn_for(&"j".repeat(total - fixed));
+    assert_eq!(arn.len(), total, "the built ARN must be {total} bytes long");
+    arn
+}
+
+/// `n` certificate hashes, each one a value `certificateHashes`' unconstrained
+/// string member admits.
+fn hashes(count: usize) -> Vec<String> {
+    (0..count).map(|index| format!("{index:0>192}")).collect()
+}
+
 /// The certificate hash every request carries: `certificateHashes` targets a list
 /// of unconstrained strings, so one entry is enough to make the request complete.
 fn one_hash() -> Vec<String> {
@@ -188,13 +235,33 @@ async fn get_revocation_status(
     profile_version_arn: &str,
     job_arn: &str,
 ) -> Answer {
+    get_revocation_status_with_hashes(
+        router,
+        platform_id,
+        profile_version_arn,
+        job_arn,
+        &one_hash(),
+    )
+    .await
+}
+
+/// The same read carrying exactly the `certificateHashes` entries given:
+/// `certificateHashes` is a LIST bound to the query string, so each entry is one
+/// repetition of the parameter.
+async fn get_revocation_status_with_hashes(
+    router: &MultiServiceRouter,
+    platform_id: &str,
+    profile_version_arn: &str,
+    job_arn: &str,
+    hashes: &[String],
+) -> Answer {
     let mut query = vec![
         format!("signatureTimestamp={}", signature_timestamp_param()),
         format!("platformId={platform_id}"),
         format!("profileVersionArn={profile_version_arn}"),
         format!("jobArn={job_arn}"),
     ];
-    for hash in one_hash() {
+    for hash in hashes {
         query.push(format!("certificateHashes={hash}"));
     }
     call(router, "GET", &format!("/revocations?{}", query.join("&")), None).await
@@ -384,6 +451,118 @@ async fn an_arn_shaped_job_is_answered_whatever_its_id_segment_carries() {
         assert!(
             reported.is_empty(),
             "case {case:?}: expected nothing revoked for {arn:?}, got {reported:?}"
+        );
+    }
+}
+
+/// The POSITIVE CONTROL of the whole operation, over an endpoint that holds no
+/// record at all: a read whose five `@required` members each satisfy their
+/// modelled constraints is ANSWERED — HTTP 200 with `revokedEntities` present and
+/// empty, since nothing it names is revoked — and never refused, because the
+/// operation models no not-found channel and an `Arn` member is judged on the
+/// ARN's SHAPE alone.
+///
+/// The rows differ along what that rule generalises over beyond the segment
+/// contents the suite's other cases walk: which partition, region and account the
+/// ARNs name (a resource of none of them is held here), how long the ARN is inside
+/// the modelled 20..2048 band — including exactly ON the ceiling — and how many
+/// entries `certificateHashes` carries.
+#[tokio::test]
+async fn a_well_formed_read_of_an_endpoint_holding_nothing_is_answered() {
+    let router = emulator();
+    let platform_id = job_signing_platform();
+
+    // Another account and another region than the one the request is signed for,
+    // and the two partitions beside `aws`: an ARN's partition, region and account
+    // are fields of its shape, so a value carrying any of them is ARN-shaped and
+    // names a resource this endpoint simply holds nothing for.
+    let other_account = "210987654321";
+    let rows: Vec<(&str, String, String, Vec<String>)> = vec![
+        (
+            "this region and account, nothing created under either name",
+            profile_version_arn("Some_Profile", "aaaaaaaaaa"),
+            job_arn_for("11111111-2222-3333-4444-555555555555"),
+            hashes(1),
+        ),
+        (
+            "ARNs of the China partition",
+            format!(
+                "arn:aws-cn:signer:cn-north-1:{ACCOUNT_ID}:/signing-profiles/Some_Profile/aaaaaaaaaa"
+            ),
+            format!(
+                "arn:aws-cn:signer:cn-north-1:{ACCOUNT_ID}:/signing-jobs/\
+                 11111111-2222-3333-4444-555555555555"
+            ),
+            hashes(1),
+        ),
+        (
+            "ARNs of the GovCloud partition",
+            format!(
+                "arn:aws-us-gov:signer:us-gov-west-1:{ACCOUNT_ID}:/signing-profiles/\
+                 Some_Profile/aaaaaaaaaa"
+            ),
+            format!(
+                "arn:aws-us-gov:signer:us-gov-west-1:{ACCOUNT_ID}:/signing-jobs/\
+                 11111111-2222-3333-4444-555555555555"
+            ),
+            hashes(1),
+        ),
+        (
+            "ARNs of another account",
+            format!(
+                "arn:aws:signer:{REGION}:{other_account}:/signing-profiles/Some_Profile/aaaaaaaaaa"
+            ),
+            format!(
+                "arn:aws:signer:{REGION}:{other_account}:/signing-jobs/\
+                 11111111-2222-3333-4444-555555555555"
+            ),
+            hashes(1),
+        ),
+        (
+            "ARNs of another region",
+            "arn:aws:signer:eu-west-1:000000000000:/signing-profiles/Some_Profile/aaaaaaaaaa"
+                .to_string(),
+            "arn:aws:signer:eu-west-1:000000000000:/signing-jobs/\
+             11111111-2222-3333-4444-555555555555"
+                .to_string(),
+            hashes(1),
+        ),
+        (
+            "ARNs of exactly the modelled 2048-byte ceiling",
+            profile_version_arn_of_length(ARN_MAX_LENGTH),
+            job_arn_of_length(ARN_MAX_LENGTH),
+            hashes(1),
+        ),
+        (
+            "two certificate hashes",
+            profile_version_arn("Some_Profile", "aaaaaaaaaa"),
+            job_arn_for("11111111-2222-3333-4444-555555555555"),
+            hashes(2),
+        ),
+        (
+            "five certificate hashes",
+            profile_version_arn("Some_Profile", "aaaaaaaaaa"),
+            job_arn_for("11111111-2222-3333-4444-555555555555"),
+            hashes(5),
+        ),
+    ];
+
+    for (case, profile_version, job, carried) in rows {
+        let answer = get_revocation_status_with_hashes(
+            &router,
+            platform_id,
+            &profile_version,
+            &job,
+            &carried,
+        )
+        .await;
+        // `revoked_entities` is what pins the member's PRESENCE: it reads the list
+        // off the body and fails the case when the answer carries none.
+        let reported = revoked_entities(&answer, case);
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: expected nothing revoked for {profile_version:?} and {job:?}, got \
+             {reported:?}"
         );
     }
 }
