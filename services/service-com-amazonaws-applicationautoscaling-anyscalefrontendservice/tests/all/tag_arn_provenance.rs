@@ -34,7 +34,7 @@
 
 use serde_json::{json, Value};
 
-use crate::emulator::{error_code, error_message, Emulator, ACCOUNT, REGION};
+use crate::emulator::{error_code, error_message, resource_id_for, Emulator, ACCOUNT, REGION};
 
 /// The sentence an ARN of this endpoint that names no registered target earns. Written out
 /// here rather than read off the code under test: the WORDING is part of the rule.
@@ -553,6 +553,321 @@ async fn an_id_this_endpoint_never_issued_reports_the_target_absent() {
         json!({"env": "sim2real"}),
         "case \"the resident target's tags\": expected the refusals to change nothing, got \
          {stored:?}"
+    );
+}
+
+/// One target's whole tagging life, as a client holding its `ScalableTargetARN` sees it.
+///
+/// The rows this is built from differ along what the rule generalises over: the namespace and
+/// dimension the target was registered on, the tag set its REGISTRATION carried, and the batch
+/// each refused write names once the target is gone.
+struct Lifecycle {
+    /// The dimension the target is registered on, which also names the resource it scales.
+    dimension: &'static str,
+    /// The `Tags` the registration carried, which `RegisterScalableTarget` takes.
+    registered: Value,
+    /// The `Tags` the write aimed at the retired ARN carries.
+    written: Value,
+    /// The `TagKeys` the removal aimed at the retired ARN names.
+    removed: Value,
+}
+
+/// The key the positive control writes: one no row's registration carries, so the tag set read
+/// back after the control is the registration's plus exactly this one.
+const CONTROL_KEY: &str = "control";
+
+/// Its value.
+const CONTROL_VALUE: &str = "served";
+
+/// The keys of a row's registration tag set, in the order the map reports them.
+fn keys_of(tags: &Value) -> Vec<String> {
+    tags.as_object()
+        .map(|tags| tags.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// RULE: a `ResourceARN` identifies the scalable target the call acts on, so once that target is
+/// DEREGISTERED the ARN names a scalable target of this account and Region that is absent — and
+/// both tag WRITES answer that exactly as the tag READ does, leaving the identity unregistered
+/// and no tag of the refused batch anywhere in the store.
+///
+/// The whole life of one target per row: registered with a tag set, served a write, a removal
+/// and a read while it exists, then deregistered, then asked the same three operations again,
+/// then registered afresh — whose tag set is empty, because a refused write landed nothing.
+#[tokio::test]
+async fn the_tag_writes_report_a_deregistered_target_absent_and_land_nothing() {
+    let rows = [
+        Lifecycle {
+            dimension: "dynamodb:table:ReadCapacityUnits",
+            registered: json!({"team": "blue"}),
+            written: json!({"env": "prod"}),
+            removed: json!(["env"]),
+        },
+        Lifecycle {
+            dimension: "dynamodb:index:WriteCapacityUnits",
+            registered: json!({}),
+            written: json!({"env": "prod", "owner": "orders-team", "cost-center": "1234"}),
+            removed: json!(["team", "env", "owner"]),
+        },
+        Lifecycle {
+            dimension: "ecs:service:DesiredCount",
+            registered: json!({"team": "blue", "env": "test"}),
+            written: json!({"team": "green"}),
+            removed: json!([]),
+        },
+    ];
+
+    for row in rows {
+        let case = row.dimension;
+        let emulator = Emulator::empty();
+        let namespace = row.dimension.split(':').next().unwrap_or_default();
+        let resource_id = resource_id_for(row.dimension);
+        // A scalable target is a capacity dimension OF a resource, so the resource it names is
+        // created in the service that owns it first.
+        emulator.given_resource(namespace, &resource_id, 1).await;
+        let identity = json!({
+            "ServiceNamespace": namespace,
+            "ResourceId": resource_id,
+            "ScalableDimension": row.dimension,
+        });
+        let mut registration = identity.clone();
+        registration["MinCapacity"] = json!(1);
+        registration["MaxCapacity"] = json!(10);
+        if !keys_of(&row.registered).is_empty() {
+            registration["Tags"] = row.registered.clone();
+        }
+        let (status, body) = emulator.call("RegisterScalableTarget", registration).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected RegisterScalableTarget to answer 200, got {status} with \
+             {body:?}"
+        );
+        // The ARN a client keeps is the one the registration handed back.
+        let arn = body["ScalableTargetARN"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !arn.is_empty(),
+            "case {case:?}: expected a ScalableTargetARN from the registration, got {body:?}"
+        );
+
+        // While the target exists, all three operations are served: a tag is written, the
+        // registration's own keys are removed, and the read reports what is left — so a refusal
+        // below is about the target being gone and not about the family refusing everything.
+        let (status, body) = emulator
+            .call(
+                "TagResource",
+                json!({"ResourceARN": arn, "Tags": {CONTROL_KEY: CONTROL_VALUE}}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected TagResource on the live ARN to answer 200, got {status} with \
+             {body:?}"
+        );
+        let mut expected = row.registered.as_object().cloned().unwrap_or_default();
+        expected.insert(CONTROL_KEY.to_string(), json!(CONTROL_VALUE));
+        let stored = tags_of(&emulator, &arn, &format!("{case}: the live tag set")).await;
+        assert_eq!(
+            stored,
+            Value::Object(expected),
+            "case {case:?}: expected the registration's tags with the written one beside them, \
+             got {stored:?}"
+        );
+        let (status, body) = emulator
+            .call(
+                "UntagResource",
+                json!({"ResourceARN": arn, "TagKeys": keys_of(&row.registered)}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected UntagResource on the live ARN to answer 200, got {status} \
+             with {body:?}"
+        );
+        let stored = tags_of(&emulator, &arn, &format!("{case}: the emptied tag set")).await;
+        assert_eq!(
+            stored,
+            json!({CONTROL_KEY: CONTROL_VALUE}),
+            "case {case:?}: expected only the key the control wrote, got {stored:?}"
+        );
+
+        // Deregistering retires the resource that ARN named.
+        let (status, body) = emulator
+            .call("DeregisterScalableTarget", identity.clone())
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DeregisterScalableTarget to answer 200, got {status} with \
+             {body:?}"
+        );
+
+        // Each operation of the family, with this row's own payload, reports the resource the
+        // ARN names as absent.
+        for (operation, request) in [
+            (
+                "TagResource",
+                json!({"ResourceARN": arn, "Tags": row.written}),
+            ),
+            (
+                "UntagResource",
+                json!({"ResourceARN": arn, "TagKeys": row.removed}),
+            ),
+            ("ListTagsForResource", json!({"ResourceARN": arn})),
+        ] {
+            let (status, body) = emulator.call(operation, request).await;
+            assert_target_not_found(
+                &format!("{case}: the retired ARN on {operation}"),
+                status,
+                &body,
+                &arn,
+            );
+        }
+
+        // The refusals registered nothing: the identity the retired ARN belonged to is still
+        // absent from the read that lists it.
+        let (status, body) = emulator
+            .call(
+                "DescribeScalableTargets",
+                json!({
+                    "ServiceNamespace": namespace,
+                    "ResourceIds": [resource_id],
+                    "ScalableDimension": row.dimension,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DescribeScalableTargets to answer 200, got {status} with \
+             {body:?}"
+        );
+        assert_eq!(
+            body["ScalableTargets"],
+            json!([]),
+            "case {case:?}: expected the refused writes to revive no target, got {body:?}"
+        );
+
+        // Nor did they store a tag against the identity: registering it again, with no tags of
+        // its own, mints a new resource whose tag set is empty — and the retired ARN keeps
+        // reporting the resource it names as absent.
+        let mut reregistration = identity.clone();
+        reregistration["MinCapacity"] = json!(1);
+        reregistration["MaxCapacity"] = json!(10);
+        let (status, body) = emulator.call("RegisterScalableTarget", reregistration).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the re-registration to answer 200, got {status} with {body:?}"
+        );
+        let reissued = body["ScalableTargetARN"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_ne!(
+            reissued, arn,
+            "case {case:?}: expected the re-registration to mint a new ARN"
+        );
+        let stored = tags_of(
+            &emulator,
+            &reissued,
+            &format!("{case}: the re-registered target's tags"),
+        )
+        .await;
+        assert_eq!(
+            stored,
+            json!({}),
+            "case {case:?}: expected the refused writes to have landed nothing, got {stored:?}"
+        );
+        for (operation, request) in family(&arn) {
+            let (status, body) = emulator.call(operation, request).await;
+            assert_target_not_found(
+                &format!("{case}: the superseded ARN on {operation}"),
+                status,
+                &body,
+                &arn,
+            );
+        }
+    }
+}
+
+/// RULE: an ARN identifies one TARGET, so retiring one capacity dimension of a resource reports
+/// that target's ARN absent while every other dimension of the SAME resource keeps being
+/// served — the resolution is per target, not per resource.
+#[tokio::test]
+async fn retiring_one_dimension_of_a_resource_leaves_the_others_serving() {
+    let emulator = Emulator::empty();
+    // Two dimensions of one DynamoDB table, so both targets name the same resource id.
+    let retired_target = emulator
+        .given_target("dynamodb:table:ReadCapacityUnits", 1, 10)
+        .await;
+    let resident_target = emulator
+        .given_target("dynamodb:table:WriteCapacityUnits", 1, 10)
+        .await;
+    assert_eq!(
+        retired_target["ResourceId"], resident_target["ResourceId"],
+        "case \"the pair\": expected both dimensions of one resource, got {retired_target:?} and \
+         {resident_target:?}"
+    );
+    let retired_arn = emulator.target_arn(&retired_target).await;
+    let resident_arn = emulator.target_arn(&resident_target).await;
+    assert_ne!(
+        retired_arn, resident_arn,
+        "case \"the pair\": expected each dimension its own ARN"
+    );
+
+    let (status, body) = emulator
+        .call("DeregisterScalableTarget", retired_target.clone())
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"the deregistration\": expected 200, got {status} with {body:?}"
+    );
+
+    for (operation, request) in family(&retired_arn) {
+        let (status, body) = emulator.call(operation, request).await;
+        assert_target_not_found(
+            &format!("the retired dimension's ARN on {operation}"),
+            status,
+            &body,
+            &retired_arn,
+        );
+    }
+
+    // The sibling dimension of the same resource is untouched: it takes a tag, gives it up and
+    // reads back as it was written.
+    let (status, body) = emulator
+        .call(
+            "TagResource",
+            json!({"ResourceARN": resident_arn, "Tags": {"env": "sim2real"}}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"the sibling dimension\": expected TagResource to answer 200, got {status} with \
+         {body:?}"
+    );
+    let stored = tags_of(&emulator, &resident_arn, "the sibling dimension's tags").await;
+    assert_eq!(
+        stored,
+        json!({"env": "sim2real"}),
+        "case \"the sibling dimension\": expected the tag just written, got {stored:?}"
+    );
+    let (status, body) = emulator
+        .call(
+            "UntagResource",
+            json!({"ResourceARN": resident_arn, "TagKeys": ["env"]}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case \"the sibling dimension\": expected UntagResource to answer 200, got {status} with \
+         {body:?}"
+    );
+    let stored = tags_of(&emulator, &resident_arn, "the emptied sibling tag set").await;
+    assert_eq!(
+        stored,
+        json!({}),
+        "case \"the sibling dimension\": expected an empty tag set, got {stored:?}"
     );
 }
 
