@@ -355,14 +355,25 @@ fn exported_text(events: &[super::StoredEvent], from_ms: i64, to_ms: i64) -> Str
 }
 
 /// One exported event's timestamp, as the exported line carries it: the instant it names, in
-/// UTC.
+/// UTC, to the millisecond the event's own timestamp is stated in.
+///
+/// The fraction is FIXED WIDTH — three digits, zero-padded ([`EVENT_TIME_FORMAT`]) — because
+/// the millisecond an event carries is the precision of the field itself, not a value whose
+/// trailing zeros are noise: an instant stamped `.630` renders `.630`, and one stamped on the
+/// whole second renders `.000`, so every exported line holds a timestamp of the same shape and
+/// a reader parsing them with one millisecond format reads them all.
 fn format_timestamp(timestamp_ms: i64) -> String {
-    ::aws_smithy_types::DateTime::from_millis(timestamp_ms)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        // Every instant this type can hold renders; a timestamp that does not is written as
-        // the epoch milliseconds it was ingested with rather than dropping the event.
-        .unwrap_or_else(|_| timestamp_ms.to_string())
+    ::chrono::DateTime::<::chrono::Utc>::from_timestamp_millis(timestamp_ms)
+        .map(|instant| instant.format(EVENT_TIME_FORMAT).to_string())
+        // Every instant a stored event can hold renders; a timestamp outside the calendar
+        // altogether is written as the epoch milliseconds it was ingested with rather than
+        // dropping the event.
+        .unwrap_or_else(|| timestamp_ms.to_string())
 }
+
+/// The rendering [`format_timestamp`] writes: the UTC calendar instant with a three-digit
+/// fraction and the UTC designator (`%.3f` writes the millisecond fraction zero-padded).
+const EVENT_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 
 /// `body` in a gzip frame, the framing exported log data is written in.
 fn gzip(body: &str) -> Vec<u8> {
