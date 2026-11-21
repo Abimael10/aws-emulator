@@ -24,7 +24,10 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, call_in_region, emulator, given_layer, layer_digest, ok, refused, REGION};
+use crate::wire::{
+    call, call_in_region, emulator, emulator_with_engine, given_layer, layer_digest, ok, refused,
+    seed_credential_secret, REGION,
+};
 
 /// A `credentialArn` of the form the model constrains `CredentialArn` to
 /// (`^arn:aws(-\w+)*:secretsmanager:[a-zA-Z0-9-:]+:secret:ecr\-pullthroughcache\/[a-zA-Z0-9\/_+=.@-]+$`,
@@ -618,7 +621,14 @@ async fn credentials_are_updatable_only_on_an_authenticated_rule() {
         ),
     ];
 
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
+    // An update that sets a `credentialArn` names the Secrets Manager secret ECR retrieves
+    // the upstream credential from, so the secrets these rows name are placed where that
+    // service keeps them: what the rows are about is WHICH rule may be updated, not what
+    // its credential points at.
+    for secret in [SECRET_ARN, OTHER_SECRET_ARN] {
+        seed_credential_secret(&engine, secret, false);
+    }
     for (index, (case, created_with, update, accepted)) in rows.iter().enumerate() {
         let prefix = format!("ptc-rule-{index}");
         given_rule(&router, case, &prefix, created_with).await;
@@ -667,6 +677,148 @@ async fn credentials_are_updatable_only_on_an_authenticated_rule() {
                 after, before,
                 "case {case:?}: the refused update must leave the rule alone, got {after:?}"
             );
+        }
+    }
+}
+
+/// RULE: an update stores only a credential ECR could really use — a `customRoleArn` that
+/// is the ARN of an IAM role, and a `credentialArn` whose Secrets Manager secret can be
+/// retrieved — and refuses anything else with the error that defect earns, leaving the rule
+/// exactly as it was. Whether the CONTENTS of a retrievable secret are a usable credential
+/// is `ValidatePullThroughCacheRule`'s verdict, so an update is not the place it is judged.
+///
+/// The rows differ along what the update names: a role ARN and the ways a value fails to be
+/// one (no ARN at all, another vendor's resource, another IAM resource type), and a secret
+/// that is held, one that was never created, one scheduled for deletion, and one that is
+/// held but stores no credential.
+#[tokio::test]
+async fn an_update_stores_only_a_credential_the_registry_could_use() {
+    /// The sentence ECR refuses a `customRoleArn` that is not a role ARN with.
+    const INVALID_ROLE: &str = "Invalid role ARN supplied in request.";
+    /// The sentence it refuses a `credentialArn` naming no retrievable secret with.
+    const SECRET_NOT_FOUND: &str = "The ARN of the secret specified in the pull through cache \
+                                    rule was not found. Update the pull through cache rule \
+                                    with a valid secret ARN and try again.";
+    /// A secret of the `credentialArn` namespace that is never created.
+    const ABSENT_SECRET: &str =
+        "arn:aws:secretsmanager:eu-west-1:000000000000:secret:ecr-pullthroughcache/absent-AbCdEf";
+    /// One that is created and then scheduled for deletion.
+    const DELETED_SECRET: &str =
+        "arn:aws:secretsmanager:eu-west-1:000000000000:secret:ecr-pullthroughcache/gone-AbCdEf";
+    /// One that is created holding a value that is no upstream credential.
+    const VALUELESS_SECRET: &str =
+        "arn:aws:secretsmanager:eu-west-1:000000000000:secret:ecr-pullthroughcache/blank-AbCdEf";
+
+    // (case, the update to send, the error code and sentence it earns, or `None` when the
+    //  update is accepted)
+    type Row<'a> = (&'a str, Value, Option<(&'a str, &'a str)>);
+    let rows: Vec<Row<'_>> = vec![
+        (
+            "a customRoleArn that is not an ARN at all",
+            json!({"customRoleArn": "not-an-arn"}),
+            Some(("InvalidParameterException", INVALID_ROLE)),
+        ),
+        (
+            "a customRoleArn naming another vendor's resource",
+            json!({"customRoleArn": "arn:aws:s3:::ecr-pull-through-cache"}),
+            Some(("InvalidParameterException", INVALID_ROLE)),
+        ),
+        (
+            "a customRoleArn naming an IAM resource that is no role",
+            json!({"customRoleArn": "arn:aws:iam::000000000000:user/ecr-pull-through-cache"}),
+            Some(("InvalidParameterException", INVALID_ROLE)),
+        ),
+        (
+            "a credentialArn naming a secret that was never created",
+            json!({"credentialArn": ABSENT_SECRET}),
+            Some(("SecretNotFoundException", SECRET_NOT_FOUND)),
+        ),
+        (
+            "a credentialArn whose secret is scheduled for deletion",
+            json!({"credentialArn": DELETED_SECRET}),
+            Some(("SecretNotFoundException", SECRET_NOT_FOUND)),
+        ),
+        (
+            "a customRoleArn that is a role of this account",
+            json!({"customRoleArn": ROLE_ARN}),
+            None,
+        ),
+        (
+            "a credentialArn whose secret the account holds",
+            json!({"credentialArn": OTHER_SECRET_ARN}),
+            None,
+        ),
+        (
+            // The update checks that the secret can be RETRIEVED; what it stores is the
+            // verdict `ValidatePullThroughCacheRule` reports, not this call's refusal.
+            "a credentialArn whose secret stores no upstream credential",
+            json!({"credentialArn": VALUELESS_SECRET}),
+            None,
+        ),
+    ];
+
+    let (router, engine) = emulator_with_engine();
+    seed_credential_secret(&engine, SECRET_ARN, false);
+    seed_credential_secret(&engine, OTHER_SECRET_ARN, false);
+    seed_credential_secret(&engine, DELETED_SECRET, true);
+    crate::wire::seed_secret_value(&engine, VALUELESS_SECRET, "not-a-credential-document");
+
+    for (index, (case, update, refusal)) in rows.iter().enumerate() {
+        let prefix = format!("ptc-credential-{index}");
+        // Created authenticated, so every row's update is one the rule's kind allows.
+        given_rule(
+            &router,
+            case,
+            &prefix,
+            &json!({"credentialArn": SECRET_ARN}),
+        )
+        .await;
+        let before = described_rule(&router, case, &prefix).await;
+
+        let mut request = json!({"ecrRepositoryPrefix": prefix.clone()});
+        for (member, value) in update.as_object().into_iter().flatten() {
+            request[member] = value.clone();
+        }
+        let answer = call(&router, "UpdatePullThroughCacheRule", &request).await;
+        let after = described_rule(&router, case, &prefix).await;
+
+        match refusal {
+            Some((code, message)) => {
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case:?}: expected HTTP 400, got {} with {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.error_code(),
+                    *code,
+                    "case {case:?}: expected {code}, got {:?}",
+                    answer.body
+                );
+                assert_eq!(
+                    answer.message(),
+                    *message,
+                    "case {case:?}: expected the refusal's own sentence, got {:?}",
+                    answer.body
+                );
+                assert_eq!(
+                    after, before,
+                    "case {case:?}: a refused update must leave the rule alone, got {after:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: expected HTTP 200, got {} with {:?}",
+                    answer.status, answer.body
+                );
+                for (member, value) in update.as_object().into_iter().flatten() {
+                    assert_eq!(
+                        &after[member], value,
+                        "case {case:?}: the stored rule must carry {member}, got {after:?}"
+                    );
+                }
+            }
         }
     }
 }

@@ -191,6 +191,47 @@ pub async fn call_as(
     Answer { status, body }
 }
 
+/// The same call as [`call`], carrying `payload` as the request body EXACTLY as written —
+/// for a case about the body's own form, which a JSON value cannot express (a top level that
+/// is not an object, a body that is not JSON at all).
+pub async fn call_with_payload(
+    router: &MultiServiceRouter,
+    operation: &str,
+    payload: &str,
+) -> Answer {
+    let request = ::http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", endpoint_host(REGION))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential={ACCOUNT_ACCESS_KEY_ID}/20260101/{REGION}/ecr/aws4_request, \
+                 SignedHeaders=host, Signature=abc"
+            ),
+        )
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
+        .body(Bytes::from(payload.to_string()))
+        .expect("the test request is well formed");
+
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let bytes = response.into_body();
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            panic!(
+                "{operation} answered a body that is not JSON ({error}): {:?}",
+                String::from_utf8_lossy(&bytes)
+            )
+        })
+    };
+    Answer { status, body }
+}
+
 /// A successful call, or a panic naming the case and what came back instead.
 pub async fn ok(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
     let answer = call(router, operation, body).await;
@@ -546,6 +587,66 @@ pub fn seed_pull_through_cache_rule(
             updated_at: None,
         },
     );
+}
+
+/// Seed, straight into AWS Secrets Manager's own store, the secret a pull through cache
+/// rule's `credentialArn` names, holding `value` as its current value.
+///
+/// Validating a rule asks Secrets Manager whether the secret its `credentialArn` names
+/// holds a retrievable credential, so a suite whose rule has to carry a credential of a
+/// given state puts that secret where that service keeps it — this emulator's one Secrets
+/// Manager store, in the Region the ARN itself names.
+pub fn seed_secret_value(engine: &engine::InMemoryEngine, arn: &str, value: &str) {
+    use service_com_amazonaws_secretsmanager_secretsmanager::state as secrets;
+
+    let now = ::std::time::SystemTime::now();
+    let region = arn.split(':').nth(3).unwrap_or_default().to_string();
+    let mut secret = secrets::Secret::new(
+        secrets::secret_name_in(arn).to_string(),
+        arn.to_string(),
+        region,
+        now,
+    );
+    let held = secrets::envelope::SecretValue::from_request(Some(&value.to_string()), None)
+        .expect("the seeded secret carries a value");
+    secret.put_version(
+        secrets::SecretVersion {
+            version_id: secrets::new_version_id(),
+            value: secrets::envelope::StoredValue::as_sent(&held),
+            version_stages: vec![secrets::STAGE_CURRENT.to_string()],
+            created_date: now,
+            last_accessed_date: None,
+        },
+        now,
+    );
+    let state = secrets::service_state(engine).expect("the secretsmanager store is reachable");
+    state.lock().insert(secret);
+}
+
+/// The same secret as [`seed_secret_value`], holding the document the Amazon ECR user guide
+/// writes an upstream registry credential as: `{"username":…,"accessToken":…}`.
+///
+/// `deleted` schedules the secret for deletion the way `DeleteSecret` does, which is how a
+/// case covers a credential whose secret has gone.
+pub fn seed_credential_secret(engine: &engine::InMemoryEngine, arn: &str, deleted: bool) {
+    use service_com_amazonaws_secretsmanager_secretsmanager::state as secrets;
+
+    seed_secret_value(
+        engine,
+        arn,
+        r#"{"username":"upstream-user","accessToken":"upstream-token"}"#,
+    );
+    if !deleted {
+        return;
+    }
+    let now = ::std::time::SystemTime::now();
+    let region = arn.split(':').nth(3).unwrap_or_default();
+    let state = secrets::service_state(engine).expect("the secretsmanager store is reachable");
+    let mut store = state.lock();
+    let secret = store
+        .get_mut(region, arn)
+        .expect("the seeded secret is in the store");
+    secret.schedule_deletion(now, now, now);
 }
 
 /// The same call as [`call`], made against `region`: the credential scope's region is

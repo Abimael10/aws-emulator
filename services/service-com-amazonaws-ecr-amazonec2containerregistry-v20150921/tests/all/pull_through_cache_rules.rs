@@ -30,10 +30,6 @@ const OTHER_CREDENTIAL_ARN: &str =
 /// An IAM role ARN for `customRoleArn`, which the model constrains only by length.
 const CUSTOM_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/ecr-pull-through-cache";
 
-/// `upstreamRepositoryPrefix`'s documented default: "When this field isn't specified,
-/// Amazon ECR will use the ROOT."
-const ROOT: &str = "ROOT";
-
 /// The wire error code ECR refuses an upstream registry it cannot cache from with
 /// (smithy_query operation=CreatePullThroughCacheRule: `UnsupportedUpstreamRegistryException`,
 /// httpError 400).
@@ -60,15 +56,17 @@ fn invalid_upstream_url_message(url: &str) -> String {
 struct Case<'a> {
     name: &'a str,
     prefix: &'a str,
-    /// `upstreamRegistry` as the request carries it; `None` leaves the member out, so
-    /// the handler must resolve it from the URL.
+    /// `upstreamRegistry` as the request carries it; `None` leaves the member out, so the
+    /// rule stores none and reports none back — the registry the URL resolves to is what
+    /// the handler's own decisions are taken on, never what the answer reports.
     upstream_registry: Option<&'a str>,
     upstream_registry_url: &'a str,
+    /// `upstreamRepositoryPrefix` as the request carries it; `None` leaves the member out,
+    /// so the rule stores none and reports none back — an absent upstream prefix is what
+    /// caching from the upstream's own root IS, not a value the answer invents.
     upstream_repository_prefix: Option<&'a str>,
     credential_arn: Option<&'a str>,
     custom_role_arn: Option<&'a str>,
-    expected_upstream_registry: &'a str,
-    expected_upstream_repository_prefix: &'a str,
 }
 
 /// The create table: one row per value of the model's `UpstreamRegistry` enum
@@ -88,8 +86,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: None,
             credential_arn: None,
             custom_role_arn: None,
-            expected_upstream_registry: "ecr-public",
-            expected_upstream_repository_prefix: ROOT,
         },
         Case {
             name: "docker-hub, named registry with a credential and an upstream prefix",
@@ -99,8 +95,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: Some("library"),
             credential_arn: Some(CREDENTIAL_ARN),
             custom_role_arn: None,
-            expected_upstream_registry: "docker-hub",
-            expected_upstream_repository_prefix: "library",
         },
         Case {
             name: "github-container-registry, registry resolved from ghcr.io",
@@ -110,8 +104,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: None,
             credential_arn: Some(OTHER_CREDENTIAL_ARN),
             custom_role_arn: Some(CUSTOM_ROLE_ARN),
-            expected_upstream_registry: "github-container-registry",
-            expected_upstream_repository_prefix: ROOT,
         },
         Case {
             name: "gitlab-container-registry, both ARNs carried",
@@ -121,8 +113,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: Some("group/project"),
             credential_arn: Some(CREDENTIAL_ARN),
             custom_role_arn: Some(CUSTOM_ROLE_ARN),
-            expected_upstream_registry: "gitlab-container-registry",
-            expected_upstream_repository_prefix: "group/project",
         },
         Case {
             name: "k8s, registry resolved from registry.k8s.io",
@@ -132,8 +122,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: Some("kube"),
             credential_arn: None,
             custom_role_arn: None,
-            expected_upstream_registry: "k8s",
-            expected_upstream_repository_prefix: "kube",
         },
         Case {
             name: "quay, named registry and the default upstream prefix",
@@ -143,8 +131,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: None,
             credential_arn: Some(CREDENTIAL_ARN),
             custom_role_arn: None,
-            expected_upstream_registry: "quay",
-            expected_upstream_repository_prefix: ROOT,
         },
         Case {
             name: "azure-container-registry, registry resolved from <custom>.azurecr.io",
@@ -154,8 +140,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: None,
             credential_arn: Some(CREDENTIAL_ARN),
             custom_role_arn: None,
-            expected_upstream_registry: "azure-container-registry",
-            expected_upstream_repository_prefix: ROOT,
         },
         Case {
             name: "ecr, registry resolved from <accountId>.dkr.ecr.<region>.amazonaws.com",
@@ -165,8 +149,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: Some("team"),
             credential_arn: None,
             custom_role_arn: Some(CUSTOM_ROLE_ARN),
-            expected_upstream_registry: "ecr",
-            expected_upstream_repository_prefix: "team",
         },
         Case {
             name: "chainguard, a registry the model documents no URL for",
@@ -176,8 +158,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: None,
             credential_arn: Some(OTHER_CREDENTIAL_ARN),
             custom_role_arn: None,
-            expected_upstream_registry: "chainguard",
-            expected_upstream_repository_prefix: ROOT,
         },
         Case {
             name: "a prefix written with the trailing slash the prefix doc allows",
@@ -187,8 +167,6 @@ fn create_cases() -> Vec<Case<'static>> {
             upstream_repository_prefix: None,
             credential_arn: None,
             custom_role_arn: None,
-            expected_upstream_registry: "quay",
-            expected_upstream_repository_prefix: ROOT,
         },
     ]
 }
@@ -214,18 +192,26 @@ fn create_request(case: &Case<'_>) -> Value {
 }
 
 /// Assert that `rule` — a create response or a described rule — reports what the row says.
-fn assert_rule(case: &Case<'_>, label: &str, rule: &Value) {
+/// Assert that `rule` — a create response or a described rule — reports what the row says.
+///
+/// `reports_upstream_registry` is false for a DESCRIBED rule: that read answers without the
+/// member whatever the create was given (see `src/ops/describe_pull_through_cache_rules.rs`),
+/// so the row's value is expected only of the create that echoed it.
+fn assert_rule(case: &Case<'_>, label: &str, rule: &Value, reports_upstream_registry: bool) {
     let expectations = [
         ("/ecrRepositoryPrefix", json!(case.prefix)),
         ("/upstreamRegistryUrl", json!(case.upstream_registry_url)),
         ("/registryId", json!(REGISTRY_ID)),
         (
             "/upstreamRegistry",
-            json!(case.expected_upstream_registry),
+            case.upstream_registry
+                .filter(|_| reports_upstream_registry)
+                .map_or(Value::Null, |registry| json!(registry)),
         ),
         (
             "/upstreamRepositoryPrefix",
-            json!(case.expected_upstream_repository_prefix),
+            case.upstream_repository_prefix
+                .map_or(Value::Null, |prefix| json!(prefix)),
         ),
         (
             "/credentialArn",
@@ -302,7 +288,7 @@ async fn a_created_rule_is_what_describe_reports() {
             &create_request(&case),
         )
         .await;
-        assert_rule(&case, "the create response", &created);
+        assert_rule(&case, "the create response", &created, true);
 
         // The round trip: the rule read back through the reporting operation, asked for
         // by the prefix the create was given.
@@ -321,7 +307,7 @@ async fn a_created_rule_is_what_describe_reports() {
             "case {:?}: exactly the one rule created for this prefix, got {rules:?}",
             case.name
         );
-        assert_rule(&case, "the described rule", &rules[0]);
+        assert_rule(&case, "the described rule", &rules[0], false);
         assert_eq!(
             at(&rules[0], "/createdAt"),
             at(&created, "/createdAt"),
@@ -422,8 +408,9 @@ async fn a_second_rule_for_the_same_prefix_is_refused_and_changes_nothing() {
         );
         assert_eq!(
             at(&rule, "/upstreamRepositoryPrefix"),
-            json!(ROOT),
-            "case {case:?}: the refused create did not change the upstream prefix, got {rule:?}"
+            Value::Null,
+            "case {case:?}: the refused create did not change the upstream prefix, which the \
+             first create named none of, got {rule:?}"
         );
         assert_eq!(
             at(&rule, "/createdAt"),
@@ -497,8 +484,9 @@ async fn an_upstream_registry_the_url_does_not_name_is_refused() {
     .await;
     assert_eq!(
         at(&created, "/upstreamRegistry"),
-        json!("ecr-public"),
-        "the registry is resolved from the documented URL, got {created:?}"
+        Value::Null,
+        "the URL resolved to a supported registry, but the request named none, so the \
+         answer reports none, got {created:?}"
     );
 }
 
@@ -937,7 +925,8 @@ async fn a_prefix_a_refused_create_left_free_takes_the_next_rule() {
         ("/ecrRepositoryPrefix", json!(prefix)),
         ("/upstreamRegistryUrl", json!("public.ecr.aws")),
         ("/registryId", json!(REGISTRY_ID)),
-        ("/upstreamRegistry", json!("ecr-public")),
+        // The request named no `upstreamRegistry`, so the rule stores and reports none.
+        ("/upstreamRegistry", Value::Null),
     ] {
         assert_eq!(
             at(&created, pointer),

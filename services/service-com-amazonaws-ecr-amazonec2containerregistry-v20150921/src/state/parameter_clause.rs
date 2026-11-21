@@ -76,3 +76,15 @@ pub fn exclusion_filters_not_allowed(setting: &str) -> Fault {
         ),
     )
 }
+
+/// The constraint ECR states for a member holding an ARN that is not one: the KIND of ARN
+/// the member carries and the value that is not one, rather than an expression quoted back
+/// at the caller.
+///
+/// The one wording of that sentence, so the boundary walk over a member's `@pattern`
+/// ([`crate::service`]) and a handler judging a member the model gives no pattern state it
+/// alike. `kind` is the kind of ARN in words (`custom role`, `signing profile`), which the
+/// boundary walk derives from the member's own name.
+pub fn malformed_arn_constraint(kind: &str, value: &str) -> String {
+    format!("The {kind} ARN '{value}' must be well formed")
+}

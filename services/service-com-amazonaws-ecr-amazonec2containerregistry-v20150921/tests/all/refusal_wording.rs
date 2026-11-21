@@ -1336,3 +1336,107 @@ async fn a_destination_that_is_the_source_registry_states_the_constraint() {
         answer.body
     );
 }
+
+/// RULE: a request body this protocol cannot FRAME — one whose top level is not a JSON
+/// structure — never becomes an input, so it is refused with the protocol's own
+/// `SerializationException` (HTTP 400) naming the token found, and NOT with the
+/// per-member refusal that answers a value the model declined. A body that IS a structure
+/// reaches the operation and is answered by it.
+///
+/// The rows differ along the JSON class the body's top level carries — a list, each scalar
+/// class, the null literal — and the operation addressed, so the refusal is the protocol's
+/// rather than any one operation's. A body that is not JSON at all keeps the framework's own
+/// rendering: the reader never got far enough to name a token.
+#[tokio::test]
+async fn a_body_that_is_not_a_structure_is_refused_as_a_serialization_failure() {
+    /// The protocol's own error code for a body it could not frame.
+    const SERIALIZATION: &str = "SerializationException";
+
+    let router = emulator();
+    // (case, the operation addressed, the body exactly as sent, the sentence it earns)
+    let rows: Vec<(&str, &str, &str, &str)> = vec![
+        (
+            "a list where a structure opens",
+            "DescribeRegistry",
+            "[]",
+            "Start of list found where not expected",
+        ),
+        (
+            "a list carrying what the operation's members would be",
+            "DescribeRepositories",
+            r#"[{"repositoryNames":["a"]}]"#,
+            "Start of list found where not expected",
+        ),
+        (
+            "a string",
+            "DescribeRegistry",
+            "\"registry\"",
+            "STRING_VALUE found where not expected",
+        ),
+        (
+            "a number",
+            "ListImages",
+            "7",
+            "NUMBER_VALUE found where not expected",
+        ),
+        (
+            "a flag",
+            "GetAuthorizationToken",
+            "true",
+            "BOOLEAN_VALUE found where not expected",
+        ),
+        (
+            "the null literal",
+            "DescribeRegistry",
+            "null",
+            "NULL_VALUE found where not expected",
+        ),
+    ];
+
+    for (case, operation, payload, sentence) in rows {
+        let answer = crate::wire::call_with_payload(&router, operation, payload).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: a body that cannot be framed is a client error, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert!(
+            answer.error_code().ends_with(SERIALIZATION),
+            "case {case:?}: expected {SERIALIZATION}, got {:?}",
+            answer.error_code()
+        );
+        assert_eq!(
+            at(&answer.body, "/Message"),
+            json!(sentence),
+            "case {case:?}: expected the framing refusal's sentence, got {:?}",
+            answer.body
+        );
+    }
+
+    // A body that IS a structure is framed and reaches the operation, which answers it:
+    // the layer above refuses nothing a request of this protocol can be read from.
+    let answer = crate::wire::call_with_payload(&router, "DescribeRegistry", "{}").await;
+    assert_eq!(
+        answer.status, 200,
+        "a structure is framed and served, got {} with {:?}",
+        answer.status, answer.body
+    );
+    // And a request the model declines on a MEMBER is still the per-member refusal, which
+    // is a different error class from the framing one.
+    let refused_member = call(
+        &router,
+        "DescribeRepositories",
+        &json!({"repositoryNames": []}),
+    )
+    .await;
+    assert_eq!(
+        refused_member.status, 400,
+        "a member the model declines is still refused, got {} with {:?}",
+        refused_member.status, refused_member.body
+    );
+    assert!(
+        refused_member.error_code().ends_with(INVALID_PARAMETER),
+        "a member refusal keeps this service's own error code, got {:?}",
+        refused_member.error_code()
+    );
+}

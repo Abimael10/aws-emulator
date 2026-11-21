@@ -6,6 +6,10 @@
 //! stored record, and a request naming a prefix the registry holds no rule for is
 //! refused rather than answered with a shorter list.
 //!
+//! `upstreamRegistry` is the one member of the record this read does not report — the
+//! recorded corpus shows the operation answering without it even for a rule created WITH
+//! one — so the create that was given the value is what echoes it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -224,11 +228,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Keyed by the normalised prefix, which is the order the store holds the rules
         // in, so a page boundary means the same thing on the next call.
+        //
+        // `upstreamRegistry` is left out of what this read reports, for every rule and
+        // whether or not the create was given one: the recorded corpus shows this
+        // operation answering without that member even for a rule created WITH it, so the
+        // value stays on the record for the create that echoed it and this read reports
+        // the rest. Everything else is the stored record as it stands.
         let candidates: Vec<(String, PullThroughCacheRule)> = store
             .pull_through_cache_rules
             .iter()
             .filter(|(key, _)| wanted.is_empty() || wanted.contains(key.as_str()))
-            .map(|(key, rule)| (key.clone(), rule.clone()))
+            .map(|(key, rule)| {
+                (
+                    key.clone(),
+                    PullThroughCacheRule {
+                        upstream_registry: None,
+                        ..rule.clone()
+                    },
+                )
+            })
             .collect();
 
         let (rules, next_token) =

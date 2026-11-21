@@ -90,6 +90,13 @@
 /// the layer download plane is.
 mod registry_v2;
 
+/// This service's request-deserialization layer, in `service/unreadable_body.rs`: a body
+/// whose top level is not a JSON structure never becomes an input, so it is refused with
+/// the protocol's own `SerializationException` rather than with the constraint refusal the
+/// framework would render. Reached from [`Service::override_operation`], the one seam a
+/// service has before dispatch.
+mod unreadable_body;
+
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
@@ -590,9 +597,9 @@ fn arn_constraint(member: &str, pattern: &str, value: Option<&str>) -> Option<St
         .strip_suffix(ARN_MEMBER_SUFFIX)
         .filter(|kind| !kind.is_empty())?;
     let value = value?;
-    Some(format!(
-        "The {} ARN '{value}' must be well formed",
-        in_words(kind)
+    Some(crate::state::malformed_arn_constraint(
+        &in_words(kind),
+        value,
     ))
 }
 
@@ -675,11 +682,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // A body the protocol cannot FRAME is refused FIRST, because deserialization
+        // precedes every later layer: the framework would otherwise report a framing
+        // failure as a constraint violation, which is a different error class and a
+        // different remediation for the caller ([`unreadable_body`]). This is NOT a
+        // re-route — the refusal answers for the operation the model's own routing key
+        // names, and a key the model does not name resolves to `None` here exactly as it
+        // does in the generated table, so the router's routing-error path is unchanged.
+        if unreadable_body::refuses(self.definition(), req) {
+            return Some(&unreadable_body::UNREADABLE_BODY);
+        }
         None
     }
 

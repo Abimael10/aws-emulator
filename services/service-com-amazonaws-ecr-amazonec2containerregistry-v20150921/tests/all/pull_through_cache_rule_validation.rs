@@ -19,7 +19,9 @@
 
 use serde_json::{json, Value};
 
-use crate::wire::{at, call, emulator, emulator_with_engine, ok, seed_pull_through_cache_rule};
+use crate::wire::{
+    at, call, emulator_with_engine, ok, seed_credential_secret, seed_pull_through_cache_rule,
+};
 
 /// A Secrets Manager secret ARN in the namespace `CredentialArn`'s modelled pattern
 /// states (smithy_query operation=ValidatePullThroughCacheRule, member credentialArn:
@@ -266,7 +268,14 @@ async fn described(
 
 #[tokio::test]
 async fn a_rules_verdict_is_read_off_its_stored_configuration() {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
+    // Every secret a row's rule names, where Secrets Manager keeps it: a credential the
+    // rule stores is one ECR retrieves the upstream's credential from, so a row whose
+    // credential is meant to be USABLE needs that secret to exist. The rows that turn on
+    // the SYNTAX of a credential name no secret of this store at all.
+    for credential in [SECRET, OTHER_SECRET] {
+        seed_credential_secret(&engine, credential, false);
+    }
 
     for case in cases() {
         ok(
@@ -584,6 +593,13 @@ async fn a_credential_the_rule_stores_has_to_be_the_arn_its_member_documents() {
 
     let (router, engine) = emulator_with_engine();
     for (case, credential, usable) in rows {
+        // A value this table expects to be USABLE is one whose secret exists, so the
+        // verdict turns on the SYNTAX the row is about rather than on a missing secret;
+        // the Secrets Manager store answers nothing about the rest, which are values no
+        // secret could be held under anyway.
+        if usable {
+            seed_credential_secret(&engine, credential, false);
+        }
         // The upstream authenticates its callers, so the credential is what the rule's
         // validity turns on.
         seed_pull_through_cache_rule(
@@ -634,9 +650,188 @@ async fn a_rule_naming_no_upstream_registry_does_not_validate() {
     }
 }
 
+/// One row of the credential-secret table: what state the Secrets Manager secret a rule's
+/// `credentialArn` names is in, and the verdict that earns the rule.
+struct SecretRow<'a> {
+    case: &'a str,
+    /// The prefix the rule is held under — its own, so no row reads another's rule.
+    prefix: &'a str,
+    /// The secret the rule's `credentialArn` names.
+    credential_arn: &'a str,
+    /// Whether that secret is placed in Secrets Manager's store at all.
+    secret_exists: bool,
+    /// Whether a `DeleteSecret` has scheduled it for deletion.
+    secret_deleted: bool,
+    /// The `customRoleArn` the rule also stores, if any.
+    custom_role_arn: Option<&'a str>,
+    /// The verdict `isValid` must carry.
+    valid: bool,
+    /// The `failureCode` the failure document must carry, for a row that does not validate.
+    failure_code: Option<&'a str>,
+}
+
+/// RULE: a rule whose upstream authenticates its callers validates only when the credential
+/// it stores can really be used — and whether the Secrets Manager secret a `credentialArn`
+/// names holds a retrievable credential is asked of Secrets Manager, the service that owns
+/// it ("Amazon ECR will attempt to retrieve the contents of the Amazon Web Services Secrets
+/// Manager secret, verify the syntax", `ValidatePullThroughCacheRule`). A rule that does not
+/// validate reports a failure DOCUMENT: a `failureCode` a client branches on and a
+/// `failureReason` stating it.
+///
+/// The rows differ along the state of what the credential points at — a secret that is
+/// there, one that was never created, one scheduled for deletion, one storing none of the
+/// documented credential fields — and along whether a usable `customRoleArn` stands beside
+/// it, which is a credential of its own.
+#[tokio::test]
+async fn a_credential_secret_that_holds_no_credential_makes_the_rule_invalid() {
+    const MISSING_SECRET: &str =
+        "arn:aws:secretsmanager:eu-west-1:000000000000:secret:ecr-pullthroughcache/absent-AbCdEf";
+    const DELETED_SECRET: &str =
+        "arn:aws:secretsmanager:eu-west-1:000000000000:secret:ecr-pullthroughcache/deleted-AbCdEf";
+
+    let rows = vec![
+        SecretRow {
+            case: "a secret the account holds, storing the upstream credential",
+            prefix: "secret-held",
+            credential_arn: SECRET,
+            secret_exists: true,
+            secret_deleted: false,
+            custom_role_arn: None,
+            valid: true,
+            failure_code: None,
+        },
+        SecretRow {
+            case: "a credentialArn naming a secret that was never created",
+            prefix: "secret-absent",
+            credential_arn: MISSING_SECRET,
+            secret_exists: false,
+            secret_deleted: false,
+            custom_role_arn: None,
+            valid: false,
+            failure_code: Some("UNABLE_TO_ACCESS_SECRET"),
+        },
+        SecretRow {
+            case: "a credentialArn whose secret has been deleted",
+            prefix: "secret-deleted",
+            credential_arn: DELETED_SECRET,
+            secret_exists: true,
+            secret_deleted: true,
+            custom_role_arn: None,
+            valid: false,
+            failure_code: Some("UNABLE_TO_ACCESS_SECRET"),
+        },
+        SecretRow {
+            case: "a deleted secret beside a customRoleArn, which authenticates on its own",
+            prefix: "secret-deleted-with-role",
+            credential_arn: DELETED_SECRET,
+            secret_exists: true,
+            secret_deleted: true,
+            custom_role_arn: Some(ROLE),
+            valid: true,
+            failure_code: None,
+        },
+    ];
+
+    let (router, engine) = emulator_with_engine();
+    for row in &rows {
+        if row.secret_exists {
+            seed_credential_secret(&engine, row.credential_arn, row.secret_deleted);
+        }
+        // The upstream authenticates its callers, so the credential is what the rule's
+        // validity turns on.
+        seed_pull_through_cache_rule(
+            &engine,
+            row.prefix,
+            Some("docker-hub"),
+            "registry-1.docker.io",
+            Some(row.credential_arn),
+            row.custom_role_arn,
+        );
+        let validated = ok(
+            &router,
+            row.case,
+            "ValidatePullThroughCacheRule",
+            &json!({"ecrRepositoryPrefix": row.prefix}),
+        )
+        .await;
+        assert_verdict(row.case, row.valid, None, &validated);
+        assert_eq!(
+            failure_code(row.case, &validated).as_deref(),
+            row.failure_code,
+            "case {:?}: expected the failure code {:?}, got {:?}",
+            row.case,
+            row.failure_code,
+            failure_code(row.case, &validated)
+        );
+    }
+
+    // A secret whose value states none of the documented credential fields holds no
+    // credential either, whatever else it holds: the secret is READ through Secrets
+    // Manager's own API, so the rule's verdict follows the value a client wrote.
+    let unusable =
+        "arn:aws:secretsmanager:eu-west-1:000000000000:secret:ecr-pullthroughcache/blank-AbCdEf";
+    crate::wire::seed_secret_value(&engine, unusable, r#"{"user":"x","token":"y"}"#);
+    seed_pull_through_cache_rule(
+        &engine,
+        "secret-unusable",
+        Some("docker-hub"),
+        "registry-1.docker.io",
+        Some(unusable),
+        None,
+    );
+    let validated = ok(
+        &router,
+        "a secret storing none of the credential fields",
+        "ValidatePullThroughCacheRule",
+        &json!({"ecrRepositoryPrefix": "secret-unusable"}),
+    )
+    .await;
+    assert_verdict(
+        "a secret storing none of the credential fields",
+        false,
+        None,
+        &validated,
+    );
+    assert_eq!(
+        failure_code("a secret storing none of the credential fields", &validated).as_deref(),
+        Some("INVALID_SECRET_FORMAT"),
+        "a secret that stores no credential field is reported as the format it is not, got \
+         {validated:?}"
+    );
+}
+
+/// The `failureCode` the `failure` member's document carries, or `None` for a rule that
+/// validated and so reports an empty `failure`.
+///
+/// The member is a string carrying a failure document, so a client parses it: a non-empty
+/// `failure` that is not that document would be a defect, and the panic says so.
+fn failure_code(case: &str, body: &Value) -> Option<String> {
+    let failure = at(body, "/failure").as_str().unwrap_or_default().to_string();
+    if failure.is_empty() {
+        return None;
+    }
+    let document: Value = serde_json::from_str(&failure).unwrap_or_else(|error| {
+        panic!("case {case:?}: the failure must be a document ({error}): {failure:?}")
+    });
+    let code = at(&document, "/failureCode")
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the failure document must carry a failureCode: {failure:?}")
+        })
+        .to_string();
+    assert!(
+        !at(&document, "/failureReason")
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "case {case:?}: the failure document must state a failureReason: {failure:?}"
+    );
+    Some(code)
+}
+
 #[tokio::test]
 async fn a_rule_is_validated_by_either_spelling_of_its_prefix() {
-    let router = emulator();
+    let (router, _engine) = emulator_with_engine();
     // "There is always an assumed / applied to the end of the prefix", so both spellings
     // address the one rule — and a prefix no rule answers to is a not-found rather than an
     // invalid rule.

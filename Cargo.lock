@@ -13603,6 +13603,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-signer-wallabyservice",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",

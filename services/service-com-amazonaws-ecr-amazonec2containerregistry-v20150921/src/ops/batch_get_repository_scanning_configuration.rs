@@ -2,8 +2,9 @@
 
 //! @op BatchGetRepositoryScanningConfiguration
 //!
-//! Reports the scanning configuration of each named repository, computed from the
-//! stored repository records (see [`crate::state::Repo::to_scanning_configuration`]).
+//! Reports the scanning configuration in force on each named repository, computed from
+//! the stored repository record and the registry's own stored scanning configuration (see
+//! [`crate::state::ComAmazonawsEcrAmazonec2containerregistryV20150921State::repository_scanning_configuration`]).
 //! This is a batch read: a name that matches no repository is reported in `failures`
 //! rather than failing the whole call.
 //!
@@ -174,7 +175,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut failures = Vec::new();
         for name in &input.repository_names {
             match store.repository(&region, name) {
-                Ok(repo) => scanning_configurations.push(repo.to_scanning_configuration()),
+                // The configuration a repository reports is the registry configuration in
+                // force on it, which is the store's own projection of the two standing
+                // instructions — see
+                // [`crate::state::ComAmazonawsEcrAmazonec2containerregistryV20150921State::repository_scanning_configuration`].
+                Ok(repo) => {
+                    scanning_configurations.push(store.repository_scanning_configuration(repo));
+                }
                 Err(_) => failures.push(RepositoryScanningConfigurationFailure {
                     repository_name: Some(name.clone()),
                     failure_code: Some(REPOSITORY_NOT_FOUND_FAILURE.to_string()),

@@ -226,13 +226,7 @@ impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
             .unwrap_or_default()
             .iter()
             .filter(|rule| rule.scan_frequency == super::SCAN_ON_PUSH_FREQUENCY)
-            .any(|rule| {
-                rule.repository_filters.is_empty()
-                    || rule
-                        .repository_filters
-                        .iter()
-                        .any(|filter| super::wildcard_matches(&filter.filter, repository_name))
-            })
+            .any(|rule| super::scanning::rule_covers(rule, repository_name))
     }
 
     /// The basic scan a push of the image `digest` names into the repository

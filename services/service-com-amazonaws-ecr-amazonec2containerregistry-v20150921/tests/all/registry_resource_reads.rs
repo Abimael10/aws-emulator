@@ -20,7 +20,8 @@ use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921 as ecr;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    emulator_with_engine, given_layer, ok, refused, seed_pull_through_cache_rule, REGISTRY_ID,
+    emulator_with_engine, given_layer, ok, refused, seed_credential_secret,
+    seed_pull_through_cache_rule, REGISTRY_ID,
 };
 
 /// An account id that is NOT this emulator's registry.
@@ -756,6 +757,13 @@ async fn pull_through_cache_rule_update_and_validate_resolve_the_prefix() {
     const ROLE: &str = "arn:aws:iam::000000000000:role/ecr-pull-through-cache";
 
     let (router, engine) = emulator_with_engine();
+
+    // The secrets these rules' credentials name, where Secrets Manager keeps them: a
+    // credential a rule stores is the secret ECR retrieves the upstream's credential from,
+    // so an update that sets one and a verdict on one both resolve it there.
+    for secret in [SECRET, OTHER_SECRET, INITIAL_SECRET] {
+        seed_credential_secret(&engine, secret, false);
+    }
 
     // Neither operation creates a rule, so a prefix no rule answers to is refused by
     // both — including a prefix whose rule was never created and the reserved `ROOT`.

@@ -33,6 +33,18 @@ const MAX_TAGS: usize = 50;
 /// resources": "the `aws:` prefix is reserved for AWS use").
 const RESERVED_PREFIX: &str = "aws:";
 
+/// The sentence a key under [`RESERVED_PREFIX`] is refused with: a tag under it belongs to
+/// the system rather than to the caller. It is the wording the sibling Amazon ECR Public
+/// registry answers the same rule with, written out here so a change of the
+/// implementation's wording fails this test.
+const SYSTEM_TAG_MESSAGE: &str = "Caller is an end user and not allowed to mutate system tags";
+
+/// The sentence a tag longer than a tag may be is refused with: the one
+/// `InvalidTagParameterException` is documented with, which states those two limits.
+const TAG_LENGTH_MESSAGE: &str = "An invalid parameter has been specified. Tag keys can have \
+                                 a maximum character length of 128 characters, and tag values \
+                                 can have a maximum length of 256 characters.";
+
 /// A resource's tag set, keyed by tag key — the order a listing reports is not part of
 /// the contract, the mapping is.
 type TagSet = BTreeMap<String, String>;
@@ -317,16 +329,18 @@ async fn a_tag_the_service_cannot_store_is_refused() {
         RESERVED_PREFIX.to_string(),
     ];
 
-    let mut cases: Vec<(String, Value, &str)> = vec![
+    let mut cases: Vec<(String, Value, &str, &str)> = vec![
         (
             format!("a key of {} characters", MAX_TAG_KEY_LEN + 1),
             json!({"resourceArn": arn, "tags": tags_json(&[(&over_long_key, "x")])}),
             "InvalidTagParameterException",
+            TAG_LENGTH_MESSAGE,
         ),
         (
             format!("a value of {} characters", MAX_TAG_VALUE_LEN + 1),
             json!({"resourceArn": arn, "tags": tags_json(&[("long", &over_long_value)])}),
             "InvalidTagParameterException",
+            TAG_LENGTH_MESSAGE,
         ),
         (
             format!("{} distinct keys in one request", MAX_TAGS + 1),
@@ -339,13 +353,15 @@ async fn a_tag_the_service_cannot_store_is_refused() {
                 ),
             }),
             "TooManyTagsException",
+            "",
         ),
     ];
     for key in &reserved {
         cases.push((
             format!("the reserved key {key:?}"),
             json!({"resourceArn": arn, "tags": tags_json(&[(key, "x")])}),
-            "InvalidParameterException",
+            "InvalidTagParameterException",
+            SYSTEM_TAG_MESSAGE,
         ));
         cases.push((
             format!("the reserved key {key:?} beside an acceptable one"),
@@ -353,12 +369,21 @@ async fn a_tag_the_service_cannot_store_is_refused() {
                 "resourceArn": arn,
                 "tags": tags_json(&[(key.as_str(), "x"), ("fine", "yes")]),
             }),
-            "InvalidParameterException",
+            "InvalidTagParameterException",
+            SYSTEM_TAG_MESSAGE,
         ));
     }
 
-    for (case, request, expected) in cases {
-        refused(&router, &case, "TagResource", &request, expected).await;
+    for (case, request, expected, sentence) in cases {
+        let body = refused(&router, &case, "TagResource", &request, expected).await;
+        // Each class states the sentence of its OWN defect: a system tag's, a length's.
+        if !sentence.is_empty() {
+            assert_eq!(
+                body["message"].as_str().unwrap_or_default(),
+                sentence,
+                "case {case:?}: expected the refusal's own sentence, got {body:?}"
+            );
+        }
         let listed = listed_tags(&router, &case, "refusal-target").await;
         assert_eq!(
             listed,
@@ -368,22 +393,29 @@ async fn a_tag_the_service_cannot_store_is_refused() {
     }
 
     // The same keys cannot be REMOVED either: AWS's own tags are not a caller's to
-    // delete, and an over-long key is no more nameable here than it is above.
+    // delete, and an over-long key is no more nameable here than it is above. Either is a
+    // failure of the TAG the request names, so either is the modelled tag error, stating
+    // its own class's sentence.
     for key in reserved.iter().chain([&over_long_key]) {
         let case = format!("UntagResource naming {key:?}");
-        let expected = if key.starts_with(RESERVED_PREFIX) {
-            "InvalidParameterException"
+        let sentence = if key.starts_with(RESERVED_PREFIX) {
+            SYSTEM_TAG_MESSAGE
         } else {
-            "InvalidTagParameterException"
+            TAG_LENGTH_MESSAGE
         };
-        refused(
+        let body = refused(
             &router,
             &case,
             "UntagResource",
             &json!({"resourceArn": arn, "tagKeys": [key]}),
-            expected,
+            "InvalidTagParameterException",
         )
         .await;
+        assert_eq!(
+            body["message"].as_str().unwrap_or_default(),
+            sentence,
+            "case {case:?}: expected the refusal's own sentence, got {body:?}"
+        );
         let listed = listed_tags(&router, &case, "refusal-target").await;
         assert_eq!(
             listed,
@@ -632,7 +664,7 @@ async fn a_creates_tags_are_the_tags_the_mutations_continue_from() {
             "repositoryName": refused_name,
             "tags": tags_json(&[(format!("{RESERVED_PREFIX}created-by"), "someone")]),
         }),
-        "InvalidParameterException",
+        "InvalidTagParameterException",
     )
     .await;
     refused(

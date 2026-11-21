@@ -34,7 +34,8 @@ use serde_json::{json, Value};
 
 use crate::registry_v2_pull::{fetch, given_credential};
 use crate::wire::{
-    at, call, emulator, fetch_url, layer_digest, ok, ok_until, refused, REGION, REGISTRY_ID,
+    at, call, emulator, emulator_with_engine, fetch_url, layer_digest, ok, ok_until, refused,
+    seed_credential_secret, REGION, REGISTRY_ID,
 };
 
 /// A Secrets Manager secret ARN in the namespace `CredentialArn`'s modelled pattern states
@@ -198,7 +199,14 @@ fn single_image(case: &str, answer: &Value) -> Value {
 async fn a_first_read_under_a_rule_caches_the_upstream_image_and_creates_the_repository() {
     for row in rows() {
         let case = row.case;
-        let router = emulator();
+        let (router, engine) = emulator_with_engine();
+        // A rule whose upstream authenticates its callers is reached through the Secrets
+        // Manager secret its `credentialArn` names, and validation asks that service
+        // whether the secret holds a credential — so the secret this row's rule names is
+        // placed where Secrets Manager keeps it.
+        if let Some(credential) = row.credential_arn {
+            seed_credential_secret(&engine, credential, false);
+        }
         given_rule(&router, &row).await;
         let repository = cached_repository(&row);
 

@@ -839,8 +839,8 @@ pub fn import_covered_image(
     // with the Secrets Manager secret containing the credentials for the upstream registry"
     // (`UnableToGetUpstreamImageException`), read off the rule by the one walk of it this
     // service states ([`pull_through_cache_upstream_failure`]).
-    if let Some(reason) = pull_through_cache_upstream_failure(&rule) {
-        return CacheImport::Unavailable(reason);
+    if let Some(failure) = pull_through_cache_upstream_failure(&rule) {
+        return CacheImport::Unavailable(failure.reason);
     }
     let upstream = upstream_reference(&rule, repository_name, tag);
     match store.repository(region, repository_name) {

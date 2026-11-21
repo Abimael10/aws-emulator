@@ -9,6 +9,11 @@
 //! as is a rule for an upstream registry that authenticates its callers when the request
 //! carries no credential to reach it with.
 //!
+//! The optional `upstreamRegistry` and `upstreamRepositoryPrefix` are stored as the request
+//! supplied them and are never back-filled with a resolved registry or the `ROOT` default:
+//! the rule reports a member only when the caller wrote it, and what an absent member MEANS
+//! is applied where the rule is used.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -243,7 +248,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nine `UpstreamRegistry` values (it gives none for `chainguard`) and two of
         // those eight are host shapes with a caller-chosen label, so the model does not
         // determine the URL of every registry a caller may legitimately name.
-        let upstream_registry = match input.upstream_registry {
+        //
+        // What the rule STORES is only what the request supplied, which is what the
+        // answer and every later read report ([`upstream_registry`] below):
+        // `upstreamRegistry` is an optional member of this input, so a request that left
+        // it out named no upstream registry and the registry reports none back — a client
+        // that reads member presence as "the caller set it" (an IaC diff, an idempotency
+        // check) is never handed a value it never wrote. The registry the URL RESOLVES to
+        // is still what the decisions that need one are taken on, here and in every
+        // reader of a stored rule (`crate::state::upstream_needs_credential`), which
+        // resolves it from the URL the same way.
+        let upstream_registry = input.upstream_registry.clone();
+        let resolved_upstream_registry = match input.upstream_registry {
             // A value outside `UpstreamRegistry` was already refused at the boundary.
             Some(registry) => registry,
             None => crate::state::upstream_registry_for_url(&input.upstream_registry_url)
@@ -271,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.credential_arn.as_deref(),
             input.custom_role_arn.as_deref(),
         ) && crate::state::upstream_needs_credential(
-            Some(&upstream_registry),
+            Some(&resolved_upstream_registry),
             &input.upstream_registry_url,
         ) {
             return Err(
@@ -286,10 +302,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // "When this field isn't specified, Amazon ECR will use the ROOT."
-        let upstream_repository_prefix = input
-            .upstream_repository_prefix
-            .unwrap_or_else(|| crate::state::DEFAULT_UPSTREAM_REPOSITORY_PREFIX.to_string());
+        // The upstream prefix the rule prepends is stored as the request supplied it, for
+        // the same reason `upstreamRegistry` is: both are optional members of this input,
+        // and the registry reports back what the caller wrote. "When this field isn't
+        // specified, Amazon ECR will use the ROOT" is about what the rule DOES — a rule
+        // storing no upstream prefix caches from the upstream's own root
+        // (`crate::state::registry_pull`, which reads an absent prefix and the explicit
+        // `ROOT` alike) — not about a value the answer invents.
+        let upstream_repository_prefix = input.upstream_repository_prefix;
 
         let now = ::std::time::SystemTime::now();
         let prefix = input.ecr_repository_prefix;
@@ -339,8 +359,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             registry_id: Some(crate::state::registry_id().to_string()),
             credential_arn: input.credential_arn,
             custom_role_arn: input.custom_role_arn,
-            upstream_repository_prefix: Some(upstream_repository_prefix),
-            upstream_registry: Some(upstream_registry),
+            upstream_repository_prefix,
+            upstream_registry,
             // Nothing has changed the rule since it was created, so that instant is also
             // the one it was last updated at.
             updated_at: Some(now),

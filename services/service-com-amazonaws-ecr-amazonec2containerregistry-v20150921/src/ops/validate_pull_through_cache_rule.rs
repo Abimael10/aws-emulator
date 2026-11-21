@@ -45,13 +45,16 @@
 //! Manager secret, verify the syntax, and then validate that authentication to the upstream
 //! registry is successful.
 //!
-//! The verdict is a statement about the rule the registry HOLDS, and it is computed from
-//! that stored record alone ([`crate::state::pull_through_cache_rule_failure`]): a rule
-//! names the upstream it caches from, an upstream that authenticates its callers carries
-//! a credential on the rule, and a credential the rule carries is the kind of ARN its
-//! member documents. A rule that meets all three validates — `isValid: true` with an
-//! empty `failure` — and one that does not is reported `isValid: false` with the
-//! `failure` naming the stored configuration defect. This emulator opens no outbound
+//! The verdict is a statement about the rule the registry HOLDS and about what that rule
+//! POINTS AT ([`crate::state::pull_through_cache_rule_verdict`]): a rule names the upstream
+//! it caches from, an upstream that authenticates its callers carries a credential on the
+//! rule, a credential the rule carries is the kind of ARN its member documents, and the
+//! Secrets Manager secret a `credentialArn` names holds a credential that can be retrieved
+//! — "this will retrieve the contents of the Amazon Web Services Secrets Manager secret,
+//! verify the syntax" — which is asked of Secrets Manager's own store. A rule that meets
+//! all of them validates — `isValid: true` with an empty `failure` — and one that does not
+//! is reported `isValid: false` with the `failure` carrying the failure document for the
+//! defect, its `failureCode` and `failureReason`. This emulator opens no outbound
 //! connection, but that is a property of the emulator rather than of the rule, so it is
 //! never reported as the rule's verdict. A prefix no rule answers to is a different
 //! answer altogether: `PullThroughCacheRuleNotFoundException`.
@@ -215,13 +218,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        // The record the verdict is read off, released before anything else is consulted:
+        // resolving the rule's credential takes the store of the service that OWNS the
+        // secret, and this crate holds no two services' locks at once.
+        let rule = rule.clone();
+        drop(store);
 
-        // The verdict, read off the stored rule: `None` is a rule whose configuration can
-        // authenticate to its upstream, which is what `isValid: true` reports; `Some` is
-        // the configuration defect that stops it, which is what `failure` reports. The
-        // emulator's own lack of egress is not one of those defects — it is not a property
-        // of the rule — so it never decides the verdict.
-        let failure = crate::state::pull_through_cache_rule_failure(rule);
+        // The verdict, read off the stored rule and the state of what it points at: `None`
+        // is a rule whose configuration can authenticate to its upstream, which is what
+        // `isValid: true` reports; `Some` is the defect that stops it, which is what
+        // `failure` reports as the document naming it. The emulator's own lack of egress is
+        // not one of those defects — it is not a property of the rule — so it never decides
+        // the verdict.
+        let failure = crate::state::pull_through_cache_rule_verdict(&*self.engine, &rule);
 
         Ok(ValidatePullThroughCacheRuleOutput {
             ecr_repository_prefix: rule.ecr_repository_prefix.clone(),
@@ -233,7 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             is_valid: failure.is_none(),
             // A rule that validated has no reason to report, which ECR answers as an
             // empty `failure` rather than by leaving the member out.
-            failure: Some(failure.unwrap_or_default()),
+            failure: Some(
+                failure
+                    .map(|failure| failure.document())
+                    .unwrap_or_default(),
+            ),
         })
     }
 }

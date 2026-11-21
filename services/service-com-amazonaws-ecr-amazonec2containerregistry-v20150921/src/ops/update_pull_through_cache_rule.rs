@@ -2,6 +2,16 @@
 
 //! @op UpdatePullThroughCacheRule
 //!
+//! Updates the credentials a stored pull through cache rule reaches its upstream registry
+//! with. A member the request omits keeps the value the rule already carries, and a value
+//! it does carry has to name a resource ECR could really use: a `customRoleArn` that is no
+//! IAM role ARN is an invalid parameter, and a `credentialArn` whose Secrets Manager secret
+//! cannot be retrieved is refused with `SecretNotFoundException`
+//! ([`crate::state::credential_secret_defect`]) — so no update leaves the rule pointing at
+//! a secret no pull through it could read. Whether the contents of a secret that CAN be
+//! retrieved are a usable credential is `ValidatePullThroughCacheRule`'s verdict, not this
+//! operation's.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -135,6 +145,70 @@ impl From<UpdatePullThroughCacheRuleErrorModeled> for UpdatePullThroughCacheRule
     }
 }
 
+/// The sentence ECR refuses a `customRoleArn` that is not an IAM role ARN with.
+///
+/// A fixed sentence naming neither the value nor the member — the wording AWS answers this
+/// request with, which is this operation's own validation rather than the clause the
+/// boundary walk states for a modelled constraint.
+const INVALID_ROLE_ARN_MESSAGE: &str = "Invalid role ARN supplied in request.";
+
+/// The modelled error a `credentialArn` the update would store is refused with, or `None`
+/// for a secret state this operation does not refuse.
+///
+/// What an update checks is that the secret it is pointed at can be RETRIEVED, which is
+/// what the two modelled errors are for: an ARN that resolves to no secret is
+/// `SecretNotFoundException` ("the ARN of the secret specified in the pull through cache
+/// rule was not found"), and so is one a `DeleteSecret` has scheduled for deletion — a
+/// secret on its way out is not a secret the ARN finds.
+///
+/// Whether the CONTENTS of a secret that can be retrieved are a usable upstream credential
+/// is a different question, and not this operation's: it is the verdict
+/// `ValidatePullThroughCacheRule` reports ("Amazon ECR will attempt to retrieve the
+/// contents of the Amazon Web Services Secrets Manager secret, verify the syntax"), so a
+/// secret that is there and readable is stored and the rule is left to validate as what it
+/// is.
+fn secret_error(
+    defect: crate::state::CredentialSecretDefect,
+) -> Option<UpdatePullThroughCacheRuleErrorModeled> {
+    match defect {
+        crate::state::CredentialSecretDefect::NotFound
+        | crate::state::CredentialSecretDefect::Inaccessible => Some(
+            UpdatePullThroughCacheRuleErrorModeled::SecretNotFoundException(
+                SecretNotFoundException {
+                    message: Some(
+                        "The ARN of the secret specified in the pull through cache rule was \
+                         not found. Update the pull through cache rule with a valid secret \
+                         ARN and try again."
+                            .to_string(),
+                    ),
+                },
+            ),
+        ),
+        crate::state::CredentialSecretDefect::MissingFields => None,
+    }
+}
+
+/// Refuse the request: the audit record for an update that stored nothing, and the
+/// modelled error it answers with. `reason` is this handler's own wording, never the
+/// request's values, so the record carries no caller-supplied text.
+fn refusal(
+    reason: &'static str,
+    caller_akid: &str,
+    error: UpdatePullThroughCacheRuleErrorModeled,
+) -> UpdatePullThroughCacheRuleErrorModeled {
+    ::tracing::info!(
+        target: "emulator::audit",
+        audit = true,
+        operation = "UpdatePullThroughCacheRule",
+        outcome = "refused",
+        reason,
+        caller_akid = %caller_akid,
+        registry_id = %crate::state::registry_id(),
+        "pull through cache rule update refused"
+    );
+    error
+}
+
 /// The `UpdatePullThroughCacheRule` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -193,53 +267,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         let now = ::std::time::SystemTime::now();
+        // Request metadata for the audit records below: who asked.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+        // The rule is resolved and the request judged AGAINST IT first, under this
+        // service's own lock and nothing else's: which rule is addressed, and whether it is
+        // a rule whose credentials may be updated at all, are facts of this store.
+        {
+            let store = state.lock();
+            // An update names a rule that must already exist: the prefix is the key AWS
+            // addresses a rule by — whichever way its trailing slash is written, see
+            // [`crate::state::normalize_prefix`] — and one no rule answers to is refused
+            // with `PullThroughCacheRuleNotFoundException` rather than created here.
+            let Some(rule) = store.pull_through_cache_rule(&input.ecr_repository_prefix) else {
+                return Err(refusal(
+                    "no such pull through cache rule",
+                    &caller_akid,
+                    UpdatePullThroughCacheRuleErrorModeled::PullThroughCacheRuleNotFoundException(
+                        PullThroughCacheRuleNotFoundException {
+                            message: Some(
+                                crate::state::pull_through_cache_rule_not_found_message(
+                                    &input.ecr_repository_prefix,
+                                ),
+                            ),
+                        },
+                    ),
+                )
+                .into());
+            };
+
+            // An authenticated and an unauthenticated pull through cache rule are distinct
+            // kinds, and the kind is fixed when the rule is created: a rule created with no
+            // credential has none to update, so a request carrying one is refused rather
+            // than turning that rule into an authenticated one. The two members this
+            // operation takes ARE the rule's credentials, so either of them is such a
+            // request.
+            let updates_credentials =
+                input.credential_arn.is_some() || input.custom_role_arn.is_some();
+            let authenticated = rule.credential_arn.is_some() || rule.custom_role_arn.is_some();
+            if updates_credentials && !authenticated {
+                return Err(refusal(
+                    "the rule was created with no credential to update",
+                    &caller_akid,
+                    UpdatePullThroughCacheRuleErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                "Invalid input: Please create an authenticated pull through \
+                                 cache rule to update the credentials"
+                                    .to_string(),
+                            ),
+                        },
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // What the request asks the rule to STORE is judged next, with no lock of this
+        // store held: resolving a credential takes the store of the service that owns the
+        // secret, and this crate holds no two services' locks at once.
+        //
+        // Both credential members name a resource ECR has to be able to use. A
+        // `customRoleArn` is "the ARN of the IAM role to be assumed by Amazon ECR", so a
+        // value that is no IAM role ARN names no role to assume and is refused as the
+        // invalid parameter it is — the member carries no `@pattern` the boundary could
+        // refuse it against. A `credentialArn` is the Secrets Manager secret "that
+        // identifies the credentials to authenticate to the upstream registry", so the
+        // secret has to be one this account holds and can retrieve — which is Secrets
+        // Manager's fact to state ([`crate::state::credential_secret_defect`]) and is what
+        // this operation's `SecretNotFoundException` answers. Without this the rule would
+        // be stored pointing at a secret no pull through it could ever read.
+        if let Some(role) = input
+            .custom_role_arn
+            .as_deref()
+            .filter(|role| !role.trim().is_empty())
+        {
+            if !crate::state::is_iam_role_arn(role) {
+                return Err(refusal(
+                    "the customRoleArn is not an IAM role ARN",
+                    &caller_akid,
+                    UpdatePullThroughCacheRuleErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(INVALID_ROLE_ARN_MESSAGE.to_string()),
+                        },
+                    ),
+                )
+                .into());
+            }
+        }
+        if let Some(credential) = input
+            .credential_arn
+            .as_deref()
+            .filter(|credential| !credential.trim().is_empty())
+        {
+            if let Some(error) = crate::state::credential_secret_defect(&*self.engine, credential)
+                .and_then(secret_error)
+            {
+                return Err(refusal(
+                    "the credentialArn names no retrievable secret",
+                    &caller_akid,
+                    error,
+                )
+                .into());
+            }
+        }
+
         let mut store = state.lock();
-        // An update names a rule that must already exist: the prefix is the key AWS
-        // addresses a rule by — whichever way its trailing slash is written, see
-        // [`crate::state::normalize_prefix`] — and one no rule answers to is refused
-        // with `PullThroughCacheRuleNotFoundException` rather than created here.
+        // The rule the write is applied to, resolved again now the lock is held: the
+        // checks above were taken on this same record, addressed by the same prefix.
         let Some(rule) = store
             .pull_through_cache_rules
             .get_mut(&crate::state::normalize_prefix(&input.ecr_repository_prefix))
         else {
-            return Err(
+            return Err(refusal(
+                "no such pull through cache rule",
+                &caller_akid,
                 UpdatePullThroughCacheRuleErrorModeled::PullThroughCacheRuleNotFoundException(
                     PullThroughCacheRuleNotFoundException {
                         message: Some(crate::state::pull_through_cache_rule_not_found_message(
                             &input.ecr_repository_prefix,
                         )),
                     },
-                )
-                .into(),
-            );
+                ),
+            )
+            .into());
         };
-
-        // An authenticated and an unauthenticated pull through cache rule are distinct
-        // kinds, and the kind is fixed when the rule is created: a rule created with no
-        // credential has none to update, so a request carrying one is refused rather
-        // than turning that rule into an authenticated one. The two members this
-        // operation takes ARE the rule's credentials, so either of them is such a
-        // request.
-        let updates_credentials = input.credential_arn.is_some() || input.custom_role_arn.is_some();
-        let authenticated = rule.credential_arn.is_some() || rule.custom_role_arn.is_some();
-        if updates_credentials && !authenticated {
-            return Err(
-                UpdatePullThroughCacheRuleErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            "Invalid input: Please create an authenticated pull through cache \
-                             rule to update the credentials"
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // Only the two credentials this operation takes are updatable; the upstream the
         // rule caches from is fixed at creation. A member the request omits keeps the
         // value the rule already carries, so an update never silently drops a credential.
+        let replaces_credential_arn = input.credential_arn.is_some();
+        let replaces_custom_role_arn = input.custom_role_arn.is_some();
         if let Some(credential_arn) = input.credential_arn {
             rule.credential_arn = Some(credential_arn);
         }
@@ -247,6 +404,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rule.custom_role_arn = Some(custom_role_arn);
         }
         rule.updated_at = Some(crate::state::reported_instant(now));
+
+        // Audit record for a state-changing operation: who asked, what changed, how it
+        // ended. Only wire metadata and the registry's own values — which credential
+        // members the update replaced, never what they hold.
+        ::tracing::info!(
+            target: "emulator::audit",
+            audit = true,
+            operation = "UpdatePullThroughCacheRule",
+            outcome = "updated",
+            caller_akid = %caller_akid,
+            registry_id = %crate::state::registry_id(),
+            credential_arn_replaced = replaces_credential_arn,
+            custom_role_arn_replaced = replaces_custom_role_arn,
+            "pull through cache rule updated"
+        );
 
         // Everything reported back is read off the stored rule, so the answer is what a
         // later read of the same rule reports.

@@ -19,7 +19,7 @@ use crate::ops::types::{
     ImageScanningConfiguration, ImageTagMutabilityExclusionFilter,
     LifecyclePolicyPreviewResult, LifecyclePolicyPreviewSummary, LifecyclePolicyRuleAction,
     PullThroughCacheRule, ReplicationConfiguration, ReplicationRule, Repository,
-    RepositoryCreationTemplate, RepositoryScanningConfiguration, SigningConfiguration, Tag,
+    RepositoryCreationTemplate, SigningConfiguration, Tag,
     TransitioningImageTotalCount, IMAGE_ACTION_TYPE_VALUES,
     LIFECYCLE_POLICY_TARGET_STORAGE_CLASS_VALUES, TAG_STATUS_VALUES,
 };
@@ -459,7 +459,9 @@ pub enum Fault {
     /// The repository exists but carries no lifecycle policy —
     /// `LifecyclePolicyNotFoundException`.
     LifecyclePolicyNotFound(String),
-    /// A tag key or value is longer than a tag may be — `InvalidTagParameterException`.
+    /// A tag the request carries is one no resource may be given: a key or value longer
+    /// than a tag may be, or a key in AWS's reserved namespace —
+    /// `InvalidTagParameterException`.
     InvalidTagParameter(String),
     /// The resource would end up carrying more tags than one may hold —
     /// `TooManyTagsException`.
@@ -2277,35 +2279,6 @@ impl Repo {
         }
     }
 
-    /// The scanning configuration reported for this repository.
-    ///
-    /// Derived from what is stored, never from the request: `scanOnPush` is the flag the
-    /// repository's own `imageScanningConfiguration` carries (modelled
-    /// `@default(false)`, so a repository created without one is not scanned on push),
-    /// and the frequency follows from it — a repository scanned on push has the
-    /// `SCAN_ON_PUSH` frequency, and one that is not has the `MANUAL` one.
-    /// `appliedScanFilters` lists the registry scanning rules' filters that match this
-    /// repository; deriving that match from the registry configuration
-    /// `PutRegistryScanningConfiguration` now stores belongs to this projection's own
-    /// operation, so the list stays empty here.
-    pub fn to_scanning_configuration(&self) -> RepositoryScanningConfiguration {
-        let scan_on_push = self.scans_on_push();
-        RepositoryScanningConfiguration {
-            repository_arn: Some(self.arn.clone()),
-            repository_name: Some(self.name.clone()),
-            scan_on_push,
-            scan_frequency: Some(
-                if scan_on_push {
-                    SCAN_ON_PUSH_FREQUENCY
-                } else {
-                    MANUAL_SCAN_FREQUENCY
-                }
-                .to_string(),
-            ),
-            applied_scan_filters: Some(Vec::new()),
-        }
-    }
-
     /// Whether `tag` may be moved from the image it points at to another one.
     ///
     /// The repository's `imageTagMutability` decides it, and the two
@@ -3367,282 +3340,6 @@ pub fn unsupported_upstream_registry_url_message(upstream_registry_url: &str) ->
     )
 }
 
-/// The wording ECR uses when a rule would cache from an upstream that authenticates its
-/// callers while storing no credential to authenticate with — the other state
-/// `UnsupportedUpstreamRegistryException` reports. It names the Secrets Manager secret a
-/// `credentialArn` points at, and has no variable part.
-pub const UPSTREAM_REQUIRES_AUTHENTICATION_MESSAGE: &str =
-    "The specified upstream registry requires authentication. Specify a valid Secrets \
-     Manager ARN containing the upstream registry credentials and try again.";
-
-/// Whether the pair of credential references a pull through cache rule would store leaves
-/// it with something to authenticate to its upstream with: a `credentialArn` naming the
-/// Secrets Manager secret the upstream's credentials live in, or the `customRoleArn` ECR
-/// assumes to reach an upstream registry of its own.
-///
-/// An empty string stores neither: `customRoleArn` is modelled `@length(0..2048)`, so the
-/// empty string is a legal value that names no role, which is the same reading
-/// [`pull_through_cache_rule_failure`] takes of a stored record. A value of nothing but
-/// whitespace names no role either — no ARN is spelled out of spaces — so the two are read
-/// the same way, which is what lets an incoming request and a stored record be judged by
-/// this one function.
-pub fn stores_upstream_credential(
-    credential_arn: Option<&str>,
-    custom_role_arn: Option<&str>,
-) -> bool {
-    [credential_arn, custom_role_arn]
-        .into_iter()
-        .flatten()
-        .any(|arn| !arn.trim().is_empty())
-}
-
-/// The upstream registries ECR caches from WITHOUT a credential on the rule: the entries
-/// of the ECR user guide's supported-upstream table that require no authentication —
-/// Amazon ECR Public, Kubernetes and Quay, the public registries whose images are pulled
-/// anonymously, and the upstreams pull through cache rules were first served for. Every
-/// other `UpstreamRegistry` value (listed in `UPSTREAM_REGISTRY_VALUES`) authenticates
-/// its callers, which is why a rule naming one carries the credential it is reached with.
-///
-/// Only the `UpstreamRegistry` value is named here: the host each registry is reached at
-/// is [`DOCUMENTED_UPSTREAM_REGISTRY_URLS`]'s, the one table of per-registry URLs, so a
-/// rule that names no `upstreamRegistry` is judged by resolving its URL through that same
-/// table and the two readings cannot drift apart.
-pub const ANONYMOUS_UPSTREAM_REGISTRIES: [&str; 3] = ["ecr-public", "k8s", "quay"];
-
-/// Whether an upstream registry a pull through cache rule points at authenticates its
-/// callers, and therefore needs a credential stored on the rule.
-///
-/// Every upstream registry ECR supports except those in
-/// [`ANONYMOUS_UPSTREAM_REGISTRIES`] requires credentials. A rule that names no upstream
-/// registry is judged by the registry its URL resolves to
-/// ([`upstream_registry_for_url`]), and a URL naming no supported registry at all is
-/// treated as one that authenticates: nothing says it serves anonymously.
-pub fn upstream_needs_credential(upstream_registry: Option<&str>, upstream_url: &str) -> bool {
-    let registry = match upstream_registry {
-        Some(registry) => Some(registry),
-        None => upstream_registry_for_url(upstream_registry_host(upstream_url)),
-    };
-    registry.is_none_or(|registry| !ANONYMOUS_UPSTREAM_REGISTRIES.contains(&registry))
-}
-
-/// The HOST a rule's `upstreamRegistryUrl` addresses: what is left after an optional
-/// scheme, before the path, without the userinfo or the port — so the URL a client wrote
-/// with any of those is read as the one registry host it points at (`public.ecr.aws:443`
-/// addresses the same registry as `public.ecr.aws`). The case is left as written, because
-/// every reader of a host here compares it case-insensitively.
-///
-/// The reading is [`::service_common::data_plane_addressing`]'s, the tree's one reader of
-/// a URL's authority and of a host's name, so this service and every other agree on what
-/// host a URL names.
-fn upstream_registry_host(upstream_url: &str) -> &str {
-    use ::service_common::data_plane_addressing::{host_only, url_authority};
-
-    let authority = url_authority(upstream_url.trim());
-    host_only(authority.split('/').next().unwrap_or_default())
-}
-
-/// The Secrets Manager secret name prefix a pull through cache rule's credential is
-/// stored under. `CredentialArn`'s own modelled pattern states it —
-/// `^arn:aws(-\w+)*:secretsmanager:[a-zA-Z0-9-:]+:secret:ecr\-pullthroughcache\/[a-zA-Z0-9\/_+=.@-]+$`
-/// — so a value naming anything else names no secret ECR reads a rule's upstream
-/// credential from.
-pub const CREDENTIAL_SECRET_NAME_PREFIX: &str = "ecr-pullthroughcache/";
-
-/// The ARN vendor (service namespace) field of a `credentialArn`: the secret a rule's
-/// credential lives in is an Amazon Web Services Secrets Manager secret.
-const SECRETS_MANAGER_VENDOR: &str = "secretsmanager";
-
-/// The resource field prefix of a Secrets Manager secret ARN (`…:secret:<name>`).
-const SECRET_RESOURCE_PREFIX: &str = "secret:";
-
-/// Whether `value` is the ARN of the Secrets Manager secret a pull through cache rule's
-/// `credentialArn` names, as that member's own modelled pattern spells one:
-/// `^arn:aws(-\w+)*:secretsmanager:[a-zA-Z0-9-:]+:secret:ecr\-pullthroughcache\/[a-zA-Z0-9\/_+=.@-]+$`.
-///
-/// The six fields come from [`::service_common::arn::parse_of`], the tree's ONE ARN parse,
-/// which also settles that the value is an ARN of the `secretsmanager` vendor at all. What
-/// is checked here is the rest of that pattern, field by field: the partition is `aws`
-/// optionally followed by `-`-separated word labels, the region-and-account span is the
-/// `[a-zA-Z0-9-:]+` the pattern states, and the secret name after
-/// [`CREDENTIAL_SECRET_NAME_PREFIX`] is non-empty and drawn from the pattern's own
-/// character class — so a value this accepts is one the member accepts.
-pub fn is_pull_through_cache_credential_arn(value: &str) -> bool {
-    let Some(arn) = ::service_common::arn::parse_of(value, SECRETS_MANAGER_VENDOR) else {
-        return false;
-    };
-    let Some(name) = arn
-        .resource
-        .strip_prefix(SECRET_RESOURCE_PREFIX)
-        .and_then(|name| name.strip_prefix(CREDENTIAL_SECRET_NAME_PREFIX))
-    else {
-        return false;
-    };
-    is_aws_partition(arn.partition)
-        // `[a-zA-Z0-9-:]+` spans the region and account fields together, so each is read
-        // under that class and the pair must carry something.
-        && (!arn.region.is_empty() || !arn.account.is_empty())
-        && [arn.region, arn.account]
-            .iter()
-            .all(|field| field.bytes().all(is_region_or_account_byte))
-        && !name.is_empty()
-        && name.bytes().all(is_secret_name_byte)
-}
-
-/// Whether `partition` is the `aws(-\w+)*` partition label `CredentialArn`'s pattern
-/// states: `aws`, optionally followed by `-`-separated word labels (`aws-cn`,
-/// `aws-us-gov`).
-fn is_aws_partition(partition: &str) -> bool {
-    let Some(labels) = partition.strip_prefix("aws") else {
-        return false;
-    };
-    if labels.is_empty() {
-        return true;
-    }
-    // `(-\w+)*`: every label after the first is introduced by a hyphen and is a non-empty
-    // run of word characters.
-    labels.starts_with('-')
-        && labels.split('-').skip(1).all(|label| {
-            !label.is_empty()
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        })
-}
-
-/// A byte of the `[a-zA-Z0-9-:]+` span `CredentialArn`'s pattern allows between the
-/// service namespace and the `secret:` resource.
-///
-/// The `:` of that class is what lets the span cover the Region and the account TOGETHER
-/// (so a secret ARN carrying no Region still matches); the two fields are read one at a
-/// time here, each already split on `:`, so only the rest of the class applies to a field.
-fn is_region_or_account_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'-'
-}
-
-/// A byte of the `[a-zA-Z0-9\/_+=.@-]+` secret name `CredentialArn`'s pattern allows
-/// after the `ecr-pullthroughcache/` namespace.
-fn is_secret_name_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"/_+=.@-".contains(&byte)
-}
-
-/// Whether `value` names an IAM role of this account, which is what a rule's
-/// `customRoleArn` carries ("The ARN of the IAM role associated with the pull through
-/// cache rule").
-///
-/// The reading is [`::service_common::iam_role::role_name`], the tree's one IAM role-ARN
-/// reader — the `iam` vendor, the empty Region a partition-global service's ARN carries,
-/// this account, and a `role/…` resource with a name — so this service and every other
-/// service that resolves a role ARN agree on what one is.
-pub fn is_iam_role_arn(value: &str) -> bool {
-    ::service_common::iam_role::role_name(value).is_some()
-}
-
-/// The reason the stored pull through cache `rule` does not validate, or `None` when it
-/// does.
-///
-/// `ValidatePullThroughCacheRule` is a verdict on the rule the registry HOLDS:
-/// "validates an existing pull through cache rule for an upstream registry that requires
-/// authentication … retrieve the contents of the Secrets Manager secret, verify the
-/// syntax, and then validate that authentication to the upstream registry is
-/// successful". So the verdict is read off the stored record and nothing else:
-///
-/// * a rule has to name the upstream it caches from;
-/// * an upstream that authenticates its callers needs a credential on the rule — a
-///   `credentialArn` or a `customRoleArn` — because without one authentication cannot
-///   even be attempted, while an upstream ECR documents as serving anonymously
-///   ([`ANONYMOUS_UPSTREAM_REGISTRIES`]) needs none;
-/// * a credential the rule does carry has to be the kind of ARN its member documents,
-///   which is the "verify the syntax" step: a `credentialArn` outside the
-///   [`CREDENTIAL_SECRET_NAME_PREFIX`] secret namespace, or a `customRoleArn` that is no
-///   IAM role, names nothing the upstream could be authenticated with.
-///
-/// An empty `customRoleArn` is no credential: the member is modelled `@length(0..2048)`,
-/// so the empty string is a legal value that stores no role.
-///
-/// Nothing here depends on reaching the upstream registry. This emulator opens no
-/// outbound connection, and that is a property of the emulator rather than of the rule,
-/// so it is never reported as the rule's verdict: a complete rule validates.
-pub fn pull_through_cache_rule_failure(rule: &PullThroughCacheRule) -> Option<String> {
-    let prefix = rule.ecr_repository_prefix.as_deref().unwrap_or_default();
-    let url = rule.upstream_registry_url.as_deref().unwrap_or_default();
-    if let Some(failure) = pull_through_cache_upstream_failure(rule) {
-        return Some(failure);
-    }
-
-    let credential = rule.credential_arn.as_deref();
-    let role = rule.custom_role_arn.as_deref();
-    if !stores_upstream_credential(credential, role)
-        && upstream_needs_credential(rule.upstream_registry.as_deref(), url)
-    {
-        return Some(format!(
-            "the upstream registry '{}' requires authentication and the pull through \
-             cache rule for '{prefix}' stores neither a credentialArn nor a customRoleArn",
-            rule.upstream_registry.as_deref().unwrap_or(url)
-        ));
-    }
-
-    None
-}
-
-/// The reason an image cannot be pulled THROUGH the stored `rule` at all, or `None` when it
-/// can: the part of a rule's verdict that decides whether the upstream named on it is
-/// reachable, which is what an on-demand import reports
-/// `UnableToGetUpstreamImageException` for.
-///
-/// Two things make a rule one no image can be pulled through, and both are read off the
-/// stored record:
-///
-/// * it names no upstream to cache from — a rule with no `upstreamRegistryUrl` addresses
-///   no registry at all;
-/// * the credential reference it carries cannot be READ — "This is usually caused because
-///   of an issue with the Secrets Manager secret containing the credentials for the
-///   upstream registry" (`UnableToGetUpstreamImageException`): a `credentialArn` outside
-///   the [`CREDENTIAL_SECRET_NAME_PREFIX`] secret namespace names no secret to retrieve a
-///   credential from, and a `customRoleArn` that is no IAM role names no role to assume to
-///   read one, so the import has nothing to authenticate with.
-///
-/// Whether an upstream that authenticates its callers was given a credential at all is a
-/// verdict on the rule rather than a failure to reach the upstream, so it is
-/// [`pull_through_cache_rule_failure`]'s to report and not this one's: ECR attempts the pull
-/// either way, and this emulator contacts no upstream registry to be refused by (see
-/// [`registry_pull`]).
-///
-/// An empty `customRoleArn` is no credential: the member is modelled `@length(0..2048)`, so
-/// the empty string is a legal value that stores no role.
-pub fn pull_through_cache_upstream_failure(rule: &PullThroughCacheRule) -> Option<String> {
-    let prefix = rule.ecr_repository_prefix.as_deref().unwrap_or_default();
-    let url = rule.upstream_registry_url.as_deref().unwrap_or_default();
-    if url.trim().is_empty() {
-        return Some(format!(
-            "the pull through cache rule for '{prefix}' stores no upstreamRegistryUrl, \
-             so it names no upstream registry to cache from"
-        ));
-    }
-
-    if let Some(credential) = rule.credential_arn.as_deref().filter(|arn| !arn.is_empty()) {
-        if !is_pull_through_cache_credential_arn(credential) {
-            return Some(format!(
-                "the credentialArn '{credential}' stored on the pull through cache rule \
-                 for '{prefix}' is not the ARN of an Amazon Web Services Secrets Manager \
-                 secret named '{CREDENTIAL_SECRET_NAME_PREFIX}…', so no upstream \
-                 credential can be retrieved from it"
-            ));
-        }
-    }
-
-    if let Some(role) = rule.custom_role_arn.as_deref().filter(|arn| !arn.is_empty()) {
-        if !is_iam_role_arn(role) {
-            return Some(format!(
-                "the customRoleArn '{role}' stored on the pull through cache rule for \
-                 '{prefix}' is not the ARN of an IAM role, so no role can be assumed to \
-                 read the upstream credential"
-            ));
-        }
-    }
-
-    None
-}
-
 /// Whether `setting` is one of the two `ImageTagMutability` values that honour
 /// exclusion filters: a filter names tags "excluded from the repository's image tag
 /// mutability setting", and only the `*_WITH_EXCLUSION` settings have an exclusion to
@@ -4272,22 +3969,56 @@ pub fn repository_name_from_arn(arn: &str) -> Result<String, Fault> {
     Ok(name.to_string())
 }
 
+/// What a caller is told about a tag key in the namespace AWS keeps for its own tags
+/// ([`RESERVED_TAG_KEY_PREFIX`]): a tag under it belongs to the system rather than to the
+/// caller, so neither writing one nor removing one is something an API caller may do.
+///
+/// Fixed, request-independent text: it states WHO may not make the change rather than
+/// which key was asked for, so it has nothing to fill from the request and never echoes
+/// the rejected key. It is the sentence the sibling Amazon ECR Public registry answers the
+/// same rule with
+/// (`services/service-com-amazonaws-ecrpublic-spencerfrontendservice/src/state.rs`'s
+/// `SYSTEM_TAG_KEY_MESSAGE`), so the two registries of one service family do not word one
+/// rule two ways.
+pub const SYSTEM_TAG_KEY_MESSAGE: &str =
+    "Caller is an end user and not allowed to mutate system tags";
+
+/// What a refusal of a tag longer than a tag may be carries: the sentence
+/// `InvalidTagParameterException` is documented with, which is the one that states those
+/// lengths ("An invalid parameter has been specified. Tag keys can have a maximum
+/// character length of 128 characters, and tag values can have a maximum length of 256
+/// characters").
+///
+/// Fixed text as well — it names the limits rather than the tag that passed one, so a
+/// caller is never told back the key or the value it submitted. The lengths in it are
+/// [`MAX_TAG_KEY_LEN`] and [`MAX_TAG_VALUE_LEN`], the bounds the same documentation
+/// states, so the sentence and the rules it describes cannot drift apart. ECR's `TagKey`
+/// and `TagValue` carry no modelled length, so this class is the handler's to refuse.
+pub fn tag_length_message() -> String {
+    format!(
+        "An invalid parameter has been specified. Tag keys can have a maximum character \
+         length of {MAX_TAG_KEY_LEN} characters, and tag values can have a maximum length \
+         of {MAX_TAG_VALUE_LEN} characters."
+    )
+}
+
 /// Refuse a tag key no caller may create or remove: one in AWS's reserved namespace, or
 /// one longer than a tag key may be.
+///
+/// Both are failures of the TAG the request carries rather than of some other parameter,
+/// so both are [`Fault::InvalidTagParameter`] — the fault the operations that write tags
+/// answer with the error ECR models for an unusable tag
+/// (`InvalidTagParameterException`), which is the code a client branches on to decide
+/// whether to drop a tag or fail its request. Each states the sentence of its OWN class:
+/// a system tag's ([`SYSTEM_TAG_KEY_MESSAGE`]), a length's ([`tag_length_message`]).
 fn check_tag_key(key: &str) -> Result<(), Fault> {
     if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
-        return Err(Fault::InvalidParameter(format!(
-            "tag key '{key}' is reserved: keys beginning with \
-             '{RESERVED_TAG_KEY_PREFIX}' are for Amazon Web Services use and cannot be \
-             created or removed by a caller"
-        )));
+        return Err(Fault::InvalidTagParameter(
+            SYSTEM_TAG_KEY_MESSAGE.to_string(),
+        ));
     }
-    let key_len = key.chars().count();
-    if key_len > MAX_TAG_KEY_LEN {
-        return Err(Fault::InvalidTagParameter(format!(
-            "tag key '{key}' is {key_len} characters; a tag key can have a maximum \
-             character length of {MAX_TAG_KEY_LEN}"
-        )));
+    if key.chars().count() > MAX_TAG_KEY_LEN {
+        return Err(Fault::InvalidTagParameter(tag_length_message()));
     }
     Ok(())
 }
@@ -4297,13 +4028,8 @@ fn check_tag_key(key: &str) -> Result<(), Fault> {
 pub fn check_tags(incoming: &[Tag]) -> Result<(), Fault> {
     for tag in incoming {
         check_tag_key(&tag.key)?;
-        let value_len = tag.value.chars().count();
-        if value_len > MAX_TAG_VALUE_LEN {
-            return Err(Fault::InvalidTagParameter(format!(
-                "the value of tag key '{}' is {value_len} characters; a tag value can \
-                 have a maximum length of {MAX_TAG_VALUE_LEN}",
-                tag.key
-            )));
+        if tag.value.chars().count() > MAX_TAG_VALUE_LEN {
+            return Err(Fault::InvalidTagParameter(tag_length_message()));
         }
     }
     Ok(())
@@ -4792,6 +4518,8 @@ pub use registry_address::*;
 /// The `docker login` credentials this registry has issued, and the pull bookkeeping a
 /// registry pull leaves behind, in `state/registry_v2.rs`.
 mod registry_v2;
+mod pull_through_cache_credentials;
+pub use pull_through_cache_credentials::*;
 pub use registry_v2::*;
 pub use layer_download::*;
 pub use image_scan::*;

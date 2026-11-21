@@ -27,10 +27,6 @@ const CREDENTIAL_ARN: &str =
 /// An IAM role ARN for `customRoleArn`, which the model constrains only by length.
 const CUSTOM_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/ecr-pull-through-cache";
 
-/// `upstreamRepositoryPrefix`'s documented default: "When this field isn't specified,
-/// Amazon ECR will use the ROOT."
-const ROOT: &str = "ROOT";
-
 /// The members `DeletePullThroughCacheRule` reports, from the model's
 /// `DeletePullThroughCacheRuleResponse` (smithy_query operation=DeletePullThroughCacheRule).
 /// `upstreamRegistry` is deliberately absent: the response shape does not carry it.
@@ -263,7 +259,8 @@ async fn a_delete_reports_the_removed_rule_and_leaves_the_others_alone() {
         );
         assert_eq!(
             at(&deleted, "/upstreamRepositoryPrefix"),
-            json!(case.upstream_repository_prefix.unwrap_or(ROOT)),
+            case.upstream_repository_prefix
+                .map_or(Value::Null, |prefix| json!(prefix)),
             "case {:?}: the delete reports the stored upstream prefix, got {deleted:?}",
             case.name
         );
