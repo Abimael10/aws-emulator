@@ -127,11 +127,15 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/event-delivery";
 const TARGET_ARN: &str = "arn:aws:sqs:us-west-2:000000000000:refusal-target";
 
 /// How long a poll waits for a condition the emulator owes: far above the provisioning
-/// span a bus takes, so a loaded host has ample room.
-const POLL_DEADLINE: Duration = Duration::from_secs(60);
+/// span a bus takes, so a loaded host has ample room. The loop stops as soon as the
+/// condition holds, so the deadline costs nothing on a passing run.
+///
+/// Visible to the crate's other suites, so a suite polling the same condition states no
+/// bound of its own. The value is the one this suite has always used.
+pub(crate) const POLL_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long one pass of a poll waits before looking again.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Every operation this service's model binds, by the routing key the `rpcv2Cbor`
 /// protocol resolves for it.
@@ -248,20 +252,28 @@ impl Wire {
             .await
             .event_bus_arn
             .unwrap_or_else(|| panic!("case {case:?}: CreateEventBus must report an EventBusArn"));
+        self.await_active(case, &arn).await;
+        arn
+    }
 
+    /// Look again until the bus at `arn` REPORTS `ACTIVE`.
+    ///
+    /// Provisioning is asynchronous, so this polls the CONDITION under a generous
+    /// deadline rather than waiting a fixed time, and stops as soon as it holds.
+    pub(crate) async fn await_active(&self, case: &str, arn: &str) {
         let deadline = Instant::now() + POLL_DEADLINE;
         loop {
             let reported = self
                 .ok::<DescribeEventBus<InMemoryEngine>>(
                     case,
                     &DescribeEventBusInput {
-                        event_bus_arn: arn.clone(),
+                        event_bus_arn: arn.to_string(),
                     },
                 )
                 .await
                 .state;
             if reported.as_deref() == Some("ACTIVE") {
-                return arn;
+                return;
             }
             assert!(
                 Instant::now() < deadline,

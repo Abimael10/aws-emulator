@@ -2334,15 +2334,19 @@ async fn the_registry_is_bounded_across_every_region() {
 /// What a bus reports about the members an update can change, read the same way
 /// out of an `UpdateEventBus` response and out of a later `DescribeEventBus` —
 /// which is what lets one expectation be asserted against both.
+///
+/// Visible to the crate's other suites, so the rule's wire-level suite
+/// (`update_reaches_every_later_read`) asserts against this ONE fact shape rather
+/// than a second copy of it.
 #[derive(Debug, PartialEq, Eq)]
-struct BusFacts {
-    description: Option<String>,
-    retention_period_in_days: Option<i32>,
-    kms_key_identifier: Option<String>,
-    state: Option<String>,
+pub(crate) struct BusFacts {
+    pub(crate) description: Option<String>,
+    pub(crate) retention_period_in_days: Option<i32>,
+    pub(crate) kms_key_identifier: Option<String>,
+    pub(crate) state: Option<String>,
 }
 
-fn facts_of_updated(output: &UpdateEventBusOutput) -> BusFacts {
+pub(crate) fn facts_of_updated(output: &UpdateEventBusOutput) -> BusFacts {
     BusFacts {
         description: output.description.clone(),
         retention_period_in_days: output
@@ -2357,7 +2361,7 @@ fn facts_of_updated(output: &UpdateEventBusOutput) -> BusFacts {
     }
 }
 
-fn facts_of_described(output: &DescribeEventBusOutput) -> BusFacts {
+pub(crate) fn facts_of_described(output: &DescribeEventBusOutput) -> BusFacts {
     BusFacts {
         description: output.description.clone(),
         retention_period_in_days: output
@@ -2374,7 +2378,11 @@ fn facts_of_described(output: &DescribeEventBusOutput) -> BusFacts {
 
 /// The whole bus a row expects: the recorded service answers an accepted change
 /// with the bus already ACTIVE, so that is part of every expectation.
-fn expected_bus(description: &str, retention_period_in_days: i32, kms: &str) -> BusFacts {
+pub(crate) fn expected_bus(
+    description: &str,
+    retention_period_in_days: i32,
+    kms: &str,
+) -> BusFacts {
     BusFacts {
         description: Some(description.to_string()),
         retention_period_in_days: Some(retention_period_in_days),
