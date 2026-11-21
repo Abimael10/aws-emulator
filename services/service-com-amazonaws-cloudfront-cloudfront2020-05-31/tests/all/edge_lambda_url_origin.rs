@@ -157,8 +157,9 @@ def lambda_handler(event, context):
 ///
 /// The handler is a PARAMETER so a sibling suite over the same topology stages a function that
 /// reports what IT needs out of the request it was handed — the query string and the cookies
-/// that reached the origin ([`crate::edge_lambda_url_origin_shaping`]) — through this one
-/// packaging step rather than a copy of it.
+/// that reached the origin ([`crate::edge_lambda_url_origin_shaping`]) — or ANSWERS what it
+/// needs ([`crate::edge_origin_cache_directives`]) — through this one packaging step rather
+/// than a copy of it.
 fn package_of(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
@@ -349,7 +350,8 @@ impl Topology {
     }
 
     /// [`Self::public_function_url_host`] over the handler `source`, for a sibling suite whose
-    /// rows are about what the origin RECEIVED and so need a handler that reports it.
+    /// rows are about what the origin RECEIVED, or about what it ANSWERED, and so need a
+    /// handler of their own.
     pub(crate) async fn public_function_url_host_running(
         &self,
         case: &str,

@@ -28,6 +28,26 @@ fn id_format_invalid_message_matches_the_constant_form() {
     );
 }
 
+/// The one producer of the out-of-range sentence and the `&'static str` form a port outside
+/// the range an origin is reached on is refused with cannot drift apart: both spell the same
+/// text, and the producer spells it for any other parameter name the same way.
+#[test]
+fn parameter_out_of_range_message_matches_the_constant_form() {
+    assert_eq!(
+        parameter_out_of_range_message("origin port"),
+        ORIGIN_PORT_OUT_OF_RANGE_MESSAGE,
+        "case origin port: expected the constant form {ORIGIN_PORT_OUT_OF_RANGE_MESSAGE:?}, \
+         got {:?}",
+        parameter_out_of_range_message("origin port")
+    );
+    assert_eq!(
+        parameter_out_of_range_message("ErrorCachingMinTTL"),
+        "The parameter ErrorCachingMinTTL is not within allowed range.",
+        "case ErrorCachingMinTTL: expected the member's own sentence, got {:?}",
+        parameter_out_of_range_message("ErrorCachingMinTTL")
+    );
+}
+
 /// Each MINT's predicate admits exactly what this service mints for that kind — the
 /// resume points a listing issues are its own ids — while the form an operation
 /// ADDRESSES a resource with ([`is_namespaced_resource_id`]) admits every namespace an

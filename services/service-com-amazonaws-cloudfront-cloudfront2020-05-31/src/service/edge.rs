@@ -71,7 +71,8 @@
 //!    `CustomErrorResponses` states for that status, where it states one: the viewer receives
 //!    the configured `ResponseCode` and the page `ResponsePagePath` names, and the error itself
 //!    is held for `ErrorCachingMinTTL` rather than for the behaviour's own TTL
-//!    ([`custom_errors`]);
+//!    ([`custom_errors`]) — and whichever span applies, an answer whose ORIGIN asked that it not
+//!    be stored is held only by the behaviour's minimum TTL ([`cache_directives`]);
 //! 12. and whatever the answer turns out to be — the origin's, the cache's, or a page
 //!    CloudFront generated itself — the header groups of the behaviour's
 //!    `ResponseHeadersPolicyId` are applied to it: the CORS headers for a viewer whose
@@ -162,6 +163,9 @@ pub mod access_logs;
 /// WHICH part of the object a viewer asking for a byte range is answered with: the window it
 /// selected, or the refusal of a range that selects none of it.
 pub mod byte_range;
+/// What the ORIGIN said about storing its own answer, and how long the edge holds it because of
+/// it.
+pub mod cache_directives;
 /// The content encodings the edge compresses an answer with, and the bytes they produce.
 pub mod compression;
 /// WHETHER a viewer that already holds a copy of the object is answered the object again, or
@@ -897,8 +901,15 @@ struct Behavior {
     /// `Compress` — "whether you want CloudFront to automatically compress certain files
     /// for this cache behavior", and [`DEFAULT_COMPRESS`] for a behaviour that states none.
     compress: bool,
-    /// The legacy per-behaviour TTL, for a behaviour that names no cache policy.
+    /// `MinTTL`, the legacy per-behaviour minimum, for a behaviour that names no cache policy:
+    /// the one span that still holds content whose origin asked no cache to store it
+    /// ([`cache_directives::held_for`]).
+    min_ttl: Option<i64>,
+    /// `DefaultTTL`, the legacy per-behaviour default, for a behaviour that names no cache
+    /// policy: how long an answer the behaviour may cache is held ([`cache_ttl`]).
     default_ttl: Option<i64>,
+    /// `MaxTTL`, the legacy per-behaviour maximum, read where the behaviour states no
+    /// `DefaultTTL` ([`cache_ttl`]).
     max_ttl: Option<i64>,
     /// `ForwardedValues` — the legacy member that states what a behaviour naming no cache
     /// policy keys on and forwards: "a `CacheBehavior` must include either a
@@ -929,6 +940,7 @@ impl Behavior {
             cache_policy_id: behavior.cache_policy_id.clone(),
             origin_request_policy_id: behavior.origin_request_policy_id.clone(),
             compress: behavior.compress.unwrap_or(DEFAULT_COMPRESS),
+            min_ttl: behavior.min_ttl,
             default_ttl: behavior.default_ttl,
             max_ttl: behavior.max_ttl,
             forwarded_values: behavior.forwarded_values.clone(),
@@ -950,6 +962,7 @@ impl Behavior {
             cache_policy_id: behavior.cache_policy_id.clone(),
             origin_request_policy_id: behavior.origin_request_policy_id.clone(),
             compress: behavior.compress.unwrap_or(DEFAULT_COMPRESS),
+            min_ttl: behavior.min_ttl,
             default_ttl: behavior.default_ttl,
             max_ttl: behavior.max_ttl,
             forwarded_values: behavior.forwarded_values.clone(),
@@ -1149,21 +1162,55 @@ fn cache_ttl(
     store: &ComAmazonawsCloudfrontCloudfront20200531State,
     behavior: &Behavior,
 ) -> Option<Duration> {
+    held_span(
+        store,
+        behavior,
+        |policy| policy.default_ttl.unwrap_or(policy.min_ttl),
+        |managed| managed.default_ttl,
+        |behavior| behavior.default_ttl.or(behavior.max_ttl),
+    )
+}
+
+/// The behaviour's MINIMUM TTL, or `None` for a behaviour whose minimum is no span at all.
+///
+/// `MinTTL` is "the minimum amount of time that you want objects to stay in CloudFront caches
+/// before CloudFront forwards another request to your origin", and it is read from the same two
+/// places [`cache_ttl`] reads the span an answer is held for ([`held_span`]). It is what still
+/// holds content whose origin asked no cache to store it ([`cache_directives::held_for`]).
+fn cache_min_ttl(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    behavior: &Behavior,
+) -> Option<Duration> {
+    held_span(
+        store,
+        behavior,
+        |policy| policy.min_ttl,
+        |managed| managed.min_ttl,
+        |behavior| behavior.min_ttl,
+    )
+}
+
+/// One span a cache behaviour states, read from the one place that behaviour states it: the
+/// cache policy the behaviour names (`stored` for a policy this account holds, `managed` for one
+/// of CloudFront's own), and the legacy per-behaviour member (`legacy`) for a behaviour that
+/// names no policy.
+///
+/// The reading is shared so every span this module takes off a behaviour is clamped the same way
+/// and answers `None` for a span that is no time at all. A behaviour naming a cache policy this
+/// account does not hold cannot be created, so a policy that can be read nowhere states no span.
+fn held_span(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    behavior: &Behavior,
+    stored: impl Fn(&crate::ops::types::CachePolicyConfig) -> i64,
+    managed: impl Fn(&crate::state::ManagedCachePolicy) -> i64,
+    legacy: impl Fn(&Behavior) -> Option<i64>,
+) -> Option<Duration> {
     let seconds = match &behavior.cache_policy_id {
         Some(id) => match store.cache_policies.get(id) {
-            Some(stored) => stored.config.default_ttl.unwrap_or(stored.config.min_ttl),
-            None => match managed_cache_policy(id) {
-                Some(managed) => managed.default_ttl,
-                // A behaviour naming a cache policy this account does not hold cannot be
-                // created, so this is a configuration that lost its policy: nothing is
-                // cached under a policy that cannot be read.
-                None => 0,
-            },
+            Some(policy) => stored(&policy.config),
+            None => managed_cache_policy(id).map_or(0, managed),
         },
-        None => behavior
-            .default_ttl
-            .or(behavior.max_ttl)
-            .unwrap_or_default(),
+        None => legacy(behavior).unwrap_or_default(),
     };
     let seconds = u64::try_from(seconds).unwrap_or_default();
     // Clamped to the longest TTL CloudFront's own cache policies carry, so a stored TTL
@@ -1270,6 +1317,9 @@ struct CacheDirective {
     /// distribution's custom error responses name to be held for its own span
     /// ([`custom_errors::caching_ttl`]).
     ttl: Option<Duration>,
+    /// The behaviour's MINIMUM TTL ([`cache_min_ttl`]), which is the one span that holds content
+    /// whose origin asked no cache to store it ([`cache_directives::held_for`]).
+    min_ttl: Option<Duration>,
 }
 
 /// Serve one viewer request addressed to a distribution's edge.
@@ -2238,6 +2288,7 @@ fn plan_resolved(
         return Plan::Refused { refusal };
     }
     let ttl = cache_ttl(store, &behavior);
+    let min_ttl = cache_min_ttl(store, &behavior);
     // What the behaviour's POLICIES make of this request: which of its parts take part in
     // the cache key, which of them reach the origin, and what the cache policy makes of the
     // viewer's `Accept-Encoding` ([`forwarding`]).
@@ -2376,6 +2427,7 @@ fn plan_resolved(
         cache: cacheable.then_some(CacheDirective {
             key: cache_key,
             ttl,
+            min_ttl,
         }),
         encode,
         viewer_path,
@@ -3082,9 +3134,15 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
         // How long this answer is held: the behaviour's own TTL for an answer the edge may
         // cache at all, and `ErrorCachingMinTTL` for one the distribution's custom error
         // responses name — which is what holds an ERROR no cache policy would hold
-        // ([`custom_errors`]).
-        let ttl = custom_errors::caching_ttl(&fetch.custom_error_responses, status)
-            .or_else(|| directive.ttl.filter(|_| is_cacheable_status(status)));
+        // ([`custom_errors`]) — unless the ORIGIN asked that its answer not be stored, which
+        // only the behaviour's minimum TTL still holds ([`cache_directives`]).
+        let ttl = cache_directives::held_for(&cache_directives::Residence {
+            status,
+            headers: &answer.headers,
+            error_ttl: custom_errors::caching_ttl(&fetch.custom_error_responses, status),
+            ttl: directive.ttl,
+            min_ttl: directive.min_ttl,
+        });
         // The size bound the entry has to stay within is [`cache`]'s own, stated where the
         // bytes are held.
         if let Some(ttl) = ttl {
@@ -3909,6 +3967,7 @@ mod tests {
                 cache_policy_id: None,
                 origin_request_policy_id: policy.map(str::to_string),
                 compress: false,
+                min_ttl: None,
                 default_ttl: None,
                 max_ttl: None,
                 forwarded_values: None,
@@ -4029,6 +4088,7 @@ mod tests {
                 cache_policy_id: None,
                 origin_request_policy_id: policy.map(str::to_string),
                 compress: false,
+                min_ttl: None,
                 default_ttl: None,
                 max_ttl: None,
                 forwarded_values,
@@ -4321,6 +4381,7 @@ mod tests {
             cache_policy_id: Some(CACHE_POLICY.to_string()),
             origin_request_policy_id: Some(ORIGIN_REQUEST_POLICY.to_string()),
             compress: true,
+            min_ttl: None,
             default_ttl: None,
             max_ttl: None,
             forwarded_values: None,

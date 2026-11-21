@@ -1540,6 +1540,14 @@ pub fn cache_policy_config_invalid(config: &CachePolicyConfig) -> Option<String>
         }
     }
 
+    // A TTL is an amount of time in seconds, so a negative one is outside the range the member
+    // admits, and the refusal names the PARAMETER that carried it through the one sentence this
+    // service states for that condition ([`parameter_out_of_range_message`]) — the same one a
+    // cache BEHAVIOUR's three TTLs are held to (`super::config_members`) and the one a port no
+    // origin can be reached on is refused with ([`ORIGIN_PORT_OUT_OF_RANGE_MESSAGE`], recorded
+    // behaviour), so no surface of this service words one rule differently. The modelled
+    // `InvalidArgument` is what carries it here, as it does there; nothing of the submitted
+    // value reaches the wire, because the parameter is the whole of what the caller has to fix.
     for (label, value) in [
         ("MinTTL", Some(config.min_ttl)),
         ("DefaultTTL", config.default_ttl),
@@ -1547,10 +1555,7 @@ pub fn cache_policy_config_invalid(config: &CachePolicyConfig) -> Option<String>
     ] {
         if let Some(value) = value {
             if value < 0 {
-                return Some(format!(
-                    "An argument is invalid: {label} is an amount of time in seconds and cannot \
-                     be negative, but the request submits {value}"
-                ));
+                return Some(parameter_out_of_range_message(label));
             }
         }
     }
@@ -4293,6 +4298,19 @@ pub fn key_group_without_a_public_key_message() -> String {
 /// same condition differently.
 pub fn invalid_parameter_message(parameter: &str) -> String {
     format!("The parameter {parameter} is invalid.")
+}
+
+/// The sentence CloudFront refuses a PARAMETER whose value is outside the range it admits with:
+/// fixed text around the name of the member, and nothing of the value it carried or of the range
+/// itself.
+///
+/// The companion of [`invalid_parameter_message`] for a value CloudFront can read and will not
+/// take — a count or an amount of time outside the domain of the member — stated once for every
+/// member refused that way. It is the sentence this service already states for a port no origin
+/// can be reached on ([`ORIGIN_PORT_OUT_OF_RANGE_MESSAGE`]), which names the kind of parameter
+/// rather than the member that carried it.
+pub fn parameter_out_of_range_message(parameter: &str) -> String {
+    format!("The parameter {parameter} is not within allowed range.")
 }
 
 /// The sentence CloudFront refuses a PARAMETER whose value is longer than it admits with:

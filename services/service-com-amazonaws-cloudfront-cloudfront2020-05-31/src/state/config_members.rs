@@ -27,6 +27,9 @@
 //!   HTTP status code — and `ResponsePagePath` is "the path to the custom error page", a
 //!   relative path beginning with a slash and carrying nothing a URL path has to have
 //!   percent-encoded;
+//! * a member documented as an amount of time in SECONDS states a span, and no span is negative
+//!   ([`duration_members`] lists them and the sentences that make them durations), so a negative
+//!   value names no duration the configuration could run under;
 //! * `GeoRestriction` states the agreement between its members: the `Location` items "specify
 //!   the countries" a `whitelist` or a `blacklist` covers, and "when it is not enabled,
 //!   `Quantity` is `0`, and you can omit `Items`" — so an enabled restriction covering no
@@ -113,6 +116,19 @@ pub fn invalid_parameter(parameter: &str) -> ConfigMemberRefusal {
     })
 }
 
+/// The refusal a member whose value CloudFront can read and will not take carries: the modelled
+/// `InvalidArgument`, naming the PARAMETER that carried it and the fact that its value is outside
+/// the range the member admits ([`super::parameter_out_of_range_message`]).
+///
+/// The companion of [`invalid_parameter`] for a value that is the right KIND of thing and outside
+/// the domain of the member — an amount of time that is no duration, a number outside the range
+/// its member admits — so the two sentences cannot drift apart between the members they refuse.
+pub fn parameter_out_of_range(parameter: &str) -> ConfigMemberRefusal {
+    ConfigMemberRefusal::InvalidArgument(crate::ops::types::InvalidArgument {
+        message: Some(parameter_out_of_range_message(parameter)),
+    })
+}
+
 /// The most origins ONE distribution's configuration may state.
 ///
 /// CloudFront's published quota is 25 origins per distribution (the Amazon CloudFront
@@ -188,6 +204,9 @@ pub fn config_member_refusal(config: &DistributionConfig) -> Option<ConfigMember
         return Some(refusal);
     }
     if let Some(refusal) = custom_error_response_refusal(config) {
+        return Some(refusal);
+    }
+    if let Some(refusal) = duration_member_refusal(config) {
         return Some(refusal);
     }
     if let Some(refusal) = geo_restriction_refusal(config) {
@@ -346,6 +365,82 @@ fn custom_error_response_refusal(config: &DistributionConfig) -> Option<ConfigMe
         }
     }
     None
+}
+
+/// The refusal the first member of `config` that states an amount of time in SECONDS outside
+/// the durations there are carries, or `None` when every one of them states a duration.
+///
+/// A member documented as "the … amount of time, in seconds" states a SPAN, and no span is
+/// negative, so a negative value names no duration at all. The model puts no `@range` on the
+/// integral types these members target, so nothing refuses such a value before a handler runs,
+/// and CloudFront answers it against the PARAMETER that carried it
+/// ([`super::parameter_out_of_range_message`]) rather than under a code of its own.
+fn duration_member_refusal(config: &DistributionConfig) -> Option<ConfigMemberRefusal> {
+    duration_members(config)
+        .into_iter()
+        .find(|(_, seconds)| *seconds < 0)
+        .map(|(parameter, _)| parameter_out_of_range(parameter))
+}
+
+/// Every member of `config` that states an amount of time in seconds, each under the name the
+/// WIRE reports it by, in the order the document carries them.
+///
+/// The members, each with the sentence that makes it a duration:
+///
+/// * `CustomErrorResponse$ErrorCachingMinTTL` — "the minimum amount of time, in seconds, that
+///   you want CloudFront to cache the HTTP status code specified in `ErrorCode`";
+/// * a cache behaviour's `MinTTL`, `DefaultTTL` and `MaxTTL` — "the {minimum,default,maximum}
+///   amount of time that you want objects to stay in CloudFront caches", which the three of a
+///   cache policy state the same way ([`super::cache_policy_config_invalid`] reads those);
+/// * `CustomOriginConfig$OriginReadTimeout` and `$OriginKeepaliveTimeout` — "specifies how long,
+///   in seconds, CloudFront waits for a response from the origin" and "how long, in seconds,
+///   CloudFront persists its connection to the origin";
+/// * `Origin$ConnectionTimeout` — "the number of seconds that CloudFront waits when trying to
+///   establish a connection to the origin".
+fn duration_members(config: &DistributionConfig) -> Vec<(&'static str, i64)> {
+    let mut out = Vec::new();
+    for response in config
+        .custom_error_responses
+        .as_ref()
+        .map(|responses| responses.items.as_deref().unwrap_or_default())
+        .unwrap_or_default()
+    {
+        if let Some(seconds) = response.error_caching_min_ttl {
+            out.push(("ErrorCachingMinTTL", seconds));
+        }
+    }
+    for behavior in behavior_members(config) {
+        // Destructured rather than indexed, the way the ordering rule below reads the same
+        // triple: the three members are named here, so a reordering of the shared view cannot
+        // leave a refusal naming the wrong one.
+        let [min, default, max] = behavior.ttls;
+        for (parameter, stated) in [
+            ("MinTTL", min),
+            ("DefaultTTL", default),
+            ("MaxTTL", max),
+        ] {
+            if let Some(seconds) = stated {
+                out.push((parameter, seconds));
+            }
+        }
+    }
+    for origin in &config.origins.items {
+        if let Some(seconds) = origin.connection_timeout {
+            out.push(("ConnectionTimeout", i64::from(seconds)));
+        }
+        let Some(custom) = origin.custom_origin_config.as_ref() else {
+            continue;
+        };
+        for (parameter, stated) in [
+            ("OriginReadTimeout", custom.origin_read_timeout),
+            ("OriginKeepaliveTimeout", custom.origin_keepalive_timeout),
+        ] {
+            if let Some(seconds) = stated {
+                out.push((parameter, i64::from(seconds)));
+            }
+        }
+    }
+    out
 }
 
 /// The refusal `config`'s geographic restriction carries, or `None` when its members agree
