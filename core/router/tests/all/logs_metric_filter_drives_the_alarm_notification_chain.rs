@@ -136,7 +136,7 @@ fn now_ms() -> i64 {
 /// Source: the model's `Statistic` enum — the arms here are the four the table states, so the
 /// arithmetic a row expects is the row's own, never a recorded number.
 #[allow(clippy::cast_precision_loss)]
-fn aggregate(case: &str, statistic: &str, values: &[f64]) -> f64 {
+pub(crate) fn aggregate(case: &str, statistic: &str, values: &[f64]) -> f64 {
     match statistic {
         "Sum" => values.iter().sum(),
         "SampleCount" => values.len() as f64,
@@ -150,7 +150,7 @@ fn aggregate(case: &str, statistic: &str, values: &[f64]) -> f64 {
 ///
 /// Source: the model's `ComparisonOperator` enum; the four single-threshold operators are the
 /// ones an alarm over a plain numeric `Threshold` uses.
-fn breaches(case: &str, comparison: &str, value: f64, threshold: f64) -> bool {
+pub(crate) fn breaches(case: &str, comparison: &str, value: f64, threshold: f64) -> bool {
     match comparison {
         "GreaterThanThreshold" => value > threshold,
         "GreaterThanOrEqualToThreshold" => value >= threshold,
