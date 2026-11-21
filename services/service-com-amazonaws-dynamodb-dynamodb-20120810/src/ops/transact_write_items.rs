@@ -1152,26 +1152,6 @@ fn refused_element(error: crate::state::RequestError) -> ElementRefusal {
     }
 }
 
-/// A refusal of ONE ACTION, unless it states the documented item-SIZE quota.
-///
-/// That quota is about the item a change ASKS for rather than about applying it — the same
-/// reading the single-item `UpdateItem` of the same expression takes — so crossing it refuses
-/// the CALL in that sentence and cancels nothing, whichever rule found it: a value the change
-/// would leave that is itself past the ceiling, or the item the change would leave as a whole.
-/// Every other value rule stays this action's own outcome.
-fn size_quota_refuses_the_call(error: crate::state::RequestError) -> ElementRefusal {
-    let states_the_size_quota = matches!(
-        &error,
-        crate::state::RequestError::Validation(message)
-            if message == crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE
-                || message == crate::state::ITEM_SIZE_EXCEEDED_MESSAGE
-    );
-    if states_the_size_quota {
-        return refused_call(error);
-    }
-    refused_element(error)
-}
-
 /// How an action answers a bad key: the cancellation its table's key schema decided, or
 /// the request-level refusal its own shape earned ([`crate::state::KeyRefusal`] owns
 /// which is which).
@@ -1313,6 +1293,19 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 .active_table(region, &name, now)
                 .map_err(refused_call)?;
             deny(caller, table, action, now).map_err(ElementRefusal::Call)?;
+            // The half of the item-size quota that needs the table: the entry a local
+            // secondary index of it would hold for this item is charged beside the item
+            // ([`crate::state::Table::item_size_exceeded`]). The bytes the element
+            // CARRIED were bounded with the rest of the request, before any table was
+            // looked up, and both refuse the call in the same sentence: a `Put` states the
+            // whole item, so an item that cannot be stored is the request's own defect.
+            if table.item_size_exceeded(&item) {
+                return Err(ElementRefusal::Call(
+                    crate::scaffolded::Scaffolded::validation(
+                        crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                    ),
+                ));
+            }
             table
                 .check_index_key_types(&item)
                 .map_err(refused_element)?;
@@ -1388,11 +1381,11 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             // alone, so it is this ACTION that failed and the transaction is cancelled
             // with that sentence against this action ([`ElementRefusal::Element`]) — except
             // the documented item-SIZE quota, which the applied change can also cross and
-            // which refuses the call ([`size_quota_refuses_the_call`]).
+            // which cancels the transaction with this action's reason ([`ElementRefusal`]).
             let touched = applied
                 .apply(&mut item)
                 .map_err(crate::state::refused_in_element)
-                .map_err(size_quota_refuses_the_call)?;
+                .map_err(refused_element)?;
             for attribute in touched.attributes() {
                 if attribute.as_str() == partition_key.as_str()
                     || Some(attribute.as_str()) == sort_key.as_deref()
@@ -1410,31 +1403,39 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 }
             }
             // The item this update LEAVES is read against the stored one, so every rule
-            // about it is this action's outcome too — except the documented item-SIZE
-            // quota, which is a quota on what the change asks for and refuses the call
-            // ([`size_quota_refuses_the_call`]).
+            // about it is this action's outcome too — the documented item-SIZE quota among
+            // them, because an item that becomes too large is something the transaction's
+            // own changes did ([`ElementRefusal`]).
             for (attribute, value) in &item {
                 crate::state::check_attribute_value(attribute, value)
                     .map_err(crate::state::stated_for_an_update)
                     .map_err(crate::state::unenveloped)
-                    .map_err(size_quota_refuses_the_call)?;
+                    .map_err(refused_element)?;
             }
             crate::state::canonicalize_item(&mut item)
                 .map_err(crate::state::unenveloped)
                 .map_err(refused_element)?;
             // Sized over what this element ASKED FOR, exactly as the single-item
             // `UpdateItem` of the same expression is: the item's non-key bytes plus
-            // what its key portion is charged
-            // ([`crate::state::update_size_exceeded`]) plus the frame each clause
-            // of the update costs
-            // ([`crate::state::ParsedUpdate::request_shape_charge`]). The ceiling is a
-            // quota on the item the update ASKS for rather than an outcome of applying it,
-            // so crossing it refuses the CALL in the sentence the single-item path states
-            // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]) and cancels nothing.
+            // what its key portion is charged, plus the entry a local secondary index of
+            // the table holds for it ([`crate::state::update_size_exceeded`]) plus the
+            // frame each clause of the update costs
+            // ([`crate::state::ParsedUpdate::request_shape_charge`]).
+            //
+            // Crossing it CANCELS the transaction rather than refusing the call: "an item
+            // size becomes too large (larger than 400 KB), or a local secondary index
+            // (LSI) becomes too large, or a similar validation error occurs because of
+            // changes made by the transaction" is one of the circumstances DynamoDB
+            // cancels a `TransactWriteItems` request under (the
+            // `TransactionCanceledException` doc), whose `ValidationError` reason lists
+            // this very sentence among its messages ("Item size to update has exceeded the
+            // maximum allowed size"). The item a `Put` CARRIES is a different question —
+            // that item is too large as submitted, whatever the transaction would do — and
+            // stays the request's own refusal.
             if crate::state::update_size_exceeded(table, &item, applied.request_shape_charge()) {
-                return Err(refused_call(crate::state::RequestError::Validation(
+                return Err(ElementRefusal::Element(
                     crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
-                )));
+                ));
             }
             table
                 .check_index_key_types(&item)

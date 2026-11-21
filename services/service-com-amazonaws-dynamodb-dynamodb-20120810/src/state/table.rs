@@ -99,6 +99,51 @@ impl Table {
 }
 
 impl Table {
+    /// What a LOCAL secondary index of this table adds to what one item is charged against
+    /// the documented item-size quota: the entry the widest of them holds for that item.
+    ///
+    /// The quota is published PER LOCAL INDEX — "for each local secondary index on a table,
+    /// there is a 400 KB limit on the total size of the following: the data in the table
+    /// item, plus the index key values and projected attributes in the index entry"
+    /// ("Service, Account, and Table Quotas" in the Amazon DynamoDB Developer Guide) — so
+    /// the index whose entry is largest is the one that decides, and a table with no local
+    /// index, or whose local indexes hold no entry for this item ([`index_covers`]: an item
+    /// missing the index's sort key is not projected into it), adds nothing.
+    ///
+    /// The entry is the one the index actually holds ([`index_entry`]), so an `ALL`
+    /// projection adds the item's own bytes again while a `KEYS_ONLY` or `INCLUDE`
+    /// projection adds only what it stores — one projection rule for what an index is sized
+    /// by, what a read of it reports and what a write of it is charged.
+    ///
+    /// A READ of the table and the item it is handed: nothing is stored and nothing is
+    /// modified.
+    pub fn local_index_entry_charge(&self, item: &Item) -> i64 {
+        self.local_secondary_indexes
+            .iter()
+            .filter(|index| index.covers(item))
+            .map(|index| index.projected_size(item, &self.key_schema))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// What `item` is charged against [`MAX_ITEM_SIZE_BYTES`] when stored in this table:
+    /// the bytes it stores ([`item_size`]) plus the local-index entry beside it
+    /// ([`Self::local_index_entry_charge`]).
+    pub fn charged_item_size(&self, item: &Item) -> i64 {
+        item_size(item).saturating_add(self.local_index_entry_charge(item))
+    }
+
+    /// Whether storing `item` in this table crosses the documented item-size quota, over
+    /// the item AND the local-index entry the same quota counts beside it.
+    ///
+    /// Asked wherever an item is stored — the single-item, batched, transactional and
+    /// PartiQL write paths — so one table answers one question about one item however the
+    /// write reached it. The quota over the bytes a REQUEST carried is asked before any
+    /// table is looked up, because it needs none; this one needs the table's indexes.
+    pub fn item_size_exceeded(&self, item: &Item) -> bool {
+        self.charged_item_size(item) > MAX_ITEM_SIZE_BYTES
+    }
+
     /// The status at `now`, derived from the stored instants.
     pub fn status(&self, now: SystemTime) -> TableStatus {
         if self.removed_at.is_some() {

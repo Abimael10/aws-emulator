@@ -16,6 +16,14 @@
 //! because one is keyed by fewer bytes than the other. A key at or above the floor fills it and
 //! is charged the bytes it holds, so the ceiling there is the quota itself.
 //!
+//! An item the table holds a LOCAL secondary index entry for is charged for that entry as well,
+//! because the published quota counts it: "for each local secondary index on a table, there is a
+//! 400 KB limit on the total size of the following: the data in the table item, plus the index key
+//! values and projected attributes in the index entry" ([`Table::local_index_entry_charge`]). So an
+//! update that grows an item an `ALL`-projected local index covers crosses the quota at half the
+//! bytes, and the growth is measured over the item the change LEAVES, not over the bytes the
+//! request carried.
+//!
 //! Beside those bytes, an update stated as an EXPRESSION is charged for the clauses it states
 //! ([`ParsedUpdate::request_shape_charge`]), because such a request asks for work over and
 //! above the item it leaves; a request that states its change without an expression — the
@@ -30,7 +38,8 @@
 //! `BatchExecuteStatement` — so the five of them stop at the same item. A request that
 //! CARRIES a whole item (`PutItem` and its batch and transactional forms) states the item
 //! itself rather than a change to one, and is bounded by the quota over the bytes it carries
-//! ([`item_size`]) with no floor of its own.
+//! ([`item_size`]) and the local-index entry beside them ([`Table::item_size_exceeded`]), with
+//! no floor of its own.
 
 use super::*;
 
@@ -53,8 +62,10 @@ pub fn key_portion_charge(key_bytes: i64) -> i64 {
 }
 
 /// What `item` is charged against [`MAX_ITEM_SIZE_BYTES`] on the update path: its non-key bytes,
-/// plus what its key portion is charged ([`key_portion_charge`]), plus what the request's own
-/// shape costs (`request_shape_charge`, zero for a change stated without an expression).
+/// plus what its key portion is charged ([`key_portion_charge`]), plus the local-index entry the
+/// same quota counts beside the item ([`Table::local_index_entry_charge`]), plus what the
+/// request's own shape costs (`request_shape_charge`, zero for a change stated without an
+/// expression).
 ///
 /// The key portion is the item's primary-key attributes as the table's key schema names them
 /// ([`Table::key_attributes`]), weighed the way every other part of the item is
@@ -66,6 +77,7 @@ pub fn update_charged_size(table: &Table, item: &Item, request_shape_charge: i64
     item_size(item)
         .saturating_sub(key_bytes)
         .saturating_add(key_portion_charge(key_bytes))
+        .saturating_add(table.local_index_entry_charge(item))
         .saturating_add(request_shape_charge)
 }
 

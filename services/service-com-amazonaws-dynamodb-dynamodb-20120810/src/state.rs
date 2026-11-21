@@ -140,12 +140,16 @@ pub const MAX_TRANSACTION_SIZE_BYTES: i64 = 4 * 1024 * 1024;
 /// How a transaction past [`MAX_TRANSACTION_SIZE_BYTES`] is refused.
 ///
 /// The quota is the whole CALL's, so the sentence names neither an action nor a table: it
-/// states the ceiling the request crossed and then the payload the request actually
-/// carried, which is the one number a caller sizing or splitting a transaction from the
-/// refusal has to read — a transaction refused for being 10 bytes over and one refused for
-/// being megabytes over are told apart only by it. The ceiling is spelled as the quota is
-/// published (`4MB`) rather than as the byte count behind it, and the payload is the
-/// aggregate this call measured ([`MAX_TRANSACTION_SIZE_BYTES`]).
+/// states the ceiling the request crossed and then the payload it actually came to, which is
+/// the one number a caller sizing or splitting a transaction from the refusal has to read — a
+/// transaction refused for being 10 bytes over and one refused for being megabytes over are
+/// told apart only by it. The ceiling is spelled as the quota is published (`4MB`) rather
+/// than as the byte count behind it, and the payload is the aggregate this call measured
+/// ([`MAX_TRANSACTION_SIZE_BYTES`]).
+///
+/// ONE sentence for the quota, whichever side of a transaction crossed it: a transactional
+/// WRITE measures the items and expression values the request carried, a transactional READ
+/// measures the items the store holds for the keys it named, and both are refused with this.
 ///
 /// The class the refusal takes is a top-level `ValidationException` rather than a
 /// cancellation, because no action of the transaction was applicable to begin with.

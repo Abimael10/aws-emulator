@@ -352,27 +352,38 @@ async fn an_action_read_against_the_stored_item_reports_its_own_cancellation_rea
     );
 }
 
-/// RULE 1's boundary: the item-update CEILING is a quota on the item an action ASKS for, not
-/// an outcome of applying it, so crossing it refuses the whole CALL with the sentence the
-/// single-item path states and cancels nothing — no `CancellationReasons` list at all.
+/// RULE 1 over the item-size CEILING: an item the transaction's own changes grow past the
+/// documented 400 KB ceiling is that action's failure, so the transaction is CANCELLED and
+/// that action reports `ValidationError` with the update path's sentence —
+/// "an item size becomes too large (larger than 400 KB), or a local secondary index (LSI)
+/// becomes too large, or a similar validation error occurs because of changes made by the
+/// transaction" is one of the circumstances DynamoDB cancels a `TransactWriteItems` request
+/// under, and "Item size to update has exceeded the maximum allowed size" is one of the
+/// messages its `ValidationError` reason lists (the `TransactionCanceledException` doc).
 ///
 /// The rows differ along what the rule generalises over: WHERE the oversized action sits
 /// (alone, before an action that would succeed, after one, beside an action whose condition
-/// does not hold), and HOW it crosses the ceiling (one oversized value, and a value just past
-/// the ceiling spread over two clauses). Each row is driven beside a control the transaction
-/// commits, so what is asserted is the ceiling being crossed.
+/// does not hold), and HOW it crosses the ceiling (one oversized value, a value just past
+/// the ceiling spread over two clauses, and a value the update COMPUTES). Every other action
+/// still reports its own outcome in request order.
+///
+/// The BOUNDARY of the rule is driven beside them: an item a `Put` CARRIES past the ceiling
+/// is too large as submitted, whatever the transaction would have done with it, so that one
+/// refuses the whole call and cancels nothing.
 #[tokio::test]
-async fn an_update_past_the_item_ceiling_refuses_the_call_rather_than_cancelling() {
+async fn an_update_the_transaction_grows_past_the_item_ceiling_cancels_it() {
     let router = seeded().await;
 
     // Past the documented 400 KB item ceiling in one value, and in two clauses that only
     // cross it together.
     let oversize = "x".repeat(400 * 1024);
     let half = "y".repeat(210 * 1024);
-    let rows: Vec<(&str, Value)> = vec![
+    // Each row: the case, the actions, and the reason every action reports in request order.
+    let rows: Vec<CancellationRow> = vec![
         (
             "the oversized action alone",
             json!([update("SET big = :v", json!({":v": {"S": oversize.clone()}}))]),
+            vec![("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
             "the oversized action before one that would succeed",
@@ -380,6 +391,7 @@ async fn an_update_past_the_item_ceiling_refuses_the_call_rather_than_cancelling
                 update("SET big = :v", json!({":v": {"S": oversize.clone()}})),
                 put("after-the-ceiling")
             ]),
+            vec![("ValidationError", Some(UPDATE_TOO_BIG)), ("None", None)],
         ),
         (
             "the oversized action after one that would succeed",
@@ -387,6 +399,7 @@ async fn an_update_past_the_item_ceiling_refuses_the_call_rather_than_cancelling
                 put("before-the-ceiling"),
                 update("SET big = :v", json!({":v": {"S": oversize.clone()}}))
             ]),
+            vec![("None", None), ("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
             "the oversized action beside a condition that does not hold",
@@ -394,6 +407,10 @@ async fn an_update_past_the_item_ceiling_refuses_the_call_rather_than_cancelling
                 failing_check(),
                 update("SET big = :v", json!({":v": {"S": oversize.clone()}}))
             ]),
+            vec![
+                ("ConditionalCheckFailed", Some(CONDITION_FAILED)),
+                ("ValidationError", Some(UPDATE_TOO_BIG)),
+            ],
         ),
         (
             "two clauses that cross the ceiling together",
@@ -401,6 +418,7 @@ async fn an_update_past_the_item_ceiling_refuses_the_call_rather_than_cancelling
                 "SET one = :a, two = :b",
                 json!({":a": {"S": half.clone()}, ":b": {"S": half.clone()}})
             )]),
+            vec![("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
         (
             // The value the update COMPUTES is what crosses the ceiling: neither operand
@@ -411,28 +429,56 @@ async fn an_update_past_the_item_ceiling_refuses_the_call_rather_than_cancelling
                 "SET joined = list_append(:a, :b)",
                 json!({":a": {"L": [{"S": half.clone()}]}, ":b": {"L": [{"S": half.clone()}]}})
             )]),
+            vec![("ValidationError", Some(UPDATE_TOO_BIG))],
         ),
     ];
 
-    for (case, actions) in rows {
-        let (status, answered) =
-            call(&router, "TransactWriteItems", json!({"TransactItems": actions})).await;
+    for (case, actions, expected) in rows {
+        let reported = cancellation(&router, case, json!({"TransactItems": actions})).await;
+        let expected: Vec<(String, Option<String>)> = expected
+            .into_iter()
+            .map(|(code, message)| (code.to_string(), message.map(str::to_string)))
+            .collect();
         assert_eq!(
-            (status, error_code(&answered).as_str(), message(&answered)),
-            (400, "ValidationException", UPDATE_TOO_BIG.to_string()),
-            "case {case:?}: expected a 400 ValidationException {UPDATE_TOO_BIG:?}, got \
-             {status} with {answered}"
-        );
-        assert!(
-            answered.get("CancellationReasons").is_none(),
-            "case {case:?}: a refused call cancels nothing, so it reports no reason list, \
-             got {answered}"
+            reported, expected,
+            "case {case:?}: expected the reasons {expected:?}, got {reported:?}"
         );
     }
 
-    // Nothing any refused call carried was applied, and the control commits: an update that
-    // stays inside the ceiling is served on the same item.
-    for key in ["after-the-ceiling", "before-the-ceiling"] {
+    // The BOUNDARY: an item a `Put` carries past the ceiling is the request's own defect, so
+    // the call is refused with the sentence for an item that was CARRIED and no reason list.
+    let (status, answered) = call(
+        &router,
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Put": {"TableName": ITEMS, "Item": {
+            "pk": {"S": "carried-past-the-ceiling"},
+            "big": {"S": oversize.clone()},
+        }}}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&answered).as_str(), message(&answered)),
+        (
+            400,
+            "ValidationException",
+            "Item size has exceeded the maximum allowed size".to_string()
+        ),
+        "case \"an item the request carried past the ceiling\": expected the carried-item \
+         sentence, got {status} with {answered}"
+    );
+    assert!(
+        answered.get("CancellationReasons").is_none(),
+        "case \"an item the request carried past the ceiling\": a refused call cancels \
+         nothing, so it reports no reason list, got {answered}"
+    );
+
+    // Nothing any cancelled or refused call carried was applied, and the control commits: an
+    // update that stays inside the ceiling is served on the same item.
+    for key in [
+        "after-the-ceiling",
+        "before-the-ceiling",
+        "carried-past-the-ceiling",
+    ] {
         let read = ok(
             &router,
             "GetItem",
@@ -441,7 +487,7 @@ async fn an_update_past_the_item_ceiling_refuses_the_call_rather_than_cancelling
         .await;
         assert!(
             read.get("Item").is_none(),
-            "case {key:?}: the refused call wrote nothing, got {read}"
+            "case {key:?}: the cancelled call wrote nothing, got {read}"
         );
     }
     ok(

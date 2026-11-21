@@ -423,6 +423,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         let mut item = put.item.clone();
                         crate::state::canonicalize_item(&mut item).map_err(lift)?;
                         let table = store.active_table(&region, &name, now).map_err(lift)?;
+                        // The HALF of the item-size quota that needs the table: what the
+                        // item is charged includes the entry a local secondary index of
+                        // this table would hold for it, which the quota counts beside the
+                        // item ([`crate::state::Table::item_size_exceeded`]). The bytes
+                        // the request carried were bounded above, before any table was
+                        // looked up.
+                        if table.item_size_exceeded(&item) {
+                            return Err(crate::scaffolded::Scaffolded::validation(
+                                crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                            ));
+                        }
                         table.check_index_keys(&item).map_err(lift)?;
                         PendingWrite::Put {
                             key: table.key_of_multi_item(&item).map_err(lift)?,

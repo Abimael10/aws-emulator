@@ -757,6 +757,14 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     ));
                 }
                 let table = store.active_table(region, &name, now).map_err(lift)?;
+                // The half of the item-size quota that needs the table: the entry a local
+                // secondary index of it would hold for this item is charged beside the
+                // item ([`crate::state::Table::item_size_exceeded`]).
+                if table.item_size_exceeded(&item) {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+                    ));
+                }
                 table.check_index_key_types(&item).map_err(keying)?;
                 table.check_index_key_values(&item).map_err(lift)?;
                 table.check_vector_attributes(&item).map_err(lift)?;
@@ -818,7 +826,12 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     }
                 } else {
                     let mut item = before.clone().unwrap_or_default();
-                    let touched = clauses.apply(&mut item).map_err(lift)?;
+                    // The change is APPLIED to the stored item here, so a defect found by
+                    // applying it — an item the change grows past the documented 400 KB
+                    // ceiling among them — is this statement's own failure and cancels the
+                    // transaction ([`cancelled_by_element`]), exactly as the same defect
+                    // does in a `TransactWriteItems` `Update`.
+                    let touched = clauses.apply(&mut item).map_err(keying)?;
                     for attribute in touched.attributes() {
                         if attribute.as_str() == partition_key.as_str()
                             || Some(attribute.as_str()) == sort_key.as_deref()
@@ -833,19 +846,31 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     // of it would be: the documented nesting, the 400 KB item size, and
                     // the key limits of every index it is projected into. The size
                     // refusal is the one the UPDATE path states
-                    // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]).
+                    // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]), and it
+                    // CANCELS the transaction: "an item size becomes too large (larger
+                    // than 400 KB), or a local secondary index (LSI) becomes too large,
+                    // or a similar validation error occurs because of changes made by the
+                    // transaction" is one of the circumstances a transaction is cancelled
+                    // under, and that is what this statement's change did (the
+                    // `TransactionCanceledException` doc, whose `ValidationError` reason
+                    // lists this very sentence).
                     for (attribute, value) in &item {
                         crate::state::check_attribute_value(attribute, value)
                             .map_err(crate::state::stated_for_an_update)
-                            .map_err(lift)?;
+                            .map_err(keying)?;
                     }
+                    // Canonicalising the applied item stays the CALL's refusal, unlike the
+                    // rules above it: what is stored is already canonical (every write path
+                    // canonicalises, idempotently, at its write site), so the only values
+                    // this can refuse are the ones the STATEMENT spelled — a defect of the
+                    // request rather than something the transaction's change did.
                     crate::state::canonicalize_item(&mut item).map_err(lift)?;
                     {
                         let table = store.active_table(region, &name, now).map_err(lift)?;
                         if crate::state::update_size_exceeded(table, &item, 0) {
-                            return Err(crate::scaffolded::Scaffolded::validation(
-                                crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
-                            ));
+                            return Err(keying(crate::state::RequestError::Validation(
+                                crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE.to_string(),
+                            )));
                         }
                         table.check_index_key_types(&item).map_err(keying)?;
                         table

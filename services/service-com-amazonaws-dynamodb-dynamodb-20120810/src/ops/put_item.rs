@@ -474,9 +474,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `active_table` above has just answered. The rules that bound the REQUEST
             // itself — the nesting depth, the collection ceilings, the condition's own
             // grammar — are asked before the lookup, because none of them depends on the
-            // table.
-            let size = crate::state::item_size(&item);
-            if size > crate::state::MAX_ITEM_SIZE_BYTES {
+            // table. What the item is charged is its own bytes PLUS the entry a local
+            // secondary index of this table would hold for it, which is how the quota is
+            // published ([`crate::state::Table::item_size_exceeded`]).
+            if table.item_size_exceeded(&item) {
                 return Err(crate::scaffolded::Scaffolded::validation(
                     crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
                 ));

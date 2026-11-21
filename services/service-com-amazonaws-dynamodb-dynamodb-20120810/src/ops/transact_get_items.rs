@@ -251,6 +251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut keyed: std::collections::BTreeSet<(String, crate::state::ItemKey)> =
             std::collections::BTreeSet::new();
         let mut ledger = crate::state::ReadLedger::default();
+        // "The aggregate size of the items in the transaction cannot exceed 4 MB"
+        // ([`crate::state::MAX_TRANSACTION_SIZE_BYTES`]), and "DynamoDB rejects the entire
+        // TransactGetItems request if [...] the aggregate size of the items in the
+        // transaction exceeded 4 MB" (this operation's doc): what the transaction reads is
+        // totalled as the walk finds each item, and the whole call is refused BELOW, before
+        // any table is debited — a refused transaction read nothing and consumed nothing.
+        let mut aggregate: i64 = 0;
         // What each table the transaction reads would consume, totalled: the read is
         // admitted all-or-nothing BELOW, once every table's share is known, because a
         // transaction that is refused consumed nothing anywhere.
@@ -315,6 +322,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             let item = table.items.get(&key).cloned();
+            // What this `Get` contributes to the transaction's aggregate: the bytes the
+            // item it found stores, and nothing for a key that held none.
+            aggregate = aggregate.saturating_add(
+                item.as_ref().map_or(0, crate::state::item_size),
+            );
             // A key that holds no item still consumed the read it asked for, which is why
             // the capacity is charged for every `Get` and only the ones that were there
             // report an `Item`.
@@ -348,6 +360,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 item: crate::state::reported_item(item, projected.as_deref())
                     .filter(|projected| !projected.is_empty()),
             });
+        }
+
+        // The aggregate the reads above came to, held to the documented transaction quota:
+        // "the aggregate size of the items in the transaction cannot exceed 4 MB" — a
+        // hundred items each inside the 400 KB item ceiling can still ask for more than one
+        // transaction may carry. Asked before any budget is touched, so a request this quota
+        // refuses debits nothing and reports no item, and worded as the same quota is worded
+        // for a transactional WRITE ([`crate::state::transaction_size_exceeded_message`]):
+        // one quota, one sentence, over the aggregate this side measured — the items the
+        // store held for the keys this call named.
+        if aggregate > crate::state::MAX_TRANSACTION_SIZE_BYTES {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::transaction_size_exceeded_message(aggregate),
+            ));
         }
 
         // "The entire transaction is rejected" when any part of it cannot be served, so

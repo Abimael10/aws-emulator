@@ -779,6 +779,14 @@ fn insert_item(
     }
     let key = {
         let table = store.active_table(region, name, now).map_err(lift)?;
+        // The half of the item-size quota that needs the table: the entry a local
+        // secondary index of it would hold for this item is charged beside the item
+        // ([`crate::state::Table::item_size_exceeded`]).
+        if table.item_size_exceeded(&item) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ITEM_SIZE_EXCEEDED_MESSAGE,
+            ));
+        }
         table.check_index_keys(&item).map_err(lift)?;
         table.key_of_item(&item).map_err(lift)?
     };

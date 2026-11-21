@@ -17,7 +17,9 @@
 //!    would GROW the stored item past it is told the item to update is. The rows span the
 //!    surfaces that carry an item (`PutItem`, `BatchWriteItem`, a transaction's `Put`, a
 //!    PartiQL `INSERT`) and the surfaces that state a CHANGE (`UpdateItem` through `SET`,
-//!    `ADD` and `list_append`, a transaction's `Update`, a PartiQL `UPDATE`).
+//!    `ADD` and `list_append`, a transaction's `Update`, a PartiQL `UPDATE`) — the
+//!    transactional one as the failing action's CANCELLATION reason, which is the class a
+//!    change the transaction made earns.
 //! 3. A transaction is applied as one unit, so the documented 4 MB aggregate is a ceiling
 //!    on the whole CALL: a transaction whose actions add up past it is refused as the
 //!    malformed request it is, with nothing of it applied, while one whose actions add up
@@ -369,18 +371,21 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
                        {":t": {"SS": [filler(MAX_ITEM_BYTES + 1)]}}}),
         ),
         (
-            "one action of a transaction",
-            "TransactWriteItems",
-            json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
-                   "UpdateExpression": "SET body = :b",
-                   "ExpressionAttributeValues": {":b": oversized()}}}]}),
-        ),
-        (
             "a statement that updates one",
             "ExecuteStatement",
             json!({"Statement":
                    format!("UPDATE \"{TABLE}\" SET body = ? WHERE pk = 'item-1' AND sk = 'a'"),
                    "Parameters": [oversized()]}),
+        ),
+        (
+            // A value the request CARRIED that no item could hold is the request's own
+            // defect, so even inside a transaction it refuses the call rather than
+            // cancelling it.
+            "one action of a transaction carrying an oversized value",
+            "TransactWriteItems",
+            json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
+                   "UpdateExpression": "SET body = :b",
+                   "ExpressionAttributeValues": {":b": oversized()}}}]}),
         ),
     ] {
         let stated = refusal(&router, case, operation, request).await;
@@ -389,6 +394,37 @@ async fn a_change_that_would_grow_the_item_past_it_is_the_update_sentence() {
             "case {case:?} ({operation}): expected {UPDATE_TOO_BIG:?}, got {stated:?}"
         );
     }
+
+    // The TRANSACTIONAL surface states the same sentence as the failing action's
+    // CANCELLATION reason where it is the transaction's own CHANGE that grew the item past
+    // the ceiling — the value here is inside the ceiling, so nothing the request carried is
+    // too large: "an item size becomes too large (larger than 400 KB) [...] because of
+    // changes made by the transaction" is one of the circumstances DynamoDB cancels a
+    // `TransactWriteItems` request under, and this sentence is one of the messages its
+    // `ValidationError` reason lists (the `TransactionCanceledException` doc).
+    let (status, answered) = call(
+        &router,
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Update": {"TableName": TABLE, "Key": key(),
+               "UpdateExpression": "SET body = :b",
+               "ExpressionAttributeValues": {":b": {"S": filler(MAX_ITEM_BYTES)}}}}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&answered).as_str()),
+        (400, "TransactionCanceledException"),
+        "case \"a transactional change past the ceiling\": expected the transaction cancelled, \
+         got {status} with {answered}"
+    );
+    assert_eq!(
+        (
+            answered["CancellationReasons"][0]["Code"].as_str(),
+            answered["CancellationReasons"][0]["Message"].as_str(),
+        ),
+        (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
+        "case \"a transactional change past the ceiling\": expected the action to report \
+         {UPDATE_TOO_BIG:?}, got {answered}"
+    );
 
     // The seeded item is where it was: a refused change writes nothing.
     let read = ok(&router, "GetItem", json!({"TableName": TABLE, "Key": key()})).await;

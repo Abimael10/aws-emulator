@@ -1,19 +1,16 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: dynamodb.update-item-size-ceiling-counts-key-and-untouched-attribute-bytes dynamodb.put-item-and-batch-write-item-size-limit-includes-all-projected-lsi-entry dynamodb.update-item-growth-over-size-limit-with-all-projected-lsi-entry dynamodb.number-byte-cost-exact-at-400kb-boundary-put-item-and-batch-write-item dynamodb.transact-write-items-put-and-update-accept-flat-409600-byte-item dynamodb.update-item-if-not-exists-size-checked-before-condition dynamodb.partiql-insert-and-update-item-size-boundary-at-409600-bytes dynamodb.transact-get-items-aggregate-size-over-4mb-rejected dynamodb.batch-get-item-oversized-echoes-consistent-read-in-unprocessed-keys dynamodb.batchwriteitem-request-over-16mib-rejected-413-before-auth dynamodb.batch-write-over-25-rejected
+Issue-Trace-Ids: dynamodb.put-item-and-batch-write-item-size-limit-includes-all-projected-lsi-entry dynamodb.update-item-growth-over-size-limit-with-all-projected-lsi-entry dynamodb.transact-write-items-put-and-update-accept-flat-409600-byte-item dynamodb.update-item-if-not-exists-size-checked-before-condition dynamodb.batch-get-item-oversized-echoes-consistent-read-in-unprocessed-keys dynamodb.batchwriteitem-request-over-16mib-rejected-413-before-auth
 Issue-Shape-Id: com.amazonaws.dynamodb#DynamoDB_20120810
-Issue-Key: dynamodb.update-item-size-ceiling-counts-key-and-untouched-attribute-bytes|_error#17|AssertionError|raise AssertionError(f"expected UpdateItem to be rejected, but it succeeded: {result!r}")
 Issue-Key: dynamodb.put-item-and-batch-write-item-size-limit-includes-all-projected-lsi-entry|_error#15|AssertionError|raise AssertionError(f'expected the call to be refused, but it succeeded: {result!r}')
 Issue-Key: dynamodb.update-item-growth-over-size-limit-with-all-projected-lsi-entry|_error#16|AssertionError|raise AssertionError(f'expected the call to be refused, but it succeeded: {result!r}')
-Issue-Key: dynamodb.number-byte-cost-exact-at-400kb-boundary-put-item-and-batch-write-item|expect_error#6|AssertionError|raise AssertionError(f'expected the call to be refused, but it succeeded: {result!r}')
 Issue-Key: dynamodb.transact-write-items-put-and-update-accept-flat-409600-byte-item|run#26|AssertionError|assert code == ERR_TXN_CANCELLED, (
 Issue-Key: dynamodb.update-item-if-not-exists-size-checked-before-condition|_expect_error#4|AssertionError|assert got == (code, message), f'expected {(code, message)!r}, got {got!r}'
-Issue-Key: dynamodb.transact-get-items-aggregate-size-over-4mb-rejected|_error#13|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
 Issue-Key: dynamodb.batch-get-item-oversized-echoes-consistent-read-in-unprocessed-keys|run#10|AssertionError|assert spec is not None, (
 Issue-Key: dynamodb.batchwriteitem-request-over-16mib-rejected-413-before-auth|run#18|AssertionError|assert status == 400, f"a small unsigned body gave {status!r}, not 400: {body!r}"
-Issue-Key: dynamodb.batch-write-over-25-rejected|run#15|AssertionError|assert message == expected, f'expected message {expected!r}, got {message!r}'
 Issue-Related: 20261111T170613Z-dynamodb-partiql-statement-parser-rejects-aws-s-grammar.md
+Issue-Related: 20261120T090000Z-dynamodb-the-update-path-size-charge-the-n-byte-cost-and-the-over-25-clause.md
 Issue-Commit: cdd06381ed07ce191d4321618e22d6aefb363f32
 
 # dynamodb: item-size, batch-size and request-size ceilings are not enforced from the stored item, so oversized writes are accepted (10 causes)
@@ -69,3 +66,31 @@ Expected vs actual, verbatim from the replay:
 7. BatchGetItem 44 keys of ~389 KB items with ConsistentRead=true — expect a partial response naming the table in UnprocessedKeys.
 8. POST a BatchWriteItem body over 16 MiB with no valid signature — expect a 400-class request-size refusal, not 403.
 9. BatchWriteItem 26 PutRequests for one table — compare the message to the serialized-value form above.
+
+## Resolution
+
+Six of the ten causes are served, and the four that are not are re-grounded, with their replay
+keys, in `issues/things-that-do-not-work/20261120T090000Z-dynamodb-the-update-path-size-charge-the-n-byte-cost-and-the-over-25-clause.md`,
+so this report carries only the keys that replay clean.
+
+Served here:
+
+- Cause 2 — the item-size quota now charges the entry each LOCAL secondary index of the table
+  would hold for the item, on every write path and on the update path
+  (`state::Table::item_size_exceeded`, `state::update_charged_size`), which is how the quota is
+  published: "for each local secondary index on a table, there is a 400 KB limit on the total
+  size of the following: the data in the table item, plus the index key values and projected
+  attributes in the index entry". Tests: `tests/all/local_index_item_size_quota.rs`.
+- Cause 4 — an item a transaction's own change grows past the ceiling now CANCELS the
+  transaction and reports that action's `ValidationError` reason, on both transactional write
+  surfaces, as the `TransactionCanceledException` doc states; an item a `Put` CARRIES past the
+  ceiling still refuses the call.
+- Cause 7 — the documented 4 MB transactional aggregate is now ENFORCED on `TransactGetItems`,
+  measured over the items the store holds for the keys the call named, with nothing read and no
+  budget debited. Tests: `tests/all/transact_get_aggregate_size.rs`. Its refusal states the
+  sentence this service words that quota with on the write side; the recorded READ-side wording
+  differs and the replay withholds it, so that half of cause 7 — and its replay key — is carried
+  by the re-grounded issue above.
+- Causes 5 and 8 replay clean; cause 9's over-16 MiB body is refused 400 before credential
+  validation and its unit now fails later, on the clause a small SIGNED body earns, which the
+  open issue `20261119T104646Z-dynamodb-9-net-new-causes-vector-index-projection.md` carries.

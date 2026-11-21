@@ -350,9 +350,12 @@ fn assert_served(
 }
 
 /// Assert the change one byte past the boundary was REFUSED with the update path's sentence:
-/// as the CALL's own failure on the single-item, PartiQL and transactional surfaces — the
-/// ceiling is a quota on the item the change ASKS for, so a transaction is refused rather
-/// than cancelled — and as the slot's own error in a batch, which answers 200.
+/// as the CALL's own failure on the single-item and standalone PartiQL surfaces, as the
+/// failing ACTION's cancellation reason on both TRANSACTIONAL surfaces — "an item size
+/// becomes too large (larger than 400 KB) [...] because of changes made by the transaction"
+/// is one of the circumstances DynamoDB cancels a transaction under, and that sentence is one
+/// of the messages its `ValidationError` reason lists (the `TransactionCanceledException`
+/// doc) — and as the slot's own error in a batch, which answers 200.
 fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value)) {
     let (status, body) = answered;
     if surface == Surface::BatchExecuteStatement {
@@ -368,16 +371,20 @@ fn assert_refused(case: &str, surface: Surface, answered: &(u16, Value)) {
         );
         return;
     }
-    if surface == Surface::TransactWriteItems {
+    if surface == Surface::TransactWriteItems || surface == Surface::ExecuteTransaction {
         assert_eq!(
-            (*status, error_code(body).as_str(), message(body).as_str()),
-            (400, "ValidationException", UPDATE_TOO_BIG),
-            "case {case:?}: expected the call to be refused with the update-path ceiling \
-             refusal, got {status} with {body}"
+            (*status, error_code(body).as_str()),
+            (400, "TransactionCanceledException"),
+            "case {case:?}: expected the transaction cancelled, got {status} with {body}"
         );
-        assert!(
-            body.get("CancellationReasons").is_none(),
-            "case {case:?}: a refused call cancels nothing, got {body}"
+        assert_eq!(
+            (
+                body["CancellationReasons"][0]["Code"].as_str(),
+                body["CancellationReasons"][0]["Message"].as_str(),
+            ),
+            (Some("ValidationError"), Some(UPDATE_TOO_BIG)),
+            "case {case:?}: expected the action to report the update-path ceiling refusal, \
+             got {body}"
         );
         return;
     }
