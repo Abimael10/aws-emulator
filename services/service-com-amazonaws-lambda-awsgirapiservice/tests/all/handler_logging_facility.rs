@@ -286,7 +286,11 @@ fn rendered_record<'log>(log: &'log str, level: &str, message: &str) -> Vec<&'lo
 
 /// Whether `field` is the instant a rendered record carries: an ISO-8601 UTC instant to the
 /// millisecond, `YYYY-MM-DDTHH:MM:SS.mmmZ`.
-fn is_instant(field: &str) -> bool {
+///
+/// `pub(crate)` so the sibling suite that reads the SAME field off a delivered record
+/// ([`crate::node_console_record_framing`]) shares this one reading of the instant's form
+/// rather than keeping a second copy of it.
+pub(crate) fn is_instant(field: &str) -> bool {
     let bytes = field.as_bytes();
     bytes.len() == 24
         && bytes[10] == b'T'
@@ -299,7 +303,9 @@ fn is_instant(field: &str) -> bool {
 }
 
 /// The invocation's request id, read off the `START` line the runtime writes.
-fn request_id_of(case: &str, log: &str) -> String {
+///
+/// `pub(crate)` for the reason [`is_instant`] is.
+pub(crate) fn request_id_of(case: &str, log: &str) -> String {
     log.lines()
         .find_map(|line| line.strip_prefix("START RequestId: "))
         .and_then(|rest| rest.split_whitespace().next())
