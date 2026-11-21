@@ -13,8 +13,12 @@
 //! retry attempts to make before the request fails" (modelled `range 0..185`): an
 //! UPPER BOUND on the retries a failure worth retrying may spend, never a count to
 //! report, so the figure a report carries is independent of the figure the schedule
-//! states and of `MaximumEventAgeInSeconds` (modelled `range 60..86400`), which such
-//! an invocation spends none of either.
+//! states and of `MaximumEventAgeInSeconds` (modelled `range 60..86400`), of which such
+//! an invocation spends no attempt either. What the age window still decides for such an
+//! invocation — whether it ran out of TIME before a further attempt of it could have
+//! been made, which is the bound its report then names — is
+//! `tests/all/retry_exhaustion_condition.rs`, so a row here only states what its own
+//! age window makes of that.
 //!
 //! RULE: a write that states a new cap changes the CONFIGURATION and nothing else:
 //! `GetSchedule` reports the cap the last write stated, while the next occurrence's
@@ -46,9 +50,10 @@ use crate::schedule_invocation::{
     scheduler, seconds_from_now, POLL_INTERVAL,
 };
 
-/// How long a case keeps watching a queue whose reports have all arrived: well past
-/// the retry interval a failure worth retrying would have been made again after, so a
-/// second report of one invocation would have had its chance to arrive.
+/// How long a case keeps watching a queue whose reports have all arrived, so a second
+/// report of one invocation would have had its chance to arrive. Nothing is asserted
+/// about how long anything took: the window is only how long the absence is watched
+/// for.
 const QUIET_WINDOW: Duration = Duration::from_secs(10);
 
 /// How far ahead of the write each case's own `at(...)` occurrence stands.
@@ -80,6 +85,10 @@ const LONGEST_EVENT_AGE: i64 = 86_400;
 /// The shortest `MaximumEventAgeInSeconds` that member admits.
 const SHORTEST_EVENT_AGE: i64 = 60;
 
+/// The member an invocation that ran out of TIME names as the bound that ended it, as
+/// `RetryPolicy` spells it.
+const MAXIMUM_EVENT_AGE_IN_SECONDS: &str = "MaximumEventAgeInSeconds";
+
 /// One row: the retry policy the schedule states, over the published range of both of
 /// `RetryPolicy`'s members.
 struct Row {
@@ -89,6 +98,9 @@ struct Row {
     cap: Option<i64>,
     /// `Target.RetryPolicy.MaximumEventAgeInSeconds`, stated beside the cap.
     event_age: Option<i64>,
+    /// The bound the report names as having ended the attempts: none for a row whose
+    /// age window would still have admitted the next attempt.
+    condition: Option<&'static str>,
 }
 
 const ROWS: &[Row] = &[
@@ -96,21 +108,28 @@ const ROWS: &[Row] = &[
         case: "no retry policy at all",
         cap: None,
         event_age: None,
+        condition: None,
     },
     Row {
         case: "a policy admitting no retry",
         cap: Some(0),
         event_age: Some(LONGEST_EVENT_AGE),
+        condition: None,
     },
     Row {
         case: "a cap between the bounds, at the shortest event age",
         cap: Some(3),
         event_age: Some(SHORTEST_EVENT_AGE),
+        // The shortest window the member admits is no longer than the span this service
+        // leaves between two attempts, so this invocation was out of time before the
+        // retry its cap still admitted could have been made.
+        condition: Some(MAXIMUM_EVENT_AGE_IN_SECONDS),
     },
     Row {
         case: "the most retries the member admits",
         cap: Some(MOST_RETRY_ATTEMPTS),
         event_age: Some(LONGEST_EVENT_AGE),
+        condition: None,
     },
 ];
 
@@ -191,12 +210,13 @@ async fn a_withheld_invocation_reports_the_attempts_it_made_whatever_the_cap_adm
             Some("Number"),
             "case {case:?}: expected the attempt count reported as a figure, got {report}"
         );
-        // Neither bound was spent, so neither of them ended the attempts.
+        // The attempt allowance was not spent, so what the report names — if anything —
+        // is the age window having closed before a further attempt could be made.
         assert_eq!(
-            attribute("EXHAUSTED_RETRY_CONDITION"),
-            None,
-            "case {case:?}: expected no exhausted-retry condition for a refusal no retry was \
-             made of, got {report}"
+            attribute("EXHAUSTED_RETRY_CONDITION").as_deref(),
+            row.condition,
+            "case {case:?}: expected the exhausted-retry condition {:?}, got {report}",
+            row.condition
         );
         let detail = attribute("ERROR_MESSAGE").unwrap_or_default();
         for expected in [WITHHELD_ACTION, target_arn.as_str()] {

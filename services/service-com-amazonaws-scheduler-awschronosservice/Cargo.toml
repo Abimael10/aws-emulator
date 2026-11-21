@@ -43,6 +43,11 @@ service-common = { path = "../common" }
 # access key id speaks for, and the identity-based policies in force on it, which is what
 # the `iam:PassRole` gate decides a pass of a target's role against (`state::pass_role`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The CloudWatch service's OWN state, written through the shared engine: the counts this
+# service publishes about its own invocations live in the very store `ListMetrics` and
+# `GetMetricStatistics` read, because a metric in an `AWS/` namespace is never published
+# over `PutMetricData` (`state::schedule_metrics`).
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # The `cron(...)` and `at(...)` halves of a `ScheduleExpression` are read by
 # maintained parsers rather than by a hand-written grammar; `chrono` is what the
 # cron parser is written in, and `chrono-tz` carries the IANA database a

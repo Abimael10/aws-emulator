@@ -3,12 +3,13 @@
 //! EventBridge Scheduler resolves a schedule's execution role against IAM.
 //!
 //! The rule under test: EventBridge Scheduler resolves `Target.RoleArn` when a schedule is
-//! CREATED — not when it fires, and not on every later write — and refuses the create with
-//! HTTP 400 `ValidationException`, persisting nothing, unless that role exists in this
-//! account and its trust policy lets the Scheduler service principal assume it. A request
-//! naming a role that does exist and does trust Scheduler is created normally. `UpdateSchedule`
-//! does NOT re-resolve it: once a schedule exists, the role it names is the invocation's
-//! problem, so an update applies even when that role has since been deleted.
+//! WRITTEN — on `CreateSchedule` and on `UpdateSchedule` alike, rather than when it fires —
+//! and refuses that write with HTTP 400 `ValidationException`, changing nothing, unless
+//! that role exists in this account and its trust policy lets the Scheduler service
+//! principal assume it. A request naming a role that does exist and does trust Scheduler is
+//! written normally. So a refused `UpdateSchedule` leaves the stored `Target.RoleArn`
+//! exactly as the last accepted write left it, and the schedule keeps delivering under that
+//! role.
 //!
 //! This suite needs TWO services on one engine — the scheduler reaches IAM
 //! through the in-process callback, so a single-service router has no IAM to ask
@@ -417,11 +418,13 @@ fn a_schedule_is_written_only_for_an_execution_role_iam_holds_and_scheduler_may_
                 }
             }
 
-            // `UpdateSchedule` does NOT apply the gate: the role is assumed when
-            // the schedule is INVOKED, so once a schedule exists every update to
-            // it applies, whatever IAM now holds for the role it names. Every row
-            // is a role the CREATE path above refused, so each proves the
-            // difference between the two paths rather than the state of one role.
+            // `UpdateSchedule` applies the SAME gate: the role is resolved by every write
+            // that states one, so an update naming a role this account cannot let Scheduler
+            // assume is refused and changes nothing — the schedule keeps the role its last
+            // accepted write left on it. Every row is a role the CREATE path above refused,
+            // one of them the schedule's OWN role deleted out of band, so each proves the
+            // gate is the role's rather than one path's.
+            let kept_role = role_arn("scheduler-role");
             let update_cases: [(&str, String); 3] = [
                 // The role the schedule was created with, DELETED out of band and
                 // then re-affirmed by the update.
@@ -452,9 +455,15 @@ fn a_schedule_is_written_only_for_an_execution_role_iam_holds_and_scheduler_may_
                     Some(schedule_body(&role_arn)),
                 );
                 assert_eq!(
-                    status, 200,
-                    "case {case:?}: UpdateSchedule must apply whatever IAM holds for the \
-                     role, got {status} {body}"
+                    (status, error_code(&body).as_str()),
+                    (400, "ValidationException"),
+                    "case {case:?}: UpdateSchedule must refuse a role Scheduler cannot \
+                     assume, got {status} {body}"
+                );
+                assert_eq!(
+                    error_message(&body),
+                    ROLE_REFUSAL,
+                    "case {case:?}: expected the execution-role refusal, got {body}"
                 );
                 let (status, body) =
                     scheduler(&router, &runtime, "GET", "/schedules/trusted", None);
@@ -465,13 +474,13 @@ fn a_schedule_is_written_only_for_an_execution_role_iam_holds_and_scheduler_may_
                             .and_then(|target| target.get("RoleArn"))
                             .and_then(serde_json::Value::as_str)
                     ),
-                    (200, Some(role_arn.as_str())),
-                    "case {case:?}: the update must have applied, dangling reference and \
-                     all, got {status} {body}"
+                    (200, Some(kept_role.as_str())),
+                    "case {case:?}: a refused update must leave the stored role as it was, \
+                     got {status} {body}"
                 );
 
-                // The CREATE path still resolves that same role, so the gate moved
-                // off `UpdateSchedule` rather than off the service.
+                // The CREATE path refuses that same role in the same words, so the gate is
+                // the role's and not one operation's.
                 let (status, body) = scheduler(
                     &router,
                     &runtime,
@@ -491,6 +500,34 @@ fn a_schedule_is_written_only_for_an_execution_role_iam_holds_and_scheduler_may_
                     "case {case:?}: expected the execution-role refusal, got {body}"
                 );
             }
+
+            // The control: an update naming a role this account DOES hold and Scheduler may
+            // assume is served and applied, so what the rows above are refused by is the
+            // role they name rather than the operation they use.
+            let assumable = role_arn("scheduler-role-lists");
+            let (status, body) = scheduler(
+                &router,
+                &runtime,
+                "PUT",
+                "/schedules/trusted",
+                Some(schedule_body(&assumable)),
+            );
+            assert_eq!(
+                status, 200,
+                "case \"an assumable role\": UpdateSchedule must be served, got {status} \
+                 {body}"
+            );
+            let (status, body) = scheduler(&router, &runtime, "GET", "/schedules/trusted", None);
+            assert_eq!(
+                (
+                    status,
+                    body.get("Target")
+                        .and_then(|target| target.get("RoleArn"))
+                        .and_then(serde_json::Value::as_str)
+                ),
+                (200, Some(assumable.as_str())),
+                "case \"an assumable role\": the update must have applied, got {status} {body}"
+            );
         })
         .expect("spawn the execution-role thread")
         .join()

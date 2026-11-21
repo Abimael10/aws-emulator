@@ -29,6 +29,10 @@
 //! `Target$Input`'s service maximum, which the model does not state — is
 //! [`target_input`].
 //!
+//! What a client can see of the invocations a store has MADE, beside the effect each
+//! had on its target — the counts EventBridge Scheduler publishes about its own
+//! deliveries, their failures and their dead-letter route — is [`schedule_metrics`].
+//!
 //! Whether the CALLER may hand this service the execution role its request names at
 //! all — the `iam:PassRole` every operation that carries a `Target.RoleArn` charges
 //! against the calling principal's own policies — is [`pass_role`]. Whether the caller may
@@ -49,12 +53,15 @@ pub mod caller_authorization;
 pub mod caller_identity;
 pub mod invocation;
 pub mod pass_role;
+pub mod schedule_metrics;
 
 pub use caller_authorization::{caller_denial, ANY_RESOURCE};
+pub use dead_letter::RETRY_INTERVAL;
 pub(crate) use event_bridge_target::event_bridge_target_violation;
 pub use invocation::{drive_invocation_clock, Invocations};
 pub use occurrence::Occurrences;
 pub use schedule_definition::*;
+pub use schedule_metrics::ScheduleMetrics;
 pub use server_defaults::{
     fill_server_defaults, DEFAULT_ACTION_AFTER_COMPLETION, DEFAULT_MAXIMUM_EVENT_AGE_IN_SECONDS,
     DEFAULT_MAXIMUM_RETRY_ATTEMPTS, DEFAULT_SCHEDULE_EXPRESSION_TIMEZONE,
@@ -671,16 +678,17 @@ fn trust_policy_admits(document: &str, principal: &str) -> bool {
 
 /// Refuse a target whose execution role EventBridge Scheduler could not assume.
 ///
-/// EventBridge Scheduler resolves `Target.RoleArn` against IAM when the schedule
-/// is CREATED and refuses that create with 400 `ValidationException`, persisting
-/// nothing, unless the role exists in this account and its trust policy lets the
-/// Scheduler service principal assume it. It is NOT resolved again on every later
-/// control-plane write: the role is assumed when the schedule is invoked, so
-/// `UpdateSchedule` applies whatever IAM holds for the role by then — which is why
-/// only `CreateSchedule` calls this.
-/// IAM is reached the way any emulated service reaches another: through the
-/// in-process callback ([`smithy_server_runtime::OperationContext::callback`]),
-/// so this crate names no other service crate.
+/// EventBridge Scheduler resolves `Target.RoleArn` against IAM on every write that
+/// states one — `CreateSchedule` and `UpdateSchedule` alike — and refuses that write
+/// with 400 `ValidationException`, changing nothing, unless the role exists in this
+/// account and its trust policy lets the Scheduler service principal assume it. So an
+/// update naming a role that cannot be assumed leaves the stored `Target.RoleArn`
+/// exactly as the last accepted write left it, and the schedule keeps delivering under
+/// that role.
+///
+/// IAM is reached the way one emulated service reaches another's API: through the
+/// in-process callback ([`smithy_server_runtime::OperationContext::callback`]), so the
+/// role is resolved by the very handlers a client's own `GetRole` would reach.
 ///
 /// `None` means the schedule may be written. That includes the case where this
 /// emulator has no IAM to ask (a router with only this service mounted, say):

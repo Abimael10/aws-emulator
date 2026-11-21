@@ -93,6 +93,9 @@
 //! the question — which failures are worth another attempt, how many attempts the
 //! policy admits, and what the dead-letter message carries — is [`super::dead_letter`];
 //! the attempts themselves wait on this clock, so nothing sleeps between them either.
+//! Each of those events is also COUNTED where a client can watch them in aggregate:
+//! the attempt made, the target call that failed, the invocation given up on and the
+//! dead-letter write ([`super::schedule_metrics`]).
 //!
 //! The remaining templated target kinds (the ECS task, the Kinesis stream and the
 //! SageMaker pipeline) are NOT invoked here: an occurrence whose target
@@ -111,6 +114,11 @@ use super::dead_letter::{
     RETRY_INTERVAL,
 };
 use super::event_bridge_target::{names_event_bus, EVENTS_ARN_NAMESPACE};
+use super::schedule_metrics::{
+    ScheduleMetrics, INVOCATIONS_FAILED_TO_BE_SENT_TO_DEAD_LETTER_COUNT,
+    INVOCATIONS_SENT_TO_DEAD_LETTER_COUNT, INVOCATION_ATTEMPT_COUNT, INVOCATION_DROPPED_COUNT,
+    TARGET_ERROR_COUNT,
+};
 use super::universal_target::{self, UniversalCall};
 use super::{
     occurrence::Occurrences, service_state, ComAmazonawsSchedulerAwschronosserviceState,
@@ -366,6 +374,9 @@ struct Firing {
 struct Pending {
     /// The schedule the invocation belongs to.
     schedule_arn: String,
+    /// The schedule GROUP it belongs to, which is the dimension its counts are
+    /// published per ([`super::schedule_metrics`]).
+    group: String,
     /// The Region the schedule itself is in, which a target ARN labelled with none is
     /// reached in.
     region: String,
@@ -778,6 +789,9 @@ pub fn drive_invocation_clock<Eng: Send + Sync + 'static>(
     };
     let callback = callback.clone();
     let claimed = ::engine::ServiceState::clone(&state);
+    // The publisher of what this clock's invocations come to, resolved once from the
+    // same shared engine the schedules live in.
+    let metrics = ScheduleMetrics::of(&**engine);
     let engine = ::std::sync::Arc::clone(engine);
     let running = runtime.spawn(async move {
         for _ in 0..MAX_CLOCK_TICKS {
@@ -799,13 +813,13 @@ pub fn drive_invocation_clock<Eng: Send + Sync + 'static>(
                 (firing, store.invocations.take_due_attempts(now))
             };
             for occurrence in firing {
-                invoke(&state, &callback, &occurrence).await;
+                invoke(&state, &callback, &metrics, &occurrence).await;
             }
             // A further attempt of an invocation is made after this tick's own
             // occurrences, so a target that keeps refusing never holds up the
             // schedules whose occurrences are due beside it.
             for pending in retrying {
-                attempt(&state, &callback, pending).await;
+                attempt(&state, &callback, &metrics, pending).await;
             }
             // A schedule's action is applied only AFTER the occurrences of this
             // tick have been handed to their targets: a schedule completes "after
@@ -829,6 +843,7 @@ pub fn drive_invocation_clock<Eng: Send + Sync + 'static>(
 async fn invoke(
     state: &::engine::ServiceState<ComAmazonawsSchedulerAwschronosserviceState>,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
+    metrics: &ScheduleMetrics,
     occurrence: &Firing,
 ) {
     let schedule = &occurrence.schedule;
@@ -852,8 +867,10 @@ async fn invoke(
     attempt(
         state,
         callback,
+        metrics,
         Pending {
             schedule_arn: schedule.arn.clone(),
+            group: schedule.group.clone(),
             region,
             target,
             nominal: occurrence.nominal,
@@ -874,9 +891,14 @@ async fn invoke(
 /// failure it does not is reported to the schedule's dead-letter queue
 /// ([`dead_letter`]). Nothing sleeps for the wait between two attempts: the due
 /// instant is stored and the clock performs the attempt it has already made due.
+///
+/// Every attempt that was MADE is counted, and so is each of the things it came to:
+/// the target call that failed, the invocation no further attempt will be made of, and
+/// the dead-letter write ([`super::schedule_metrics`]).
 async fn attempt(
     state: &::engine::ServiceState<ComAmazonawsSchedulerAwschronosserviceState>,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
+    metrics: &ScheduleMetrics,
     mut pending: Pending,
 ) {
     pending.attempts = pending.attempts.saturating_add(1);
@@ -888,8 +910,14 @@ async fn attempt(
         pending.attempts,
     );
     let failure = match perform(callback, &pending, &body).await {
-        Attempt::Delivered => return,
+        Attempt::Delivered => {
+            metrics.count(&pending.group, INVOCATION_ATTEMPT_COUNT);
+            return;
+        }
         Attempt::NotAttempted(why) => {
+            // Nothing was attempted, so there is no attempt to count and nothing
+            // failed: a target kind this emulator does not invoke is not a delivery
+            // that went wrong.
             ::tracing::warn!(
                 schedule = %pending.schedule_arn,
                 target = %pending.target.arn,
@@ -900,19 +928,16 @@ async fn attempt(
         }
         Attempt::Failed(failure) => failure,
     };
+    metrics.count(&pending.group, INVOCATION_ATTEMPT_COUNT);
+    metrics.count(&pending.group, TARGET_ERROR_COUNT);
     // The attempts already made BEYOND the first are the retries the policy counts.
     let retries_made = pending.attempts.saturating_sub(1);
     let next = after(SystemTime::now(), RETRY_INTERVAL);
-    let exhausted = if failure.retryable {
-        RetryBounds::of(pending.target.retry_policy.as_ref()).exhausted(
-            retries_made,
-            next.duration_since(pending.began).unwrap_or_default(),
-        )
-    } else {
-        // A refusal of the request itself spends neither bound: it is the
-        // invocation's last attempt however many the policy would have admitted.
-        None
-    };
+    let exhausted = RetryBounds::of(pending.target.retry_policy.as_ref()).ended(
+        retries_made,
+        next.duration_since(pending.began).unwrap_or_default(),
+        failure.retryable,
+    );
     if failure.retryable && exhausted.is_none() {
         let mut held = pending.clone();
         held.due = next;
@@ -920,11 +945,23 @@ async fn attempt(
             return;
         }
     }
+    // No further attempt of this invocation will be made, so the occurrence it belongs
+    // to delivered nothing.
+    metrics.count(&pending.group, INVOCATION_DROPPED_COUNT);
     // What is reported is the failed EVENT — the request the attempt carried to the
     // target's own API ([`failed_event`]) — rather than the bare payload the target
     // was to be handed.
     let event = failed_event(&pending.target, &pending.region, &body);
-    dead_letter(callback, &pending, &event, &failure, exhausted, retries_made).await;
+    dead_letter(
+        callback,
+        metrics,
+        &pending,
+        &event,
+        &failure,
+        exhausted,
+        retries_made,
+    )
+    .await;
 }
 
 /// WHAT one occurrence calls, which is what the target's own ARN names.
@@ -1335,9 +1372,12 @@ fn failed_event(target: &Target, region: &str, payload: &str) -> String {
 /// as well — a dead-letter queue is reached by the same `sqs:SendMessage` a queue
 /// target is, which is the grant AWS documents for one — so a role that may not write
 /// to that queue leaves the failure in this emulator's log alone, which is also all a
-/// schedule naming no such queue leaves behind.
+/// schedule naming no such queue leaves behind. Whether the write was MADE is counted
+/// either way ([`super::schedule_metrics`]): a failure reported nowhere a client can
+/// read it is the one thing an aggregate view of this service must still show.
 async fn dead_letter(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
+    metrics: &ScheduleMetrics,
     pending: &Pending,
     event: &str,
     failure: &Failure,
@@ -1368,6 +1408,10 @@ async fn dead_letter(
     let url = ::service_common::arn::parse_of(queue_arn, SQS_ARN_NAMESPACE)
         .and_then(|parsed| queue_url(region, parsed.account, parsed.resource));
     let Some(url) = url else {
+        metrics.count(
+            &pending.group,
+            INVOCATIONS_FAILED_TO_BE_SENT_TO_DEAD_LETTER_COUNT,
+        );
         ::tracing::warn!(
             schedule = %pending.schedule_arn,
             dead_letter_queue = %queue_arn,
@@ -1382,6 +1426,10 @@ async fn dead_letter(
     if let Some(withheld) =
         withheld_action(callback, pending, send_refusal, SEND_MESSAGE_ACTION, queue_arn).await
     {
+        metrics.count(
+            &pending.group,
+            INVOCATIONS_FAILED_TO_BE_SENT_TO_DEAD_LETTER_COUNT,
+        );
         ::tracing::warn!(
             schedule = %pending.schedule_arn,
             dead_letter_queue = %queue_arn,
@@ -1420,6 +1468,10 @@ async fn dead_letter(
         }
     }
     if let Err(error) = request.send().await {
+        metrics.count(
+            &pending.group,
+            INVOCATIONS_FAILED_TO_BE_SENT_TO_DEAD_LETTER_COUNT,
+        );
         ::tracing::warn!(
             schedule = %pending.schedule_arn,
             dead_letter_queue = %queue_arn,
@@ -1427,7 +1479,9 @@ async fn dead_letter(
             "an EventBridge Scheduler invocation was not dead-lettered: the dead-letter queue \
              did not accept it"
         );
+        return;
     }
+    metrics.count(&pending.group, INVOCATIONS_SENT_TO_DEAD_LETTER_COUNT);
 }
 
 /// Hand `body` to the target `target.arn` names, through the one API that target's
@@ -2105,6 +2159,7 @@ mod tests {
         let waiting = |due: SystemTime| Pending {
             schedule_arn: "arn:aws:scheduler:eu-west-2:000000000000:schedule/default/nightly"
                 .to_string(),
+            group: "default".to_string(),
             region: "eu-west-2".to_string(),
             target: Target::default(),
             nominal: now,

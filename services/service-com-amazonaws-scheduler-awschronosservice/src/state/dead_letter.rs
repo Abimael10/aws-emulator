@@ -31,7 +31,13 @@
 //! request itself — the permissions the invocation is made under withhold the call,
 //! the target does not exist, the request is not one the target accepts — fails the
 //! same way however often it is repeated, so such an attempt is the invocation's
-//! last whatever the retry policy admits ([`failure_of`]).
+//! last whatever the retry policy admits ([`failure_of`]). The invocation's own AGE
+//! is not spent that way: the attempt ALLOWANCE is spent only by attempts actually made,
+//! so a failure never worth repeating spends none of it and that bound ends nothing,
+//! while the clock runs whatever the failure was — so an invocation whose next attempt
+//! would fall outside its `MaximumEventAgeInSeconds` window ran out of time, which is the
+//! bound its report names ([`RetryBounds::ended`]), and one inside that window whose
+//! failure was never repeated ends on no bound at all and names none.
 
 use std::time::Duration;
 
@@ -56,15 +62,22 @@ pub(crate) const DEFAULT_MAXIMUM_EVENT_AGE: Duration =
 
 /// How long after a failed attempt the next attempt falls due.
 ///
-/// AWS makes its retries "with exponential backoff" and publishes no schedule for
-/// them, so this span is CHOSEN: short enough that an invocation whose schedule
-/// states a few attempts reaches its dead-letter route while a client is still
-/// watching for it, and long enough that a default policy's attempts span more than
-/// the shortest `MaximumEventAgeInSeconds` a schedule may state — so the age bound
-/// still ends a series of retries the attempt count alone would not. Nothing sleeps
-/// for it: the next attempt's instant is stored and the clock performs the attempt
-/// once it has already fallen due.
-pub(crate) const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// `MaximumRetryAttempts` documents only that "retry attempts with exponential backoff
+/// continue until either the maximum number of attempts is made or until the duration of
+/// the `MaximumEventAgeInSeconds` is reached": AWS publishes no spacing for those
+/// attempts, so the figure is this emulator's CHOSEN one. What it is chosen against is
+/// the one thing a client can observe about the spacing — which bound a dead-letter
+/// report names. Two invocations of the same failing target, differing only in the age
+/// window their schedules state, are reported differently: the one whose
+/// `MaximumEventAgeInSeconds` is the SHORTEST the member admits (modelled
+/// `range 60..86400`) is reported as having run out of TIME, with no retry made, however
+/// many attempts its policy still admitted, while the one stating the longest window is
+/// reported as having spent no bound at all. So the next attempt of an invocation falls
+/// no sooner than that shortest window, which is this span — and a schedule stating that
+/// shortest window is therefore out of time before a retry of it is made, which is what
+/// such a schedule's report says. Nothing sleeps for it: the next attempt's instant is
+/// stored and the clock performs the attempt once it has already fallen due.
+pub const RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The error code reported for a failure whose answer carried none.
 ///
@@ -124,6 +137,9 @@ const NUMBER_TYPE: &str = "Number";
 /// names it — which is what the dead-letter message reports the condition as.
 const MAXIMUM_EVENT_AGE_MEMBER: &str = "MaximumEventAgeInSeconds";
 
+/// See [`MAXIMUM_EVENT_AGE_MEMBER`]: the other bound a series of attempts can end on.
+const MAXIMUM_RETRY_ATTEMPTS_MEMBER: &str = "MaximumRetryAttempts";
+
 /// Why one delivery attempt did not reach its target.
 #[derive(Debug, Clone)]
 pub(crate) struct Failure {
@@ -158,6 +174,17 @@ pub(crate) enum Exhaustion {
     MaximumEventAge,
 }
 
+impl Exhaustion {
+    /// The `RetryPolicy` member this bound is stated by, which is how a dead-letter
+    /// message names the condition that ended the attempts.
+    pub(crate) fn member(self) -> &'static str {
+        match self {
+            Self::MaximumRetryAttempts => MAXIMUM_RETRY_ATTEMPTS_MEMBER,
+            Self::MaximumEventAge => MAXIMUM_EVENT_AGE_MEMBER,
+        }
+    }
+}
+
 /// The bounds one schedule's retry policy puts on an invocation's attempts.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RetryBounds {
@@ -181,23 +208,31 @@ impl RetryBounds {
         Self { retries, age }
     }
 
-    /// Which bound a further attempt would exceed, or `None` while these bounds
-    /// admit one.
+    /// Which bound ENDED this invocation's attempts, or `None` while they are not
+    /// over.
     ///
     /// `retries_made` counts the attempts already made BEYOND the first, and
-    /// `age_at_next` is how old the invocation would be when that further attempt
-    /// was made: retries "continue until either the maximum number of attempts is
-    /// made or until the duration of the `MaximumEventAgeInSeconds` is reached", so
-    /// either figure reaching its bound ends them, and the attempt count is reported
-    /// first because it is the one the policy states as a count of attempts.
-    pub(crate) fn exhausted(&self, retries_made: u32, age_at_next: Duration) -> Option<Exhaustion> {
-        if retries_made >= self.retries {
+    /// `age_at_next` is how old the invocation would be when a further attempt was
+    /// made: retries "continue until either the maximum number of attempts is made or
+    /// until the duration of the `MaximumEventAgeInSeconds` is reached", so whichever of
+    /// the two the invocation reaches first is the one that ended them.
+    ///
+    /// The two bounds are spent differently by a failure that is not worth repeating
+    /// (`retryable`): no attempt of it is made again, so it spends none of the attempt
+    /// ALLOWANCE and that bound ends nothing however much of the allowance the attempts
+    /// made had already used — while the invocation's own age is the clock's and runs
+    /// whatever the failure was, so an invocation whose next attempt would fall outside
+    /// the age window is one that ran out of time, which ends it either way.
+    pub(crate) fn ended(
+        &self,
+        retries_made: u32,
+        age_at_next: Duration,
+        retryable: bool,
+    ) -> Option<Exhaustion> {
+        if retryable && retries_made >= self.retries {
             return Some(Exhaustion::MaximumRetryAttempts);
         }
-        if age_at_next >= self.age {
-            return Some(Exhaustion::MaximumEventAge);
-        }
-        None
+        (age_at_next >= self.age).then_some(Exhaustion::MaximumEventAge)
     }
 }
 
@@ -237,10 +272,10 @@ pub(crate) struct Attribute {
 /// was, the instant it was scheduled at, how many retries it took, and the failure
 /// that ended it.
 ///
-/// `EXHAUSTED_RETRY_CONDITION` is reported for the event-age bound alone: it names
-/// the condition the retries ran OUT of time on, so an invocation whose attempts
-/// were used up — and one whose failure was never retryable, which spent none of
-/// either bound — carries no such attribute.
+/// `EXHAUSTED_RETRY_CONDITION` names the bound that ENDED the attempts, by the member
+/// name the retry policy states it under, and is carried only by an invocation one of
+/// those bounds ended: an invocation whose failure was never worth repeating and whose
+/// age bound was still ahead of it ran out of neither, so it carries no such attribute.
 pub(crate) fn dead_letter_attributes(report: &Report<'_>) -> Vec<Attribute> {
     let text = |name: &'static str, value: &str| Attribute {
         name,
@@ -260,11 +295,8 @@ pub(crate) fn dead_letter_attributes(report: &Report<'_>) -> Vec<Attribute> {
         text(SCHEDULED_TIME_ATTRIBUTE, report.scheduled_time),
         text(TARGET_ARN_ATTRIBUTE, report.target_arn),
     ];
-    if report.exhausted == Some(Exhaustion::MaximumEventAge) {
-        attributes.push(text(
-            EXHAUSTED_RETRY_CONDITION_ATTRIBUTE,
-            MAXIMUM_EVENT_AGE_MEMBER,
-        ));
+    if let Some(bound) = report.exhausted {
+        attributes.push(text(EXHAUSTED_RETRY_CONDITION_ATTRIBUTE, bound.member()));
     }
     attributes
 }
@@ -446,56 +478,158 @@ mod tests {
         }
     }
 
+    /// One row of the table below: the policy's bounds, how far the attempts have got,
+    /// and which bound that leaves the invocation ended on.
+    struct Ending {
+        case: &'static str,
+        /// `RetryPolicy$MaximumRetryAttempts`, as the bounds hold it.
+        retries: u32,
+        /// `RetryPolicy$MaximumEventAgeInSeconds`, in seconds.
+        age: u64,
+        /// The attempts already made beyond the first.
+        retries_made: u32,
+        /// How old the invocation would be when a further attempt was made, in seconds.
+        age_at_next: u64,
+        /// Whether another attempt of the failure could come to anything else.
+        retryable: bool,
+        /// The bound that ended the attempts, or `None` for an invocation neither
+        /// bound ended.
+        ended: Option<Exhaustion>,
+    }
+
     /// Either bound ends the attempts, and the one that ends them is the one the
     /// report names: the rows differ along which bound the invocation meets first,
-    /// including the row where neither is met yet.
+    /// including the row where neither is met yet, along the allowance the policy
+    /// states (from no retry at all to several), and along whether the failure was one
+    /// another attempt could have come to anything else — which is what decides whether
+    /// the attempt ALLOWANCE was spent at all.
     #[test]
     fn either_bound_ends_the_attempts() {
-        let bounds = RetryBounds {
-            retries: 3,
-            age: Duration::from_secs(60),
-        };
-        // (case, the retries already made, the age the next attempt would be at,
-        //  which bound that exhausts)
-        let rows: [(&str, u32, u64, Option<Exhaustion>); 6] = [
-            ("the first failure of a policy admitting retries", 0, 1, None),
-            ("a retry inside both bounds", 2, 30, None),
-            (
-                "the retry that reaches the attempt count",
-                3,
-                30,
-                Some(Exhaustion::MaximumRetryAttempts),
-            ),
-            (
-                "an attempt count past its bound",
-                9,
-                30,
-                Some(Exhaustion::MaximumRetryAttempts),
-            ),
-            (
-                "the attempt that reaches the event age",
-                1,
-                60,
-                Some(Exhaustion::MaximumEventAge),
-            ),
-            (
-                "an age past its bound",
-                1,
-                3_600,
-                Some(Exhaustion::MaximumEventAge),
-            ),
+        let rows: [Ending; 11] = [
+            Ending {
+                case: "the first failure of a policy admitting retries",
+                retries: 3,
+                age: 60,
+                retries_made: 0,
+                age_at_next: 1,
+                retryable: true,
+                ended: None,
+            },
+            Ending {
+                case: "a retry inside both bounds",
+                retries: 3,
+                age: 60,
+                retries_made: 2,
+                age_at_next: 30,
+                retryable: true,
+                ended: None,
+            },
+            Ending {
+                case: "the retry that reaches the attempt count",
+                retries: 3,
+                age: 60,
+                retries_made: 3,
+                age_at_next: 30,
+                retryable: true,
+                ended: Some(Exhaustion::MaximumRetryAttempts),
+            },
+            Ending {
+                case: "an attempt count past its bound",
+                retries: 3,
+                age: 60,
+                retries_made: 9,
+                age_at_next: 30,
+                retryable: true,
+                ended: Some(Exhaustion::MaximumRetryAttempts),
+            },
+            Ending {
+                case: "a policy admitting no retry at all",
+                retries: 0,
+                age: 60,
+                retries_made: 0,
+                age_at_next: 1,
+                retryable: true,
+                ended: Some(Exhaustion::MaximumRetryAttempts),
+            },
+            Ending {
+                case: "the attempt that reaches the event age",
+                retries: 3,
+                age: 60,
+                retries_made: 1,
+                age_at_next: 60,
+                retryable: true,
+                ended: Some(Exhaustion::MaximumEventAge),
+            },
+            Ending {
+                case: "an age past its bound",
+                retries: 3,
+                age: 60,
+                retries_made: 1,
+                age_at_next: 3_600,
+                retryable: true,
+                ended: Some(Exhaustion::MaximumEventAge),
+            },
+            Ending {
+                case: "a failure never worth repeating, inside the age window",
+                retries: 3,
+                age: 60,
+                retries_made: 0,
+                age_at_next: 1,
+                retryable: false,
+                ended: None,
+            },
+            Ending {
+                case: "a failure never worth repeating, past the attempt count",
+                retries: 3,
+                age: 60,
+                retries_made: 9,
+                age_at_next: 30,
+                retryable: false,
+                ended: None,
+            },
+            Ending {
+                // The allowance is spent and the window is closed: a failure no further
+                // attempt could change spends no allowance, so what ended it is the time.
+                case: "a failure never worth repeating under a policy admitting no retry",
+                retries: 0,
+                age: 60,
+                retries_made: 0,
+                age_at_next: 60,
+                retryable: false,
+                ended: Some(Exhaustion::MaximumEventAge),
+            },
+            Ending {
+                case: "a failure never worth repeating, out of time",
+                retries: 3,
+                age: 60,
+                retries_made: 0,
+                age_at_next: 60,
+                retryable: false,
+                ended: Some(Exhaustion::MaximumEventAge),
+            },
         ];
-        for (case, retries_made, age, expected) in rows {
-            let exhausted = bounds.exhausted(retries_made, Duration::from_secs(age));
+        for row in rows {
+            let case = row.case;
+            let bounds = RetryBounds {
+                retries: row.retries,
+                age: Duration::from_secs(row.age),
+            };
+            let ended = bounds.ended(
+                row.retries_made,
+                Duration::from_secs(row.age_at_next),
+                row.retryable,
+            );
             assert_eq!(
-                exhausted, expected,
-                "case {case:?}: expected {expected:?}, got {exhausted:?}"
+                ended, row.ended,
+                "case {case:?}: expected {:?}, got {ended:?}",
+                row.ended
             );
         }
     }
 
     /// The dead-letter message's attributes carry the invocation's own detail, and
-    /// the exhausted-retry condition is reported for the event-age bound alone.
+    /// the exhausted-retry condition names the bound that ended the attempts — and is
+    /// absent for an invocation neither bound ended.
     #[test]
     fn a_dead_letter_message_carries_the_failures_detail() {
         let failure = Failure {
@@ -503,18 +637,18 @@ mod tests {
             message: "The specified queue does not exist.".to_string(),
             retryable: false,
         };
-        // (case, which bound ended the attempts, whether the condition is reported)
-        let rows: [(&str, Option<Exhaustion>, bool); 3] = [
-            ("a failure that was never retryable", None, false),
+        // (case, which bound ended the attempts, the condition it is reported as)
+        let rows: [(&str, Option<Exhaustion>, Option<&str>); 3] = [
+            ("neither bound was spent", None, None),
             (
                 "attempts used up",
                 Some(Exhaustion::MaximumRetryAttempts),
-                false,
+                Some(MAXIMUM_RETRY_ATTEMPTS_MEMBER),
             ),
             (
                 "retries out of time",
                 Some(Exhaustion::MaximumEventAge),
-                true,
+                Some(MAXIMUM_EVENT_AGE_MEMBER),
             ),
         ];
         for (case, exhausted, reported) in rows {
@@ -560,18 +694,11 @@ mod tests {
             }
             let condition = held(EXHAUSTED_RETRY_CONDITION_ATTRIBUTE);
             assert_eq!(
-                condition.is_some(),
+                condition.as_deref(),
                 reported,
-                "case {case:?}: expected the exhausted-retry condition reported={reported}, got \
+                "case {case:?}: expected the exhausted-retry condition {reported:?}, got \
                  {condition:?}"
             );
-            if reported {
-                assert_eq!(
-                    condition.as_deref(),
-                    Some(MAXIMUM_EVENT_AGE_MEMBER),
-                    "case {case:?}: expected the event-age member named, got {condition:?}"
-                );
-            }
             let numbers: Vec<&str> = attributes
                 .iter()
                 .filter(|attribute| attribute.data_type == NUMBER_TYPE)

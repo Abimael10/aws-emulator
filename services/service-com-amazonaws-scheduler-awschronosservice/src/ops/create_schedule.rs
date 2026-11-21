@@ -270,12 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::access_denied(message));
         }
 
-        // EventBridge Scheduler resolves the execution role when the schedule is
-        // CREATED, so a role this account does not hold — or one that does not
+        // EventBridge Scheduler resolves the execution role on every write that
+        // states one, so a role this account does not hold — or one that does not
         // let Scheduler assume it — is refused here, before anything is
-        // persisted. A later `UpdateSchedule` does not resolve it again. The IAM
-        // lookup runs before the store is locked: the guard is not held across an
-        // await.
+        // persisted. The IAM lookup runs before the store is locked: the guard is
+        // not held across an await.
         if let Some(message) =
             crate::state::execution_role_violation(ctx.callback(), &region, &input.target.role_arn)
                 .await
