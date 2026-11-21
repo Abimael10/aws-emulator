@@ -21,12 +21,14 @@
 //! has taken, every `KnowledgeBaseType` the model declares, and every way an ARN can
 //! fail to name a policy-bearing knowledge base.
 //!
-//! `PutResourcePolicy` and `DeleteResourcePolicy` are still scaffold stubs, each with
-//! an issue of its own, so the WRITE that attaches a policy is made here through the
-//! one state writer those handlers will use
-//! (`KnowledgeBaseRecord::attach_resource_policy`), exactly as the suites of this
-//! crate drive a store no operation reaches yet; everything the read answers is
-//! asserted over the router, on the real wire path.
+//! This suite is about the READ, so the write that attaches a policy is made through the
+//! one state writer every resource-policy handler uses
+//! (`KnowledgeBaseRecord::attach_resource_policy`) — which keeps a row free to store a
+//! document no accepted `PutResourcePolicy` would (one shorter than a policy, say) and
+//! still assert what the read reports. `PutResourcePolicy` itself, which attaches a
+//! policy over the wire, is `knowledge_base_resource_policy_write`'s subject;
+//! `DeleteResourcePolicy` is still a scaffold stub with an issue of its own. Everything
+//! the read answers is asserted over the router, on the real wire path.
 
 use std::sync::Arc;
 
@@ -43,7 +45,7 @@ use smithy_server_runtime::MultiServiceRouter;
 ///
 /// Source: the `KnowledgeBaseType` enum of this service's Smithy model
 /// (`smithy_query(query="shape",shape="KnowledgeBaseType")`).
-const KNOWLEDGE_BASE_TYPES: [&str; 4] = ["VECTOR", "KENDRA", "SQL", "MANAGED"];
+pub(crate) const KNOWLEDGE_BASE_TYPES: [&str; 4] = ["VECTOR", "KENDRA", "SQL", "MANAGED"];
 
 /// RULE: a resource-policy operation's `resourceArn` names the knowledge base its
 /// `knowledge-base/<id>` resource field names, and names none for an ARN of any
@@ -138,10 +140,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      SignedHeaders=host;x-amz-date, Signature=0123456789abcdef";
 
 /// The region of [`AUTHORIZATION`]'s credential scope.
-const REGION: &str = "eu-west-1";
+pub(crate) const REGION: &str = "eu-west-1";
 
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// A role ARN matching the modelled `KnowledgeBaseRoleArn` pattern.
 const KB_ROLE: &str =
@@ -157,13 +159,13 @@ const KENDRA_INDEX: &str =
 
 /// The `ResourceNotFoundException` sentence AWS answers when the knowledge base a
 /// resource-policy call names is not stored: fixed text but for the id the ARN named.
-fn knowledge_base_absent(knowledge_base_id: &str) -> String {
+pub(crate) fn knowledge_base_absent(knowledge_base_id: &str) -> String {
     format!("KnowledgeBase with id {knowledge_base_id} is not found.")
 }
 
 /// The `ValidationException` sentence AWS answers for a knowledge base of a kind that
 /// carries no resource policy: entirely fixed text, naming the one kind that does.
-const KIND_CARRIES_NO_POLICY: &str =
+pub(crate) const KIND_CARRIES_NO_POLICY: &str =
     "Resource policies are only supported for MANAGED type knowledge bases.";
 
 /// The same not-found sentence for the knowledge base that IS stored but carries no
@@ -174,7 +176,7 @@ const POLICY_ABSENT: &str = "Couldn't perform GetResourcePolicy operation. Faile
 
 /// One value as a percent-encoded URI component, as a client that sends a non-greedy
 /// `@httpLabel` encodes it.
-fn label(value: &str) -> String {
+pub(crate) fn label(value: &str) -> String {
     value
         .replace('%', "%25")
         .replace(':', "%3A")
@@ -183,27 +185,27 @@ fn label(value: &str) -> String {
 
 /// One HTTP answer from the emulator, parsed.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     /// The restJson1 error shape name, from `x-amzn-errortype` or the body's
     /// `__type`; `None` on a success.
-    error_type: Option<String>,
+    pub(crate) error_type: Option<String>,
     body: Value,
 }
 
 impl Answer {
-    fn member(&self, member: &str) -> &Value {
+    pub(crate) fn member(&self, member: &str) -> &Value {
         &self.body[member]
     }
 
-    fn string(&self, member: &str) -> String {
+    pub(crate) fn string(&self, member: &str) -> String {
         self.member(member)
             .as_str()
             .unwrap_or_else(|| panic!("{member:?} is not a string in {:?}", self.body))
             .to_string()
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.string("message")
     }
 }
@@ -216,7 +218,7 @@ impl Answer {
 /// `KendraKnowledgeBaseConfiguration`, `SqlKnowledgeBaseConfiguration` and
 /// `ManagedKnowledgeBaseConfiguration` structures of this service's Smithy model
 /// (`smithy_query(query="shape",shape="KnowledgeBaseConfiguration")`).
-fn knowledge_base_of_type(name: &str, knowledge_base_type: &str) -> Value {
+pub(crate) fn knowledge_base_of_type(name: &str, knowledge_base_type: &str) -> Value {
     let mut request = json!({ "name": name, "roleArn": KB_ROLE });
     match knowledge_base_type {
         "VECTOR" => {
@@ -261,7 +263,7 @@ fn knowledge_base_of_type(name: &str, knowledge_base_type: &str) -> Value {
 }
 
 /// One cross-account grant, as a resource policy of a knowledge base reads.
-fn grant(sid: &str, account: &str) -> String {
+pub(crate) fn grant(sid: &str, account: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Sid":"{sid}","Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{account}:root"}},"Action":["bedrock:Retrieve"],"Resource":"*"}}]}}"#
     )
@@ -269,13 +271,13 @@ fn grant(sid: &str, account: &str) -> String {
 
 /// The emulator under test: one router over one shared engine, exactly as the
 /// production router mounts this service.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
-    engine: Arc<engine::InMemoryEngine>,
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -283,7 +285,7 @@ impl Emulator {
         Self { router, engine }
     }
 
-    async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
+    pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {
         let bytes = body
             .map(|value| Bytes::from(serde_json::to_vec(&value).expect("serialize request body")))
             .unwrap_or_default();
@@ -327,7 +329,7 @@ impl Emulator {
     }
 
     /// Create one knowledge base of `knowledge_base_type` and report its id and ARN.
-    async fn knowledge_base(
+    pub(crate) async fn knowledge_base(
         &self,
         case: &str,
         name: &str,
@@ -359,7 +361,7 @@ impl Emulator {
 
     /// `GetResourcePolicy`, with the ARN percent-encoded as a client that sends a
     /// non-greedy `@httpLabel` encodes it.
-    async fn get_resource_policy(&self, resource_arn: &str) -> Answer {
+    pub(crate) async fn get_resource_policy(&self, resource_arn: &str) -> Answer {
         self.call("GET", &format!("/resourcepolicy/{}", label(resource_arn)), None)
             .await
     }
@@ -367,7 +369,7 @@ impl Emulator {
     /// Attach `policy` to the stored knowledge base through the one state writer the
     /// still-scaffolded `PutResourcePolicy` will use, and report the `revisionId` the
     /// write left it at.
-    fn attach_policy(&self, case: &str, knowledge_base_id: &str, policy: &str) -> String {
+    pub(crate) fn attach_policy(&self, case: &str, knowledge_base_id: &str, policy: &str) -> String {
         let state = service_state(&*self.engine).expect("the bedrock-agent store");
         let mut state = state.lock();
         state
@@ -378,7 +380,7 @@ impl Emulator {
 
     /// Accept a delete of the knowledge base, which is what takes it out of the reach
     /// of every operation that acts on it.
-    async fn delete_knowledge_base(&self, case: &str, knowledge_base_id: &str) {
+    pub(crate) async fn delete_knowledge_base(&self, case: &str, knowledge_base_id: &str) {
         let deleted = self
             .call("DELETE", &format!("/knowledgebases/{knowledge_base_id}"), None)
             .await;

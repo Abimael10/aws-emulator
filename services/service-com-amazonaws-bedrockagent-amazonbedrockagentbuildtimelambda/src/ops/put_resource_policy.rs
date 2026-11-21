@@ -1,21 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: attaches the resource-based policy a request carried to the knowledge
+//! base its `resourceArn` names, and answers that knowledge base's own ARN with the
+//! `revisionId` the write left the policy at.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The readings the write turns on are all
+//! [`crate::state::resource_policies`]'s, so the write and the read beside it cannot
+//! come to disagree:
 //!
-//! The two readings a resource policy of a knowledge base turns on — which knowledge
-//! base a `resourceArn` names, and which kind of knowledge base carries a policy at
-//! all — are in [`crate::state::resource_policies`]. What is NOT written down
-//! anywhere this emulator can read is the wording of the refusals AWS answers here,
-//! so they have to come from the recorded responses.
+//! * WHICH knowledge base a `resourceArn` names and whether its KIND carries a policy
+//!   at all, through the one resolution every resource-policy operation shares
+//!   ([`crate::state::ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::policy_bearing_knowledge_base`]):
+//!   an ARN that names no knowledge base of this plane, and a knowledge base whose kind
+//!   carries no policy, are bad requests the modelled `ValidationException` refuses; an
+//!   ARN naming a knowledge base this store does not hold is the missing resource
+//!   `ResourceNotFoundException` refuses;
+//! * WHICH documents may be attached ([`crate::state::resource_policy_document_problem`]):
+//!   a value that is not a resource-based policy document, and one whose grants reach a
+//!   principal nobody named, are both bad requests — a resource policy is what "allows
+//!   other AWS accounts to access the knowledge base", not every caller;
+//! * the caller's `expectedRevisionId` precondition
+//!   ([`crate::state::KnowledgeBaseRecord::resource_policy_revision_matches`]), which
+//!   the modelled `ConflictException` refuses when it does not hold.
+//!
+//! Nothing is written by refusing, so a refused write leaves the knowledge base the
+//! policy it had; an accepted one advances that policy's revision by exactly one
+//! through the single writer of it
+//! ([`crate::state::KnowledgeBaseRecord::attach_resource_policy`]), and the document is
+//! stored as the request supplied it, which is what the read reports back.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +184,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // The transitions the CLOCK had already made due — owed at this instant whether
+        // or not anyone wrote a policy — are materialised first, so this write sees the
+        // store as of now and a knowledge base whose removal came due is out of it.
+        state.materialise_due_transitions(now);
+
+        // Which knowledge base this write is about, through the one resolution the read
+        // beside it makes: the id to attach to, the ARN the answer reports, and the
+        // revision the policy is at right now.
+        let (knowledge_base_id, knowledge_base_arn, revision_matches) =
+            match state.policy_bearing_knowledge_base(&input.resource_arn) {
+                Ok(record) => (
+                    record.knowledge_base_id.clone(),
+                    record.knowledge_base_arn.clone(),
+                    input
+                        .expected_revision_id
+                        .as_deref()
+                        .map(|expected| record.resource_policy_revision_matches(expected)),
+                ),
+                Err(crate::state::ResourcePolicyRefusal::NotAKnowledgeBase) => {
+                    return Err(PutResourcePolicyErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::resource_policy_arn_pattern_message(
+                                &input.resource_arn,
+                            )),
+                            field_list: None,
+                        },
+                    )
+                    .into())
+                }
+                Err(crate::state::ResourcePolicyRefusal::NoSuchKnowledgeBase(
+                    knowledge_base_id,
+                )) => {
+                    return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(
+                                crate::state::policied_knowledge_base_not_found_message(
+                                    &knowledge_base_id,
+                                ),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+                Err(crate::state::ResourcePolicyRefusal::KindCarriesNoPolicy) => {
+                    return Err(PutResourcePolicyErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::unsupported_resource_policy_message()),
+                            field_list: None,
+                        },
+                    )
+                    .into())
+                }
+            };
+
+        // Whether the document itself may be attached: a value outside the IAM JSON
+        // policy language, and one whose grants reach a principal nobody named, are
+        // both bad requests rather than policies to store.
+        if let Some(problem) = crate::state::resource_policy_document_problem(&input.policy) {
+            return Err(PutResourcePolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(problem.message()),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        // The caller's precondition, read against the revision the store held above. A
+        // request carrying none writes unconditionally.
+        if revision_matches == Some(false) {
+            return Err(PutResourcePolicyErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::concurrent_update_conflict_message(Self::NAME)),
+            })
+            .into());
+        }
+
+        let Some(record) = state.live_knowledge_base_mut(&knowledge_base_id) else {
+            return Err(PutResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the knowledge base just resolved is not writable".to_string()),
+                },
+            )
+            .into());
+        };
+        // The one writer of a knowledge base's policy, so this write advances the
+        // revision exactly as every other one does.
+        let revision_id = record.attach_resource_policy(input.policy);
+
+        Ok(PutResourcePolicyOutput {
+            // The knowledge base's OWN ARN, off the record the policy now hangs on,
+            // rather than the value the request spelled: it is "the ARN of the
+            // knowledge base that the resource policy was attached to".
+            resource_arn: knowledge_base_arn,
+            revision_id,
+        })
     }
 }

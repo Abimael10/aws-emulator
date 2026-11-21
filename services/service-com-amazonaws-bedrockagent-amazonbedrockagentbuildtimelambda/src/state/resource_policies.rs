@@ -19,9 +19,13 @@
 //! sentence the write and the read have to make the same way. Both are now folded
 //! into ONE resolution, [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::policy_bearing_knowledge_base`],
 //! which answers either the knowledge base whose policy the call is about or the
-//! reason there is none to be about — so `GetResourcePolicy` and the write and
-//! delete beside it (each still a scaffold stub with an issue of its own) cannot
-//! disagree on which ARN names what.
+//! reason there is none to be about — so `GetResourcePolicy`, the write beside it
+//! and the delete (still a scaffold stub with an issue of its own) cannot disagree
+//! on which ARN names what.
+//!
+//! What a write may ATTACH is here too ([`resource_policy_document_problem`]): the
+//! document's own two clauses, read before the store is touched, so a read never
+//! reports a document some write should not have stored.
 //!
 //! The policy itself is held on the knowledge base's own record
 //! ([`KnowledgeBaseRecord::resource_policy`]), as one [`ResourcePolicyRecord`]: the
@@ -99,6 +103,21 @@ impl KnowledgeBaseRecord {
         self.resource_policy = Some(record);
         revision_id
     }
+
+    /// Whether `expected` names the revision this knowledge base's policy is at NOW.
+    ///
+    /// The caller's precondition, which `PutResourcePolicy$expectedRevisionId` and
+    /// `DeleteResourcePolicy$expectedRevisionId` both state as "the revisionId from the
+    /// most recent GetResourcePolicy or PutResourcePolicy response", carried "to prevent
+    /// conflicts when multiple users update the same policy concurrently" — so it holds
+    /// exactly when the value equals the revision the store holds, compared by equality.
+    /// A knowledge base carrying NO policy is at no revision, so no value names its
+    /// revision: a precondition on a policy that is not there cannot hold.
+    pub fn resource_policy_revision_matches(&self, expected: &str) -> bool {
+        self.resource_policy
+            .as_ref()
+            .is_some_and(|stored| stored.revision_id() == expected)
+    }
 }
 
 /// Why a resource-policy operation has no knowledge-base policy to act on.
@@ -174,6 +193,79 @@ pub fn unsupported_resource_policy_message() -> String {
         "Resource policies are only supported for {MANAGED_KNOWLEDGE_BASE_TYPE} \
          type knowledge bases."
     )
+}
+
+/// Why this service will not attach a resource policy document a write carried.
+///
+/// Both readings are of the DOCUMENT alone — neither consults the store — and both are
+/// bad requests the modelled `ValidationException` refuses, so a write judges them
+/// before it touches the knowledge base it would attach to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourcePolicyDocumentProblem {
+    /// The value is not a resource-based policy document at all, carrying the clause of
+    /// the IAM JSON policy language it breaks.
+    NotAPolicyDocument(::service_common::iam_policy::PolicyDefect),
+    /// The document is a policy, and its grants reach a principal nobody named.
+    GrantsPublicAccess,
+}
+
+impl ResourcePolicyDocumentProblem {
+    /// The `ValidationException` message this problem is refused with.
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotAPolicyDocument(defect) => {
+                format!("The resource policy is not a valid policy document: {defect}.")
+            }
+            Self::GrantsPublicAccess => PUBLIC_RESOURCE_POLICY_MESSAGE.to_string(),
+        }
+    }
+}
+
+/// The sentence a write is refused with when the document it carried would open the
+/// knowledge base to every caller.
+///
+/// Entirely FIXED text: it states what was refused about the document and the two ways
+/// the IAM policy language gives to fix it, and names nothing of the request, because
+/// the document the caller sent is what the caller already holds.
+pub const PUBLIC_RESOURCE_POLICY_MESSAGE: &str =
+    "Resource policies must not grant access to all principals. Replace any wildcard \
+     principal with specific principals, or add a condition that limits the callers to \
+     specific AWS accounts.";
+
+/// Why the document `policy` cannot be attached to a knowledge base, or `None` for one
+/// this service stores.
+///
+/// Two readings, in the order a caller earns each refusal, both taken off the document
+/// parsed ONCE:
+///
+/// * the value is a resource-based policy document — the member is modelled
+///   `mediaType("application/json")` and documented as "the JSON-formatted resource
+///   policy", so a text outside the IAM JSON policy language describes no grant this
+///   service could enforce. The grammar is the workspace's ONE reading of a
+///   resource-based policy ([`::service_common::iam_policy::resource_policy_defect_of`]),
+///   so two services handed one document cannot disagree about whether it is a policy;
+/// * its grants reach only principals it NAMES. A resource policy of a knowledge base
+///   is what "allows other AWS accounts to access the knowledge base", so a document
+///   granting to a principal nobody named would open it to every caller instead — read
+///   through the workspace's one reading of that question
+///   ([`::service_common::public_resource_policy::grants_public_access_of`]).
+///
+/// Nothing is written by judging, so a refused write leaves the knowledge base the
+/// policy it had. A document's SIZE is the member's own `@length`, which the boundary
+/// walk refuses before any handler runs.
+pub fn resource_policy_document_problem(policy: &str) -> Option<ResourcePolicyDocumentProblem> {
+    let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return Some(ResourcePolicyDocumentProblem::NotAPolicyDocument(
+            ::service_common::iam_policy::PolicyDefect::NotJson,
+        ));
+    };
+    if let Some(defect) = ::service_common::iam_policy::resource_policy_defect_of(&document) {
+        return Some(ResourcePolicyDocumentProblem::NotAPolicyDocument(defect));
+    }
+    if ::service_common::public_resource_policy::grants_public_access_of(&document) {
+        return Some(ResourcePolicyDocumentProblem::GrantsPublicAccess);
+    }
+    None
 }
 
 /// The `ResourceNotFoundException` message a resource-policy operation answers when

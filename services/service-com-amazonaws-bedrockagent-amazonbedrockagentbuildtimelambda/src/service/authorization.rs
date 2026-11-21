@@ -65,11 +65,14 @@
 //! record is what keeps a refused call from telling an unauthorized caller whether what it
 //! named exists.
 //!
-//! The two resource-policy operations that WRITE one — `PutResourcePolicy` and
-//! `DeleteResourcePolicy` — are still scaffolded (501), so this emulator holds no
-//! resource-based policy for any resource of this service and the identity-based decision is
-//! the whole decision; a document one of them stores later is read beside the caller's own,
-//! as every gate in this tree that holds one does.
+//! `PutResourcePolicy` attaches a resource-based policy to a knowledge base
+//! ([`crate::ops::put_resource_policy`]); `DeleteResourcePolicy`, which removes one, is
+//! still scaffolded (501). Such a document is what "allows other AWS accounts to access the
+//! knowledge base" (the model's own sentence for it), and every credential this emulator
+//! issues speaks for a principal of the one account that owns what it names, so for the
+//! callers this gate judges the identity-based decision is still the whole decision; a
+//! cross-account caller, which this emulator has none of, is what would make the stored
+//! document part of it, as every gate in this tree that reads one does.
 //!
 //! ## The callers this gate does not bound
 //!
