@@ -86,11 +86,10 @@ pub const DEFAULT_ALLOCATED_STORAGE: i32 = 20;
 /// A cluster is composite: it is ready only once the DB instances it provisions are, so
 /// it owes one [`TRANSITION_SPAN`] for its nodes and one more for itself — a caller that
 /// reads straight after its nodes settled still sees the cluster coming up.
-pub const CLUSTER_TRANSITION_SPAN: Duration = Duration::from_millis(2 * TRANSITION_SPAN_MILLIS);
-
-/// [`TRANSITION_SPAN`] in milliseconds, so [`CLUSTER_TRANSITION_SPAN`] is derived from
-/// the one span this service settles a DB instance over rather than restating it.
-const TRANSITION_SPAN_MILLIS: u64 = TRANSITION_SPAN.as_millis() as u64;
+///
+/// Derived from the one span this service settles a DB instance over rather than restating
+/// it, so both stay an order of magnitude below a client's round trip together.
+pub const CLUSTER_TRANSITION_SPAN: Duration = TRANSITION_SPAN.saturating_mul(2);
 
 /// How many DB clusters the store holds before `CreateDbCluster` refuses with the
 /// modelled `ServiceQuotaExceededException`.

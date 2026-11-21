@@ -26,6 +26,14 @@ use service_com_amazonaws_timestreaminfluxdb_amazontimestreaminfluxdb as influxd
 
 use crate::db_instance_lifecycle::{call, call_in, ok, router_and_engine, ACCOUNT, REGION};
 
+/// How long this suite waits for a clock-owed settle before giving up: far above the span
+/// this service settles a transient status after, so a loaded host cannot fail a test that
+/// is about the settle happening at all.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a poll waits before looking again at a record the clock owes a settle.
+const SETTLE_LOOK_AGAIN: Duration = Duration::from_millis(25);
+
 /// A router whose account already holds the AWS Marketplace subscription the
 /// read-replicas cluster deployment type is gated behind.
 ///
@@ -36,13 +44,26 @@ use crate::db_instance_lifecycle::{call, call_in, ok, router_and_engine, ACCOUNT
 /// out of band of every operation here, so the happy-path rows below grant the
 /// subscription through the store seam before they create anything.
 fn router() -> MultiServiceRouter {
+    router_and_store().0
+}
+
+/// [`router`], handed back with the engine whose store it answers from — what a row that
+/// reads a record as the STORE holds it, rather than as a reporting read reports it,
+/// needs.
+///
+/// A transient status is read from the store because the span this service settles one
+/// over (`state::TRANSITION_SPAN`) is deliberately shorter than the round trip a client
+/// needs to issue its next request, so a reporting read issued after the announcing call
+/// is entitled to find the settle already due; the store keeps the status and the instant
+/// the settle falls due until a reporting operation materialises it.
+fn router_and_store() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>) {
     let (router, engine) = router_and_engine();
     influxdb::state::subscribe_account_to_marketplace_offering(
         &*engine,
         influxdb::state::READ_REPLICAS_OFFERING,
     )
     .expect("the shared engine holds this service's store");
-    router
+    (router, engine)
 }
 
 /// Members that `CreateDbClusterInput` and `GetDbClusterOutput` BOTH model and that the
@@ -382,6 +403,31 @@ async fn create_cases(router: &MultiServiceRouter) -> Vec<ClusterCase> {
     ]
 }
 
+/// Read the cluster `id` back until the clock-owed settle to `AVAILABLE` has been
+/// materialised, the way a client polls, and hand back the settled record.
+///
+/// The settle is read rather than waited for by the clock: the span this service settles a
+/// transient status over (`state::TRANSITION_SPAN`) is deliberately shorter than a
+/// client's round trip, so WHICH read observes it is not something a test asserts.
+async fn settled_cluster(router: &MultiServiceRouter, id: &str, case: &str) -> Value {
+    let started = Instant::now();
+    loop {
+        let body = ok(
+            case,
+            call(router, "GetDbCluster", json!({ "dbClusterId": id })).await,
+        );
+        if body["status"].as_str() == Some("AVAILABLE") {
+            return body;
+        }
+        assert!(
+            started.elapsed() < SETTLE_DEADLINE,
+            "case {case:?}: the clock-owed settle to AVAILABLE never happened within \
+             {SETTLE_DEADLINE:?}, last answer {body}"
+        );
+        tokio::time::sleep(SETTLE_LOOK_AGAIN).await;
+    }
+}
+
 #[tokio::test]
 async fn a_created_cluster_reads_back_from_state_member_for_member() {
     let router = router();
@@ -408,7 +454,7 @@ async fn a_created_cluster_reads_back_from_state_member_for_member() {
             created["dbClusterStatus"]
         );
 
-        let fetched = ok(label, call(&router, "GetDbCluster", json!({ "dbClusterId": &id })).await);
+        let fetched = settled_cluster(&router, &id, label).await;
 
         assert_eq!(
             fetched["id"].as_str(),
@@ -423,8 +469,8 @@ async fn a_created_cluster_reads_back_from_state_member_for_member() {
         );
         assert_eq!(
             fetched["status"].as_str(),
-            Some("CREATING"),
-            "case {label:?}: the transition span must not be zero, got {:?}",
+            Some("AVAILABLE"),
+            "case {label:?}: the clock settles a created cluster, got {:?}",
             fetched["status"]
         );
 
@@ -574,11 +620,55 @@ async fn a_created_cluster_reads_back_from_state_member_for_member() {
 
 #[tokio::test]
 async fn a_cluster_provisions_one_db_instance_per_node_of_its_configuration() {
-    let router = router();
+    let (router, engine) = router_and_store();
     for case in create_cases(&router).await {
         let label = case.label.as_str();
         let created = ok(label, call(&router, "CreateDbCluster", case.body.clone()).await);
         let cluster_id = cluster_id_of(label, &created);
+
+        // Every node this create provisioned is CREATING and owes its settle one
+        // transition span after it was minted. Read from the store (see
+        // [`router_and_store`]): the reads below are entitled to report the settled
+        // status, so the transient one the create left behind is asserted where it is
+        // kept.
+        {
+            let state = influxdb::state::service_state(&*engine)
+                .expect("the shared engine holds this service's store");
+            let store = state.lock();
+            let nodes: Vec<&influxdb::state::DbInstance> = store
+                .db_instances
+                .values()
+                .filter(|record| {
+                    record
+                        .cluster
+                        .as_ref()
+                        .is_some_and(|role| role.db_cluster_id == cluster_id)
+                })
+                .collect();
+            assert_eq!(
+                nodes.len(),
+                case.expected_node_count(),
+                "case {label:?}: expected {} provisioned DB instances in the store, got {}",
+                case.expected_node_count(),
+                nodes.len()
+            );
+            for node in nodes {
+                assert_eq!(
+                    node.status,
+                    influxdb::state::STATUS_CREATING,
+                    "case {label:?}: a freshly provisioned node is creating, got {:?}",
+                    node.status
+                );
+                assert_eq!(
+                    node.settles_at,
+                    Some(node.created_at + influxdb::state::TRANSITION_SPAN),
+                    "case {label:?}: a node's settle must fall due one transition span \
+                     after it was minted, got {:?}",
+                    node.settles_at
+                );
+            }
+        }
+
         let cluster = ok(
             label,
             call(&router, "GetDbCluster", json!({ "dbClusterId": &cluster_id })).await,
@@ -643,10 +733,11 @@ async fn a_cluster_provisions_one_db_instance_per_node_of_its_configuration() {
                 "case {label:?}: a cluster node is deployed on its own, got {:?}",
                 node["deploymentType"]
             );
-            assert_eq!(
-                node["status"].as_str(),
-                Some("CREATING"),
-                "case {label:?}: a freshly provisioned node is creating, got {:?}",
+            // The node's transient status is asserted on the store above, because this
+            // read may legitimately report the status the clock has already settled it to.
+            assert!(
+                ["CREATING", "AVAILABLE"].contains(&node["status"].as_str().unwrap_or_default()),
+                "case {label:?}: a provisioned node is creating or settled, got {:?}",
                 node["status"]
             );
             assert_eq!(
@@ -684,7 +775,7 @@ async fn a_cluster_provisions_one_db_instance_per_node_of_its_configuration() {
 
 #[tokio::test]
 async fn a_cluster_is_available_only_after_the_nodes_it_provisions_are() {
-    let router = router();
+    let (router, engine) = router_and_store();
     let case = "the clock settles the nodes, then the cluster";
     let created = ok(
         case,
@@ -704,58 +795,93 @@ async fn a_cluster_is_available_only_after_the_nodes_it_provisions_are() {
             .collect()
     }
 
-    let immediate = ok(
-        case,
-        call(&router, "GetDbCluster", json!({ "dbClusterId": &id })).await,
-    );
     assert_eq!(
-        immediate["status"].as_str(),
+        created["dbClusterStatus"].as_str(),
         Some("CREATING"),
         "case {case:?}: the span must not be zero, got {:?}",
-        immediate["status"]
-    );
-    let statuses = node_statuses(&router, case).await;
-    assert!(
-        !statuses.is_empty() && statuses.iter().all(|status| status == "CREATING"),
-        "case {case:?}: the nodes are provisioning too, got {statuses:?}"
+        created["dbClusterStatus"]
     );
 
-    // Poll both until each is up, recording WHEN each became available. The assertion is
-    // the ordering, not a wall-clock window: a composite is ready only once what it
-    // provisions is.
+    // The cluster and the nodes it provisioned are all coming up, and the cluster's own
+    // settle falls due AFTER every node's: a composite is ready only once what it
+    // provisions is. Both are read from the store (see [`router_and_store`]) and compared
+    // as the instants the clock owes them, so the ordering asserted is the records' own
+    // rather than a sampling of the wall clock.
+    {
+        let state = influxdb::state::service_state(&*engine)
+            .expect("the shared engine holds this service's store");
+        let store = state.lock();
+        let cluster = store
+            .db_clusters
+            .get(&id)
+            .unwrap_or_else(|| panic!("case {case:?}: the created cluster {id} is not stored"));
+        assert_eq!(
+            cluster.status,
+            influxdb::state::CLUSTER_STATUS_CREATING,
+            "case {case:?}: a freshly created cluster is provisioning, got {:?}",
+            cluster.status
+        );
+        let cluster_due = cluster
+            .settles_at
+            .unwrap_or_else(|| panic!("case {case:?}: the cluster owes no settle"));
+        let nodes: Vec<&influxdb::state::DbInstance> = cluster
+            .db_instance_ids
+            .iter()
+            .filter_map(|node_id| store.db_instances.get(node_id))
+            .collect();
+        assert_eq!(
+            nodes.len(),
+            cluster.db_instance_ids.len(),
+            "case {case:?}: every node the cluster reports must be stored, got {} of {}",
+            nodes.len(),
+            cluster.db_instance_ids.len()
+        );
+        assert!(
+            !nodes.is_empty(),
+            "case {case:?}: a cluster provisions at least one node"
+        );
+        for node in nodes {
+            assert_eq!(
+                node.status,
+                influxdb::state::STATUS_CREATING,
+                "case {case:?}: the nodes are provisioning too, got {:?}",
+                node.status
+            );
+            let node_due = node
+                .settles_at
+                .unwrap_or_else(|| panic!("case {case:?}: node {} owes no settle", node.id));
+            assert!(
+                node_due < cluster_due,
+                "case {case:?}: the cluster's settle falls due at {cluster_due:?}, not \
+                 after its node's at {node_due:?}"
+            );
+        }
+    }
+
+    // The clock settles both, and a client that polls observes it: looked at again until
+    // the cluster and every node it provisioned report AVAILABLE, inside a deadline far
+    // above the span, so a loaded host cannot fail a test that is about the settle
+    // happening at all.
     let started = Instant::now();
     let deadline = Duration::from_secs(30);
-    let mut nodes_up: Option<Duration> = None;
-    let mut cluster_up: Option<Duration> = None;
-    while cluster_up.is_none() && started.elapsed() < deadline {
-        let statuses = node_statuses(&router, case).await;
-        if nodes_up.is_none() && statuses.iter().all(|status| status == "AVAILABLE") {
-            nodes_up = Some(started.elapsed());
-        }
+    loop {
         let cluster = ok(
             case,
             call(&router, "GetDbCluster", json!({ "dbClusterId": &id })).await,
         );
-        if cluster["status"].as_str() == Some("AVAILABLE") {
-            cluster_up = Some(started.elapsed());
+        let statuses = node_statuses(&router, case).await;
+        let nodes_up =
+            !statuses.is_empty() && statuses.iter().all(|status| status == "AVAILABLE");
+        if cluster["status"].as_str() == Some("AVAILABLE") && nodes_up {
+            break;
         }
-        // Sampled finely enough that the two settles, one transition span apart, fall in
-        // different iterations: what the assertion below reads is their ORDER, so the
-        // sampling has to be finer than the span between them.
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(
+            started.elapsed() < deadline,
+            "case {case:?}: the clock-owed settles never happened within {deadline:?}, \
+             last answer {cluster} with nodes {statuses:?}"
+        );
+        tokio::time::sleep(SETTLE_LOOK_AGAIN).await;
     }
-
-    let nodes_up = nodes_up.unwrap_or_else(|| {
-        panic!("case {case:?}: the nodes never settled within {deadline:?}");
-    });
-    let cluster_up = cluster_up.unwrap_or_else(|| {
-        panic!("case {case:?}: the cluster never settled within {deadline:?}");
-    });
-    assert!(
-        nodes_up < cluster_up,
-        "case {case:?}: the cluster became available at {cluster_up:?}, not after its \
-         nodes at {nodes_up:?}"
-    );
 
     // Once up it stays up, and the nodes with it.
     let settled = ok(

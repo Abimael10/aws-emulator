@@ -14,11 +14,19 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_timestreaminfluxdb_amazontimestreaminfluxdb as influxdb;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// How long a test here waits for a clock-owed settle before giving up: far above the
+/// span this service settles a transient status after, so a loaded host cannot fail a
+/// test that is about the settle happening at all.
+pub(crate) const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a poll waits before looking again at a record the clock owes a settle.
+pub(crate) const SETTLE_LOOK_AGAIN: Duration = Duration::from_millis(25);
 
 /// The region the tests sign with by default; the ARNs must be scoped to it.
 pub(crate) const REGION: &str = "us-west-2";
@@ -996,7 +1004,7 @@ async fn delete_removes_the_instance_from_every_read_path() {
 
 #[tokio::test]
 async fn a_new_instance_is_creating_until_the_clock_settles_it_to_available() {
-    let router = router();
+    let (router, engine) = router_and_engine();
     let created = ok(
         "clock",
         call(&router, "CreateDbInstance", minimal_create("settling-one")).await,
@@ -1009,23 +1017,35 @@ async fn a_new_instance_is_creating_until_the_clock_settles_it_to_available() {
         created["status"]
     );
 
-    // A caller reading straight back still observes the transient status.
-    let immediate = ok(
-        "clock: immediate read",
-        call(&router, "GetDbInstance", json!({ "identifier": &id })).await,
-    );
-    assert_eq!(
-        immediate["status"].as_str(),
-        Some("CREATING"),
-        "case \"clock: immediate read\": the transition span must not be zero, got {:?}",
-        immediate["status"]
-    );
+    // The span is not zero: the record the create left behind is CREATING and owes its
+    // settle one transition span after the create. Read from the STORE, because that span
+    // is deliberately shorter than the round trip a client needs to issue its next
+    // request — a reporting read is entitled to find the settle already due — and the
+    // store keeps the transient status until a reporting operation materialises it.
+    {
+        let state = influxdb::state::service_state(&*engine)
+            .expect("the shared engine holds this service's store");
+        let store = state.lock();
+        let record = store
+            .db_instances
+            .get(&id)
+            .unwrap_or_else(|| panic!("case \"clock\": the created instance {id} is not stored"));
+        assert_eq!(
+            record.status,
+            influxdb::state::STATUS_CREATING,
+            "case \"clock\": the stored record is provisioning, got {:?}",
+            record.status
+        );
+        assert_eq!(
+            record.settles_at,
+            Some(record.created_at + influxdb::state::TRANSITION_SPAN),
+            "case \"clock\": the settle must fall due one transition span after the \
+             create, got {:?}",
+            record.settles_at
+        );
+    }
 
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let settled = ok(
-        "clock: after the span",
-        call(&router, "GetDbInstance", json!({ "identifier": &id })).await,
-    );
+    let settled = poll_to_status(&router, &id, "AVAILABLE", "clock: after the span").await;
     assert_eq!(
         settled["status"].as_str(),
         Some("AVAILABLE"),
@@ -1059,17 +1079,40 @@ async fn a_new_instance_is_creating_until_the_clock_settles_it_to_available() {
         "case \"clock: update\": got {:?}",
         updated["status"]
     );
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let resettled = ok(
-        "clock: update settles",
-        call(&router, "GetDbInstance", json!({ "identifier": &id })).await,
-    );
+    let resettled = poll_to_status(&router, &id, "AVAILABLE", "clock: update settles").await;
     assert_eq!(
         resettled["status"].as_str(),
         Some("AVAILABLE"),
         "case \"clock: update settles\": expected AVAILABLE, got {:?}",
         resettled["status"]
     );
+}
+
+/// Read the DB instance `identifier` back until it reports `status`, the way a client
+/// polls: look, and look again one interval later until a deadline far above the span the
+/// clock settles a transient status after passes.
+async fn poll_to_status(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    status: &str,
+    case: &str,
+) -> Value {
+    let started = Instant::now();
+    loop {
+        let body = ok(
+            case,
+            call(router, "GetDbInstance", json!({ "identifier": identifier })).await,
+        );
+        if body["status"].as_str() == Some(status) {
+            return body;
+        }
+        assert!(
+            started.elapsed() < SETTLE_DEADLINE,
+            "case {case:?}: {status} was never observed within {SETTLE_DEADLINE:?}, last \
+             answer {body}"
+        );
+        tokio::time::sleep(SETTLE_LOOK_AGAIN).await;
+    }
 }
 
 #[tokio::test]
@@ -1251,22 +1294,36 @@ fn every_status_and_resource_type_this_service_reports_is_a_modelled_value() {
     );
 }
 
+/// The order of magnitude a client's round trip is of: an SDK client's request over a
+/// loopback socket — serialize, sign, write, read, parse — costs milliseconds, and a
+/// chained workflow issues its next read as soon as the previous call answers.
+const CLIENT_ROUND_TRIP_ORDER: Duration = Duration::from_millis(10);
+
 #[test]
 fn the_clock_owed_transition_span_settles_before_a_clients_next_read() {
     let span = influxdb::state::TRANSITION_SPAN;
     // Non-zero: the transient status a lifecycle call announces is the record's real
-    // status at that instant, so a caller that acts on the answer it just got still
-    // observes it and the state errors keyed to it.
+    // status at the instant that call answers, so the state errors keyed to it are
+    // reachable rather than dead code.
     assert!(
         !span.is_zero(),
         "case \"transition span\": a transient status must be observable, got {span:?}"
     );
-    // Shorter than the round trip a client needs to issue its next read: the settle is
-    // already due when a polling client's first probe arrives, so no workflow spends one
-    // of the client's probe intervals per transition it waits through.
+    // An ORDER OF MAGNITUDE below that round trip: the settle is already due when a
+    // polling client's first probe after the announcing call arrives, so no workflow
+    // spends one of the client's probe intervals per transition it waits through — which
+    // is what lets a workflow that chains several of them converge at all.
     assert!(
-        span <= Duration::from_millis(50),
-        "case \"transition span\": a transient status must be settled before a client's \
-         follow-up read, got {span:?}"
+        span * 10 <= CLIENT_ROUND_TRIP_ORDER,
+        "case \"transition span\": a transient status must be settled an order of \
+         magnitude inside a client's round trip ({CLIENT_ROUND_TRIP_ORDER:?}), got {span:?}"
+    );
+    // The composite span a DB cluster settles over is this same span once per dependency
+    // level (its nodes, then the cluster itself), so it stays inside that round trip too.
+    assert!(
+        influxdb::state::CLUSTER_TRANSITION_SPAN < CLIENT_ROUND_TRIP_ORDER,
+        "case \"cluster transition span\": a composite's settle must be due inside a \
+         client's round trip ({CLIENT_ROUND_TRIP_ORDER:?}), got {:?}",
+        influxdb::state::CLUSTER_TRANSITION_SPAN
     );
 }

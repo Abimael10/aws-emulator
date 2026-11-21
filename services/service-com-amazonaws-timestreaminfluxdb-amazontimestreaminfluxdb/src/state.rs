@@ -208,17 +208,24 @@ pub const ARN_NAMESPACE: &str = "timestream-influxdb";
 /// How long a DB instance stays in a transient status before the clock settles it to
 /// `AVAILABLE`.
 ///
-/// NOT an AWS-documented duration (a real instance takes minutes): a chosen span. It is
-/// non-zero, so the transient status a lifecycle call announces is the record's real
-/// status at that instant and the state errors keyed to it (a restart of an instance that
-/// is not running, say) are reachable for a caller that acts on the answer it just got.
-/// It is also SHORTER than the round trip a client needs to issue its next read, which is
-/// what keeps a polling client live: the settle is already due when that read arrives, so
-/// a workflow that provisions, waits, deletes and re-provisions does not spend one of the
-/// client's probe intervals on every transition it waits through. A span of the order of a
-/// client's probe interval instead of its round trip is what makes such a workflow cost
-/// more wall time than the workflow is given.
-pub const TRANSITION_SPAN: Duration = Duration::from_millis(25);
+/// NOT an AWS-documented duration (a real instance takes minutes): a chosen span, and the
+/// one span every record of this service settles over, so a workflow that chains several
+/// transitions pays the same cost for each.
+///
+/// It is non-zero, so the transient status a lifecycle call announces is the record's real
+/// status at the instant that call answers, and the state errors keyed to it (a restart of
+/// an instance that is not running, say) are reachable rather than dead code.
+///
+/// It is an ORDER OF MAGNITUDE below the round trip a client needs to issue its next
+/// request, and it is dated from the call that announced the transition rather than from
+/// anything that call does afterwards, which is what keeps a polling client live: the
+/// settle is already due when the client's first probe after that answer arrives, so a
+/// workflow that waits through a transition never spends one of its probe intervals on it
+/// and one that chains several (provision, back up, restore, wait for each) converges in
+/// the time the chain itself takes. A span of the order of the round trip — let alone of a
+/// probe interval — leaves that first probe reading the transient status and the client
+/// sleeping one whole interval per transition.
+pub const TRANSITION_SPAN: Duration = Duration::from_millis(1);
 
 /// The default `maxResults` for the paginated list operations: the maximum the model's
 /// `MaxResults` range (1..100) allows, so an unbounded request pages at the modelled cap.

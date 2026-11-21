@@ -25,12 +25,53 @@
 //! status this API can put an instance into — the provision, the three flavours of
 //! reconfiguration, and a restart already running.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_timestreaminfluxdb_amazontimestreaminfluxdb as influxdb;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::db_instance_lifecycle::{call_in, ok, router, REGION};
+use crate::db_instance_lifecycle::{call_in, ok, router, router_and_engine, REGION};
+
+/// Hold the instance `id` in the transient status it is in, by moving the instant the
+/// clock owes its settle far beyond the end of this test.
+///
+/// The span this service settles a transient status over
+/// (`influxdb::state::TRANSITION_SPAN`) is deliberately shorter than the round trip a
+/// client needs to issue its next request, so the refusal a transient status answers with
+/// is asserted on a record HELD in that status rather than on a race against that span.
+/// Nothing else about the record changes: the status is the one the announcing call
+/// reported.
+fn hold_transient(engine: &engine::InMemoryEngine, id: &str, case: &str) {
+    with_record(engine, id, case, |record| {
+        record.settles_at = Some(SystemTime::now() + Duration::from_secs(3_600));
+    });
+}
+
+/// Release the hold [`hold_transient`] put on `id`, so the settle the clock owes is due
+/// again and the next reporting read materialises it.
+fn release_transient(engine: &engine::InMemoryEngine, id: &str, case: &str) {
+    with_record(engine, id, case, |record| {
+        record.settles_at = Some(SystemTime::now());
+    });
+}
+
+/// Apply `change` to the stored DB instance `id`.
+fn with_record(
+    engine: &engine::InMemoryEngine,
+    id: &str,
+    case: &str,
+    change: impl FnOnce(&mut influxdb::state::DbInstance),
+) {
+    let state = influxdb::state::service_state(engine)
+        .expect("the shared engine holds this service's store");
+    let mut store = state.lock();
+    let record = store
+        .db_instances
+        .get_mut(id)
+        .unwrap_or_else(|| panic!("case {case:?}: the instance {id} is not stored"));
+    change(record);
+}
 
 /// The minimum a `CreateDbInstance` request must carry, per the model's `@required`
 /// members (`name`, `password`, `dbInstanceType`, `vpcSubnetIds`, `vpcSecurityGroupIds`,
@@ -306,7 +347,7 @@ async fn a_reboot_is_refused_while_the_instance_is_in_a_transient_status() {
     ];
 
     for case in cases {
-        let router = router();
+        let (router, engine) = router_and_engine();
         let created = ok(
             case.label,
             call_in(
@@ -339,6 +380,9 @@ async fn a_reboot_is_refused_while_the_instance_is_in_a_transient_status() {
             case.status,
             started["status"]
         );
+        // Held in that status for the reboot below, so what the refusal is asserted
+        // against is the status itself and not how fast this test reaches the service.
+        hold_transient(&engine, &id, case.label);
 
         let (status, body) = call_in(
             &router,
@@ -408,6 +452,25 @@ async fn a_reboot_is_refused_while_the_instance_is_in_a_transient_status() {
 
         // The refused call left the record alone: it is still in the transient status it
         // was in, and the clock still settles it to AVAILABLE on its own.
+        let held = ok(
+            case.label,
+            call_in(
+                &router,
+                REGION,
+                "GetDbInstance",
+                json!({ "identifier": &id }),
+            )
+            .await,
+        );
+        assert_eq!(
+            held["status"].as_str(),
+            Some(case.status),
+            "case {:?}: the refused reboot must leave the instance in {}, got {:?}",
+            case.label,
+            case.status,
+            held["status"]
+        );
+        release_transient(&engine, &id, case.label);
         let settled = poll_until_status(&router, REGION, &id, "AVAILABLE", case.label).await;
         assert_eq!(
             settled["id"].as_str(),

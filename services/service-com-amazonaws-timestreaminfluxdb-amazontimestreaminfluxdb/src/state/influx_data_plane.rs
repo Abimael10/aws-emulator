@@ -198,15 +198,6 @@ async fn serve_over<Eng: Send + Sync + 'static>(
     };
     record.served_endpoint = Some(host);
     record.served_port = Some(port);
-    // The clock-owed settle is re-dated from HERE, because this is when the instance has an
-    // endpoint at all: binding the socket is IO, and a span measured from before it could
-    // already be due by the time the create answers — which would leave a caller acting on
-    // that answer unable to observe the transient status its own call announced, and the
-    // state errors keyed to it unreachable. A record that owes no transition (one already
-    // settled) is left alone.
-    if record.settles_at.is_some() {
-        record.settles_at = Some(::std::time::SystemTime::now() + super::TRANSITION_SPAN);
-    }
     store.db_instance_planes.insert(id.to_string(), plane);
 }
 

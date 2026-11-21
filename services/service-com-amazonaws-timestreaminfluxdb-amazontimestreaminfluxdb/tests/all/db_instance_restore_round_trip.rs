@@ -7,11 +7,14 @@
 //! RULE, in two halves, both about LIVENESS of this service's DB-instance lifecycle:
 //!
 //! * Every transient status this service reports is settled by the CLOCK, and the settle
-//!   it owes falls due one transition span after the call that started it — a span shorter
-//!   than the round trip a client needs to issue its next read. So a client that polls
-//!   `GetDbInstance` observes the settled status on its first probe after the call, and a
-//!   workflow that waits through several transitions never spends one of its probe
-//!   intervals per transition.
+//!   it owes falls due one transition span after the call that announced it — a span an
+//!   order of magnitude below the round trip a client needs to issue its next read, dated
+//!   from that call and not from the work the handler does before answering. So a client
+//!   that polls `GetDbInstance` observes the settled status on its first probe after the
+//!   call, and a workflow that waits through several transitions — including one that
+//!   CHAINS them, provision then back up then restore
+//!   ([`a_chained_create_backup_restore_workflow_converges_for_a_polling_client`]) — never
+//!   spends one of its probe intervals per transition.
 //! * A name a live DB instance owns is a STATE, not an always-invalid input: while the
 //!   instance lives a second create under that name is refused `ConflictException`, and
 //!   `DeleteDbInstance` releases both the id and the name AT ONCE, so the identical
@@ -1411,4 +1414,313 @@ async fn a_restore_refuses_a_backup_or_a_name_that_does_not_resolve() {
         Some(0),
         "case {case:?}: a refused restore must persist no cluster, got {clusters}"
     );
+}
+
+// =======================================================================================
+// The CHAINED lifecycle: provision an instance, back it up, restore it — every settle on
+// the chain due before the polling client's next probe.
+// =======================================================================================
+
+/// One chained row: the Region the whole chain is driven in, the source instance's create,
+/// and what the restore request carries beyond `name` and `dbBackupId`.
+struct ChainedCase {
+    label: &'static str,
+    region: &'static str,
+    source: fn(&str) -> Value,
+    restore: Value,
+}
+
+/// Rows spanning what the rule generalises over: the Region, the deployment type and
+/// storage of the source, the name's shape inside the modelled `DbResourceName` pattern,
+/// how many optional members the chain carries, and whether the restore overrides any of
+/// what the backup captured.
+fn chained_cases() -> Vec<ChainedCase> {
+    vec![
+        ChainedCase {
+            label: "a single-AZ source restored as the backup captured it",
+            region: "us-west-2",
+            source: minimal_create,
+            restore: json!({}),
+        },
+        ChainedCase {
+            label: "a Multi-AZ source restored with its placement overridden",
+            region: "eu-central-1",
+            source: multi_az_create,
+            restore: json!({
+                "deploymentType": "SINGLE_AZ",
+                "port": 1024,
+                "networkType": "IPV4",
+            }),
+        },
+        ChainedCase {
+            label: "a source at the top of the storage range, restored untouched",
+            region: "ap-southeast-4",
+            source: large_single_az_create,
+            restore: json!({}),
+        },
+    ]
+}
+
+/// Assert the settle the clock owes the stored DB instance `id` falls due exactly one
+/// transition span after the instant the record was minted at — the instant of the call
+/// that announced the transition.
+///
+/// Read from the STORE, which keeps an owed settle until a reporting operation materialises
+/// it. This is the half of the rule that makes the span the CLIENT's: nothing the
+/// announcing call does after minting the record — binding the socket a restored instance's
+/// own InfluxDB API is served on, say, which `RestoreFromDbBackup` awaits before it answers
+/// — may re-date the settle, or the first probe a polling client issues after that answer
+/// lands inside the span again and the client sleeps a whole probe interval.
+fn assert_instance_settle_is_one_span_after_its_call(
+    engine: &engine::InMemoryEngine,
+    id: &str,
+    case: &str,
+    which: &str,
+) {
+    let state = influxdb::state::service_state(engine)
+        .expect("the shared engine holds this service's store");
+    let store = state.lock();
+    let record = store
+        .db_instances
+        .get(id)
+        .unwrap_or_else(|| panic!("case {case:?}: {which} {id} is not stored"));
+    assert_eq!(
+        record.settles_at,
+        Some(record.created_at + influxdb::state::TRANSITION_SPAN),
+        "case {case:?}: {which}'s settle must fall due one transition span \
+         ({:?}) after the call that announced it, got {:?} on a record minted at {:?}",
+        influxdb::state::TRANSITION_SPAN,
+        record.settles_at,
+        record.created_at
+    );
+}
+
+/// The same assertion for the stored DB backup `id`.
+fn assert_backup_settle_is_one_span_after_its_call(
+    engine: &engine::InMemoryEngine,
+    id: &str,
+    case: &str,
+) {
+    let state = influxdb::state::service_state(engine)
+        .expect("the shared engine holds this service's store");
+    let store = state.lock();
+    let record = store
+        .db_backups
+        .get(id)
+        .unwrap_or_else(|| panic!("case {case:?}: the backup {id} is not stored"));
+    assert_eq!(
+        record.settles_at,
+        Some(record.created_at + influxdb::state::TRANSITION_SPAN),
+        "case {case:?}: the backup's settle must fall due one transition span ({:?}) \
+         after the call that announced it, got {:?} on a record minted at {:?}",
+        influxdb::state::TRANSITION_SPAN,
+        record.settles_at,
+        record.created_at
+    );
+}
+
+/// Read the backup `identifier` back until it reports `COMPLETED`, the way a client polls,
+/// and hand back the settled record with how many probes it took.
+async fn poll_to_completed(
+    router: &MultiServiceRouter,
+    region: &str,
+    identifier: &str,
+    case: &str,
+) -> (Value, usize) {
+    let started = Instant::now();
+    let mut probes = 0;
+    loop {
+        probes += 1;
+        let body = ok(
+            case,
+            call_in(
+                router,
+                region,
+                "GetDbBackup",
+                json!({ "identifier": identifier }),
+            )
+            .await,
+        );
+        let status = body["status"].as_str().unwrap_or_default();
+        if status == "COMPLETED" {
+            return (body, probes);
+        }
+        assert_eq!(
+            status, "IN_PROGRESS",
+            "case {case:?}: a backup being taken must report IN_PROGRESS until the clock \
+             settles it to COMPLETED, got {body}"
+        );
+        assert!(
+            started.elapsed() < SETTLE_DEADLINE,
+            "case {case:?}: the clock-owed settle to COMPLETED never happened, last \
+             answer {body}"
+        );
+        tokio::time::sleep(PROBE_INTERVAL).await;
+    }
+}
+
+/// RULE: every status transition this service owes on the clock falls due one transition
+/// span after the CALL that announced it, and that span is an order of magnitude below the
+/// round trip a client needs to issue its next request. So the first probe a polling client
+/// makes after such a call finds the settle already due, no transition costs the client one
+/// of its probe intervals, and a workflow that CHAINS transitions — provision a DB
+/// instance and wait for it, back it up and wait for the backup, restore the backup and
+/// wait for the resource it mints — converges in the time the chain itself takes rather
+/// than in one probe interval per link.
+///
+/// Each row drives exactly that chain, the way a client drives it, and asserts for each of
+/// the three records it walks that the settle is owed one span after the announcing call
+/// (on the store, where an owed settle is kept) and that a client needs no more probes than
+/// [`MAX_PROBES`] to observe it. The statuses named are members of the modelled `Status`,
+/// `DbBackupStatus` and `RestoreStatus` enums (`smithy_query(query="shape",
+/// shape="Status,DbBackupStatus,RestoreStatus")`).
+#[tokio::test]
+async fn a_chained_create_backup_restore_workflow_converges_for_a_polling_client() {
+    for case in chained_cases() {
+        let label = case.label;
+        // One router per row, so what the row asserts is about its own state alone.
+        let (router, engine) = router_and_engine();
+
+        // 1. The instance is provisioning, and the clock owes it AVAILABLE.
+        let created = ok(
+            label,
+            call_in(
+                &router,
+                case.region,
+                "CreateDbInstance",
+                (case.source)("chained-source"),
+            )
+            .await,
+        );
+        let source_id = id_of(label, &created);
+        assert_eq!(
+            created["status"].as_str(),
+            Some("CREATING"),
+            "case {label:?}: a freshly created instance is provisioning, got {created}"
+        );
+        assert_instance_settle_is_one_span_after_its_call(
+            &engine,
+            &source_id,
+            label,
+            "the created instance",
+        );
+        let (available, probes) =
+            poll_to_available(&router, case.region, &source_id, label, "CREATING").await;
+        assert!(
+            probes <= MAX_PROBES,
+            "case {label:?}: a client needed {probes} probes to see the created instance \
+             settled, expected at most {MAX_PROBES}"
+        );
+
+        // 2. The backup is being taken, and the clock owes it COMPLETED.
+        let taken = ok(
+            label,
+            call_in(
+                &router,
+                case.region,
+                "CreateDbBackup",
+                json!({
+                    "name": "chained-backup",
+                    "dbResourceId": &source_id,
+                    "retentionDays": 1,
+                }),
+            )
+            .await,
+        );
+        let backup_id = taken["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {label:?}: expected a backup `id`, got {taken}"))
+            .to_string();
+        assert_eq!(
+            taken["status"].as_str(),
+            Some("IN_PROGRESS"),
+            "case {label:?}: taking a backup is work the service does, got {taken}"
+        );
+        assert_backup_settle_is_one_span_after_its_call(&engine, &backup_id, label);
+        let (completed, probes) = poll_to_completed(&router, case.region, &backup_id, label).await;
+        assert!(
+            probes <= MAX_PROBES,
+            "case {label:?}: a client needed {probes} probes to see the backup completed, \
+             expected at most {MAX_PROBES}"
+        );
+        assert_eq!(
+            completed["dbResourceId"].as_str(),
+            Some(source_id.as_str()),
+            "case {label:?}: the backup must name the resource it was taken from, got \
+             {completed}"
+        );
+
+        // 3. The restore mints a resource of its own, RESTORING, and the clock owes it
+        //    AVAILABLE — dated from the restore call, not from the data-plane socket it
+        //    publishes for the resource before answering.
+        let restored = ok(
+            label,
+            call_in(
+                &router,
+                case.region,
+                "RestoreFromDbBackup",
+                restore_request("chained-restore", &backup_id, &case.restore),
+            )
+            .await,
+        );
+        let restored_id = restored["restoredDbResourceId"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("case {label:?}: expected a `restoredDbResourceId`, got {restored}")
+            })
+            .to_string();
+        assert_eq!(
+            restored["restoreStatus"].as_str(),
+            Some("RESTORING"),
+            "case {label:?}: the restore reports its own status, got {restored}"
+        );
+        assert_eq!(
+            restored["resourceType"].as_str(),
+            Some("db-instance"),
+            "case {label:?}: a single-node deployment type restores a DB instance, got \
+             {restored}"
+        );
+        assert_ne!(
+            restored_id, source_id,
+            "case {label:?}: a restore to a new resource must mint an id of its own"
+        );
+        assert_instance_settle_is_one_span_after_its_call(
+            &engine,
+            &restored_id,
+            label,
+            "the restored instance",
+        );
+        let (settled, probes) =
+            poll_to_available(&router, case.region, &restored_id, label, "RESTORING").await;
+        assert!(
+            probes <= MAX_PROBES,
+            "case {label:?}: a client needed {probes} probes to see the restored instance \
+             settled, expected at most {MAX_PROBES}"
+        );
+
+        // The chain converged on the resource the restore asked for: the restored instance
+        // is AVAILABLE under the restore's name, and it is not the instance the chain
+        // started from.
+        assert_eq!(
+            settled["status"].as_str(),
+            Some("AVAILABLE"),
+            "case {label:?}: the restored instance must reach AVAILABLE, got {settled}"
+        );
+        assert_eq!(
+            settled["name"].as_str(),
+            Some("chained-restore"),
+            "case {label:?}: the restored instance carries the restore's name, got {settled}"
+        );
+        assert_eq!(
+            settled["id"].as_str(),
+            Some(restored_id.as_str()),
+            "case {label:?}: the restored instance reads back under the id the restore \
+             reported, got {settled}"
+        );
+        assert_eq!(
+            available["id"].as_str(),
+            Some(source_id.as_str()),
+            "case {label:?}: the source instance is still its own record, got {available}"
+        );
+    }
 }
