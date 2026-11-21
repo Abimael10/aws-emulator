@@ -18,11 +18,12 @@
 //! of an image, a write that mints a resource, the list that reports it), which analysis a read
 //! asks for (`GENERAL_LABELS` by default, `IMAGE_PROPERTIES` by name), where the image came
 //! from (an object in the store, and the bytes the event carried inline), what the frame
-//! carries (one colour, two colours), the format it was staged in (PNG, JPEG — "the image must
-//! be either a PNG or JPEG formatted file"), whether the request narrows the answer
-//! (`MaxLabels`), and whether the call is served or refused — and, where it is refused, which of
-//! the two unreadable-image classes it falls into (an address the store does not serve, bytes
-//! that are no image at all). Both managed runtimes that bundle an SDK are driven.
+//! carries (one colour, two colours, a drawn face — the entity this service's own detector
+//! measures, which is what a general label names), the format it was staged in (PNG, JPEG —
+//! "the image must be either a PNG or JPEG formatted file"), whether the request narrows the
+//! answer (`MaxLabels`), and whether the call is served or refused — and, where it is refused,
+//! which of the two unreadable-image classes it falls into (an address the store does not serve,
+//! bytes that are no image at all). Both managed runtimes that bundle an SDK are driven.
 //!
 //! The LAST test of the suite is the other half of the same seam, and the rule a pipeline
 //! written on it rests on: `Invoke`'s `FunctionError` is "if present, indicates that an error
@@ -45,7 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
-use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
+use image::{DynamicImage, GrayImage, ImageFormat, Luma, Rgb, RgbImage};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -84,19 +85,26 @@ const BUCKET: &str = "vision-landing";
 const FLAT_PNG_KEY: &str = "uploads/one-colour.png";
 const FLAT_JPEG_KEY: &str = "uploads/one-colour.jpg";
 const TWO_COLOUR_KEY: &str = "uploads/two-colours.png";
+const PORTRAIT_KEY: &str = "uploads/portrait.png";
+const TWO_FACE_PORTRAIT_KEY: &str = "uploads/portrait-two-faces.png";
 const ABSENT_KEY: &str = "uploads/never-written.png";
 
 /// The table the handler records what it measured in.
 const TABLE: &str = "vision-labels";
 
-/// The colours the frames are drawn from, and the label name this emulator's Rekognition
-/// reports each as — one of the twelve simplified colour names, capitalised
+/// The colours the frames are drawn from, and the simplified colour name this emulator's
+/// Rekognition MEASURES each as — one of the twelve simplified colour names
 /// (`smithy_query(query="doc",shape="DominantColor",member="SimplifiedColor")`: "One of 12
-/// simplified color names").
+/// simplified color names"). A colour is a measured property of the frame, reported under
+/// `ImageProperties`, and not an entity the frame carries, so no colour is a LABEL of it.
 const RED: [u8; 3] = [255, 0, 0];
 const BLUE: [u8; 3] = [0, 0, 255];
-const RED_LABEL: &str = "Red";
-const BLUE_LABEL: &str = "Blue";
+const RED_COLOUR: &str = "red";
+
+/// The entity labels a frame carrying a measured FACE is reported with, in the order the
+/// service reports them: the entity measured, then each ancestor the published general-label
+/// taxonomy puts above it.
+const ENTITY_CHAIN: [&str; 3] = ["Face", "Head", "Person"];
 
 /// The version of the label detection model the service answers with, which is the member's
 /// own documentation: "version number of the label detection model that was used to detect
@@ -148,6 +156,60 @@ fn encoded(frame: &RgbImage, format: ImageFormat) -> Vec<u8> {
         .write_to(&mut bytes, format)
         .expect("the drawn frame encodes");
     bytes.into_inner()
+}
+
+/// A drawn PORTRAIT as the PNG bytes a client submits.
+fn encoded_portrait(frame: &GrayImage) -> Vec<u8> {
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageLuma8(frame.clone())
+        .write_to(&mut bytes, ImageFormat::Png)
+        .expect("the drawn portrait encodes");
+    bytes.into_inner()
+}
+
+/// The tones a portrait is drawn from: the ground behind the head, the head itself, and the
+/// features that stand dark against it, which is the structure a geometric face detector reads.
+const GROUND_TONE: u8 = 110;
+const SKIN_TONE: u8 = 190;
+const FEATURE_TONE: u8 = 30;
+
+/// A portrait of `faces`, each given as the centre between its eyes and how far apart they are:
+/// a head ellipse in the skin tone, two eyes and a mouth in the feature tone, drawn at the
+/// standard facial proportions so the frame carries an ENTITY a geometric detector measures
+/// rather than only a colour.
+fn portrait(width: u32, height: u32, faces: &[(f32, f32, f32)]) -> GrayImage {
+    let mut frame = GrayImage::from_pixel(width, height, Luma([GROUND_TONE]));
+    for (x, y, span) in faces {
+        fill_ellipse(&mut frame, *x, y + 0.15 * span, 1.1 * span, 1.5 * span, SKIN_TONE);
+    }
+    // Every head goes on before any feature, so one face's head cannot paint over another's
+    // eyes where two faces are drawn close together.
+    for (x, y, span) in faces {
+        let eye = 0.18 * span;
+        for side in [-0.5, 0.5] {
+            fill_ellipse(&mut frame, x + side * span, *y, eye, eye, FEATURE_TONE);
+        }
+        fill_ellipse(&mut frame, *x, y + span, 0.35 * span, 0.12 * span, FEATURE_TONE);
+    }
+    frame
+}
+
+/// Fill the ellipse of radii `rx`/`ry` around `(cx, cy)` with `tone`.
+fn fill_ellipse(frame: &mut GrayImage, cx: f32, cy: f32, rx: f32, ry: f32, tone: u8) {
+    let (width, height) = (frame.width() as i64, frame.height() as i64);
+    let from_x = ((cx - rx).floor() as i64).max(0);
+    let to_x = ((cx + rx).ceil() as i64).min(width - 1);
+    let from_y = ((cy - ry).floor() as i64).max(0);
+    let to_y = ((cy + ry).ceil() as i64).min(height - 1);
+    for y in from_y..=to_y {
+        for x in from_x..=to_x {
+            let dx = (x as f32 - cx) / rx.max(1.0);
+            let dy = (y as f32 - cy) / ry.max(1.0);
+            if dx * dx + dy * dy <= 1.0 {
+                frame.put_pixel(x as u32, y as u32, Luma([tone]));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -407,8 +469,8 @@ async fn invoke(
     (signal, payload)
 }
 
-/// Stage the bucket, the three frames and the table every row stands on, and answer the base64
-/// of the one frame a row submits INLINE.
+/// Stage the bucket, the frames and the table every row stands on, and answer the base64 of the
+/// one frame a row submits INLINE.
 async fn staged(router: &MultiServiceRouter, case: &str) -> String {
     let (status, answered) = s3(router, "PUT", &format!("/{BUCKET}"), b"").await;
     assert_eq!(
@@ -417,11 +479,23 @@ async fn staged(router: &MultiServiceRouter, case: &str) -> String {
         "case {case:?}: expected CreateBucket to answer 200, got {status} ({})",
         String::from_utf8_lossy(&answered)
     );
-    let two_colour = encoded(&halves(RED, BLUE), ImageFormat::Png);
-    let objects: [(&str, Vec<u8>); 3] = [
+    let one_face = encoded_portrait(&portrait(320, 320, &[(160.0, 150.0, 56.0)]));
+    let objects: [(&str, Vec<u8>); 5] = [
         (FLAT_PNG_KEY, encoded(&flat(RED), ImageFormat::Png)),
         (FLAT_JPEG_KEY, encoded(&flat(RED), ImageFormat::Jpeg)),
-        (TWO_COLOUR_KEY, two_colour.clone()),
+        (
+            TWO_COLOUR_KEY,
+            encoded(&halves(RED, BLUE), ImageFormat::Png),
+        ),
+        (PORTRAIT_KEY, one_face.clone()),
+        (
+            TWO_FACE_PORTRAIT_KEY,
+            encoded_portrait(&portrait(
+                480,
+                320,
+                &[(130.0, 150.0, 56.0), (350.0, 140.0, 36.0)],
+            )),
+        ),
     ];
     for (key, bytes) in &objects {
         let (status, answered) = s3(router, "PUT", &format!("/{BUCKET}/{key}"), bytes).await;
@@ -466,7 +540,7 @@ async fn staged(router: &MultiServiceRouter, case: &str) -> String {
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    base64::engine::general_purpose::STANDARD.encode(&two_colour)
+    base64::engine::general_purpose::STANDARD.encode(&one_face)
 }
 
 /// The label names an answered analysis reported, in the order the service reported them.
@@ -605,11 +679,11 @@ struct Probe {
 }
 
 /// The probes, one per thing the rule generalises over: a read of a one-colour frame staged as
-/// PNG, the same frame staged as JPEG, a two-colour frame, the same read narrowed by
-/// `MaxLabels`, a read asking for the other analysis, another read operation of the same
-/// service, a write that mints a resource, the list that reports it, a read of an address the
-/// store does not serve, and a read of bytes that are no image at all — the two refusal classes
-/// an unreadable image falls into.
+/// PNG, the same frame staged as JPEG, a two-colour frame, a frame carrying an entity the
+/// service measures, the same read narrowed by `MaxLabels`, a read asking for the other
+/// analysis, another read operation of the same service, a write that mints a resource, the
+/// list that reports it, a read of an address the store does not serve, and a read of bytes
+/// that are no image at all — the two refusal classes an unreadable image falls into.
 fn probes() -> Vec<Probe> {
     vec![
         Probe {
@@ -635,11 +709,19 @@ fn probes() -> Vec<Probe> {
             served: true,
         },
         Probe {
+            case: "a frame carrying an entity the service measures",
+            operation: "DetectLabels",
+            input: || {
+                json!({ "Image": { "S3Object": { "Bucket": BUCKET, "Name": PORTRAIT_KEY } } })
+            },
+            served: true,
+        },
+        Probe {
             case: "the same frame with the answer narrowed to one label",
             operation: "DetectLabels",
             input: || {
                 json!({
-                    "Image": { "S3Object": { "Bucket": BUCKET, "Name": TWO_COLOUR_KEY } },
+                    "Image": { "S3Object": { "Bucket": BUCKET, "Name": PORTRAIT_KEY } },
                     "MaxLabels": 1,
                 })
             },
@@ -737,7 +819,7 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
         &json!({
             "probes": asked,
             "bucket": BUCKET,
-            "key": TWO_COLOUR_KEY,
+            "key": PORTRAIT_KEY,
             "table": TABLE,
         }),
     )
@@ -766,17 +848,20 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
         );
     }
 
-    // The frame drawn in ONE colour: that colour, and nothing else — one label per thing
-    // measured in the frame.
+    // The frames drawn in COLOUR and nothing else: a colour is a measured property of a frame
+    // rather than an entity in it, so each is answered with an empty label list — what was
+    // measured — and with the model that ran all the same.
     for case in [
         "one colour, staged as PNG",
         "the same frame staged in the other format the service reads",
+        "two colours, neither of them the whole frame",
     ] {
         let answer = report[case]["answer"].clone();
         assert_eq!(
             label_names(&answer),
-            vec![RED_LABEL.to_string()],
-            "case {case:?}: expected the one colour drawn and nothing else, got {answer}"
+            Vec::<String>::new(),
+            "case {case:?}: expected no entity to be reported for a frame that carries only \
+             colour, got {answer}"
         );
         assert_eq!(
             answer["LabelModelVersion"].as_str(),
@@ -785,26 +870,26 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
         );
     }
 
-    // Two colours, half the frame each: both of them, one label per colour measured — and what
-    // the handler read back is what this service answers a CLIENT for the same
-    // image.
-    let case_two = "two colours, neither of them the whole frame";
-    let two = report[case_two]["answer"].clone();
+    // The frame carrying a drawn FACE: the entity measured and every ancestor the taxonomy puts
+    // above it — and what the handler read back is what this service answers a CLIENT for the
+    // same image.
+    let case_entity = "a frame carrying an entity the service measures";
+    let entity = report[case_entity]["answer"].clone();
     assert_eq!(
-        label_names(&two),
-        vec![RED_LABEL.to_string(), BLUE_LABEL.to_string()],
-        "case {case_two:?}: expected both colours drawn and nothing else, got {two}"
+        label_names(&entity),
+        ENTITY_CHAIN.map(str::to_string).to_vec(),
+        "case {case_entity:?}: expected the entity measured and its ancestors, got {entity}"
     );
     let (status, directly) = rekognition(
         &router,
         "DetectLabels",
-        &json!({ "Image": { "S3Object": { "Bucket": BUCKET, "Name": TWO_COLOUR_KEY } } }),
+        &json!({ "Image": { "S3Object": { "Bucket": BUCKET, "Name": PORTRAIT_KEY } } }),
     )
     .await;
     assert_eq!(
         (status, label_names(&directly)),
-        (200, label_names(&two)),
-        "case {case_two:?}: expected the handler to have read what this service answers a \
+        (200, label_names(&entity)),
+        "case {case_entity:?}: expected the handler to have read what this service answers a \
          client for the same image, got {directly}"
     );
 
@@ -814,7 +899,7 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
     let narrowed = report[case_narrowed]["answer"].clone();
     assert_eq!(
         label_names(&narrowed),
-        vec![RED_LABEL.to_string()],
+        vec![ENTITY_CHAIN[0].to_string()],
         "case {case_narrowed:?}: expected the one highest-confidence label, got {narrowed}"
     );
 
@@ -828,7 +913,7 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
     );
     assert_eq!(
         properties["ImageProperties"]["DominantColors"][0]["SimplifiedColor"].as_str(),
-        Some("red"),
+        Some(RED_COLOUR),
         "case {case_properties:?}: expected the colour drawn as the frame's dominant one, got \
          {properties}"
     );
@@ -917,14 +1002,14 @@ async fn a_node_handler_analyses_an_image_through_the_sdk_the_runtime_supplies()
         "GetItem",
         &json!({
             "TableName": TABLE,
-            "Key": { "image_name": { "S": TWO_COLOUR_KEY } },
+            "Key": { "image_name": { "S": PORTRAIT_KEY } },
             "ConsistentRead": true,
         }),
     )
     .await;
     assert_eq!(
         held["Item"]["labels"]["SS"],
-        json!([RED_LABEL, BLUE_LABEL]),
+        json!(ENTITY_CHAIN),
         "case {case:?}: expected the measured labels recorded under the object's key, got {held}"
     );
     assert_eq!(
@@ -964,7 +1049,7 @@ async fn a_python_handler_analyses_an_image_through_the_sdk_the_runtime_supplies
         caller,
         &json!({
             "bucket": BUCKET,
-            "key": FLAT_PNG_KEY,
+            "key": PORTRAIT_KEY,
             "absent": ABSENT_KEY,
             "inline": inline,
             "table": TABLE,
@@ -978,18 +1063,18 @@ async fn a_python_handler_analyses_an_image_through_the_sdk_the_runtime_supplies
     );
     assert_eq!(
         payload["recorded"],
-        json!([RED_LABEL]),
-        "case {case:?}: expected the one colour drawn and nothing else, got {payload}"
+        json!(ENTITY_CHAIN),
+        "case {case:?}: expected the entity measured and its ancestors, got {payload}"
     );
     assert_eq!(
         payload["model_version"].as_str(),
         Some(LABEL_MODEL_VERSION),
         "case {case:?}: expected the model that detected the labels, got {payload}"
     );
-    // The bytes the event carried inline are the two-colour frame, narrowed to one label.
+    // The bytes the event carried inline are the same frame, narrowed to one label.
     assert_eq!(
         payload["inline"],
-        json!([RED_LABEL]),
+        json!([ENTITY_CHAIN[0]]),
         "case {case:?}: expected the one highest-confidence label of the inline frame, got \
          {payload}"
     );
@@ -1013,14 +1098,14 @@ async fn a_python_handler_analyses_an_image_through_the_sdk_the_runtime_supplies
         "GetItem",
         &json!({
             "TableName": TABLE,
-            "Key": { "image_name": { "S": FLAT_PNG_KEY } },
+            "Key": { "image_name": { "S": PORTRAIT_KEY } },
             "ConsistentRead": true,
         }),
     )
     .await;
     assert_eq!(
         held["Item"]["labels"]["SS"],
-        json!([RED_LABEL]),
+        json!(ENTITY_CHAIN),
         "case {case:?}: expected the measured labels recorded under the object's key, got {held}"
     );
 }
@@ -1126,26 +1211,26 @@ struct Upload {
 const UPLOADS: &[Upload] = &[
     Upload {
         case: "the first upload of a key, whose condition holds",
-        key: FLAT_PNG_KEY,
+        key: PORTRAIT_KEY,
         run: "run-1",
         stored_run: "run-1",
-        labels: &[RED_LABEL],
+        labels: &ENTITY_CHAIN,
         caught: None,
     },
     Upload {
         case: "a re-upload of the same key, whose condition cannot hold",
-        key: FLAT_PNG_KEY,
+        key: PORTRAIT_KEY,
         run: "run-2",
         stored_run: "run-1",
-        labels: &[RED_LABEL],
+        labels: &ENTITY_CHAIN,
         caught: Some(CONDITION_FAILED),
     },
     Upload {
         case: "an upload of another key, whose condition holds again",
-        key: TWO_COLOUR_KEY,
+        key: TWO_FACE_PORTRAIT_KEY,
         run: "run-3",
         stored_run: "run-3",
-        labels: &[RED_LABEL, BLUE_LABEL],
+        labels: &ENTITY_CHAIN,
         caught: None,
     },
 ];
@@ -1190,7 +1275,10 @@ async fn a_refusal_the_handler_catches_leaves_the_invocation_clean() {
                 "table": TABLE,
                 "run": upload.run,
                 "max_labels": 10,
-                "min_confidence": 70,
+                // The documented floor a request naming no `MinConfidence` is narrowed to, so
+                // the measured entity of each staged frame is reported for the handler to
+                // record.
+                "min_confidence": 55,
                 "caught_suffix": CAUGHT_SUFFIX,
             }),
         )

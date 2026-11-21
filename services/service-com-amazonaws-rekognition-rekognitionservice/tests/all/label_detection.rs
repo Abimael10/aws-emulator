@@ -5,11 +5,15 @@
 //! [`MultiServiceRouter`] the production emulator mounts.
 //!
 //! THE RULE UNDER TEST: `DetectLabels` reports what the SUBMITTED IMAGE carries and only
-//! what was measured in it — one label per thing measured in the pixels, with the ancestor
-//! label the taxonomy puts above it and an `Instance` box per measured instance, and, where
-//! the request asks for image properties, the measured quality and dominant colours of the
-//! pixels themselves — so an image carrying no measurable entity is answered with an empty
-//! label list rather than a refusal, a SCALAR member nothing measured is absent while every
+//! what was measured in it — one label per real-world ENTITY measured in the pixels, named from
+//! the general-label taxonomy, with every ancestor the taxonomy puts above it reported as a
+//! unique label of its own and an `Instance` box per measured instance, and, where the request
+//! asks for image properties, the measured quality and dominant colours of the pixels
+//! themselves. A measurement of the frame's own pixels is not an entity IN the frame, so a
+//! simplified colour name is never a label name: an image carrying no measurable entity is
+//! answered with an empty label list rather than a refusal or the names of the colours
+//! covering it, while those colours are still measured and reported under
+//! `ImageProperties.DominantColors`. A SCALAR member nothing measured is absent while every
 //! modelled LIST member of a reported `Label` is present (empty where there is nothing to
 //! report), `Features` decides which of the two analyses runs, and `MaxLabels`,
 //! `MinConfidence` and `Settings.GeneralLabels` only NARROW what was measured. The image's
@@ -72,41 +76,46 @@ const MEASURED_TOLERANCE: f64 = 0.5;
 /// `Instances`, `Parents`, `Aliases` and `Categories` as lists).
 const LIST_MEMBERS: [&str; 4] = ["Instances", "Parents", "Aliases", "Categories"];
 
-/// The two label-category rows this emulator holds, one per kind of label it can measure:
-/// the labels that describe a person and the labels that describe the frame's own colour and
-/// composition. Both are rows of the label-category list the Amazon Rekognition Developer
-/// Guide publishes, linked from the filters' own documentation ("To see a list of label
-/// categories, see …", `smithy_query(query="shape",shape="GeneralLabelsSettings")`).
+/// The one label-category row this emulator holds: the category the published taxonomy puts
+/// the person-description entities it can measure in. It is a row of the label-category list
+/// the Amazon Rekognition Developer Guide publishes, linked from the filters' own
+/// documentation ("To see a list of label categories, see …",
+/// `smithy_query(query="shape",shape="GeneralLabelsSettings")`).
 const PERSON_DESCRIPTION_CATEGORY: &str = "Person Description";
+
+/// The category the published list puts the COLOUR and composition of a frame in, which this
+/// service measures but reports under `ImageProperties` rather than as a label.
 const COLORS_CATEGORY: &str = "Colors and Visual Composition";
 
 /// The twelve simplified colour names a measured colour is reported under — "One of 12
 /// simplified color names"
-/// (`smithy_query(query="doc",shape="DominantColor",member="SimplifiedColor")`) — which is
-/// also the vocabulary a colour LABEL is named from, capitalised.
+/// (`smithy_query(query="doc",shape="DominantColor",member="SimplifiedColor")`). None of them
+/// names an entity an image carries, so none of them is ever the name of a reported label.
 const SIMPLIFIED_COLORS: [&str; 12] = [
     "black", "grey", "white", "red", "orange", "yellow", "green", "cyan", "blue", "purple",
     "pink", "brown",
 ];
 
-/// The label name of a simplified colour name.
+/// A simplified colour name as a label name would be written.
 fn colour_label(name: &str) -> String {
     let mut capitalised = name.to_string();
     capitalised[..1].make_ascii_uppercase();
     capitalised
 }
 
-/// Every label of an answer that is not one of the measured entities is a colour of the
-/// frame.
-fn assert_colour_vocabulary(case: &str, labels: &[Value]) {
-    let vocabulary: Vec<String> = SIMPLIFIED_COLORS.iter().map(|name| colour_label(name)).collect();
+/// Every label of an answer is one of the entities this service can measure, and never one of
+/// the simplified colour names a measured COLOUR is reported under.
+fn assert_entity_vocabulary(case: &str, labels: &[Value]) {
+    let colours: Vec<String> = SIMPLIFIED_COLORS.iter().map(|name| colour_label(name)).collect();
     for name in names(labels) {
-        if PERSON_CHAIN.contains(&name.as_str()) {
-            continue;
-        }
         assert!(
-            vocabulary.contains(&name),
-            "case {case:?}: a colour label is named from the simplified colour names, \
+            !colours.contains(&name) && !SIMPLIFIED_COLORS.contains(&name.as_str()),
+            "case {case:?}: a simplified colour name is a measured property of the frame and \
+             not an entity in it, so it is no label name, got {name:?}"
+        );
+        assert!(
+            PERSON_CHAIN.contains(&name.as_str()),
+            "case {case:?}: a reported label is named from the general-label taxonomy, \
              got {name:?}"
         );
     }
@@ -233,9 +242,9 @@ fn labels_of(case: &str, reply: &Reply) -> Vec<Value> {
             1,
             "case {case:?}: a reported label names the category it belongs to, got {label:?}"
         );
-        assert!(
-            [PERSON_DESCRIPTION_CATEGORY, COLORS_CATEGORY]
-                .contains(&categories(label)[0].as_str()),
+        assert_eq!(
+            categories(label),
+            vec![PERSON_DESCRIPTION_CATEGORY.to_string()],
             "case {case:?}: a category is a row of the published category list, got {label:?}"
         );
     }
@@ -307,10 +316,10 @@ fn assert_close(case: &str, what: &str, measured: f64, expected: f64) {
 // What an image carries
 // ---------------------------------------------------------------------------
 
-/// One label per entity MEASURED in the image, with the ancestor it brings with it and an
-/// instance per measured face, and one per colour the frame carries; an image carrying no
-/// entity reports no entity label at all. The same answer whichever format the image was
-/// encoded in and however it was submitted.
+/// One label per ENTITY measured in the image, with every ancestor it brings with it and an
+/// instance per measured face; an image carrying no entity reports no label at all — not even
+/// the colours covering it. The same answer whichever format the image was encoded in and
+/// however it was submitted.
 #[tokio::test]
 async fn labels_report_the_entities_measured_in_the_image() {
     let router = harness();
@@ -336,20 +345,18 @@ async fn labels_report_the_entities_measured_in_the_image() {
                  got {:?}",
                 reply.body
             );
-            assert_colour_vocabulary(&case, &labels);
+            assert_entity_vocabulary(&case, &labels);
             if drawn == 0 {
-                for entity in PERSON_CHAIN {
-                    assert!(
-                        label_named(&labels, entity).is_none(),
-                        "case {case:?}: no face was drawn, so no {entity} is reported, \
-                         got {labels:?}"
-                    );
-                }
+                assert!(
+                    labels.is_empty(),
+                    "case {case:?}: no entity was measured, so no label is reported, \
+                     got {labels:?}"
+                );
                 continue;
             }
             assert_eq!(
-                names(&labels)[..PERSON_CHAIN.len()],
-                PERSON_CHAIN.map(str::to_string),
+                names(&labels),
+                PERSON_CHAIN.map(str::to_string).to_vec(),
                 "case {case:?}: a measured face is reported with every ancestor above it, \
                  got {labels:?}"
             );
@@ -429,9 +436,9 @@ async fn labels_report_the_entities_measured_in_the_image() {
 /// `Instances`, `Parents`, `Aliases`, `Categories` — present and empty where there is
 /// nothing to report rather than omitted, and exactly one category row naming where the
 /// published taxonomy puts the label. The table spans what the rule generalises over: which
-/// kind of label the frame measures (a measured entity, its ancestor, one colour, several),
-/// how the image was submitted, which `Features` were asked for, and whether the answer was
-/// narrowed or filtered before it was reported.
+/// kind of label the frame measures (a measured entity, its ancestors, none at all), how the
+/// image was submitted, which `Features` were asked for, and whether the answer was narrowed
+/// or filtered before it was reported.
 #[tokio::test]
 async fn every_reported_label_carries_each_modelled_list_member() {
     let router = harness_with_object_store();
@@ -449,26 +456,32 @@ async fn every_reported_label_carries_each_modelled_list_member() {
     let flat = colour_png(&flat_colour(64, 64, [255, 255, 255]));
     let two_colours = colour_png(&two_colour(80, 40, 30, [30, 60, 220], [220, 30, 30]));
 
-    let cases: Vec<(&str, Value)> = vec![
+    // (the case, the request, whether the frame carries an entity to report)
+    let cases: Vec<(&str, Value, bool)> = vec![
         (
             "a portrait submitted inline",
             json!({ "Image": bytes_image(&portrait) }),
+            true,
         ),
         (
             "the same portrait read from an S3 object",
             json!({ "Image": { "S3Object": { "Bucket": BUCKET, "Name": "portrait.png" } } }),
+            true,
         ),
         (
             "a portrait carrying two faces",
             json!({ "Image": bytes_image(&two_face_portrait().png()) }),
+            true,
         ),
         (
             "a frame of one colour and no entity",
             json!({ "Image": bytes_image(&flat) }),
+            false,
         ),
         (
-            "a frame of two colours",
+            "a frame of two colours and no entity",
             json!({ "Image": bytes_image(&two_colours) }),
+            false,
         ),
         (
             "a portrait with the image properties asked for too",
@@ -476,14 +489,17 @@ async fn every_reported_label_carries_each_modelled_list_member() {
                 "Image": bytes_image(&portrait),
                 "Features": ["GENERAL_LABELS", "IMAGE_PROPERTIES"],
             }),
+            true,
         ),
         (
             "a portrait narrowed to one label",
             json!({ "Image": bytes_image(&portrait), "MaxLabels": 1 }),
+            true,
         ),
         (
             "a portrait narrowed to the floor of the scale",
             json!({ "Image": bytes_image(&portrait), "MinConfidence": PERCENT_MIN }),
+            true,
         ),
         (
             "a portrait filtered to its measured entity",
@@ -491,6 +507,7 @@ async fn every_reported_label_carries_each_modelled_list_member() {
                 "Image": bytes_image(&portrait),
                 "Settings": { "GeneralLabels": { "LabelInclusionFilters": [FACE] } },
             }),
+            true,
         ),
         (
             "a portrait filtered by the category its labels belong to",
@@ -502,16 +519,20 @@ async fn every_reported_label_carries_each_modelled_list_member() {
                     },
                 },
             }),
+            true,
         ),
     ];
 
-    for (case, body) in cases {
+    for (case, body, labelled) in cases {
         let reply = detect(&router, body).await;
         // `labels_of` is what checks each modelled list member of every label reported.
         let labels = labels_of(case, &reply);
-        assert!(
+        assert_entity_vocabulary(case, &labels);
+        assert_eq!(
             !labels.is_empty(),
-            "case {case:?}: the frame measures at least one label, got {:?}",
+            labelled,
+            "case {case:?}: a label is reported for each entity measured and for nothing \
+             else, got {:?}",
             reply.body
         );
         for label in &labels {
@@ -612,6 +633,7 @@ async fn max_labels_and_min_confidence_narrow_what_was_measured() {
         unnarrowed.len() >= 3,
         "the frame must measure several labels for the caps to bite, got {unnarrowed:?}"
     );
+    assert_entity_vocabulary("no narrowing", &unnarrowed);
 
     // (what the request narrows by, whether it must remove something)
     let cases: Vec<(&str, Value, bool)> = vec![
@@ -650,9 +672,12 @@ async fn max_labels_and_min_confidence_narrow_what_was_measured() {
             true,
         ),
         (
+            // Every label of one measured entity carries that entity's own confidence — the
+            // recorded answer reports an ancestor at the confidence of the label below it — so
+            // a floor under what was measured removes none of them.
             "MinConfidence just below what was measured for the face",
             json!({ "MinConfidence": measured - 1.0 }),
-            true,
+            false,
         ),
         (
             "MinConfidence just above what was measured for the face",
@@ -761,12 +786,10 @@ async fn the_general_label_filters_select_which_labels_are_reported() {
         "the frame must measure several labels for the filters to select from, \
          got {unfiltered:?}"
     );
-    // The colour of the frame, which is a label the entity filters below do not name.
-    let colour = unfiltered
-        .iter()
-        .find(|name| !PERSON_CHAIN.contains(&name.as_str()))
-        .cloned()
-        .expect("the frame carries a measured colour");
+    // A simplified colour name of a colour the frame really carries, which is a measured
+    // property of the frame rather than a label of it — so no filter naming one selects
+    // anything.
+    let colour = colour_label("grey");
 
     // (the case, the filters, which of the unfiltered labels must survive them)
     let cases: Vec<(&str, Value, Vec<String>)> = vec![
@@ -786,9 +809,14 @@ async fn the_general_label_filters_select_which_labels_are_reported() {
             vec![FACE.to_string(), PERSON.to_string()],
         ),
         (
-            "an inclusion filter naming the colour measured",
+            "an inclusion filter naming the intermediate ancestor",
+            json!({ "LabelInclusionFilters": [HEAD] }),
+            vec![HEAD.to_string()],
+        ),
+        (
+            "an inclusion filter naming a colour the frame carries",
             json!({ "LabelInclusionFilters": [colour] }),
-            vec![colour.clone()],
+            Vec::new(),
         ),
         (
             "an inclusion filter naming an entity nothing measured",
@@ -841,6 +869,11 @@ async fn the_general_label_filters_select_which_labels_are_reported() {
             "a category exclusion filter naming the colour category",
             json!({ "LabelCategoryExclusionFilters": [COLORS_CATEGORY] }),
             PERSON_CHAIN.map(str::to_string).to_vec(),
+        ),
+        (
+            "a category exclusion filter naming a category nothing measured",
+            json!({ "LabelCategoryExclusionFilters": ["Animals and Pets"] }),
+            unfiltered.clone(),
         ),
     ];
     for (case, filters, expected) in cases {
@@ -1245,10 +1278,12 @@ async fn an_instance_reports_the_colours_of_its_own_box() {
     }
 }
 
-/// A measured colour is named from the twelve simplified colour names, and a frame carrying
-/// that colour is reported as a LABEL under the same name capitalised — one row per entry of
-/// the catalog, each drawn in a colour that falls under it. A frame drawn in one colour also
-/// admits no foreground/background split, so neither side is reported for it.
+/// A measured colour is named from the twelve simplified colour names and reported where the
+/// model puts it — under `ImageProperties.DominantColors` — and NEVER as a label: a frame drawn
+/// flat in one colour carries no entity, so its `Labels` is empty while its colour is
+/// measured. One row per entry of the catalog, each drawn in a colour that falls under it. A
+/// frame drawn in one colour also admits no foreground/background split, so neither side is
+/// reported for it.
 #[tokio::test]
 async fn a_measured_colour_is_named_from_the_simplified_colour_names() {
     let router = harness();
@@ -1283,21 +1318,10 @@ async fn a_measured_colour_is_named_from_the_simplified_colour_names() {
         )
         .await;
         let labels = labels_of(case, &reply);
-        assert_eq!(
-            names(&labels),
-            vec![colour_label(case)],
-            "case {case:?}: the frame's one colour is its one label, got {labels:?}"
-        );
-        assert_eq!(
-            categories(&labels[0]),
-            vec![COLORS_CATEGORY.to_string()],
-            "case {case:?}: a colour belongs to the colour category, got {labels:?}"
-        );
-        assert_close(
-            case,
-            "the colour label's confidence",
-            number(case, &labels[0], &["Confidence"]),
-            100.0,
+        assert!(
+            labels.is_empty(),
+            "case {case:?}: the frame's colour is a property of it and no entity in it, so no \
+             label is reported, got {labels:?}"
         );
         let properties = reply
             .field("ImageProperties")
@@ -1328,48 +1352,59 @@ async fn a_measured_colour_is_named_from_the_simplified_colour_names() {
     }
 }
 
-/// The colours reported as labels of a frame are the families covering at least a hundredth
-/// of it, and nothing else: a frame of essentially one colour reports that one colour and no
-/// second label restating it. The table runs the share at which the second colour starts
-/// being reported, at the bound and on both sides of it.
+/// The colours a frame carries are MEASURED however much of it they cover, and reported under
+/// `ImageProperties.DominantColors` — never as labels of the frame, whatever share they hold.
+/// The table runs the share at which a second colour becomes a measured dominant colour of its
+/// own, at the bound and on both sides of it.
 #[tokio::test]
-async fn a_colour_is_a_label_once_it_covers_a_hundredth_of_the_frame() {
+async fn the_colours_of_a_frame_are_measured_but_never_reported_as_labels() {
     let router = harness();
     let red = [220_u8, 30, 30];
     let blue = [30_u8, 60, 220];
-    // (the case, how many of the 100 columns carry the second colour, that colour reported)
+    // (the case, how many of the 100 columns carry the second colour, that colour measured)
     let cases: Vec<(&str, u32, bool)> = vec![
         ("one colour alone", 0, false),
-        ("a second colour at a hundredth of the frame", 1, true),
+        ("a second colour on a hundredth of the frame", 1, true),
         ("a second colour on a fiftieth of the frame", 2, true),
         ("two colours in quantity", 40, true),
     ];
-    for (case, columns, reported) in cases {
+    for (case, columns, measured) in cases {
         let frame = two_colour(100, 50, columns, blue, red);
         let reply = detect(
             &router,
-            json!({ "Image": bytes_image(&colour_png(&frame)) }),
+            json!({
+                "Image": bytes_image(&colour_png(&frame)),
+                "Features": ["GENERAL_LABELS", "IMAGE_PROPERTIES"],
+            }),
         )
         .await;
         let labels = labels_of(case, &reply);
-        assert_colour_vocabulary(case, &labels);
-        assert_eq!(
-            label_named(&labels, colour_label("blue").as_str()).is_some(),
-            reported,
-            "case {case:?}: a colour covering {columns}% of the frame is {}a label of it, \
-             got {labels:?}",
-            if reported { "" } else { "not " }
-        );
+        assert_entity_vocabulary(case, &labels);
         assert!(
-            label_named(&labels, colour_label("red").as_str()).is_some(),
-            "case {case:?}: the colour most of the frame carries is a label of it, \
-             got {labels:?}"
+            labels.is_empty(),
+            "case {case:?}: the frame carries no entity, so no colour of it is reported as a \
+             label, got {labels:?}"
+        );
+        let families: Vec<String> = reply
+            .field("ImageProperties")
+            .and_then(|properties| properties.get("DominantColors"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|colour| colour.get("SimplifiedColor").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            families.contains(&"red".to_string()),
+            "case {case:?}: the colour most of the frame carries is measured, got {families:?}"
         );
         assert_eq!(
-            labels.len(),
-            if reported { 2 } else { 1 },
-            "case {case:?}: one label per colour family measured and no other, \
-             got {labels:?}"
+            families.contains(&"blue".to_string()),
+            measured,
+            "case {case:?}: a colour on {columns} of the 100 columns is {}measured, \
+             got {families:?}",
+            if measured { "" } else { "not " }
         );
     }
 }
@@ -1499,6 +1534,294 @@ async fn an_unreadable_image_is_refused_with_the_error_for_why() {
                 .is_some_and(|message| !message.is_empty()),
             "case {case:?}: the refusal states why, got {:?}",
             reply.body
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What `Labels` is allowed to name
+// ---------------------------------------------------------------------------
+
+/// Each entity of the taxonomy this service can measure, with the ancestors the published
+/// taxonomy puts above it, nearest first: a face is part of a head, which is part of a person.
+/// A reported label's own `Parents` is that list, and each ancestor is a label of its own.
+const ANCESTORS: [(&str, &[&str]); 3] = [(FACE, &[HEAD, PERSON]), (HEAD, &[PERSON]), (PERSON, &[])];
+
+/// A grey frame graded from black on the left to white on the right.
+fn graded(width: u32, height: u32) -> GrayImage {
+    GrayImage::from_fn(width, height, |x, _| {
+        Luma([((x * 255) / width.max(1)) as u8])
+    })
+}
+
+/// One row of the vocabulary table: the frame the test drew, how it is submitted, which
+/// analyses are asked for, and whether the frame carries an entity this service can measure.
+struct Drawn {
+    what: &'static str,
+    bytes: Vec<u8>,
+    staged_as: Option<&'static str>,
+    features: Option<Value>,
+    entities: bool,
+}
+
+/// The rows, one per thing the rule generalises over: whether the frame carries an entity at
+/// all, which colour families cover it, how it was drawn (flat, split, graded, banded), the
+/// encoded format, how it was submitted and which `Features` were asked for.
+fn drawn_frames() -> Vec<Drawn> {
+    vec![
+        Drawn {
+            what: "a frame drawn flat in one achromatic colour",
+            bytes: colour_png(&flat_colour(64, 64, [255, 255, 255])),
+            staged_as: None,
+            features: None,
+            entities: false,
+        },
+        Drawn {
+            what: "a frame drawn flat in one chromatic colour",
+            bytes: colour_png(&flat_colour(64, 64, [220, 30, 30])),
+            staged_as: None,
+            features: None,
+            entities: false,
+        },
+        Drawn {
+            what: "a frame drawn flat in a colour two families share a hue with",
+            bytes: colour_png(&flat_colour(48, 96, [120, 70, 20])),
+            staged_as: None,
+            features: None,
+            entities: false,
+        },
+        Drawn {
+            what: "a frame split between two colours",
+            bytes: colour_png(&two_colour(100, 50, 40, [30, 60, 220], [220, 30, 30])),
+            staged_as: None,
+            features: None,
+            entities: false,
+        },
+        Drawn {
+            what: "a frame graded from dark to light",
+            bytes: encode(&graded(120, 60), ImageFormat::Png),
+            staged_as: None,
+            features: None,
+            entities: false,
+        },
+        Drawn {
+            what: "a banded frame, whose bands are edges the measurement reads",
+            bytes: encode(&banded_tones(120, 120, &[40, 215, 40, 215]), ImageFormat::Png),
+            staged_as: None,
+            features: None,
+            entities: false,
+        },
+        Drawn {
+            what: "a frame carrying no entity, with both analyses asked for",
+            bytes: colour_png(&flat_colour(64, 64, [40, 180, 60])),
+            staged_as: None,
+            features: Some(json!(["GENERAL_LABELS", "IMAGE_PROPERTIES"])),
+            entities: false,
+        },
+        Drawn {
+            what: "a portrait carrying one measured face, as PNG",
+            bytes: Portrait::one_face().png(),
+            staged_as: None,
+            features: None,
+            entities: true,
+        },
+        Drawn {
+            what: "the same portrait in the other format the service reads",
+            bytes: encode(&Portrait::one_face().render(), ImageFormat::Jpeg),
+            staged_as: None,
+            features: None,
+            entities: true,
+        },
+        Drawn {
+            what: "a portrait carrying two measured faces",
+            bytes: two_face_portrait().png(),
+            staged_as: None,
+            features: None,
+            entities: true,
+        },
+        Drawn {
+            what: "a portrait with both analyses asked for",
+            bytes: Portrait::one_face().png(),
+            staged_as: None,
+            features: Some(json!(["GENERAL_LABELS", "IMAGE_PROPERTIES"])),
+            entities: true,
+        },
+        Drawn {
+            what: "a portrait read from an S3 object rather than submitted inline",
+            bytes: Portrait::one_face().png(),
+            staged_as: Some("portrait-taxonomy.png"),
+            features: None,
+            entities: true,
+        },
+        Drawn {
+            what: "a flat frame read from an S3 object rather than submitted inline",
+            bytes: colour_png(&flat_colour(64, 64, [30, 60, 220])),
+            staged_as: Some("flat-taxonomy.png"),
+            features: Some(json!(["GENERAL_LABELS", "IMAGE_PROPERTIES"])),
+            entities: false,
+        },
+    ]
+}
+
+/// `Labels` names general-label taxonomy ENTITIES and nothing else: a frame carrying a measured
+/// entity reports it with every ancestor above it as a unique label carrying its own ancestors
+/// and category, and a frame carrying none reports an EMPTY list rather than the names of the
+/// colours covering it — which are measured all the same and reported under
+/// `ImageProperties.DominantColors`, where the model puts them.
+#[tokio::test]
+async fn labels_name_the_entities_measured_and_never_the_colours_of_the_frame() {
+    let router = harness_with_object_store();
+    assert_eq!(
+        s3(&router, &format!("/{BUCKET}"), &[]).await,
+        200,
+        "the bucket the images are staged in must be created"
+    );
+
+    for frame in drawn_frames() {
+        let case = frame.what;
+        let image = match frame.staged_as {
+            Some(key) => {
+                assert_eq!(
+                    s3(&router, &format!("/{BUCKET}/{key}"), &frame.bytes).await,
+                    200,
+                    "case {case:?}: the image must be staged"
+                );
+                json!({ "S3Object": { "Bucket": BUCKET, "Name": key } })
+            }
+            None => bytes_image(&frame.bytes),
+        };
+        let mut body = json!({ "Image": image });
+        if let Some(features) = frame.features.clone() {
+            body.as_object_mut()
+                .expect("the request is an object")
+                .insert("Features".to_string(), features);
+        }
+        let reply = detect(&router, body).await;
+        // `labels_of` checks every modelled member of every label reported, including the one
+        // published category row each belongs to.
+        let labels = labels_of(case, &reply);
+        assert_entity_vocabulary(case, &labels);
+        assert_eq!(
+            !labels.is_empty(),
+            frame.entities,
+            "case {case:?}: a label is reported for each entity measured and for nothing else, \
+             got {labels:?}"
+        );
+        let reported = names(&labels);
+        for label in &labels {
+            let name = label
+                .get("Name")
+                .and_then(Value::as_str)
+                .expect("a reported label names an entity")
+                .to_string();
+            let (_, ancestors) = ANCESTORS
+                .iter()
+                .find(|(entity, _)| *entity == name)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected a taxonomy entity, got {name:?}")
+                });
+            assert_eq!(
+                reported.iter().filter(|other| **other == name).count(),
+                1,
+                "case {case:?}: every label is a unique label, got {reported:?}"
+            );
+            assert_eq!(
+                label.get("Parents"),
+                Some(&json!(ancestors
+                    .iter()
+                    .map(|ancestor| json!({ "Name": ancestor }))
+                    .collect::<Vec<Value>>())),
+                "case {case:?}: a label carries every ancestor above it, got {label:?}"
+            );
+            for ancestor in *ancestors {
+                assert!(
+                    reported.contains(&(*ancestor).to_string()),
+                    "case {case:?}: every ancestor of {name:?} is reported as a unique label of \
+                     its own, got {reported:?}"
+                );
+            }
+            assert_eq!(
+                instances(label).is_empty(),
+                name != FACE,
+                "case {case:?}: only the entity whose extent was measured carries an instance, \
+                 got {label:?}"
+            );
+        }
+        // Whatever the labels say, the colours of the frame ARE measured: a request that asked
+        // for the image properties is told which families cover it, under the member the model
+        // puts them in.
+        if frame.features.is_some() {
+            let properties = reply
+                .field("ImageProperties")
+                .cloned()
+                .unwrap_or_else(|| panic!("case {case:?}: image properties were asked for"));
+            let colours = properties
+                .get("DominantColors")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                !colours.is_empty(),
+                "case {case:?}: the colours the frame holds are measured and reported here, \
+                 got {properties:?}"
+            );
+            for colour in &colours {
+                assert!(
+                    colour
+                        .get("SimplifiedColor")
+                        .and_then(Value::as_str)
+                        .is_some_and(|family| SIMPLIFIED_COLORS.contains(&family)),
+                    "case {case:?}: a measured colour is named from the simplified colour \
+                     names, got {colour:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A consequence of the rule a client can observe: `Settings.GeneralLabels` filters by LABEL
+/// NAME, so no simplified colour name selects anything — one row per entry of the published
+/// catalog, each asked of a portrait drawn over a background of that very colour, where naming
+/// the measured entity does select.
+#[tokio::test]
+async fn no_colour_name_selects_a_label_through_the_general_label_filters() {
+    let router = harness();
+    let portrait = bytes_image(&Portrait::one_face().png());
+    for family in SIMPLIFIED_COLORS {
+        let named = colour_label(family);
+        let case = format!("an inclusion filter naming the colour family {named:?}");
+        let reply = detect(
+            &router,
+            json!({
+                "Image": portrait,
+                "Settings": { "GeneralLabels": { "LabelInclusionFilters": [named] } },
+            }),
+        )
+        .await;
+        let labels = labels_of(&case, &reply);
+        assert!(
+            labels.is_empty(),
+            "case {case:?}: a colour name is no label name, so it selects nothing, \
+             got {labels:?}"
+        );
+    }
+
+    // The same request naming a measured entity selects it, so the empty answers above are the
+    // filter finding no such label rather than the filter never selecting anything.
+    for entity in PERSON_CHAIN {
+        let case = format!("an inclusion filter naming the measured entity {entity:?}");
+        let reply = detect(
+            &router,
+            json!({
+                "Image": portrait,
+                "Settings": { "GeneralLabels": { "LabelInclusionFilters": [entity] } },
+            }),
+        )
+        .await;
+        assert_eq!(
+            names(&labels_of(&case, &reply)),
+            vec![entity.to_string()],
+            "case {case:?}: the entity measured is selected by its own name"
         );
     }
 }

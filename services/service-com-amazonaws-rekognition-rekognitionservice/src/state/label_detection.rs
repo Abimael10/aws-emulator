@@ -14,41 +14,38 @@
 //!
 //! ## Which entities this process can measure
 //!
+//! `Labels` names the real-world ENTITIES an image carries — "objects like flower, tree, and
+//! table; events like wedding, graduation, and birthday party; and concepts like landscape,
+//! evening, and nature" — so every name reported there is a row of the general-label taxonomy
+//! ([`super::label_taxonomy`]) and nothing else is: a measurement of the frame's own pixels is
+//! reported where the model puts it, under `ImageProperties`, and a dominant colour's
+//! simplified colour name is a property OF the picture rather than an entity IN it.
+//!
 //! Recognising an arbitrary entity (a flower, a wedding, a landscape) needs a trained
-//! classifier over a label taxonomy, and no such classifier exists in this process. What
+//! classifier over that whole taxonomy, and no such classifier exists in this process. What
 //! does exist is the geometric face detector in [`super::face_detection`], which measures
-//! the faces an image carries off its own pixels. So the entity vocabulary this detector
-//! reports is the one its measurement supports:
+//! the faces an image carries off its own pixels, so the entities reported are the ones its
+//! measurement supports:
 //!
-//! * [`FACE_LABEL`] — one per face the detector measured, carrying an `Instance` with the
-//!   box it measured for that face and the agreement score it measured for it.
-//! * [`HEAD_LABEL`] and [`PERSON_LABEL`] — the ancestors the published taxonomy puts above
-//!   that label. The operation documents that "DetectLabels returns a hierarchical taxonomy
-//!   of detected labels … The response includes the all ancestors for a label, where every
-//!   ancestor is a unique label", so a measured face is reported together with the entities
-//!   it is part of. Neither carries an `Instance`: where a head or a person extends in the
-//!   image is not something the face detector measured, and a box the size of the face would
-//!   not be either one's box.
-//! * A COLOUR the frame carries, which is the one other thing about an image's content that
-//!   is measured rather than classified. Its name is the simplified colour name this
-//!   model's own `DominantColor.SimplifiedColor` member is defined over — "one of 12
-//!   simplified color names", [`SIMPLIFIED_COLORS`] — capitalised the way a label name is.
-//!   Every pixel is classified into one of those twelve families, and a family covering at
-//!   least [`MIN_COLOR_SHARE`] of the frame is reported, with the confidence
-//!   [`color_confidence`] gives for how much of the frame it covers. A colour is not one of
-//!   the "common object labels" a box is returned for, so no `Instance` locates one. How
-//!   much of the frame ONE colour covers is already what that label's own confidence
-//!   reports, so a frame of essentially one colour is not reported a SECOND time under a
-//!   composition name: `Labels` carries one label per thing measured, not one per way of
-//!   restating a measurement.
+//! * [`label_taxonomy::FACE`] — the entity measured, reported with one `Instance` per face the
+//!   detector located, each carrying the box it measured for that face and the agreement score
+//!   it measured for it, since "bounding boxes are described for all instances of detected
+//!   common object labels".
+//! * [`label_taxonomy::HEAD`] and [`label_taxonomy::PERSON`] — the ancestors the published
+//!   taxonomy puts above that entity, each reported as a unique label of its own by the one
+//!   expansion every measured entity goes through. The operation documents that "DetectLabels
+//!   returns a hierarchical taxonomy of detected labels … The response includes the all
+//!   ancestors for a label, where every ancestor is a unique label", so a measured face is
+//!   reported together with the entities it is part of. Neither carries an `Instance`: where a
+//!   head or a person extends in the image is not something the face detector measured, and a
+//!   box the size of the face would not be either one's box.
 //!
-//! An image carrying no measured entity and no measurable colour is answered with an EMPTY
-//! label list — the answer for an image in which nothing was found — and never with a
-//! refusal: a refusal here is reserved for an image that could not be read at all. Every
-//! label reported carries all six members `Label` models, built in one place
-//! ([`super::label_taxonomy`]): the category the published taxonomy puts it in, its
-//! ancestors, the instances located for it, and the EMPTY `Aliases` list this emulator has
-//! nothing to report in.
+//! An image in which no entity was measured is answered with an EMPTY label list — the answer
+//! for an image in which nothing was found — and never with a refusal: a refusal here is
+//! reserved for an image that could not be read at all. Every label reported carries all six
+//! members `Label` models, built in one place ([`super::label_taxonomy`]): the category the
+//! published taxonomy puts it in, every ancestor above it, the instances located for it, and
+//! the EMPTY `Aliases` list this emulator has nothing to report in.
 //!
 //! ## What the pixels themselves measure
 //!
@@ -85,7 +82,7 @@ use ::image::DynamicImage;
 
 use super::face_detection;
 use super::image_source::{self, UnreadableImage};
-use super::label_taxonomy::{self, COLORS_CATEGORY, PERSON_DESCRIPTION_CATEGORY};
+use super::label_taxonomy::{self, Measured};
 use crate::ops::types::{
     BoundingBox, DetectLabelsImageBackground, DetectLabelsImageForeground,
     DetectLabelsImageProperties, DetectLabelsImageQuality, DominantColor, FaceDetail,
@@ -113,12 +110,6 @@ pub const DEFAULT_MAX_DOMINANT_COLORS: usize = 10;
 pub const GENERAL_LABELS_FEATURE: &str = "GENERAL_LABELS";
 pub const IMAGE_PROPERTIES_FEATURE: &str = "IMAGE_PROPERTIES";
 
-/// The entity label a measured face is reported as, and the ancestors the published
-/// taxonomy puts above it: a face is part of a head, which is part of a person.
-pub const FACE_LABEL: &str = "Face";
-pub const HEAD_LABEL: &str = "Head";
-pub const PERSON_LABEL: &str = "Person";
-
 /// The version of the label detection model that produced an answer, which `DetectLabels`
 /// reports in `LabelModelVersion`. It is an opaque string on the wire; this detector is one
 /// generation, so one value is pinned for it.
@@ -145,11 +136,10 @@ const COLOR_BUCKETS: usize =
 
 /// The twelve simplified colour names a measured colour is reported under: the vocabulary
 /// `DominantColor.SimplifiedColor` is defined over — "one of 12 simplified color names"
-/// (`smithy_query(query="doc",shape="DominantColor",member="SimplifiedColor")`) — which is
-/// also the vocabulary the colour LABELS of an image are named from. Three of them are the
-/// achromatic tones, told apart by lightness; the other nine are the chromatic families,
-/// told apart by hue, with the two names that share a hue with another family (a dark warm
-/// colour is brown, a pale red is pink) distinguished by lightness as well.
+/// (`smithy_query(query="doc",shape="DominantColor",member="SimplifiedColor")`). Three of them
+/// are the achromatic tones, told apart by lightness; the other nine are the chromatic
+/// families, told apart by hue, with the two names that share a hue with another family (a dark
+/// warm colour is brown, a pale red is pink) distinguished by lightness as well.
 ///
 /// The index of a name in this list is the family [`color_family`] classifies a colour into.
 pub const SIMPLIFIED_COLORS: [&str; 12] = [
@@ -171,20 +161,6 @@ const BLUE: usize = 8;
 const PURPLE: usize = 9;
 const PINK: usize = 10;
 const BROWN: usize = 11;
-
-/// How much of a frame a colour family must cover for the frame to be reported as carrying
-/// that colour: a colour a handful of pixels hold is a colour IN the image, not a label OF
-/// it.
-pub const MIN_COLOR_SHARE: f64 = 0.01;
-
-/// How much of a frame a colour family covers to be reported with full confidence. Below it
-/// the confidence falls off linearly to [`MIN_COLOR_CONFIDENCE`] at [`MIN_COLOR_SHARE`].
-/// The scale is this one, not a scale AWS publishes, because none is published.
-pub const FULL_COLOR_SHARE: f64 = 0.05;
-
-/// The confidence a colour covering none of the frame would carry, which is the floor the
-/// fall-off above runs down to.
-pub const MIN_COLOR_CONFIDENCE: f64 = 50.0;
 
 /// How little chroma a pixel may carry and still be one of the achromatic tones, on the
 /// 0..1 scale `max(R,G,B) - min(R,G,B)` is measured on.
@@ -264,17 +240,12 @@ pub fn analysed_image(
     let decoded = face_detection::decoded_image(bytes)?;
     let plane = Plane::of(&decoded);
     let labels = if requested.general_labels {
-        let mut labels = detected_labels(
+        detected_labels(
             &face_detection::faces_in_decoded_image(&decoded),
             requested
                 .image_properties
                 .then_some((&plane, requested.max_dominant_colors)),
-        );
-        // The entities measured come first and the colours of the frame after them: a label
-        // of what the picture HOLDS before a label of what it LOOKS like, which is the order
-        // two equally confident labels are then reported in.
-        labels.extend(color_labels(&plane));
-        labels
+        )
     } else {
         Vec::new()
     };
@@ -378,10 +349,10 @@ fn excluded(filters: &Option<Vec<String>>, values: &[&str], inclusive: bool) -> 
     named != inclusive
 }
 
-/// The labels of the entities measured in one frame: one [`FACE_LABEL`] carrying an instance
-/// per measured face, and the ancestor labels it brings with it — "the response includes all
-/// ancestor labels", "where every ancestor is a unique label". An empty list when nothing
-/// was measured.
+/// The labels of the entities measured in one frame: the [`label_taxonomy::FACE`] entity
+/// carrying an instance per measured face, and the ancestor labels the taxonomy expansion
+/// brings with it — "the response includes the all ancestors for a label", "where every
+/// ancestor is a unique label". An empty list when no entity was measured.
 ///
 /// `colors`, when the request asked for image properties, is the frame and the colour cap
 /// each instance's own `DominantColors` are measured over.
@@ -407,87 +378,13 @@ fn detected_labels(faces: &[FaceDetail], colors: Option<(&Plane, usize)>) -> Vec
         .iter()
         .filter_map(|face| face.confidence)
         .fold(0.0_f32, f32::max);
-    vec![
-        label_taxonomy::reported_label(
-            FACE_LABEL,
-            confidence,
-            PERSON_DESCRIPTION_CATEGORY,
-            &[HEAD_LABEL, PERSON_LABEL],
-            instances,
-        ),
-        // Each ancestor of the measured label is reported as a label of its own, and where
-        // a head or a person extends is not what the face detector measured, so neither
-        // locates an instance.
-        label_taxonomy::reported_label(
-            HEAD_LABEL,
-            confidence,
-            PERSON_DESCRIPTION_CATEGORY,
-            &[PERSON_LABEL],
-            Vec::new(),
-        ),
-        label_taxonomy::reported_label(
-            PERSON_LABEL,
-            confidence,
-            PERSON_DESCRIPTION_CATEGORY,
-            &[],
-            Vec::new(),
-        ),
-    ]
-}
-
-/// The colours one frame carries, as labels of it: one per simplified colour family
-/// covering at least [`MIN_COLOR_SHARE`] of the pixels, most covered first.
-fn color_labels(plane: &Plane) -> Vec<Label> {
-    let pixels = plane.pixels();
-    if pixels == 0 {
-        return Vec::new();
-    }
-    let mut covered = [0_u64; SIMPLIFIED_COLORS.len()];
-    for index in 0..pixels {
-        let (red, green, blue) = plane.rgb_at(index);
-        covered[color_family(red, green, blue)] += 1;
-    }
-    let mut families: Vec<(usize, f64)> = covered
-        .iter()
-        .enumerate()
-        .map(|(family, count)| (family, *count as f64 / pixels as f64))
-        .filter(|(_, share)| *share >= MIN_COLOR_SHARE)
-        .collect();
-    // Most covered first; two families covering equally much are ordered by the family, so
-    // one frame's answer is one answer.
-    families.sort_by(|left, right| right.1.total_cmp(&left.1).then(left.0.cmp(&right.0)));
-    families
-        .into_iter()
-        .map(|(family, share)| {
-            // A colour is not one of the "common object labels" a bounding box is returned
-            // for, and it has no ancestor in the colour vocabulary.
-            label_taxonomy::reported_label(
-                &color_label_name(family),
-                color_confidence(share),
-                COLORS_CATEGORY,
-                &[],
-                Vec::new(),
-            )
-        })
-        .collect()
-}
-
-/// The label name of a colour family: its simplified colour name, capitalised the way a
-/// label name is.
-fn color_label_name(family: usize) -> String {
-    let name = SIMPLIFIED_COLORS[family];
-    let mut capitalised = name.to_string();
-    capitalised[..1].make_ascii_uppercase();
-    capitalised
-}
-
-/// How confident a colour label covering `share` of the frame is: full confidence at
-/// [`FULL_COLOR_SHARE`] of the pixels and down to [`MIN_COLOR_CONFIDENCE`] as the share
-/// goes to nothing.
-pub fn color_confidence(share: f64) -> f32 {
-    let measured =
-        MIN_COLOR_CONFIDENCE + (100.0 - MIN_COLOR_CONFIDENCE) * (share / FULL_COLOR_SHARE).min(1.0);
-    measured.clamp(0.0, 100.0) as f32
+    // One entity measured, reported with every ancestor the taxonomy puts above it as a
+    // unique label of its own.
+    label_taxonomy::reported_labels(vec![Measured {
+        name: label_taxonomy::FACE,
+        confidence,
+        instances,
+    }])
 }
 
 /// The simplified colour name a measured colour falls under: one of [`SIMPLIFIED_COLORS`].

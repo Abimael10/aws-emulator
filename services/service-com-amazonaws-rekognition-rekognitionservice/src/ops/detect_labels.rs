@@ -7,11 +7,15 @@
 //! `DetectLabels` answers with what the submitted image CARRIES, and with nothing else: the
 //! image's bytes are the request's own inline `Bytes` or the object this emulator's Amazon
 //! S3 holds at the `S3Object` it named ([`crate::state::image_source`]), and both the
-//! entities and colours reported in `Labels` and the pixel measurements reported in
+//! real-world entities reported in `Labels` and the pixel measurements reported in
 //! `ImageProperties` are measured off the decoded frame by
-//! [`crate::state::label_detection`]. An image carrying nothing this process can measure is
-//! answered with an EMPTY `Labels` list, which is what was measured; a refusal is reserved
-//! for an image this service could not read at all, one modelled error per reason.
+//! [`crate::state::label_detection`]. `Labels` names ENTITIES of the general-label taxonomy
+//! ([`crate::state::label_taxonomy`]), each with every ancestor above it as a unique label of
+//! its own; the measured colours of the frame are a property of the picture rather than an
+//! entity in it, so they are reported under `ImageProperties.DominantColors` alone. An image
+//! carrying no entity this process can measure is answered with an EMPTY `Labels` list, which
+//! is what was measured; a refusal is reserved for an image this service could not read at
+//! all, one modelled error per reason.
 //!
 //! `Features` selects the two analyses, and a request naming none asks for `GENERAL_LABELS`
 //! — "if no option is specified GENERAL_LABELS is used by default". `ImageProperties` is
