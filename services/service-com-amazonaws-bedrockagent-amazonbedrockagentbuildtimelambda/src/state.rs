@@ -144,7 +144,9 @@
 //! `CreatePromptVersion` cuts from that draft are held beside it in the
 //! [`prompt_versions`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::prompt_versions)
 //! map, keyed by the prompt and the version number, so a change to the draft
-//! never moves what a numbered version reports.
+//! never moves what a numbered version reports. What `ListPrompts` enumerates
+//! over those two maps, in which order, and the page it hands out live in the
+//! `prompt_listing` module beside this one.
 //!
 //! Whether a NEW agent may be minted at all is the one thing about the agent
 //! surface that is not a property of a record in the
@@ -212,6 +214,10 @@ mod resource_policies;
 /// `GetPrompt` reports, their projections, and the resolution of a prompt identifier.
 mod prompts;
 
+/// What `ListPrompts` enumerates — the account's prompts, or one prompt's versions —
+/// the order it reports them in, and the page it hands out.
+mod prompt_listing;
+
 /// WHICH values this service's front door states that an enumerated type admits, and
 /// in which order — the one listing both the request boundary's refusals and a
 /// handler-stated discriminator clause are built from.
@@ -225,6 +231,7 @@ pub use ingestion_job_listing::*;
 pub use ingestion_record::*;
 pub use knowledge_base_names::*;
 pub use opensearch_serverless_store::*;
+pub use prompt_listing::*;
 pub use prompts::*;
 pub use published_enum_value_sets::*;
 pub use pushed_documents::*;
@@ -996,27 +1003,29 @@ impl FlowVersionRecord {
     }
 }
 
-/// One position in the `ListFlowVersions` ordering: the flow's DRAFT version,
-/// which the listing reports first, or one of its numbered versions.
+/// One position in a listing of ONE resource's versions: the resource's DRAFT
+/// version, which such a listing reports first, or one of its numbered
+/// versions. Shared by every version listing of this service, so no two of them
+/// can order or resume their versions differently.
 ///
 /// The derived ordering IS the listing's order — `Draft` is declared first, so
 /// it precedes every numbered version, and numbered versions compare by the
 /// sequence they were cut in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum FlowVersionCursor {
-    /// The flow's own DRAFT version.
+pub enum VersionCursor {
+    /// The resource's own DRAFT version.
     Draft,
-    /// The numbered version this many versions into the flow's history.
+    /// The numbered version this many versions into the resource's history.
     Numbered(u32),
 }
 
-impl FlowVersionCursor {
-    /// The position a `ListFlowVersions` page resumes after, or `None` when the
-    /// token is not one this listing handed out.
+impl VersionCursor {
+    /// The position a version listing's page resumes after, or `None` when the
+    /// token is not one such a listing handed out.
     ///
     /// A page's `nextToken` is the version the page stopped at, so the next page
-    /// starts at the first version of the same flow above it — stable even if
-    /// the version the token names has since been deleted.
+    /// starts at the first version of the same resource above it — stable even
+    /// if the version the token names has since been deleted.
     ///
     /// Versions are numbered from 1, so a page never hands out a token that
     /// starts with `0`: neither `0` itself nor a zero-padded number names a
@@ -3523,7 +3532,7 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     pub fn page_of_flow_versions(
         &self,
         flow_id: &str,
-        after: Option<FlowVersionCursor>,
+        after: Option<VersionCursor>,
         page_size: usize,
     ) -> (Vec<FlowVersionSummary>, Option<String>) {
         let Some(flow) = self.flows.get(flow_id) else {
@@ -3537,18 +3546,18 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             .collect();
         numbered.sort_by_key(|record| record.version);
 
-        let ordered: Vec<(FlowVersionCursor, FlowVersionSummary)> =
-            ::std::iter::once((FlowVersionCursor::Draft, flow.to_draft_version_summary()))
+        let ordered: Vec<(VersionCursor, FlowVersionSummary)> =
+            ::std::iter::once((VersionCursor::Draft, flow.to_draft_version_summary()))
                 .chain(numbered.into_iter().map(|record| {
                     (
-                        FlowVersionCursor::Numbered(record.version),
+                        VersionCursor::Numbered(record.version),
                         record.to_summary(),
                     )
                 }))
                 .filter(|(cursor, _)| after.is_none_or(|after| *cursor > after))
                 .collect();
 
-        let page: Vec<&(FlowVersionCursor, FlowVersionSummary)> =
+        let page: Vec<&(VersionCursor, FlowVersionSummary)> =
             ordered.iter().take(page_size).collect();
         let next_token = (ordered.len() > page.len())
             .then(|| page.last().map(|(cursor, _)| cursor.token()))

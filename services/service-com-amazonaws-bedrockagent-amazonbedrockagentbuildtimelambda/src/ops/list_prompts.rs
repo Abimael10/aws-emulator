@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListPrompts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListPrompts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListPrompts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the prompt library out of [`crate::state`]: with no `promptIdentifier`,
+//! the working draft of each prompt the account holds; with one, every version the
+//! prompt it names holds. Both pages are projected from the stored records
+//! `CreatePrompt` and `CreatePromptVersion` wrote, so a summary never disagrees with the
+//! `GetPrompt` read of the same version.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListPrompts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListPromptsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListPromptsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // WHAT this call enumerates is decided by `promptIdentifier`, which is documented
+        // "The unique identifier of the prompt for whose versions you want to return
+        // information. Omit this field to list information about all prompts in an
+        // account": present, the versions of the prompt it names; absent, the working
+        // draft of every prompt.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListPrompts"))
+        // The modelled `PromptIdentifier` admits a prompt ARN — optionally qualified with
+        // a version — or a bare prompt id, and nothing else. The boundary validator lets
+        // other values through, because the pattern's top-level alternation leaves its
+        // first branch anchored only at the start, so an identifier of neither form is
+        // refused here as the bad request it is rather than reported as a missing prompt.
+        //
+        // A version a qualified identifier carries selects nothing here: the member names
+        // the PROMPT whose versions are returned, so every version of that prompt is
+        // enumerated whichever form named it.
+        let selection = match input.prompt_identifier.as_deref() {
+            None => None,
+            Some(identifier) => match crate::state::prompt_from_identifier(identifier) {
+                Some(selection) => Some(selection.prompt_id.to_string()),
+                None => {
+                    return Err(ListPromptsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::prompt_identifier_pattern_message(
+                                identifier,
+                            )),
+                            field_list: None,
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // A token this service did not hand out names no position in the listing, which is
+        // a bad request rather than an empty page. WHICH tokens this listing hands out
+        // follows from what it enumerates: a position among the account's prompts, or a
+        // position among one prompt's versions.
+        let unissued_token = || -> Self::Error {
+            ListPromptsErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "nextToken is not a pagination token this service issued".to_string(),
+                ),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: "nextToken".to_string(),
+                    message: "not a pagination token this service issued".to_string(),
+                }]),
+            })
+            .into()
+        };
+        let (resume_prompts, resume_versions) =
+            match (selection.as_deref(), input.next_token.as_deref()) {
+                (_, None) => (None, None),
+                (None, Some(token)) => (
+                    Some(crate::state::PromptPageCursor::parse(token).ok_or_else(unissued_token)?),
+                    None,
+                ),
+                (Some(_), Some(token)) => (
+                    None,
+                    Some(crate::state::VersionCursor::parse(token).ok_or_else(unissued_token)?),
+                ),
+            };
+
+        // `maxResults` is "the maximum number of results to return in the response", so it
+        // shortens the page and nothing lengthens it past the bound the modelled
+        // `promptSummaries` (`length ..10`) carries.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_PROMPTS_PER_PAGE, |requested| {
+                usize::try_from(requested).unwrap_or(crate::state::MAX_PROMPTS_PER_PAGE)
+            })
+            .clamp(1, crate::state::MAX_PROMPTS_PER_PAGE);
+
+        // A read: the prompts are reported as they stand, and the only write is the one
+        // the CLOCK already made due elsewhere in this plane — a transition that was owed
+        // at this instant whether or not anyone had listed a prompt.
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        let (prompt_summaries, next_token) = match selection {
+            None => state.page_of_prompts(resume_prompts.as_ref(), page_size),
+            Some(prompt_id) => {
+                // A prompt that exists always enumerates at least its working draft, so
+                // an empty listing could only mean the prompt itself is missing — which
+                // is the modelled refusal, not a 200 with nothing in it.
+                if !state.prompts.contains_key(&prompt_id) {
+                    return Err(ListPromptsErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::prompt_not_found_message(Self::NAME)),
+                        },
+                    )
+                    .into());
+                }
+                state.page_of_prompt_versions(&prompt_id, resume_versions, page_size)
+            }
+        };
+
+        Ok(ListPromptsOutput {
+            prompt_summaries,
+            next_token,
+        })
     }
 }

@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A token this service did not hand out names no position in the listing.
         let after = match input.next_token.as_deref() {
             None => None,
-            Some(token) => match crate::state::FlowVersionCursor::parse(token) {
+            Some(token) => match crate::state::VersionCursor::parse(token) {
                 Some(cursor) => Some(cursor),
                 None => {
                     return Err(ListFlowVersionsErrorModeled::ValidationException(
