@@ -28,7 +28,16 @@
 //! CloudWatch Logs' `CreateLogGroup`, the execution role and its policies through IAM's
 //! `CreateRole`/`PutRolePolicy` — and every value asserted is read back through
 //! `DescribeTasks` and `DescribeLogStreams`.
+//!
+//! A second table spans the rest of what the rule generalises over: WHICH call started the
+//! task (`RunTask`, `StartTask` on a named container instance, and the scheduler of a
+//! service, which places tasks with no further call), and how the grant is SCOPED (every
+//! resource, the streams of the group the configuration names, the streams of another
+//! group). Its rows assert the WHOLE `stoppedReason`, whose variable parts — the session the
+//! execution role was assumed in, the action the driver performs and the stream ARN it
+//! addressed — come from the request and from the emulator's IAM and Logs state.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,7 +45,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    cluster_with_capacity, iam, list, ok, present_count, string, ACCOUNT, SIGNED_REGION,
+    cluster_with_capacity, create_cluster, iam, list, ok, present_count, register_capacity,
+    string, ACCOUNT, SIGNED_REGION,
 };
 
 /// The cluster every task below runs in.
@@ -304,12 +314,40 @@ async fn register(
     row: &Row,
     role_arn: Option<&str>,
 ) -> String {
+    register_logging_revision(
+        router,
+        family,
+        row.group,
+        row.create_group,
+        role_arn,
+        ONE_LINE_PROGRAM,
+        row.case,
+    )
+    .await
+}
+
+/// The program a container whose task is expected to STOP runs: it writes one line and
+/// exits, so a task that was launched at all stops for the work it did.
+const ONE_LINE_PROGRAM: &str = "echo ready";
+
+/// Register one revision of `family` whose single container delivers through the `awslogs`
+/// driver to `group` — having the driver create that group when `create_group` is set — under
+/// `role_arn`, running `program`, and answer its ARN.
+async fn register_logging_revision(
+    router: &MultiServiceRouter,
+    family: &str,
+    group: &str,
+    create_group: bool,
+    role_arn: Option<&str>,
+    program: &str,
+    case: &str,
+) -> String {
     let mut options = json!({
-        "awslogs-group": row.group,
+        "awslogs-group": group,
         "awslogs-region": SIGNED_REGION,
         "awslogs-stream-prefix": STREAM_PREFIX,
     });
-    if row.create_group {
+    if create_group {
         options["awslogs-create-group"] = json!("true");
     }
     let mut request = json!({
@@ -319,23 +357,23 @@ async fn register(
             "image": IMAGE,
             "memory": 128,
             "essential": true,
-            "command": ["sh", "-c", "echo ready"],
+            "command": ["sh", "-c", program],
             "logConfiguration": { "logDriver": "awslogs", "options": options },
         }],
     });
     if let Some(role_arn) = role_arn {
         request["executionRoleArn"] = json!(role_arn);
     }
-    let body = ok(router, "RegisterTaskDefinition", request, row.case).await;
-    string(&body["taskDefinition"], "taskDefinitionArn", row.case)
+    let body = ok(router, "RegisterTaskDefinition", request, case).await;
+    string(&body["taskDefinition"], "taskDefinitionArn", case)
 }
 
-/// One task, as `DescribeTasks` reports it.
-async fn describe(router: &MultiServiceRouter, arn: &str, case: &str) -> Value {
+/// One task of `cluster`, as `DescribeTasks` reports it.
+async fn describe(router: &MultiServiceRouter, cluster: &str, arn: &str, case: &str) -> Value {
     let body = ok(
         router,
         "DescribeTasks",
-        json!({ "cluster": CLUSTER, "tasks": [arn] }),
+        json!({ "cluster": cluster, "tasks": [arn] }),
         case,
     )
     .await;
@@ -355,11 +393,16 @@ fn stopped_reason(task: &Value) -> &str {
     task["stoppedReason"].as_str().unwrap_or_default()
 }
 
-/// Read one task again until it reports a `stopCode`, and answer it.
-async fn stopped_task(router: &MultiServiceRouter, arn: &str, case: &str) -> Value {
+/// Read one task of `cluster` again until it reports a `stopCode`, and answer it.
+async fn stopped_task(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    arn: &str,
+    case: &str,
+) -> Value {
     let deadline = Instant::now() + POLL_BUDGET;
     loop {
-        let task = describe(router, arn, case).await;
+        let task = describe(router, cluster, arn, case).await;
         if !stop_code(&task).is_empty() {
             return task;
         }
@@ -434,7 +477,7 @@ async fn a_task_whose_awslogs_logger_cannot_be_initialised_fails_to_start() {
 
     for (row, arn) in &launched {
         let case = row.case;
-        let task = stopped_task(&router, arn, case).await;
+        let task = stopped_task(&router, CLUSTER, arn, case).await;
         let reason = stopped_reason(&task).to_string();
         let Some(failure) = row.failure else {
             // The logger was initialised, so the task RAN: it stops for the work it did,
@@ -495,4 +538,524 @@ fn task_id(task_arn: &str) -> String {
         .next()
         .unwrap_or(task_arn)
         .to_string()
+}
+
+// ---------------------------------------------------------------------------------------
+// The same rule, on every call that STARTS a task, and for the WHOLE reason
+// ---------------------------------------------------------------------------------------
+
+/// Which call put the task in the cluster.
+///
+/// The agent initialises the logger of a task Amazon ECS PLACED, so the call that placed it
+/// decides nothing: `RunTask` ("Starts a new task using the specified task definition"),
+/// `StartTask` ("Starts a new task from the specified task definition on the specified
+/// container instance") and the scheduler of a service ("Runs and maintains your desired
+/// number of tasks from a specified task definition", `CreateService`) all reach one launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartPath {
+    RunTask,
+    StartTask,
+    Scheduler,
+}
+
+/// What a row's execution role is allowed, as one identity-based document of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathGrant {
+    /// The driver's two actions on every resource of the account.
+    EveryGroup,
+    /// Those actions on the streams of the group the configuration NAMES, which is how a
+    /// grant for one log group is written.
+    NamedGroupOnly,
+    /// Those actions on the streams of ANOTHER group, so the one the configuration names is
+    /// outside what the role may write to.
+    OtherGroupOnly,
+    /// A grant about another service entirely, so nothing in force allows the driver's
+    /// actions at all.
+    NoLogsGrant,
+}
+
+/// Which answer CloudWatch Logs gives the driver's stream creation, for a row whose launch
+/// it refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// This account holds no log group by the name the configuration carries.
+    NoSuchGroup,
+    /// No policy in force on the execution role permits the creation.
+    NotAuthorized,
+}
+
+/// A log group name no policy or configuration below delivers to: the group a grant scoped
+/// AWAY from the one a row names is written for.
+const SCOPED_AWAY_GROUP: &str = "/emulator/ecs/elsewhere";
+
+/// `Task$lastStatus` of a task that is running its containers, and of one that is over
+/// (`smithy_query(query="shape",shape="Task")`, member `lastStatus`: "The last known status
+/// for the task").
+const RUNNING: &str = "RUNNING";
+const STOPPED: &str = "STOPPED";
+
+/// The program the container of a row that LAUNCHES runs: it writes one line and then stays
+/// up, so such a task is observable in the `RUNNING` state it reached.
+const STAYS_UP_PROGRAM: &str = "echo ready; sleep 300";
+
+/// One row: the call that starts the task, the group its container's `awslogs` configuration
+/// names, what its execution role may do, and the launch that produces.
+struct PathRow {
+    case: &'static str,
+    path: StartPath,
+    group: &'static str,
+    grant: PathGrant,
+    /// The refusal the stream creation earns, and `None` for a row whose launch goes ahead.
+    refusal: Option<Refusal>,
+}
+
+const PATH_ROWS: &[PathRow] = &[
+    PathRow {
+        case: "RunTask into a group nobody created",
+        path: StartPath::RunTask,
+        group: UNHELD_GROUP,
+        grant: PathGrant::EveryGroup,
+        refusal: Some(Refusal::NoSuchGroup),
+    },
+    PathRow {
+        case: "RunTask with no logs grant on the execution role",
+        path: StartPath::RunTask,
+        group: HELD_GROUP,
+        grant: PathGrant::NoLogsGrant,
+        refusal: Some(Refusal::NotAuthorized),
+    },
+    PathRow {
+        case: "RunTask with the grant scoped to the group it delivers to",
+        path: StartPath::RunTask,
+        group: HELD_GROUP,
+        grant: PathGrant::NamedGroupOnly,
+        refusal: None,
+    },
+    PathRow {
+        case: "StartTask into a group nobody created",
+        path: StartPath::StartTask,
+        group: UNHELD_GROUP,
+        grant: PathGrant::EveryGroup,
+        refusal: Some(Refusal::NoSuchGroup),
+    },
+    PathRow {
+        case: "StartTask with the grant scoped to another group",
+        path: StartPath::StartTask,
+        group: HELD_GROUP,
+        grant: PathGrant::OtherGroupOnly,
+        refusal: Some(Refusal::NotAuthorized),
+    },
+    PathRow {
+        case: "StartTask with the grant scoped to the group it delivers to",
+        path: StartPath::StartTask,
+        group: HELD_GROUP,
+        grant: PathGrant::NamedGroupOnly,
+        refusal: None,
+    },
+    PathRow {
+        case: "a service whose revision delivers to a group nobody created",
+        path: StartPath::Scheduler,
+        group: UNHELD_GROUP,
+        grant: PathGrant::EveryGroup,
+        refusal: Some(Refusal::NoSuchGroup),
+    },
+    PathRow {
+        case: "a service whose execution role has no logs grant",
+        path: StartPath::Scheduler,
+        group: HELD_GROUP,
+        grant: PathGrant::NoLogsGrant,
+        refusal: Some(Refusal::NotAuthorized),
+    },
+    PathRow {
+        case: "a service whose grant is scoped to the group it delivers to",
+        path: StartPath::Scheduler,
+        group: HELD_GROUP,
+        grant: PathGrant::NamedGroupOnly,
+        refusal: None,
+    },
+];
+
+/// The identity-based document one row's execution role carries, for a row delivering to
+/// `group`.
+fn path_policy(grant: PathGrant, group: &str) -> String {
+    let delivery = [CREATE_LOG_STREAM, PUT_LOG_EVENTS];
+    match grant {
+        PathGrant::EveryGroup => policy("Allow", &delivery),
+        PathGrant::NamedGroupOnly => scoped_policy(&delivery, &log_group_scope(group)),
+        PathGrant::OtherGroupOnly => {
+            scoped_policy(&delivery, &log_group_scope(SCOPED_AWAY_GROUP))
+        }
+        PathGrant::NoLogsGrant => policy("Allow", &["s3:GetObject"]),
+    }
+}
+
+/// An identity-based policy allowing `actions` on `resource` ALONE.
+fn scoped_policy(actions: &[&str], resource: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": actions,
+            "Resource": resource,
+        }],
+    })
+    .to_string()
+}
+
+/// The resource a grant written for ONE log group's streams names: that group's ARN with the
+/// trailing wildcard, which is what covers the streams in it.
+fn log_group_scope(group: &str) -> String {
+    format!("arn:aws:logs:{SIGNED_REGION}:{ACCOUNT}:log-group:{group}:*")
+}
+
+/// The ARN of the session Amazon ECS initialises the logger in: an assumed-role session of
+/// the task's execution role, named after the task it is for.
+fn session_arn(role_arn: &str, task_id: &str) -> String {
+    let role_name = role_arn.split('/').next_back().unwrap_or(role_arn);
+    format!("arn:aws:sts::{ACCOUNT}:assumed-role/{role_name}/{task_id}")
+}
+
+/// The ARN of the stream the driver creates for one task's container: the group's own ARN
+/// carrying the stream `<prefix>/<container name>/<task id>` the options name.
+fn stream_arn(group: &str, task_id: &str) -> String {
+    format!(
+        "arn:aws:logs:{SIGNED_REGION}:{ACCOUNT}:log-group:{group}:log-stream:\
+         {STREAM_PREFIX}/{CONTAINER}/{task_id}"
+    )
+}
+
+/// The WHOLE `stoppedReason` a refused row's task must carry, built the way the agent builds
+/// it from values of the request and of the emulator's own IAM and Logs state: the fixed
+/// opening, the answer CloudWatch Logs gave — its own sentence for a group this account does
+/// not hold, or the authorization refusal naming the session the role was assumed in, the
+/// action the driver performs and the stream it addressed — and the agent's account of how
+/// often it tried. Spelled out here rather than imported, so a wrong wording in the
+/// implementation cannot make this pass.
+fn expected_reason(refusal: Refusal, role_arn: &str, group: &str, task_id: &str) -> String {
+    let failure = match refusal {
+        Refusal::NoSuchGroup => RESOURCE_NOT_FOUND.to_string(),
+        Refusal::NotAuthorized => format!(
+            "{ACCESS_DENIED}User: {session} is not authorized to perform: {CREATE_LOG_STREAM} \
+             on resource: {stream} because no identity-based policy allows the \
+             {CREATE_LOG_STREAM} action",
+            session = session_arn(role_arn, task_id),
+            stream = stream_arn(group, task_id),
+        ),
+    };
+    format!("{LOGGER_FAILURE_PREFIX}{failure}: exceeded maximum number of attempts, 1")
+}
+
+/// What one row's launch left to read back.
+struct Launched<'row> {
+    row: &'row PathRow,
+    /// The cluster the row runs in: one of its own, so no row's launch competes with
+    /// another's for capacity.
+    cluster: String,
+    /// The execution role the row's revision names.
+    role_arn: String,
+    /// The task the starting call answered with, and `None` for a row whose task the
+    /// SCHEDULER places — that task is read back off the service that placed it.
+    task_arn: Option<String>,
+    /// The service whose scheduler places it, for such a row.
+    service_name: String,
+}
+
+/// `Task$lastStatus`, or an empty string while the task reports none.
+fn last_status(task: &Value) -> &str {
+    task["lastStatus"].as_str().unwrap_or_default()
+}
+
+/// Read one task of `cluster` again until it SETTLES: stopped with a stop code for a row
+/// whose logger could not be initialised, running for a row whose logger could.
+///
+/// A refused row's task is also asserted never to have been observed `RUNNING`: a launch the
+/// logger failed starts no container, so no reading of it reports the state of a task that
+/// is running one.
+async fn settled_task(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    arn: &str,
+    refusal: Option<Refusal>,
+    case: &str,
+) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    loop {
+        let task = describe(router, cluster, arn, case).await;
+        let status = last_status(&task).to_string();
+        if !status.is_empty() {
+            seen.insert(status.clone());
+        }
+        let settled = if refusal.is_some() {
+            status == STOPPED && !stop_code(&task).is_empty()
+        } else {
+            status == RUNNING
+        };
+        if settled {
+            if refusal.is_some() {
+                assert!(
+                    !seen.contains(RUNNING),
+                    "case {case:?}: a task whose logger could not be initialised runs no \
+                     container, so it is never {RUNNING}, got the statuses {seen:?}"
+                );
+            }
+            return task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the task to settle (refusal {refusal:?}), got {task} \
+             after the statuses {seen:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The task the scheduler of `service` placed, read back off the service rather than off a
+/// call that placed it: its ARN and the settled task itself.
+async fn scheduler_task(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    service: &str,
+    refusal: Option<Refusal>,
+    case: &str,
+) -> (String, Value) {
+    // `ListTasks` reports the tasks on their way to the status asked for, so a task the
+    // launch failed is listed under the one it is on its way to.
+    let desired = if refusal.is_some() { STOPPED } else { RUNNING };
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let listed = ok(
+            router,
+            "ListTasks",
+            json!({
+                "cluster": cluster,
+                "serviceName": service,
+                "desiredStatus": desired,
+            }),
+            case,
+        )
+        .await;
+        let placed = list(&listed, "taskArns", case);
+        if let Some(arn) = placed.first().and_then(Value::as_str) {
+            let arn = arn.to_string();
+            let task = settled_task(router, cluster, &arn, refusal, case).await;
+            return (arn, task);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the scheduler to place a task on its way to {desired}, \
+             got {listed}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Read `group` again until it holds the stream `stream` — the delivery a container that RAN
+/// opens — and panic naming what the group held instead when it never does.
+async fn group_holding_stream(router: &MultiServiceRouter, group: &str, stream: &str, case: &str) {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let held = streams(router, group).await;
+        if held.iter().any(|name| name == stream) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected {group} to hold the stream {stream:?} the driver creates \
+             for a container that runs, got {held:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: the `awslogs` destination decides whether a task's containers are launched AT ALL,
+/// whichever call placed the task — and a task refused it is stopped with
+/// `TaskFailedToStart` and the agent's whole `ResourceInitializationError` sentence, naming
+/// the session the execution role was assumed in, the action the driver performs and the
+/// stream it addressed.
+#[tokio::test]
+async fn an_unwritable_awslogs_destination_fails_the_task_on_every_start_path() {
+    let router = emulator();
+    let (status, created) = logs(
+        &router,
+        "CreateLogGroup",
+        json!({ "logGroupName": HELD_GROUP }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the group the held rows deliver into must be created, got {status} with {created}"
+    );
+
+    // Every row is started FIRST and read back afterwards: the launches are decided in the
+    // one emulator, so the suite waits for the longest of them rather than for their sum.
+    let mut launched: Vec<Launched<'_>> = Vec::new();
+    for (index, row) in PATH_ROWS.iter().enumerate() {
+        let case = row.case;
+        let cluster = format!("loggerpath{index}");
+        create_cluster(&router, &cluster, case).await;
+        let instance = register_capacity(&router, &cluster, case).await;
+        let role_arn = create_role(
+            &router,
+            &format!("loggerPathRole{index}"),
+            Some(path_policy(row.grant, row.group)),
+            case,
+        )
+        .await;
+        let family = format!("loggerpath{index}");
+        let definition = register_logging_revision(
+            &router,
+            &family,
+            row.group,
+            false,
+            Some(&role_arn),
+            STAYS_UP_PROGRAM,
+            case,
+        )
+        .await;
+        let service_name = format!("loggerpathsvc{index}");
+        let task_arn = match row.path {
+            StartPath::RunTask => Some(started_task_arn(
+                &router,
+                "RunTask",
+                json!({ "cluster": cluster, "taskDefinition": definition }),
+                case,
+            )
+            .await),
+            StartPath::StartTask => Some(
+                started_task_arn(
+                    &router,
+                    "StartTask",
+                    json!({
+                        "cluster": cluster,
+                        "taskDefinition": definition,
+                        "containerInstances": [instance],
+                    }),
+                    case,
+                )
+                .await,
+            ),
+            StartPath::Scheduler => {
+                ok(
+                    &router,
+                    "CreateService",
+                    json!({
+                        "cluster": cluster,
+                        "serviceName": service_name,
+                        "taskDefinition": definition,
+                        "desiredCount": 1,
+                        "launchType": "EC2",
+                    }),
+                    case,
+                )
+                .await;
+                None
+            }
+        };
+        launched.push(Launched {
+            row,
+            cluster,
+            role_arn,
+            task_arn,
+            service_name,
+        });
+    }
+
+    for entry in &launched {
+        let row = entry.row;
+        let case = row.case;
+        let (arn, task) = match entry.task_arn.as_deref() {
+            Some(arn) => (
+                arn.to_string(),
+                settled_task(&router, &entry.cluster, arn, row.refusal, case).await,
+            ),
+            None => {
+                scheduler_task(
+                    &router,
+                    &entry.cluster,
+                    &entry.service_name,
+                    row.refusal,
+                    case,
+                )
+                .await
+            }
+        };
+        let task_id = task_id(&arn);
+        let stream = format!("{STREAM_PREFIX}/{CONTAINER}/{task_id}");
+        let Some(refusal) = row.refusal else {
+            // The logger was initialised, so the containers were launched: such a task is
+            // running, carries no stop and opened the stream its output goes to.
+            assert_eq!(
+                last_status(&task),
+                RUNNING,
+                "case {case:?}: a task whose logger can be initialised runs, got {task}"
+            );
+            assert!(
+                stop_code(&task).is_empty() && stopped_reason(&task).is_empty(),
+                "case {case:?}: a running task carries no stop, got {task}"
+            );
+            // `Task$startedAt` is "the Unix timestamp for the time when the task started",
+            // which a task whose containers were launched carries.
+            assert!(
+                task["startedAt"].is_number(),
+                "case {case:?}: a task whose containers were launched reports when it \
+                 started, got {task}"
+            );
+            group_holding_stream(&router, row.group, &stream, case).await;
+            continue;
+        };
+        assert_eq!(
+            stop_code(&task),
+            TASK_FAILED_TO_START,
+            "case {case:?}: a task whose logger could not be initialised never ran, got {task}"
+        );
+        assert_eq!(
+            last_status(&task),
+            STOPPED,
+            "case {case:?}: such a task is reported stopped, got {task}"
+        );
+        assert_eq!(
+            stopped_reason(&task),
+            expected_reason(refusal, &entry.role_arn, row.group, &task_id),
+            "case {case:?}: expected the agent's whole account of the logger it could not \
+             validate, got {task}"
+        );
+        // Nothing ran, whatever a poll of this task happened to catch: a task Amazon ECS
+        // never started carries no `startedAt` ("the Unix timestamp for the time when the
+        // task started"), and no container of it claims an exit code.
+        assert!(
+            task["startedAt"].is_null(),
+            "case {case:?}: a task whose logger could not be initialised was never started, \
+             so it reports no startedAt, got {task}"
+        );
+        for container in list(&task, "containers", case) {
+            assert_eq!(
+                present_count(&container, "exitCode", case),
+                None,
+                "case {case:?}: a container that never started reports no exit code, got \
+                 {container}"
+            );
+        }
+        let held = streams(&router, row.group).await;
+        assert!(
+            !held.contains(&stream),
+            "case {case:?}: nothing is delivered for a logger that could not be initialised, \
+             got {held:?}"
+        );
+    }
+}
+
+/// Start one task through `operation` and answer the ARN it was placed under.
+async fn started_task_arn(
+    router: &MultiServiceRouter,
+    operation: &str,
+    request: Value,
+    case: &str,
+) -> String {
+    let body = ok(router, operation, request, case).await;
+    let tasks = list(&body, "tasks", case);
+    let task = tasks
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a task back, got {body}"));
+    string(task, "taskArn", case)
 }
