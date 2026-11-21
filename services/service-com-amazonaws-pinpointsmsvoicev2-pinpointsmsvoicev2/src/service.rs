@@ -45,6 +45,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+mod validation;
+
 /// This service's own Smithy shape id, whose LOCAL name (`PinpointSMSVoiceV2`) is what an
 /// `awsJson1_0` request names its target service by
 /// (`X-Amz-Target: PinpointSMSVoiceV2.<Operation>`).
@@ -63,6 +65,13 @@ const RPC_SERVICE_SHAPE_ID: &str = "com.amazonaws.pinpointsmsvoicev2#PinpointSMS
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// One modelled-refusal wrapper per modelled operation, keyed by the routing key the
+    /// model names that operation by ([`smithy_server_runtime::Operation::NAME`], the same
+    /// key the generated routing table uses). Built once here, never per request; each
+    /// entry is zero-sized, so this is a table of NAMES rather than a second set of
+    /// operations — the operation that serves a request is still the one the generated
+    /// table built from the shared engine (see [`validation`]).
+    refusals: std::collections::HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -72,6 +81,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            refusals: validation::modelled_validation_table::<Eng>(),
         }
     }
 }
@@ -116,8 +126,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // Every MODELLED operation is served through its modelled-refusal wrapper, so a
+        // request this service refuses before the handler runs is stated in the service's
+        // OWN modelled `ValidationException` — with the `Reason` and `Fields` the model
+        // declares — instead of the framework's two-field refusal body. The wrapper hands
+        // every request it does not refuse to the generated operation in the routing
+        // table, which remains the only thing that serves one.
+        //
+        // Keyed by the protocol's own routing key, so a request the model names no
+        // operation for resolves to nothing here and keeps the framework's routing
+        // failure.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.refusals.get(key).map(|wrapper| &**wrapper)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -131,25 +152,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // sentence is fixed and the bracketed parameter list is taken from the request.
         // The code stays `ValidationException`, the error this service models for a
         // bad field, so a client still branches on the same name.
+        //
+        // A refusal of a modelled operation is answered in the modelled shape — `Message`,
+        // `Reason` and `Fields` — by [`validation`], in front of every operation, which
+        // this seam cannot do: it carries an error code and a message and nothing else.
+        // This remains the wording of the few refusals that do not reach that renderer (a
+        // body no codec can read), and it states the same sentence, from the same
+        // function, so the two cannot drift.
         match refusal {
-            Refusal::Invalid(violations) => {
-                let mut named: Vec<String> = Vec::with_capacity(violations.len());
-                for violation in violations {
-                    // One member can fail two constraints; it is one rejected
-                    // parameter either way.
-                    let quoted = format!("'{}'", violation.path);
-                    if !named.contains(&quoted) {
-                        named.push(quoted);
-                    }
-                }
-                Some(Refused {
-                    code: "ValidationException".to_string(),
-                    message: format!(
-                        "The following parameter is null, empty or invalid: [{}]",
-                        named.join(", ")
-                    ),
-                })
-            }
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "ValidationException".to_string(),
+                message: validation::parameter_list_message(violations),
+            }),
             // Authentication is the framework's to word: it refuses before this
             // service's surface is reached at all.
             _ => None,
