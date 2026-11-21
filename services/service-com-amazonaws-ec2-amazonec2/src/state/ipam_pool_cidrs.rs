@@ -36,6 +36,24 @@ pub const IPAM_POOL_CIDR_STATE_PENDING_PROVISION: &str = "pending-provision";
 /// [`TRANSITION_DELAY`] after the call that provisioned it.
 pub const IPAM_POOL_CIDR_STATE_PROVISIONED: &str = "provisioned";
 
+/// A CIDR whose provisioning settled as a FAILURE: the `IpamPoolCidrState` enum's
+/// `failed-provision` member.
+///
+/// "Details related to why an IPAM pool CIDR FAILED TO BE PROVISIONED"
+/// (`IpamPoolCidr$FailureReason`) is the member such a record carries, so work a provision
+/// cannot carry out is reported as a settled failure OF THE RANGE rather than as a refusal of
+/// the request: the request itself was well formed and was accepted, and what could not be
+/// done is the provisioning. The clock owes this state one [`TRANSITION_DELAY`] after the call
+/// that asked for it, exactly as it owes [`IPAM_POOL_CIDR_STATE_PROVISIONED`] to a provision
+/// that can be carried out.
+pub const IPAM_POOL_CIDR_STATE_FAILED_PROVISION: &str = "failed-provision";
+
+/// The `IpamPoolCidrFailureReason$Code` of a provision there was no space for: the
+/// `IpamPoolCidrFailureCode` enum's `cidr-not-available` member
+/// (`smithy_query(query="shape",shape="IpamPoolCidrFailureCode")`), that catalog's own name
+/// for "the range this pool was to be given could not be had".
+pub const IPAM_POOL_CIDR_FAILURE_CODE_NOT_AVAILABLE: &str = "cidr-not-available";
+
 /// A CIDR whose deprovisioning has been asked for and has not settled yet: the
 /// `IpamPoolCidrState` enum's `pending-deprovision` member, which
 /// `DeprovisionIpamPoolCidr` answers with.
@@ -63,6 +81,15 @@ pub struct IpamPoolCidrRecord {
     /// The state the clock owes this CIDR, if it owes one — `provisioned` after a
     /// provision, `deprovisioned` after a deprovision.
     pub pending: Option<PendingStateMove>,
+    /// What the CIDR reports about the failure once the move the clock owes it is a FAILED
+    /// one; nothing at all for a move that settles as a success.
+    ///
+    /// Held beside the view rather than on it because the record carries no failure WHILE the
+    /// work is still under way: "details related to why an IPAM pool CIDR failed to be
+    /// provisioned" (`IpamPoolCidr$FailureReason`) is what a SETTLED failure reports, so the
+    /// reason is applied at the instant the state becomes the failed one
+    /// ([`ComAmazonawsEc2Amazonec2State::materialize_due_ipam_pool_cidr_moves`]).
+    pub failure_reason_when_due: Option<IpamPoolCidrFailureReason>,
 }
 
 /// Whether a CIDR in `state` still holds space in its pool — whether it is one of the
@@ -71,11 +98,14 @@ pub struct IpamPoolCidrRecord {
 /// A range whose deprovisioning the caller has ALREADY asked for is not: the caller has
 /// taken it back, and "to deprovision pool CIDRs, see DeprovisionIpamPoolCidr"
 /// (`DeleteIpamPool`) is exactly the step that asking performs, so the pool no longer counts
-/// it against a delete. Everything else does.
+/// it against a delete. Neither is a range whose provisioning FAILED: nothing was ever given
+/// to the pool, so there is no space for it to hold. Everything else does.
 pub fn ipam_pool_cidr_holds_space(state: Option<&str>) -> bool {
     !matches!(
         state,
-        Some(IPAM_POOL_CIDR_STATE_PENDING_DEPROVISION) | Some(IPAM_POOL_CIDR_STATE_DEPROVISIONED)
+        Some(IPAM_POOL_CIDR_STATE_PENDING_DEPROVISION)
+            | Some(IPAM_POOL_CIDR_STATE_DEPROVISIONED)
+            | Some(IPAM_POOL_CIDR_STATE_FAILED_PROVISION)
     )
 }
 
@@ -173,6 +203,9 @@ impl ComAmazonawsEc2Amazonec2State {
                 pending: Some(PendingStateMove::starting_now(
                     IPAM_POOL_CIDR_STATE_PROVISIONED,
                 )),
+                // The move this provision owes settles as a SUCCESS, so there is no failure
+                // to report when it falls due.
+                failure_reason_when_due: None,
             },
         );
         if let Some((source_pool_id, allocation)) = assignment {
@@ -180,6 +213,63 @@ impl ComAmazonawsEc2Amazonec2State {
             // provisioned RANGE, which is what a replay of it is answered by.
             self.allocate_ipam_pool_cidr(&source_pool_id, None, allocation);
         }
+        Some(view)
+    }
+
+    /// Record a provision of a range of `netmask_length` bits the pool CANNOT be given, and
+    /// answer the CIDR as the store then holds it — `None` when the store is at its ceiling
+    /// and NOTHING was stored.
+    ///
+    /// A request that names a SIZE asks the service to choose the range, and the space it
+    /// would choose out of may hold no free block of that size. That is not something wrong
+    /// with the REQUEST — it names a size the pool's own rules admit, and the space a pool
+    /// holds changes without the caller — so the provision is accepted and the range it would
+    /// have created settles as a failure: the record starts
+    /// [`IPAM_POOL_CIDR_STATE_PENDING_PROVISION`] like any other and the clock owes it
+    /// [`IPAM_POOL_CIDR_STATE_FAILED_PROVISION`] with `reason` beside it, rather than
+    /// `provisioned`.
+    ///
+    /// Nothing is assigned out of any pool for it: no range was chosen, so the record carries
+    /// no `Cidr` at all and no source pool gives up space for one.
+    pub fn provision_failing_ipam_pool_cidr(
+        &mut self,
+        pool_id: &str,
+        netmask_length: Option<i32>,
+        reason: IpamPoolCidrFailureReason,
+    ) -> Option<IpamPoolCidr> {
+        let view = IpamPoolCidr {
+            // No range was chosen, so there is none to report: the size asked for is the only
+            // thing this record knows about the range it would have held.
+            cidr: None,
+            state: Some(IPAM_POOL_CIDR_STATE_PENDING_PROVISION.to_string()),
+            // Reported once the failure has SETTLED, which is the move recorded below.
+            failure_reason: None,
+            ipam_pool_cidr_id: None,
+            netmask_length,
+        };
+        // The message beside the failure is the SERVICE's own wording rather than anything the
+        // caller chose, so what this record costs the store's budget of caller-supplied data
+        // is what every other pool CIDR record costs — which is also what is refunded when it
+        // is removed.
+        let charge = ipam_pool_cidr_payload_bytes(&view);
+        if !self.has_ipam_pool_cidr_capacity() || self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
+        let cidr_id = self.next_id(IPAM_POOL_CIDR_ID_PREFIX);
+        let mut view = view;
+        view.ipam_pool_cidr_id = Some(cidr_id.clone());
+        self.add_stored_bytes(charge);
+        self.ipam_pool_cidrs.insert(
+            cidr_id,
+            IpamPoolCidrRecord {
+                ipam_pool_id: pool_id.to_string(),
+                view: view.clone(),
+                pending: Some(PendingStateMove::starting_now(
+                    IPAM_POOL_CIDR_STATE_FAILED_PROVISION,
+                )),
+                failure_reason_when_due: Some(reason),
+            },
+        );
         Some(view)
     }
 
@@ -310,9 +400,11 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// Apply the state moves the clock owes the stored pool CIDRs, as of `now`.
     ///
-    /// A `pending-provision` range is `provisioned` once its own instant has passed, and a
-    /// `pending-deprovision` one has left the pool at its instant — both owed whether or not
-    /// anybody called, which is why they are applied from
+    /// A `pending-provision` range is `provisioned` once its own instant has passed — or
+    /// `failed-provision`, carrying the reason recorded for it, when the work it asked for
+    /// could not be carried out ([`Self::provision_failing_ipam_pool_cidr`]) — and a
+    /// `pending-deprovision` one has left the pool at its instant. All of them are owed whether
+    /// or not anybody called, which is why they are applied from
     /// [`Self::materialize_due_transitions`], its one caller, before anything reads the
     /// store.
     pub(super) fn materialize_due_ipam_pool_cidr_moves(&mut self, now: Instant) {
@@ -330,6 +422,10 @@ impl ComAmazonawsEc2Amazonec2State {
                 continue;
             }
             record.view.state = Some(due.to_string());
+            // "Details related to why an IPAM pool CIDR failed to be provisioned"
+            // (`IpamPoolCidr$FailureReason`): the reason is part of the SETTLED failure, so it
+            // starts being reported at the instant the failed state does.
+            record.view.failure_reason = record.failure_reason_when_due.take();
             record.pending = None;
         }
         for cidr_id in deprovisioned {

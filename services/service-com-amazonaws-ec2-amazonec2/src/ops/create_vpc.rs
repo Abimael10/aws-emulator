@@ -385,18 +385,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         family = state::ADDRESS_FAMILY_IPV4,
                     )));
                 }
+                // A VPC is a resource OF A REGION, so it can only be given space out of a pool
+                // that allocates in that Region — the one reader of that question, which words
+                // the refusal the way EC2 words it for a resource type a pool's locale does not
+                // serve.
+                state::require_ipam_pool_allocates_in(
+                    &pool,
+                    pool_id,
+                    state::IPAM_POOL_ALLOCATION_RESOURCE_TYPE_VPC,
+                    &region,
+                )?;
+                // "Resources that do not have these tags will not be allowed to allocate space
+                // from the pool" (`IpamPool$AllocationResourceTags`): the tags the VPC is being
+                // created with are the tags it will have, so they are what the pool's own
+                // requirement is asked of, before any space is taken.
+                state::require_pool_allocation_resource_tags(&pool, pool_id, &tags)?;
                 match named_cidr_block.clone() {
                     // A range the REQUEST named has to be one the pool actually has to hand
                     // out, on exactly the terms `AllocateIpamPoolCidr` holds one to: its size
                     // inside the pool's allocation rules, and the range itself inside the
                     // pool's free space.
                     Some(canonical) => {
-                        state::require_compliant_allocation_cidr(
-                            &pool,
-                            pool_id,
-                            "ipv4NetmaskLength",
-                            &canonical,
-                        )?;
+                        state::require_resource_allocation_cidr(&pool, pool_id, &canonical)?;
                         store.require_ipam_pool_space(pool_id, "cidrBlock", &canonical)?;
                         canonical
                     }
@@ -426,10 +436,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 "/{netmask_length}"
                             )));
                         }
-                        state::require_compliant_allocation_length(
+                        state::require_resource_allocation_netmask_length(
                             &pool,
                             pool_id,
-                            "ipv4NetmaskLength",
                             netmask_length,
                         )?;
                         store.choose_free_ipam_pool_cidr(

@@ -1990,9 +1990,12 @@ fn refuse_incompatible_security_groups(
                 })
                 .ok_or_else(|| {
                     // The name was resolved IN the launch subnet's VPC, so the sentence names
-                    // the network the lookup was scoped to — the wording the rule path of this
-                    // crate answers a reference it scoped the same way with
-                    // (`crate::state::prepared_user_id_group_pair`).
+                    // the network the lookup was scoped to: a name is only a name INSIDE one
+                    // network, so which network it was looked up in is what the caller has to
+                    // correct. A RULE's referenced group is named by an id instead, which
+                    // identifies one group account-wide, so that path answers EC2's generic
+                    // different-networks sentence rather than this one
+                    // (`crate::state::RESOURCES_IN_DIFFERENT_NETWORKS`).
                     crate::scaffolded::Scaffolded::service_error(
                         crate::state::INVALID_GROUP_NOT_FOUND,
                         400,

@@ -30,15 +30,16 @@ use std::time::{Duration, Instant};
 use ec2::state::{
     ADDRESS_FAMILY_IPV4, ADDRESS_FAMILY_IPV6, DRY_RUN_OPERATION, DRY_RUN_OPERATION_MESSAGE,
     DRY_RUN_OPERATION_STATUS, INVALID_IPAM_POOL_ID_MALFORMED, INVALID_IPAM_POOL_ID_NOT_FOUND,
-    INVALID_PARAMETER_COMBINATION, INVALID_PARAMETER_VALUE, IPAM_POOL_CIDR_ID_PREFIX,
-    IPAM_POOL_CIDR_STATE_PENDING_PROVISION, IPAM_POOL_CIDR_STATE_PROVISIONED,
-    MAX_CLIENT_TOKEN_CHARS, MISSING_PARAMETER, TRANSITION_DELAY,
+    INVALID_PARAMETER_COMBINATION, INVALID_PARAMETER_VALUE,
+    IPAM_POOL_CIDR_FAILURE_CODE_NOT_AVAILABLE, IPAM_POOL_CIDR_ID_PREFIX,
+    IPAM_POOL_CIDR_STATE_FAILED_PROVISION, IPAM_POOL_CIDR_STATE_PENDING_PROVISION,
+    IPAM_POOL_CIDR_STATE_PROVISIONED, MAX_CLIENT_TOKEN_CHARS, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{element, emulator, error_code, error_message};
-use super::wire::{Param, child_text, document, param};
+use super::wire::{Param, child, child_text, document, param};
 
 /// The Region every call here is signed for.
 const REGION: &str = "us-east-1";
@@ -159,6 +160,10 @@ struct ReportedCidr {
     state: String,
     /// The `netmaskLength` reported for it, as text.
     netmask_length: Option<String>,
+    /// The `failureReason`'s `code`, for a CIDR whose provisioning settled as a failure.
+    failure_code: Option<String>,
+    /// The `failureReason`'s `message`, for the same.
+    failure_message: Option<String>,
 }
 
 /// One CIDR read out of `body`: the element carrying an `ipamPoolCidrId`, so the members read
@@ -184,6 +189,10 @@ fn reported_all(case: &str, body: &str) -> Vec<ReportedCidr> {
             cidr: child_text(node, "cidr").unwrap_or_default(),
             state: child_text(node, "state").unwrap_or_default(),
             netmask_length: child_text(node, "netmaskLength"),
+            failure_code: child(node, "failureReason")
+                .and_then(|reason| child_text(reason, "code")),
+            failure_message: child(node, "failureReason")
+                .and_then(|reason| child_text(reason, "message")),
         })
         .collect()
 }
@@ -196,11 +205,41 @@ async fn held(case: &str, router: &MultiServiceRouter, pool_id: &str) -> Vec<Rep
     reported
 }
 
-/// Look at the pool's CIDRs AGAIN until the range `cidr` is reported in `wanted`, or a deadline
-/// far past the service's own transition span passes. Answers the last state seen.
+/// Look at the pool's CIDRs AGAIN until the record `names` picks is reported in `wanted`, or a
+/// deadline far past the service's own transition span passes. Answers the record as it was
+/// last seen, or `None` while the pool reports no record `names` picks at all.
+///
+/// The ONE poller of this suite, so the deadline and the interval have a single implementation
+/// and a caller only says how the record it waits on is NAMED: by its range, or — for a
+/// provision that could not be given space, which never chose a range — by its id.
 ///
 /// The CONDITION is what is waited for, never a span of wall clock: the move is one the clock
 /// owes, so a loaded host costs more looks rather than a different answer.
+async fn poll_until(
+    case: &str,
+    router: &MultiServiceRouter,
+    pool_id: &str,
+    wanted: &str,
+    names: impl Fn(&ReportedCidr) -> bool,
+) -> Option<ReportedCidr> {
+    let deadline = Instant::now() + settle_deadline();
+    loop {
+        let record = held(case, router, pool_id)
+            .await
+            .into_iter()
+            .find(&names);
+        let settled = record
+            .as_ref()
+            .is_some_and(|record| record.state == wanted);
+        if settled || Instant::now() >= deadline {
+            return record;
+        }
+        tokio::time::sleep(poll_interval()).await;
+    }
+}
+
+/// The state the range `cidr` of the pool is reported in once it is `wanted`, or the state it
+/// was last seen in — the empty string while the pool reports no such range.
 async fn poll_until_state(
     case: &str,
     router: &MultiServiceRouter,
@@ -208,19 +247,29 @@ async fn poll_until_state(
     cidr: &str,
     wanted: &str,
 ) -> String {
-    let deadline = Instant::now() + settle_deadline();
-    loop {
-        let state = held(case, router, pool_id)
-            .await
-            .into_iter()
-            .find(|reported| reported.cidr == cidr)
-            .map(|reported| reported.state)
-            .unwrap_or_default();
-        if state == wanted || Instant::now() >= deadline {
-            return state;
-        }
-        tokio::time::sleep(poll_interval()).await;
-    }
+    poll_until(case, router, pool_id, wanted, |reported| {
+        reported.cidr == cidr
+    })
+    .await
+    .map(|reported| reported.state)
+    .unwrap_or_default()
+}
+
+/// The record `id` names once it is `wanted`, or as it was last seen.
+///
+/// The by-id counterpart of [`poll_until_state`], for a record that carries NO range of its
+/// own: a provision that could not be given space never chose one, so its id is the only name
+/// it has.
+async fn poll_until_record_state(
+    case: &str,
+    router: &MultiServiceRouter,
+    pool_id: &str,
+    id: &str,
+    wanted: &str,
+) -> ReportedCidr {
+    poll_until(case, router, pool_id, wanted, |reported| reported.id == id)
+        .await
+        .unwrap_or_else(|| panic!("case {case:?}: the pool no longer reports {id}"))
 }
 
 /// Provision `cidr` to the pool, asserting the provision took, and answer the CIDR it reported.
@@ -724,8 +773,12 @@ async fn a_range_the_pool_cannot_hand_out_is_refused_and_stored_nowhere() {
             ADDRESS_FAMILY_IPV4,
             &[],
             &[],
-            MISSING_PARAMETER,
-            |_| "Either 'cidr' or 'netmaskLength' must be provided".to_string(),
+            INVALID_PARAMETER_COMBINATION,
+            |_| {
+                "The request cannot contain empty CIDR and Netmask Length. Exactly one of \
+                 them should be provided."
+                    .to_string()
+            },
         ),
         (
             "both a cidr and a netmask length",
@@ -733,7 +786,11 @@ async fn a_range_the_pool_cannot_hand_out_is_refused_and_stored_nowhere() {
             &[],
             &[("Cidr", "10.50.0.0/16"), ("NetmaskLength", "24")],
             INVALID_PARAMETER_COMBINATION,
-            |_| "Only one of 'cidr' or 'netmaskLength' may be provided".to_string(),
+            |_| {
+                "The request cannot contain both CIDR and Netmask Length. Exactly one of \
+                 them should be provided."
+                    .to_string()
+            },
         ),
         (
             "an IPv6 range for a pool that holds IPv4 space",
@@ -948,6 +1005,31 @@ async fn space_the_source_pool_does_not_hold_is_refused() {
     );
     let rows: [Refusal; 5] = [
         (
+            // A SIZE no address of the pool's family has names no block at all, which is a
+            // property of the request rather than of the space the source pool holds — so it
+            // is refused here instead of being accepted and settled as a failed provision.
+            "a size one bit past the longest IPv4 netmask",
+            "10.68.0.0/16",
+            &[("NetmaskLength", "33")],
+            INVALID_PARAMETER_VALUE,
+            |_| {
+                "Invalid value '33' for netmaskLength. An ipv4 CIDR has a netmask length \
+                 between 0 and 32"
+                    .to_string()
+            },
+        ),
+        (
+            "a size no IPv4 address has at all",
+            "10.69.0.0/16",
+            &[("NetmaskLength", "40")],
+            INVALID_PARAMETER_VALUE,
+            |_| {
+                "Invalid value '40' for netmaskLength. An ipv4 CIDR has a netmask length \
+                 between 0 and 32"
+                    .to_string()
+            },
+        ),
+        (
             "a range of altogether different space",
             "10.70.0.0/16",
             &[("Cidr", "192.0.2.0/24")],
@@ -983,30 +1065,6 @@ async fn space_the_source_pool_does_not_hold_is_refused() {
                 )
             },
         ),
-        (
-            "a size larger than the whole of the source pool's space",
-            "10.73.0.0/24",
-            &[("NetmaskLength", "16")],
-            INVALID_PARAMETER_VALUE,
-            |source| {
-                format!(
-                    "Invalid value '16' for netmaskLength. The source IPAM pool '{source}' has \
-                     no free CIDR of that size"
-                )
-            },
-        ),
-        (
-            "a size one address larger than the source pool's space",
-            "10.74.0.0/24",
-            &[("NetmaskLength", "23")],
-            INVALID_PARAMETER_VALUE,
-            |source| {
-                format!(
-                    "Invalid value '23' for netmaskLength. The source IPAM pool '{source}' has \
-                     no free CIDR of that size"
-                )
-            },
-        ),
     ];
 
     for (case, source_range, extra, code, message) in rows {
@@ -1031,6 +1089,139 @@ async fn space_the_source_pool_does_not_hold_is_refused() {
         assert!(
             after.is_empty(),
             "case {case:?}: expected the refused call to store nothing, got {after:?}"
+        );
+    }
+}
+
+/// A SIZE the source pool holds no free block of is ACCEPTED, and the range it would have
+/// created settles as a failed provision — the refusal is the state of the range, not the
+/// answer to the call.
+///
+/// The request names a size the pool's own rules admit; what is missing is SPACE, which is a
+/// property of the source pool at that instant rather than of the request. So the provision is
+/// served, the record starts `pending-provision` carrying the size asked for and no range at
+/// all, and the clock settles it as `failed-provision` with the failure catalog's own code for
+/// a range that could not be had.
+///
+/// The rows differ along WHY there is no free block: a size larger than the whole of the source
+/// pool's space, a size one bit larger than it, and a size that would fit if another pool had
+/// not already been given every address of it.
+#[tokio::test]
+async fn a_size_the_source_pool_has_no_free_block_for_is_accepted_and_settles_as_failed() {
+    // (case, the source pool's range, the netmask length asked for, whether another pool is
+    //  given the whole of the source pool's space first)
+    let rows: [(&str, &str, &str, bool); 3] = [
+        (
+            "a size larger than the whole of the source pool's space",
+            "10.73.0.0/24",
+            "16",
+            false,
+        ),
+        (
+            "a size one bit larger than the source pool's space",
+            "10.74.0.0/24",
+            "23",
+            false,
+        ),
+        (
+            "a size the source pool has already given every address of away",
+            "10.75.0.0/24",
+            "24",
+            true,
+        ),
+    ];
+
+    for (case, source_range, netmask_length, already_taken) in rows {
+        let (router, _engine) = emulator();
+        let scope = create_scope(case, &router).await;
+        let source = create_pool(case, &router, &scope, ADDRESS_FAMILY_IPV4, None).await;
+        provision(case, &router, &source, source_range).await;
+        if already_taken {
+            let first = create_pool(
+                case,
+                &router,
+                &scope,
+                ADDRESS_FAMILY_IPV4,
+                Some(source.as_str()),
+            )
+            .await;
+            provision(case, &router, &first, source_range).await;
+        }
+        let child = create_pool(
+            case,
+            &router,
+            &scope,
+            ADDRESS_FAMILY_IPV4,
+            Some(source.as_str()),
+        )
+        .await;
+
+        let body = ok(
+            case,
+            &router,
+            PROVISION,
+            &[
+                param("IpamPoolId", &child),
+                param("NetmaskLength", netmask_length),
+            ],
+        )
+        .await;
+        let answered = reported_one(case, &body);
+        assert_eq!(
+            answered.state, IPAM_POOL_CIDR_STATE_PENDING_PROVISION,
+            "case {case:?}: expected the accepted provision to answer \
+             {IPAM_POOL_CIDR_STATE_PENDING_PROVISION:?}, got {answered:?}"
+        );
+        assert_eq!(
+            answered.netmask_length.as_deref(),
+            Some(netmask_length),
+            "case {case:?}: expected the size asked for to be reported, got {answered:?}"
+        );
+        assert!(
+            answered.cidr.is_empty(),
+            "case {case:?}: expected no range at all on a provision nothing could be chosen \
+             for, got {answered:?}"
+        );
+        assert!(
+            answered.failure_code.is_none(),
+            "case {case:?}: expected no failure reason while the provision is still under \
+             way, got {answered:?}"
+        );
+
+        let settled = poll_until_record_state(
+            case,
+            &router,
+            &child,
+            &answered.id,
+            IPAM_POOL_CIDR_STATE_FAILED_PROVISION,
+        )
+        .await;
+        assert_eq!(
+            settled.state, IPAM_POOL_CIDR_STATE_FAILED_PROVISION,
+            "case {case:?}: expected the clock to settle the provision as \
+             {IPAM_POOL_CIDR_STATE_FAILED_PROVISION:?}, got {settled:?}"
+        );
+        assert_eq!(
+            settled.failure_code.as_deref(),
+            Some(IPAM_POOL_CIDR_FAILURE_CODE_NOT_AVAILABLE),
+            "case {case:?}: expected the failure to carry \
+             {IPAM_POOL_CIDR_FAILURE_CODE_NOT_AVAILABLE:?}, got {settled:?}"
+        );
+        assert!(
+            settled
+                .failure_message
+                .as_deref()
+                .is_some_and(|message| message.contains(&source)),
+            "case {case:?}: expected the failure to say which pool had no space, got \
+             {settled:?}"
+        );
+
+        // The failed provision gave the pool no space: a range it holds is one a later
+        // allocation could come out of, and this one holds none.
+        let after = held(case, &router, &child).await;
+        assert!(
+            after.iter().all(|reported| reported.cidr.is_empty()),
+            "case {case:?}: expected the pool to hold no range, got {after:?}"
         );
     }
 }

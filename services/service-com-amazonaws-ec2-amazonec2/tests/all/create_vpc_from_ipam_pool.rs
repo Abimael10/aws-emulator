@@ -29,6 +29,11 @@ use super::wire::{child_text, document, param, Param};
 /// The Region every call here is signed for.
 const REGION: &str = "us-east-1";
 
+/// Another Region of the same partition, given to an IPAM as an operating Region so a pool may
+/// name it as its locale: a pool that allocates THERE allocates no block to a VPC of
+/// [`REGION`].
+const OTHER_REGION: &str = "us-west-2";
+
 /// The space provisioned to the pool every test here allocates out of.
 const POOL_SPACE: &str = "10.200.0.0/16";
 
@@ -54,6 +59,12 @@ fn member(case: &str, body: &str, name: &str) -> String {
 
 /// One IPAM pool with [`POOL_SPACE`] provisioned to it, and `extra` on the pool itself: the
 /// router and the pool id.
+///
+/// The pool's locale is the Region every call here is signed for: "the locale is the Amazon
+/// Web Services Region where this IPAM pool is available for allocations"
+/// (`AllocateIpamPoolCidr`), so a pool a VPC OF THIS REGION can take space out of has to name
+/// it. A pool without one is a row of
+/// [`a_pool_that_does_not_allocate_in_this_region_serves_no_vpc`] instead.
 async fn pool_with_space(case: &str, extra: &[Param]) -> (MultiServiceRouter, String) {
     let (router, _engine) = super::ec2_query::emulator();
     let ipam = ok(case, &router, "CreateIpam", &[]).await;
@@ -61,6 +72,7 @@ async fn pool_with_space(case: &str, extra: &[Param]) -> (MultiServiceRouter, St
     let mut params = vec![
         param("IpamScopeId", &scope_id),
         param("AddressFamily", ec2::state::ADDRESS_FAMILY_IPV4),
+        param("Locale", REGION),
     ];
     params.extend(extra.iter().cloned());
     let created = ok(case, &router, "CreateIpamPool", &params).await;
@@ -518,4 +530,291 @@ async fn a_pool_with_no_default_size_says_exactly_one_of_the_two_is_needed() {
          allocation netmask length set. Exactly one of them should be provided.",
         "case {case:?}: expected the sentence EC2 words for this, got {body}"
     );
+}
+
+/// A VPC is a resource OF A REGION, so a pool that is not available for allocations in the
+/// Region the VPC is created in serves no VPC at all: the resource type is not valid for that
+/// pool, and the refusal names the pool's locale as every read of the pool reports it.
+///
+/// The rows differ along WHY the pool does not allocate here: a pool created with no locale,
+/// which "means any locale" and is therefore available in none, and a pool whose locale is
+/// another Region the same IPAM operates in. Both carry space and admit the size asked for, so
+/// the locale is the only thing between the request and a block.
+#[tokio::test]
+async fn a_pool_that_does_not_allocate_in_this_region_serves_no_vpc() {
+    // (case, the Locale the pool is created with, the locale the refusal must name)
+    let rows: [(&str, Option<&str>, &str); 2] = [
+        (
+            "a top-level pool created with no locale",
+            None,
+            ec2::state::IPAM_POOL_LOCALE_NONE,
+        ),
+        (
+            "a pool whose locale is another Region of the same IPAM",
+            Some(OTHER_REGION),
+            OTHER_REGION,
+        ),
+    ];
+
+    for (case, locale, reported_locale) in rows {
+        let (router, _engine) = super::ec2_query::emulator();
+        // The IPAM operates in both Regions, so the locale of the second row is one a pool may
+        // name at all — what refuses the VPC is that it is not THIS Region.
+        let ipam = ok(
+            case,
+            &router,
+            "CreateIpam",
+            &[param("OperatingRegion.1.RegionName", OTHER_REGION)],
+        )
+        .await;
+        let scope_id = member(case, &ipam, "privateDefaultScopeId");
+        let mut params = vec![
+            param("IpamScopeId", &scope_id),
+            param("AddressFamily", ec2::state::ADDRESS_FAMILY_IPV4),
+        ];
+        if let Some(locale) = locale {
+            params.push(param("Locale", locale));
+        }
+        let created = ok(case, &router, "CreateIpamPool", &params).await;
+        let pool_id = member(case, &created, "ipamPoolId");
+        ok(
+            case,
+            &router,
+            "ProvisionIpamPoolCidr",
+            &[param("IpamPoolId", &pool_id), param("Cidr", POOL_SPACE)],
+        )
+        .await;
+
+        // Each form of the request — a size for the pool to choose, and a block the request
+        // names itself — is refused the same way: the pool allocates nothing here.
+        for (form, members) in [
+            ("a size the pool chooses from", vec![param("Ipv4NetmaskLength", "24")]),
+            ("a block the request names", vec![param("CidrBlock", "10.200.9.0/24")]),
+        ] {
+            let mut request = vec![param("Ipv4IpamPoolId", &pool_id)];
+            request.extend(members);
+            let (status, body) = call(&router, "CreateVpc", &request).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?} with {form}: expected HTTP 400, got {status} with body {body}"
+            );
+            assert_eq!(
+                error_code(&body).as_str(),
+                ec2::state::INVALID_PARAMETER_VALUE,
+                "case {case:?} with {form}: expected the parameter-value class, got {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                format!(
+                    "The resource type vpc is not valid for pool {pool_id} with \
+                     {reported_locale} locale."
+                ),
+                "case {case:?} with {form}: expected the sentence EC2 words for a pool that \
+                 does not allocate here, got {body}"
+            );
+        }
+        let vpcs = elements(&ok(case, &router, "DescribeVpcs", &[]).await, "cidrBlock");
+        assert!(
+            !vpcs.iter().any(|cidr| cidr.starts_with("10.200.")),
+            "case {case:?}: the refusals must have created no VPC out of the pool, got {vpcs:?}"
+        );
+    }
+}
+
+/// A size outside the pool's own allocation netmask rules is refused naming the size asked for
+/// and the bound the pool allows: "the minimum netmask length required for CIDR allocations in
+/// this IPAM pool to be compliant" and "the maximum netmask length possible"
+/// (`IpamPool$AllocationMinNetmaskLength`, `$AllocationMaxNetmaskLength`) are the two bounds a
+/// VPC's block is held to as well.
+///
+/// The rows differ along which bound the request breaks and how it asks for the size: each
+/// published bound, one past it on either side, and a block the request names itself rather
+/// than a size for the pool to choose.
+#[tokio::test]
+async fn a_size_outside_the_pools_allocation_rules_names_the_bound_it_broke() {
+    // The pool every row below allocates out of: blocks between a /20 and a /26.
+    let case = "a pool that allocates /20 to /26 blocks";
+    let (router, pool_id) = pool_with_space(
+        case,
+        &[
+            param("AllocationMinNetmaskLength", "20"),
+            param("AllocationMaxNetmaskLength", "26"),
+        ],
+    )
+    .await;
+
+    // (case, the members beside Ipv4IpamPoolId, the message — None for a request the pool
+    //  serves)
+    let rows: Vec<(&str, Vec<Param>, Option<String>)> = vec![
+        (
+            "the largest size the pool allows",
+            vec![param("Ipv4NetmaskLength", "20")],
+            None,
+        ),
+        (
+            "the smallest size the pool allows",
+            vec![param("Ipv4NetmaskLength", "26")],
+            None,
+        ),
+        (
+            "a size inside both bounds",
+            vec![param("Ipv4NetmaskLength", "24")],
+            None,
+        ),
+        (
+            "one bit larger than the largest size the pool allows",
+            vec![param("Ipv4NetmaskLength", "19")],
+            Some(format!(
+                "The requested netmask length /19 is larger than allowed by pool {pool_id}. \
+                 Largest netmask length allowed is /20"
+            )),
+        ),
+        (
+            "one bit smaller than the smallest size the pool allows",
+            vec![param("Ipv4NetmaskLength", "27")],
+            Some(format!(
+                "The requested netmask length /27 is smaller than allowed by pool {pool_id}. \
+                 Smallest netmask length allowed is /26"
+            )),
+        ),
+        (
+            "a block the request names whose own size is too large",
+            vec![param("CidrBlock", "10.200.0.0/18")],
+            Some(format!(
+                "The requested netmask length /18 is larger than allowed by pool {pool_id}. \
+                 Largest netmask length allowed is /20"
+            )),
+        ),
+        (
+            "a block the request names whose own size is too small",
+            vec![param("CidrBlock", "10.200.0.0/28")],
+            Some(format!(
+                "The requested netmask length /28 is smaller than allowed by pool {pool_id}. \
+                 Smallest netmask length allowed is /26"
+            )),
+        ),
+    ];
+
+    for (case, members, refusal) in rows {
+        let mut request = vec![param("Ipv4IpamPoolId", &pool_id)];
+        request.extend(members);
+        let (status, body) = call(&router, "CreateVpc", &request).await;
+        match refusal {
+            None => assert_eq!(
+                status, 200,
+                "case {case:?}: expected the pool to serve this size, got {status} with body \
+                 {body}"
+            ),
+            Some(message) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected HTTP 400, got {status} with body {body}"
+                );
+                assert_eq!(
+                    error_code(&body).as_str(),
+                    ec2::state::INVALID_PARAMETER_VALUE,
+                    "case {case:?}: expected the parameter-value class, got {body}"
+                );
+                assert_eq!(
+                    error_message(&body), message,
+                    "case {case:?}: expected the sentence naming the bound, got {body}"
+                );
+            }
+        }
+    }
+}
+
+/// A pool that requires resource tags allocates only to a resource carrying them: "resources
+/// that do not have these tags will not be allowed to allocate space from the pool"
+/// (`IpamPool$AllocationResourceTags`).
+///
+/// The rows differ along how the VPC's own tags relate to the required set: none at all, the
+/// required key with another value, only one of the two required pairs, and both of them
+/// beside a tag the pool never asked for.
+#[tokio::test]
+async fn a_vpc_without_the_tags_the_pool_requires_is_refused() {
+    let case = "a pool that requires Owner=TeamA and Tier=web";
+    let (router, pool_id) = pool_with_space(
+        case,
+        &[
+            param("AllocationResourceTag.1.Key", "Owner"),
+            param("AllocationResourceTag.1.Value", "TeamA"),
+            param("AllocationResourceTag.2.Key", "Tier"),
+            param("AllocationResourceTag.2.Value", "web"),
+        ],
+    )
+    .await;
+
+    /// One tag on the VPC the row creates.
+    fn tag(index: usize, key: &str, value: &str) -> Vec<Param> {
+        vec![
+            param("TagSpecification.1.ResourceType", "vpc"),
+            param(&format!("TagSpecification.1.Tag.{index}.Key"), key),
+            param(&format!("TagSpecification.1.Tag.{index}.Value"), value),
+        ]
+    }
+
+    // (case, the tags the create carries, whether the pool allocates to it)
+    let rows: Vec<(&str, Vec<Param>, bool)> = vec![
+        ("no tags at all", Vec::new(), false),
+        (
+            "the required key with another value",
+            tag(1, "Owner", "TeamB"),
+            false,
+        ),
+        ("only one of the required pairs", tag(1, "Owner", "TeamA"), false),
+        (
+            "both required pairs beside one the pool never asked for",
+            {
+                let mut tags = tag(1, "Owner", "TeamA");
+                tags.extend(tag(2, "Tier", "web"));
+                tags.extend(tag(3, "Name", "anything"));
+                tags
+            },
+            true,
+        ),
+    ];
+
+    for (case, tags, served) in rows {
+        let mut request = vec![
+            param("Ipv4IpamPoolId", &pool_id),
+            param("Ipv4NetmaskLength", "24"),
+        ];
+        request.extend(tags);
+        let (status, body) = call(&router, "CreateVpc", &request).await;
+        if served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the tagged VPC to be served, got {status} with body \
+                 {body}"
+            );
+            let vpc_id = member(case, &body, "vpcId");
+            let cidr_block = member(case, &body, "cidrBlock");
+            let held = allocations(case, &router, &pool_id).await;
+            assert_eq!(
+                held,
+                vec![(
+                    cidr_block,
+                    ec2::state::IPAM_POOL_ALLOCATION_RESOURCE_TYPE_VPC.to_string(),
+                    Some(vpc_id),
+                )],
+                "case {case:?}: expected the pool to hold the allocation it served"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body).as_str(),
+            ec2::state::INVALID_PARAMETER_VALUE,
+            "case {case:?}: expected the parameter-value class, got {body}"
+        );
+        let held = allocations(case, &router, &pool_id).await;
+        assert!(
+            held.is_empty(),
+            "case {case:?}: the refusal must have taken no space out of the pool, got {held:?}"
+        );
+    }
 }

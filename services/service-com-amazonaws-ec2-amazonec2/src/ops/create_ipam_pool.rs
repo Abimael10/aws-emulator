@@ -448,7 +448,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 })?;
                 if source.ipam_scope_arn != scope.ipam_scope_arn {
-                    return Err(state::invalid_parameter_value(format!(
+                    // A pool and the pool it draws on are two members of ONE request that
+                    // cannot go together — the scope is named by the request and the source
+                    // pool carries its own — so what is wrong is the combination rather than
+                    // either value, which is the class EC2 answers for a cross-scope source.
+                    return Err(state::invalid_parameter_combination(format!(
                         "The source IPAM pool '{source_pool_id}' is not in the IPAM scope \
                          '{scope_id}'"
                     )));

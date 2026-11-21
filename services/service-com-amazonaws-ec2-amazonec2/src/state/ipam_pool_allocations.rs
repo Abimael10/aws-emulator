@@ -393,19 +393,54 @@ pub fn require_compliant_allocation_length<E>(
     member: &str,
     length: i32,
 ) -> Result<(), Scaffolded<E>> {
+    require_netmask_within_pool_rules(
+        pool,
+        length,
+        |min| {
+            format!(
+                "Invalid value '{length}' for {member}. The IPAM pool '{pool_id}' allocates \
+                 CIDRs with a netmask length of at least '{min}'"
+            )
+        },
+        |max| {
+            format!(
+                "Invalid value '{length}' for {member}. The IPAM pool '{pool_id}' allocates \
+                 CIDRs with a netmask length of at most '{max}'"
+            )
+        },
+    )
+}
+
+/// `length` held to the two bounds a pool's allocation rules carry, refused in whichever
+/// wording the CALLER of this reader answers them in.
+///
+/// The ONE implementation of the rule itself — "the MINIMUM netmask length required for CIDR
+/// allocations in this IPAM pool to be compliant" and "the MAXIMUM netmask length possible"
+/// (`IpamPool$AllocationMinNetmaskLength`, `IpamPool$AllocationMaxNetmaskLength`) — so the
+/// two refusals EC2 words differently (an allocation call's and a resource creation's) cannot
+/// come to different verdicts about the same pool and the same size. `too_large` is handed the
+/// minimum a length SHORTER than it broke, `too_small` the maximum a longer one broke.
+fn require_netmask_within_pool_rules<E>(
+    pool: &IpamPool,
+    length: i32,
+    too_large: impl FnOnce(i32) -> String,
+    too_small: impl FnOnce(i32) -> String,
+) -> Result<(), Scaffolded<E>> {
     if let Some(min) = pool.allocation_min_netmask_length.filter(|min| length < *min) {
-        return Err(invalid_parameter_value(format!(
-            "Invalid value '{length}' for {member}. The IPAM pool '{pool_id}' allocates \
-             CIDRs with a netmask length of at least '{min}'"
-        )));
+        return Err(invalid_parameter_value(too_large(min)));
     }
     if let Some(max) = pool.allocation_max_netmask_length.filter(|max| length > *max) {
-        return Err(invalid_parameter_value(format!(
-            "Invalid value '{length}' for {member}. The IPAM pool '{pool_id}' allocates \
-             CIDRs with a netmask length of at most '{max}'"
-        )));
+        return Err(invalid_parameter_value(too_small(max)));
     }
     Ok(())
+}
+
+/// The netmask length `cidr` itself names, or `None` for a value that names none.
+///
+/// One reading of "how large is this range" for the two readers below, so a range the request
+/// named is measured the same way whichever refusal it would be held to.
+fn allocation_cidr_netmask_length(cidr: &str) -> Option<i32> {
+    cidr_block_prefix_length(cidr).and_then(|length| i32::try_from(length).ok())
 }
 
 /// The netmask length `cidr` itself names, held to the pool's allocation rules through
@@ -419,12 +454,137 @@ pub fn require_compliant_allocation_cidr<E>(
     member: &str,
     cidr: &str,
 ) -> Result<(), Scaffolded<E>> {
-    let Some(length) =
-        cidr_block_prefix_length(cidr).and_then(|length| i32::try_from(length).ok())
-    else {
+    let Some(length) = allocation_cidr_netmask_length(cidr) else {
         return Ok(());
     };
     require_compliant_allocation_length(pool, pool_id, member, length)
+}
+
+/// `pool` held to being a pool a RESOURCE of `region` may take its range out of.
+///
+/// "The locale is the Amazon Web Services Region where this IPAM pool is available for
+/// allocations" (`AllocateIpamPoolCidr`): a resource is created IN one Region, so the pool its
+/// CIDR comes out of has to be available in that Region — one whose locale is another Region
+/// is not, and neither is one that names no locale, which is available in no Region in
+/// particular ("default is none and means any locale",
+/// `CreateIpamPoolRequest$Locale`). Either way a resource of this Region cannot be given space
+/// out of it, which EC2 refuses naming the resource type that is not valid for the pool and
+/// the locale the pool reports ([`reported_ipam_pool`], so the sentence spells a pool without
+/// one the way every read of it does).
+///
+/// This says nothing about what the pool itself may HOLD: a pool created without a locale
+/// still takes space anywhere its IPAM operates ([`IPAM_POOL_LOCALE_NONE`] and the locale
+/// readings beside it), and `AllocateIpamPoolCidr`, which assigns a range to no resource at
+/// all, asks this of no pool. What a locale decides here is only whether a REGION-BOUND
+/// RESOURCE can be the holder of one of the pool's ranges.
+///
+/// `resource_type` is the `IpamPoolAllocationResourceType` of the resource being created, so
+/// the sentence names what the allocation would have been for. The ONE reader of that
+/// question, so every path that takes space out of a pool FOR A RESOURCE is held to the
+/// Region that pool allocates in.
+pub fn require_ipam_pool_allocates_in<E>(
+    pool: &IpamPool,
+    pool_id: &str,
+    resource_type: &str,
+    region: &str,
+) -> Result<(), Scaffolded<E>> {
+    if pool.locale.as_deref() == Some(region) {
+        return Ok(());
+    }
+    let locale = pool.locale.as_deref().unwrap_or(IPAM_POOL_LOCALE_NONE);
+    Err(invalid_parameter_value(format!(
+        "The resource type {resource_type} is not valid for pool {pool_id} with {locale} \
+         locale."
+    )))
+}
+
+/// The tags `pool` requires of the resources it allocates to, held against the `tags` the
+/// resource is being created with.
+///
+/// "Tags that are required for resources that use CIDRs from this IPAM pool. Resources that do
+/// not have these tags will not be allowed to allocate space from the pool"
+/// (`IpamPool$AllocationResourceTags`): the required list is a SET of key/value pairs the
+/// resource has to carry, so a resource missing any one of them is not one the pool allocates
+/// to — refused before any space is taken rather than stored as a resource the pool's own
+/// rules exclude.
+///
+/// The ONE reader of that question, for the same reason
+/// [`require_netmask_within_pool_rules`] is the one reader of a pool's netmask rules.
+///
+/// The sentence states the rule the model's own member states, naming the required pair the
+/// resource does not carry and the pool requiring it. Only the CODE of this refusal is
+/// recorded for the emulator to reproduce (`InvalidParameterValue`), so the wording here is
+/// this crate's statement of the modelled rule rather than reproduced EC2 text; every value in
+/// it comes from the pool's stored rules and the request's own tags.
+pub fn require_pool_allocation_resource_tags<E>(
+    pool: &IpamPool,
+    pool_id: &str,
+    tags: &[Tag],
+) -> Result<(), Scaffolded<E>> {
+    let required = pool.allocation_resource_tags.as_deref().unwrap_or_default();
+    let Some(missing) = required.iter().find(|required| {
+        !tags.iter().any(|tag| {
+            tag.key.as_deref().unwrap_or_default()
+                == required.key.as_deref().unwrap_or_default()
+                && tag.value.as_deref().unwrap_or_default()
+                    == required.value.as_deref().unwrap_or_default()
+        })
+    }) else {
+        return Ok(());
+    };
+    Err(invalid_parameter_value(format!(
+        "The resource does not have the tag {key}={value}, which pool {pool_id} requires of \
+         the resources that use CIDRs from it.",
+        key = missing.key.as_deref().unwrap_or_default(),
+        value = missing.value.as_deref().unwrap_or_default(),
+    )))
+}
+
+/// `length` held to the netmask rules of a pool a RESOURCE takes its range out of, in the
+/// wording EC2 answers such a resource's creation with.
+///
+/// The same two bounds [`require_compliant_allocation_length`] reads — a pool's
+/// `AllocationMinNetmaskLength` and `AllocationMaxNetmaskLength` — asked on behalf of a
+/// resource rather than of an allocation call: a netmask length SHORTER than the pool's
+/// minimum asks for a LARGER block than the pool hands out, and one longer than its maximum
+/// for a smaller one, so the sentence names the length asked for and the bound the pool
+/// allows, each spelled as a netmask.
+pub fn require_resource_allocation_netmask_length<E>(
+    pool: &IpamPool,
+    pool_id: &str,
+    length: i32,
+) -> Result<(), Scaffolded<E>> {
+    require_netmask_within_pool_rules(
+        pool,
+        length,
+        |min| {
+            format!(
+                "The requested netmask length /{length} is larger than allowed by pool \
+                 {pool_id}. Largest netmask length allowed is /{min}"
+            )
+        },
+        |max| {
+            format!(
+                "The requested netmask length /{length} is smaller than allowed by pool \
+                 {pool_id}. Smallest netmask length allowed is /{max}"
+            )
+        },
+    )
+}
+
+/// The netmask length `cidr` itself names, held to the pool's rules through
+/// [`require_resource_allocation_netmask_length`] — the resource-creation counterpart of
+/// [`require_compliant_allocation_cidr`], for the same reason: a range the request named
+/// carries its own size.
+pub fn require_resource_allocation_cidr<E>(
+    pool: &IpamPool,
+    pool_id: &str,
+    cidr: &str,
+) -> Result<(), Scaffolded<E>> {
+    let Some(length) = allocation_cidr_netmask_length(cidr) else {
+        return Ok(());
+    };
+    require_resource_allocation_netmask_length(pool, pool_id, length)
 }
 
 /// What a search for a free block inside a pool's space is asked for.

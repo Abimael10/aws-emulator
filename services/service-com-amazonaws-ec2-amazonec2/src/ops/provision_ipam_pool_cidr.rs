@@ -163,17 +163,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Either 'NetmaskLength' or 'Cidr' is required" (`$Cidr` / `$NetmaskLength`): a
         // request that names neither asks for no range at all, and one that names both says
-        // two different things about the size of the range it wants.
+        // two different things about the size of the range it wants. Either way what is wrong
+        // is the COMBINATION of members the request carries, which is the class EC2 answers
+        // for both halves of this rule, in the sentence it words it with.
         let requested_cidr = input.cidr.as_deref().filter(|cidr| !cidr.is_empty());
         match (requested_cidr, input.netmask_length) {
             (None, None) => {
-                return Err(state::missing_parameter(
-                    "Either 'cidr' or 'netmaskLength' must be provided",
+                return Err(state::invalid_parameter_combination(
+                    "The request cannot contain empty CIDR and Netmask Length. Exactly one \
+                     of them should be provided.",
                 ));
             }
             (Some(_), Some(_)) => {
                 return Err(state::invalid_parameter_combination(
-                    "Only one of 'cidr' or 'netmaskLength' may be provided",
+                    "The request cannot contain both CIDR and Netmask Length. Exactly one of \
+                     them should be provided.",
                 ));
             }
             _ => {}
@@ -237,10 +241,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // IPv6 pool. A top-level pool of a family with no such space has none to choose from.
         let requested_cidr: String = match (requested_cidr, input.netmask_length) {
             (Some(cidr), _) => cidr.to_string(),
-            (None, Some(netmask_length)) => {
-                let netmask_length = u32::try_from(netmask_length).unwrap_or(u32::MAX);
+            (None, Some(requested_length)) => {
+                let netmask_length = u32::try_from(requested_length).unwrap_or(u32::MAX);
                 match pool.source_ipam_pool_id.as_deref() {
                     Some(source_pool_id) => {
+                        // A size that is no netmask length of this family's addresses at all
+                        // names no block the pool could ever be given: "possible netmask
+                        // lengths for IPv4 addresses are 0 - 32. Possible netmask lengths for
+                        // IPv6 addresses are 0 - 128"
+                        // (`CreateIpamPoolRequest$AllocationMinNetmaskLength`), through the one
+                        // reader of that per-family bound. That is a property of the REQUEST,
+                        // so it is refused here rather than accepted and settled as a failure
+                        // the way "no free block of a size the pool could hand out" is below.
+                        let max_length = state::max_netmask_length_for_family(family);
+                        if !(0..=max_length).contains(&requested_length) {
+                            return Err(state::invalid_parameter_value(format!(
+                                "Invalid value '{requested_length}' for netmaskLength. An \
+                                 {family} CIDR has a netmask length between 0 and {max_length}"
+                            )));
+                        }
                         // The space the source pool holds, less every range already assigned
                         // OUT of it, is what this pool may be given: the first free block of
                         // the requested size, so two pools drawing on one source pool cannot
@@ -257,7 +276,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // give.
                         let mut budget =
                             state::MatchBudget::new(state::MAX_FILTER_MATCH_STEPS);
-                        state::first_free_cidr_block(
+                        let free = state::first_free_cidr_block(
                             &state::FreeCidrBlockSearch {
                                 space: &space,
                                 netmask_length,
@@ -267,14 +286,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             },
                             &mut budget,
                         )
-                        .map_err(|_| search_budget_spent())?
-                        .ok_or_else(|| {
-                            state::invalid_parameter_value(format!(
-                                "Invalid value '{netmask_length}' for netmaskLength. The \
-                                 source IPAM pool '{source_pool_id}' has no free CIDR of \
-                                 that size"
-                            ))
-                        })?
+                        .map_err(|_| search_budget_spent())?;
+                        match free {
+                            Some(cidr) => cidr,
+                            // The size is one the pool may be given and the request is well
+                            // formed; what is missing is SPACE, which is a property of the
+                            // source pool at this instant rather than of the request — the
+                            // range it asks for could be free again without the caller
+                            // changing a thing. So the provision is ACCEPTED and the range it
+                            // would have created settles as a failure the caller reads off the
+                            // pool's CIDRs, carrying the catalog's own code for a range that
+                            // could not be had. The MESSAGE beside that code states what was
+                            // missing in this crate's own words — only the failed state and
+                            // the catalog code are recorded for this class, so the sentence is
+                            // not reproduced EC2 text — with the pool and the size taken from
+                            // the request and the store.
+                            None => {
+                                return store
+                                    .provision_failing_ipam_pool_cidr(
+                                        pool_id,
+                                        Some(requested_length),
+                                        IpamPoolCidrFailureReason {
+                                            code: Some(
+                                                state::IPAM_POOL_CIDR_FAILURE_CODE_NOT_AVAILABLE
+                                                    .to_string(),
+                                            ),
+                                            // The size the record itself reports, so the
+                                            // sentence and the `NetmaskLength` beside it cannot
+                                            // say two different things.
+                                            message: Some(format!(
+                                                "The source IPAM pool '{source_pool_id}' has \
+                                                 no free CIDR of netmask length \
+                                                 /{requested_length}"
+                                            )),
+                                        },
+                                    )
+                                    .map(|ipam_pool_cidr| ProvisionIpamPoolCidrOutput {
+                                        ipam_pool_cidr: Some(ipam_pool_cidr),
+                                    })
+                                    .ok_or_else(|| {
+                                        state::resource_limit_exceeded(format!(
+                                            "This emulator holds {max} IPAM pool CIDRs, which \
+                                             is as many as it stores",
+                                            max = state::MAX_STORED_RECORDS_PER_STORE,
+                                        ))
+                                    });
+                            }
+                        }
                     }
                     None if family == state::ADDRESS_FAMILY_IPV6 => {
                         // "An Amazon-provided IPv6 CIDR block" comes out of the space Amazon
@@ -326,8 +384,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (None, None) => {
                 // Refused above, where the request's own form is read.
-                return Err(state::missing_parameter(
-                    "Either 'cidr' or 'netmaskLength' must be provided",
+                return Err(state::invalid_parameter_combination(
+                    "The request cannot contain empty CIDR and Netmask Length. Exactly one \
+                     of them should be provided.",
                 ));
             }
         };

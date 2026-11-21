@@ -17,49 +17,24 @@ Issue-Key: ec2.ipam-top-pool-reports-none-locale-depth-one-and-omits-allocation-
 Issue-Key: ec2.stop-start-transitions-are-monotone-and-reads-do-not-advance-them|_assert_transition_reason#3|AssertionError|raise AssertionError(
 Issue-Key: ec2.terminate-termination-protected-instance-rejected|run#11|AssertionError|assert message == expected_message, f"expected message {expected_message!r}, got {message!r}"
 Issue-Key: ec2|AuthorizeSecurityGroupIngress|InvalidGroup.NotFound
-Issue-Key: ec2.arm64-t4g-micro-guest-reports-aarch64|_poll#17|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.arm64-x86-64-binary-execution-in-the-guest-rejected|_poll#18|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.arm64-x86-64-payload-runs-on-t3-micro-and-is-rejected-on-t4g-micro|_poll#18|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.cpuopts-threads-per-core-one-observed-in-guest|_poll#21|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.capres-cancel-with-a-running-instance-releases-it-without-stopping-the-guest|_poll#12|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.capres-open-reservation-consumed-implicitly-while-a-targeted-one-is-untouched|_poll#18|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.concurrent-modify-instance-capacity-reservation-attributes-race|_poll_until#20|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.diops-io2-provisioned-iops-outrun-gp3-baseline-measured-by-fio-in-one-guest|_poll#18|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.dsnapinc-changed-blocks-across-unrelated-lineages-rejected-same-lineage-lists-guest-block|_run_guest#29|Timeout|time.sleep(5)
-Issue-Key: ec2.dvolgrow-capacity-added-by-modify-volume-is-unusable-until-resize2fs|_run_guest#26|Timeout|time.sleep(5)
-Issue-Key: ec2.dvolgrow-root-volume-grows-online-and-only-growpart-reaches-the-live-root-filesystem|_run_guest#33|Timeout|time.sleep(5)
-Issue-Key: ec2.ebsio-snapshot-restored-into-another-availability-zone-carries-the-payload|_poll_until#20|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-attach-volume-across-availability-zones-rejected|_poll_until#33|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-concurrent-attach-of-one-volume-to-two-instances-yields-a-single-winner|_poll_until#26|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-ebs-volume-bytes-survive-detach-and-reattach-to-a-different-instance|_poll_until#20|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-instance-store-bytes-vanish-across-stop-start-while-ebs-bytes-persist|_poll#27|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-instance-type-change-is-visible-to-the-guest-and-matches-the-catalog|_poll_until#13|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-instance-user-data-executes-and-the-guest-reports-the-nonce|_poll_until#11|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-launch-with-a-private-ip-already-in-use-rejected|_poll_until#12|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-security-group-ingress-decides-whether-the-instance-answers|_poll_until#14|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-snapshot-restores-the-exact-bytes-written-to-the-source-volume|_poll_until#17|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.ec2-stop-start-preserves-root-volume-bytes-and-reassigns-the-public-ip|_poll_until#10|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.hibernate-restores-the-running-process-and-a-plain-stop-does-not|_poll#3|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.idvdoc-foreign-signature-rejected-as-proof-of-this-document|_poll_until#13|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.idvdoc-signature-verifies-against-the-aws-public-certificate|_poll_until#14|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.imdshop-container-on-the-default-bridge-blocked-at-hop-limit-1-and-served-at-2|_run_guest#10|Timeout|time.sleep(5)
-Issue-Key: ec2.multiattach-detaching-one-guest-leaves-the-other-attachment-live-and-its-bytes-intact|_poll_until#19|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.nvme-instance-store-guest-device-path-rejected-as-an-ebs-attachment-point|_poll#14|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.nvme-instance-store-namespace-is-nvme-while-the-xen-ebs-root-stays-xvd|_poll#16|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.nvme-instance-store-serial-to-device-mapping-and-data-survive-a-reboot|_poll#16|AssertionError|raise AssertionError(
-Issue-Key: ec2.secip-assigning-more-private-ips-than-the-instance-type-permits-rejected|_poll#19|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.secip-hot-attached-second-eni-appears-in-the-guest-as-a-new-interface-with-its-own-address|_poll#19|AssertionError|raise AssertionError(
-Issue-Key: ec2.secip-secondary-private-ip-is-reachable-from-a-peer-only-when-the-eni-holds-it|_poll#14|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.shutdown-api-termination-disabled-rejects-terminate-but-still-permits-stop|_poll#12|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.shutdown-in-guest-halt-with-stop-behavior-leaves-it-stopped-and-restartable|_poll#12|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.shutdown-in-guest-halt-with-terminate-behavior-terminates-the-instance|_poll#12|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.srcdest-check-enforcement-gates-appliance-forwarded-traffic|_poll#6|Timeout|time.sleep(interval_s)
-Issue-Key: ec2.asghc-launch-template-round-trips-imdsv2-user-data-and-its-omissions|run#11|AssertionError|assert got == want, f"declared values did not round-trip: got {got!r}, want {want!r}"
+Issue-Keys-Refiled: the 38 guest-observable keys of cause 6 (every `ec2.arm64-*`, `ec2.capres-*`, `ec2.cpuopts-*`, `ec2.diops-*`, `ec2.dsnapinc-*`, `ec2.dvolgrow-*`, `ec2.ebsio-*`, `ec2.ec2-*`, `ec2.hibernate-*`, `ec2.idvdoc-*`, `ec2.imdshop-*`, `ec2.multiattach-*`, `ec2.nvme-*`, `ec2.secip-*`, `ec2.shutdown-*`, `ec2.srcdest-*` and `ec2.asghc-*` key of this report, and their trace ids above) are NOT fixed by this resolution and are listed, unchanged, in issues/things-that-do-not-work/20261107T075601Z-ec2-no-instance-ever-presents-a-guest.md, which owns them; they are struck from this report so nothing reads them out of things-that-now-work as resolved.
 Issue-Commit: 620c90c23a321396910fd66a692ef2fcecf33f7f
 
 # EC2: CreateVpc from an IPAM pool is a stub (12 checks), 5 IPAM refusal/representation causes, 3 message-fidelity causes, and no instance ever presents a guest (37 checks hang)
 
 > _Note: this issue was identified against the code base at commit `620c90c23a321396910fd66a692ef2fcecf33f7f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _Resolution note: causes 1 to 5 are done — the IPAM refusals and representations (CreateVpc's
+> pool locale, allocation netmask rules and required resource tags; ProvisionIpamPoolCidr's
+> accepted-then-failed provision and its combination refusal; CreateIpamPool's cross-scope
+> source; DeleteIpamScope and the IpamPool Locale/PoolDepth projection), the
+> StateTransitionReason format, the termination-protection message and the cross-VPC
+> security-group reference sentence. **Cause 6 of 6 is NOT fixed by this change**: no instance
+> presents a guest, which needs a runtime this emulator does not have. It is refiled unchanged,
+> with every Issue-Key it owns (the 37 guest-timeout keys and the asghc launch-template key),
+> as `issues/things-that-do-not-work/20261107T075601Z-ec2-no-instance-ever-presents-a-guest.md`
+> — so none of those checks is reported here as working, and the keys listed above for them are
+> owned by that report now._
 
 ## Operation
 CreateVpc

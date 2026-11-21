@@ -2541,6 +2541,17 @@ pub fn prepared_ip_permission<E>(
     })
 }
 
+/// The sentence EC2 answers when two resources ONE request names sit in different networks,
+/// as it words it: fixed text with no variable part at all — it names neither resource nor
+/// either network.
+///
+/// A rule's referenced group is refused with it under
+/// [`crate::state::INVALID_GROUP_NOT_FOUND`]: from the rule's own VPC there is no such group,
+/// and what the caller has to correct is the cross-network reference rather than a missing
+/// resource, which is why the wording is about the two networks and not about the group.
+pub const RESOURCES_IN_DIFFERENT_NETWORKS: &str =
+    "You have specified two resources that belong to different networks.";
+
 /// One referenced-group grant in the form the rule that names it is stored in: the group by
 /// the ID a rule references it by, and the account that owns it.
 ///
@@ -2647,11 +2658,13 @@ pub fn prepared_user_id_group_pair<E>(
                 if !visible {
                     // The group exists, in another network the request did not identify, so
                     // from the rule's VPC there is no such group — in EC2's own wording for
-                    // this class, which names the network the lookup was scoped to.
+                    // this class, the generic sentence it answers whenever two resources a
+                    // request names sit in different networks, which names neither the group
+                    // nor either network.
                     return Err(Scaffolded::service_error(
                         INVALID_GROUP_NOT_FOUND,
                         400,
-                        format!("The security group '{group_id}' does not exist in VPC '{vpc_id}'"),
+                        RESOURCES_IN_DIFFERENT_NETWORKS.to_string(),
                     ));
                 }
             }

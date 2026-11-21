@@ -1950,7 +1950,7 @@ use crate::ops::types::{
     InstanceIpv6Prefix, InstanceNetworkInterface, InstanceNetworkInterfaceAttachment,
     InstancePrivateIpAddress,
     Ipam, IpamInternetRegistryAssociation, IpamOperatingRegion, IpamPolicy, IpamPool,
-    IpamPoolAllocation, IpamPoolCidr,
+    IpamPoolAllocation, IpamPoolCidr, IpamPoolCidrFailureReason,
     IpamPrefixListResolver, IpamPrefixListResolverRule, IpamPrefixListResolverTarget,
     IpamResourceDiscovery, IpamResourceDiscoveryAssociation, IpamResourceTag,
     IpamRoutingPolicyRegistration, IpamRoutingPolicyRegistrationDelta, IpamScope,
