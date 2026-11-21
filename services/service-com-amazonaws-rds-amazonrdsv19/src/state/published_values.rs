@@ -229,6 +229,23 @@ pub fn replica_mode_is_supported_for(engine: &str) -> bool {
 // constraint the model itself declares (`com.amazonaws.rds#ReplicaMode`), before a handler
 // runs, so no handler here restates that value list.
 
+/// The message `SwitchoverReadReplica` answers a `DBInstanceNotFoundFault` with for a
+/// `DBInstanceIdentifier` naming no DB instance of the region the request was signed for.
+///
+/// Amazon RDS words the instance-not-found refusal PER OPERATION rather than from one
+/// template: this front door states that the instance was not found and then names it after a
+/// colon, which is not how the other role change on the same resource (`PromoteReadReplica`)
+/// words the same fault. The fixed text is therefore pinned here, one sentence per front
+/// door, so no operation answers another's wording.
+///
+/// `named` is the value the REQUEST carried, not the key the store folded it to (the
+/// identifier "is stored as a lowercase string", so the lookup folds and the refusal does
+/// not), for the same reason [`crate::state::db_cluster_not_found_message`] names the
+/// request's spelling: a caller matching the message against what it sent finds it there.
+pub fn switchover_read_replica_not_found_message(named: &str) -> String {
+    format!("The DB instance wasn't found: {named}.")
+}
+
 /// The message `SwitchoverReadReplica` answers an `InvalidParameterValue` with for a DB
 /// instance whose database engine the operation does not apply to.
 ///

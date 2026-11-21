@@ -349,7 +349,7 @@ async fn a_switchover_refuses_what_it_cannot_be_performed_on() {
     );
     assert_eq!(
         text(&refused, "Message"),
-        "DBInstance switchover-absent not found.",
+        "The DB instance wasn't found: switchover-absent.",
         "case {case:?}: got {refused}"
     );
 

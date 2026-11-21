@@ -178,7 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is in scope.
         let key = (region.clone(), identifier.clone());
         let Some(instance) = store.db_instances.get(&key) else {
-            return Err(not_found(&identifier));
+            // The refusal names the instance in the spelling the REQUEST carried: only the
+            // lookup folds, so a caller matching the message against what it sent finds it.
+            return Err(not_found(&input.db_instance_identifier));
         };
         // Which ENGINE the instance runs decides whether this operation applies to it at all:
         // a switchover is the Oracle Data Guard role transition, so an instance running any
@@ -301,12 +303,15 @@ fn begin_switchover(record: &mut crate::state::DbInstanceRecord) {
 
 /// The modelled 404 for a `DBInstanceIdentifier` naming no DB instance of this region.
 ///
-/// The wording is the one this service's instance-lifecycle front doors answer — the stop, the
-/// start and the promotion of a DB instance — since a switchover is the same kind of call on
-/// the same resource: it acts on the instance itself.
+/// The wording is THIS operation's own
+/// ([`crate::state::switchover_read_replica_not_found_message`]): Amazon RDS words the
+/// instance-not-found refusal per front door, so a switchover does not answer the sentence the
+/// promotion of a DB instance answers even though both act on the same resource.
 fn not_found(identifier: &str) -> SwitchoverReadReplicaError {
     SwitchoverReadReplicaErrorModeled::DBInstanceNotFoundFault(DBInstanceNotFoundFault {
-        message: Some(format!("DBInstance {identifier} not found.")),
+        message: Some(crate::state::switchover_read_replica_not_found_message(
+            identifier,
+        )),
     })
     .into()
 }
