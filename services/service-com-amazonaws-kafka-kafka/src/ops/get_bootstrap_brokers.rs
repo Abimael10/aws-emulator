@@ -2,15 +2,17 @@
 
 //! @op GetBootstrapBrokers
 //! Renders the cluster's bootstrap-broker strings from its persisted access settings:
-//! one string per ACCESS METHOD the cluster actually enables, each carrying one
-//! `hostname:port` pair per broker node the cluster holds — the address THIS emulator
-//! accepts an Apache Kafka connection on for that node on that method, so a client that
-//! splits the string to size its connection pool, to pin a replication factor to the
-//! broker count or to fail over to another broker sees the cluster `DescribeCluster`
-//! reports. Every pair of ONE string carries the SAME port, the one that method is
-//! served on, and each node is told apart by its own host — Amazon MSK's listener model,
-//! where a port identifies the access method and the host the broker — so two methods
-//! never share a port and a client that writes a rule per port writes it per method.
+//! one string per ACCESS METHOD the cluster actually enables, each carrying the
+//! `hostname:port` THIS emulator accepts an Apache Kafka connection on for that method —
+//! "a list of brokers that a client application can use to bootstrap", which "doesn't
+//! necessarily include all of the brokers in the cluster", so what every pair of it has to
+//! be is an address a client can really reach. Every pair of ONE string carries the SAME
+//! port, the one that method is served on — Amazon MSK's listener model, where a port
+//! identifies the access method — so two methods never share a port and a client that
+//! writes a rule per port writes it per method. The cluster's whole broker list is what
+//! the `Metadata` the broker behind the published address answers reports, so a client
+//! that sizes its connection pool or pins a replication factor to the broker count reads
+//! the cluster `DescribeCluster` reports.
 //! A method the
 //! cluster does not enable has no string at all — a member is populated exactly when
 //! the cluster's encryption-in-transit setting AND its client authentication admit a
@@ -402,10 +404,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             };
-            // "A string containing one or more hostname:port pairs": one pair per broker
-            // node of the cluster, comma-separated, which is how a client splits the
-            // string into the brokers it may bootstrap against — every one of them on this
-            // method's single port.
+            // "A string containing one or more hostname:port pairs", comma-separated:
+            // every address this emulator serves that method's brokers at, which is what
+            // a client splits the string into to bootstrap against them — each of them on
+            // this method's single port.
             announced.push((path, Some(authorities.join(","))));
         }
         let endpoint = |path: Method| -> Option<String> {

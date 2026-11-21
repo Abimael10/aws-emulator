@@ -485,11 +485,10 @@ fn hmac_sha512(key: &[u8], data: &[u8]) -> Vec<u8> {
 /// Open a TCP connection to a published authority, asserting first that the address is
 /// one of this emulator's own.
 ///
-/// A published pair names the BROKER NODE in its host and the access method in its port
-/// (Amazon MSK publishes one port per method, shared by every node), and the host sits in
-/// the zone that names the interface the core bound the socket on — so the host is
-/// resolved to that interface here, exactly as a resolver answers a name under the
-/// loopback zone, and the port is what picks the socket out.
+/// A published pair names the access method in its port (Amazon MSK publishes one port per
+/// method, shared by every broker node) and, in its host, the interface the core bound
+/// that socket on — so the host is checked to be this emulator's own interface here and
+/// the port is what picks the socket out.
 async fn dial(case: &str, authority: &str) -> TcpStream {
     let (host, port) = authority
         .rsplit_once(':')
@@ -836,9 +835,10 @@ async fn every_published_bootstrap_address_answers_the_kafka_protocol() {
 }
 
 /// RULE: the brokers a client learns from `Metadata` are the broker nodes the cluster
-/// holds — one entry per node, each at its OWN address, the one the bootstrap string
-/// publishes for that node, with the first of them the controller — so a client sent to
-/// any node of the cluster reaches the endpoint this emulator serves that node on.
+/// holds — one entry per node, every one of them at the address this emulator serves that
+/// access method at (the one the bootstrap string publishes), with the first of them the
+/// controller — so a client sent to any node of the cluster reaches the endpoint this
+/// emulator serves it on.
 ///
 /// The rows differ along the number of brokers the cluster holds, which is what the rule
 /// counts over.
@@ -860,9 +860,8 @@ async fn metadata_reports_every_broker_node_the_cluster_holds() {
                 ..ClusterRequest::named(&format!("plane-brokers-{brokers}"))
             })
             .await;
-        // The addresses the cluster publishes once it has settled — one per broker node —
-        // and the nodes the control plane then reports for it, the ones a client must be
-        // told about.
+        // The address the cluster publishes once it has settled, and the nodes the control
+        // plane then reports for it — the ones a client must be told about.
         let authority = published_address(&emulator, &cluster, "bootstrapBrokerString", case).await;
         let pairs = published_pairs(&emulator, &cluster, case)
             .await
@@ -907,18 +906,19 @@ async fn metadata_reports_every_broker_node_the_cluster_holds() {
             "case {case:?}: Metadata must report the cluster's own broker nodes, got \
              {reported:?} for {node_ids:?}"
         );
-        // Each node at the pair the bootstrap string publishes for it, in the same order:
-        // the string lists one address per node, so the two readings of the cluster's
-        // brokers name the same addresses.
+        // Every node at an address the bootstrap string publishes: the nodes of one access
+        // method are reached at the socket that method is served on, so the two readings of
+        // the cluster's brokers name the same addresses.
         let addressed: Vec<String> = metadata
             .brokers
             .iter()
             .map(|broker| format!("{}:{}", broker.host.as_str(), broker.port))
             .collect();
-        assert_eq!(
-            addressed, pairs,
-            "case {case:?}: each broker node must be reachable at its own published \
-             address {pairs:?}, got {addressed:?}"
+        assert!(
+            addressed.iter().all(|address| pairs.contains(address))
+                && pairs.iter().all(|pair| addressed.contains(pair)),
+            "case {case:?}: every broker node must be reachable at a published address \
+             {pairs:?}, got {addressed:?}"
         );
         assert_eq!(
             i64::from(metadata.controller_id.0),

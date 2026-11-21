@@ -327,21 +327,19 @@ async fn the_node_listing_reports_every_stored_broker() {
             );
         }
 
-        // The bootstrap reader names each broker node at the HOST this emulator
-        // publishes it under, while a node's `Endpoints` names the name Amazon MSK
-        // gives it, so the two readers report the same stored brokers in the two
-        // zones each is published in: what is asserted here is that the bootstrap
-        // hosts are those nodes' own, on this emulator's own interface.
+        // The bootstrap reader names the ADDRESS this emulator answers Apache Kafka
+        // connections on for an access method, while a node's `Endpoints` names the name
+        // Amazon MSK gives that node: the two readers answer two different questions, so
+        // what is asserted here is that the published address is one of this emulator's
+        // own, whatever the nodes are named.
         let hosts = bootstrap_hosts(&case, &emulator.bootstrap_brokers(&arn).await);
-        assert_eq!(
-            hosts.len(),
-            listed.len(),
-            "case {case}: expected one published host per broker node, got {hosts:?}"
+        assert!(
+            !hosts.is_empty(),
+            "case {case}: a cluster with brokers must publish a bootstrap host"
         );
         for host in &hosts {
             assert!(
-                host.starts_with("b-")
-                    && ::service_common::data_plane_addressing::names_the_loopback_interface(host),
+                ::service_common::data_plane_addressing::names_the_loopback_interface(host),
                 "case {case}: expected a broker host on this emulator's own interface, got \
                  {host:?}"
             );

@@ -1107,9 +1107,9 @@ pub struct BrokerNode {
     pub id: i32,
     /// `b-<id>.<cluster>.<suffix>.kafka.<region>.amazonaws.com`, the name Amazon MSK
     /// gives this node ([`broker_plane::addressing::broker_endpoint_host`]).
-    /// `GetBootstrapBrokers` publishes it in the zone this emulator may announce a name
-    /// of its own in, with the port of the access method appended
-    /// ([`broker_plane::addressing::published_broker_host`]).
+    /// `GetBootstrapBrokers` publishes the address the core bound the access method's
+    /// socket at, with that method's port
+    /// ([`broker_plane::addressing::served_broker_host`]).
     pub endpoint_host: String,
     /// The one subnet of `BrokerNodeGroupInfo$ClientSubnets` this broker's
     /// network interface sits in. Stored rather than recomputed per read, so the

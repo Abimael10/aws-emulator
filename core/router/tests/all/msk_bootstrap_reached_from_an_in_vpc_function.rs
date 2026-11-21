@@ -455,7 +455,7 @@ async fn ec2_network(router: &MultiServiceRouter) -> Network {
 
 /// Create the cluster in that network, wait until MSK reports it `ACTIVE`, and answer every
 /// bootstrap string it publishes, member by member — each as the `host:port` pairs it carries,
-/// one per broker node of the cluster.
+/// which are the addresses this emulator serves that access path's brokers at.
 async fn plant_the_cluster(
     router: &MultiServiceRouter,
     network: &Network,
@@ -789,8 +789,8 @@ async fn an_in_vpc_function_speaks_kafka_with_the_address_msk_published() {
         "expected a name of another zone to be a server failure, got {resolved}"
     );
 
-    // THEN the data plane itself, at every address the control plane published — one per
-    // broker node of the cluster, each a plane of its own.
+    // THEN the data plane itself, at every address the control plane published — the
+    // addresses this emulator serves that access path's brokers at.
     for (member, pairs) in &published {
         for authority in pairs {
             let case = format!("the address published as {member} / {authority}");
@@ -824,9 +824,10 @@ async fn an_in_vpc_function_speaks_kafka_with_the_address_msk_published() {
                 "case {case:?}: expected the broker to report that it serves Metadata, got \
                  {report}"
             );
-            // The brokers it reports are the addresses the control plane published for this
-            // path, so a client that re-resolves the cluster from its metadata keeps talking to
-            // this plane — and sizes its pool at the brokers the cluster really has.
+            // The brokers it reports are reachable at the addresses the control plane
+            // published for this path, so a client that re-resolves the cluster from its
+            // metadata keeps talking to this plane — and is told the brokers the cluster
+            // really has.
             let reported: Vec<String> = broker
                 .pointer("/metadata/brokers")
                 .and_then(Value::as_array)
@@ -841,9 +842,11 @@ async fn an_in_vpc_function_speaks_kafka_with_the_address_msk_published() {
                     )
                 })
                 .collect();
-            assert_eq!(
-                &reported, pairs,
-                "case {case:?}: expected the brokers reported to be the published addresses \
+            assert!(
+                !reported.is_empty()
+                    && reported.iter().all(|address| pairs.contains(address))
+                    && pairs.iter().all(|pair| reported.contains(pair)),
+                "case {case:?}: expected every broker reported to be at a published address \
                  {pairs:?}, got {report}"
             );
             if encrypted {

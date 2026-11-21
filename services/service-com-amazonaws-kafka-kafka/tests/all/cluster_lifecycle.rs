@@ -490,12 +490,9 @@ async fn bootstrap_brokers_follow_the_cluster_access_paths() {
                     .rsplit_once(':')
                     .unwrap_or_else(|| panic!("case {row:?}: {member} entry {endpoint:?} is not a host:port pair"));
                 assert!(
-                    host.starts_with("b-")
-                        && ::service_common::data_plane_addressing::names_the_loopback_interface(
-                            host
-                        ),
-                    "case {row:?}: {member} must name a broker node of the cluster on this \
-                     emulator's own interface, got {endpoint:?}"
+                    ::service_common::data_plane_addressing::names_the_loopback_interface(host),
+                    "case {row:?}: {member} must name an address on this emulator's own \
+                     interface, got {endpoint:?}"
                 );
                 assert!(
                     port.parse::<u16>().is_ok_and(|port| port > 0),

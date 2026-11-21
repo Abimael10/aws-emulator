@@ -312,10 +312,10 @@ impl Emulator {
     /// The address the cluster `arn` publishes under the bootstrap member `member`, once
     /// it publishes one: the FIRST `host:port` pair of that member's string.
     ///
-    /// A bootstrap string carries one pair per broker node of the cluster, and a client
-    /// bootstraps against any one of them, so this answers the first — the one address
-    /// every data-plane suite of this crate dials its socket from. The CARDINALITY of the
-    /// string is the subject of `bootstrap_broker_cardinality`.
+    /// A bootstrap string carries the `host:port` pairs this emulator serves that access
+    /// method's brokers at, and a client bootstraps against any one of them, so this
+    /// answers the first. The CARDINALITY of the string is the subject of
+    /// `bootstrap_broker_cardinality`.
     ///
     /// `GetBootstrapBrokers` refuses while the cluster is still `CREATING`, so this LOOKS
     /// AGAIN until the address is published rather than waiting out a span — the one

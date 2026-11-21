@@ -877,12 +877,12 @@ impl Broker {
             .collect()
     }
 
-    /// The authority THIS broker node is published at for this access method, which is
+    /// The authority this broker node is published at for this access method, which is
     /// the address a client on this connection reached it at.
     fn authority(&self) -> String {
         self.state
             .lock()
-            .broker_authority(&self.region, &self.cluster_arn, self.path, self.node_id)
+            .broker_authority(&self.region, &self.cluster_arn, self.path)
             .unwrap_or_default()
     }
 
@@ -1457,9 +1457,9 @@ impl Broker {
     /// `Metadata`: the brokers a client reaches this cluster at, and the topics it
     /// asked about.
     ///
-    /// Every broker node the cluster holds is reported, each at the address it is
-    /// PUBLISHED at for this access method — its own host on the one port the method is
-    /// served on, so a client that sizes its connection pool from the broker list, or
+    /// Every broker node the cluster holds is reported, each at the address this access
+    /// method is served at — the one socket its nodes share, on the port the method is
+    /// served on — so a client that sizes its connection pool from the broker list, or
     /// re-resolves the cluster from its metadata, reaches this emulator's own socket for
     /// each of them rather than a name nothing serves. Each partition is placed on as
     /// many of those nodes as the topic's replication factor, starting at the node its
@@ -1471,21 +1471,14 @@ impl Broker {
         let (held, brokers) = {
             let mut store = self.state.lock();
             let ids = store.broker_node_ids(&self.region, &self.cluster_arn);
-            // A node this emulator publishes no address for is reported at the one this
-            // connection arrived on: that address does serve the cluster, where a node's
-            // own unpublished one would serve nothing.
+            // The address this access method is served at, which is where every node of
+            // the cluster is reached: a client is told the node ids the cluster holds, and
+            // the one address that serves them.
             let own = store
-                .broker_authority(&self.region, &self.cluster_arn, self.path, self.node_id)
+                .broker_authority(&self.region, &self.cluster_arn, self.path)
                 .unwrap_or_default();
-            let brokers: Vec<(i32, String)> = ids
-                .iter()
-                .map(|node_id| {
-                    let authority = store
-                        .broker_authority(&self.region, &self.cluster_arn, self.path, *node_id)
-                        .unwrap_or_else(|| own.clone());
-                    (*node_id, authority)
-                })
-                .collect();
+            let brokers: Vec<(i32, String)> =
+                ids.iter().map(|node_id| (*node_id, own.clone())).collect();
             (store.data_plane_topics(&self.cluster_arn, now), brokers)
         };
         let broker_ids: Vec<i32> = brokers.iter().map(|(node_id, _)| *node_id).collect();

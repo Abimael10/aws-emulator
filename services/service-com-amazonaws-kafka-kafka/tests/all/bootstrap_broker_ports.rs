@@ -6,12 +6,12 @@
 //!
 //! RULE under test: a cluster's brokers listen on ONE port per ACCESS METHOD, shared by
 //! every broker node of the cluster — so within one bootstrap string every
-//! `hostname:port` pair carries the SAME port and the nodes are told apart by their
-//! HOSTS, two different access methods never share a port, and the same hosts appear
-//! under every method the cluster publishes. That is what makes the port of a published
-//! address identify the access method a client is reaching: a rule written per port is a
-//! rule per method, and a client that derives a sibling endpoint by swapping the port of
-//! one string for another method's builds an address this emulator really serves.
+//! `hostname:port` pair carries the SAME port, two different access methods never share a
+//! port, and the same hosts appear under every method the cluster publishes. That is what
+//! makes the port of a published address identify the access method a client is reaching:
+//! a rule written per port is a rule per method, and a client that derives a sibling
+//! endpoint by swapping the port of one string for another method's builds an address this
+//! emulator really serves.
 //!
 //! An `Ipv6` member is the same access method reached over another network layer — one
 //! broker endpoint whose record set gains AAAA entries — so it carries that method's own
@@ -197,19 +197,27 @@ async fn one_port_per_access_method_is_shared_by_every_broker_node() {
             !members.is_empty(),
             "case {case:?}: a cluster with brokers must publish a bootstrap string"
         );
+        // The broker nodes this row provisioned, which the ONE port each method publishes
+        // below is shared by: the port is the access method's, not a node's, so it does not
+        // multiply with the nodes behind it.
+        let described = emulator.describe(arn).await;
+        assert_eq!(
+            described.at("/clusterInfo/numberOfBrokerNodes").as_i64(),
+            i64::try_from(row.brokers).ok(),
+            "case {case:?}: expected the cluster to hold {} broker nodes, got {}",
+            row.brokers,
+            described.body
+        );
 
-        // Within ONE string: one pair per broker node, every pair on the same port, each
-        // under a host of its own.
+        // Within ONE string: every pair on the same port, each address named once.
         let mut port_of_method: BTreeMap<&str, u16> = BTreeMap::new();
         let mut string_of_method: BTreeMap<&str, String> = BTreeMap::new();
         let mut hosts_of_method: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
         for (member, pairs) in &members {
             let probe = format!("{case} / {member}");
-            assert_eq!(
-                pairs.len(),
-                row.brokers,
-                "case {probe:?}: expected one pair per broker node ({} nodes), got {pairs:?}",
-                row.brokers
+            assert!(
+                !pairs.is_empty(),
+                "case {probe:?}: a published member must carry a hostname:port pair"
             );
             let mut ports: BTreeSet<u16> = BTreeSet::new();
             let mut hosts: BTreeSet<String> = BTreeSet::new();
@@ -218,7 +226,7 @@ async fn one_port_per_access_method_is_shared_by_every_broker_node() {
                 ports.insert(port);
                 assert!(
                     hosts.insert(host.clone()),
-                    "case {probe:?}: every broker node must have a host of its own, got \
+                    "case {probe:?}: a string must name each address it serves once, got \
                      {pairs:?}"
                 );
             }
@@ -267,9 +275,8 @@ async fn one_port_per_access_method_is_shared_by_every_broker_node() {
             "case {case:?}: expected one distinct string per access method, got \
              {string_of_method:?}"
         );
-        // The HOSTS are the cluster's brokers, the same ones under every method — which is
-        // what lets a client derive one method's endpoint from another's by swapping the
-        // port.
+        // The HOSTS are the same under every method — which is what lets a client derive
+        // one method's endpoint from another's by swapping the port.
         let distinct_hosts: BTreeSet<&BTreeSet<String>> = hosts_of_method.values().collect();
         assert_eq!(
             distinct_hosts.len(),

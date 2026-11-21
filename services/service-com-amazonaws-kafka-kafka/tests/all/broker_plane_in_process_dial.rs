@@ -42,7 +42,7 @@ const CLIENT_ID: &str = "in-process-client";
 const SERVED_BY: &str = "kafka";
 
 /// The bootstrap strings a cluster publishes, member by member: every `host:port` pair of
-/// each, one per broker node of the cluster.
+/// each, which are the addresses this emulator serves that access method's brokers at.
 async fn published(emulator: &Emulator, cluster: &str, case: &str) -> BTreeMap<String, Vec<String>> {
     let reply = emulator.bootstrap_brokers(cluster).await;
     assert_eq!(
@@ -243,9 +243,9 @@ async fn a_published_bootstrap_address_is_reachable_by_an_in_process_client() {
                     !versions.api_keys.is_empty(),
                     "case {probe:?}: expected the broker to report the APIs it serves"
                 );
-                // And the brokers it reports are the addresses the control plane published for
-                // this path, so a client that re-resolves the cluster from its metadata keeps
-                // talking to this same plane.
+                // And the brokers it reports are reachable at the addresses the control
+                // plane published for this path, so a client that re-resolves the cluster
+                // from its metadata keeps talking to this same plane.
                 let metadata: MetadataResponse = session
                     .call(
                         &probe,
@@ -266,8 +266,9 @@ async fn a_published_bootstrap_address_is_reachable_by_an_in_process_client() {
                         format!("{host}:{port}")
                     })
                     .collect();
-                assert_eq!(
-                    reported, expected,
+                assert!(
+                    reported.iter().all(|address| expected.contains(address))
+                        && expected.iter().all(|address| reported.contains(address)),
                     "case {probe:?}: expected the brokers reported to be the published addresses \
                      {expected:?}, got {reported:?}"
                 );

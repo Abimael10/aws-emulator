@@ -14,10 +14,10 @@
 //! answers from.
 //!
 //! ONE socket per ACCESS METHOD a cluster enables, shared by every BROKER NODE of the
-//! cluster: Amazon MSK publishes one port per access method, and the nodes behind it are
-//! told apart by their own hosts ([`addressing`]) — so the bootstrap string of an
-//! N-broker cluster carries N `host:port` pairs, one per node, every one of them on that
-//! method's single port, and the `Metadata` answer reports each node at its own host. A
+//! cluster: Amazon MSK publishes one port per access method, so a bootstrap string carries
+//! that method's own port, and the address it names is the one the core bound the socket at
+//! ([`addressing`]) — the `Metadata` answer reports every node of the cluster there, since
+//! that one socket is where each of them is reached. A
 //! Kafka request frame begins with its length, so its first byte is never the `0x16` a TLS
 //! record opens with: the connection's first byte says whether the client dialled the
 //! encrypted half or the plaintext one ([`::service_common::in_band_tls`]), which is how
@@ -395,14 +395,13 @@ impl AccessPath {
     }
 }
 
-/// The ONE socket a cluster's brokers answer one ACCESS METHOD's connections on, and
-/// what every broker node of that cluster is published at on it.
+/// The ONE socket a cluster's brokers answer one ACCESS METHOD's connections on, and the
+/// address that socket is published at.
 ///
 /// One socket per method, shared by every node, is Amazon MSK's own listener model: a
-/// method has one port, and the nodes behind it are told apart by their HOSTS
-/// ([`addressing`]). So the record holds the port the core assigned and the zone the
-/// nodes' names are published in, and a node's own pair is composed from the node's
-/// host and that port.
+/// method has one port. So the record holds the port the core assigned and the HOST the
+/// core bound it on — together the address a client dials to reach this cluster's brokers
+/// over this method ([`addressing`]).
 ///
 /// The store OWNS the listener: dropping it closes the port and severs every
 /// connection on it, so it must outlive every bootstrap string handed out — which is
@@ -411,21 +410,18 @@ pub struct ClusterEndpoint {
     /// The port every broker node of the cluster answers this method on — the one the
     /// core assigned this socket.
     port: u16,
-    /// The DNS zone the broker hosts published on this socket sit in, read off the
-    /// address the core bound it at ([`addressing::published_zone`]). Kept with the
-    /// socket, so a node added to the cluster later is published in the same zone as the
-    /// nodes already there.
-    zone: String,
+    /// The host this socket is dialled at, read off the address the CORE bound it on
+    /// ([`addressing::served_broker_host`]). Kept with the socket, so every later read of
+    /// the cluster's endpoints answers the address a client was already given.
+    host: String,
     /// Held only to keep the port open; the core owns the socket and its lifetime.
     _listener: ::emulator_server::ResourceListener,
-    /// Per BROKER NODE, the record that makes that node reachable at the address it is
-    /// published at by a client running in THIS process
-    /// (`service_common::dialable_data_planes`) — the code of a Lambda function attached
-    /// to the cluster's VPC, which is the one vantage point a VPC-only bootstrap address
-    /// is reachable from. One per node, so a node the cluster gains later is recorded
-    /// without disturbing the nodes already published; all of them are dropped with the
-    /// listener, so nothing resolves to a port that is closed.
-    published: BTreeMap<i32, ::service_common::dialable_data_planes::OpenedPlanes>,
+    /// The record that makes this endpoint reachable at the address it is published at by
+    /// a client running in THIS process (`service_common::dialable_data_planes`) — the
+    /// code of a Lambda function attached to the cluster's VPC, which is the one vantage
+    /// point a VPC-only bootstrap address is reachable from. Dropped with the listener, so
+    /// nothing resolves to a port that is closed.
+    _dialable: Option<::service_common::dialable_data_planes::OpenedPlanes>,
 }
 
 /// Written by hand rather than derived: a [`::emulator_server::ResourceListener`] is a
@@ -435,9 +431,8 @@ impl std::fmt::Debug for ClusterEndpoint {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ClusterEndpoint")
+            .field("host", &self.host)
             .field("port", &self.port)
-            .field("zone", &self.zone)
-            .field("published", &self.published.len())
             .finish()
     }
 }
@@ -449,31 +444,24 @@ impl ClusterEndpoint {
         self.port
     }
 
-    /// The zone the broker hosts published on this socket sit in.
+    /// The `host:port` every broker node of the cluster answers this access method on:
+    /// the address the CORE bound this socket at, which is what a client dials.
     #[must_use]
-    pub fn zone(&self) -> &str {
-        &self.zone
-    }
-
-    /// The `host:port` the broker node whose published host is `host` answers on.
-    #[must_use]
-    pub fn authority_of(&self, host: &str) -> String {
-        ::service_common::data_plane_addressing::host_port_authority(host, self.port)
+    pub fn authority(&self) -> String {
+        ::service_common::data_plane_addressing::host_port_authority(&self.host, self.port)
     }
 }
 
 /// The `host:port` pairs the cluster `cluster_arn` names answers `path` connections on:
-/// ONE per broker node the cluster holds, in broker-id order, every one of them on the
-/// SAME port — the one this access method is served on — and each under that node's own
-/// host.
+/// the DISTINCT addresses this emulator serves that method's brokers at, each named once.
 ///
-/// A bootstrap string "contains one or more hostname:port pairs"
-/// (`GetBootstrapBrokers`), one per broker node — so a client that splits it to size its
-/// connection pool, to pin a replication factor to the broker count or to fail over to
-/// another broker sees the cluster the control plane reports, and a client that reads the
-/// port as the access method reads the same port from every pair. A cluster that publishes
-/// no broker nodes of its own stands behind one ([`BROKER_NODE_ID`]), so its string
-/// carries exactly one pair.
+/// A bootstrap string "contains one or more hostname:port pairs" and "doesn't necessarily
+/// include all of the brokers in the cluster" (`GetBootstrapBrokers`) — what a client
+/// takes from it is WHERE TO BOOTSTRAP, so every pair of it has to be an address this
+/// emulator really answers the Apache Kafka wire protocol on. The nodes of one access
+/// method share its socket here, so that is one pair, carrying the port the method is
+/// served on; the whole broker list a client sizes its pool from is what the `Metadata`
+/// the broker behind it answers reports.
 ///
 /// `None` when the socket could not be opened — the caller then answers with a modelled
 /// error rather than announcing a broker list with an address nothing serves in it.
@@ -505,11 +493,13 @@ pub async fn ensure_cluster_endpoints<Eng: Send + Sync + 'static>(
         }
         open_access_method(engine, ctx, region, cluster_arn, path, &state).await?;
     }
-    // The nodes are read ONCE, with the socket already open, and the addresses answered are
-    // the ones just published — so a node a growing cluster gained is never announced ahead
-    // of the record that makes it reachable.
-    let announced = publish_broker_nodes(engine, ctx, region, cluster_arn, path, &state);
-    (!announced.is_empty()).then_some(announced)
+    // Read with the socket already open, so the address answered is one already being
+    // served when the caller publishes it.
+    let announced = state
+        .lock()
+        .broker_authority(region, cluster_arn, path)
+        .map(|authority| vec![authority]);
+    announced
 }
 
 /// Open the ONE socket the cluster `cluster_arn` answers `path` connections on, and
@@ -539,9 +529,7 @@ async fn open_access_method<Eng: Send + Sync + 'static>(
     // The node a client that dialled the METHOD's port lands on: the first broker node of
     // the cluster, which is the node a bootstrap connection reaches. Every node of the
     // cluster reads and writes the same log, so which one a connection is answered as
-    // decides only the identity it is answered with — and a client that dialled a
-    // particular node's published host in process is answered as THAT node
-    // ([`publish_broker_nodes`]).
+    // decides only the identity it is answered with.
     let bootstrap_node = state
         .lock()
         .broker_node_ids(region, cluster_arn)
@@ -556,9 +544,18 @@ async fn open_access_method<Eng: Send + Sync + 'static>(
         .ok()?;
     let authority = ::service_common::data_plane_addressing::listener_authority(&listener);
     let port = listener.port();
-    // The zone the method's broker hosts are published in is the one the address the CORE
-    // bound names, which is the interface a client that resolves such a name then dials.
-    let zone = addressing::published_zone(&authority);
+    // The host this method's brokers are published at is the one the CORE bound the socket
+    // on, which is the address a client that takes the published pair then dials.
+    let host = addressing::served_broker_host(&authority);
+    // And the SAME broker answers that address for a client running in THIS process, which
+    // is the one vantage point a VPC-only bootstrap address is reachable from. The plane
+    // negotiates its encryption in band itself ([`wire::ClusterBroker`]), reading byte 0
+    // the way it does on the socket, so the record carries no upgrader of its own.
+    let dialable =
+        ::service_common::dialable_data_planes::DialablePlanes::of(engine).map(|planes| {
+            let plane = ::service_common::dialable_data_planes::served_in_process(served, None);
+            planes.opening([authority.clone()], SIGNING_NAME, &plane)
+        });
 
     let mut store = state.lock();
     // Another call may have opened one while this was binding; keep the first, so an
@@ -575,9 +572,9 @@ async fn open_access_method<Eng: Send + Sync + 'static>(
         key,
         ClusterEndpoint {
             port,
-            zone,
+            host,
             _listener: listener,
-            published: BTreeMap::new(),
+            _dialable: dialable,
         },
     );
     ::tracing::info!(
@@ -588,83 +585,6 @@ async fn open_access_method<Eng: Send + Sync + 'static>(
         "opened an access method's Apache Kafka endpoint"
     );
     Some(())
-}
-
-/// Record every broker node of the cluster as reachable at the address it is PUBLISHED
-/// at by a client running in this process, on the socket its access method is served on,
-/// and answer those addresses in node-id order.
-///
-/// One record per node, each served by the broker of THAT node: a connection opened to a
-/// node's own published host is answered as that node, exactly as a connection to an
-/// Amazon MSK broker's own host is. A node already published keeps the record it has, so
-/// an announced address never moves under a client; a node the cluster gained since the
-/// socket was opened gets one here.
-///
-/// The node ids are read ONCE here, which is why this answers the addresses too: the list a
-/// bootstrap string is rendered from is the list just published, so no node is announced
-/// before the record that makes it reachable in process exists. Empty for a cluster this
-/// Region holds no record of, or an access method whose socket is not open.
-fn publish_broker_nodes<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-    cluster_arn: &str,
-    path: AccessPath,
-    state: &::engine::ServiceState<ComAmazonawsKafkaKafkaState>,
-) -> Vec<String> {
-    let key = (cluster_arn.to_string(), path);
-    // The nodes and the addresses they are published at are read off the store under ONE
-    // guard, so the list answered and the list recorded below are the same list.
-    let announced: Vec<(i32, String)> = {
-        let store = state.lock();
-        if !store.cluster_endpoints.contains_key(&key) {
-            return Vec::new();
-        }
-        store
-            .broker_node_ids(region, cluster_arn)
-            .into_iter()
-            .filter_map(|node_id| {
-                store
-                    .broker_authority(region, cluster_arn, path, node_id)
-                    .map(|authority| (node_id, authority))
-            })
-            .collect()
-    };
-    let Some(planes) = ::service_common::dialable_data_planes::DialablePlanes::of(engine) else {
-        return announced
-            .into_iter()
-            .map(|(_node_id, authority)| authority)
-            .collect();
-    };
-    // A node already published keeps the record it has; only a node the cluster gained
-    // since the socket was opened needs one.
-    let unpublished: Vec<(i32, String)> = {
-        let store = state.lock();
-        match store.cluster_endpoints.get(&key) {
-            Some(endpoint) => announced
-                .iter()
-                .filter(|(node_id, _)| !endpoint.published.contains_key(node_id))
-                .cloned()
-                .collect(),
-            None => Vec::new(),
-        }
-    };
-    for (node_id, authority) in unpublished {
-        let served = broker_of_node(engine, ctx, region, cluster_arn, path, node_id, state);
-        // The plane negotiates its encryption in band itself ([`wire::ClusterBroker`]),
-        // reading byte 0 the way it does on the socket, so the record carries no upgrader
-        // of its own.
-        let plane = ::service_common::dialable_data_planes::served_in_process(served, None);
-        let opened = planes.opening([authority], SIGNING_NAME, &plane);
-        let mut store = state.lock();
-        if let Some(endpoint) = store.cluster_endpoints.get_mut(&key) {
-            endpoint.published.entry(node_id).or_insert(opened);
-        }
-    }
-    announced
-        .into_iter()
-        .map(|(_node_id, authority)| authority)
-        .collect()
 }
 
 /// The broker ONE node of a cluster's access method answers as, over this service's own
@@ -740,10 +660,9 @@ impl ComAmazonawsKafkaKafkaState {
         }
     }
 
-    /// The `host:port` the broker node `node_id` of the cluster `cluster_arn` is
-    /// published at for `path`: that node's own published host
-    /// ([`addressing::published_broker_host`]) on the port the access method is served
-    /// on.
+    /// The `host:port` the brokers of the cluster `cluster_arn` are published at for
+    /// `path`: the address the core bound that access method's socket at, which every
+    /// broker node of the cluster answers on.
     ///
     /// `None` for a cluster this Region holds no record of, or an access method whose
     /// socket has not been opened — there is no address to report for either.
@@ -753,32 +672,14 @@ impl ComAmazonawsKafkaKafkaState {
         region: &str,
         cluster_arn: &str,
         path: AccessPath,
-        node_id: i32,
     ) -> Option<String> {
         let endpoint = self
             .cluster_endpoints
             .get(&(cluster_arn.to_string(), path))?;
-        let cluster = self.cluster_in(region, cluster_arn)?;
-        // The node's own Amazon MSK name, as the record carries it; a cluster that
-        // publishes no broker nodes of its own stands behind one, whose name is composed
-        // the same way.
-        let endpoint_host = cluster
-            .brokers
-            .iter()
-            .find(|broker| broker.id == node_id)
-            .map(|broker| broker.endpoint_host.clone())
-            .unwrap_or_else(|| {
-                addressing::broker_endpoint_host(
-                    &cluster.region,
-                    &cluster.name,
-                    &cluster.dns_suffix,
-                    node_id,
-                )
-            });
-        Some(endpoint.authority_of(&addressing::published_broker_host(
-            &endpoint_host,
-            endpoint.zone(),
-        )))
+        // A cluster this Region no longer holds has no published address, even while the
+        // socket of a cluster of that name elsewhere is open.
+        self.cluster_in(region, cluster_arn)?;
+        Some(endpoint.authority())
     }
 }
 

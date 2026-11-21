@@ -500,13 +500,10 @@ async fn a_serverless_body_registers_a_serverless_cluster() {
             .unwrap_or_default()
             .to_string();
         assert!(
-            iam_string.starts_with("b-")
-                && iam_string
-                    .rsplit_once(':')
-                    .is_some_and(|(host, port)| {
-                        ::service_common::data_plane_addressing::names_the_loopback_interface(host)
-                            && port.parse::<u16>().is_ok_and(|port| port > 0)
-                    }),
+            iam_string.rsplit_once(':').is_some_and(|(host, port)| {
+                ::service_common::data_plane_addressing::names_the_loopback_interface(host)
+                    && port.parse::<u16>().is_ok_and(|port| port > 0)
+            }),
             "case {row:?}: expected a serverless bootstrap endpoint this emulator serves, got \
              {iam_string:?}"
         );

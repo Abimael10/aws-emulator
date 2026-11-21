@@ -1,26 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How MANY `hostname:port` pairs a bootstrap string carries, driven end to end over the
+//! WHICH `hostname:port` pairs a bootstrap string carries, driven end to end over the
 //! same `MultiServiceRouter` the emulator serves from, through the shared harness in
 //! `tests/all/kafka_harness.rs`.
 //!
 //! RULE under test: every bootstrap string a cluster publishes is "a string containing one
-//! or more hostname:port pairs" (`GetBootstrapBrokers` output members), carrying ONE pair
-//! per broker node the cluster was provisioned with — so the pairs number exactly the
-//! cluster's broker count, each pair addresses a DISTINCT broker, and the same holds for
-//! every variant the cluster entitles. A cluster that publishes no broker nodes of its own
-//! (MSK Serverless) stands behind one endpoint, so its single string carries one pair.
+//! or more hostname:port pairs" that "doesn't necessarily include all of the brokers in
+//! the cluster" (`GetBootstrapBrokers` output members and documentation), and every pair
+//! of it is an address THIS emulator answers the Apache Kafka wire protocol on — named
+//! once, on the port its access method is served on. The nodes of one access method share
+//! that socket here, so what a client learns the cluster's whole broker list from is the
+//! `Metadata` the broker behind a published pair answers: one entry per broker node the
+//! cluster was provisioned with.
 //!
-//! Every pair is an address this emulator really answers the Apache Kafka wire protocol
-//! on, and the brokers a client learns from `Metadata` over any one of them are the same
-//! list in the same order — so a client that splits the string to size its connection
-//! pool, to pin a replication factor to the broker count or to fail over to another broker
-//! reaches a broker for each pair it took.
+//! So a client that splits the string to bootstrap, and then sizes its connection pool,
+//! pins a replication factor to the broker count or fails over to another broker from the
+//! metadata it reads there, reaches a broker for every address it took.
 //!
 //! The rows differ along what the rule generalises over: the number of broker nodes (the
 //! published minimum, two, three, and a count above the subnets it is spread over), the
 //! number of client subnets they are placed in, and which access paths the cluster
-//! entitles — so the count is asserted on the plaintext, TLS and both SASL variants, not
+//! entitles — so the pairs are asserted on the plaintext, TLS and both SASL variants, not
 //! only on the one a single row happens to publish.
 
 use std::collections::BTreeSet;
@@ -68,8 +68,8 @@ fn split(pair: &str, case: &str) -> (String, u16) {
     (host.to_string(), port)
 }
 
-/// One row: the cluster to create, and the broker nodes it is provisioned with — which is
-/// the number of pairs every string it publishes must then carry.
+/// One row: the cluster to create, and the broker nodes it is provisioned with — the
+/// nodes its published addresses then serve, and the ones `Metadata` reports behind them.
 struct Row {
     case: &'static str,
     created: ClusterRequest,
@@ -143,13 +143,13 @@ fn rows() -> Vec<Row> {
 }
 
 #[tokio::test]
-async fn every_bootstrap_string_carries_one_distinct_pair_per_broker_node() {
+async fn every_bootstrap_string_names_each_served_address_once() {
     let emulator = Emulator::new();
     let rows = rows();
 
     // Every row's cluster first, then ONE activation span: a cluster still `CREATING` has
     // no brokers to bootstrap against, so the reader refuses it, and these rows are about
-    // how many endpoints a SETTLED cluster publishes.
+    // what a SETTLED cluster publishes.
     let mut arns = Vec::new();
     for row in &rows {
         arns.push(emulator.create_ok(&row.created).await);
@@ -163,40 +163,47 @@ async fn every_bootstrap_string_carries_one_distinct_pair_per_broker_node() {
             !members.is_empty(),
             "case {case:?}: a cluster with brokers must publish a bootstrap string"
         );
+        // The cluster holds the nodes the row provisioned, whatever its published
+        // addresses number: the two are different readings of the cluster.
+        let described = emulator.describe(arn).await;
+        assert_eq!(
+            described.at("/clusterInfo/numberOfBrokerNodes").as_i64(),
+            i64::try_from(row.brokers).ok(),
+            "case {case:?}: expected the cluster to hold {} broker nodes, got {}",
+            row.brokers,
+            described.body
+        );
         for (member, pairs) in &members {
             let probe = format!("{case} / {member}");
-            assert_eq!(
-                pairs.len(),
-                row.brokers,
-                "case {probe:?}: expected one hostname:port pair per broker node \
-                 ({} nodes), got {pairs:?}",
-                row.brokers
+            assert!(
+                !pairs.is_empty(),
+                "case {probe:?}: a published member must carry a hostname:port pair"
             );
-            // Each pair addresses a DISTINCT broker: a string that repeats one address
-            // names one broker however many times it names it.
+            // Each address is named ONCE: a string that repeats one address names one
+            // endpoint however many times it names it.
             let distinct: BTreeSet<&String> = pairs.iter().collect();
             assert_eq!(
                 distinct.len(),
                 pairs.len(),
-                "case {probe:?}: every pair must address a distinct broker, got {pairs:?}"
+                "case {probe:?}: every pair must name a distinct address, got {pairs:?}"
             );
+            let mut ports: BTreeSet<u16> = BTreeSet::new();
             for pair in pairs {
                 let (host, port) = split(pair, &probe);
                 assert!(
-                    !host.is_empty() && port > 0,
+                    ::service_common::data_plane_addressing::names_the_loopback_interface(&host)
+                        && port > 0,
                     "case {probe:?}: {pair:?} must name an address this emulator serves"
                 );
+                ports.insert(port);
             }
+            // And every pair of one string carries that access method's own port.
+            assert_eq!(
+                ports.len(),
+                1,
+                "case {probe:?}: one access method is served on one port, got {ports:?}"
+            );
         }
-        // And the strings of one cluster agree with each other: every variant lists the
-        // same number of brokers, whichever access path it is for.
-        let counts: BTreeSet<usize> = members.iter().map(|(_, pairs)| pairs.len()).collect();
-        assert_eq!(
-            counts,
-            BTreeSet::from([row.brokers]),
-            "case {case:?}: every variant must list the cluster's {} brokers, got {counts:?}",
-            row.brokers
-        );
     }
 }
 
@@ -228,8 +235,8 @@ async fn a_serverless_cluster_publishes_the_one_endpoint_it_stands_behind() {
 
 #[tokio::test]
 async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
-    // The rows differ along the broker count, which is what decides how many pairs are
-    // dialled and how long the list each of them reports is.
+    // The rows differ along the broker count, which is what decides how long the broker
+    // list each published pair reports is.
     let rows: &[(&str, i64, &[&str])] = &[
         ("one broker", 1, &["subnet-a"]),
         ("two brokers", 2, &["subnet-a", "subnet-b"]),
@@ -256,10 +263,9 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
             .find(|(member, _)| member == "bootstrapBrokerString")
             .map(|(_, pairs)| pairs)
             .unwrap_or_else(|| panic!("case {case:?}: the cluster published no plaintext string"));
-        assert_eq!(
-            pairs.len(),
-            usize::try_from(*brokers).unwrap_or_default(),
-            "case {case:?}: expected one pair per broker node, got {pairs:?}"
+        assert!(
+            !pairs.is_empty(),
+            "case {case:?}: the plaintext string must carry a pair to dial"
         );
         let mut coordinators: BTreeSet<String> = BTreeSet::new();
         for pair in &pairs {
@@ -271,8 +277,9 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
                 "case {probe:?}: every published pair must answer ApiVersions, got error {}",
                 negotiated.error_code
             );
-            // And the broker list it reports is the whole published list, in the same
-            // order: the brokers are one cluster, whichever of them the client reached.
+            // And the broker list it reports is the cluster's whole membership — one entry
+            // per broker node — every one of them at an address the string publishes: the
+            // brokers are one cluster, whichever of them the client reached.
             let metadata = client.metadata(&probe).await;
             let reported: Vec<String> = metadata
                 .brokers
@@ -280,9 +287,15 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
                 .map(|broker| format!("{}:{}", broker.host.as_str(), broker.port))
                 .collect();
             assert_eq!(
-                reported, pairs,
-                "case {probe:?}: expected Metadata to report the published brokers {pairs:?}, \
-                 got {reported:?}"
+                reported.len(),
+                usize::try_from(*brokers).unwrap_or_default(),
+                "case {probe:?}: expected Metadata to report the cluster's {brokers} broker \
+                 nodes, got {reported:?}"
+            );
+            assert!(
+                reported.iter().all(|address| pairs.contains(address)),
+                "case {probe:?}: expected Metadata to report the published addresses \
+                 {pairs:?}, got {reported:?}"
             );
             // The coordinator of a group a client asks for is a broker OF THIS CLUSTER, at
             // an address the string publishes and on the port of the access method the
@@ -325,7 +338,7 @@ async fn every_published_pair_answers_and_reports_the_whole_broker_list() {
 }
 
 #[tokio::test]
-async fn the_pairs_follow_the_cluster_when_its_broker_count_grows() {
+async fn the_published_addresses_hold_while_the_brokers_follow_the_cluster() {
     let case = "a cluster scaled from two brokers to four";
     let emulator = Emulator::new();
     let cluster = emulator
@@ -339,13 +352,16 @@ async fn the_pairs_follow_the_cluster_when_its_broker_count_grows() {
     let version = crate::kafka_harness::poll_until_active(&emulator, &cluster, case).await;
     let before = published(&emulator, &cluster, case).await;
     for (member, pairs) in &before {
-        assert_eq!(
-            pairs.len(),
-            2,
-            "case {case:?}: {member} must list the two brokers the cluster was created with, \
-             got {pairs:?}"
+        assert!(
+            !pairs.is_empty(),
+            "case {case:?}: {member} must name an address to bootstrap at, got {pairs:?}"
         );
     }
+    let dialled = before
+        .iter()
+        .find(|(member, _)| member == "bootstrapBrokerString")
+        .and_then(|(_, pairs)| pairs.first().cloned())
+        .unwrap_or_else(|| panic!("case {case:?}: the cluster published no plaintext address"));
 
     let accepted = emulator
         .call(
@@ -366,41 +382,46 @@ async fn the_pairs_follow_the_cluster_when_its_broker_count_grows() {
         accepted.status, accepted.body
     );
     // The new nodes are a transition the CLOCK owes the cluster, so this LOOKS AGAIN until
-    // the published endpoints name them rather than waiting out a span; the deadline is far
-    // longer than that span, so it says nothing about how fast the host runs.
+    // the brokers behind the published address number four rather than waiting out a span;
+    // the deadline is far longer than that span, so it says nothing about how fast the host
+    // runs.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         let after = published(&emulator, &cluster, case).await;
-        let settled = !after.is_empty()
-            && after.iter().all(|(_, pairs)| pairs.len() == 4)
-            && after
+        // The addresses the cluster already published are kept, so a client holding the old
+        // string still reaches the cluster's brokers.
+        for (member, pairs) in &before {
+            let grown = after
                 .iter()
-                .all(|(_, pairs)| pairs.iter().collect::<BTreeSet<_>>().len() == 4);
-        if settled {
-            // The addresses the cluster already published are kept, so a client holding the
-            // old string still reaches the brokers it named.
-            for (member, pairs) in &before {
-                let grown = after
-                    .iter()
-                    .find(|(grown, _)| grown == member)
-                    .map(|(_, pairs)| pairs.clone())
-                    .unwrap_or_default();
-                assert!(
-                    pairs.iter().all(|pair| grown.contains(pair)),
-                    "case {case:?}: {member} must keep the addresses it published {pairs:?}, \
-                     got {grown:?}"
-                );
-            }
+                .find(|(grown, _)| grown == member)
+                .map(|(_, pairs)| pairs.clone())
+                .unwrap_or_default();
+            assert!(
+                pairs.iter().all(|pair| grown.contains(pair)),
+                "case {case:?}: {member} must keep the addresses it published {pairs:?}, \
+                 got {grown:?}"
+            );
+        }
+        let mut client = Client::plaintext(case, &dialled).await;
+        client.api_versions(case).await;
+        let reported: Vec<i32> = client
+            .metadata(case)
+            .await
+            .brokers
+            .iter()
+            .map(|broker| broker.node_id.0)
+            .collect();
+        if reported.len() == 4 {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "case {case:?}: the published endpoints must name the four brokers the cluster \
-             holds, last read {after:?}"
+            "case {case:?}: the brokers behind the published address must follow the four the \
+             cluster holds, last read {reported:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    // And the control plane agrees about the count the endpoints now name.
+    // And the control plane agrees about the count the brokers now number.
     let described = emulator.describe(&cluster).await;
     assert_eq!(
         described.at("/clusterInfo/numberOfBrokerNodes").as_i64(),
