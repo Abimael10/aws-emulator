@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 
-use ::chrono::{Datelike, Days, NaiveDate};
+use ::chrono::{Datelike, Days, Months, NaiveDate};
 
 use super::{metering_key, ComAmazonawsApigatewayBackplanecontrolserviceState, UsagePlanEntry};
 
@@ -60,13 +60,11 @@ pub fn usage_today() -> NaiveDate {
 
 /// The widest interval of days one read of the usage data may cover.
 ///
-/// An EMULATOR RESOURCE GUARD rather than a published quota: the report holds one entry
-/// per day per metered key, so an interval a caller names has to be bounded for the answer
-/// to be. Ninety days is the window API Gateway's usage data is available over, so the
-/// guard admits every interval the data can cover and refuses only an interval no usage
-/// could be reported for ([`usage_interval_too_wide`]). It also bounds what is KEPT: a
-/// count older than this is dropped as the data plane records a newer one
-/// ([`UsageLog::record`]).
+/// The window API Gateway's usage data is available over: an interval wider than it names
+/// days no usage could be reported for, and is refused as a bad request
+/// ([`usage_interval_too_wide`], which states this same count of days). It also bounds what
+/// is KEPT: a count older than this is dropped as the data plane records a newer one
+/// ([`UsageLog::record`]), so the store holds exactly the days a report may cover.
 pub const MAX_USAGE_INTERVAL_DAYS: u64 = 90;
 
 /// The requests one metered `(usage plan, API key)` pair sent, counted by the UTC day each
@@ -80,17 +78,38 @@ pub const MAX_USAGE_INTERVAL_DAYS: u64 = 90;
 pub struct UsageLog {
     /// The request count of each day the pair sent a request on.
     pub per_day: BTreeMap<NaiveDate, i64>,
-    /// The requests this pair may send in ONE metering period BEYOND the plan's own
-    /// budget, keyed by the first day of the period the grant applies to — the signed
-    /// difference a granted extension makes to that period's quota.
+    /// What a grant of remaining quota RECORDED for this pair, keyed by the day the grant
+    /// was made on.
     ///
-    /// Keyed by the period rather than held as one number because the grant is "a temporary
-    /// extension to the remaining quota" (`UpdateUsage`'s own documentation): it is spent
-    /// alongside the period's own budget and is gone once the period it was granted in
-    /// ends, which is what makes the plan's quota whole again — and no more than whole — at
-    /// the next reset. Bounded like [`Self::per_day`], by
+    /// Keyed by the day of the grant, and carrying the day the grant reaches through, because
+    /// a grant is "a temporary extension to the remaining quota" (`UpdateUsage`'s own
+    /// documentation) of the metering period it was made in: it is a RECORDED FACT about
+    /// those days, so it is held as the plan's quota stood when the grant was made and is
+    /// read back unchanged however the plan's `quota` is edited afterwards. It is gone once
+    /// the period it was granted in ends, which is what makes the plan's quota whole again —
+    /// and no more than whole — at the next reset. Bounded like [`Self::per_day`], by
     /// [`MAX_USAGE_INTERVAL_DAYS`].
-    pub extensions: BTreeMap<NaiveDate, i64>,
+    pub grants: BTreeMap<NaiveDate, GrantedRemaining>,
+}
+
+/// One grant of remaining quota, as the grant itself states it.
+///
+/// What is stored is what the grant SAYS — the requests the pair has left from the grant on
+/// — rather than a difference against the plan's budget at grant time: a difference would be
+/// rewritten by the next edit of the plan's `quota`, and the remaining quota of a day the
+/// pair already has usage data for is a fact about that day.
+#[derive(Debug, Clone, Copy)]
+pub struct GrantedRemaining {
+    /// The requests the metering period admits from the pair from the grant on — the
+    /// `remaining` the grant states.
+    pub remaining: i64,
+    /// The last day of the metering period the grant was made in, as the plan's quota stood
+    /// when it was made: the grant covers that period and no later one, so the day it reaches
+    /// through is recorded with it rather than recomputed from the plan's present `period`.
+    pub through: NaiveDate,
+    /// How many requests the pair had already sent on the day of the grant when it was made,
+    /// so what counts the granted remaining down is the requests that came AFTER the grant.
+    pub sent_by_grant: i64,
 }
 
 impl UsageLog {
@@ -99,24 +118,27 @@ impl UsageLog {
         self.per_day.get(&day).copied().unwrap_or_default()
     }
 
-    /// The extension granted to the metering period that began on `period_start`, zero for
-    /// a period nothing was granted in.
-    pub fn extension_of(&self, period_start: NaiveDate) -> i64 {
-        self.extensions
-            .get(&period_start)
-            .copied()
-            .unwrap_or_default()
+    /// The grant whose reach covers `day`, with the day it was made on — the LATEST grant
+    /// made on or before that day that still reaches it — or `None` for a day no grant
+    /// covers.
+    ///
+    /// The latest one because a grant states the remaining quota outright, so a later grant
+    /// is the one that stands; a day before every grant is a day no grant had been made yet,
+    /// and a day past a grant's own period is a day its extension no longer reaches.
+    pub fn grant_covering(&self, day: NaiveDate) -> Option<(NaiveDate, GrantedRemaining)> {
+        let (granted_on, grant) = self.grants.range(..=day).next_back()?;
+        (day <= grant.through).then_some((*granted_on, *grant))
     }
 
-    /// Grant the period that began on `period_start` an extension of `extension` requests,
-    /// REPLACING whatever that period had been granted before: the remaining quota a grant
-    /// names is the one the period has from then on, not an increment on an earlier grant.
+    /// Record `grant`, made on `granted_on`, REPLACING whatever that day had been granted
+    /// before: the remaining quota a grant names is the one the pair has from then on, not an
+    /// increment on an earlier grant.
     ///
-    /// Forgets the grants of periods older than the window usage data is kept over, for the
+    /// Forgets the grants of days older than the window usage data is kept over, for the
     /// reason [`Self::record`] forgets a count.
-    fn grant(&mut self, period_start: NaiveDate, extension: i64) {
-        self.extensions.insert(period_start, extension);
-        self.forget_before(period_start);
+    fn grant(&mut self, granted_on: NaiveDate, grant: GrantedRemaining) {
+        self.grants.insert(granted_on, grant);
+        self.forget_before(granted_on);
     }
 
     /// How many requests the pair sent from `from` through `through`, both days included —
@@ -152,7 +174,7 @@ impl UsageLog {
     fn forget_before(&mut self, day: NaiveDate) {
         if let Some(oldest) = day.checked_sub_days(Days::new(MAX_USAGE_INTERVAL_DAYS)) {
             self.per_day.retain(|counted, _| *counted > oldest);
-            self.extensions.retain(|granted, _| *granted > oldest);
+            self.grants.retain(|granted, _| *granted > oldest);
         }
     }
 }
@@ -164,6 +186,9 @@ pub struct QuotaWindow {
     /// The first day of the period — where the count the limit is applied to starts, which
     /// is what makes the quota RESET at a period boundary.
     pub start: NaiveDate,
+    /// The last day of the period — the day a grant made in it reaches through, after which
+    /// the next period starts the count again.
+    pub through: NaiveDate,
     /// The requests admissible in the period: the plan's `limit`, less the `offset` in the
     /// initial period.
     pub budget: i64,
@@ -181,6 +206,7 @@ pub fn quota_window(plan: &UsagePlanEntry, day: NaiveDate) -> Option<QuotaWindow
     let quota = plan.quota.as_ref()?;
     let period = quota.period.as_deref()?;
     let start = quota_period_start(period, day)?;
+    let through = quota_period_end(period, day)?;
     let initial = plan
         .created_on
         .and_then(|created| quota_period_start(period, created))
@@ -188,6 +214,7 @@ pub fn quota_window(plan: &UsagePlanEntry, day: NaiveDate) -> Option<QuotaWindow
     let offset = if initial { i64::from(quota.offset) } else { 0 };
     Some(QuotaWindow {
         start,
+        through,
         budget: i64::from(quota.limit).saturating_sub(offset).max(0),
     })
 }
@@ -212,73 +239,74 @@ pub fn quota_period_start(period: &str, day: NaiveDate) -> Option<NaiveDate> {
     }
 }
 
-impl ComAmazonawsApigatewayBackplanecontrolserviceState {
-    /// The quota window `day` falls in for ONE metered `(usage plan, API key)` pair: the
-    /// plan's own window ([`quota_window`]), carrying the budget that pair's period actually
-    /// admits — the plan's limit plus whatever extension the pair was granted for it.
-    ///
-    /// The ONE place the two halves of a period's budget meet, so the data plane's
-    /// admission, the daily log a read reports and a later grant all count against the same
-    /// number. A pair with no grant is the plan's own window unchanged.
-    pub fn metered_quota_window(
-        &self,
-        usage_plan_id: &str,
-        key_id: &str,
-        day: NaiveDate,
-    ) -> Option<QuotaWindow> {
-        let mut window = quota_window(self.usage_plans.get(usage_plan_id)?, day)?;
-        let granted = self
-            .usage_logs
-            .get(&metering_key(usage_plan_id, key_id))
-            .map_or(0, |log| log.extension_of(window.start));
-        // A grant can lower the period's budget as well as raise it (a remaining quota set
-        // below what the period had left), but never below nothing: a budget is a count of
-        // requests.
-        window.budget = window.budget.saturating_add(granted).max(0);
-        Some(window)
+/// The LAST day of the metering `period` that `day` falls in, or `None` for a period this
+/// service knows no window for.
+///
+/// The far end of the window [`quota_period_start`] opens, and so the day an extension
+/// granted in the period reaches through: the calendar end of the period its name gives it —
+/// the day itself, the last day of its week, or the last day of its month — because the next
+/// period is where the quota is whole again.
+pub fn quota_period_end(period: &str, day: NaiveDate) -> Option<NaiveDate> {
+    let start = quota_period_start(period, day)?;
+    match period {
+        "DAY" => Some(start),
+        "WEEK" => start.checked_add_days(Days::new(6)),
+        "MONTH" => start
+            .checked_add_months(Months::new(1))
+            .and_then(|next_period| next_period.pred_opt()),
+        _ => None,
     }
+}
 
+impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// Grant the pair the remaining quota `remaining` for the rest of the metering period
-    /// that `day` falls in, answering the window the grant applies to — or `None` for a plan
-    /// that meters no quota in a window, which has no remaining quota to grant.
+    /// that `day` falls in, answering what the pair has left once the grant is recorded — or
+    /// `None` for a plan that meters no quota in a window, which has no remaining quota to
+    /// grant.
     ///
-    /// The grant is stated as what the period has LEFT, so what is stored is the difference
-    /// that makes to the period's budget: the pair has sent what it has sent, and after the
-    /// grant the period admits exactly `remaining` further requests from it. Every later
-    /// request is counted down from there by the one accounting in [`Self::quota_admits`],
-    /// and the next period starts at the plan's own limit again.
+    /// The grant is stated as what the period has LEFT, so that is what is RECORDED: the
+    /// requests the pair may still send, the day of the grant, and the day the period the
+    /// grant was made in reaches through. Nothing of the plan's present `quota` is folded
+    /// into the record, so an edit of the plan's limit or period afterwards leaves the
+    /// recorded remaining of the days already recorded exactly as it was. Every later request
+    /// is counted down from the grant by the one accounting in [`Self::remaining_quota`], and
+    /// the next period starts at the plan's own limit again.
     pub fn grant_remaining_quota(
         &mut self,
         usage_plan_id: &str,
         key_id: &str,
         day: NaiveDate,
         remaining: i64,
-    ) -> Option<QuotaWindow> {
-        // The plan's OWN window, not the extended one: a grant states the period's
-        // remaining quota outright, so it replaces any earlier grant rather than compounding
-        // with it.
+    ) -> Option<i64> {
+        // The plan's window is read for the PERIOD the grant covers, not for its budget: a
+        // grant states the remaining quota outright, so what the plan's limit happens to be
+        // right now is no part of the recorded fact.
         let window = quota_window(self.usage_plans.get(usage_plan_id)?, day)?;
         let log = self
             .usage_logs
             .entry(metering_key(usage_plan_id, key_id))
             .or_default();
-        let spent = log.used_between(window.start, day);
         log.grant(
-            window.start,
-            remaining.saturating_add(spent).saturating_sub(window.budget),
+            day,
+            GrantedRemaining {
+                // A count of requests, so never below nothing.
+                remaining: remaining.max(0),
+                through: window.through,
+                sent_by_grant: log.used_on(day),
+            },
         );
         // The grant is usage data of its own: the pair has a usage record for the day it was
-        // made on, so a read of the usage over that day reports the extended quota rather
+        // made on, so a read of the usage over that day reports the granted quota rather
         // than indexing nothing for a key that has one.
         log.open(day);
-        self.metered_quota_window(usage_plan_id, key_id, day)
+        self.remaining_quota(usage_plan_id, key_id, day)
     }
 
     /// Count one request from the API key `key_id` against the quota of `usage_plan_id` on
     /// the UTC day `day`, and report whether that quota admitted it.
     ///
-    /// The count is the one thing a quota is: a period admits [`QuotaWindow::budget`]
-    /// requests, so a request arriving once the period's own count has reached it is NOT
+    /// The count is the one thing a quota is: a period admits what it has left
+    /// ([`Self::remaining_quota`]), so a request arriving once nothing is left is NOT
     /// admitted and NOT counted — the period is already at its limit, and a refused
     /// request consumed none of it. A plan that meters no quota ([`quota_window`]) admits
     /// every request and still counts it, because what it sent is what a read of the usage
@@ -288,18 +316,16 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// read of the usage data agree on how many requests a key has sent and how many it has
     /// left.
     pub fn quota_admits(&mut self, usage_plan_id: &str, key_id: &str, day: NaiveDate) -> bool {
-        let window = self.metered_quota_window(usage_plan_id, key_id, day);
-        let counted = metering_key(usage_plan_id, key_id);
-        if let Some(window) = window {
-            let spent = self
-                .usage_logs
-                .get(&counted)
-                .map_or(0, |log| log.used_between(window.start, day));
-            if spent >= window.budget {
-                return false;
-            }
+        if self
+            .remaining_quota(usage_plan_id, key_id, day)
+            .is_some_and(|remaining| remaining <= 0)
+        {
+            return false;
         }
-        self.usage_logs.entry(counted).or_default().record(day);
+        self.usage_logs
+            .entry(metering_key(usage_plan_id, key_id))
+            .or_default()
+            .record(day);
         true
     }
 
@@ -324,25 +350,34 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
     }
 
     /// What the metering period that holds `day` has LEFT for one metered `(usage plan, API
-    /// key)` pair: the period's budget — the plan's limit and whatever extension the pair was
-    /// granted for it — less everything the pair sent in the period up to and including that
-    /// day. `None` for a plan that meters no quota in a window, which has no remaining quota
-    /// at all.
+    /// key)` pair. `None` for a plan that meters no quota in a window and no grant covering
+    /// that day, which has no remaining quota at all.
+    ///
+    /// Read from the GRANT when one covers the day — the remaining quota that grant recorded,
+    /// less the requests the pair sent after it — and from the plan's own window otherwise:
+    /// the period's budget less everything the pair sent in the period up to and including
+    /// that day. A recorded grant is a fact about the days it covers, so what a read of those
+    /// days reports does not move when the plan's `quota` is edited afterwards; every other
+    /// day answers from the plan's quota as it stands.
     ///
     /// The ONE statement of what "remaining" means, read by the daily log a report carries
-    /// and by the grant that sets it, so the number a caller is told and the number the next
-    /// request is admitted against are the same one.
+    /// and by the admission of the next request, so the number a caller is told and the
+    /// number the next request is admitted against are the same one.
     pub fn remaining_quota(
         &self,
         usage_plan_id: &str,
         key_id: &str,
         day: NaiveDate,
     ) -> Option<i64> {
-        let window = self.metered_quota_window(usage_plan_id, key_id, day)?;
-        let spent = self
-            .usage_logs
-            .get(&metering_key(usage_plan_id, key_id))
-            .map_or(0, |log| log.used_between(window.start, day));
+        let log = self.usage_logs.get(&metering_key(usage_plan_id, key_id));
+        if let Some((granted_on, grant)) = log.and_then(|log| log.grant_covering(day)) {
+            let since_grant = log
+                .map_or(0, |log| log.used_between(granted_on, day))
+                .saturating_sub(grant.sent_by_grant);
+            return Some(grant.remaining.saturating_sub(since_grant).max(0));
+        }
+        let window = quota_window(self.usage_plans.get(usage_plan_id)?, day)?;
+        let spent = log.map_or(0, |log| log.used_between(window.start, day));
         Some(window.budget.saturating_sub(spent).max(0))
     }
 
@@ -388,6 +423,17 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
 /// meter, which names just as little usage data of this plan.
 pub const NO_SUCH_METERED_API_KEY: &str = "Invalid API Key content specified";
 
+/// The `NotFoundException` message for a `keyId` that names no API key a READ of the usage
+/// data could report, which is a key this plan does not meter.
+///
+/// A sentence of its own, worded as neither the grant's
+/// ([`NO_SUCH_METERED_API_KEY`]) nor an API key reader's ([`super::NO_SUCH_API_KEY`]): a
+/// recorded refusal of a report naming a key the account does not hold states the KEY
+/// IDENTIFIER the request narrowed the report by, and quotes the rejected id back nowhere.
+/// The same sentence for a key the account holds but this plan does not meter, which names
+/// just as little usage data of this plan.
+pub const NO_SUCH_REPORTED_API_KEY: &str = "Invalid Key identifier specified";
+
 /// The `BadRequestException` message for a grant of remaining quota made against a usage
 /// plan that meters no quota in a window — one carrying no `quota` at all, or one whose
 /// quota names no `period`.
@@ -419,12 +465,14 @@ pub const INVALID_USAGE_END_DATE: &str = "Invalid end date specified";
 pub const INVALID_USAGE_INTERVAL: &str = "Usage end date must be after start date";
 
 /// The `BadRequestException` message for an interval wider than the window a report may
-/// cover; see [`MAX_USAGE_INTERVAL_DAYS`] for what bounds it.
+/// cover.
+///
+/// WHOLLY FIXED text, like the sentence for an inverted interval
+/// ([`INVALID_USAGE_INTERVAL`]): it states the bound the usage data is available over — the
+/// same count of days for every interval past it ([`MAX_USAGE_INTERVAL_DAYS`]) — and
+/// interpolates nothing of the request, neither a date nor the span it asked for.
 pub fn usage_interval_too_wide() -> String {
-    format!(
-        "Invalid usage interval specified. The usage interval must be at most \
-         {MAX_USAGE_INTERVAL_DAYS} days"
-    )
+    format!("Usage date range cannot exceed {MAX_USAGE_INTERVAL_DAYS} days")
 }
 
 /// The interval `start_date` through `end_date` covers, or the sentence the pair is refused

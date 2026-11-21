@@ -38,7 +38,7 @@ use ::chrono::{DateTime, Days, NaiveDate, Utc};
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
     INVALID_POSITION, INVALID_USAGE_END_DATE, INVALID_USAGE_INTERVAL, INVALID_USAGE_START_DATE,
-    MAX_USAGE_INTERVAL_DAYS, NO_SUCH_API_KEY, NO_SUCH_USAGE_PLAN,
+    MAX_USAGE_INTERVAL_DAYS, NO_SUCH_REPORTED_API_KEY, NO_SUCH_USAGE_PLAN,
 };
 
 use crate::api_key_lifecycle::create_key;
@@ -706,13 +706,13 @@ async fn an_unresolvable_plan_key_or_interval_is_refused() {
             "a keyId naming no stored key at all",
             plan.clone(),
             "&keyId=no-such-key".to_string(),
-            NO_SUCH_API_KEY,
+            NO_SUCH_REPORTED_API_KEY,
         ),
         (
             "a keyId naming a stored key the plan does not meter",
             plan.clone(),
             format!("&keyId={unmetered}"),
-            NO_SUCH_API_KEY,
+            NO_SUCH_REPORTED_API_KEY,
         ),
     ] {
         let refused = get_usage(&gateway, &plan_id, &date(from), &date(from), &query).await;
@@ -781,10 +781,7 @@ async fn an_unresolvable_plan_key_or_interval_is_refused() {
             "an interval one day wider than a report covers",
             date(from),
             date(too_wide),
-            format!(
-                "Invalid usage interval specified. The usage interval must be at most \
-                 {MAX_USAGE_INTERVAL_DAYS} days"
-            ),
+            format!("Usage date range cannot exceed {MAX_USAGE_INTERVAL_DAYS} days"),
         ),
     ] {
         let refused = get_usage(&gateway, &plan, &start, &end, "").await;

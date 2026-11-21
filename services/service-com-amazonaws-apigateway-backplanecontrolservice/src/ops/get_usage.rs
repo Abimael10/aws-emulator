@@ -180,8 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // `keyId` is "the Id of the API key associated with the resultant usage data", so
         // it NARROWS the report to one key the plan meters, and an id naming no such key
-        // names no usage data of this plan: it is refused as the API key identifier it is,
-        // rather than served a report of every key or an empty one.
+        // names no usage data of this plan: it is refused as the key identifier of a usage
+        // report it is — this operation's own sentence, not the one an API key's reader or
+        // the grant of a remaining quota answers — rather than served a report of every key
+        // or an empty one.
         let metered = metered_key_ids(&store, &input.usage_plan_id);
         let selected = match input.key_id.as_deref() {
             None => metered,
@@ -190,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             Some(_) => {
                 return Err(GetUsageErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::NO_SUCH_API_KEY.to_string()),
+                    message: Some(crate::state::NO_SUCH_REPORTED_API_KEY.to_string()),
                 })
                 .into())
             }

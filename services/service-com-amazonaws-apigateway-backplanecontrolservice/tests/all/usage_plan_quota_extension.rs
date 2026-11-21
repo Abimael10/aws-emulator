@@ -45,7 +45,16 @@ use crate::usage_plan_usage_report::{
 
 /// `UpdateUsage` for the `(plan, key)` pair, carrying `patches` verbatim as its
 /// `patchOperations`.
-async fn update_usage(gateway: &Gateway, plan: &str, key_id: &str, patches: Value) -> Answer {
+///
+/// `pub(crate)` so the sibling suite over the RECORDED remaining quota
+/// (`usage_plan_recorded_remaining`) grants through the same call rather than standing a
+/// second copy of it up.
+pub(crate) async fn update_usage(
+    gateway: &Gateway,
+    plan: &str,
+    key_id: &str,
+    patches: Value,
+) -> Answer {
     gateway
         .call(
             "PATCH",
@@ -55,8 +64,9 @@ async fn update_usage(gateway: &Gateway, plan: &str, key_id: &str, patches: Valu
         .await
 }
 
-/// One `patchOperations` entry naming the remaining quota of the metering period.
-fn remaining_patch(op: &str, value: i64) -> Value {
+/// One `patchOperations` entry naming the remaining quota of the metering period; shared
+/// with the sibling suite like [`update_usage`].
+pub(crate) fn remaining_patch(op: &str, value: i64) -> Value {
     json!([{ "op": op, "path": "/remaining", "value": value.to_string() }])
 }
 
