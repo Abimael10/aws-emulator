@@ -874,3 +874,174 @@ async fn the_connector_records_an_environment_keeps_are_bounded() {
         );
     }
 }
+
+/// Every `ConnectorState` the model declares, from the catalog this crate generated from
+/// the model (`smithy_query(query="shape", shape="ConnectorState")`), paired with whether
+/// a record in that state is one whose teardown has NOT started — the side of the line
+/// this crate single-homes in `evs::state::StoredConnector::is_live`, which the connector
+/// delete and the deletion of the environment that holds the connector both resolve
+/// records by.
+const CONNECTOR_STATE_SIDES: &[(&str, bool)] = &[
+    // The connection is being established, reconfigured, up, or concluded without one:
+    // the teardown has not started, so the record is still one a request acts on.
+    ("CREATING", true),
+    ("ACTIVE", true),
+    ("UPDATING", true),
+    ("CREATE_FAILED", true),
+    ("UPDATE_FAILED", true),
+    // The teardown has started: the connection is being torn down, or it is gone.
+    ("DELETING", false),
+    ("DELETED", false),
+];
+
+/// A `modifiedAt` in the past, written onto the record under test so that a delete that
+/// re-stamps it is visibly distinguishable from a delete that must leave it exactly as it
+/// stands — without either assertion depending on how fast the host runs.
+const MARKER_MODIFIED_AT_MS: i64 = 1_700_000_000_000;
+
+/// Put the stored connector of one environment into `state`, stamped
+/// [`MARKER_MODIFIED_AT_MS`] and owing no transition.
+///
+/// `CREATE_FAILED` and `UPDATE_FAILED` are reached by nothing a client can call, so every
+/// row is seeded through this service's own store — as
+/// `tests/all/environment_deletion_hosts.rs` seeds the `HostState` values — which also
+/// keeps the row set exactly the modelled catalog. Everything the rule is about is then
+/// driven over the wire.
+fn force_connector_state(router: &Emulator, environment_id: &str, connector_id: &str, state: &str) {
+    let store = evs::state::service_state(&*router.engine)
+        .expect("the in-memory engine carries this service's store");
+    let mut store = store.lock();
+    let stored = store
+        .environments
+        .get_mut(environment_id)
+        .unwrap_or_else(|| panic!("the store holds the environment {environment_id}"))
+        .connectors
+        .get_mut(connector_id)
+        .unwrap_or_else(|| panic!("the environment holds the connector {connector_id}"));
+    stored.state = state.to_string();
+    stored.modified_at_ms = MARKER_MODIFIED_AT_MS;
+    stored.pending = None;
+}
+
+/// Create an environment holding one connector forced into `state`, and answer the
+/// environment id, the connector id and the record as a client reads it.
+async fn environment_with_connector_in_state(
+    router: &Emulator,
+    case: &str,
+    state: &str,
+) -> (String, String, Value) {
+    let environment = create_settled(router, None).await;
+    let created = create_connector(
+        router,
+        case,
+        &environment,
+        VCENTER,
+        "vcenter.evs.example.com",
+        SECRET_ARN,
+    )
+    .await;
+    let connector_id = created["connectorId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no connectorId in {created}"))
+        .to_string();
+    force_connector_state(router, &environment, &connector_id, state);
+    let before = stored_connector(router, case, &environment, &connector_id).await;
+    assert_member(case, &before, "state", &json!(state));
+    (environment, connector_id, before)
+}
+
+#[tokio::test]
+async fn the_teardown_line_is_one_rule_for_both_deletes() {
+    // One predicate decides, for every `ConnectorState`, whether a connector's teardown
+    // has still to be STARTED: `DeleteEnvironmentConnector` starts it and re-stamps the
+    // record only for a connector on the live side of that line, and the deletion of the
+    // environment that holds the connector starts it for exactly the same records. A
+    // record already on the other side is left precisely as it stands by both, so neither
+    // restarts a teardown this service has already accepted.
+    let router = emulator();
+
+    // Every modelled state has a row, so the table and the catalog cannot drift apart.
+    for state in evs::ops::types::CONNECTOR_STATE_VALUES {
+        assert!(
+            CONNECTOR_STATE_SIDES.iter().any(|(row, _)| row == state),
+            "the table must cover the modelled state {state:?}"
+        );
+    }
+    assert_eq!(
+        CONNECTOR_STATE_SIDES.len(),
+        evs::ops::types::CONNECTOR_STATE_VALUES.len(),
+        "the table must name only modelled states, got {CONNECTOR_STATE_SIDES:?}"
+    );
+
+    for (state, teardown_not_started) in CONNECTOR_STATE_SIDES {
+        // The connector delete.
+        let case = format!("DeleteEnvironmentConnector against a {state} connector");
+        let (environment, connector_id, before) =
+            environment_with_connector_in_state(&router, &case, state).await;
+
+        let (status, body) = call(
+            &router,
+            "DeleteEnvironmentConnector",
+            &delete_request(&environment, &connector_id),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the delete expected 200, got {status} {body}"
+        );
+        let reported = reported_connector(&case, &body);
+        let after = stored_connector(&router, &case, &environment, &connector_id).await;
+        assert_eq!(
+            reported, after,
+            "case {case:?}: the delete must report the record it left, got {reported} beside {after}"
+        );
+        if *teardown_not_started {
+            assert_member(&case, &reported, "state", &json!("DELETING"));
+            assert!(
+                seconds(&case, &reported, "modifiedAt") > seconds(&case, &before, "modifiedAt"),
+                "case {case:?}: starting the teardown must re-stamp the record, got {reported}"
+            );
+            // And the clock owes the started teardown its terminal state.
+            settle(&router);
+            let settled = stored_connector(&router, &case, &environment, &connector_id).await;
+            assert_member(&case, &settled, "state", &json!("DELETED"));
+        } else {
+            assert_eq!(
+                reported, before,
+                "case {case:?}: a connector already going away is reported as it stands, \
+                 got {reported}"
+            );
+        }
+
+        // The deletion of the environment that holds the connector, which starts the
+        // teardown of the same records.
+        let case = format!("DeleteEnvironment holding a {state} connector");
+        let (environment, connector_id, before) =
+            environment_with_connector_in_state(&router, &case, state).await;
+
+        let (status, body) = call(
+            &router,
+            "DeleteEnvironment",
+            &json!({ "environmentId": environment }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the environment delete expected 200, got {status} {body}"
+        );
+        let after = stored_connector(&router, &case, &environment, &connector_id).await;
+        if *teardown_not_started {
+            assert_member(&case, &after, "state", &json!("DELETING"));
+            assert!(
+                seconds(&case, &after, "modifiedAt") > seconds(&case, &before, "modifiedAt"),
+                "case {case:?}: starting the teardown must re-stamp the record, got {after}"
+            );
+        } else {
+            assert_eq!(
+                after, before,
+                "case {case:?}: a connector already going away must be left as it stands, \
+                 got {after}"
+            );
+        }
+    }
+}

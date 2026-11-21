@@ -259,12 +259,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
 
-        // `@idempotent`: a connector that is already DELETING or DELETED is reported as
-        // it stands, so a repeated call neither restarts the teardown nor moves
+        // `@idempotent`: a connector whose teardown has already started is reported as it
+        // stands, so a repeated call neither restarts the teardown nor moves
         // `modifiedAt` — and its precondition is not re-judged, having been judged when
         // the delete that started the teardown was accepted.
-        let already_going_away = connector.state == crate::state::CONNECTOR_DELETING
-            || connector.state == crate::state::CONNECTOR_DELETED;
+        //
+        // "Already going away" is exactly the negation of the predicate the state module
+        // single-homes ([`crate::state::StoredConnector::is_live`]), which is what
+        // `live_connector` and `live_connector_mut` resolve records by: asking it here
+        // keeps this delete and every reader of a connector on ONE definition of the
+        // line, so a `ConnectorState` moved to either side of it moves for all of them.
+        let already_going_away = !connector.is_live();
 
         if !already_going_away && blocking_entitlements > 0 {
             // Refused with the operation's modelled client error, and NOTHING about the

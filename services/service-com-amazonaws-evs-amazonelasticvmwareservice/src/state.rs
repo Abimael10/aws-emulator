@@ -1752,7 +1752,10 @@ impl StoredEnvironment {
     /// deletion leaves no host that is not already terminal ([`Self::live_hosts`]).
     pub fn start_dependent_deletions(&mut self, deletion: &PendingTransition, now_ms: i64) {
         for connector in self.connectors.values_mut() {
-            if connector.state == CONNECTOR_DELETING || connector.state == CONNECTOR_DELETED {
+            // The same one predicate every reader and writer of a connector resolves
+            // records by ([`StoredConnector::is_live`]): a record whose teardown has
+            // already started is left exactly as it stands.
+            if !connector.is_live() {
                 continue;
             }
             connector.state = CONNECTOR_DELETING.to_string();
