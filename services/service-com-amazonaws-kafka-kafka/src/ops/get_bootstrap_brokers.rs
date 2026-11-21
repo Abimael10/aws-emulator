@@ -119,6 +119,9 @@
 //! * `ForbiddenException` (HTTP 403) — Returns information about an error.
 //! * `InternalServerErrorException` (HTTP 500) — Returns information about an error.
 //! * `UnauthorizedException` (HTTP 401) — Returns information about an error.
+//! * `NotFoundException` (HTTP 404) — widened in through `extra_errors` (see below): the
+//!   model's own `errors` list for this operation does not carry the shape, yet the service
+//!   answers it — with the parameter at fault — for a `ClusterArn` it cannot resolve.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -135,7 +138,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kafka-kafka.json");
 // here — hence the `GetBootstrapBrokersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kafka#GetBootstrapBrokers")]
+//
+// `NotFoundException` is widened in through `extra_errors`: this SERVICE models the shape
+// (every other cluster reader declares it) and answers it for a cluster reference that
+// resolves to nothing, so this operation refuses such a reference with the modelled shape —
+// which is what carries the `InvalidParameter` naming the input member that failed to
+// resolve — rather than with a body of its own.
+#[smithy_macros::operation_error(
+    "com.amazonaws.kafka#GetBootstrapBrokers",
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum GetBootstrapBrokersErrorModeled {
     BadRequestException(BadRequestException),
@@ -143,6 +155,7 @@ pub enum GetBootstrapBrokersErrorModeled {
     ForbiddenException(ForbiddenException),
     InternalServerErrorException(InternalServerErrorException),
     UnauthorizedException(UnauthorizedException),
+    NotFoundException(NotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -273,16 +286,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) else {
                 // This operation's model declares NO `NotFoundException`, yet the
                 // service answers one for a cluster reference it cannot resolve —
-                // the same 404 and the same fixed sentence every reader that DOES
-                // model it answers ([`crate::state::RESOURCE_NOT_FOUND_MESSAGE`]).
-                // A client branches on the code, so the code the service answers is
-                // the code that goes on the wire, through the unmodelled channel
-                // ([`crate::scaffolded::Scaffolded::unmodeled`]).
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::NOT_FOUND_CODE,
-                    crate::state::NOT_FOUND_STATUS,
-                    crate::state::RESOURCE_NOT_FOUND_MESSAGE,
-                ));
+                // the same 404, the same fixed sentence and the same named
+                // parameter every reader that DOES model it answers
+                // ([`crate::state::resource_not_found`]). A client branches on the
+                // code and attributes the refusal through `invalidParameter`, so
+                // both travel: the shape is widened onto this operation's error
+                // enum rather than carried as a body of its own.
+                return Err(GetBootstrapBrokersErrorModeled::NotFoundException(
+                    crate::state::resource_not_found(crate::state::CLUSTER_ARN_MEMBER),
+                )
+                .into());
             };
 
             // The cluster's own resource-based policy is in force on this action too

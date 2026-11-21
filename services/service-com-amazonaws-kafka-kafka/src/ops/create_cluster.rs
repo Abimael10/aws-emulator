@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -329,6 +329,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::network::PlacementSubnets::Resolved(None)
             | crate::state::network::PlacementSubnets::Unknown => {}
         }
+
+        // "The list of subnets to connect to in the client virtual private cloud
+        // (VPC). AWS creates elastic network interfaces inside these subnets"
+        // (`BrokerNodeGroupInfo$ClientSubnets`), and such an interface is always
+        // attached to at least one security group — so a request that names none of
+        // its own is attached to the default security group of the VPC those subnets
+        // are in, which is then what the cluster REPORTS as its broker node group's
+        // security groups. Applied to the configuration that is stored, through the
+        // one place that states that rule, so a v1 create and a v2 provisioned
+        // create store the same attachment.
+        let placed_in = input.broker_node_group_info.client_subnets.clone();
+        crate::state::network::attach_default_security_groups(
+            ctx,
+            &region,
+            &placed_in,
+            &mut input.broker_node_group_info.security_groups,
+        )
+        .await;
 
         let mut state = state.lock();
 

@@ -31,7 +31,8 @@ impl Cluster {
         input: CreateClusterInput,
     ) -> Self {
         let name = input.cluster_name.as_str();
-        let ClusterIdentity { arn, dns_suffix } = cluster_identity(region, name, suffix);
+        let ClusterIdentity { arn, dns_suffix } =
+            cluster_identity(region, name, suffix, CLUSTER_TYPE_PROVISIONED);
 
         // BOUNDED, not trusted: the model's own 1..15 range already refuses an
         // out-of-range request at the boundary, but this constructor must not let
@@ -139,7 +140,10 @@ impl Cluster {
         tags: Option<HashMap<String, String>>,
         request: ServerlessRequest,
     ) -> Self {
-        let ClusterIdentity { arn, dns_suffix } = cluster_identity(region, &name, suffix);
+        // The kind is what the ARN's last segment encodes, so this path mints a
+        // SERVERLESS ARN rather than the provisioned form.
+        let ClusterIdentity { arn, dns_suffix } =
+            cluster_identity(region, &name, suffix, CLUSTER_TYPE_SERVERLESS);
         let config = ServerlessConfig {
             vpc_configs: request.vpc_configs,
             client_authentication: request.client_authentication,

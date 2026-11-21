@@ -251,6 +251,136 @@ pub async fn security_group_outside_vpc_refusal(
     .map(|group_id| security_group_outside_vpc_message(group_id, vpc_id))
 }
 
+/// The EC2 filter that selects the resources of one VPC (`vpc-id`), used for the reason
+/// [`SUBNET_ID_FILTER`] is.
+const VPC_ID_FILTER: &str = "vpc-id";
+
+/// The EC2 filter that selects security groups by the name they carry
+/// (`DescribeSecurityGroupsRequest$Filters`, `group-name`).
+const SECURITY_GROUP_NAME_FILTER: &str = "group-name";
+
+/// The name of the group every VPC comes with: "Your VPC automatically comes with a default
+/// security group" (Amazon VPC User Guide, "Default security groups"), which is the group a
+/// placement that attaches none of its own lands in.
+const DEFAULT_SECURITY_GROUP_NAME: &str = "default";
+
+/// Record, in `groups`, the security groups a placement in `subnet_ids` is ATTACHED to when
+/// the request named none of its own — the VPC's default group
+/// ([`default_placement_security_groups`]) — and leave a list the request did name exactly
+/// as it named it.
+///
+/// The ONE application of that rule, so every create that places a resource in a client VPC
+/// stores the attachment the same way: a member the request left out, and one it set to the
+/// empty list, both name no group of their own, and an interface is never attached to
+/// nothing. Applied to the configuration that is STORED, so every reader answers from the
+/// one stored copy instead of re-deriving it.
+pub async fn attach_default_security_groups(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[String],
+    groups: &mut Option<Vec<String>>,
+) {
+    if groups.as_ref().is_some_and(|named| !named.is_empty()) {
+        return;
+    }
+    if let Some(attached) = default_placement_security_groups(ctx, region, subnet_ids).await {
+        *groups = Some(attached);
+    }
+}
+
+/// The security groups a placement in `subnet_ids` is ATTACHED to when the request names
+/// none of its own: the default security group of each VPC EC2 reports those subnets in, in
+/// the order the request named the subnets — and `None` when nothing about them could be
+/// resolved.
+///
+/// A placement's elastic network interfaces are created inside those subnets and are always
+/// attached to at least one security group, so a request that names none is attached to the
+/// VPC's default group — which is then what the resource REPORTS as its security groups. The
+/// groups of the account are EC2's, like the subnets, so they are read off EC2 rather than
+/// invented here: which VPC holds a subnet comes from the same `DescribeSubnets` the
+/// existence gate asks, and that VPC's default group from `DescribeSecurityGroups`.
+///
+/// `None` — nothing to attach, so the member keeps whatever the request said — for
+/// everything that is not EC2 reporting a default group: an emulator with no EC2 to ask, a
+/// read it could not make, subnets it reports no VPC for, and a VPC it reports no default
+/// group for. An attachment is grounded in what EC2 answered rather than assumed from
+/// silence, exactly as a refusal is.
+pub async fn default_placement_security_groups(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[String],
+) -> Option<Vec<String>> {
+    // The caller-sized list is clamped before it is cloned into either call below or walked
+    // against what EC2 answered, exactly as the readings above clamp it.
+    if subnet_ids.is_empty() || subnet_ids.len() > MAX_PLACEMENT_SUBNETS {
+        return None;
+    }
+    let endpoint = peer_endpoint("ec2", region)?;
+    let client = callback_client!(aws_sdk_ec2, ctx, endpoint, region);
+    let subnets = match client
+        .describe_subnets()
+        .filters(id_filter(SUBNET_ID_FILTER, subnet_ids))
+        .send()
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            warn_unresolved(&error, "the subnets");
+            return None;
+        }
+    };
+    // The VPCs those subnets are in, each ONCE and in the order the request named them: a
+    // configuration may name several subnets of one VPC, which is one network interface's
+    // worth of groups, not one per subnet.
+    let mut vpc_ids: Vec<String> = Vec::new();
+    for subnet_id in subnet_ids {
+        let held_by = subnets
+            .subnets()
+            .iter()
+            .find(|subnet| subnet.subnet_id() == Some(subnet_id.as_str()))
+            .and_then(::aws_sdk_ec2::types::Subnet::vpc_id);
+        if let Some(vpc_id) = held_by {
+            if !vpc_ids.iter().any(|held| held == vpc_id) {
+                vpc_ids.push(vpc_id.to_string());
+            }
+        }
+    }
+    if vpc_ids.is_empty() {
+        return None;
+    }
+    let groups = match client
+        .describe_security_groups()
+        .filters(id_filter(VPC_ID_FILTER, &vpc_ids))
+        .filters(id_filter(
+            SECURITY_GROUP_NAME_FILTER,
+            &[DEFAULT_SECURITY_GROUP_NAME.to_string()],
+        ))
+        .send()
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => {
+            warn_unresolved(&error, "the default security groups");
+            return None;
+        }
+    };
+    let attached: Vec<String> = vpc_ids
+        .iter()
+        .filter_map(|vpc_id| {
+            groups
+                .security_groups()
+                .iter()
+                .find(|group| {
+                    group.vpc_id() == Some(vpc_id.as_str())
+                        && group.group_name() == Some(DEFAULT_SECURITY_GROUP_NAME)
+                })
+                .and_then(::aws_sdk_ec2::types::SecurityGroup::group_id)
+                .map(str::to_string)
+        })
+        .collect();
+    (!attached.is_empty()).then_some(attached)
+}
+
 /// The first id of `ids` that `held_by` reports in a VPC other than `vpc_id`, or `None` when
 /// none of them is reported in another VPC.
 ///

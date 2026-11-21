@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so both are refused before anything is minted. Everything that depends
         // on the request alone is checked here, before the registry lock is
         // taken.
-        let body = match (provisioned, serverless) {
+        let mut body = match (provisioned, serverless) {
             (Some(request), None) => ClusterBody::Provisioned(Box::new(request)),
             (None, Some(request)) => ClusterBody::Serverless(request),
             // A body naming BOTH kinds asks for two clusters at once, so it is no body this
@@ -358,6 +358,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 crate::state::network::PlacementSubnets::Resolved(None)
                 | crate::state::network::PlacementSubnets::Unknown => {}
+            }
+        }
+
+        // The network interfaces a cluster is reached through are created inside the
+        // subnets its configuration names and are always attached to at least one
+        // security group, so a configuration that names NONE is attached to the default
+        // security group of the VPC its subnets are in — and a reader of the cluster then
+        // reports that group as the configuration's. Resolved here, against the account's
+        // EC2 inventory and over the same callback the placement above is resolved
+        // through, and APPLIED to the configuration that is stored, so every reader
+        // answers from the one stored copy rather than re-deriving it. Both kinds of
+        // cluster carry such a configuration: the provisioned body's one broker node
+        // group, and each of a serverless body's VPC configurations.
+        match &mut body {
+            ClusterBody::Provisioned(request) => {
+                let group = &mut request.broker_node_group_info;
+                crate::state::network::attach_default_security_groups(
+                    ctx,
+                    &region,
+                    &group.client_subnets.clone(),
+                    &mut group.security_groups,
+                )
+                .await;
+            }
+            ClusterBody::Serverless(request) => {
+                for config in &mut request.vpc_configs {
+                    crate::state::network::attach_default_security_groups(
+                        ctx,
+                        &region,
+                        &config.subnet_ids.clone(),
+                        &mut config.security_group_ids,
+                    )
+                    .await;
+                }
             }
         }
 

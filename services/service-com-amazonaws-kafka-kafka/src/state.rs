@@ -951,17 +951,26 @@ pub const REPLICATOR_VERSION_NOT_CURRENT_MESSAGE: &str =
 /// wire (`CurrentVersion`'s `jsonName`).
 pub const CURRENT_VERSION_MEMBER: &str = "currentVersion";
 
-/// The wire error code that refusal carries, and the status the model gives the
-/// `NotFoundException` shape (`@httpError 404`).
+/// The refusal an operation answers for a resource reference this endpoint holds
+/// nothing for: the modelled `NotFoundException` (HTTP 404, the status the model
+/// gives the shape) naming, in `InvalidParameter`, the input member that carried
+/// the reference, and [`RESOURCE_NOT_FOUND_MESSAGE`] as its whole message.
 ///
-/// Named here because an operation whose model declares NO `NotFoundException`
-/// still answers one for a reference it cannot resolve — the service answers the
-/// code whatever its published model lists — so such an operation carries it
-/// through the unmodelled channel
-/// ([`crate::scaffolded::Scaffolded::unmodeled`]) with these two values.
-pub const NOT_FOUND_CODE: &str = "NotFoundException";
-/// The status that refusal carries.
-pub const NOT_FOUND_STATUS: u16 = 404;
+/// `member` is that member's name as the WIRE carries it
+/// ([`CLUSTER_ARN_MEMBER`] and its siblings), which is how every refusal of this
+/// service names the parameter at fault.
+///
+/// Built here because an operation whose own model does not DECLARE the shape
+/// still answers it for a reference it cannot resolve — the service answers the
+/// code whatever its published model lists — so such an operation widens the
+/// shape in through `#[operation_error]`'s `extra_errors` and refuses with this
+/// same payload rather than with a body of its own.
+pub fn resource_not_found(member: &str) -> crate::ops::types::NotFoundException {
+    crate::ops::types::NotFoundException {
+        invalid_parameter: Some(member.to_string()),
+        message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
 
 /// The same refusal, as the replicator APIs phrase it: the input member that
 /// failed to resolve, then [`RESOURCE_NOT_FOUND_MESSAGE`] and nothing else.
@@ -3787,25 +3796,51 @@ struct ClusterIdentity {
     dns_suffix: String,
 }
 
+/// The segment an MSK cluster ARN carries after its cluster id when the cluster
+/// is SERVERLESS.
+///
+/// The last segment of a cluster ARN encodes which KIND of cluster the ARN names
+/// — recorded behaviour, since the model places no constraint on the ARN text —
+/// and a client reads the kind out of it: a serverless ARN carries this fixed
+/// marker where a provisioned one carries its own ordinal, so an IAM resource
+/// pattern or a console that distinguishes the two kinds by ARN classifies an
+/// emulated cluster as the kind it really is.
+pub const SERVERLESS_CLUSTER_ARN_SEGMENT: &str = "s2";
+
+/// The segment a cluster ARN ends in, for a cluster of `cluster_type` registered
+/// under the 1-based `ordinal`: the serverless marker for a serverless cluster,
+/// and the cluster's own ordinal for a provisioned one.
+///
+/// ONE place, so both create paths derive the segment from the kind of cluster
+/// they register rather than from which constructor minted the ARN.
+fn cluster_arn_type_segment(cluster_type: &str, ordinal: u64) -> String {
+    match cluster_type {
+        CLUSTER_TYPE_SERVERLESS => SERVERLESS_CLUSTER_ARN_SEGMENT.to_string(),
+        _ => ordinal.to_string(),
+    }
+}
+
 /// Derive a cluster's identity from the registry's monotonic counter, so one
 /// number seeds its uuid, its ARN tail and its endpoint host names — and both
 /// create paths mint an ARN the same way, whichever kind of cluster they
-/// register.
-fn cluster_identity(region: &str, name: &str, suffix: u64) -> ClusterIdentity {
-    // The counter, as the 1-based ordinal AWS puts at the end of a cluster ARN.
-    // The SAME value seeds the digest, so a cluster's uuid, DNS suffix and ARN
-    // tail all follow from one number.
+/// register, apart from the type segment the ARN ends in
+/// ([`cluster_arn_type_segment`]).
+fn cluster_identity(region: &str, name: &str, suffix: u64, cluster_type: &str) -> ClusterIdentity {
+    // The counter, as the 1-based ordinal AWS puts at the end of a PROVISIONED
+    // cluster ARN. The SAME value seeds the digest, so a cluster's uuid, DNS
+    // suffix and ARN tail all follow from one number whichever kind it is.
     let ordinal = suffix + 1;
     let digest = stable_digest(&format!(
         "{}:{region}:{name}:{ordinal}",
         ::engine::emulator_account_id()
     ));
     let cluster_uuid = uuid_v4_shaped_from_digest(&digest);
+    let type_segment = cluster_arn_type_segment(cluster_type, ordinal);
     ClusterIdentity {
         arn: ::engine::emulator_arn(
             "kafka",
             region,
-            &format!("cluster/{name}/{cluster_uuid}-{ordinal}"),
+            &format!("cluster/{name}/{cluster_uuid}-{type_segment}"),
         ),
         // The DNS suffix of an MSK endpoint is a short opaque cluster id plus the
         // cell the cluster landed in: `b-1.demo.a1b2c3.c4.kafka.<region>...`.
