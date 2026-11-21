@@ -2474,6 +2474,12 @@ impl Database {
                 .execute(follow_on, [])
                 .map_err(SqlError::from_engine)?;
         }
+        // And the value a definition's own `AUTO_INCREMENT` table option started its
+        // counter at, carried into the engine's counter for that table now the table
+        // exists: the mark is the value below the first key the table hands out.
+        if let Some((table, mark)) = &plan.starting_sequence {
+            self.advance_sequences(&[(table.clone(), *mark)]);
+        }
         // What the statement declared, and what it dropped: a table's
         // declarations are replaced wholesale when it is created, and go with it
         // when it is dropped, so a table's remembered declarations are the ones

@@ -71,7 +71,7 @@ use sqlparser::ast::{
     FunctionArgExpr, FunctionArguments, GroupByExpr, Ident, ObjectName, ObjectNamePart,
     ObjectType, OnConflict, OnConflictAction, OnInsert, OrderByKind, Query, SelectItem, SetExpr,
     Statement, TableConstraint, TableFactor, TableObject, Value, visit_expressions,
-    visit_expressions_mut,
+    visit_expressions_mut, CreateTableOptions, SqlOption,
 };
 use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::keywords::Keyword;
@@ -680,6 +680,11 @@ pub struct Plan {
     /// remembers so a later read of them reports the type they were declared
     /// with.
     pub sequence_columns: Vec<SequenceColumn>,
+    /// The table whose counter this statement's own definition starts at a value of its
+    /// own, and the MARK that start sets — the value below it, because a counter's mark is
+    /// the last value it handed out. `None` for every statement whose definition says
+    /// nothing about where a counter starts.
+    pub starting_sequence: Option<(String, i64)>,
     /// Statements that complete this one, run after it: the sequence a
     /// declaration needs and the engine does not keep itself, and the further
     /// tables one statement empties.
@@ -958,6 +963,7 @@ pub fn plan(sql: &str, catalog: &Catalog<'_>) -> Result<Plan, SqlError> {
     // rendered the same way as the ones the caller wrote.
     names::quote_identifiers(&mut statement);
     let (sequence_columns, mut follow_on) = plan_sequences(&mut statement);
+    let starting_sequence = plan_table_options(&mut statement);
     let (sql, emptied) = rendered(&statement);
     follow_on.extend(emptied);
     Ok(Plan {
@@ -974,9 +980,73 @@ pub fn plan(sql: &str, catalog: &Catalog<'_>) -> Result<Plan, SqlError> {
         named_columns,
         sole_table,
         sequence_columns,
+        starting_sequence,
         follow_on,
     })
 }
+
+/// Take the TABLE OPTIONS off a definition, and answer the mark its counter starts from
+/// where one of them said so.
+///
+/// A table option names a property of how the engine STORES the table — which storage engine
+/// holds it, the character set and collation its text columns default to, its row format, how
+/// its pages are packed, its comment — and not what the table holds: every column, constraint
+/// and default the definition declares is unchanged by them, and the engine behind this data
+/// plane has one storage engine and one encoding, so it declares none of them. A definition
+/// carrying them therefore defines exactly the table the same definition without them
+/// defines, which is why they are taken off here rather than handed to an engine whose
+/// grammar has no clause for them.
+///
+/// `AUTO_INCREMENT = <value>` is the one option in that list a client can OBSERVE — "the
+/// initial `AUTO_INCREMENT` value for the table", so the first key the table's counter hands
+/// out is that value — and it is answered rather than dropped: the engine keeps the counter as
+/// the mark of the last value handed out, so the mark a definition starting at `<value>` sets
+/// is the one below it ([`crate::state::Database::advance_sequences`], which carries it in
+/// once the table exists). A value of one or less is the counter's own start, so it sets
+/// nothing.
+fn plan_table_options(statement: &mut Statement) -> Option<(String, i64)> {
+    let Statement::CreateTable(create) = statement else {
+        return None;
+    };
+    // The table as the ENGINE will hold it, which is the name the counter is kept under:
+    // every name this front end renders is delimited and nothing folds its case
+    // ([`names::quote_identifiers`]), so a definition that wrote `Orders` creates `Orders`
+    // and a mark keyed by anything else would reach no counter at all.
+    let table = create
+        .name
+        .0
+        .last()
+        .map(|part| part.to_string())
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string();
+    let starting_at = starting_auto_increment(&create.table_options);
+    create.table_options = CreateTableOptions::None;
+    starting_at
+        .filter(|value| *value > 1)
+        .map(|value| (table, value - 1))
+}
+
+/// The value a definition's `AUTO_INCREMENT = <value>` table option names, read off the parse.
+fn starting_auto_increment(options: &CreateTableOptions) -> Option<i64> {
+    let named = match options {
+        CreateTableOptions::With(options)
+        | CreateTableOptions::Options(options)
+        | CreateTableOptions::Plain(options) => options,
+        _ => return None,
+    };
+    named.iter().find_map(|option| match option {
+        SqlOption::KeyValue { key, value }
+            if key.value.eq_ignore_ascii_case(AUTO_INCREMENT_OPTION) =>
+        {
+            value.to_string().trim().parse().ok()
+        }
+        _ => None,
+    })
+}
+
+/// MySQL's own name for the table option that says which value a table's counter starts at.
+const AUTO_INCREMENT_OPTION: &str = "AUTO_INCREMENT";
 
 /// The column each result column of a statement READS, where the statement reads one
 /// directly: a column reference, bare or qualified, whether or not an alias renames it.

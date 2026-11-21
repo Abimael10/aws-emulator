@@ -932,3 +932,249 @@ async fn an_error_the_database_raised_is_worded_as_the_clusters_engine_words_it(
         );
     }
 }
+
+/// The column definitions every table-option case declares, so the only difference between
+/// a case's two tables is the options the definition carries.
+const OPTION_CASE_COLUMNS: &str = "(id INT PRIMARY KEY, label VARCHAR(64) NOT NULL, hits INT)";
+
+/// RULE: a TABLE OPTION of a `CREATE TABLE` names a property of how the engine STORES the
+/// table — which storage engine holds it, the character set and collation its text columns
+/// default to, its row format, how its pages are packed, its comment — and not what the
+/// table holds, so a definition carrying table options is executed and defines exactly the
+/// table the same definition without them defines. `DatabaseErrorException` is reserved for
+/// SQL the engine itself rejects, which valid data definition is not. The one option of that
+/// list a client can OBSERVE is `AUTO_INCREMENT = <value>`, "the initial AUTO_INCREMENT value
+/// for the table", which the test below this one pins.
+///
+/// The rows span what the rule generalises over: each option class the MySQL Reference
+/// Manual's `CREATE TABLE` entry lists under `table_option` (the storage engine, the
+/// character set, the collation, the row format, the key packing, the persistent statistics,
+/// the comment, the starting counter), the spellings a client writes them in (with `=` and
+/// without, upper and lower case, several in one definition), and a definition carrying none
+/// at all as the control every row is compared against.
+#[tokio::test]
+async fn a_definition_carrying_mysql_table_options_defines_the_same_table() {
+    // (case, the options the definition carries)
+    let cases = [
+        ("the storage engine", "ENGINE = InnoDB"),
+        ("the storage engine, written without =", "ENGINE InnoDB"),
+        ("the storage engine, in lower case", "engine = innodb"),
+        ("another storage engine", "ENGINE = MyISAM"),
+        (
+            "the default character set and collation",
+            "DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci",
+        ),
+        ("the row format", "ROW_FORMAT = DYNAMIC"),
+        ("the key packing", "PACK_KEYS = 1 KEY_BLOCK_SIZE = 8"),
+        ("the persistent statistics", "STATS_PERSISTENT = 1"),
+        ("a comment", "COMMENT = 'rows a client seeded'"),
+        (
+            "the counter's own start, on a table whose key is not a counter",
+            "AUTO_INCREMENT = 1",
+        ),
+        (
+            "the whole idiom a dump emits",
+            "ENGINE = InnoDB AUTO_INCREMENT = 1 DEFAULT CHARSET = utf8mb4 \
+             COLLATE = utf8mb4_0900_ai_ci ROW_FORMAT = DYNAMIC",
+        ),
+    ];
+
+    for (index, (case, options)) in cases.into_iter().enumerate() {
+        let api = DataApi::new();
+        let declared = format!("options_{index}");
+        let control = format!("plain_{index}");
+
+        let (status, created) = api
+            .execute(json!({
+                "sql": format!("CREATE TABLE {declared} {OPTION_CASE_COLUMNS} {options}"),
+            }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the definition must be executed, got {status} {created}"
+        );
+        assert_eq!(
+            number(&created, "numberOfRecordsUpdated"),
+            0,
+            "case {case:?}: a definition updates no records, got {created}"
+        );
+        api.run(json!({
+            "sql": format!("CREATE TABLE {control} {OPTION_CASE_COLUMNS}"),
+        }))
+        .await;
+
+        // The same row, stored and read back through both tables: what the table holds, and
+        // how the result set describes it, cannot depend on the options.
+        for table in [&declared, &control] {
+            api.run(json!({
+                "sql": format!(
+                    "INSERT INTO {table} (id, label, hits) VALUES (:id, :label, 7)"
+                ),
+                "parameters": [
+                    parameter("id", json!({"longValue": 1})),
+                    parameter("label", json!({"stringValue": "seeded"})),
+                ],
+            }))
+            .await;
+        }
+        let read_back = async |table: &str| {
+            api.run(json!({
+                "sql": format!("SELECT id, label, hits FROM {table} ORDER BY id"),
+                "includeResultMetadata": true,
+            }))
+            .await
+        };
+        let from_declared = read_back(&declared).await;
+        let from_control = read_back(&control).await;
+        assert_eq!(
+            from_declared["records"], from_control["records"],
+            "case {case:?}: expected the rows of the table declared without options \
+             ({}), got {from_declared}",
+            from_control["records"]
+        );
+        assert_eq!(
+            described_columns(&from_declared),
+            described_columns(&from_control),
+            "case {case:?}: expected the columns of the table declared without options, \
+             got {from_declared}"
+        );
+
+        // And the constraints the definition declared are in force in both: the NOT NULL
+        // column refuses a row that leaves it out.
+        for table in [&declared, &control] {
+            let (status, refused) = api
+                .execute(json!({
+                    "sql": format!("INSERT INTO {table} (id, hits) VALUES (2, 1)"),
+                }))
+                .await;
+            assert_eq!(
+                (status, error_code(&refused)),
+                (400, "DatabaseErrorException"),
+                "case {case:?}: the NOT NULL column of {table} must refuse the row, got \
+                 {status} {refused}"
+            );
+        }
+    }
+}
+
+/// RULE: `AUTO_INCREMENT = <value>` is "the initial AUTO_INCREMENT value for the table", so
+/// the first key the table's counter hands out is that value and each later row takes the
+/// next one — whatever else the definition carries, and whichever dialect declared the
+/// counter.
+///
+/// The rows span what the rule generalises over: starting values at the counter's own start,
+/// just above it and far above it, the option alone and inside the idiom a dump emits, both
+/// spellings of a counter column (MySQL's `AUTO_INCREMENT` attribute, which is the one
+/// `generatedFields` reports, and PostgreSQL's `serial`), and the case a definition writes the
+/// table's name in — the name the engine then keeps the counter under.
+#[tokio::test]
+async fn a_definition_can_start_the_tables_counter_at_a_value_of_its_own() {
+    // (case, the table's name, the counter column's declaration, the options, the first key
+    //  the table hands out)
+    let cases = [
+        (
+            "the counter's own start",
+            "counted_plain",
+            "INT AUTO_INCREMENT",
+            "AUTO_INCREMENT = 1",
+            1,
+        ),
+        (
+            "one above the counter's own start",
+            "counted_next",
+            "INT AUTO_INCREMENT",
+            "AUTO_INCREMENT = 2",
+            2,
+        ),
+        (
+            "far above it",
+            "counted_far",
+            "INT AUTO_INCREMENT",
+            "AUTO_INCREMENT = 1000",
+            1000,
+        ),
+        (
+            "inside the idiom a dump emits",
+            "counted_dump",
+            "BIGINT AUTO_INCREMENT",
+            "ENGINE = InnoDB AUTO_INCREMENT = 42 DEFAULT CHARSET = utf8mb4",
+            42,
+        ),
+        (
+            "a counter declared in PostgreSQL's spelling",
+            "counted_serial",
+            "serial",
+            "AUTO_INCREMENT = 7",
+            7,
+        ),
+        (
+            "a table whose name is not in lower case",
+            "CountedOrders",
+            "INT AUTO_INCREMENT",
+            "AUTO_INCREMENT = 500",
+            500,
+        ),
+        (
+            "a table whose name the definition delimited",
+            "\"Counted Orders\"",
+            "INT AUTO_INCREMENT",
+            "AUTO_INCREMENT = 9",
+            9,
+        ),
+        (
+            "no starting value at all, so the counter's own start",
+            "counted_none",
+            "INT AUTO_INCREMENT",
+            "ENGINE = InnoDB",
+            1,
+        ),
+    ];
+
+    for (case, table, counter, options, first_key) in cases {
+        let api = DataApi::new();
+        let (status, created) = api
+            .execute(json!({
+                "sql": format!(
+                    "CREATE TABLE {table} (id {counter} PRIMARY KEY, label VARCHAR(16)) {options}"
+                ),
+            }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the definition must be executed, got {status} {created}"
+        );
+
+        // Two rows that leave the counter column out: the first takes the value the
+        // definition started the counter at, the second the one after it.
+        for expected in [first_key, first_key + 1] {
+            api.run(json!({
+                "sql": format!("INSERT INTO {table} (label) VALUES (:label)"),
+                "parameters": [parameter("label", json!({"stringValue": "row"}))],
+            }))
+            .await;
+            let stored = api
+                .run(json!({"sql": format!("SELECT max(id) FROM {table}")}))
+                .await;
+            assert_eq!(
+                stored["records"],
+                json!([[{"longValue": expected}]]),
+                "case {case:?}: expected the counter to hand out {expected}, got {stored}"
+            );
+        }
+    }
+}
+
+/// Each column of a result set as `(name, typeName, nullable)`, which is what
+/// `columnMetadata` describes a table's columns by.
+fn described_columns(body: &Value) -> Vec<(String, String, Value)> {
+    list(body, "columnMetadata")
+        .iter()
+        .map(|column| {
+            (
+                column["name"].as_str().unwrap_or_default().to_string(),
+                column["typeName"].as_str().unwrap_or_default().to_string(),
+                column["nullable"].clone(),
+            )
+        })
+        .collect()
+}
