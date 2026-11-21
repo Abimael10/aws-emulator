@@ -563,8 +563,9 @@ pub fn managed_base_image_arn(region: &str, image_id: &str) -> String {
 /// `ListManagedMicrovmImageVersions` serves this table, so what a client DISCOVERS to
 /// pin as `CreateMicrovmImage$baseImageVersion` ("The specific version of the base
 /// MicroVM image to use") is what the table publishes. A create's own version is not
-/// checked against it — the service records whatever version the request pinned — and
-/// what a create that pins NONE records is not a generation of this table either; see
+/// checked against it — the service records whatever version the request pinned — while
+/// a create that pins NONE is RESOLVED from it, against the newest generation the table
+/// publishes for the base image the request named; see
 /// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`].
 ///
 /// Each generation also publishes the architectures a MicroVM built on it can target,
@@ -682,10 +683,11 @@ pub fn managed_base_image_publication(image_id: &str) -> Option<(DateTime, DateT
 /// published order is newest first ([`published_managed_base_image_versions`]), so this
 /// is the first row `ListManagedMicrovmImageVersions` serves for it.
 ///
-/// A published-order ACCESSOR, not a resolution rule: nothing resolves a request
-/// against it (see
-/// [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`] for
-/// what an unpinned build records), and the listing's own order check reads it.
+/// This is also the generation an unpinned build on that base image is placed on
+/// ([`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`]): the
+/// newest version the named base image publishes, read from the one table the catalogue
+/// listing serves, so the pedigree a version records and the catalogue a client
+/// discovers that version in cannot disagree.
 pub fn latest_managed_base_image_version(image_id: &str) -> Option<&'static str> {
     published_managed_base_image_versions(image_id)
         .into_iter()
@@ -2599,9 +2601,31 @@ pub fn idempotency_key(operation: &str, client_token: &str) -> String {
     format!("{operation}\u{1f}{client_token}")
 }
 
-/// `now`, as the wire timestamp type every output member uses.
+/// The nanoseconds a millisecond holds, the resolution every instant this service
+/// records is kept at ([`millisecond_precision`]).
+const NANOS_PER_MILLISECOND: u32 = 1_000_000;
+
+/// `at`, with its sub-second part cut down to the MILLISECOND resolution this service
+/// reports an instant at.
+///
+/// Every `Timestamp` member of this API serializes as epoch-seconds with a fraction
+/// (`restJson1`, and the model states no `timestampFormat` override on any of them), and
+/// the service reports those seconds at millisecond resolution (recorded AWS behaviour).
+/// The resolution therefore belongs to the instant a record KEEPS rather than to one
+/// projection of it: a stored instant is already the value every read of that record,
+/// and everything derived from it, reports, so no two answers about one record can
+/// disagree about it.
+pub fn millisecond_precision(at: DateTime) -> DateTime {
+    DateTime::from_secs_and_nanos(
+        at.secs(),
+        at.subsec_nanos() / NANOS_PER_MILLISECOND * NANOS_PER_MILLISECOND,
+    )
+}
+
+/// `now`, as the wire timestamp type every output member uses, at the resolution this
+/// service reports an instant at ([`millisecond_precision`]).
 pub fn now_datetime() -> DateTime {
-    DateTime::from(::std::time::SystemTime::now())
+    millisecond_precision(DateTime::from(::std::time::SystemTime::now()))
 }
 
 /// The region this request was signed for, for the ARNs it mints.

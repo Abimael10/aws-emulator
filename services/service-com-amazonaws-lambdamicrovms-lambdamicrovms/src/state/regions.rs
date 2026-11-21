@@ -232,23 +232,30 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
     /// The version of the base image `base_image_arn` names, for a request that named
     /// none.
     ///
-    /// `baseImageVersion` is "the specific version of the base MicroVM image to use",
-    /// so the service resolves one rather than recording none: the base image's own
-    /// active version when this region holds it, and otherwise the initial version,
-    /// [`FIRST_IMAGE_VERSION`].
+    /// `baseImageVersion` is "the specific version of the base MicroVM image to use", so
+    /// the service RESOLVES one from the base image the request named rather than
+    /// recording a constant: the version that base image currently publishes, in the
+    /// label form it publishes it in. Which record publishes it follows from the
+    /// namespace the reference is in — an image of this account publishes the version it
+    /// is serving ([`MicrovmImage::latest_active_image_version`]), and an AWS-managed
+    /// base image publishes its generations through the catalogue, whose newest one is
+    /// what a build on it is placed on ([`latest_managed_base_image_version`]).
     ///
-    /// A reference into the AWS-managed catalogue takes that same initial version rather
-    /// than the newest GENERATION the catalogue publishes for it
-    /// ([`latest_managed_base_image_version`]), so the catalogue is deliberately NOT
-    /// consulted here: the recorded create answers the `major.minor` initial version for
-    /// an unpinned build on a managed base image, while a build that pins a generation
-    /// records the generation it pinned.
+    /// A base image that publishes NO version — an own image whose every build failed, a
+    /// reference into neither namespace — leaves nothing to resolve, so the record takes
+    /// the initial version, [`FIRST_IMAGE_VERSION`]: the member is never left unset on an
+    /// accepted create.
     pub fn resolve_base_image_version(&self, region: &str, base_image_arn: &str) -> String {
         if let Some(active) = self
             .image(region, base_image_arn)
             .and_then(|image| image.latest_active_image_version.clone())
         {
             return active;
+        }
+        if let Some(published) =
+            managed_microvm_image_id(base_image_arn).and_then(latest_managed_base_image_version)
+        {
+            return published.to_string();
         }
         FIRST_IMAGE_VERSION.to_string()
     }

@@ -75,3 +75,32 @@ Cause 2 (ListMicrovmImageBuilds createdAt precision):
    Emulator: six fractional digits, e.g. 1795018028.325499.
    Do not assert the instant itself — it is per-run; assert only that the fractional part is at most three digits, and that the same build's createdAt read back through GetMicrovmImageBuild serializes identically.
 8. Re-replay fixture lambdamicrovms-customer-image-lifecycle step task#8 to confirm the fix: both rows of the page must match the recorded rows on every value-asserted member, createdAt included at the recorded precision.
+
+## Fix status
+
+Cause 1: the RESOLUTION is implemented. An unpinned `baseImageVersion` is now resolved from the
+base image the request named — the version that base image currently publishes, in the label form
+it publishes it in: the version an own image is serving, and for an AWS-managed reference the newest
+generation its catalogue entry publishes
+(`ComAmazonawsLambdamicrovmsLambdamicrovmsState::resolve_base_image_version`, src/state/regions.rs)
+— and the resolved value is stored on the version record, so the create response, the
+single-version read and every listing row report one pedigree.
+
+What this report proposes beyond that — relabelling the catalogue's published versions so the
+resolution can answer the recorded `'2.0'` — the corpus itself contradicts: the recorded
+`ListManagedMicrovmImageVersions` for the same base image publishes integer GENERATION labels
+`'1'` and `'0'` (value-asserted; see `20261030T024426Z-lambda-microvms-managed-microvm-image-catalog-is-synthesized.md`,
+Cause 1, whose key that recording reports as fixed). The catalogue therefore keeps the labels the
+corpus records, the resolution returns the newest of them, and the replay cluster still reports the
+difference between that label and `'2.0'` — a label of AWS's live catalogue that no record this
+emulator holds produces, and which cannot be invented without contradicting the recorded catalogue
+listing.
+
+Cause 2: FIXED. Every instant this service records is now kept at the millisecond resolution it
+reports (`crate::state::millisecond_precision`, applied in `crate::state::now_datetime`), so no
+`Timestamp` member of any response carries a finer fraction and no two reads of one record disagree.
+`tests/all/microvm_lifecycle.rs` pins that over every read path that reports an instant, asserting
+the RAW digits the emulator wrote. The replay cluster for `ListMicrovmImageBuilds` compares the
+whole row, which carries the recording's own per-run `createdAt` instant and a shaped `buildId`
+whose minted form is the subject of `20261117T102011Z-lambda-microvms-getmicrovmimagebuild-answers-with-a-buildid-that.md`,
+so that key stays reported open on values this cause does not claim.

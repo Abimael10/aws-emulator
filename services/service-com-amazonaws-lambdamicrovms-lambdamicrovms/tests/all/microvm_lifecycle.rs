@@ -97,6 +97,23 @@ const BASE_IMAGE_ARN: &str = "arn:aws:lambda:us-west-2:aws:microvm-image:al2023-
 /// `^arn:aws[a-z\-]*:iam::[0-9]{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
 const BUILD_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/microvm-build";
 
+/// The base-image version a create that pins NO `baseImageVersion` is resolved to on the
+/// base image above: the newest version that base image publishes, which for an
+/// AWS-managed one is the newest generation its catalogue entry publishes
+/// (`state::resolve_base_image_version`). Read off the catalogue rather than written as a
+/// literal, so a suite asserts the resolution rather than one published label.
+pub(crate) fn resolved_base_image_version() -> String {
+    let image_id = BASE_IMAGE_ARN
+        .rsplit_once(':')
+        .map(|(_, image_id)| image_id)
+        .unwrap_or_default();
+    service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::latest_managed_base_image_version(
+        image_id,
+    )
+    .unwrap_or_else(|| panic!("the catalogue publishes a generation of {image_id:?}"))
+    .to_string()
+}
+
 /// An execution role ARN, same `RoleArn` shape as the build role.
 const EXECUTION_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/microvm-exec";
 
@@ -174,6 +191,24 @@ pub(crate) async fn call_for_error_type(
     uri: &str,
     body: Option<Value>,
 ) -> (u16, String, Value) {
+    let (status, error_type, text) = call_for_raw_body(router, region, method, uri, body).await;
+    let json = match text.is_empty() {
+        true => Value::Null,
+        false => serde_json::from_str(&text).unwrap_or(Value::Null),
+    };
+    (status, error_type, json)
+}
+
+/// The same request as [`call_for_error_type`], with the answer's body as the RAW TEXT
+/// the emulator serialized — what a suite asserting the wire FORM of a value needs,
+/// because a JSON parse hands back a number rather than the digits that were written.
+pub(crate) async fn call_for_raw_body(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, String, String) {
     let payload = body.map(|value| value.to_string()).unwrap_or_default();
     let request = http::Request::builder()
         .method(method)
@@ -199,12 +234,11 @@ pub(crate) async fn call_for_error_type(
         .unwrap_or_default()
         .to_string();
     let bytes = response.into_body();
-    let json = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, error_type, json)
+    (
+        status,
+        error_type,
+        String::from_utf8_lossy(&bytes).to_string(),
+    )
 }
 
 /// A `CreateMicrovmImage` body: the four required members, plus whatever `extra` adds.
@@ -1417,4 +1451,264 @@ pub(crate) fn as_uri_value(value: &str) -> &str {
         "an identifier used in a URI must need no escaping, got {value:?}"
     );
     value
+}
+
+/// Every member this service reports an INSTANT in: the `Timestamp` members its outputs
+/// declare (`createdAt`, `updatedAt`, `startedAt`, `terminatedAt` —
+/// `smithy_query(query="operation",operation="CreateMicrovmImage,GetMicrovmImage,GetMicrovmImageVersion,GetMicrovmImageBuild,RunMicrovm,GetMicrovm,ListManagedMicrovmImages")`).
+const REPORTED_INSTANT_MEMBERS: &[&str] = &["createdAt", "updatedAt", "startedAt", "terminatedAt"];
+
+/// How many fractional digits a millisecond needs in epoch-seconds.
+const MILLISECOND_FRACTION_DIGITS: usize = 3;
+
+/// The digits each occurrence of the member `member` of the RAW response text `body` was
+/// serialized with — one per row for a listing page, in the order the page wrote them.
+///
+/// Read off the TEXT rather than off a parse, because what is under test is the form the
+/// emulator wrote: a parse hands back a number, which carries no record of how many
+/// digits were written for it.
+fn written_members<'a>(body: &'a str, member: &str) -> Vec<&'a str> {
+    let key = format!("\"{member}\":");
+    let mut written = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find(&key) {
+        let value = &rest[at + key.len()..];
+        let end = value.find([',', '}', ']']).unwrap_or(value.len());
+        written.push(value[..end].trim());
+        rest = &value[end..];
+    }
+    written
+}
+
+/// Assert the rule on every instant the raw answer `body` reports: an instant of this
+/// service is epoch-seconds naming a real moment, carrying at most the three fractional
+/// digits a millisecond needs. Answers `(how many it judged, how many of those carried a
+/// sub-second fraction at all)`, so a case can insist both that the answer reported an
+/// instant and that the resolution itself is observable rather than only the absence of
+/// excess digits.
+fn assert_millisecond_instants(case: &str, body: &str) -> (usize, usize) {
+    let mut judged = 0usize;
+    let mut fractional = 0usize;
+    for member in REPORTED_INSTANT_MEMBERS {
+        for written in written_members(body, member) {
+            if written == "null" {
+                continue;
+            }
+            let (whole, fraction) = written.split_once('.').unwrap_or((written, ""));
+            assert!(
+                whole.parse::<i64>().is_ok_and(|secs| secs > 0),
+                "case {case:?}: expected {member} to be epoch-seconds naming a real \
+                 instant, got {written:?}"
+            );
+            assert!(
+                fraction.chars().all(|digit| digit.is_ascii_digit())
+                    && fraction.len() <= MILLISECOND_FRACTION_DIGITS,
+                "case {case:?}: expected {member} at millisecond resolution (at most \
+                 {MILLISECOND_FRACTION_DIGITS} fractional digits), got {written:?}"
+            );
+            judged += 1;
+            fractional += usize::from(!fraction.is_empty());
+        }
+    }
+    (judged, fractional)
+}
+
+/// One request, with the answer as both the raw text the emulator wrote and its parse.
+async fn call_raw(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, String, Value) {
+    let (status, _error_type, text) = call_for_raw_body(router, REGION, method, uri, body).await;
+    let json = match text.is_empty() {
+        true => Value::Null,
+        false => serde_json::from_str(&text).unwrap_or(Value::Null),
+    };
+    (status, text, json)
+}
+
+/// RULE: every instant this service reports is epoch-seconds at MILLISECOND resolution —
+/// no answer carries a finer sub-second fraction, whichever member or read path reports it
+/// — and the instant a record keeps is one value, so a listing row and the single-resource
+/// read of the same record report it identically.
+#[tokio::test]
+async fn every_reported_instant_is_epoch_seconds_at_millisecond_resolution() {
+    let router = emulator();
+    let name = "instant-resolution";
+
+    // The writes first: each one's own answer reports the instants it recorded. The count
+    // of instants that carried a sub-second FRACTION is kept across the whole case, so the
+    // resolution itself is observed rather than only the absence of excess digits.
+    let mut fractional_seen = 0usize;
+    let (status, created_text, created) = call_raw(
+        &router,
+        "POST",
+        "/2025-09-09/microvm-images",
+        Some(image_body(name, json!({}))),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "the create got {status} {created_text}"
+    );
+    let (judged, fractional) = assert_millisecond_instants("the create", &created_text);
+    assert!(
+        judged > 0,
+        "the create reports an instant: got {created_text}"
+    );
+    fractional_seen += fractional;
+    let image_arn = created["imageArn"].as_str().unwrap_or_default().to_string();
+    let image_version = created["imageVersion"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // The build is owed by the clock: wait for the CONDITION, so the reads below are of a
+    // settled record rather than of one mid-transition.
+    poll_until(
+        "the build",
+        &format!("the version {image_version} of {name} has settled"),
+        || async {
+            let (status, read) = call(
+                &router,
+                "GET",
+                &format!("/2025-09-09/microvm-images/{name}/versions/{image_version}"),
+                None,
+            )
+            .await;
+            status == 200
+                && read["state"]
+                    .as_str()
+                    .is_some_and(|state| state == "SUCCESSFUL" || state == "FAILED")
+        },
+    )
+    .await;
+
+    let (status, run_text, run) = call_raw(
+        &router,
+        "POST",
+        "/2025-09-09/microvms",
+        Some(json!({"imageIdentifier": image_arn.clone()})),
+    )
+    .await;
+    assert_eq!(status, 200, "the launch got {status} {run_text}");
+    let (judged, fractional) = assert_millisecond_instants("the launch", &run_text);
+    assert!(
+        judged > 0,
+        "the launch reports an instant: got {run_text}"
+    );
+    fractional_seen += fractional;
+    let microvm_id = run["microvmId"].as_str().unwrap_or_default().to_string();
+
+    let (status, terminated_text, _) = call_raw(
+        &router,
+        "DELETE",
+        &format!("/2025-09-09/microvms/{}", as_uri_value(&microvm_id)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the termination got {status} {terminated_text}"
+    );
+    fractional_seen += assert_millisecond_instants("the termination", &terminated_text).1;
+
+    // One build of that version, so the build read can be addressed.
+    let builds_uri = format!(
+        "/2025-09-09/microvm-images/{}/versions/{}/builds",
+        as_uri_value(&image_arn),
+        as_uri_value(&image_version)
+    );
+    let (status, _, builds) = call_raw(&router, "GET", &builds_uri, None).await;
+    assert_eq!(status, 200, "the build listing got {status} {builds}");
+    let build_rows = builds["items"].as_array().cloned().unwrap_or_default();
+    let build_id = build_rows
+        .first()
+        .and_then(|row| row["buildId"].as_str())
+        .unwrap_or_else(|| panic!("the version holds a build to read: got {builds}"))
+        .to_string();
+
+    // Rows: every read path of this service that reports an instant — a single-resource
+    // read, a listing page of several rows, and the AWS-managed catalogue, whose instants
+    // are the published table's rather than the clock's.
+    let paths: Vec<(&str, String)> = vec![
+        (
+            "the image read",
+            format!("/2025-09-09/microvm-images/{}", as_uri_value(&image_arn)),
+        ),
+        ("the image listing", "/2025-09-09/microvm-images".to_string()),
+        (
+            "the version read",
+            format!(
+                "/2025-09-09/microvm-images/{}/versions/{}",
+                as_uri_value(&image_arn),
+                as_uri_value(&image_version)
+            ),
+        ),
+        (
+            "the version listing",
+            format!(
+                "/2025-09-09/microvm-images/{}/versions",
+                as_uri_value(&image_arn)
+            ),
+        ),
+        ("the build listing", builds_uri.clone()),
+        (
+            "the build read",
+            format!("{builds_uri}/{}", as_uri_value(&build_id)),
+        ),
+        (
+            "the MicroVM read",
+            format!("/2025-09-09/microvms/{}", as_uri_value(&microvm_id)),
+        ),
+        ("the MicroVM listing", "/2025-09-09/microvms".to_string()),
+        (
+            "the managed catalogue",
+            "/2025-09-09/managed-microvm-images".to_string(),
+        ),
+    ];
+
+    for (case, uri) in paths {
+        let (status, text, body) = call_raw(&router, "GET", &uri, None).await;
+        assert_eq!(status, 200, "case {case:?}: got {status} {text}");
+        let (judged, fractional) = assert_millisecond_instants(case, &text);
+        assert!(
+            judged > 0,
+            "case {case:?}: expected the answer to report an instant, got {body}"
+        );
+        fractional_seen += fractional;
+    }
+
+    // The resolution is a millisecond, not a whole second: the instants this service takes
+    // off its own clock keep their sub-second part.
+    assert!(
+        fractional_seen > 0,
+        "expected the instants read off the clock to keep their sub-second part, \
+         got none carrying a fraction across every read path"
+    );
+
+    // One record, one instant: the listing row and the single-build read of the SAME
+    // build report the same value, which a client can compare and key its own records on.
+    let (_, _, listed) = call_raw(&router, "GET", &builds_uri, None).await;
+    let row = listed["items"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|row| row["buildId"].as_str() == Some(build_id.as_str()))
+        .unwrap_or_else(|| panic!("the page carries the build {build_id}: got {listed}"));
+    let (_, _, read) = call_raw(
+        &router,
+        "GET",
+        &format!("{builds_uri}/{}", as_uri_value(&build_id)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        row["createdAt"], read["createdAt"],
+        "expected the build {build_id} to report one createdAt on both read paths, got \
+         {:?} listed and {:?} read",
+        row["createdAt"], read["createdAt"]
+    );
 }

@@ -11,13 +11,13 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
-    next_image_version, FIRST_IMAGE_VERSION,
+    next_image_version, IMAGE_STATE_CREATED, IMAGE_STATE_CREATE_FAILED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::microvm_lifecycle::{
     as_uri_value, built_image, call, emulator, expected_image_arn, image_body, poll_until,
-    run_microvm, PAST_THE_SPAN,
+    resolved_base_image_version, run_microvm, PAST_THE_SPAN,
 };
 
 /// `TokenParts`'s value shape `AuthTokenValue` is `@length(max: 8000)`
@@ -422,10 +422,11 @@ async fn the_created_image_projection_carries_every_modelled_member() {
         crate::microvm_lifecycle::REGION
     );
 
-    // The version a request that pins no `baseImageVersion` gets: the `major.minor`
-    // initial version (`state::FIRST_IMAGE_VERSION`), rather than a literal of this
+    // The version a request that pins no `baseImageVersion` gets: the version the base
+    // image the harness names publishes
+    // (`microvm_lifecycle::resolved_base_image_version`), rather than a literal of this
     // suite.
-    let resolved_base_version = json!(FIRST_IMAGE_VERSION);
+    let resolved_base_version = json!(resolved_base_image_version());
 
     // Rows differ in which of the two resolved members the request carries, because
     // each one is resolved, stored and projected independently of the other.
@@ -504,7 +505,23 @@ async fn the_created_image_projection_carries_every_modelled_member() {
         created_rows.push((case, name.to_string(), created));
     }
 
-    tokio::time::sleep(PAST_THE_SPAN).await;
+    // Each image's build is owed by the CLOCK, so wait for the condition it owes — the
+    // image reporting a settled state, which is what moves `updatedAt` on — by looking
+    // again until it holds, never for a span of time.
+    for (case, name, _) in &created_rows {
+        poll_until(
+            case,
+            &format!("the build of the image {name} has settled"),
+            || async {
+                let (status, image) = get_image(&router, name).await;
+                status == 200
+                    && image["state"].as_str().is_some_and(|state| {
+                        state == IMAGE_STATE_CREATED || state == IMAGE_STATE_CREATE_FAILED
+                    })
+            },
+        )
+        .await;
+    }
 
     for (case, name, created) in &created_rows {
         let (status, image) = get_image(&router, name).await;

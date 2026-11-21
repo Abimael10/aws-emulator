@@ -28,7 +28,7 @@ use service_com_amazonaws_lambdamicrovms_lambdamicrovms::ops::types::ARCHITECTUR
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     latest_managed_base_image_version, managed_base_image_arn,
     managed_base_image_supported_architectures, published_managed_base_image_versions,
-    version_order, FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS,
+    version_order, MANAGED_BASE_IMAGE_IDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -207,9 +207,9 @@ async fn every_published_generation_reports_the_architectures_it_supports() {
 }
 
 /// RULE: the catalogue is the ONE table both sides of the service read — a create that
-/// pins a generation the catalogue publishes is accepted and records that generation,
-/// one that pins none records the `major.minor` initial version, and neither changes
-/// what the catalogue publishes.
+/// pins a generation the catalogue publishes is accepted and records that generation, one
+/// that pins none records the newest generation the catalogue publishes for the base image
+/// it named, and neither changes what the catalogue publishes.
 #[tokio::test]
 async fn a_build_pins_any_published_generation() {
     let router = emulator();
@@ -236,10 +236,12 @@ async fn a_build_pins_any_published_generation() {
     rows.push((
         "unpinned".to_string(),
         json!({"baseImageArn": base_image_arn}),
-        // A build that pins no generation records the `major.minor` INITIAL version
-        // rather than a catalogue generation (recorded behaviour —
-        // `state::resolve_base_image_version`).
-        FIRST_IMAGE_VERSION.to_string(),
+        // A build that pins no generation is RESOLVED against the catalogue: it records
+        // the newest generation published for the base image it named
+        // (`state::resolve_base_image_version`).
+        latest_managed_base_image_version(image_id)
+            .unwrap_or_else(|| panic!("the catalogue publishes a generation of {image_id}"))
+            .to_string(),
     ));
 
     for (name, extra, expected) in rows {
