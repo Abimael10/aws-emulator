@@ -87,7 +87,12 @@ const STATE_ENABLED: &str = "Enabled";
 /// The attribute the sink item is keyed by, the attribute the handler stamps it with, and the
 /// value it stamps there. None of the three is read by this emulator: they are the handler's
 /// own, passed to it through its environment and asserted here.
-const KEY_ATTRIBUTE: &str = "pk";
+///
+/// `KEY_ATTRIBUTE` is `pub(crate)` because the sink table has ONE shape in this target: the
+/// sibling suite that watches the same chain through a stream CONSUMER
+/// ([`crate::kinesis_fan_out_consumer_handler_writes_dynamodb`]) writes its items to a table
+/// [`given_table`] created, so both suites read the key this one names.
+pub(crate) const KEY_ATTRIBUTE: &str = "pk";
 /// See [`KEY_ATTRIBUTE`].
 const SOURCE_ATTRIBUTE: &str = "source";
 /// See [`KEY_ATTRIBUTE`].
@@ -129,7 +134,10 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One DynamoDB call (`awsJson1_0`, `DynamoDB_20120810.<Operation>`) that must answer 200.
-async fn dynamodb(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+///
+/// `pub(crate)` for the reason [`KEY_ATTRIBUTE`] is: every suite of this target that reads a
+/// handler's own DynamoDB write back reads it over this one wire.
+pub(crate) async fn dynamodb(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -162,7 +170,9 @@ async fn dynamodb(router: &MultiServiceRouter, case: &str, operation: &str, body
 
 /// The sink table the handler writes, waited out to `ACTIVE` — "you can perform read and
 /// write operations only on an ACTIVE table" — and answered as its ARN.
-async fn given_table(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+///
+/// `pub(crate)` for the reason [`KEY_ATTRIBUTE`] is.
+pub(crate) async fn given_table(router: &MultiServiceRouter, case: &str, name: &str) -> String {
     let created = dynamodb(
         router,
         case,

@@ -161,7 +161,12 @@ fn emulator() -> MultiServiceRouter {
 ///
 /// Registered and read back through Kinesis's own surface, so the ARN a mapping below names is
 /// the one that service minted and reports.
-async fn given_active_consumer(
+///
+/// `pub(crate)` because a consumer a mapping may be created on has ONE fixture in this target:
+/// the sibling suite that watches the same delivery through the handler's own AWS call
+/// ([`crate::kinesis_fan_out_consumer_handler_writes_dynamodb`]) stands its consumer up here
+/// too, so the two tables cannot drift apart on what a readable consumer is.
+pub(crate) async fn given_active_consumer(
     router: &MultiServiceRouter,
     case: &str,
     stream_arn: &str,
