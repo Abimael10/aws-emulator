@@ -3,7 +3,7 @@
 //! What a Config refusal says about the REQUEST that drew it, end to end over the wire.
 //!
 //! An error code is shared by many legs, so the message is the whole of what a client can
-//! branch on — and whether it carries anything of the request is itself the rule. Four
+//! branch on — and whether it carries anything of the request is itself the rule. Five
 //! rules are pinned here, each over a TABLE of inputs rather than one recorded call:
 //!
 //! 1. a command this service cannot read as a Config query is a SYNTAX error, reported at
@@ -15,9 +15,15 @@
 //!    members that identifier carries, whatever they are;
 //! 3. the service-linked recorder surface words a refusal for the DIMENSION the request
 //!    selected the recorder by: the service-principal legs name the service principal, and
-//!    never the recorder name the caller never sent;//! 4. `PutResourceConfig` refuses a `ResourceType` the CloudFormation registry holds no
+//!    never the recorder name the caller never sent;
+//! 4. `PutResourceConfig` refuses a `ResourceType` the CloudFormation registry holds no
 //!    registration for as the input-validation failure of the value it was sent —
-//!    `ValidationException`, client 400 — and records nothing.
+//!    `ValidationException`, client 400 — and records nothing. The refusal is keyed on that
+//!    member alone, so it is the same whatever else the request carries, and it never
+//!    clears, because nothing a caller retries registers a type;
+//! 5. the position a syntax error reports counts CHARACTERS of the submitted expression,
+//!    and is always a position that expression has: a line it was written over, at a
+//!    character of that line or the one just past its end.
 //!
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — reusing the
@@ -534,5 +540,336 @@ async fn an_unregistered_resource_type_is_refused_by_the_registry_lookups_own_cl
         history["configurationItems"].as_array().map(Vec::len),
         Some(1),
         "the registered type is recorded and read back, got {history}"
+    );
+}
+
+/// `ResourceType`'s length maximum, from `smithy_query(query="operation",
+/// operation="PutResourceConfig")`: `ResourceTypeString`, 1..196.
+const RESOURCE_TYPE_MAX_LENGTH: usize = 196;
+
+/// Another entry of `com.amazonaws.configservice#ResourceType`, used as the control of the
+/// registration rule below so the control is not a type the rows beside it name.
+const KMS_KEY: &str = "AWS::KMS::Key";
+
+/// The sentence Config refuses a `ResourceType` the CloudFormation registry holds no
+/// registration for with: fixed text whose one variable part is the type the request
+/// carried. Written out here rather than read from the service's own helper, so this suite
+/// PINS the template instead of restating it.
+fn unregistered_type_text(resource_type: &str) -> String {
+    format!(
+        "Cannot find registered Resource Type with name {resource_type}. Please register the \
+         Resource Type with Cloudformation and try again."
+    )
+}
+
+/// Require that `PutResourceConfig` refuses `body` for the registration of `resource_type`
+/// as the INPUT-VALIDATION class — client 400, `ValidationException` — with that
+/// registration sentence.
+///
+/// The report names the permission class as well, because that is the other class this leg
+/// could be answered with and the two have opposite remediations: one is fixed by
+/// registering the type, the other by changing a role.
+async fn refused_registration(case: &str, emulator: &Emulator, resource_type: &str, body: &Value) {
+    let (status, code, message) = refusal(emulator, "PutResourceConfig", body).await;
+    let expected = unregistered_type_text(resource_type);
+    assert_eq!(
+        (status, code.as_str(), message.as_str()),
+        (400, "ValidationException", expected.as_str()),
+        "case {case:?}: expected the registration precondition for {resource_type:?} as the \
+         input-validation class rather than an InsufficientPermissionsException, got {status} \
+         with {code} and {message:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_registration_refusal_is_keyed_on_the_resource_type_alone_and_never_clears() {
+    let emulator = recording_emulator().await;
+
+    // Rows differ along what the rule generalises over in the NAME the registry holds no
+    // registration for: its length — one character, the member's length minimum, and 196,
+    // its maximum — its script, its organization segment (including every name the
+    // operation's own doc reserves: "You cannot use the organization names 'amzn',
+    // 'amazon', 'alexa', 'custom' with custom resource types"), and the separator between
+    // its segments.
+    let longest = format!(
+        "Acme::Vendor::{}",
+        "W".repeat(RESOURCE_TYPE_MAX_LENGTH - "Acme::Vendor::".len())
+    );
+    let cases: [(&str, &str); 9] = [
+        ("a type name of one character, the length minimum", "x"),
+        ("a type name at the 196-character length maximum", longest.as_str()),
+        (
+            "a non-ASCII organization and type name",
+            "Acmé::Réseau::Commutateur",
+        ),
+        ("a reserved organization name", "amzn::Widget::Resource"),
+        (
+            "a second reserved organization name",
+            "amazon::Widget::Resource",
+        ),
+        (
+            "a third reserved organization name",
+            "alexa::Widget::Resource",
+        ),
+        (
+            "a fourth reserved organization name",
+            "custom::Widget::Resource",
+        ),
+        (
+            "a published type name with a trailing space",
+            "AWS::S3::Bucket ",
+        ),
+        (
+            "a published type name with single-colon separators",
+            "AWS:S3:Bucket",
+        ),
+    ];
+
+    for (case, resource_type) in cases {
+        let body = resource_config(resource_type, "r-1", r#"{"state":"new"}"#);
+        refused_registration(case, &emulator, resource_type, &body).await;
+        // Nothing a caller RETRIES registers a type with CloudFormation, so this refusal
+        // never clears: the call answers the same class and the same sentence however
+        // often it is made.
+        refused_registration(
+            &format!("{case}, called a second time"),
+            &emulator,
+            resource_type,
+            &body,
+        )
+        .await;
+    }
+
+    // The refusal is keyed on the ResourceType alone, so the same unregistered type draws
+    // it whatever ELSE the request carries: rows differ along the resource name, the tags,
+    // the shape of the configuration document, the resource id (one at its 768-character
+    // length maximum) and the schema version.
+    let unregistered = "Acme::Network::Router";
+    let longest_id = format!("r-{}", "9".repeat(RESOURCE_ID_MAX_LENGTH - 2));
+    let bodies: [(&str, Value); 5] = [
+        (
+            "the required members only",
+            json!({
+                "ResourceType": unregistered,
+                "SchemaVersionId": "1-0-0",
+                "ResourceId": "r-2",
+                "Configuration": "{}",
+            }),
+        ),
+        (
+            "a resource name and tags beside them",
+            json!({
+                "ResourceType": unregistered,
+                "SchemaVersionId": "1-0-0",
+                "ResourceId": "r-3",
+                "ResourceName": "router-1",
+                "Configuration": "{}",
+                "Tags": { "env": "prod", "team": "network" },
+            }),
+        ),
+        (
+            "a nested configuration document",
+            json!({
+                "ResourceType": unregistered,
+                "SchemaVersionId": "1-0-0",
+                "ResourceId": "r-4",
+                "Configuration": r#"{"ports":[{"id":1},{"id":2}],"vlan":{"id":7}}"#,
+            }),
+        ),
+        (
+            "a resource id at its length maximum",
+            json!({
+                "ResourceType": unregistered,
+                "SchemaVersionId": "1-0-0",
+                "ResourceId": longest_id,
+                "Configuration": "{}",
+            }),
+        ),
+        (
+            "another schema version",
+            json!({
+                "ResourceType": unregistered,
+                "SchemaVersionId": "00000000-0000-0000-0000-000000000009",
+                "ResourceId": "r-5",
+                "Configuration": "{}",
+            }),
+        ),
+    ];
+    for (case, body) in bodies {
+        refused_registration(case, &emulator, unregistered, &body).await;
+    }
+
+    // Not one of the rows recorded anything: the inventory counts no resource at all.
+    let counted = emulator.ok("GetDiscoveredResourceCounts", &json!({})).await;
+    assert_eq!(
+        counted["resourceCounts"].as_array().map(Vec::len),
+        Some(0),
+        "a refused write records nothing, got {counted}"
+    );
+
+    // The recorder precondition is judged AHEAD of the registry lookup: with no recorder
+    // running, the same unregistered type is refused for the recorder, so a caller is told
+    // the precondition it has to meet before the value it has to fix.
+    let idle = Emulator::new();
+    let (status, code, message) = refusal(
+        &idle,
+        "PutResourceConfig",
+        &resource_config(unregistered, "r-6", "{}"),
+    )
+    .await;
+    assert_eq!(
+        (status, code.as_str(), message.as_str()),
+        (
+            400,
+            "NoRunningConfigurationRecorderException",
+            "You must create and start a configuration recorder before you call the \
+             PutResourceConfig API."
+        ),
+        "expected the recorder precondition ahead of the registry lookup, got {status} with \
+         {code} and {message:?}"
+    );
+
+    // The control: a published type none of the rows named is recorded and read back, so
+    // they are refused for the names they carried and not by this write path as such.
+    emulator
+        .ok(
+            "PutResourceConfig",
+            &resource_config(KMS_KEY, "key-0001", r#"{"enabled":true}"#),
+        )
+        .await;
+    let history = emulator
+        .ok(
+            "GetResourceConfigHistory",
+            &json!({ "resourceType": KMS_KEY, "resourceId": "key-0001" }),
+        )
+        .await;
+    assert_eq!(
+        history["configurationItems"].as_array().map(Vec::len),
+        Some(1),
+        "the published type is recorded and read back, got {history}"
+    );
+}
+
+/// The position Config reports for an expression cut short: one past its last CHARACTER —
+/// the line is how many lines the text was written over, and the column counts the
+/// characters of its last line, so the position names a character the caller wrote rather
+/// than a byte of its encoding.
+fn ran_out_message(expression: &str) -> String {
+    let last_line = expression.split('\n').next_back().unwrap_or(expression);
+    let line = expression.split('\n').count();
+    let column = last_line.chars().count() + 1;
+    format!("syntax error at line {line}, column {column}")
+}
+
+/// The line and column a syntax-error message reports, read off the fixed text it is
+/// worded with, or `None` for a refusal of the other kind — a command that IS read and
+/// breaks a rule of the query language carries that rule's own sentence instead.
+fn reported_position(message: &str) -> Option<(usize, usize)> {
+    let located = message.strip_prefix("syntax error at line ")?;
+    let (line, column) = located.split_once(", column ")?;
+    Some((line.parse().ok()?, column.parse().ok()?))
+}
+
+#[tokio::test]
+async fn a_query_cut_short_is_reported_where_its_text_ran_out_in_characters() {
+    let emulator = Emulator::new();
+
+    // A command cut short stopped at no token of itself — it needed one more than was
+    // sent — so it is reported one past its last character. Rows differ along what was
+    // left open, along the length of what was written, along the script of its text
+    // (non-ASCII letters, each one character of several bytes, so a position counted in
+    // bytes would differ), and along how many lines it was written over.
+    for (case, expression) in [
+        ("one bracket left open", "SELECT ("),
+        ("three brackets left open", "SELECT ((( invalid"),
+        ("five brackets left open before a property", "SELECT ((((( resourceId"),
+        ("a non-ASCII property behind an open bracket", "SELECT ((( résumé"),
+        (
+            "a condition on a non-ASCII tag with no value",
+            "SELECT resourceId WHERE tags.ключ =",
+        ),
+        (
+            "a bracket left open after a non-ASCII literal",
+            "SELECT resourceId WHERE tags.ключ = 'значение' AND (",
+        ),
+        (
+            "a condition left open on the third line",
+            "SELECT resourceId\nWHERE resourceType = 'AWS::S3::Bucket'\n  AND (",
+        ),
+    ] {
+        let message = refused_expression(case, &emulator, expression).await;
+        let expected = ran_out_message(expression);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expression:?} to be reported where its text ran out, \
+             {expected:?}, got {message:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_reported_position_is_a_position_of_the_submitted_expression() {
+    let emulator = Emulator::new();
+
+    // Every PREFIX of one well-formed Config query, cut at a character boundary: a set of
+    // expressions this suite did not write by hand, each of which the reading either
+    // serves or stops somewhere inside. Wherever it stops, the position it reports is one
+    // the submitted text HAS — a line the text was written over, at a character of that
+    // line or the one just past its end — so a tool highlighting that position never
+    // points outside what the caller sent.
+    let query = "SELECT resourceId, tags.ключ\nWHERE resourceType = 'AWS::S3::Bucket'\n\
+                 ORDER BY resourceId\nLIMIT 5";
+    let cuts = query
+        .char_indices()
+        .map(|(at, _)| at)
+        .chain(std::iter::once(query.len()))
+        .skip(1);
+    let mut positions = 0usize;
+
+    for end in cuts {
+        let prefix = &query[..end];
+        let case = format!("the first {} character(s)", prefix.chars().count());
+        let (status, code, message) = refusal(
+            &emulator,
+            "SelectResourceConfig",
+            &json!({ "Expression": prefix }),
+        )
+        .await;
+        if status == 200 {
+            continue;
+        }
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidExpressionException"),
+            "case {case:?}: a command the reading will not serve is refused as a malformed \
+             expression, got {status} {code} with message {message:?}"
+        );
+        let Some((line, column)) = reported_position(&message) else {
+            // The other refusal this code stands for: a command that is read and breaks a
+            // rule of the query language, worded with that rule's own sentence.
+            assert!(
+                !message.is_empty(),
+                "case {case:?}: a refusal of {prefix:?} carries a message, got none"
+            );
+            continue;
+        };
+        positions += 1;
+        let lines: Vec<&str> = prefix.split('\n').collect();
+        assert!(
+            (1..=lines.len()).contains(&line),
+            "case {case:?}: expected a line of {prefix:?} (1..={}), got {line} from {message:?}",
+            lines.len()
+        );
+        let characters = lines[line - 1].chars().count() + 1;
+        assert!(
+            (1..=characters).contains(&column),
+            "case {case:?}: expected a column of line {line} of {prefix:?} (1..={characters}), \
+             got {column} from {message:?}"
+        );
+    }
+
+    assert!(
+        positions > 10,
+        "expected the prefixes of {query:?} to report many positions, got {positions}"
     );
 }
