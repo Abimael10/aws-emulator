@@ -382,9 +382,9 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
     );
     assert_eq!(
         switched["TableDescription"]["ProvisionedThroughput"]["ReadCapacityUnits"],
-        json!(5),
-        "case \"switched to on-demand\": the switch is asynchronous, so its own answer still \
-         reports the capacity in force, got {switched}"
+        json!(0),
+        "case \"switched to on-demand\": the capacity mode is in force at once, so the \
+         answer reports the new mode's capacity, got {switched}"
     );
     // The reported capacity goes from 5/5 to 0/0: the last time it went down is now —
     // stamped when the move was accepted, so this answer carries it — while the day's
@@ -403,8 +403,8 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
             .is_some_and(|instant| instant > 0.0),
         "case \"switched to on-demand\": expected LastDecreaseDateTime, got {throughput}"
     );
-    // An index's capacity is withdrawn with the table's, and reads the same way: its own
-    // pair is the one still in force while the switch settles, beside the instant the
+    // An index's capacity is withdrawn with the table's, and reads the same way: the
+    // figures beside the new mode are the new mode's own, beside the instant the
     // withdrawal was stamped at.
     let index = &switched["TableDescription"]["GlobalSecondaryIndexes"][0];
     assert_eq!(
@@ -413,8 +413,8 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
             index["ProvisionedThroughput"]["WriteCapacityUnits"].clone(),
             index["ProvisionedThroughput"]["NumberOfDecreasesToday"].clone(),
         ),
-        (json!(3), json!(2), json!(0)),
-        "case \"switched to on-demand\": an index reports the capacity it is still serving \
+        (json!(0), json!(0), json!(0)),
+        "case \"switched to on-demand\": an index reports the new mode's capacity \
          and no counted decrease, got {index}"
     );
     assert!(

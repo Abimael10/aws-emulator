@@ -2862,34 +2862,37 @@ pub fn requested_page(token: Option<&str>) -> Option<&str> {
 /// including the one PAST the last item.
 ///
 /// Shared by every listing of this service that SERVES a token it cannot read instead of
-/// refusing one, so one rule decides what such a token does: it names no position of this
-/// enumeration at all, and a listing that does not refuse it IGNORES it — answering the page a
-/// request carrying no token asks for, the FIRST one. A listing that refuses such a token
-/// instead reads the cursor itself ([`decode_page_token`]) and words the refusal its own model
-/// declares ([`invalid_next_token_message`]).
+/// refusing one, so one rule decides what such a token does: it names no position this
+/// enumeration holds an item at, which is the position PAST its last item, and the page served
+/// there carries no item and owes no further token — the answer the recorded listings of this
+/// service give a token they cannot resume from, and the page a walk terminates on. A listing
+/// that refuses such a token instead reads the cursor itself ([`decode_page_token`]) and words
+/// the refusal its own model declares ([`invalid_next_token_message`]).
 pub enum ResumedAt {
-    /// The beginning: what a request carrying no token — or one this service cannot read a
-    /// cursor out of, which names no position — asks for.
+    /// The beginning: what a request carrying no token asks for.
     TheFirstItem,
-    /// The item the token's cursor names — the one the previous page stopped before.
+    /// The item the token's cursor names — which the listing that minted it reads as the
+    /// position it left off at.
     TheItemNamed(String),
+    /// Past the last item: what a token this service cannot read a cursor out of names, since
+    /// no item of this enumeration answers to it.
+    PastTheLastItem,
 }
 
 impl ResumedAt {
-    /// Which of the two `token` asks for.
+    /// Which of the three `token` asks for.
     ///
     /// An EMPTY `NextToken` is no token at all and asks for the first page, the one rule every
     /// paginated read of this service shares ([`requested_page`]). A value this service did not
     /// mint carries no cursor of this enumeration ([`decode_page_token`]), so it names no item
-    /// of the listing and nothing for the page to resume from: it is ignored, exactly as a
-    /// request that carried no token at all is answered.
+    /// of the listing: the position it asks for is the one past the last.
     #[must_use]
     pub fn of(token: Option<&str>) -> Self {
         match requested_page(token) {
             None => Self::TheFirstItem,
             Some(token) => match decode_page_token(token) {
                 Some(cursor) => Self::TheItemNamed(cursor),
-                None => Self::TheFirstItem,
+                None => Self::PastTheLastItem,
             },
         }
     }
@@ -2899,12 +2902,14 @@ impl ResumedAt {
     ///
     /// The listing's own order is the caller's — a key is both the paging order and the cursor —
     /// so only the POSITIONS are decided here; `before` is how the caller locates one of
-    /// them in the order it sorted.
+    /// them in the order it sorted. The position past the last item is reported as an index no
+    /// listing holds, so the page cut from it is empty whatever the listing's length.
     #[must_use]
     pub fn start_of(&self, before: impl FnOnce(&str) -> usize) -> usize {
         match self {
             Self::TheFirstItem => 0,
             Self::TheItemNamed(cursor) => before(cursor),
+            Self::PastTheLastItem => usize::MAX,
         }
     }
 }

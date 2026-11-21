@@ -10,13 +10,16 @@
 //! makes is that resource kind's own recorded contract:
 //!
 //! * the FORM — how much of the way CloudFront writes that kind's identifiers a route reads of
-//!   the value, which is a property of the value alone. The two field-level encryption records
-//!   read the ALPHABET an identifier is written in and nothing more — neither the letter it
-//!   opens with nor the width of its body ([`super::is_entity_id_form`],
-//!   [`super::unresolved_field_level_encryption_config`],
-//!   [`super::unresolved_field_level_encryption_profile`]); the distribution and the origin
-//!   access control read the whole form their ids are minted in
-//!   ([`super::is_distribution_id`], [`super::is_origin_access_control_id`]);
+//!   the value, which is a property of the value alone. The two field-level encryption records'
+//!   `/config` routes, their deletes and the profile's own read the WHOLE form their ids are
+//!   minted in — the kind's namespace letter over an identifier body
+//!   ([`super::unresolved_field_level_encryption_config`],
+//!   [`super::unresolved_field_level_encryption_profile`]) — while the configuration's resource
+//!   read reads the ALPHABET and nothing more
+//!   ([`super::unresolved_field_level_encryption_config_on_the_resource_read`]); the
+//!   distribution reads the whole form its ids are minted in
+//!   ([`super::is_distribution_id`]), and the origin access control reads NO form at all
+//!   ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]);
 //! * which KIND an identifier belongs to, for the family CloudFront draws from ONE form. A
 //!   distribution, a streaming distribution, an origin access identity and an origin access
 //!   control all carry an `E` followed by an identifier body of the same width and alphabet,
@@ -115,25 +118,22 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 
     /// The modelled `NoSuchOriginAccessControl` an operation ADDRESSED by an origin access
-    /// control `Id` answers an identifier it could not resolve.
+    /// control `Id` answers an identifier it could not resolve: the ABSENT-control sentence,
+    /// whatever the value's form.
     ///
-    /// The same split the distribution's reads make ([`Self::unresolved_distribution`]), and
-    /// for the same reason: ONE code and one status cover both outcomes, so the MESSAGE is
-    /// what tells them apart. An `Id` that could address a control — written in the form
-    /// CloudFront writes a control's identifiers in, and not one this account holds another
-    /// kind of the shared-form family under ([`Self::addresses`]) — names a control that is
-    /// simply not there, which is the absent-control sentence; every other value is an
-    /// identifier this route cannot read at all, which is the one stated by
-    /// [`id_format_invalid_message`]. Both are fixed text, so nothing from the request
-    /// reaches the wire either way.
+    /// Unlike the distribution's reads ([`Self::unresolved_distribution`]), this surface reads
+    /// NO form of the value before it resolves it — how much of an identifier's form a route
+    /// reads is that resource kind's own recorded contract, and the recorded answers of the
+    /// origin-access-control routes report EVERY `Id` the account holds no control under as the
+    /// control that is absent: a value that is no identifier this service mints, and one held
+    /// as another kind of the `E`-form family, read the same. `Id` is a plain `string`
+    /// `@httpLabel` with no `@pattern` and no `@length`
+    /// (`smithy_query(query="operation",operation="GetOriginAccessControl")`), so there is no
+    /// modelled constraint to refuse a value on either. The sentence is fixed text, so nothing
+    /// from the request reaches the wire.
     pub fn unresolved_origin_access_control(&self, id: &str) -> NoSuchOriginAccessControl {
-        if self.addresses(EntityKind::OriginAccessControl, id) {
-            no_such_origin_access_control()
-        } else {
-            NoSuchOriginAccessControl {
-                message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
-            }
-        }
+        let _ = id;
+        no_such_origin_access_control()
     }
 }
 

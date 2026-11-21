@@ -1,21 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! A field-level encryption identifier in the REQUEST PATH earns the sentence its own
-//! ALPHABET decides, end to end over HTTP.
+//! FORM decides, end to end over HTTP.
 //!
 //! The rule under test: an operation ADDRESSED by a field-level encryption identifier answers
 //! its one modelled not-found code (404) for every identifier it cannot resolve — these
 //! operations model no argument error
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
 //! `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`) — so the MESSAGE is what tells
-//! the two conditions apart: a value written in the characters CloudFront writes an identifier
-//! in (its digits and uppercase letters, carrying no separator and no lower case) that the
-//! store holds nothing for is the ABSENT resource ("The specified field level encryption
-//! config/profile does not exist."), and a value written OUTSIDE that alphabet is the
-//! identifier the service reports it cannot READ ("Id format is invalid"). `Id` is a plain
-//! `string` `@httpLabel` with no `@pattern` and no `@length`, so neither the letter an
-//! identifier opens with nor the width of its body is a property these routes refuse a value
-//! on. Both sentences are fixed text: neither echoes the value submitted.
+//! the two conditions apart, and what decides it is how much of the identifier's FORM that
+//! route reads, which is the route's own recorded contract: the `/config` reads, the profile's
+//! reads, the updates and the deletes read the WHOLE form their kind's identifiers are minted
+//! in (its namespace letter over a body of the width CloudFront writes one in), so a value of
+//! another form is the identifier the service reports it cannot READ ("Id format is invalid"),
+//! while `GetFieldLevelEncryption`, the configuration's resource read, reads the identifier
+//! ALPHABET alone (digits and uppercase letters, carrying no separator and no lower case). A
+//! value the form admits that the store holds nothing for is the ABSENT resource ("The
+//! specified field level encryption config/profile does not exist."). Both sentences are fixed
+//! text: neither echoes the value submitted.
 //!
 //! So the rows span what the rule generalises over:
 //!
@@ -23,15 +25,16 @@
 //!   (`P`-prefixed) — each with its own sentence;
 //! * every OPERATION that addresses one by a path identifier: both readers of each kind, its
 //!   update and its delete;
-//! * the values written in the identifier alphabet the store holds nothing for: one of the
-//!   kind's own namespace that was never minted, the minted id with its last character
-//!   changed, bodies one character short of and one character past the width the kind is issued
-//!   at, a namespace letter no kind of this service issues an identifier under, the sibling
-//!   kind's own minted id, a public key id and the `E`-prefixed namespace the other CloudFront
-//!   entity ids are drawn from — each the ABSENT resource;
-//! * and the values written outside it: a minted id in lower case, a body outside the id
-//!   alphabet, a UUID, a bare word and the resource's own caller reference — each the
-//!   identifier reported UNREADABLE.
+//! * the values of the kind's own minted form the store holds nothing for: one of the
+//!   kind's own namespace that was never minted and the minted id with its last character
+//!   changed — each the ABSENT resource on every route;
+//! * the values of the identifier alphabet that are of ANOTHER form: bodies one character short
+//!   of and one character past the width the kind is issued at, a namespace letter no kind of
+//!   this service issues an identifier under, the sibling kind's own minted id, a public key id
+//!   and the `E`-prefixed namespace the other CloudFront entity ids are drawn from;
+//! * and the values written outside the alphabet: a minted id in lower case, a body outside the
+//!   id alphabet, a UUID, a bare word and the resource's own caller reference — each the
+//!   identifier reported UNREADABLE on every route.
 //!
 //! Each kind's width and alphabet are read off an id this emulator really MINTED rather than
 //! written out here, so the table cannot drift from what the service issues.
@@ -130,6 +133,13 @@ impl Op {
             Kind::Config => NO_SUCH_CONFIG,
             Kind::Profile => NO_SUCH_PROFILE,
         }
+    }
+
+    /// Whether this operation reads the WHOLE form its kind's identifiers are minted in before
+    /// it resolves the value — its own recorded contract. The configuration's RESOURCE read is
+    /// the one operation of this surface that reads the alphabet alone.
+    fn reads_the_whole_form(self) -> bool {
+        !matches!(self, Self::GetFieldLevelEncryption)
     }
 
     /// Send this operation at `id`, carrying the stored resource's current version token so
@@ -245,39 +255,59 @@ async fn seed(router: &MultiServiceRouter) -> Stored {
     }
 }
 
-/// One identifier a case submits where an identifier of the addressed kind belongs, and
-/// whether it is written in the ALPHABET CloudFront writes an identifier in — which is what
-/// decides the sentence it earns.
+/// One identifier a case submits where an identifier of the addressed kind belongs, and what
+/// its FORM says about it — which, together with how much of the form the route reads, decides
+/// the sentence it earns.
 struct Shape {
     case: String,
     id: String,
     in_the_identifier_alphabet: bool,
+    of_the_kinds_minted_form: bool,
 }
 
 impl Shape {
-    /// A value written in the identifier alphabet: the store holding nothing for it is the
-    /// absent resource.
+    /// A value of the form the addressed kind's identifiers are MINTED in: every route of this
+    /// surface resolves it, so the store holding nothing for it is the absent resource.
     fn own(case: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
             in_the_identifier_alphabet: true,
+            of_the_kinds_minted_form: true,
+        }
+    }
+
+    /// A value written in the identifier alphabet but NOT in the addressed kind's own minted
+    /// form — another width, another namespace letter, or another kind's identifier.
+    fn other_form(case: impl Into<String>, id: impl Into<String>) -> Self {
+        Self {
+            case: case.into(),
+            id: id.into(),
+            in_the_identifier_alphabet: true,
+            of_the_kinds_minted_form: false,
         }
     }
 
     /// A value written outside that alphabet, which no identifier CloudFront issues is: the
-    /// identifier the service reports it cannot read.
+    /// identifier the service reports it cannot read, on every route.
     fn foreign(case: impl Into<String>, id: impl Into<String>) -> Self {
         Self {
             case: case.into(),
             id: id.into(),
             in_the_identifier_alphabet: false,
+            of_the_kinds_minted_form: false,
         }
     }
 
-    /// The sentence this identifier earns from `op`.
+    /// The sentence this identifier earns from `op`: the absent resource where the form `op`
+    /// reads admits the value, and the unreadable identifier where it does not.
     fn expected(&self, op: Op) -> &'static str {
-        if self.in_the_identifier_alphabet {
+        let readable = if op.reads_the_whole_form() {
+            self.of_the_kinds_minted_form
+        } else {
+            self.in_the_identifier_alphabet
+        };
+        if readable {
             op.absent()
         } else {
             UNREADABLE_IDENTIFIER
@@ -307,34 +337,36 @@ fn shapes(kind: Kind, stored: &Stored, public_key: &str) -> Vec<Shape> {
     let changed: String = changed.into_iter().collect();
 
     vec![
-        // Values written in the identifier alphabet, which the store holds nothing for.
+        // Values of the form this kind's identifiers are minted in, which the store holds
+        // nothing for.
         Shape::own(
             "an id of this kind that was never minted",
             format!("{prefix}{}", "0".repeat(body.len())),
         ),
         Shape::own("the minted id with its last character changed", changed),
-        Shape::own(
+        // Values of the identifier alphabet that are not of this kind's minted form.
+        Shape::other_form(
             "this kind's prefix with a body one character short",
             format!("{prefix}{}", &body[..body.len() - 1]),
         ),
-        Shape::own(
+        Shape::other_form(
             "this kind's prefix with a body one character too long",
             format!("{prefix}{body}A"),
         ),
-        Shape::own(
+        Shape::other_form(
             "a namespace letter no kind of this service mints",
             format!("W{body}"),
         ),
-        Shape::own(
+        Shape::other_form(
             "a namespace letter no kind of this service mints and a far longer body",
             format!("W{body}{body}"),
         ),
-        Shape::own(
+        Shape::other_form(
             "the sibling field-level encryption kind's own minted id",
             sibling,
         ),
-        Shape::own("a public key id this service minted", public_key),
-        Shape::own(
+        Shape::other_form("a public key id this service minted", public_key),
+        Shape::other_form(
             "the namespace every other CloudFront entity id is drawn from",
             format!("E{body}"),
         ),
@@ -381,10 +413,10 @@ fn assert_refusal(answer: &Answer, case: &str, code: &str, message: &str) {
 // ---------------------------------------------------------------------------
 
 /// Every operation addressed by a field-level encryption identifier answers its one not-found
-/// code for an identifier it cannot resolve, and the identifier's ALPHABET decides which of
-/// that code's two sentences: the absent-resource sentence for a value written in the
-/// characters CloudFront writes an identifier in, and the unreadable-identifier sentence for a
-/// value written outside them.
+/// code for an identifier it cannot resolve, and the identifier's FORM — judged by as much of
+/// it as the route reads — decides which of that code's two sentences: the absent-resource
+/// sentence where the form admits the value, and the unreadable-identifier sentence where it
+/// does not.
 #[tokio::test]
 async fn a_path_identifier_that_resolves_to_nothing_earns_the_sentence_its_form_decides() {
     let router = emulator();

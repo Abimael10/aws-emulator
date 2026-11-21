@@ -1013,7 +1013,7 @@ async fn an_id_no_configuration_holds_is_refused() {
         (
             "a profile id where a configuration id belongs",
             profile.clone(),
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "a token of no configuration id's shape",

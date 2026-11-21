@@ -28,7 +28,11 @@
 //! index's — and a `NumberOfDecreasesToday` that does not yet count the decrease just
 //! accepted ([`crate::state::CapacityInForce`]). The pair's `Status` beside those figures
 //! is the move's own `UPDATING`, and a later read is what reports the figures the move
-//! left.
+//! left. An update that moves the table's capacity MODE is the exception: the mode is in
+//! force from the moment the call returns, and the provisioned pair belongs to the mode, so
+//! the pair that description carries is the NEW mode's own — none for a table moved onto
+//! on-demand capacity, and the pair the update set for one moved onto provisioned capacity —
+//! while the warm pair beside it is still the one in force.
 //!
 //! A request that names NO updatable member at all is refused as a `ValidationException`
 //! before any of that: it is permanently invalid rather than a transient conflict. So is
@@ -508,11 +512,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the update resolves to is computed against the STORED table, so a
         // request that only names an index update leaves the table's own mode and
         // throughput alone.
-        let billing_mode = crate::state::requested_throughput_mode(
+        let requested_mode = crate::state::requested_throughput_mode(
             input.billing_mode.as_deref(),
             input.table_throughput_mode.as_deref(),
-        )
-        .map_or(stored_billing_mode, str::to_string);
+        );
+        // Whether this update moves the table's capacity MODE, which decides which
+        // generation of the capacity figures the description below carries
+        // ([`crate::state::CapacityInForce`]).
+        let capacity_mode_moved = requested_mode.is_some_and(|mode| mode != stored_billing_mode);
+        let billing_mode = requested_mode.map_or(stored_billing_mode, str::to_string);
         // Each mode member was held to the enum's value set before this handler ran, and a
         // stored mode is one this service wrote, so what the update resolves to is always
         // one of the two modes.
@@ -785,7 +793,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // started outlives the call, so its figures are what the reads after it report and
         // this response carries the generation still in force
         // ([`crate::state::CapacityInForce::restate`]).
-        capacity_in_force.restate(&mut description);
+        //
+        // A move of the capacity MODE is the exception for the PROVISIONED pair: the mode
+        // itself is in force from the moment the call returns (the response's
+        // `BillingModeSummary` and `TableThroughputModeSummary` report the mode the update
+        // resolved to), and that pair belongs to the mode — an on-demand table provisions no
+        // capacity at all, and a table moved onto provisioned capacity serves the pair the
+        // update set — so the figures beside the new mode are the new mode's own. What the
+        // table keeps WARM is a setting of its own, so that half is the generation in force
+        // either way.
+        if capacity_mode_moved {
+            capacity_in_force.restate_warm(&mut description);
+        } else {
+            capacity_in_force.restate(&mut description);
+        }
         // The audit record for a state-changing call: who asked, what the table carries
         // after the change and that it succeeded. Never a credential — only the access
         // key id the caller presented.

@@ -151,16 +151,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reports the stored record as it stands.
         //
         // "Request the ID for the field-level encryption configuration information": whether
-        // the value could be an identifier of THIS resource kind is decided before the
-        // configuration is resolved — a value outside the form CloudFront ISSUES this
-        // record's identifiers in is the identifier it reports it cannot read, and an
-        // identifier of that form the store holds no configuration under is the
-        // configuration that is absent
-        // ([`crate::state::unresolved_field_level_encryption_config`]).
+        // the value could be an identifier at all is decided before the configuration is
+        // resolved — a value outside the ALPHABET CloudFront writes an identifier in is the
+        // identifier this route reports it cannot read, and every value of that alphabet the
+        // store holds no configuration under is the configuration that is absent, which is
+        // what this route's recorded answers report
+        // ([`crate::state::unresolved_field_level_encryption_config_on_the_resource_read`]).
         let Some(stored) = store.field_level_encryption_config(&input.id) else {
             return Err(
                 GetFieldLevelEncryptionErrorModeled::NoSuchFieldLevelEncryptionConfig(
-                    crate::state::unresolved_field_level_encryption_config(&input.id),
+                    crate::state::unresolved_field_level_encryption_config_on_the_resource_read(
+                        &input.id,
+                    ),
                 )
                 .into(),
             );

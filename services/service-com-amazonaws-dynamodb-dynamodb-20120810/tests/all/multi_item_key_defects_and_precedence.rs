@@ -982,8 +982,8 @@ async fn request_shape_is_settled_before_the_table_is_looked_up() {
             "UpdateItem",
             json!({"Key": {"pk": {"S": "k"}, "sk": {"S": "s"}},
                    "Expected": {"a": {"Exists": true}}}),
-            "One or more parameter values were invalid: Value must be provided when Exists is \
-             true for Attribute: a",
+            "1 validation error detected: One or more parameter values were invalid: Value \
+             must be provided when Exists is true for Attribute: a",
         ),
         (
             "an Expected comparison given too few operands",

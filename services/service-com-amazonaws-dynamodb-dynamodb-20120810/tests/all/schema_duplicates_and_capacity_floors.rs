@@ -737,6 +737,10 @@ async fn a_capacity_move_raises_the_warm_pair_it_cannot_lower_and_stamps_the_inc
         // The warm pair in force as each move starts, which is what that move's own answer
         // reports beside the capacity.
         let mut warm_in_force = row.created_warm;
+        // The capacity MODE in force as each move starts: a move that changes it reports the
+        // NEW mode's capacity, since the mode is in force when the call returns and the
+        // provisioned pair belongs to it.
+        let mut mode_in_force = row.created_mode;
         let mut increased = false;
         for step in row.moves {
             let mut update = json!({"TableName": row.name});
@@ -749,22 +753,28 @@ async fn a_capacity_move_raises_the_warm_pair_it_cannot_lower_and_stamps_the_inc
             }
             let updated = ok(&router, "UpdateTable", update).await;
 
-            // The move is asynchronous, so its own answer reports the capacity and the
-            // warm pair the table is STILL serving.
+            // A move inside one capacity mode is asynchronous, so its own answer reports the
+            // capacity the table is STILL serving; a move of the MODE answers with the new
+            // mode's capacity. The warm pair it reports is the one in force either way.
+            let moves_the_mode = step.mode.is_some_and(|mode| mode != mode_in_force);
+            let answered = if moves_the_mode { step.reported } else { before };
             let description = &updated["TableDescription"];
             assert_eq!(
                 (reported_capacity(description), reported_warm(description)),
                 (
-                    (json!(before.0), json!(before.1)),
+                    (json!(answered.0), json!(answered.1)),
                     (json!(warm_in_force.0), json!(warm_in_force.1)),
                 ),
                 "case {case:?}: expected the answer to the move to {:?} to report the capacity \
-                 {before:?} and the pair {warm_in_force:?} still in force, got {description}",
+                 {answered:?} and the pair {warm_in_force:?} still in force, got {description}",
                 step.capacity
             );
             increased |= step.reported.0 > before.0 || step.reported.1 > before.1;
             before = step.reported;
             warm_in_force = step.warm;
+            if let Some(mode) = step.mode {
+                mode_in_force = mode;
+            }
             // The instant of the last increase is stamped when the move is ACCEPTED, so
             // this answer already carries it.
             assert_eq!(

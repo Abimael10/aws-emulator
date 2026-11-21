@@ -7,13 +7,12 @@
 //! `DeleteOriginAccessControl` — `smithy_query(query="operation",
 //! operation="GetOriginAccessControl")` reports `Id` as a required `@httpLabel` on a plain
 //! `string`, with no `@pattern` and no `@length`, and `errors: [AccessDenied,
-//! NoSuchOriginAccessControl]`) answers both ways its `Id` can fail to resolve under that
-//! ONE code and its 404, and the MESSAGE is what tells them apart: a value that COULD
-//! address a control — written in the form CloudFront writes a control's identifiers in, and
-//! not one this account holds another kind of resource under — names a control that is
-//! simply not there, "The specified origin access control does not exist."; every other
-//! value is an identifier this route cannot read at all, "Id format is invalid". Both
-//! sentences are fixed text: neither echoes the value submitted.
+//! NoSuchOriginAccessControl]`) resolves the `Id` it is handed against the STORE and
+//! nothing else: every value this account holds no control under is the control reported
+//! ABSENT, "The specified origin access control does not exist.", whatever form the value
+//! takes — the model places no constraint on the member, so this surface has no
+//! unreadable-identifier answer at all. The sentence is fixed text: it never echoes the
+//! value submitted.
 //!
 //! The rows span what the rule generalises over: the minted identifiers of TWO other kinds of
 //! the identifier form a distribution, a streaming distribution, an origin access identity and
@@ -39,10 +38,6 @@ use crate::public_key_lifecycle::{create_key, pem, Key};
 /// The sentence a control the store holds nothing for earns, spelled out here rather than taken
 /// from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONTROL: &str = "The specified origin access control does not exist.";
-
-/// The sentence a value that could address no control of this service earns, spelled out here
-/// for the same reason (`crate::state`'s `id_format_invalid_message` for the `Id` member).
-const ID_FORMAT_INVALID: &str = "Id format is invalid";
 
 /// One operation addressed by an origin access control `Id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,9 +293,10 @@ fn outside_the_identifier_alphabet(live: &Live) -> Vec<(String, String)> {
 
 /// RULE: an identifier this account issued for ANOTHER kind of resource names no origin
 /// access control, and neither does a value of no width or alphabet this service mints one
-/// in: each is an identifier this route cannot read.
+/// in: each is resolved against this kind's own store and reported as the control that is
+/// ABSENT.
 #[tokio::test]
-async fn another_kinds_identifier_is_an_unreadable_identifier() {
+async fn another_kinds_identifier_is_the_absent_control() {
     let router = emulator();
     let live = live(&router).await;
 
@@ -312,7 +308,7 @@ async fn another_kinds_identifier_is_an_unreadable_identifier() {
             assert_refusal(
                 &answer,
                 &format!("{op:?} with {case} ({id:?})"),
-                ID_FORMAT_INVALID,
+                NO_SUCH_CONTROL,
             );
         }
     }
@@ -326,11 +322,11 @@ async fn another_kinds_identifier_is_an_unreadable_identifier() {
     );
 }
 
-/// RULE: a value written in no alphabet CloudFront mints an identifier in could address no
-/// control of this service, so it is the identifier reported unreadable rather than the
-/// control reported absent.
+/// RULE: a value written in no alphabet CloudFront mints an identifier in names no control
+/// either — this route reads no form of the value, so it is resolved against the store like
+/// any other and reported as the control that is ABSENT.
 #[tokio::test]
-async fn a_value_this_service_issues_no_identifier_in_is_an_unreadable_identifier() {
+async fn a_value_this_service_issues_no_identifier_in_is_the_absent_control() {
     let router = emulator();
     let live = live(&router).await;
 
@@ -342,7 +338,7 @@ async fn a_value_this_service_issues_no_identifier_in_is_an_unreadable_identifie
             assert_refusal(
                 &answer,
                 &format!("{op:?} with {case} ({id:?})"),
-                ID_FORMAT_INVALID,
+                NO_SUCH_CONTROL,
             );
         }
     }
@@ -356,9 +352,8 @@ async fn a_value_this_service_issues_no_identifier_in_is_an_unreadable_identifie
 }
 
 /// RULE, over a value this account really DID issue for a control: an identifier a delete
-/// retired could still address a control — its form is the one this service mints and nothing
-/// else answers to it now — so it is the control reported ABSENT, while the live identifier of
-/// another kind of the shared form is the identifier this route cannot read.
+/// retired names a control that is no longer there, and so does the live identifier of
+/// another kind of the shared form — both are the control reported ABSENT.
 /// Driven through all four operations addressed by an `Id`.
 #[tokio::test]
 async fn a_deleted_controls_own_identifier_is_the_absent_control() {
@@ -398,7 +393,7 @@ async fn a_deleted_controls_own_identifier_is_the_absent_control() {
             (
                 "a live origin access identity's identifier",
                 live.origin_access_identity_id.as_str(),
-                ID_FORMAT_INVALID,
+                NO_SUCH_CONTROL,
             ),
         ] {
             let answer = op

@@ -13,11 +13,15 @@
 //! calendar day" — `ProvisionedThroughputDescription$NumberOfDecreasesToday`) and the warm
 //! pair ("the minimum provisioned capacity maintained for immediate data access" —
 //! `TableWarmThroughputDescription`), at the table and at each index it already carried.
-//! The figures the request names are what the reads AFTER the move report.
+//! The figures the request names are what the reads AFTER the move report. An update that
+//! moves the capacity MODE is the exception, tabled in
+//! `update_table_capacity_mode_switch_figures.rs`: the mode is in force when the call
+//! returns and the provisioned pair belongs to the mode, so that answer carries the new
+//! mode's figures.
 //!
 //! The rows below span the class the rule generalises over rather than one capacity move:
-//! each direction a provisioned pair can move, a capacity withdrawn and restored by a
-//! capacity-mode switch, a warm pair the request names, an index's own capacity moved, and
+//! each direction a provisioned pair can move, a capacity withdrawn by a capacity-mode
+//! switch, a warm pair the request names, an index's own capacity moved, and
 //! an index CREATED by the same call — which has no earlier generation, so it reports the
 //! figures it was created with.
 
@@ -124,16 +128,18 @@ fn rows() -> Vec<Row> {
         Row {
             case: "the capacity withdrawn by a switch to on-demand",
             update: json!({"BillingMode": "PAY_PER_REQUEST"}),
+            // The capacity MODE is in force when the call returns, and the provisioned pair
+            // belongs to the mode: "on-demand mode does not use provisioned throughput", so
+            // the table and its index report none from this answer on.
             in_force: &[
-                (TABLE_READ, CREATED_READ),
-                (TABLE_WRITE, CREATED_WRITE),
+                (TABLE_READ, 0),
+                (TABLE_WRITE, 0),
                 (TABLE_DECREASES, 0),
-                (INDEX_READ, CREATED_INDEX_READ),
-                (INDEX_WRITE, CREATED_INDEX_WRITE),
+                (INDEX_READ, 0),
+                (INDEX_WRITE, 0),
             ],
             settled: &[
-                // "On-demand mode does not use provisioned throughput", and withdrawing
-                // the capacity spends none of the day's counted decreases.
+                // Withdrawing the capacity spends none of the day's counted decreases.
                 (TABLE_READ, 0),
                 (TABLE_WRITE, 0),
                 (TABLE_DECREASES, 0),

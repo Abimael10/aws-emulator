@@ -889,16 +889,18 @@ async fn update_table_moves_the_capacity_it_is_given() {
         json!("PAY_PER_REQUEST"),
         "case billing-mode switch: the new mode is reported, got {updated}"
     );
-    // The withdrawal is asynchronous, so the switch's own answer still reports the capacity
-    // the table and its index are serving; the settled table reports none.
+    // The capacity MODE is in force from the moment the call returns, and the provisioned
+    // pair belongs to the mode, so the switch's own answer reports the new mode's figures —
+    // an on-demand table provisions no capacity, for itself or for its indexes — and the
+    // settled table reports the same.
     assert_eq!(
         (
             description["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
             index_named(description, "ByKind")["ProvisionedThroughput"]["WriteCapacityUnits"]
                 .clone(),
         ),
-        (json!(10), json!(2)),
-        "case billing-mode switch: the answer reports the capacity still in force, got \
+        (json!(0), json!(0)),
+        "case billing-mode switch: the answer reports the new mode's capacity, got \
          {updated}"
     );
     let settled = wait_until_active(&router, region, "Capacity").await;
@@ -955,17 +957,17 @@ async fn update_table_moves_the_capacity_it_is_given() {
     )
     .await;
     let description = &updated["TableDescription"];
-    // The restore is asynchronous too: the answer reports the zeroes the on-demand table
-    // was still serving, and the capacity it sets is what the settled table reports.
+    // The mode is in force when the call returns and the provisioned pair belongs to the
+    // mode, so the restore's answer reports the pair it set, for the table and for the index.
     assert_eq!(
         (
             description["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
             index_named(description, "ByKind")["ProvisionedThroughput"]["ReadCapacityUnits"]
                 .clone(),
         ),
-        (json!(0), json!(0)),
-        "case switch back with index capacity: the answer reports the capacity still in \
-         force, got {updated}"
+        (json!(3), json!(6)),
+        "case switch back with index capacity: the answer reports the new mode's \
+         capacity, got {updated}"
     );
     let settled = wait_until_active(&router, region, "Capacity").await;
     assert_eq!(

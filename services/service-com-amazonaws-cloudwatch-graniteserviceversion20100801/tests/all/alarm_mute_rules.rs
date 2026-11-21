@@ -993,26 +993,15 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         );
     }
 
-    // A token this service cannot read a cursor out of names no position of this listing, so it
-    // is IGNORED and the first page is served rather than the request refused. Rows differ along
-    // how the token misses: text that is no token at all, a truncated one, and one with text
-    // appended.
+    // A token this service cannot read a cursor out of names no rule this listing holds, so it
+    // names the position PAST the last one and the EMPTY page is served rather than the request
+    // refused. Rows differ along how the token misses: text that is no token at all, a truncated
+    // one, and one with text appended.
     let minted = text(
         &ok(&router, "ListAlarmMuteRules", &json!({"MaxRecords": 1})).await,
         "NextToken",
     )
     .unwrap_or_default();
-    // The rules `given_mute_rules` wrote, in the name order this listing reports them in: the
-    // page an ignored token must answer with, named rather than read back out of another answer.
-    let every_rule: Vec<String> = [
-        "active-rule",
-        "expired-rule",
-        "scheduled-rule",
-        "untargeted-rule",
-    ]
-    .iter()
-    .map(|name| rule_arn(REGION, name))
-    .collect();
     for (case, token) in [
         ("a token that is not one", "not-a-token".to_string()),
         (
@@ -1032,8 +1021,8 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         .await;
         assert_eq!(
             (status, listed_arns(&body), body.get("NextToken")),
-            (200, every_rule.clone(), None),
-            "case {case:?}: expected HTTP 200 with the token ignored and the first page served, \
+            (200, Vec::new(), None),
+            "case {case:?}: expected HTTP 200 with the empty page past the last rule, \
              got {status} with {body}"
         );
     }
@@ -1310,12 +1299,12 @@ async fn deleting_a_mute_rule_is_idempotent_and_reaches_only_its_own_region() {
 }
 
 #[tokio::test]
-async fn a_next_token_this_listing_cannot_resume_from_is_ignored() {
+async fn a_next_token_this_listing_cannot_resume_from_asks_for_the_empty_page() {
     // The rule: a `NextToken` names a POSITION in the enumeration — "The token returned from a
     // previous call to indicate where to continue retrieving results."
     // (`ListAlarmMuteRulesInput$NextToken`) — and one this listing cannot read a cursor out of
-    // names no position at all, so it is IGNORED and the FIRST page is served, not a refusal
-    // that aborts the walk.
+    // names no rule it holds, so it names the position PAST the last one: the EMPTY page is
+    // served, not a refusal that aborts the walk and not the first page again.
     //
     // Rows differ along the FORM of the value offered: no token at all, the empty string, a token
     // this listing minted, and four shapes of value it cannot read a cursor out of (text that is
@@ -1355,19 +1344,19 @@ async fn a_next_token_this_listing_cannot_resume_from_is_ignored() {
         (
             "text that is no cursor",
             Some("not-a-token".to_string()),
-            every_rule.clone(),
+            Vec::new(),
         ),
         (
             "an opaque blob of another service's form",
             Some("eyJuZXh0Ijoibm90aGluZyJ9".to_string()),
-            every_rule.clone(),
+            Vec::new(),
         ),
         (
             "a blob whose bytes are no text",
             Some("AAAA".to_string()),
-            every_rule.clone(),
+            Vec::new(),
         ),
-        ("a minted cursor truncated", Some(truncated), every_rule.clone()),
+        ("a minted cursor truncated", Some(truncated), Vec::new()),
     ];
 
     for (case, token, expected) in cases {

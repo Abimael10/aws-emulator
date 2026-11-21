@@ -450,8 +450,9 @@ async fn a_withdrawn_provisioned_capacity_leaves_the_warm_throughput_it_kept_in_
         )
         .await;
         let description = &switched["TableDescription"];
-        // The switch is asynchronous, so its own answer reports the capacity each resource
-        // is still provisioned for.
+        // The capacity MODE is in force from the moment the call returns, and the
+        // provisioned pair belongs to the mode, so the switch's own answer reports the new
+        // mode's figures: an on-demand table and its index provision no capacity.
         assert_eq!(
             (
                 description["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
@@ -460,12 +461,8 @@ async fn a_withdrawn_provisioned_capacity_leaves_the_warm_throughput_it_kept_in_
                     ["ReadCapacityUnits"]
                     .clone(),
             ),
-            (
-                json!(row.table_capacity.0),
-                json!(row.table_capacity.1),
-                json!(row.index_capacity.0),
-            ),
-            "case {case:?}: expected the switch to report the capacity still in force, got \
+            (json!(0), json!(0), json!(0)),
+            "case {case:?}: expected the switch to report the new mode's capacity, got \
              {description}"
         );
         assert_warm(

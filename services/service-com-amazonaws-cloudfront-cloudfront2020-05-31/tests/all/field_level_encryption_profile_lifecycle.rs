@@ -966,18 +966,15 @@ async fn an_id_no_profile_holds_is_refused_by_both_readers() {
 
     // The rows span the ways an id can name no profile: a well-shaped profile id that was
     // never minted, an id in another namespace and of a width no identifier of this kind is
-    // issued at, and a value of no CloudFront identifier form at all. Every value written in
-    // the identifier ALPHABET is the profile reported absent; only a value outside that
-    // alphabet is the identifier reported unreadable.
+    // issued at, and a value of no CloudFront identifier form at all. These readers read the
+    // WHOLE form a profile id is minted in, so only a value of that form is the profile
+    // reported absent; every other value is the identifier reported unreadable.
     for (case, expected) in [
         (
             "P280MFCLSYOCVU",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
-        (
-            "EDFDVBD6EXAMPLE",
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
-        ),
+        ("EDFDVBD6EXAMPLE", UNREADABLE_PROFILE_ID_MESSAGE),
         ("not-a-profile-id", UNREADABLE_PROFILE_ID_MESSAGE),
     ] {
         for (reader, answer) in [

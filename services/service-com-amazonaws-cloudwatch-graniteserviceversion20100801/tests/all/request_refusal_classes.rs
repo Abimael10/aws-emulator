@@ -281,10 +281,9 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
         }
 
         // The alarm LISTING refuses no token: a value it cannot read a cursor out of names no
-        // position of the enumeration at all, so it is IGNORED and the listing answers the page
-        // a request carrying no token asks for — its first, which holds the alarm this test
-        // wrote (`tests/all/paginated_read_cursor.rs` holds that rule over every listing of
-        // this service that serves such a token).
+        // alarm this enumeration holds, so it names the position PAST the last one and the
+        // EMPTY page is served (`tests/all/paginated_read_cursor.rs` holds that rule over
+        // every listing of this service that serves such a token).
         let listed = ok(&router, "DescribeAlarms", &json!({"NextToken": token})).await;
         let named: Vec<String> = listed["MetricAlarms"]
             .as_array()
@@ -294,17 +293,15 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
             .filter_map(|alarm| alarm.get("AlarmName").and_then(Value::as_str))
             .map(ToString::to_string)
             .collect();
-        assert_eq!(
-            named,
-            vec!["paged-alarm".to_string()],
-            "case {case:?}: a token the alarm listing cannot read must be ignored and the first \
-             page served, got {listed}"
+        assert!(
+            named.is_empty(),
+            "case {case:?}: a token the alarm listing cannot resume from must answer the \
+             empty page, got {listed}"
         );
         assert_eq!(
-            listed,
-            ok(&router, "DescribeAlarms", &json!({})).await,
-            "case {case:?}: that page is the one a request carrying no token is answered with, \
-             got {listed}"
+            listed.get("NextToken"),
+            None,
+            "case {case:?}: an empty page owes no further token, got {listed}"
         );
     }
 }

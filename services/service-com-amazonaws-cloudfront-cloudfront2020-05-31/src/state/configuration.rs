@@ -3503,11 +3503,11 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_PROFILE_COMMENT: usize = MAX_ORIGIN_ACCESS_
 /// argument error
 /// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionProfile")` reports
 /// `errors: [AccessDenied, NoSuchFieldLevelEncryptionProfile]`), and the recorded answers of
-/// this surface report every id written in the identifier alphabet that the account holds no
-/// profile under as the profile that is absent. A profile id borne
+/// this surface report every id written in the form a profile identifier is MINTED in that the
+/// account holds no profile under as the profile that is absent. A profile id borne
 /// by a submitted DOCUMENT addresses nothing, so it is resolved against the store alone and
 /// reports the absent profile whatever shape it takes; an id that ADDRESSES one is read for
-/// its alphabet first ([`unresolved_field_level_encryption_profile`]). The same rule the
+/// its form first ([`unresolved_field_level_encryption_profile`]). The same rule the
 /// public key reads keep ([`no_such_public_key`]) and the one
 /// [`no_such_field_level_encryption_config`] keeps for the other field-level encryption
 /// resource.
@@ -3538,15 +3538,13 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
 /// These operations model this one not-found code and no argument error, so one code and one
 /// status cover two conditions and the MESSAGE is what tells them apart, decided from the value
 /// alone and therefore before the store is consulted. The FORM this route reads of the value is
-/// the ALPHABET CloudFront writes an identifier in and nothing more ([`is_entity_id_form`]):
-/// `Id` is a plain `string` `@httpLabel` with no `@pattern` and no `@length`
-/// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionProfile")`), so neither
-/// the letter an identifier opens with nor the width of its body is a property this route may
-/// refuse a value on — the recorded answers of this surface report an identifier of that
-/// alphabet as the profile that is ABSENT whatever letter it opens with and however wide it is,
-/// because WHICH identifier was ever issued is a property of the store. A value written outside
-/// that alphabet was never an identifier CloudFront issued and is the identifier the service
-/// reports it cannot read ([`id_format_invalid_message`]).
+/// the WHOLE form a profile identifier is written in ([`is_field_level_encryption_profile_id`]):
+/// the kind's own namespace letter over an identifier body. A value of that form the store holds
+/// no profile under names a profile that is simply ABSENT, because WHICH identifier of the form
+/// was ever issued is a property of the store; a value of any other form — a word, a UUID, a
+/// lower-cased value, or a well-formed identifier of ANOTHER resource kind, which was issued for
+/// that kind and can therefore never name a profile — is the identifier the service reports it
+/// cannot read ([`id_format_invalid_message`]).
 ///
 /// Only an identifier that ADDRESSES the operation is judged this way: a profile id borne by a
 /// submitted CONFIGURATION (a query-arg or content-type mapping's `ProfileId`) addresses
@@ -3555,7 +3553,7 @@ pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
 pub fn unresolved_field_level_encryption_profile(
     id: &str,
 ) -> crate::ops::types::NoSuchFieldLevelEncryptionProfile {
-    if is_entity_id_form(id) {
+    if is_field_level_encryption_profile_id(id) {
         no_such_field_level_encryption_profile()
     } else {
         crate::ops::types::NoSuchFieldLevelEncryptionProfile {
@@ -3653,10 +3651,10 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_CONFIG_COMMENT: usize = MAX_ORIGIN_ACCESS_I
 /// [`no_such_field_level_encryption_profile`] keeps for the other field-level encryption
 /// resource: these operations model this one not-found code and no argument error
 /// (`smithy_query(query="operation",operation="GetFieldLevelEncryptionConfig")` reports
-/// `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`), and the recorded answers of
-/// this surface report every id written in the identifier alphabet that the account holds no
-/// configuration under as the configuration that is absent
-/// ([`unresolved_field_level_encryption_config`]).
+/// `errors: [AccessDenied, NoSuchFieldLevelEncryptionConfig]`), and each route reports every id
+/// of the form IT reads that the account holds no configuration under as the configuration that
+/// is absent ([`unresolved_field_level_encryption_config`],
+/// [`unresolved_field_level_encryption_config_on_the_resource_read`]).
 ///
 /// The sentence states a property of the store rather than of the request — the id names no
 /// configuration — so nothing from the request belongs in the text and every refusal of this
@@ -3676,11 +3674,42 @@ pub fn no_such_field_level_encryption_config() -> crate::ops::types::NoSuchField
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE: &str =
     "The specified field level encryption config does not exist.";
 
-/// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) an operation ADDRESSED by a
-/// field-level encryption configuration `Id` in its path answers an `Id` it cannot resolve —
-/// the split [`unresolved_field_level_encryption_profile`] makes for the other field-level
-/// encryption record, over the same identifier ALPHABET ([`is_entity_id_form`]).
+/// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) the operations addressed by a
+/// field-level encryption configuration `Id` that read or delete the CONFIGURATION answer an
+/// `Id` they cannot resolve — the split [`unresolved_field_level_encryption_profile`] makes for
+/// the other field-level encryption record, over the configuration's own whole identifier form
+/// ([`is_field_level_encryption_config_id`]).
+///
+/// The RESOURCE read of the same kind (`GetFieldLevelEncryption`, `GET
+/// /2020-05-31/field-level-encryption/{Id}`) reads less of the value, as its own recorded
+/// answers report: [`unresolved_field_level_encryption_config_on_the_resource_read`]. How much
+/// of an identifier's form a route reads is each route's recorded contract, so do not fold the
+/// two into one.
 pub fn unresolved_field_level_encryption_config(
+    id: &str,
+) -> crate::ops::types::NoSuchFieldLevelEncryptionConfig {
+    if is_field_level_encryption_config_id(id) {
+        no_such_field_level_encryption_config()
+    } else {
+        crate::ops::types::NoSuchFieldLevelEncryptionConfig {
+            message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
+        }
+    }
+}
+
+/// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) the RESOURCE read of a
+/// field-level encryption configuration (`GetFieldLevelEncryption`) answers an `Id` it cannot
+/// resolve.
+///
+/// This route reads the ALPHABET an identifier is written in and nothing more
+/// ([`is_entity_id_form`]) — neither the letter the value opens with nor the width of its body:
+/// its recorded answers report a value of that alphabet the store holds no configuration under
+/// as the configuration that is ABSENT, and `Id` is a plain `string` `@httpLabel` with no
+/// `@pattern` and no `@length`
+/// (`smithy_query(query="operation",operation="GetFieldLevelEncryption")`). A value written
+/// outside the alphabet was never an identifier CloudFront issued and is the identifier the
+/// service reports it cannot read ([`id_format_invalid_message`]).
+pub fn unresolved_field_level_encryption_config_on_the_resource_read(
     id: &str,
 ) -> crate::ops::types::NoSuchFieldLevelEncryptionConfig {
     if is_entity_id_form(id) {

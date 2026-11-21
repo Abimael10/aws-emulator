@@ -14,13 +14,11 @@
 //!    succeeds with status `ACTIVE`. (That the count is per Region rather than
 //!    cross-Region is asserted in `tests/all/region_scoping.rs`; every row here is signed
 //!    for one Region.)
-//! 2. `DeleteDomain` splits the `domainId`s it resolves no domain for by ALLOCATION
-//!    HISTORY: an id this service MINTED and no longer holds earns the modelled 404
-//!    `ResourceNotFoundException`, whose detail member names the requested id, while an id
-//!    it never minted resolves to no ARN at the edge at all and is refused by the front
-//!    door's own authorizer ahead of the lookup, with the unmodelled
-//!    `AuthorizerConfigurationException` and NO detail value. A READ of either
-//!    (`GetDomain`) answers the modelled 404.
+//! 2. `DeleteDomain` answers every `domainId` it resolves no domain for with the modelled
+//!    404 `ResourceNotFoundException`, whose detail member names the requested id — an id
+//!    this service minted and no longer holds and one it never minted read the same, which
+//!    is the ONE error the operation models. A READ of either (`GetDomain`) answers the
+//!    same 404.
 //! 3. A Domain-not-found answer reports `Domain not found: <domainId>`, the requested id
 //!    verbatim, from whichever operation resolved the Domain.
 //! 4. `GetMedicalScribeListeningSession` resolves a session only under the exact
@@ -87,23 +85,6 @@ fn unallocated_domain_id(prefix: &str, filler: char, len: usize) -> String {
     }
     id
 }
-
-/// RECORDED: the error code the front door's authorizer answers a `domainId` with no
-/// allocation history with — declared on no shape of this model
-/// (`smithy_query(query="shape",shape="AuthorizerConfigurationException")` reports it is
-/// not found). Written out here rather than imported, so this suite pins the WIRE value a
-/// client branches on.
-const AUTHORIZER_CONFIGURATION_CODE: &str = "AuthorizerConfigurationException";
-
-/// The status that refusal carries: the authorization layer's own, and a client-side one —
-/// an SDK retries a server fault, and an id that was never allocated anywhere can never
-/// start resolving.
-const AUTHORIZER_CONFIGURATION_STATUS: u16 = 403;
-
-/// The body member the domain plane keys an error's detail text by — the member name the
-/// model spells (`src/ops/types/exception_wire.rs`), which is where a refusal of this plane
-/// carrying no detail states its explicit null.
-const MODEL_MEMBER_DETAIL: &str = "message";
 
 /// The creates that fill one account's cap: `MAX_DOMAINS_PER_ACCOUNT` requests differing
 /// along what `CreateDomain` generalises over — which optional members are present, the
@@ -329,7 +310,7 @@ async fn a_domain_whose_deletion_is_still_in_flight_keeps_its_slot_until_the_pur
 }
 
 #[tokio::test]
-async fn delete_domain_splits_an_unresolvable_id_by_allocation_history() {
+async fn delete_domain_answers_every_unresolvable_id_the_modelled_not_found() {
     let emulator = Emulator::new("us-east-1");
 
     // Well-formed ids this service never allocated: both modelled prefixes, both ends of
@@ -347,30 +328,24 @@ async fn delete_domain_splits_an_unresolvable_id_by_allocation_history() {
     ];
 
     for (case, domain_id) in &unallocated {
-        // DeleteDomain of an id with no allocation history anywhere: the front door
-        // resolves no resource ARN for it, so its own authorizer refuses the call before
-        // the resource lookup runs — an error code this model declares on no shape,
-        // carrying no detail value at all. Never a 5xx: the condition is permanent, and an
-        // SDK retries a server fault.
+        // `DeleteDomain` models ONE error, so an id this Region resolves no domain for is
+        // that 404 naming the requested id, whatever allocation history the id has.
         let (status, body) = emulator
             .send("DELETE", &format!("/domain/{domain_id}"), None)
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (
-                AUTHORIZER_CONFIGURATION_STATUS,
-                AUTHORIZER_CONFIGURATION_CODE
-            ),
-            "case {case:?} ({domain_id}): expected the authorizer's own refusal, got \
+            (404, "ResourceNotFoundException"),
+            "case {case:?} ({domain_id}): expected the modelled not-found, got \
              {status} {body:?}"
         );
         assert_eq!(
-            body.get(MODEL_MEMBER_DETAIL),
-            Some(&Value::Null),
-            "case {case:?}: the detail member must be present and null, got {body:?}"
+            detail_text(case, &body),
+            format!("Domain not found: {domain_id}"),
+            "case {case:?}: the not-found must name the requested id, got {body:?}"
         );
 
-        // A READ of the same id is NOT that refusal: `GetDomain` answers every id it
+        // A READ of the same id is worded the same way: `GetDomain` answers every id it
         // resolves no domain for with the modelled not-found, naming the requested id.
         let (status, read) = emulator
             .send("GET", &format!("/domain/{domain_id}"), None)

@@ -12,6 +12,15 @@
 //! pre-move warm pair and a `NumberOfDecreasesToday` that does not yet count the decrease
 //! just accepted. What the move leaves in force is what the reads after it report.
 //!
+//! A move of the capacity MODE is not of that kind for the PROVISIONED pair: the mode a
+//! request resolves to is in force from the moment the call returns — its `BillingModeSummary`
+//! and `TableThroughputModeSummary` report it — and the provisioned pair belongs to the mode,
+//! an on-demand table provisioning no capacity at all, so a description whose mode has moved
+//! carries the new mode's own pair. What the table keeps WARM is a setting of its own rather
+//! than a figure of the mode, so that half is still the generation in force
+//! ([`CapacityInForce::restate_warm`]). The caller of this type is what decides that (see
+//! `UpdateTable`); what this type holds is one generation of one table's figures.
+//!
 //! The two DATE members beside those figures are not of that generation: "the date and
 //! time of the last provisioned throughput increase" / "decrease for this table"
 //! (`ProvisionedThroughputDescription$LastIncreaseDateTime` /
@@ -60,6 +69,21 @@ impl Figures {
                 description.number_of_decreases_today = self.decreases_today;
             }
         }
+        self.restate_warm(warm_read, warm_write);
+    }
+
+    /// Report the WARM pair these figures carry, and leave the provisioned pair beside it
+    /// alone.
+    ///
+    /// What the table keeps warm is a setting of its own — "the minimum provisioned capacity
+    /// maintained for immediate data access" — rather than a figure of the capacity mode, so
+    /// a move that changes the MODE still answers with the warm pair in force while it
+    /// settles.
+    fn restate_warm(
+        &self,
+        warm_read: Option<&mut Option<i64>>,
+        warm_write: Option<&mut Option<i64>>,
+    ) {
         if let Some((read, write)) = self.warm {
             if let Some(slot) = warm_read {
                 *slot = read;
@@ -138,6 +162,19 @@ impl CapacityInForce {
     /// index this call CREATED has no earlier generation, so it keeps the figures it was
     /// created with.
     pub fn restate(&self, description: &mut TableDescription) {
+        self.put_back(description, true);
+    }
+
+    /// Report only the WARM pair of that capacity in `description`, for a call whose
+    /// PROVISIONED pair belongs to a capacity mode the update moved the table into (see this
+    /// module's docs and `UpdateTable`).
+    pub fn restate_warm(&self, description: &mut TableDescription) {
+        self.put_back(description, false);
+    }
+
+    /// The one walk over a description both of those take, reporting the provisioned pair as
+    /// well only when `provisioned` says to.
+    fn put_back(&self, description: &mut TableDescription, provisioned: bool) {
         let (warm_read, warm_write) = match description.warm_throughput.as_mut() {
             Some(warm) => (
                 Some(&mut warm.read_units_per_second),
@@ -145,11 +182,15 @@ impl CapacityInForce {
             ),
             None => (None, None),
         };
-        self.table.restate(
-            description.provisioned_throughput.as_mut(),
-            warm_read,
-            warm_write,
-        );
+        if provisioned {
+            self.table.restate(
+                description.provisioned_throughput.as_mut(),
+                warm_read,
+                warm_write,
+            );
+        } else {
+            self.table.restate_warm(warm_read, warm_write);
+        }
         for index in description.global_secondary_indexes.iter_mut().flatten() {
             let Some(figures) = index
                 .index_name
@@ -165,7 +206,11 @@ impl CapacityInForce {
                 ),
                 None => (None, None),
             };
-            figures.restate(index.provisioned_throughput.as_mut(), warm_read, warm_write);
+            if provisioned {
+                figures.restate(index.provisioned_throughput.as_mut(), warm_read, warm_write);
+            } else {
+                figures.restate_warm(warm_read, warm_write);
+            }
         }
     }
 }

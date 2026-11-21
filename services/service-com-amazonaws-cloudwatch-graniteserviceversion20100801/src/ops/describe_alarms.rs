@@ -242,9 +242,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which POSITION of this enumeration the request's `NextToken` names, by the one rule
         // every listing of this service that SERVES such a token shares
         // ([`crate::state::ResumedAt`]). This read refuses no token: a value this service
-        // cannot read a cursor out of names no position of the enumeration at all, so it is
-        // ignored and the listing answers its FIRST page — the answer a request carrying no
-        // token gets.
+        // cannot read a cursor out of names no item this enumeration holds, so it names the
+        // position PAST the last one and the page served there is empty.
         let start_at = crate::state::ResumedAt::of(input.next_token.as_deref());
 
         // One page size for every path below, so paging behaves the same whichever filter

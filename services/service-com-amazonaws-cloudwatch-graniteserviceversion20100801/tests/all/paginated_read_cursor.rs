@@ -6,11 +6,13 @@
 //! The rule under test: **a `NextToken` names a POSITION in the enumeration, and a listing that
 //! serves such a token rather than refusing it resumes AT that position — never at the
 //! beginning** — so a continuation delivers only the items after the ones already delivered,
-//! while a value this service cannot read a cursor out of names no position at all and is
-//! IGNORED: the listing answers the page a request carrying no token asks for, its first
+//! while a value this service cannot read a cursor out of names no item this enumeration holds,
+//! which is the position PAST its last one: the listing answers the EMPTY page, carrying no
+//! item and owing no further token
 //! (`DescribeAlarmsInput$NextToken` "The token returned by a previous call to indicate that
 //! there is more data available.", `ListAlarmMuteRulesOutput$NextToken` "If this field is
-//! absent, there are no more results to retrieve.").
+//! absent, there are no more results to retrieve."). An EMPTY `NextToken` is no token at all:
+//! the only page it can name is the first.
 //!
 //! The rows differ along what the rule generalises over: which listing is walked (the alarm
 //! listing narrowed by a name prefix, the same listing asked for a composite alarm's children,
@@ -18,7 +20,7 @@
 //! that is no cursor at all, a value whose bytes are not text, an opaque blob of the form AWS
 //! carries a token in, the empty string, and no token at all), and how many items the listing
 //! holds beside the page. The recorded case — a prefix-scoped alarm listing continued with a
-//! token minted for it — is one row among them.
+//! token it cannot resume from — is one row among them.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -37,7 +39,7 @@ const PREFIX: &str = "cursor-alarm-";
 ///
 /// The first is no cursor at all; the second reads as a hexadecimal cursor whose bytes are not
 /// text; the third is the padded base64 blob AWS carries its own tokens in. None of them names
-/// an item of this service's enumerations, so each of them is ignored.
+/// an item of this service's enumerations, so each of them asks for the position past the last.
 const FOREIGN_TOKENS: [(&str, &str); 3] = [
     ("a value that is no cursor at all", "not-a-cursor"),
     ("a cursor whose bytes are not text", "fffe"),
@@ -126,7 +128,7 @@ async fn a_continued_alarm_listing_delivers_only_the_alarms_after_the_ones_alrea
 }
 
 #[tokio::test]
-async fn an_unreadable_token_is_ignored_by_the_alarm_listing() {
+async fn an_unresumable_token_answers_the_empty_page_of_the_alarm_listing() {
     let router = build_router();
     let names = given_alarms(&router, 2).await;
     let first = ok(
@@ -148,17 +150,15 @@ async fn an_unreadable_token_is_ignored_by_the_alarm_listing() {
             &json!({"AlarmNamePrefix": PREFIX, "MaxRecords": 2, "NextToken": token}),
         )
         .await;
-        assert_eq!(
-            listed_alarms(&listed),
-            names,
-            "case {case:?}: expected the token ignored and the first page served, got {listed}"
+        assert!(
+            listed_alarms(&listed).is_empty(),
+            "case {case:?}: expected the empty page past the last alarm, got {listed}"
         );
-        // Ignored, so the whole answer is the one the first page carries — the token it owes
-        // the NEXT page included.
+        // Nothing is left after the last item, so no further token is owed.
         assert_eq!(
             next_token(&listed),
-            next_token(&first),
-            "case {case:?}: expected the first page's own token, got {listed}"
+            None,
+            "case {case:?}: an empty page owes no token, got {listed}"
         );
     }
 
@@ -184,7 +184,7 @@ async fn an_unreadable_token_is_ignored_by_the_alarm_listing() {
 }
 
 #[tokio::test]
-async fn an_unreadable_token_is_ignored_by_a_relationship_walk() {
+async fn an_unresumable_token_answers_the_empty_page_of_a_relationship_walk() {
     let router = build_router();
     let children = given_alarms(&router, 2).await;
     let parent = "cursor-parent";
@@ -217,16 +217,15 @@ async fn an_unreadable_token_is_ignored_by_a_relationship_walk() {
             &json!({"ChildrenOfAlarmName": parent, "MaxRecords": 2, "NextToken": token}),
         )
         .await;
-        assert_eq!(
-            listed_alarms(&listed),
-            children,
-            "case {case:?}: expected the token ignored and the first page served, got {listed}"
+        assert!(
+            listed_alarms(&listed).is_empty(),
+            "case {case:?}: expected the empty page past the last child, got {listed}"
         );
     }
 }
 
 #[tokio::test]
-async fn an_unreadable_token_is_ignored_by_the_mute_rule_listing() {
+async fn an_unresumable_token_answers_the_empty_page_of_the_mute_rule_listing() {
     let router = build_router();
     // The same rule, read through the OTHER listing of this service that serves a token it
     // cannot read: one rule decides what such a token names for both.
@@ -255,10 +254,9 @@ async fn an_unreadable_token_is_ignored_by_the_mute_rule_listing() {
             &json!({"MaxRecords": 2, "NextToken": token}),
         )
         .await;
-        assert_eq!(
-            listed_arns(&listed),
-            listed_arns(&first),
-            "case {case:?}: expected the token ignored and the first page served, got {listed}"
+        assert!(
+            listed_arns(&listed).is_empty(),
+            "case {case:?}: expected the empty page past the last rule, got {listed}"
         );
     }
 }

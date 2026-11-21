@@ -1337,9 +1337,9 @@ async fn an_expected_entry_states_what_it_expects() {
 
     // Each row: the case, the entry, and the clause the service states — `None` where
     // the entry states a condition the service can decide — beside whether that clause is
-    // stated inside the `<N> validation error(s) detected: ` envelope, which is recorded
-    // per refusal rather than per member: the entry that states NEITHER member is enveloped
-    // while the one whose `Exists` has no `Value` states its sentence alone.
+    // stated inside the `<N> validation error(s) detected: ` envelope, which every clause an
+    // `Expected` entry's own members earn carries, as the recorded refusals of this surface
+    // word them.
     let rows: Vec<(&str, Value, Option<&str>, bool)> = vec![
         (
             "an entry stating neither Value nor Exists",
@@ -1351,7 +1351,7 @@ async fn an_expected_entry_states_what_it_expects() {
             "Exists true with no Value",
             json!({"Exists": true}),
             Some("Value must be provided when Exists is true for Attribute: attr"),
-            false,
+            true,
         ),
         (
             "Value beside Exists false",

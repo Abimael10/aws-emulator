@@ -1,37 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WIDTH and the NAMESPACE LETTER of a field-level encryption path identifier are NEITHER
-//! read when the one not-found code's two sentences are told apart, end to end over HTTP.
+//! The WIDTH and the NAMESPACE LETTER of a field-level encryption path identifier are read
+//! by the operations that address a CONFIGURATION or a PROFILE document, and by neither on the
+//! configuration's own resource read, end to end over HTTP.
 //!
-//! The rule under test: an operation addressed by a field-level encryption identifier reads the
-//! ALPHABET CloudFront writes an identifier in and nothing more — the digits and uppercase
-//! letters an identifier is written in, carrying no separator and no lower case. `Id` is a
-//! plain `string` `@httpLabel` with no `@pattern` and no `@length`, so neither the letter an
-//! identifier opens with (the configuration's `C`, the profile's `P`) nor the width of its body
-//! is a property a route may refuse a value on: every value of that alphabet is carried through
-//! to the store and, where nothing answers to it, is the record reported ABSENT ("The specified
-//! field level encryption config/profile does not exist."), while a value written outside the
-//! alphabet — in lower case, around a separator, as a UUID or as a word — is the identifier the
-//! service reports it cannot READ ("Id format is invalid"). Both sentences travel under the
-//! kind's one modelled not-found code and its 404
+//! The rule under test: how much of an identifier's FORM a route reads before it resolves it is
+//! that route's own recorded contract, and both answers travel under the kind's ONE modelled
+//! not-found code and its 404
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryption,GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`
 //! reports the kind's not-found error and `AccessDenied` and nothing else), so the MESSAGE is
-//! all that tells the two conditions apart.
+//! all that tells the two conditions apart:
+//!
+//! * the configuration's `/config` read, the profile's two reads, and the updates and deletes
+//!   of both read the WHOLE form their kind's identifiers are minted in — the kind's namespace
+//!   letter over a body of the width CloudFront writes an identifier body in — so a value of
+//!   the identifier alphabet at another width, under another letter, or minted for another
+//!   resource kind entirely is the identifier the service reports it cannot READ ("Id format is
+//!   invalid"), while a value of the kind's own form that the store holds nothing for is the
+//!   record reported ABSENT, since WHICH identifier of that form was issued is a property of
+//!   the store;
+//! * `GetFieldLevelEncryption`, the configuration's resource read, reads the ALPHABET and
+//!   nothing more: every value of the digits and uppercase letters an identifier is written in
+//!   is carried through to the store there.
 //!
 //! The rows therefore vary what the rule generalises over:
 //!
 //! * the BODY at the issued width, written in digits and letters never minted, in zeros, in one
 //!   letter, and as the minted identifier with its last character changed — each the record
-//!   reported absent, since WHICH identifier of that alphabet was issued is a property of the
-//!   store;
+//!   reported absent, on every route;
 //! * the BODY WIDTH, from one character up to three times the width this service issues,
-//!   including one short of and one past it — each still carried through to the store;
+//!   including one short of and one past it;
 //! * the NAMESPACE LETTER: the addressed kind's own, one no kind of this service issues an
 //!   identifier under, the one every other CloudFront entity id is drawn from, and a leading
 //!   digit — the last three at the issued width as well as at every other;
 //! * the identifiers of the NEIGHBOURING kinds this service really minted — the sibling
-//!   field-level encryption record's and a public key's — each issued under another letter and
-//!   each still a value this surface resolves against its own store;
+//!   field-level encryption record's and a public key's;
 //! * both RESOURCE KINDS of this surface, each through every operation that addresses it by a
 //!   path identifier — both readers, the update and the delete;
 //! * and the values that are outside the alphabet altogether: a minted identifier in lower
@@ -41,9 +44,10 @@
 //! The issued width is read off an identifier this emulator really issued, so no width here is
 //! written out by hand. The harness, the document builders and the create paths are the
 //! crate's own, reused rather than copied — and the harness this suite builds ([`Kind`],
-//! [`seed`], [`address`], [`assert_refusal`]) is itself reused by
-//! `field_level_encryption_identifier_issued_form.rs`, which reads the same sentence back
-//! through the resources' LIFECYCLE rather than through generated identifiers.
+//! [`seed`], [`address`], [`assert_refusal`], [`unresolved_answer`]) is itself reused by
+//! `field_level_encryption_identifier_alphabet.rs` and
+//! `field_level_encryption_identifier_is_not_refused_on_its_form.rs`, which read the same
+//! sentences back through the resources' LIFECYCLE rather than through generated identifiers.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -274,6 +278,59 @@ pub(crate) fn assert_refusal(answer: &Answer, case: &str, code: &str, message: &
     );
 }
 
+/// Whether `operation` reads the WHOLE identifier form of its resource kind before it resolves
+/// the value.
+///
+/// How much of the form a route reads is that route's own recorded contract: the
+/// configuration's RESOURCE read is the one operation of this surface whose recorded answers
+/// report a value of the identifier alphabet at any width as the record that is absent, so it
+/// reads the alphabet alone; every other operation addressed by one of these identifiers reads
+/// the kind's namespace letter and the width of its body too.
+pub(crate) fn reads_the_whole_form(operation: &str) -> bool {
+    operation != "GetFieldLevelEncryption"
+}
+
+/// Whether `value` is written in the characters CloudFront writes an identifier in: digits and
+/// uppercase letters, with no separator and no lower case.
+fn in_the_identifier_alphabet(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+}
+
+/// Whether `id` is written in the form the kind's identifiers are MINTED in, read off an
+/// identifier this emulator really issued (`minted`): its namespace letter over a body of its
+/// width, in the identifier alphabet.
+fn of_the_minted_form(id: &str, minted: &str) -> bool {
+    id.len() == minted.len()
+        && id.chars().next() == minted.chars().next()
+        && in_the_identifier_alphabet(id)
+}
+
+/// The sentence `operation` answers `id` when the store holds no record of `kind` under it,
+/// where `minted` is an identifier this emulator really issued for that kind.
+///
+/// The two sentences of the kind's one not-found code, chosen by how much of the form the route
+/// reads ([`reads_the_whole_form`]).
+pub(crate) fn unresolved_answer(
+    operation: &str,
+    kind: Kind,
+    id: &str,
+    minted: &str,
+) -> &'static str {
+    let readable = if reads_the_whole_form(operation) {
+        of_the_minted_form(id, minted)
+    } else {
+        in_the_identifier_alphabet(id)
+    };
+    if readable {
+        kind.absent()
+    } else {
+        UNREADABLE_IDENTIFIER
+    }
+}
+
 /// The widths this suite submits a body at that are NOT the width this service issues
 /// (`minted`): one character, two, one short of the issued width, one past it, twice it and
 /// three times it.
@@ -338,8 +395,7 @@ fn identifiers_of_the_issued_form(kind: Kind, seeded: &Seeded) -> Vec<(String, S
 /// identifier alphabet at ANOTHER width or under ANOTHER namespace letter: the kind's own
 /// namespace letter at every width in [`other_widths`], a letter no kind of this service issues
 /// an identifier under, the letter every other entity id of this service is drawn from and a
-/// leading digit — each at the issued width and at every other — so neither the width nor the
-/// namespace letter keeps a value of the alphabet from reaching the store.
+/// leading digit — each at the issued width and at every other.
 fn values_of_other_widths_and_namespaces(kind: Kind, seeded: &Seeded) -> Vec<(String, String)> {
     let minted = seeded.minted(kind);
     let namespace = minted.chars().next().unwrap_or(UNMINTED_NAMESPACE);
@@ -368,10 +424,9 @@ fn values_of_other_widths_and_namespaces(kind: Kind, seeded: &Seeded) -> Vec<(St
 }
 
 /// The identifiers of the NEIGHBOURING kinds this emulator really minted, submitted where an
-/// identifier of `kind` belongs: each was issued under ANOTHER kind's namespace letter, and each
-/// is still a value of the identifier alphabet — so the addressed operation resolves it against
-/// its own store and reports the record that is absent, the letter it opens with being no part
-/// of the judgement.
+/// identifier of `kind` belongs: each was issued under ANOTHER kind's namespace letter, so a
+/// route that reads the whole form reports it unreadable while the one that reads the alphabet
+/// alone resolves it against its own store.
 fn neighbouring_minted_identifiers(
     kind: Kind,
     seeded: &Seeded,
@@ -465,18 +520,19 @@ async fn an_identifier_of_the_issued_form_the_store_cannot_resolve_reads_as_abse
     );
 }
 
-/// Neither the WIDTH nor the NAMESPACE LETTER is read: a body at any other width under the
-/// kind's own letter, any width under a letter this kind's identifiers are not issued under, and
-/// the identifiers the neighbouring kinds were really minted under are each carried through to
-/// the store and reported as the record that is ABSENT, through every operation addressed by
-/// one.
+/// Neither the WIDTH nor the NAMESPACE LETTER keeps a value from being resolved where a route
+/// reads only the alphabet, and both are read where a route reads the whole form: a body at any
+/// other width under the kind's own letter, any width under a letter this kind's identifiers are
+/// not issued under, and the identifiers the neighbouring kinds were really minted under are
+/// each answered by [`unresolved_answer`], through every operation addressed by one.
 #[tokio::test]
-async fn a_value_of_another_width_or_namespace_is_carried_through_to_the_store() {
+async fn a_value_of_another_width_or_namespace_is_judged_by_the_form_its_route_reads() {
     let router = emulator();
     let seeded = seed(&router).await;
     let public_key = upload_key(&router, 1).await;
 
     for kind in [Kind::Config, Kind::Profile] {
+        let minted = seeded.minted(kind).to_string();
         let rows = values_of_other_widths_and_namespaces(kind, &seeded)
             .into_iter()
             .chain(neighbouring_minted_identifiers(kind, &seeded, &public_key));
@@ -486,7 +542,7 @@ async fn a_value_of_another_width_or_namespace_is_carried_through_to_the_store()
                     &answer,
                     &format!("{operation} with {case} ({id:?})"),
                     kind.code(),
-                    kind.absent(),
+                    unresolved_answer(operation, kind, &id, &minted),
                 );
             }
         }

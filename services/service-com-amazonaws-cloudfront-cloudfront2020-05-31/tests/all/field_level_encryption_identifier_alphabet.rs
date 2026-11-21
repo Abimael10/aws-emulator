@@ -1,37 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ALPHABET a field-level encryption path identifier is written in is the WHOLE of what an
-//! operation addressed by one decides about the value, end to end over HTTP.
+//! The ALPHABET a field-level encryption path identifier is written in is the OUTER bound of
+//! what any operation addressed by one accepts, end to end over HTTP.
 //!
 //! The rule under test: an operation addressed by a field-level encryption identifier answers
 //! its one modelled not-found code (404) for every identifier it cannot resolve — the kind's
 //! own not-found error and `AccessDenied` are all these operations model
-//! (`smithy_query(query="operation",operation="GetFieldLevelEncryption,GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`),
-//! and `Id` is a plain `string` `@httpLabel` with no `@pattern` and no `@length` — so the
-//! MESSAGE is what tells the two conditions apart, and it is decided by the CHARACTERS the
-//! value is written in and by nothing else: a value written in the digits and uppercase
-//! letters CloudFront writes an identifier in is carried through to the store and reported as
-//! the record that is ABSENT, while a value written outside them — in lower case, around a
-//! separator, as a UUID, as a word — is the identifier the service reports it cannot READ.
+//! (`smithy_query(query="operation",operation="GetFieldLevelEncryption,GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`)
+//! — so the MESSAGE is what tells the two conditions apart, and a value carrying a character
+//! the identifier alphabet does not admit is the identifier reported UNREADABLE by every one of
+//! them, whatever else is true of it. Inside the alphabet, how much of the FORM each route
+//! reads is its own recorded contract, which
+//! `field_level_encryption_identifier_width_and_namespace.rs` states and
+//! [`unresolved_answer`] decides.
 //!
-//! The rows vary the dimensions the rule generalises over, each of which it is INDIFFERENT to
-//! as long as the alphabet holds: the WIDTH (one character, the width this service issues, one
-//! short of it, one past it, and far beyond it), the LEADING LETTER (the kind's own, the
-//! sibling kind's, a letter no kind of this service mints under, the letter the other entity
-//! ids are drawn from, and a digit), the CHARACTER CLASSES the body mixes (letters only,
-//! digits only, both), both RESOURCE KINDS of this surface and every OPERATION addressed by
-//! one of their identifiers — against the values outside the alphabet, which are the suite's
-//! contrast rows.
+//! The rows vary the dimensions the rule generalises over: the WIDTH (one character, the width
+//! this service issues, one short of it, one past it, and far beyond it), the LEADING LETTER
+//! (the kind's own, the sibling kind's, a letter no kind of this service mints under, the letter
+//! the other entity ids are drawn from, and a digit), the CHARACTER CLASSES the body mixes
+//! (letters only, digits only, both), both RESOURCE KINDS of this surface and every OPERATION
+//! addressed by one of their identifiers — against the values outside the alphabet, which are
+//! the suite's contrast rows.
 //!
 //! The harness is the one `field_level_encryption_identifier_width_and_namespace.rs` publishes
-//! ([`Kind`], [`seed`], [`address`], [`assert_refusal`], [`UNREADABLE_IDENTIFIER`]), reused
-//! rather than copied; the width this service issues is read off an identifier it really
-//! minted, so no width here is written out by hand.
+//! ([`Kind`], [`seed`], [`address`], [`assert_refusal`], [`unresolved_answer`],
+//! [`UNREADABLE_IDENTIFIER`]), reused rather than copied; the width this service issues is read
+//! off an identifier it really minted, so no width here is written out by hand.
 
 use crate::distribution_lifecycle::emulator;
 use crate::field_level_encryption_config_lifecycle::get_config;
 use crate::field_level_encryption_identifier_width_and_namespace::{
-    address, assert_refusal, seed, Kind, Seeded, UNREADABLE_IDENTIFIER,
+    address, assert_refusal, seed, unresolved_answer, Kind, Seeded, UNREADABLE_IDENTIFIER,
 };
 use crate::field_level_encryption_profile_lifecycle::get_profile;
 
@@ -156,26 +155,26 @@ fn outside_the_alphabet(kind: Kind, seeded: &Seeded) -> Vec<(String, String)> {
     ]
 }
 
-/// RULE: a value written in the identifier alphabet is resolved against the STORE, so one the
-/// store holds no record for is the record reported ABSENT — whatever its width, whatever
-/// character it opens with and whatever classes its body mixes — through every operation
-/// addressed by an identifier of either kind.
+/// RULE: a value written in the identifier alphabet is judged by the form its route reads — the
+/// kind's whole minted form, or the alphabet alone — so one the store holds no record for is
+/// either the record reported ABSENT or the identifier reported UNREADABLE, and never anything
+/// else, through every operation addressed by an identifier of either kind.
 #[tokio::test]
-async fn a_value_of_the_identifier_alphabet_is_resolved_against_the_store() {
+async fn a_value_of_the_identifier_alphabet_is_judged_by_the_form_its_route_reads() {
     let router = emulator();
     let seeded = seed(&router).await;
 
     for kind in [Kind::Config, Kind::Profile] {
+        let minted = seeded.minted(kind).to_string();
         for (case, id) in in_the_alphabet(kind, &seeded) {
             for (operation, answer) in address(&router, kind, &id, &seeded).await {
                 let case = format!("{operation} with {case} ({id:?})");
-                let actual = answer.root().find_text("Message").unwrap_or_default();
-                assert_ne!(
-                    actual, UNREADABLE_IDENTIFIER,
-                    "case {case:?}: a value of the identifier alphabet must not be refused on \
-                     its form, got {actual:?}"
+                assert_refusal(
+                    &answer,
+                    &case,
+                    kind.code(),
+                    unresolved_answer(operation, kind, &id, &minted),
                 );
-                assert_refusal(&answer, &case, kind.code(), kind.absent());
             }
         }
     }

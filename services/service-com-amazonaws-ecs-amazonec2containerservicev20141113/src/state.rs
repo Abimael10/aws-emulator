@@ -1423,18 +1423,20 @@ pub const DEFAULT_PORT_PROTOCOL: &str = "tcp";
 pub const DYNAMIC_HOST_PORT: i32 = 0;
 
 /// Every launch type a task-definition projection may report, in the order Amazon ECS
-/// reports them in `TaskDefinition$compatibilities`. The membership is the `Compatibility`
-/// enum (`smithy_query(query="shape", shape="com.amazonaws.ecs#Compatibility")`:
-/// `EC2`, `FARGATE`, `EXTERNAL`, `MANAGED_INSTANCES`); the ORDER is the one recorded ECS
-/// responses carry, so a client that reads the list positionally reads the same launch
-/// type the real service named. [`TaskDefinitionRecord::compatibilities`] filters it by
-/// what the stored revision was validated against.
-pub const COMPATIBILITY_ORDER: [&str; 4] = [
-    "EXTERNAL",
-    "EC2",
-    LAUNCH_TYPE_FARGATE,
-    LAUNCH_TYPE_MANAGED_INSTANCES,
-];
+/// reports them in `TaskDefinition$compatibilities`: the launch types a revision's own
+/// parameters are validated against, as recorded ECS responses report them — `EXTERNAL`,
+/// `EC2` and `FARGATE`.
+///
+/// The `Compatibility` enum carries a fourth value (`smithy_query(query="shape",
+/// shape="com.amazonaws.ecs#Compatibility")`: `EC2`, `FARGATE`, `EXTERNAL`,
+/// `MANAGED_INSTANCES`), which a REGISTRATION may ask to be validated against and which is
+/// then reported back in `requiresCompatibilities` — but managed-instances capacity is not a
+/// launch type Amazon ECS derives into this list, and no recorded projection of a revision
+/// carries it however the revision is shaped. The ORDER is the one recorded ECS responses
+/// carry, so a client that reads the list positionally reads the same launch type the real
+/// service named. [`TaskDefinitionRecord::compatibilities`] filters it by what the stored
+/// revision was validated against.
+pub const COMPATIBILITY_ORDER: [&str; 3] = ["EXTERNAL", "EC2", LAUNCH_TYPE_FARGATE];
 
 /// The launch types `Cluster$statistics` separates a cluster's counts by, each paired
 /// with the segment its four statistic names carry (`running<segment>TasksCount`,
@@ -3870,11 +3872,10 @@ impl TaskDefinitionRecord {
     /// on capacity Amazon ECS owns and so has no container instance whose own role the
     /// agent could pull under.
     ///
-    /// Managed-instances capacity places a task on EC2 capacity Amazon ECS manages for the
-    /// caller, so it imposes no task-definition parameter requirement of its own — every
-    /// revision is validated against it, exactly as every revision is validated against
-    /// `EC2`. Which launch types a PLACEMENT may name outright is a further and narrower
-    /// question ([`PLACEMENT_LAUNCH_TYPES`]), decided where a `launchType` is checked
+    /// The launch types this list is drawn from are [`COMPATIBILITY_ORDER`]: managed-instances
+    /// capacity is no part of it, as recorded projections of a revision report. Which launch
+    /// types a PLACEMENT may name outright is a further and narrower question
+    /// ([`PLACEMENT_LAUNCH_TYPES`]), decided where a `launchType` is checked
     /// ([`validate_launch_type`]).
     ///
     /// What the REGISTRATION asked to be validated against (`requiresCompatibilities`) is
@@ -3886,7 +3887,7 @@ impl TaskDefinitionRecord {
         COMPATIBILITY_ORDER
             .iter()
             .filter(|launch_type| match **launch_type {
-                "EC2" | "MANAGED_INSTANCES" => true,
+                "EC2" => true,
                 "EXTERNAL" => !awsvpc,
                 "FARGATE" => {
                     awsvpc
