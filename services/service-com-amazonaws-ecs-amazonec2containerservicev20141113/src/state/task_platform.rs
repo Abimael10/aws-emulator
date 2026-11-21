@@ -26,7 +26,10 @@
 //!   ([`FARGATE_DEFAULT_EPHEMERAL_STORAGE_GIB`]);
 //! * `Task$overrides` is "one or more container overrides", which a placement always has:
 //!   the task runs the containers its revision declares, so each of them is named there
-//!   whether or not the request overrode anything of it ([`resolved_task_overrides`]).
+//!   whether or not the request overrode anything of it ([`resolved_task_overrides`]);
+//! * the size of the capacity Amazon ECS provisioned for the task, which it reports beside
+//!   the task's own `cpu` and `memory` for a placement onto capacity it provisions
+//!   ([`TaskRecord::provisioned_size`]).
 //!
 //! Resolved ONCE, by the placement, and stored on the task — not recomputed per read: a
 //! later registration in the same family, or a later platform version being published,
@@ -219,5 +222,29 @@ pub fn task_cpu_architecture(
     match host_reported {
         Some(reported) => reported.to_string(),
         None => requested_cpu_architecture(runtime_platform),
+    }
+}
+
+impl TaskRecord {
+    /// The size of the capacity Amazon ECS PROVISIONED for this task — `(cpu, memory)`, in
+    /// the units the task's own `cpu` and `memory` count in — and `None` for a task whose
+    /// capacity Amazon ECS does not provision.
+    ///
+    /// A task placed on Fargate runs on infrastructure Amazon Web Services provisions FOR
+    /// that task, sized by the task itself ("This field is required for Fargate",
+    /// `Task$cpu`), so what was provisioned for it is the task's resolved size; a task
+    /// placed on capacity registered to the cluster runs on an instance the account
+    /// provisioned for itself, whose size is no part of the task, so the task reports no
+    /// provisioned size at all.
+    ///
+    /// Read off the task's own reported size, so the provisioned size and the size the
+    /// task reports can never disagree.
+    pub fn provisioned_size(&self) -> Option<(String, String)> {
+        if !self.runs_on_fargate() {
+            return None;
+        }
+        let cpu = self.cpu.clone()?;
+        let memory = self.memory.clone()?;
+        Some((cpu, memory))
     }
 }

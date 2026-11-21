@@ -535,6 +535,11 @@ pub use task_placement_constraints::*;
 mod container_instance_tasks;
 pub use container_instance_tasks::*;
 
+/// The RESOLUTION every instant this service reports is reported at: the one conversion
+/// from a clock reading to a stored timestamp.
+mod reported_timestamps;
+pub use reported_timestamps::*;
+
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -4033,7 +4038,7 @@ impl DaemonTaskDefinitionRecord {
     /// the delete running.
     pub fn request_delete(&mut self, now: SystemTime) {
         self.status = DAEMON_TASK_DEFINITION_DELETE_IN_PROGRESS.to_string();
-        self.delete_requested_at = Some(DateTime::from(now));
+        self.delete_requested_at = Some(reported_instant(now));
         self.deleted_due_at = Some(now + TRANSITION_SPAN);
     }
 
@@ -4364,6 +4369,12 @@ impl TaskRecord {
     /// see the resource tags for the task. If TAGS is specified, the tags are included
     /// in the response. If this field is omitted, tags aren't included."
     pub fn view(&self, include_tags: bool) -> Task {
+        // The size of the capacity Amazon ECS provisioned for this task, reported beside
+        // the size the task itself states ([`Self::provisioned_size`]).
+        let (provisioned_cpu, provisioned_memory) = match self.provisioned_size() {
+            Some((cpu, memory)) => (Some(cpu), Some(memory)),
+            None => (None, None),
+        };
         Task {
             // `Task$attachments`: "The Elastic Network Adapter that's associated with the
             // task if the task uses the `awsvpc` network mode" — the attachments this task
@@ -4440,6 +4451,8 @@ impl TaskRecord {
             task_arn: Some(self.task_arn.clone()),
             task_definition_arn: Some(self.task_definition_arn.clone()),
             version: self.version,
+            provisioned_cpu,
+            provisioned_memory,
             ..Task::default()
         }
     }
@@ -4505,7 +4518,7 @@ impl TaskRecord {
             protection_enabled: self.protection_expires_at.is_some(),
             // "The epoch time when protection for the task will expire" — absent for a
             // task that is not protected, which has no expiry to report.
-            expiration_date: self.protection_expires_at.map(DateTime::from),
+            expiration_date: self.protection_expires_at.map(reported_instant),
         }
     }
 
@@ -4554,7 +4567,7 @@ impl TaskRecord {
             return false;
         }
         self.connectivity = Some(CONNECTIVITY_CONNECTED.to_string());
-        self.connectivity_at = Some(DateTime::from(at));
+        self.connectivity_at = Some(reported_instant(at));
         true
     }
 
@@ -4653,7 +4666,7 @@ impl TaskRecord {
         self.last_status = STATUS_DEACTIVATING.to_string();
         self.stopped_reason = Some(ESSENTIAL_CONTAINER_EXITED_REASON.to_string());
         self.stop_code = Some(STOP_CODE_ESSENTIAL_CONTAINER_EXITED.to_string());
-        self.stopping_at = Some(DateTime::from(at));
+        self.stopping_at = Some(reported_instant(at));
         self.stopped_due_at = Some(at + TRANSITION_SPAN);
         for container in &mut self.containers {
             container.advance_to(STATUS_DEACTIVATING);

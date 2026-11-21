@@ -460,7 +460,7 @@ fn apply_registrations(
             platform_devices: Vec::new(),
             tags: Vec::new(),
             // The instant the registration was owed at, not the instant this pass ran.
-            registered_at: DateTime::from(registration.registered_at),
+            registered_at: reported_instant(registration.registered_at),
             version: 0,
         };
         let cluster_name = record.cluster_name.clone();

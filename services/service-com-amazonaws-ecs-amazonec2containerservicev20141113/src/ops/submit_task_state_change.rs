@@ -413,14 +413,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // PENDING state to the RUNNING state".
                     task.started_at = task
                         .started_at
-                        .or(Some(::aws_smithy_types::DateTime::from(now)));
+                        .or(Some(crate::state::reported_instant(now)));
                 }
                 if reported == crate::state::STATUS_DEACTIVATING {
                     // `Task$stoppingAt`: "the time when the task transitions from the
                     // RUNNING state to STOPPING".
                     task.stopping_at = task
                         .stopping_at
-                        .or(Some(::aws_smithy_types::DateTime::from(now)));
+                        .or(Some(crate::state::reported_instant(now)));
                 }
                 if reported == crate::state::STATUS_STOPPED {
                     task.pending_due_at = None;
@@ -430,7 +430,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // RUNNING state to the STOPPED state".
                     task.stopped_at = task
                         .stopped_at
-                        .or(Some(::aws_smithy_types::DateTime::from(now)));
+                        .or(Some(crate::state::reported_instant(now)));
                     // `Task$stoppedReason`: "The reason that the task was stopped" — "the
                     // reason for the state change request" that stopped it.
                     if let Some(reason) = input.reason.clone() {
@@ -536,7 +536,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if change.status == crate::state::STATUS_RUNNING
                 && agent.last_status != crate::state::STATUS_RUNNING
             {
-                agent.last_started_at = Some(::aws_smithy_types::DateTime::from(now));
+                agent.last_started_at = Some(crate::state::reported_instant(now));
             }
             agent.last_status = change.status.clone();
             agent.reason = change.reason.clone();

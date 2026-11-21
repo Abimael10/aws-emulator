@@ -35,6 +35,23 @@
 //! The second case carries the rule into the task's TERMINAL record: a task whose image the
 //! registry will not serve stops without ever running, and the stopped record still reports
 //! every member above, with the interface Amazon ECS created for it torn down.
+//!
+//! # Two further rules of the same record
+//!
+//! > The size of the capacity Amazon ECS PROVISIONED for a task is reported beside the size
+//! > the task itself states, for a placement onto capacity Amazon ECS provisions: a Fargate
+//! > task runs on infrastructure sized for that task ("This field is required for Fargate",
+//! > `Task$cpu`), so what was provisioned for it is its own resolved `cpu`/`memory`, while a
+//! > task placed on capacity registered to the cluster runs on an instance the account
+//! > provisioned for itself and reports no provisioned size at all. The rows span both ways
+//! > a placement selects Fargate (a launch type, a capacity provider strategy), two task
+//! > sizes, and a placement onto the cluster's own registered capacity.
+//!
+//! > Every instant this service reports is an epoch-seconds timestamp carrying at most
+//! > MILLISECOND resolution, whatever resolution the host clock this emulator reads ticks
+//! > at. The rows span the records that carry one — a task, a task-definition revision and a
+//! > service with its deployment — read through the call that wrote it and through the read
+//! > that answers it afterwards.
 
 use std::time::{Duration, Instant};
 
@@ -43,8 +60,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
     create_cluster, ec2, ec2_element, ecr, emulator_with_ec2, emulator_with_ecr_and_iam, iam,
-    identity_document, identity_document_signature, list, ok, register_capacity, string, ACCOUNT,
-    AWSVPC_SUBNET, SIGNED_REGION,
+    identity_document, identity_document_signature, list, ok, register_capacity,
+    register_definition, service, string, ACCOUNT, AWSVPC_SUBNET, SIGNED_REGION,
 };
 
 /// The cluster every placement below is made in.
@@ -1014,4 +1031,298 @@ async fn a_task_that_never_launched_keeps_its_platform_record_and_loses_its_inte
         ),
         "case {case:?}: expected StopTask to answer the terminal record it found, got {task}"
     );
+}
+
+/// The cluster the provisioned-size rows are placed in.
+const PROVISIONED_CLUSTER: &str = "taskprovisioned";
+
+/// One row of the provisioned-size table: the task size a revision registers, how the
+/// placement selects its capacity, and what the task must then report as provisioned.
+struct SizeRow {
+    case: &'static str,
+    /// The family the row registers, so each row reads its own revision back.
+    family: &'static str,
+    /// The task size the revision carries, which is the size the task states.
+    cpu: &'static str,
+    memory: &'static str,
+    /// What the run names for its placement: a `launchType`, else a capacity provider
+    /// strategy over the provider named here.
+    launch_type: Option<&'static str>,
+    strategy: Option<&'static str>,
+    /// Whether the capacity this placement runs on is capacity Amazon ECS provisions, which
+    /// is what decides whether a provisioned size is reported at all.
+    expect_provisioned: bool,
+}
+
+#[tokio::test]
+async fn a_task_reports_the_size_of_the_capacity_amazon_ecs_provisioned_for_it() {
+    let router = service();
+    let case = "setup";
+    create_cluster(&router, PROVISIONED_CLUSTER, case).await;
+    // A task placed with the `EC2` launch type runs on the capacity registered to its
+    // cluster, so the cluster holds one container instance; the predefined Fargate
+    // providers place tasks in it only once they are associated with it.
+    register_capacity(&router, PROVISIONED_CLUSTER, case).await;
+    ok(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": PROVISIONED_CLUSTER,
+            "capacityProviders": ["FARGATE", "FARGATE_SPOT"],
+            "defaultCapacityProviderStrategy": [],
+        }),
+        case,
+    )
+    .await;
+
+    let rows = [
+        SizeRow {
+            case: "a Fargate launch type",
+            family: "provisionedfargate",
+            cpu: "256",
+            memory: "512",
+            launch_type: Some("FARGATE"),
+            strategy: None,
+            expect_provisioned: true,
+        },
+        SizeRow {
+            case: "a larger Fargate task size",
+            family: "provisionedlarge",
+            cpu: "1024",
+            memory: "2048",
+            launch_type: Some("FARGATE"),
+            strategy: None,
+            expect_provisioned: true,
+        },
+        SizeRow {
+            case: "a capacity provider strategy naming a Fargate provider",
+            family: "provisionedspot",
+            cpu: "512",
+            memory: "1024",
+            launch_type: None,
+            strategy: Some("FARGATE_SPOT"),
+            expect_provisioned: true,
+        },
+        SizeRow {
+            case: "an EC2 launch type on the capacity registered to the cluster",
+            family: "provisionedec2",
+            cpu: "256",
+            memory: "512",
+            launch_type: Some("EC2"),
+            strategy: None,
+            expect_provisioned: false,
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let mut definition = json!({
+            "family": row.family,
+            "networkMode": "awsvpc",
+            "cpu": row.cpu,
+            "memory": row.memory,
+            "containerDefinitions": [container("app", IMAGE)],
+        });
+        if row.expect_provisioned {
+            definition["requiresCompatibilities"] = json!(["FARGATE"]);
+        }
+        ok(&router, "RegisterTaskDefinition", definition, case).await;
+
+        let mut request = json!({
+            "cluster": PROVISIONED_CLUSTER,
+            "taskDefinition": row.family,
+            "networkConfiguration": network_configuration(AWSVPC_SUBNET),
+        });
+        if let Some(launch_type) = row.launch_type {
+            request["launchType"] = json!(launch_type);
+        }
+        if let Some(provider) = row.strategy {
+            request["capacityProviderStrategy"] =
+                json!([{ "capacityProvider": provider, "weight": 1 }]);
+        }
+        let placed = ok(&router, "RunTask", request, case).await;
+        let tasks = list(&placed, "tasks", case);
+        assert_eq!(
+            tasks.len(),
+            1,
+            "case {case:?}: expected RunTask to place one task, got {placed}"
+        );
+        let task = tasks[0].clone();
+        let task_arn = string(&task, "taskArn", case);
+        // Both surfaces are asserted, so a member computed for the placement's own answer
+        // and not stored cannot pass.
+        let read = describe(&router, PROVISIONED_CLUSTER, &task_arn, case).await;
+        for (surface, task) in [("RunTask", &task), ("DescribeTasks", &read)] {
+            let (expect_cpu, expect_memory) = if row.expect_provisioned {
+                (Some(row.cpu), Some(row.memory))
+            } else {
+                (None, None)
+            };
+            assert_eq!(
+                task["provisionedCpu"].as_str(),
+                expect_cpu,
+                "case {case:?} ({surface}): expected provisionedCpu {expect_cpu:?}, got {task}"
+            );
+            assert_eq!(
+                task["provisionedMemory"].as_str(),
+                expect_memory,
+                "case {case:?} ({surface}): expected provisionedMemory {expect_memory:?}, \
+                 got {task}"
+            );
+            // Where a size IS reported it is the task's own: the capacity was provisioned
+            // for this task, so the two can never disagree.
+            if row.expect_provisioned {
+                assert_eq!(
+                    (task["provisionedCpu"].as_str(), task["provisionedMemory"].as_str()),
+                    (task["cpu"].as_str(), task["memory"].as_str()),
+                    "case {case:?} ({surface}): expected the provisioned size to be the \
+                     task's own, got {task}"
+                );
+            }
+        }
+    }
+}
+
+/// Assert `reported` is an epoch-seconds timestamp of at most millisecond resolution: the
+/// milliseconds it carries are whole, so nothing finer than a millisecond reaches the wire.
+fn assert_millisecond_resolution(case: &str, member: &str, reported: &Value) {
+    let Some(seconds) = reported.as_f64() else {
+        panic!("case {case:?}: expected an epoch timestamp for {member}, got {reported:?}");
+    };
+    let millis = seconds * 1_000.0;
+    assert!(
+        (millis - millis.round()).abs() < 1e-3,
+        "case {case:?}: expected {member} at at most millisecond resolution, got {reported}"
+    );
+}
+
+/// The cluster the records read for their reported instants are created in.
+const INSTANT_CLUSTER: &str = "taskinstants";
+
+#[tokio::test]
+async fn every_instant_a_record_reports_carries_at_most_milliseconds() {
+    let router = service();
+    let case = "setup";
+    create_cluster(&router, INSTANT_CLUSTER, case).await;
+    register_capacity(&router, INSTANT_CLUSTER, case).await;
+
+    // A task-definition revision, a task of it, and a service over a revision of its own:
+    // three records that each carry an instant, each read through the call that wrote it
+    // and through the read that answers it afterwards.
+    let registered = ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": "instantfamily",
+            "requiresCompatibilities": ["FARGATE"],
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "containerDefinitions": [container("app", IMAGE)],
+        }),
+        case,
+    )
+    .await;
+    let placed = ok(
+        &router,
+        "RunTask",
+        json!({
+            "cluster": INSTANT_CLUSTER,
+            "taskDefinition": "instantfamily",
+            "launchType": "FARGATE",
+            "networkConfiguration": network_configuration(AWSVPC_SUBNET),
+        }),
+        case,
+    )
+    .await;
+    let task = list(&placed, "tasks", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected one placed task, got {placed}"));
+    let task_arn = string(&task, "taskArn", case);
+    let read = describe(&router, INSTANT_CLUSTER, &task_arn, case).await;
+    register_definition(&router, "instantservicefamily", case).await;
+    let created = ok(
+        &router,
+        "CreateService",
+        json!({
+            "cluster": INSTANT_CLUSTER,
+            "serviceName": "instantservice",
+            "taskDefinition": "instantservicefamily",
+            "desiredCount": 1,
+            "launchType": "EC2",
+        }),
+        case,
+    )
+    .await;
+    let described = ok(
+        &router,
+        "DescribeServices",
+        json!({ "cluster": INSTANT_CLUSTER, "services": ["instantservice"] }),
+        case,
+    )
+    .await;
+    let described_service = list(&described, "services", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the service back, got {described}"));
+    let stopped = ok(
+        &router,
+        "StopTask",
+        json!({
+            "cluster": INSTANT_CLUSTER,
+            "task": task_arn,
+            "reason": "the record this row reads",
+        }),
+        case,
+    )
+    .await;
+
+    // The rows span the operations and the members that carry an instant.
+    let rows = [
+        (
+            "RegisterTaskDefinition",
+            "$.taskDefinition.registeredAt",
+            registered["taskDefinition"]["registeredAt"].clone(),
+        ),
+        ("RunTask", "$.tasks[0].createdAt", task["createdAt"].clone()),
+        (
+            "DescribeTasks",
+            "$.tasks[0].createdAt",
+            read["createdAt"].clone(),
+        ),
+        (
+            "StopTask",
+            "$.task.stoppingAt",
+            stopped["task"]["stoppingAt"].clone(),
+        ),
+        (
+            "CreateService",
+            "$.service.createdAt",
+            created["service"]["createdAt"].clone(),
+        ),
+        (
+            "CreateService",
+            "$.service.deployments[0].createdAt",
+            list(&created["service"], "deployments", case)[0]["createdAt"].clone(),
+        ),
+        (
+            "CreateService",
+            "$.service.deployments[0].updatedAt",
+            list(&created["service"], "deployments", case)[0]["updatedAt"].clone(),
+        ),
+        (
+            "DescribeServices",
+            "$.services[0].createdAt",
+            described_service["createdAt"].clone(),
+        ),
+    ];
+
+    for (operation, member, reported) in rows {
+        assert!(
+            !reported.is_null(),
+            "case {operation:?}: expected {member} on the record, got {reported}"
+        );
+        assert_millisecond_resolution(operation, member, &reported);
+    }
 }

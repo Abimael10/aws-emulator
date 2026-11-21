@@ -1369,7 +1369,7 @@ pub(super) fn lifecycle_hook_detail(hook: &LifecycleHookRecord) -> DeploymentLif
         target_type: Some(LIFECYCLE_HOOK_TARGET_PAUSE.to_string()),
         target_arn: None,
         status: Some(hook.status.clone()),
-        expires_at: Some(DateTime::from(hook.expires_at)),
+        expires_at: Some(reported_instant(hook.expires_at)),
         timeout_action: Some(hook.timeout_action.clone()),
     }
 }
@@ -2975,9 +2975,10 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// Now, as the wire timestamp type every modelled timestamp member uses.
+/// Now, as the wire timestamp type every modelled timestamp member uses — at the
+/// resolution this service reports an instant at ([`reported_instant`]).
 pub fn now() -> DateTime {
-    DateTime::from(SystemTime::now())
+    reported_instant(SystemTime::now())
 }
 
 /// How many seconds one minute of a wait is, so a minutes-valued member is converted to a

@@ -172,7 +172,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         );
         // The instant the rollout moved at, in the date-time text every AWS event body
         // carries an instant in — the same rendering a task's own event uses.
-        if let Some(updated_at) = super::task_events::date_time_text(DateTime::from(at)) {
+        if let Some(updated_at) = super::task_events::date_time_text(reported_instant(at)) {
             detail.insert(
                 "updatedAt".to_string(),
                 ::serde_json::Value::String(updated_at),

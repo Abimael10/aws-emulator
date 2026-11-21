@@ -439,7 +439,7 @@ fn task_state_change_detail(task: &TaskRecord, at: SystemTime) -> ::serde_json::
         "executionStoppedAt",
         task.execution_stopped_at,
     );
-    insert_instant(&mut detail, "updatedAt", Some(DateTime::from(at)));
+    insert_instant(&mut detail, "updatedAt", Some(reported_instant(at)));
     detail.insert(
         "version".to_string(),
         ::serde_json::Value::from(task.version),

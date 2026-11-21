@@ -44,6 +44,9 @@ macro_rules! ecs_shape_type {
     (integer) => {
         ::aws_smithy_schema::ShapeType::Integer
     };
+    (long) => {
+        ::aws_smithy_schema::ShapeType::Long
+    };
     (date_time) => {
         ::aws_smithy_schema::ShapeType::Timestamp
     };
@@ -61,10 +64,10 @@ macro_rules! ecs_shape_type {
 /// One member's schema, as the vendored codegen emits it: the member's shape id, its shape
 /// type, its wire name and its index in the member list.
 ///
-/// `$kind` is the member's shape kind — `string`, `integer`, `date_time`, `list_of_string`,
-/// `list_of_struct(T)`, `struct_of(T)` — or `recorded("<namespace>", <kind>)` for a member the
-/// model does not declare at all, whose shape id then sits in the namespace given there rather
-/// than in the service's own.
+/// `$kind` is the member's shape kind — `string`, `integer`, `long`, `date_time`,
+/// `list_of_string`, `list_of_struct(T)`, `struct_of(T)` — or `recorded("<namespace>", <kind>)`
+/// for a member the model does not declare at all, whose shape id then sits in the namespace
+/// given there rather than in the service's own.
 macro_rules! ecs_member_schema {
     (
         $ns:literal, $local:literal, $wire:literal, $idx:literal,
@@ -112,6 +115,9 @@ macro_rules! ecs_write_member {
     ($s:ident, $m:expr, $v:expr, integer) => {
         $s.write_integer($m, *$v)?;
     };
+    ($s:ident, $m:expr, $v:expr, long) => {
+        $s.write_long($m, *$v)?;
+    };
     ($s:ident, $m:expr, $v:expr, date_time) => {
         $s.write_timestamp($m, $v)?;
     };
@@ -152,6 +158,9 @@ macro_rules! ecs_read_member {
     };
     ($d:ident, $m:expr, integer) => {
         $d.read_integer($m)?
+    };
+    ($d:ident, $m:expr, long) => {
+        $d.read_long($m)?
     };
     ($d:ident, $m:expr, date_time) => {
         $d.read_timestamp($m)?

@@ -2034,7 +2034,18 @@ pub struct ConflictException {
     pub message: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ecs#Task")]
+/// One task, as every task-returning operation reports it: the members `Task` declares, in
+/// the model's own member order, with `provisionedCpu` and `provisionedMemory` appended
+/// last.
+///
+/// Member set, order and requiredness from `smithy_query(query="shape", shape="Task")`, plus
+/// those two — the CPU and memory the capacity Amazon ECS provisioned for the task carries,
+/// which the real service reports beside the task's own `cpu`/`memory` and the on-disk model
+/// omits. That is why the schema and the codec come from `types::unmodelled_member_wire`
+/// rather than from the derive (see that module's note); they are filled in from the task's
+/// resolved size ([`crate::state::TaskRecord::view`]) and absent for a task whose capacity
+/// Amazon ECS does not provision, so every modelled member reaches the wire exactly as the
+/// derive wrote it.
 #[derive(Debug, Clone, Default)]
 pub struct Task {
     pub attachments: Option<Vec<Attachment>>,
@@ -2074,7 +2085,221 @@ pub struct Task {
     pub version: i64,
     pub ephemeral_storage: Option<EphemeralStorage>,
     pub fargate_ephemeral_storage: Option<TaskEphemeralStorage>,
+    /// The CPU units the capacity Amazon ECS provisioned for this task carries, as the task
+    /// was provisioned with them, and `None` for a task whose capacity Amazon ECS does not
+    /// provision.
+    pub provisioned_cpu: Option<String>,
+    /// The memory, in MiB, that same capacity carries, reported the same way.
+    pub provisioned_memory: Option<String>,
 }
+
+ecs_schema_and_codec!(
+    Task,
+    TASK_SCHEMA,
+    "com.amazonaws.ecs#Task",
+    "com.amazonaws.ecs",
+    "Task",
+    (
+        M_ATTACHMENTS,
+        attachments,
+        "attachments",
+        0,
+        opt,
+        list_of_struct(Attachment)
+    ),
+    (
+        M_ATTRIBUTES,
+        attributes,
+        "attributes",
+        1,
+        opt,
+        list_of_struct(Attribute)
+    ),
+    (
+        M_AVAILABILITY_ZONE,
+        availability_zone,
+        "availabilityZone",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_CAPACITY_PROVIDER_NAME,
+        capacity_provider_name,
+        "capacityProviderName",
+        3,
+        opt,
+        string
+    ),
+    (M_CLUSTER_ARN, cluster_arn, "clusterArn", 4, opt, string),
+    (M_CONNECTIVITY, connectivity, "connectivity", 5, opt, string),
+    (
+        M_CONNECTIVITY_AT,
+        connectivity_at,
+        "connectivityAt",
+        6,
+        opt,
+        date_time
+    ),
+    (
+        M_CONTAINER_INSTANCE_ARN,
+        container_instance_arn,
+        "containerInstanceArn",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_CONTAINERS,
+        containers,
+        "containers",
+        8,
+        opt,
+        list_of_struct(Container)
+    ),
+    (M_CPU, cpu, "cpu", 9, opt, string),
+    (M_CREATED_AT, created_at, "createdAt", 10, opt, date_time),
+    (
+        M_DESIRED_STATUS,
+        desired_status,
+        "desiredStatus",
+        11,
+        opt,
+        string
+    ),
+    (
+        M_ENABLE_EXECUTE_COMMAND,
+        enable_execute_command,
+        "enableExecuteCommand",
+        12,
+        defaulted,
+        boolean
+    ),
+    (
+        M_EXECUTION_STOPPED_AT,
+        execution_stopped_at,
+        "executionStoppedAt",
+        13,
+        opt,
+        date_time
+    ),
+    (M_GROUP, group, "group", 14, opt, string),
+    (
+        M_HEALTH_STATUS,
+        health_status,
+        "healthStatus",
+        15,
+        opt,
+        string
+    ),
+    (
+        M_INFERENCE_ACCELERATORS,
+        inference_accelerators,
+        "inferenceAccelerators",
+        16,
+        opt,
+        list_of_struct(InferenceAccelerator)
+    ),
+    (M_LAST_STATUS, last_status, "lastStatus", 17, opt, string),
+    (M_LAUNCH_TYPE, launch_type, "launchType", 18, opt, string),
+    (M_MEMORY, memory, "memory", 19, opt, string),
+    (
+        M_OVERRIDES,
+        overrides,
+        "overrides",
+        20,
+        opt,
+        struct_of(TaskOverride)
+    ),
+    (
+        M_PLATFORM_VERSION,
+        platform_version,
+        "platformVersion",
+        21,
+        opt,
+        string
+    ),
+    (
+        M_PLATFORM_FAMILY,
+        platform_family,
+        "platformFamily",
+        22,
+        opt,
+        string
+    ),
+    (
+        M_PULL_STARTED_AT,
+        pull_started_at,
+        "pullStartedAt",
+        23,
+        opt,
+        date_time
+    ),
+    (
+        M_PULL_STOPPED_AT,
+        pull_stopped_at,
+        "pullStoppedAt",
+        24,
+        opt,
+        date_time
+    ),
+    (M_STARTED_AT, started_at, "startedAt", 25, opt, date_time),
+    (M_STARTED_BY, started_by, "startedBy", 26, opt, string),
+    (M_STOP_CODE, stop_code, "stopCode", 27, opt, string),
+    (M_STOPPED_AT, stopped_at, "stoppedAt", 28, opt, date_time),
+    (
+        M_STOPPED_REASON,
+        stopped_reason,
+        "stoppedReason",
+        29,
+        opt,
+        string
+    ),
+    (M_STOPPING_AT, stopping_at, "stoppingAt", 30, opt, date_time),
+    (M_TAGS, tags, "tags", 31, opt, list_of_struct(Tag)),
+    (M_TASK_ARN, task_arn, "taskArn", 32, opt, string),
+    (
+        M_TASK_DEFINITION_ARN,
+        task_definition_arn,
+        "taskDefinitionArn",
+        33,
+        opt,
+        string
+    ),
+    (M_VERSION, version, "version", 34, defaulted, long),
+    (
+        M_EPHEMERAL_STORAGE,
+        ephemeral_storage,
+        "ephemeralStorage",
+        35,
+        opt,
+        struct_of(EphemeralStorage)
+    ),
+    (
+        M_FARGATE_EPHEMERAL_STORAGE,
+        fargate_ephemeral_storage,
+        "fargateEphemeralStorage",
+        36,
+        opt,
+        struct_of(TaskEphemeralStorage)
+    ),
+    (
+        M_PROVISIONED_CPU,
+        provisioned_cpu,
+        "provisionedCpu",
+        37,
+        opt,
+        recorded("com.amazonaws.ecs.recorded", string)
+    ),
+    (
+        M_PROVISIONED_MEMORY,
+        provisioned_memory,
+        "provisionedMemory",
+        38,
+        opt,
+        recorded("com.amazonaws.ecs.recorded", string)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ecs#Container")]
 #[derive(Debug, Clone, Default)]

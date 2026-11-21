@@ -142,7 +142,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         None => {
                             task.running_due_at = None;
                             task.last_status = STATUS_RUNNING.to_string();
-                            task.started_at = Some(DateTime::from(due));
+                            task.started_at = Some(reported_instant(due));
                             // A task placed on its own runs the work it was placed for
                             // and then ends, so the instant that work is finished is owed
                             // from the instant it started ([`CONTAINER_WORK_SPAN`]); a
@@ -229,7 +229,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 // failed launch earns records the same instant for itself
                 // ([`TaskRecord::fail_launch`]); this is every other stop.
                 if task.pull_started_at.is_some() && task.pull_stopped_at.is_none() {
-                    task.pull_stopped_at = Some(DateTime::from(began_at));
+                    task.pull_stopped_at = Some(reported_instant(began_at));
                     task.launch_failure_due_at = None;
                 }
                 let mut released = false;
@@ -264,8 +264,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // it gets no startedAt — only the stop timestamps.
                     task.running_due_at = None;
                     task.last_status = STATUS_STOPPED.to_string();
-                    task.stopped_at = Some(DateTime::from(due));
-                    task.execution_stopped_at = Some(DateTime::from(due));
+                    task.stopped_at = Some(reported_instant(due));
+                    task.execution_stopped_at = Some(reported_instant(due));
                     for container in &mut task.containers {
                         container.advance_to(STATUS_STOPPED);
                     }
@@ -565,7 +565,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         deployment.status = SERVICE_DEPLOYMENT_SUCCESSFUL.to_string();
                         deployment.status_reason =
                             rollout_state_reason(&deployment.deployment_id, true);
-                        deployment.finished_at = Some(DateTime::from(due));
+                        deployment.finished_at = Some(reported_instant(due));
                     }
                 }
             }
@@ -624,7 +624,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.next_service_event_seq += 1;
         ServiceEventRecord {
             id: uuid_from_sequence(self.next_service_event_seq),
-            created_at: DateTime::from(at),
+            created_at: reported_instant(at),
             message,
         }
     }
@@ -1323,7 +1323,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                             let reason = no_previous_revision_reason(&record.service_arn);
                             finish_deployment(
                                 record,
-                                DateTime::from(due),
+                                reported_instant(due),
                                 SERVICE_DEPLOYMENT_ROLLBACK_FAILED,
                                 &reason,
                             );
@@ -1332,7 +1332,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 } else if let Some(record) = self.service_deployments.get_mut(&arn) {
                     finish_deployment(
                         record,
-                        DateTime::from(due),
+                        reported_instant(due),
                         SERVICE_DEPLOYMENT_STOPPED,
                         &stopped_by_request_reason(&deployment_id),
                     );
@@ -1399,7 +1399,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     if refusal.is_some() {
                         record.status = SERVICE_DEPLOYMENT_ROLLBACK_FAILED.to_string();
                         record.status_reason = no_previous_revision_reason(&record.service_arn);
-                        record.finished_at = Some(DateTime::from(at));
+                        record.finished_at = Some(reported_instant(at));
                     }
                 }
             }
@@ -1416,7 +1416,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     if !record.is_finished() {
                         record.status = SERVICE_DEPLOYMENT_SUCCESSFUL.to_string();
                         record.status_reason = rollout_state_reason(&record.deployment_id, true);
-                        record.finished_at = Some(DateTime::from(due));
+                        record.finished_at = Some(reported_instant(due));
                     }
                 }
             }
@@ -1432,7 +1432,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     record.rollback_due_at = None;
                     if !record.is_finished() {
                         record.status = SERVICE_DEPLOYMENT_ROLLBACK_SUCCESSFUL.to_string();
-                        record.finished_at = Some(DateTime::from(due));
+                        record.finished_at = Some(reported_instant(due));
                     }
                 }
             }
@@ -1570,7 +1570,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .cloned()
             .ok_or(LifecycleHookRefusal::NoPreviousRevision)?;
         let key = (record.cluster_name.clone(), record.service_name.clone());
-        let timestamp = DateTime::from(at);
+        let timestamp = reported_instant(at);
         let deployment_id = self.next_deployment_id();
         // The service a rollout belongs to outlives it, but a rollout of a service that is
         // gone has nothing to put a revision back onto.
@@ -3231,7 +3231,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // itself is KEPT, exactly as the service record is.
         self.finish_open_deployments(
             &service_arn,
-            DateTime::from(now),
+            reported_instant(now),
             SERVICE_DEPLOYMENT_STOPPED,
             &format!("Service {name} was deleted"),
         );
@@ -3245,7 +3245,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }) {
             if task_set.status != TASK_SET_DRAINING {
                 task_set.status = TASK_SET_DRAINING.to_string();
-                task_set.updated_at = DateTime::from(now);
+                task_set.updated_at = reported_instant(now);
             }
         }
     }
@@ -3309,7 +3309,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         };
         if let Some(task_set) = self.task_sets.get_mut(key) {
             task_set.scale = stored_scale(Some(scale));
-            task_set.updated_at = DateTime::from(now);
+            task_set.updated_at = reported_instant(now);
         }
         // The revision the task set places is the one it was created with, as stored: an
         // update of the scale changes how MANY tasks the task set holds, never which
@@ -3380,7 +3380,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             value: MIN_SCALE_PERCENT,
             unit: Some(SCALE_UNIT_PERCENT.to_string()),
         };
-        deleted.updated_at = DateTime::from(now);
+        deleted.updated_at = reported_instant(now);
         deleted.removal_due_at = Some(deleted.removal_due_at.unwrap_or(now + TRANSITION_SPAN));
         Some(deleted.clone())
     }
@@ -3415,7 +3415,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         now: SystemTime,
     ) -> Option<TaskSetRecord> {
         let promoted = self.task_sets.get(key).cloned()?;
-        let at = DateTime::from(now);
+        let at = reported_instant(now);
         for task_set in self.task_sets.values_mut().filter(|task_set| {
             task_set.cluster_name == promoted.cluster_name
                 && task_set.service_name == promoted.service_name
@@ -3615,7 +3615,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .task_definition
             .clone()
             .and_then(|revision| self.task_definitions.get(&revision).cloned());
-        let updated_at = DateTime::from(now);
+        let updated_at = reported_instant(now);
         let Some(service) = self.services.get_mut(key) else {
             return Ok(false);
         };
@@ -4102,7 +4102,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             daemon_revision_arn: None,
             tags,
             enable_execute_command: service.enable_execute_command,
-            created_at: DateTime::from(now),
+            created_at: reported_instant(now),
             started_at: None,
             stopping_at: None,
             stopped_at: None,
@@ -4215,7 +4215,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         }
         task.desired_status = STATUS_STOPPED.to_string();
         task.last_status = STATUS_DEACTIVATING.to_string();
-        task.stopping_at = Some(DateTime::from(now));
+        task.stopping_at = Some(reported_instant(now));
         task.stopped_reason = Some(reason.to_string());
         task.stop_code = Some(STOP_CODE_SERVICE_SCHEDULER.to_string());
         task.stopped_due_at = Some(now + TRANSITION_SPAN);

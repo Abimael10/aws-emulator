@@ -435,7 +435,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The instant of THIS call, as the wire timestamp type: the same instant the rollout
         // this create starts is dated by, so the daemon's `createdAt` and the `updatedAt`
         // that rollout stamps on it are one instant rather than two readings of the clock.
-        let created_at = ::aws_smithy_types::DateTime::from(now);
+        let created_at = crate::state::reported_instant(now);
         let record = crate::state::DaemonRecord {
             name: input.daemon_name.clone(),
             arn: arn.clone(),

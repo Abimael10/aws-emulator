@@ -1597,3 +1597,134 @@ async fn a_task_whose_role_cannot_get_the_registry_token_fails_the_resource_retr
          authentication was withheld, got {names:?}"
     );
 }
+
+/// A SECOND image manifest, differing from [`MANIFEST`] in the annotation it carries: a
+/// registry stores two different manifests under two different content digests, so a row
+/// reading the digest of one image cannot pass by reporting the other's.
+const SECOND_MANIFEST: &str = concat!(
+    r#"{"schemaVersion":2,"#,
+    r#""mediaType":"application/vnd.docker.distribution.manifest.v2+json","#,
+    r#""annotations":{"org.opencontainers.image.title":"second"}}"#
+);
+
+/// Create the repository `repository` and put `manifest` in it under the tag `1`, through
+/// Amazon ECR's own API — answering the digest that registry stored it under.
+async fn push_manifest(
+    router: &MultiServiceRouter,
+    repository: &str,
+    manifest: &str,
+    case: &str,
+) -> String {
+    ecr(
+        router,
+        "CreateRepository",
+        json!({ "repositoryName": repository }),
+        case,
+    )
+    .await;
+    let pushed = ecr(
+        router,
+        "PutImage",
+        json!({
+            "repositoryName": repository,
+            "imageManifest": manifest,
+            "imageTag": "1",
+        }),
+        case,
+    )
+    .await;
+    string(&pushed["image"]["imageId"], "imageDigest", case)
+}
+
+/// Poll one task until Amazon ECS has recorded the image pull its launch makes — the step a
+/// container's image digest is known from (`Task$pullStartedAt` is "the Unix timestamp for
+/// the time when the container image pull began") — and answer the record it then holds.
+async fn pulled(router: &MultiServiceRouter, task_arn: &str, case: &str) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let task = describe(router, task_arn, case).await;
+        if !task["pullStartedAt"].is_null() {
+            return task;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the image pull of the launch to be recorded, got {task}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: `Container$imageDigest` is "the container image manifest digest", so a container
+/// reports the digest the registry that SERVED its pull resolved the reference to — and
+/// reports none for an image no registry of this emulator resolved, because no manifest of
+/// it was fetched to digest.
+///
+/// The rows differ along what the rule generalises over: which repository of the registry
+/// the reference names (and so which manifest was served), the FORM the reference takes (a
+/// tag against the digest itself), and whether any registry this emulator holds answers for
+/// the reference at all.
+#[tokio::test]
+async fn a_container_reports_the_manifest_digest_the_registry_resolved_its_image_to() {
+    let router = emulator_with_ecr_and_iam();
+    cluster(&router).await;
+    let case = "the registry's records";
+
+    // Two repositories, each holding one image of its own manifest, so the two digests the
+    // registry stored differ.
+    let first = push_manifest(&router, "digestapp", MANIFEST, case).await;
+    let second = push_manifest(&router, "digestother", SECOND_MANIFEST, case).await;
+    assert_ne!(
+        first, second,
+        "case {case:?}: expected two manifests to be stored under two digests, got {first}"
+    );
+    let full = role(
+        &router,
+        "digestpull",
+        Some(&grant(&["ecr:GetAuthorizationToken", "ecr:BatchGetImage"])),
+    )
+    .await;
+
+    // (case, family, the reference the revision runs, the digest the container must report)
+    let rows = [
+        (
+            "a tag of one repository",
+            "digestfirstfamily",
+            ecr_image("digestapp:1"),
+            Some(first.clone()),
+        ),
+        (
+            "a tag of another repository, whose manifest differs",
+            "digestsecondfamily",
+            ecr_image("digestother:1"),
+            Some(second.clone()),
+        ),
+        (
+            "a reference addressing the digest itself",
+            "digestbydigestfamily",
+            ecr_image(&format!("digestapp@{first}")),
+            Some(first.clone()),
+        ),
+        (
+            // No registry this emulator holds answers for this reference — the gallery
+            // alias it names is not the one this emulator's gallery serves — so no
+            // manifest of it was fetched and there is no digest to report.
+            "an image no registry of this emulator resolves",
+            "digestunresolvedfamily",
+            "public.ecr.aws/nginx/nginx:latest".to_string(),
+            None,
+        ),
+    ];
+
+    for (case, family, image, expected) in rows {
+        let task_arn = run(&router, family, &image, Some(&full), case).await;
+        let task = pulled(&router, &task_arn, case).await;
+        for container in list(&task, "containers", case) {
+            assert_eq!(
+                container["imageDigest"].as_str(),
+                expected.as_deref(),
+                "case {case:?}: expected the digest {expected:?} the registry resolved \
+                 {image} to, got {container}"
+            );
+        }
+    }
+}

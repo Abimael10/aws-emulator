@@ -139,7 +139,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         );
         // The instant the action happened at, in the date-time text every AWS event body
         // carries an instant in — the same rendering a task's own event uses.
-        if let Some(created_at) = super::task_events::date_time_text(DateTime::from(at)) {
+        if let Some(created_at) = super::task_events::date_time_text(reported_instant(at)) {
             detail.insert(
                 "createdAt".to_string(),
                 ::serde_json::Value::String(created_at),

@@ -637,7 +637,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         now: SystemTime,
     ) -> Option<(String, String)> {
         let daemon = self.daemons.get(daemon_arn)?.clone();
-        let at = DateTime::from(now);
+        let at = reported_instant(now);
         let revision_arn =
             self.next_daemon_revision_arn(region, &daemon.cluster_name, &daemon.name);
         let revision = DaemonRevisionRecord {
@@ -815,7 +815,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// A delete already under way is not restarted: the second request asks for what the
     /// first one already got, so it answers the drain the first one started.
     pub fn request_daemon_delete(&mut self, daemon_arn: &str, now: SystemTime) -> Option<String> {
-        let at = DateTime::from(now);
+        let at = reported_instant(now);
         let daemon = self.daemons.get(daemon_arn)?.clone();
         if daemon.removal_due_at.is_some() {
             return Some(daemon.deployment_arn.clone());
@@ -893,7 +893,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 if let Some(deployment) = self.daemon_deployments.get_mut(&arn) {
                     deployment.started_due_at = None;
                     deployment.status = DAEMON_DEPLOYMENT_IN_PROGRESS.to_string();
-                    deployment.started_at = Some(DateTime::from(due));
+                    deployment.started_at = Some(reported_instant(due));
                     // The end of a rollout falls due one span after its start, so a caller
                     // reading in between still sees it in progress.
                     deployment.finished_due_at = Some(due + TRANSITION_SPAN);
@@ -919,7 +919,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         // the instant its last task started when that came later — a
                         // rollout cannot be reported as finished before the work it
                         // reports.
-                        let owed = DateTime::from(due);
+                        let owed = reported_instant(due);
                         deployment.finished_at = Some(if timestamp_key(reached) > timestamp_key(owed)
                         {
                             reached
@@ -1220,7 +1220,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 Vec::new()
             },
             enable_execute_command: daemon.enable_execute_command,
-            created_at: DateTime::from(now),
+            created_at: reported_instant(now),
             started_at: None,
             stopping_at: None,
             stopped_at: None,

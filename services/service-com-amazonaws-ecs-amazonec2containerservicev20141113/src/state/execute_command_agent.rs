@@ -67,7 +67,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         last_status: container.last_status.clone(),
                         reason: None,
                         last_started_at: (container.last_status == STATUS_RUNNING)
-                            .then(|| DateTime::from(now)),
+                            .then(|| reported_instant(now)),
                     });
                     changed = true;
                     continue;
@@ -93,7 +93,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     continue;
                 }
                 if stage == STATUS_RUNNING {
-                    agent.last_started_at = Some(DateTime::from(now));
+                    agent.last_started_at = Some(reported_instant(now));
                 }
                 agent.last_status = stage;
                 changed = true;

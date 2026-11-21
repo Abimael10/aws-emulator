@@ -397,7 +397,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             record.circuit_breaker_triggered = true;
             finish_deployment(
                 record,
-                DateTime::from(at),
+                reported_instant(at),
                 SERVICE_DEPLOYMENT_STOPPED,
                 CIRCUIT_BREAKER_STOPPED_REASON,
             );
@@ -452,7 +452,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         stored.circuit_breaker_triggered = true;
                         finish_deployment(
                             stored,
-                            DateTime::from(at),
+                            reported_instant(at),
                             SERVICE_DEPLOYMENT_ROLLBACK_FAILED,
                             &reason,
                         );

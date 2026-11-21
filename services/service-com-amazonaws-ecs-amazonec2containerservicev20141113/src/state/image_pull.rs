@@ -1079,7 +1079,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// which is known from the pull on — and stays absent for an image no registry here
     /// resolved, because no manifest of it was fetched to digest.
     pub fn record_image_pulls(&mut self, verdicts: &[ImagePullVerdict], now: SystemTime) {
-        let at = DateTime::from(now);
+        let at = reported_instant(now);
         for verdict in verdicts {
             if let Some(task) = self.tasks.get_mut(&verdict.task_arn) {
                 if task.pull_started_at.is_some() || task.desired_status != STATUS_RUNNING {
@@ -1183,7 +1183,7 @@ impl TaskRecord {
         self.desired_status = STATUS_STOPPED.to_string();
         self.stopped_reason = Some(reason.to_string());
         self.stop_code = Some(STOP_CODE_TASK_FAILED_TO_START.to_string());
-        self.stopping_at = Some(DateTime::from(at));
+        self.stopping_at = Some(reported_instant(at));
         self.pending_due_at = None;
         self.running_due_at = None;
         // The ATTEMPT that failed the launch ends here, where it was waited out rather than
@@ -1191,7 +1191,7 @@ impl TaskRecord {
         // container image pull completed", so a fetch that was still going reports this
         // instant as the one it ended at.
         if self.pull_started_at.is_some() && self.pull_stopped_at.is_none() {
-            self.pull_stopped_at = Some(DateTime::from(at));
+            self.pull_stopped_at = Some(reported_instant(at));
         }
         self.launch_failure_due_at = None;
         self.stopped_due_at = Some(at + TRANSITION_SPAN);

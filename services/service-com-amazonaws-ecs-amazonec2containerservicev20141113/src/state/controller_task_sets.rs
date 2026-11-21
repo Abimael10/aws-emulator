@@ -162,7 +162,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let Ok(definition) = self.usable_revision(region, &family, revision).cloned() else {
             return Ok(None);
         };
-        let created_at = DateTime::from(now);
+        let created_at = reported_instant(now);
         let id = self.next_task_set_id();
         let record = TaskSetRecord {
             arn: task_set_arn(region, &key.0, &key.1, &id),
