@@ -28,11 +28,13 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
-# Speaks HTTP/1.1 on the raw connection the core hands a load balancer's own socket, which
-# is what makes the published `DNSName` an address a client dials with its own client
-# (`src/service/listener_socket.rs`). `hyper-util` carries the tokio IO and timer adapters
-# for it, `http-body-util` the bounded body reader and the one-shot body.
-hyper = { version = "1", features = ["server", "http1"] }
+# Speaks HTTP on the raw connection the core hands a load balancer's own socket, which is
+# what makes the published `DNSName` an address a client dials with its own client
+# (`src/service/listener_socket.rs`): HTTP/1.1, and the HTTP/2 a connection whose ALPN
+# selected `h2` is served with (`src/service/alpn_protocols.rs`). `hyper-util` carries the
+# tokio IO, timer and executor adapters for them, `http-body-util` the bounded body reader
+# and the one-shot body.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 # Parses the HEAD of one HTTP/1.x request off the bytes of a load balancer's own connection —
@@ -142,6 +144,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The HTTP/2 CLIENT half of one connection: the suite that drives what a listener's ALPN
+# negotiates sends its request over the protocol the handshake selected
+# (`tests/all/alb_negotiated_application_protocol.rs`), so a listener that offers `h2`
+# without serving it fails the suite. The server halves are declared above. TEST-ONLY.
+hyper = { version = "1", features = ["client", "http2"] }
 # Declares one module per `tests/all/<name>.rs`, so the crate's single integration-test
 # target (`tests/all/main.rs`) lists no suite by hand. TEST-ONLY.
 automod = { workspace = true }

@@ -11,9 +11,11 @@
 //! deletion that has been performed and COMPLETES, while a rule the caller deleted
 //! itself, and an identifier this store never held, are the modelled `RuleNotFound`.
 //!
-//! The LISTENER is not covered by that: `DeleteListener` models
-//! `ListenerNotFoundException` and answers it for a listener a cascade removed as well as
-//! for one the caller deleted, which the rows below pin too.
+//! The LISTENER is released on both paths too, and the two differ: `DeleteListener`
+//! models `ListenerNotFoundException` and answers it for a listener a CASCADE removed —
+//! the recorded teardown of a load balancer and then its listener is refused — while a
+//! REPEAT of the caller's own `DeleteListener` is the delete it already performed and
+//! completes, which the rows below pin too.
 //!
 //! The rows differ along what the rule generalises over: which container was deleted (the
 //! load balancer or the listener), which resource the delete then names (a rule a caller
@@ -187,10 +189,12 @@ async fn a_rule_released_with_its_container_is_deleted_idempotently() {
     }
 }
 
-/// The control: an identifier that names nothing WITHOUT a cascade is the modelled
-/// refusal — a rule or a listener the caller deleted itself, and one nothing ever carried.
+/// The control: an identifier that names nothing and no release of this store's either —
+/// a rule the caller deleted itself, and an ARN nothing ever carried — is the modelled
+/// refusal, while the caller's own listener delete is idempotent however often it is
+/// repeated.
 #[tokio::test]
-async fn a_delete_the_caller_already_made_and_an_identifier_nothing_carried_are_refused() {
+async fn a_repeat_delete_is_idempotent_only_where_this_store_released_the_resource() {
     let (router, _engine) = emulator();
     let held = fixture(&router, "the control fixture", "cascade-control-alb").await;
 
@@ -212,22 +216,17 @@ async fn a_delete_the_caller_already_made_and_an_identifier_nothing_carried_are_
         again.body
     );
 
-    // And of the listener, with its load balancer still there.
-    let first = delete_listener(&router, &held.listener).await;
-    assert_eq!(
-        first.status, 200,
-        "case the caller's own listener delete: expected 200, got {} body {}",
-        first.status, first.body
-    );
-    let again = delete_listener(&router, &held.listener).await;
-    assert_eq!(
-        (again.status, again.error_code().as_str()),
-        (400, LISTENER_NOT_FOUND),
-        "case deleting the caller's own deleted listener again: expected 400 \
-         {LISTENER_NOT_FOUND}, got {} body {}",
-        again.status,
-        again.body
-    );
+    // The listener's own delete, with its load balancer still there: the repeat asks for
+    // the delete this API already performed, so it completes with the same empty body.
+    for attempt in 1..=3 {
+        let reply = delete_listener(&router, &held.listener).await;
+        assert_eq!(
+            reply.status, 200,
+            "case the caller's own listener delete attempt {attempt}: expected 200, got {} body \
+             {}",
+            reply.status, reply.body
+        );
+    }
 
     // Identifiers nothing ever carried: well formed, of this account and Region, naming a
     // load balancer, a listener and a rule this store never held.

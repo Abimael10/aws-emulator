@@ -112,6 +112,11 @@
 //! judges a token against, which is an outbound connection this emulator makes none of, so
 //! such a rule is answered [`ACTION_NOT_PERFORMED_STATUS`] rather than by letting the
 //! request through to the action behind it.
+//!
+//! Whatever produced the answer, the headers the LISTENER's own attribute collection has it
+//! send or remove are applied on the way out ([`super::response_headers`]): the load
+//! balancer's own `Server` header, and each response header one of its
+//! `routing.http.response.*.header_value` attributes carries a value for.
 
 use std::net::IpAddr;
 use std::time::SystemTime;
@@ -1032,7 +1037,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     // address — the address is the forwarding load balancer's, and the port it would have
     // come from is one nothing here observed.
     let mut client_address = request.client_address.clone();
-    let served = loop {
+    let mut served = loop {
         // What this service holds about the addressed load balancer and the listener the
         // request reached, under a lock that is RELEASED before anything else is asked.
         //
@@ -1256,6 +1261,25 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             }
         }
     };
+    // The headers the LISTENER that answered sends or removes on the way out, out of its own
+    // attribute collection ([`super::response_headers`]): the load balancer's own `Server`
+    // header, and each response header one of its `routing.http.response.*.header_value`
+    // attributes carries a value for. Applied to whatever produced the answer — a target's
+    // response as much as a status the load balancer produced itself — because the headers
+    // are the listener's. Read under one lock that is released before the answer is
+    // rendered; nothing is written.
+    {
+        let store = state.lock();
+        if let (Some(listener), Some(family)) = (
+            store.listeners.get(&listener_arn),
+            store.listener_family(&listener_arn),
+        ) {
+            super::response_headers::applied(
+                &mut served.headers,
+                &listener.effective_attributes(family),
+            );
+        }
+    }
     // The record of one request this endpoint answered: which load balancer and listener
     // took it, what was asked, and what was answered. Reported through the emulator's own
     // logging facility, so a client can see which plane claimed a request it believed went

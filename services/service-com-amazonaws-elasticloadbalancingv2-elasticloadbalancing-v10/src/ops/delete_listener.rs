@@ -7,11 +7,23 @@
 //! balancer forwards to — and refuses an ARN this store holds no listener for with the
 //! modelled `ListenerNotFoundException`.
 //!
+//! A REPEAT of this delete is the delete it already performed: the same ARN deleted a
+//! second time answers HTTP 200 with the same empty body, which is what the recorded
+//! re-delete of a listener answers and what a retry or a second teardown pass sends. The
+//! record of that release is what says so ([`crate::state::cascaded_releases`]), because
+//! neither of the other two readings matches the recordings: a blanket success for every
+//! absent listener contradicts the recorded teardown of a load balancer and then its
+//! listener (refused), and a success for every ARN whose LOAD BALANCER still exists
+//! contradicts the recorded not-found probe, which is refused for a fabricated listener id
+//! on a load balancer the same run created. What a caller can act on is the same either
+//! way: the deletion this API performed stays performed, and an ARN it never performed one
+//! for is refused.
+//!
 //! Unlike `DeleteLoadBalancer`, whose documentation makes deleting an absent load
 //! balancer a success, this operation models `ListenerNotFoundException`, and that is
-//! what an absent listener answers — including one that went with its load balancer:
-//! "deleting a load balancer also deletes its listeners", and a delete naming a listener
-//! that cascade removed is refused, which is what the recorded teardown of a load
+//! what a listener this store never held answers — and so is one that went with its load
+//! balancer: "deleting a load balancer also deletes its listeners", and a delete naming a
+//! listener that cascade removed is refused, which is what the recorded teardown of a load
 //! balancer and then its listener answers. (A RULE released by such a cascade is NOT
 //! refused — see [`crate::ops::delete_rule`].)
 //!
@@ -161,6 +173,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.listener_arn)
             .map(|listener| listener.load_balancer_arn.clone());
         if !guard.remove_listener(&input.listener_arn, now) {
+            // A delete of a listener THIS API already deleted asks for something that has
+            // been performed, so it completes with the same empty body: the record of that
+            // release is what says so ([`crate::state::cascaded_releases`]). Nothing is
+            // removed and nothing else changes — the listener is already gone.
+            if guard.cascaded_releases.holds(&input.listener_arn) {
+                return Ok(DeleteListenerOutput {});
+            }
             return Err(DeleteListenerErrorModeled::ListenerNotFoundException(
                 ListenerNotFoundException {
                     message: Some(crate::state::listener_not_found_message(&input.listener_arn)),

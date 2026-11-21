@@ -133,6 +133,13 @@ pub mod client_certificates;
 /// The trace identifier a load balancer stamps on every request it forwards.
 pub mod request_tracing;
 
+/// The response headers a listener's own attribute collection has it send or remove on the
+/// answer the client receives.
+pub mod response_headers;
+
+/// The application protocols a TLS-terminating listener offers during the handshake.
+pub mod alpn_protocols;
+
 pub mod target_group_selection;
 
 pub mod user_authentication;

@@ -137,8 +137,7 @@ pub use service_interfaces::{
     reconcile_load_balancer_interfaces, release_load_balancer_interfaces,
 };
 
-/// What this store released WITH ITS CONTAINER, which is what makes a delete of it
-/// idempotent.
+/// What this store has already released, which is what makes a delete of it idempotent.
 pub mod cascaded_releases;
 
 pub use cascaded_releases::CascadedReleases;
@@ -4447,9 +4446,10 @@ pub struct ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// store: nothing accumulates here either, because a marker carries the position it
     /// names rather than pointing at a page kept on the side.
     page_token_key: PageTokenKey,
-    /// The listeners and rules this store released WITH THEIR CONTAINER, which is what
-    /// makes a delete of one of them idempotent ([`CascadedReleases`]). A bounded window,
-    /// so it does not grow with the number of calls.
+    /// The resources whose release this store has ALREADY PERFORMED — the rules it released
+    /// with their container, and the listeners a caller's own `DeleteListener` removed —
+    /// which is what makes a delete of one of them idempotent ([`CascadedReleases`]). A
+    /// bounded window, so it does not grow with the number of calls.
     pub cascaded_releases: CascadedReleases,
     /// Where the host-count series of each routed `(load balancer, target group)` pair has
     /// got to, and the one clock that advances them ([`host_counts`]). A series per pair
@@ -4752,10 +4752,15 @@ impl ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State {
     /// Remove ONE listener — from the store, from its load balancer's listener list and
     /// from every target group no remaining listener of that load balancer forwards to —
     /// answering whether it was there.
+    ///
+    /// The removal is recorded as PERFORMED ([`cascaded_releases`]): this is the caller's
+    /// own `DeleteListener`, so the repeat of it a retry or a second teardown pass sends is
+    /// answered as the delete that has already been made.
     pub fn remove_listener(&mut self, arn: &str, now: SystemTime) -> bool {
         let Some(removed) = self.listeners.remove(arn) else {
             return false;
         };
+        self.cascaded_releases.record(arn);
         // The listener's rules go with the listener — the ones a caller added and the
         // default rule it minted with itself — so a delete of one of them afterwards asks
         // for something this removal already performed ([`cascaded_releases`]).

@@ -16,7 +16,9 @@ Issue-Commit: 5d0d11832
 
 # elbv2: four target-health, ALPN, listener-lifecycle and data-plane causes still open (split out of the seven-cause report)
 
-> _Split out of `issues/things-that-now-work/20261104T094656Z-elbv2-seven-target-health-routing-and-data-plane-causes-still-open.md`, whose causes 3, 6, 8 and 10 and the SCHEDULE half of cause 2 are fixed. The causes below are NOT fixed; they kept the original report's numbering, trace ids and Issue-Keys so they stay filed and replayable. Trace each one back to the current code base._
+> _Split out of `issues/things-that-now-work/20261104T094656Z-elbv2-seven-target-health-routing-and-data-plane-causes-still-open.md`, whose causes 3, 6, 8 and 10 and the SCHEDULE half of cause 2 are fixed. They kept the original report's numbering, trace ids and Issue-Keys so they stay filed and replayable._
+>
+> _RESOLVED in part: cause 7 (`DeleteListener` on a listener this API has already deleted) and the MUTUAL TLS half of cause 9 are fixed, and the SUBJECT of cause 4 (the application protocols a TLS-terminating listener offers, and the HTTP/2 it then speaks) and of the first half of cause 9.3 (the response headers a listener's attributes decide) are implemented and pinned by `tests/all/alb_negotiated_application_protocol.rs` and `tests/all/alb_listener_response_headers.rs`. The causes that do NOT pass — cause 2, the poll ahead of cause 4's assertion, the `{DNSName}:{listener port}` addressing of cause 9.1 and the two remaining polls of cause 9.3 — are RE-FILED with their six replay keys in `issues/things-that-do-not-work/20261118T090000Z-elbv2-target-health-on-silence-alpn-poll-ssl-policy-and-dnsname-port-addressing-remain-open.md`, so they are not recorded as working. The descriptions below are the state of the code base BEFORE that work; read the re-filed report for what is left._
 
 ## Operation
 DescribeTargetHealth

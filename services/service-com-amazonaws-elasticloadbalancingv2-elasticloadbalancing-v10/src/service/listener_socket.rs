@@ -23,6 +23,12 @@
 //! reaches an `HTTP` listener of the Application family and a `TCP` one of the Network family,
 //! and a TLS connection the listener that terminates TLS (`HTTPS`, `TLS`).
 //!
+//! WHICH HTTP VERSION is spoken on it is the handshake's own answer: the listener offers the
+//! application protocols its own configuration names — a TLS listener's `AlpnPolicy`, and for
+//! an Application Load Balancer's HTTPS listener the load balancer's `routing.http2.enabled`
+//! ([`crate::service::alpn_protocols`]) — and this socket then speaks the protocol that
+//! negotiation selected, HTTP/2 for `h2` and HTTP/1.1 for everything else.
+//!
 //! # What this address serves, and under which certificate
 //!
 //! The first byte of a connection says what the client opened with: a TLS record (the
@@ -259,6 +265,11 @@ struct NegotiatedTls {
     /// The chain the CLIENT presented, for a listener that asked for one and a client that
     /// answered with a certificate ([`crate::service::client_certificates`]).
     client_certificate: Option<String>,
+    /// The APPLICATION PROTOCOL the handshake selected out of what the listener offered and
+    /// the client offered ([`crate::service::alpn_protocols`]), and `None` for a handshake
+    /// that selected none — a client that offered nothing the listener offers, and a
+    /// listener that offers none. It is what this socket then SPEAKS on the connection.
+    application_protocol: Option<String>,
 }
 
 /// What one request's FRAMING is judged against: the framings the client wrote on this
@@ -301,8 +312,8 @@ impl Framing {
 }
 
 impl ListenerSocket {
-    /// Serve one accepted connection: negotiate what the client opened with, then speak
-    /// HTTP/1.1 on it until the client closes it.
+    /// Serve one accepted connection: negotiate what the client opened with, then speak the
+    /// protocol that negotiation selected on it until the client closes it.
     async fn serve_connection(&self, conn: ListenerConn) {
         let Some(accepted) = self.accepted(conn).await else {
             return;
@@ -318,6 +329,13 @@ impl ListenerSocket {
         let io = ::hyper_util::rt::TokioIo::new(conn);
         let callback = self.callback.clone();
         let state = self.state.clone();
+        // Which HTTP version is spoken on this connection: the one the handshake SELECTED
+        // out of what the listener offered ([`crate::service::alpn_protocols`]). A
+        // connection that negotiated `h2` is served HTTP/2, and every other one — a
+        // connection in the clear, a handshake that selected nothing, a client that chose
+        // `http/1.1` — HTTP/1.1, which is what a client of such a connection speaks.
+        let speaks_http_2 = negotiated.application_protocol.as_deref()
+            == Some(crate::service::alpn_protocols::HTTP_2);
         let service = ::hyper::service::service_fn(move |request: ::http::Request<_>| {
             let callback = callback.clone();
             let load_balancer_name = load_balancer_name.clone();
@@ -355,12 +373,29 @@ impl ListenerSocket {
                 )
             }
         });
-        if let Err(error) = ::hyper::server::conn::http1::Builder::new()
-            .timer(::hyper_util::rt::TokioTimer::new())
-            .header_read_timeout(request_deadline())
-            .serve_connection(io, service)
-            .await
-        {
+        let served = match speaks_http_2 {
+            // HTTP/2 multiplexes the requests of one connection, so each is driven on a
+            // task of the runtime this connection is already served on — and how many may
+            // be open at once is bounded by the core's own HTTP in-flight cap, the same
+            // bound the body reads of this address take a permit from ([`in_flight`]), so
+            // one connection cannot open streams without end.
+            true => {
+                ::hyper::server::conn::http2::Builder::new(::hyper_util::rt::TokioExecutor::new())
+                    .timer(::hyper_util::rt::TokioTimer::new())
+                    .keep_alive_timeout(request_deadline())
+                    .max_concurrent_streams(concurrent_streams())
+                    .serve_connection(io, service)
+                    .await
+            }
+            false => {
+                ::hyper::server::conn::http1::Builder::new()
+                    .timer(::hyper_util::rt::TokioTimer::new())
+                    .header_read_timeout(request_deadline())
+                    .serve_connection(io, service)
+                    .await
+            }
+        };
+        if let Err(error) = served {
             // A connection the client dropped, or a request this emulator could not frame,
             // ends here and takes nothing else with it: the next connection is served
             // normally.
@@ -415,6 +450,7 @@ impl ListenerSocket {
             &presented,
             plan.ssl_policy.as_deref(),
             plan.asks_for_client_certificates,
+            &plan.alpn_protocols,
         ) {
             // The account's own certificates, as the listener names them.
             Some(config) => {
@@ -493,6 +529,7 @@ impl ListenerSocket {
             ssl_policy,
             certificate_arns,
             asks_for_client_certificates,
+            alpn_protocols,
         ) = {
             let store = self.state.lock();
             let record = store.load_balancers.get(load_balancer_arn)?;
@@ -535,6 +572,10 @@ impl ListenerSocket {
                     .and_then(|attributes| attributes.mode)
                     .as_deref()
                     == Some(crate::service::client_certificates::PASSTHROUGH_MODE),
+                // And which application protocols it OFFERS a client: the listener's own
+                // ALPN policy, or the load balancer's `routing.http2.enabled`
+                // ([`crate::service::alpn_protocols`]).
+                crate::service::alpn_protocols::offered(listener, record),
             )
         };
         Some(ConnectionPlan {
@@ -543,6 +584,7 @@ impl ListenerSocket {
             ssl_policy,
             certificates: self.material_of(&certificate_arns),
             asks_for_client_certificates,
+            alpn_protocols,
         })
     }
 
@@ -604,6 +646,12 @@ where
         client_certificate: connection
             .peer_certificates()
             .and_then(crate::service::client_certificates::presented_chain),
+        // The application protocol the two ends agreed on, which is the protocol this
+        // socket then speaks on the connection.
+        application_protocol: connection
+            .alpn_protocol()
+            .and_then(|protocol| std::str::from_utf8(protocol).ok())
+            .map(str::to_string),
     }
 }
 
@@ -710,6 +758,9 @@ struct ConnectionPlan {
     /// Whether the addressed listener asks the client for a certificate of its own
     /// ([`crate::service::client_certificates`]).
     asks_for_client_certificates: bool,
+    /// The application protocols that listener offers the client, in the order it prefers
+    /// them ([`crate::service::alpn_protocols`]). Empty for a listener that offers none.
+    alpn_protocols: Vec<&'static str>,
 }
 
 /// The TLS server configuration a listener presenting `certificates` under the security
@@ -726,16 +777,22 @@ struct ConnectionPlan {
 /// `asks_for_client_certificates` is the listener's own mutual-authentication mode: a listener
 /// that hands a client certificate to its target asks every client for one
 /// ([`crate::service::client_certificates`]), and every other listener asks for none.
+///
+/// `alpn_protocols` are the application protocols that listener offers, in its own
+/// preference order ([`crate::service::alpn_protocols`]): the handshake selects the first of
+/// them the client offered too, and this socket then speaks the selected one.
 fn tls_server_config(
     certificates: &[Arc<CertificateKeyMaterial>],
     ssl_policy: Option<&str>,
     asks_for_client_certificates: bool,
+    alpn_protocols: &[&'static str],
 ) -> Option<Arc<::rustls::ServerConfig>> {
-    ::service_common::acm_certificate_termination::server_config(
+    ::service_common::acm_certificate_termination::server_config_offering(
         certificates,
         &negotiated_versions(ssl_policy),
         asks_for_client_certificates
             .then(crate::service::client_certificates::PresentedWithoutValidation::asking),
+        alpn_protocols,
     )
 }
 
@@ -801,6 +858,18 @@ fn handshake_deadline() -> Duration {
 /// How many bytes of one request this address reads: the core's per-connection ceiling.
 fn body_ceiling() -> usize {
     usize::try_from(listener_caps::MAX_BYTES_PER_CONN).unwrap_or(usize::MAX)
+}
+
+/// How many requests one HTTP/2 connection may have open at once: the core's own HTTP
+/// in-flight cap, which is also what the body reads of this address take a permit from
+/// ([`in_flight`]).
+///
+/// An HTTP/2 client multiplexes its requests on one connection, so without this bound the
+/// streams of a single connection are the one thing about this address a client chooses the
+/// count of. A request past the bound waits for a stream rather than being shed, exactly as a
+/// further connection waits for the core's own connection permit.
+fn concurrent_streams() -> u32 {
+    u32::try_from(listener_caps::MAX_HTTP_INFLIGHT).unwrap_or(u32::MAX)
 }
 
 /// Answer one request from the data plane of the load balancer this socket was opened for.
@@ -1075,11 +1144,11 @@ mod tests {
         // caller falls back to the core's own TLS server rather than failing the handshake.
         let certificates = vec![material(&["a.example.com"])];
         assert!(
-            tls_server_config(&certificates, None, false).is_none(),
+            tls_server_config(&certificates, None, false, &[]).is_none(),
             "case material that loads no key: expected no configuration of this service's own"
         );
         assert!(
-            tls_server_config(&[], None, false).is_none(),
+            tls_server_config(&[], None, false, &[]).is_none(),
             "case a listener with no certificate: expected no configuration of this service's own"
         );
     }
@@ -1265,6 +1334,7 @@ mod tests {
                     certificate_arn: Some("arn:aws:acm:us-west-2:111122223333:certificate/c1"
                         .to_string()),
                     client_certificate: Some(PRESENTED.to_string()),
+                    application_protocol: Some("h2".to_string()),
                 },
                 [
                     Some(TLS_1_3),
@@ -1283,6 +1353,7 @@ mod tests {
                     certificate_arn: Some("arn:aws:acm:us-west-2:111122223333:certificate/c2"
                         .to_string()),
                     client_certificate: None,
+                    application_protocol: None,
                 },
                 [
                     Some(TLS_1_2),

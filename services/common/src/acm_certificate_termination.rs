@@ -23,7 +23,10 @@
 //!
 //! What this module does NOT decide is whether a CLIENT certificate is asked for: that is
 //! the presenting resource's own configuration (a mutual-TLS truststore), so the verifier
-//! is handed in by the caller that enforces it.
+//! is handed in by the caller that enforces it. Neither is the APPLICATION PROTOCOL the
+//! handshake negotiates: which protocols a resource offers is its own configuration too (a
+//! listener's ALPN policy, an attribute of the load balancer in front of it), so they are
+//! handed in by the caller that SERVES them ([`server_config_offering`]).
 
 use std::sync::Arc;
 
@@ -55,10 +58,30 @@ pub fn provider() -> Arc<::rustls::crypto::CryptoProvider> {
 /// `versions` are the protocol versions the resource's own policy negotiates; an empty
 /// list takes the library's safe defaults. `client_certificates` is the verifier of a
 /// resource that asks the client for a certificate, and `None` asks for none.
+///
+/// The handshake OFFERS no application protocol: [`server_config_offering`] is the
+/// constructor for a resource whose own configuration says which protocols it serves.
 pub fn server_config(
     certificates: &[Arc<CertificateKeyMaterial>],
     versions: &[&'static ::rustls::SupportedProtocolVersion],
     client_certificates: Option<Arc<dyn client_certificates::ClientCertVerifier>>,
+) -> Option<Arc<::rustls::ServerConfig>> {
+    server_config_offering(certificates, versions, client_certificates, &[])
+}
+
+/// [`server_config`] for a resource that NEGOTIATES the application protocol: the
+/// protocols in `alpn_protocols` are offered in that order, which is the server's own
+/// preference order, and the handshake selects the first of them the client also offered.
+///
+/// An empty list offers none, which is a resource whose configuration names no protocol —
+/// and leaves a client that offered some to speak the protocol it would have spoken
+/// anyway. A protocol is offered only where the resource SERVES it: a selection the server
+/// cannot speak would break every connection made by a client that accepted it.
+pub fn server_config_offering(
+    certificates: &[Arc<CertificateKeyMaterial>],
+    versions: &[&'static ::rustls::SupportedProtocolVersion],
+    client_certificates: Option<Arc<dyn client_certificates::ClientCertVerifier>>,
+    alpn_protocols: &[&str],
 ) -> Option<Arc<::rustls::ServerConfig>> {
     let resolver = Arc::new(SelectedByServerName::of(certificates)?);
     let builder = ::rustls::ServerConfig::builder_with_provider(provider());
@@ -66,12 +89,16 @@ pub fn server_config(
         true => builder.with_safe_default_protocol_versions().ok()?,
         false => builder.with_protocol_versions(versions).ok()?,
     };
-    let config = match client_certificates {
+    let mut config = match client_certificates {
         Some(verifier) => builder
             .with_client_cert_verifier(verifier)
             .with_cert_resolver(resolver),
         None => builder.with_no_client_auth().with_cert_resolver(resolver),
     };
+    config.alpn_protocols = alpn_protocols
+        .iter()
+        .map(|protocol| protocol.as_bytes().to_vec())
+        .collect();
     Some(Arc::new(config))
 }
 

@@ -1,27 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What this store released WITH ITS CONTAINER, which is what makes a delete of it
-//! IDEMPOTENT.
+//! What this store has ALREADY RELEASED, which is what makes a delete of it IDEMPOTENT.
 //!
-//! Elastic Load Balancing releases a resource together with the one that contains it:
-//! deleting a load balancer "also deletes its listeners" (`DeleteLoadBalancer`), and a
-//! listener's rules go with the listener. So a client tearing a deployment down — or a
-//! template delete walking its resources — asks to delete a listener or a rule the
-//! cascade has ALREADY deleted, and the deletion it asks for has been performed: the call
-//! completes rather than reporting a resource the caller is right to believe is gone.
+//! A delete asks for a resource to be gone, so a delete naming one this store has already
+//! released asks for something that has been performed: the call completes rather than
+//! reporting a resource the caller is right to believe is gone. Two releases put an ARN
+//! here:
 //!
-//! A resource a caller deleted ITSELF is not recorded here, and neither is an identifier
-//! this store never held: a second `DeleteRule` on a rule the caller removed, and a delete
-//! of an ARN nothing ever carried, are the modelled `NotFound` of the operation.
+//! * a resource released WITH ITS CONTAINER — deleting a load balancer "also deletes its
+//!   listeners" (`DeleteLoadBalancer`), and a listener's rules go with the listener — so a
+//!   client tearing a deployment down, or a template delete walking its resources, may name
+//!   a rule the cascade already removed;
+//! * a LISTENER a caller's own `DeleteListener` removed, so the repeat of that delete a
+//!   retry or a second teardown pass sends is answered as the delete it already performed
+//!   ([`crate::ops::delete_listener`]).
+//!
+//! An identifier this store never held is not here, and neither is a resource the CASCADE of
+//! its container removed where that container modelled the removal as a refusal: a delete of
+//! an ARN nothing ever carried, and a `DeleteListener` naming a listener that went with its
+//! load balancer, are the modelled `NotFound` of the operation.
 //!
 //! The record is a BOUNDED window ([`CascadedReleases::CAPACITY`]), the emulator's own
-//! bound as every quota in this module is: it holds far more cascades than any workflow
-//! tears down, and past it the oldest is forgotten rather than the store growing without
-//! end — a delete of a cascade that old is the modelled `NotFound` again.
+//! bound as every quota in this module is: it holds far more releases than any workflow
+//! performs, and past it the oldest is forgotten rather than the store growing without
+//! end — a delete of a release that old is the modelled `NotFound` again.
 
 use std::collections::{HashSet, VecDeque};
 
-/// The ARNs this store released with their container, newest last.
+/// The ARNs whose release this store has already performed, newest last.
 #[derive(Debug, Default)]
 pub struct CascadedReleases {
     /// The order the ARNs were released in, so the oldest is what the bound drops.
@@ -34,7 +40,8 @@ impl CascadedReleases {
     /// How many cascaded releases this window remembers.
     pub const CAPACITY: usize = 10_000;
 
-    /// Record that `arn` was released with the resource that contained it.
+    /// Record that the release of `arn` has been performed — with the resource that
+    /// contained it, or by the caller's own delete of it.
     pub fn record(&mut self, arn: &str) {
         if !self.held.insert(arn.to_string()) {
             return;
@@ -47,8 +54,8 @@ impl CascadedReleases {
         }
     }
 
-    /// Whether `arn` names a resource this store released with its container, so a
-    /// delete of it asks for something already performed.
+    /// Whether `arn` names a resource this store has already released, so a delete of it
+    /// asks for something already performed.
     pub fn holds(&self, arn: &str) -> bool {
         self.held.contains(arn)
     }

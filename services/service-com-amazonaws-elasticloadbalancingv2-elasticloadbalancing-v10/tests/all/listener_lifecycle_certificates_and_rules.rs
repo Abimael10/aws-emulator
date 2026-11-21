@@ -235,6 +235,12 @@ fn addressing(operation: &str, arn: &str) -> Form {
 /// listener, or the listener it named was deleted. The refusal of an operation that acts
 /// on the listener names the ARN it was given, which is the only thing the caller can
 /// act on.
+///
+/// `DeleteListener` is the one exception, and it is the delete's own idempotency rather
+/// than a resolution: the listener below was deleted by THIS API, so deleting it again
+/// asks for a deletion already performed and completes
+/// (`crate::cascaded_delete_idempotency` pins that over the teardown orders). It refuses
+/// the ARN that never named a listener like every other operation.
 #[tokio::test]
 async fn every_listener_operation_refuses_an_absent_listener() {
     let (router, _engine) = emulator();
@@ -299,6 +305,15 @@ async fn every_listener_operation_refuses_an_absent_listener() {
         ] {
             let case = format!("{operation} with {how}");
             let reply = call(&router, &addressing(operation, arn)).await;
+            if operation == "DeleteListener" && arn == &deleted {
+                assert_eq!(
+                    reply.status, 200,
+                    "case {case}: the delete has already been performed, so the call \
+                     completes, got {} {}",
+                    reply.status, reply.body
+                );
+                continue;
+            }
             assert_eq!(
                 (reply.status, reply.error_code().as_str()),
                 (400, LISTENER_NOT_FOUND),
@@ -536,14 +551,20 @@ async fn deleting_a_listener_releases_only_that_listener() {
         );
     }
 
-    // Deleting it again is the same refusal as for a listener that never existed.
+    // Deleting it again asks for the deletion this API already performed, so it completes
+    // with the same empty body — and the sibling is still there.
     let again = call(&router, &form).await;
     assert_eq!(
-        (again.status, again.error_code().as_str()),
-        (400, LISTENER_NOT_FOUND),
-        "case delete the same listener twice: expected 400 {LISTENER_NOT_FOUND}, got {} {}",
-        again.status,
-        again.body
+        again.status, 200,
+        "case delete the same listener twice: expected 200, got {} {}",
+        again.status, again.body
+    );
+    let after = call(&router, &all).await;
+    assert_eq!(
+        members(&after.body, "Listeners").len(),
+        1,
+        "case delete the same listener twice: expected the sibling to survive, got {}",
+        after.body
     );
 }
 
