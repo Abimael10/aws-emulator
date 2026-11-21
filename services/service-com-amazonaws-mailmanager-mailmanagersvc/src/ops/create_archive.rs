@@ -4,7 +4,10 @@
 //! Implemented: mints an `ArchiveId`, stores the archive in this service's state and
 //! returns the stored id. `ClientToken` (`@idempotencyToken`) makes a retry return the id
 //! the first call minted; a name already in use is refused with the modelled
-//! `ConflictException`.
+//! `ConflictException`. A `KmsKeyArn` is resolved against KMS and judged by that key's own
+//! key policy before anything is written — see `crate::state::archive_encryption_key` — so a
+//! key this service could not encrypt the archive's mail under is refused with the modelled
+//! `AccessDeniedException` and creates nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,6 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx);
+        // What KMS says about the key this create would bind the archive to, resolved BEFORE
+        // the store is touched: it is a READ of another emulated service, and a create this
+        // refuses must leave nothing behind. See
+        // `crate::state::archive_encryption_key` for why the key policy decides and for
+        // what establishes nothing.
+        let archive_key = crate::state::archive_encryption_key::resolve(
+            ctx,
+            &region,
+            input.kms_key_arn.as_deref(),
+        )
+        .await;
         let now = crate::state::now_millis();
         let mut store = state.lock();
         store.purge_permanently_deleted(now);
@@ -228,8 +242,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let archive_id = store.mint_archive_id(now);
+        let archive_arn = crate::state::archive_arn(&region, &archive_id);
+
+        // The authorization is taken for the archive this create would make, because its ARN
+        // is what every KMS request the service makes for that archive names as the resource
+        // it acts for — so the identifier is minted first. A refusal writes none of the three
+        // records a create leaves: no archive, no name-index entry and no `ClientToken`
+        // record, so the name stays free and the token is still a token of no create. The
+        // minted identifier itself is simply never used; the sequence it came from is an
+        // internal counter and the values it feeds are opaque.
+        if archive_key.refuses_archive(&region, &archive_arn) {
+            return Err(CreateArchiveErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(
+                    crate::state::archive_encryption_key::KEY_NOT_USABLE_MESSAGE.to_string(),
+                ),
+            })
+            .into());
+        }
+
         let record = crate::state::ArchiveRecord {
-            archive_arn: crate::state::archive_arn(&region, &archive_id),
+            archive_arn,
             archive_id: archive_id.clone(),
             archive_name: input.archive_name.clone(),
             // `ArchiveState` has no non-terminal value: the model declares only ACTIVE

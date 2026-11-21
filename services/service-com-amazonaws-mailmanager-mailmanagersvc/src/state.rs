@@ -8,6 +8,10 @@
 //! [`bump_millis`] guarantee that an update is *observably* later than the create that
 //! preceded it even when both land inside one clock tick.
 
+/// Whether the customer managed KMS key a `CreateArchive` names is one this service may
+/// encrypt an archive's mail under — the question KMS, which owns keys, answers.
+pub mod archive_encryption_key;
+
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 

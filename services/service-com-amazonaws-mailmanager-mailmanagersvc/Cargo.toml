@@ -25,6 +25,10 @@ tracing = { workspace = true }
 # Renders an authenticated `ListMembersOfAddressList` continuation token as the opaque
 # string that travels on the wire, and reads one back.
 hex = { workspace = true }
+# Resolves the `KmsKeyArn` a `CreateArchive` names against KMS — the key, who manages it and
+# the key policy it carries — over the emulator's own in-process transport, before an archive
+# is created under it (`crate::state::archive_encryption_key`).
+aws-sdk-kms = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -33,6 +37,9 @@ emulator-core-build-support = { workspace = true }
 # Declares tests/all/main.rs's suite modules, one per tests/all/<name>.rs.
 automod = { workspace = true }
 sha2 = { workspace = true }
+# The archive-encryption suite mounts the KMS service beside this one on a single engine,
+# because `CreateArchive` resolves the key it is given by calling it.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 
 [lints]
 workspace = true
