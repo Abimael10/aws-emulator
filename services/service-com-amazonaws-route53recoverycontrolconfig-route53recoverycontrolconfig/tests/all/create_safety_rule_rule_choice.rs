@@ -159,6 +159,13 @@ fn refused_rows(panel_arn: &str, controls: &[String]) -> Vec<Refused> {
             body: json!({ "ClientToken": "rule-choice-neither" }),
         },
         Refused {
+            case: "neither member: a ClientToken and Tags".to_string(),
+            body: json!({
+                "ClientToken": "rule-choice-neither-both-extras",
+                "Tags": { "suite": "rule-choice" }
+            }),
+        },
+        Refused {
             case: "both members, each valid on its own".to_string(),
             body: json!({
                 "AssertionRule": assertion_member(panel_arn, &one, "both-assertion", "ATLEAST", 5000),

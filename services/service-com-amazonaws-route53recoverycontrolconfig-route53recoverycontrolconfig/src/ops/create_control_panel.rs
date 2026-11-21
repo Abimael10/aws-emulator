@@ -167,8 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The same authorization check the ARN-addressed operations run, for the parent
         // this create would attach to: decided from the request alone, so it runs before
         // the ARN is looked up and before the request's idempotency token is honoured.
-        crate::state::authorize_resource_arn(Self::NAME, &input.cluster_arn)
-            .map_err(CreateControlPanelErrorModeled::AccessDeniedException)?;
+        crate::state::read_resource_arn(Self::NAME, &input.cluster_arn).map_err(|refused| {
+            refused.lifted(
+                CreateControlPanelErrorModeled::ValidationException,
+                CreateControlPanelErrorModeled::AccessDeniedException,
+            )
+        })?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateControlPanelErrorModeled::InternalServerException(

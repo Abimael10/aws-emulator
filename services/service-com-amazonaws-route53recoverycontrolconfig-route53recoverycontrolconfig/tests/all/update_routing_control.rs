@@ -646,9 +646,11 @@ async fn addressing_an_unknown_routing_control_is_not_found() {
         }
     }
 
-    // Rows: an ARN of every OTHER resource level, and a value that is no ARN at all —
-    // none of them nests a routing control, so none of them can be answered with a
-    // control panel's id.
+    // Rows: an ARN of every OTHER resource level — none of them nests a routing control,
+    // so none of them can be answered with a control panel's id. A value that is not a
+    // well-formed ARN is a different class entirely (400 `ValidationException`), pinned by
+    // `every_operation_taking_an_arn_refuses_a_malformed_one_as_input` in
+    // `tests/all/rejection_error_classes.rs`.
     let other: Vec<(&str, String)> = vec![
         ("a control-panel ARN", panel_arn.clone()),
         ("a cluster ARN", cluster_arn.clone()),
@@ -656,7 +658,6 @@ async fn addressing_an_unknown_routing_control_is_not_found() {
             "a safety-rule ARN",
             format!("{panel_arn}/safetyrule/22222222-2222-2222-2222-222222222222"),
         ),
-        ("a value that is not an ARN at all", "not-an-arn".to_string()),
     ];
 
     for (case, arn) in &other {

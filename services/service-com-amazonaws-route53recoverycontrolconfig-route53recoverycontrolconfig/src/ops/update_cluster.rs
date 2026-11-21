@@ -162,8 +162,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let endpoint_base = ctx.endpoint();
         // The authorization check this service's ARN-addressed operations share: decided
         // from the request alone, so it runs before the ARN is looked up.
-        crate::state::authorize_resource_arn(Self::NAME, &input.cluster_arn)
-            .map_err(UpdateClusterErrorModeled::AccessDeniedException)?;
+        crate::state::read_resource_arn(Self::NAME, &input.cluster_arn).map_err(|refused| {
+            refused.lifted(
+                UpdateClusterErrorModeled::ValidationException,
+                UpdateClusterErrorModeled::AccessDeniedException,
+            )
+        })?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateClusterErrorModeled::InternalServerException(

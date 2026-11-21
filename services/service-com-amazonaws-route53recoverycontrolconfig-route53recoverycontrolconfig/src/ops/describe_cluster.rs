@@ -157,8 +157,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether the caller may act on the resource an ARN names is decided from the
         // request alone, so it is decided BEFORE the ARN is looked up: an ARN of another
         // account is refused without the answer saying whether a cluster is stored there.
-        crate::state::authorize_resource_arn(Self::NAME, &input.cluster_arn)
-            .map_err(DescribeClusterErrorModeled::AccessDeniedException)?;
+        crate::state::read_resource_arn(Self::NAME, &input.cluster_arn).map_err(|refused| {
+            refused.lifted(
+                DescribeClusterErrorModeled::ValidationException,
+                DescribeClusterErrorModeled::AccessDeniedException,
+            )
+        })?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeClusterErrorModeled::InternalServerException(

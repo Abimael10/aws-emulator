@@ -63,7 +63,26 @@
 //! declares `ValidationException` (400) for it — the code the framework's default
 //! already names — so it keeps the framework's wording: a `@range` on a `@httpQuery`
 //! parameter, an absent member, and the rules the handlers enforce over stored state.
+//!
+//! # The stage ahead of all of it: the caller
+//!
+//! Route 53 ARC's recovery-control API is reached through a REST front door that verifies
+//! WHO is calling before anything reads what the call says, and a caller it cannot verify
+//! is refused there rather than by this service: HTTP 401, `x-amzn-errortype:
+//! UnauthorizedException` and the one fixed sentence `Unauthorized` — a status and a code
+//! this model declares for no operation
+//! (`smithy_query(query="shape",shape="UnauthorizedException")` reports no such shape),
+//! because the layer that states them is not the service. The emulator verifies every
+//! request's signature centrally and a service never checks one itself, so the only seam
+//! handed that verdict is the definition this file returns from `definition()`, which is why
+//! the generated entry is wrapped in [`front_door_stage::FrontDoorDefinition`] — the tree's
+//! one statement of that refusal, in [`service_common::front_door`]. Every refusal this
+//! service words itself, and every modelled error its handlers raise, passes through
+//! untouched.
 
+mod front_door_stage;
+
+use front_door_stage::FrontDoorDefinition;
 use service_common::front_door::{FrontDoorTable, BAD_REQUEST_EXCEPTION, INVALID_REQUEST_BODY};
 use service_common::validation::SubmittedEcho;
 use service_common::validation_message::{
@@ -71,8 +90,8 @@ use service_common::validation_message::{
     string_too_short,
 };
 use smithy_server_runtime::{
-    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service, Violation,
-    ViolationKind,
+    http, ErasedOperation, ErasedServiceDefinition, OperationRoutingTable, Refusal, Refused,
+    Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -197,7 +216,11 @@ fn body_wording(refused: &[(Violation, SubmittedEcho)]) -> Option<Refused> {
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with the one framework-level refusal this endpoint words
+    /// itself wrapped: the authentication layer's verdict about the CALLER, which the front
+    /// door ahead of this API states as its own HTTP 401 `UnauthorizedException`
+    /// ([`front_door_stage`]).
+    entry: FrontDoorDefinition<crate::ServiceDefinition<Eng>>,
     /// The same modelled operations the generated table holds, each served behind this
     /// service's front door ([`FrontDoorTable`]) so a request BODY that breaks a modelled
     /// `@pattern`/`@length` or enumerated set is refused by that layer, in its words,
@@ -261,7 +284,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             )))
             .serve(crate::ops::update_safety_rule::UpdateSafetyRule::new(Arc::clone(&engine)));
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: FrontDoorDefinition::new(crate::ServiceDefinition::new(engine)),
             front_door: front_door.finish(),
         }
     }

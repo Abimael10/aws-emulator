@@ -89,15 +89,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53recoverycontrolc
 // resolves a caller-supplied ARN declares, though this operation's own `errors` list omits
 // it — is widened in through `extra_errors`, so an ARN of another account is refused with
 // the same 403 the rest of this service answers it with rather than with another status.
+// `ValidationException` (400) is widened in for the stage AHEAD of that one, and for the
+// same reason: a value that is not a well-formed ARN is malformed input wherever this
+// service reads one, and this operation's list omits that shape too.
 #[smithy_macros::operation_error(
     "com.amazonaws.route53recoverycontrolconfig#GetResourcePolicy",
-    extra_errors = ["AccessDeniedException"]
+    extra_errors = ["AccessDeniedException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum GetResourcePolicyErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -155,8 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Whether the caller may act on the resource an ARN names is decided from the
         // request alone, so it is decided BEFORE the ARN is looked up: an ARN of another
         // account is refused without the answer saying whether a policy is stored there.
-        crate::state::authorize_resource_arn(Self::NAME, &input.resource_arn)
-            .map_err(GetResourcePolicyErrorModeled::AccessDeniedException)?;
+        crate::state::read_resource_arn(Self::NAME, &input.resource_arn).map_err(|refused| {
+            refused.lifted(
+                GetResourcePolicyErrorModeled::ValidationException,
+                GetResourcePolicyErrorModeled::AccessDeniedException,
+            )
+        })?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetResourcePolicyErrorModeled::InternalServerException(

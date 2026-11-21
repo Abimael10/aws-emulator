@@ -19,7 +19,11 @@
 //!   `BadRequestException` (400), stating the regex it measures that member against or the
 //!   declared bound, and the value that failed it. Which regex it states for which member
 //!   is the rule `tests/all/reported_regex.rs` spans; the same layer's clause for a value
-//!   outside an enumerated SET is pinned by `tests/all/body_enum_refusals.rs`.
+//!   outside an enumerated SET is pinned by `tests/all/body_enum_refusals.rs`;
+//! * a caller-supplied resource ARN is read for its SYNTAX before anything resolves it: a
+//!   value that is not a well-formed ARN is malformed input — `ValidationException` (400),
+//!   `ARN format is invalid: <value>.` — and the not-found class is reserved for a
+//!   WELL-FORMED ARN that addresses nothing.
 
 use std::time::Duration;
 
@@ -918,4 +922,307 @@ async fn a_body_class_the_front_door_has_no_clause_for_keeps_the_modelled_error(
          {listed:?}",
         cases.len()
     );
+}
+
+/// The sentence a caller-supplied value that is not a well-formed ARN is refused with:
+/// fixed text and the submitted value, closed by a full stop. Restated here independently
+/// of the service's own code.
+fn invalid_arn_format(value: &str) -> String {
+    format!("ARN format is invalid: {value}.")
+}
+
+/// Every operation of this service whose input carries a caller-supplied resource ARN,
+/// addressed or referenced (`smithy_query(query="digest")`): the whole surface the ARN
+/// gate applies to. `ListAssociatedRoute53HealthChecks` is left out because it is still a
+/// 501 scaffold.
+const ARN_TAKING_OPERATIONS: &[&str] = &[
+    "DescribeCluster",
+    "DeleteCluster",
+    "UpdateCluster",
+    "DescribeControlPanel",
+    "DeleteControlPanel",
+    "UpdateControlPanel",
+    "DescribeRoutingControl",
+    "DeleteRoutingControl",
+    "UpdateRoutingControl",
+    "DescribeSafetyRule",
+    "DeleteSafetyRule",
+    "UpdateSafetyRule",
+    "ListControlPanels",
+    "ListRoutingControls",
+    "ListSafetyRules",
+    "ListTagsForResource",
+    "TagResource",
+    "UntagResource",
+    "GetResourcePolicy",
+    "CreateControlPanel",
+    "CreateRoutingControl",
+    "CreateSafetyRule",
+];
+
+/// Send `operation` with `arn` as the resource ARN its input carries, over the route and
+/// the method the model binds it to (`smithy_query(query="digest")`), with every other
+/// member filled by a value the model accepts.
+async fn with_arn(router: &MultiServiceRouter, operation: &str, arn: &str) -> (u16, Value) {
+    let label = enc(arn);
+    let rule_config = json!({ "Inverted": false, "Threshold": 1, "Type": "ATLEAST" });
+    match operation {
+        "DescribeCluster" => call(router, "GET", &format!("/cluster/{label}"), None).await,
+        "DeleteCluster" => call(router, "DELETE", &format!("/cluster/{label}"), None).await,
+        "UpdateCluster" => {
+            let body = json!({ "ClusterArn": arn, "NetworkType": "IPV4" });
+            call(router, "PUT", "/cluster", Some(body)).await
+        }
+        "DescribeControlPanel" => call(router, "GET", &format!("/controlpanel/{label}"), None).await,
+        "DeleteControlPanel" => {
+            call(router, "DELETE", &format!("/controlpanel/{label}"), None).await
+        }
+        "UpdateControlPanel" => {
+            let body = json!({ "ControlPanelArn": arn, "ControlPanelName": "renamed" });
+            call(router, "PUT", "/controlpanel", Some(body)).await
+        }
+        "DescribeRoutingControl" => {
+            call(router, "GET", &format!("/routingcontrol/{label}"), None).await
+        }
+        "DeleteRoutingControl" => {
+            call(router, "DELETE", &format!("/routingcontrol/{label}"), None).await
+        }
+        "UpdateRoutingControl" => {
+            let body = json!({ "RoutingControlArn": arn, "RoutingControlName": "renamed" });
+            call(router, "PUT", "/routingcontrol", Some(body)).await
+        }
+        "DescribeSafetyRule" => call(router, "GET", &format!("/safetyrule/{label}"), None).await,
+        "DeleteSafetyRule" => call(router, "DELETE", &format!("/safetyrule/{label}"), None).await,
+        "UpdateSafetyRule" => {
+            let body = json!({
+                "AssertionRuleUpdate": {
+                    "Name": "renamed",
+                    "SafetyRuleArn": arn,
+                    "WaitPeriodMs": 5000
+                }
+            });
+            call(router, "PUT", "/safetyrule", Some(body)).await
+        }
+        "ListControlPanels" => {
+            call(router, "GET", &format!("/controlpanels?ClusterArn={label}"), None).await
+        }
+        "ListRoutingControls" => {
+            call(
+                router,
+                "GET",
+                &format!("/controlpanel/{label}/routingcontrols"),
+                None,
+            )
+            .await
+        }
+        "ListSafetyRules" => {
+            call(
+                router,
+                "GET",
+                &format!("/controlpanel/{label}/safetyrules"),
+                None,
+            )
+            .await
+        }
+        "ListTagsForResource" => call(router, "GET", &format!("/tags/{label}"), None).await,
+        "TagResource" => {
+            let body = json!({ "Tags": { "suite": "arn-format" } });
+            call(router, "POST", &format!("/tags/{label}"), Some(body)).await
+        }
+        "UntagResource" => {
+            call(
+                router,
+                "DELETE",
+                &format!("/tags/{label}?TagKeys=suite"),
+                None,
+            )
+            .await
+        }
+        "GetResourcePolicy" => call(router, "GET", &format!("/resourcePolicy/{label}"), None).await,
+        "CreateControlPanel" => {
+            let body = json!({ "ClusterArn": arn, "ControlPanelName": "arn-format-panel" });
+            call(router, "POST", "/controlpanel", Some(body)).await
+        }
+        "CreateRoutingControl" => {
+            let body = json!({ "ClusterArn": arn, "RoutingControlName": "arn-format-control" });
+            call(router, "POST", "/routingcontrol", Some(body)).await
+        }
+        "CreateSafetyRule" => {
+            let body = json!({
+                "AssertionRule": {
+                    "AssertedControls": [format!("{arn}/routingcontrol/abc")],
+                    "ControlPanelArn": arn,
+                    "Name": "arn-format-rule",
+                    "RuleConfig": rule_config,
+                    "WaitPeriodMs": 5000
+                }
+            });
+            call(router, "POST", "/safetyrule", Some(body)).await
+        }
+        other => panic!("case {other}: this suite builds no request for that operation"),
+    }
+}
+
+/// RULE: an operation that takes a caller-supplied resource ARN reads that value's ARN
+/// SYNTAX before it resolves it — a value that is not a well-formed ARN is refused as
+/// malformed input, `ValidationException` (400) stating
+/// `ARN format is invalid: <value>.`, and never as an absent resource.
+///
+/// The rows span both dimensions the rule generalises over: every operation of the service
+/// that takes such an ARN, addressed (a path label) or referenced (a body member), against
+/// every way a value can fail to be an ARN — no fields at all, a missing field, an empty
+/// partition, vendor or resource, and a leading field that is not `arn`. Each value also
+/// satisfies the `@pattern` the model puts on this service's body ARN members, so it is
+/// this gate that answers and not the request-body validator.
+#[tokio::test]
+async fn every_operation_taking_an_arn_refuses_a_malformed_one_as_input() {
+    let router = router();
+    // A real tree exists throughout, so a refusal is about the value the request carried
+    // and not about an empty store.
+    let cluster = create_cluster(&router, json!({ "ClusterName": "arn-format" })).await;
+    let cluster_arn = cluster["ClusterArn"].as_str().unwrap_or_default().to_string();
+
+    // (case, the value under test)
+    let values: Vec<(&str, &str)> = vec![
+        ("no ARN fields at all", "not-an-arn"),
+        (
+            "five fields: no resource field",
+            "arn:aws:route53-recovery-control::000000000000",
+        ),
+        (
+            "an empty partition",
+            "arn::route53-recovery-control::000000000000:cluster/abc",
+        ),
+        ("an empty vendor", "arn:aws:::000000000000:cluster/abc"),
+        (
+            "an empty resource",
+            "arn:aws:route53-recovery-control::000000000000:",
+        ),
+        (
+            "a leading field that is not arn",
+            "AWS:aws:route53-recovery-control::000000000000:cluster/abc",
+        ),
+    ];
+
+    for operation in ARN_TAKING_OPERATIONS {
+        for (case, value) in &values {
+            let (status, answer) = with_arn(&router, operation, value).await;
+            let expected = invalid_arn_format(value);
+            let actual = message(&answer);
+            assert_eq!(
+                (status, error_code(&answer).as_str(), actual.as_str()),
+                (400, "ValidationException", expected.as_str()),
+                "case {operation} with {case} ({value:?}): expected 400 ValidationException \
+                 {expected:?}, got {status} {answer:?}"
+            );
+        }
+    }
+
+    // Nothing the refused requests named was created, and the cluster they ran against is
+    // untouched.
+    let listed = listed_cluster_arns(&router).await;
+    assert_eq!(
+        listed,
+        vec![cluster_arn],
+        "case after the whole table: expected only the cluster created up front, got {listed:?}"
+    );
+}
+
+/// RULE, at its boundary: the not-found class is reserved for a WELL-FORMED ARN that
+/// addresses no stored resource, so the same requests that are refused 400 above are
+/// answered 404 for a well-formed ARN of the right kind that was never minted — while a
+/// create, which only REFERENCES its parent, keeps its own 400 sentence for it.
+///
+/// The rows span the three addressed resource kinds and the kind-agnostic tagging and
+/// policy surface, and the ARN carries a path of the shape each operation addresses.
+#[tokio::test]
+async fn a_well_formed_arn_that_is_not_stored_stays_a_not_found() {
+    let router = router();
+    let unstored = "00000000-0000-0000-0000-000000000000";
+    let cluster = format!("{ARN_PREFIX}cluster/{unstored}");
+    let panel = format!("{ARN_PREFIX}controlpanel/{unstored}");
+    let control = format!("{panel}/routingcontrol/{unstored}");
+    let rule = format!("{panel}/safetyrule/{unstored}");
+
+    // (operation, the well-formed ARN it addresses)
+    let addressed: Vec<(&str, &str)> = vec![
+        ("DescribeCluster", &cluster),
+        ("DeleteCluster", &cluster),
+        ("UpdateCluster", &cluster),
+        ("DescribeControlPanel", &panel),
+        ("DeleteControlPanel", &panel),
+        ("UpdateControlPanel", &panel),
+        ("DescribeRoutingControl", &control),
+        ("DeleteRoutingControl", &control),
+        ("UpdateRoutingControl", &control),
+        ("DescribeSafetyRule", &rule),
+        ("DeleteSafetyRule", &rule),
+        ("UpdateSafetyRule", &rule),
+        ("ListRoutingControls", &panel),
+        ("ListSafetyRules", &panel),
+        ("ListTagsForResource", &cluster),
+        ("TagResource", &cluster),
+        ("UntagResource", &cluster),
+        ("GetResourcePolicy", &cluster),
+    ];
+
+    for (operation, arn) in &addressed {
+        let (status, answer) = with_arn(&router, operation, arn).await;
+        assert_eq!(
+            (status, error_code(&answer).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {operation} with an unstored {arn}: expected 404 ResourceNotFoundException, \
+             got {status} {answer:?}"
+        );
+    }
+
+    // A create only REFERENCES the parent it attaches to, so an unstored parent is still
+    // the input refusal that names the kind of resource and the ARN the request sent.
+    for (operation, resource) in [
+        ("CreateControlPanel", "Cluster"),
+        ("CreateRoutingControl", "Cluster"),
+    ] {
+        let (status, answer) = with_arn(&router, operation, &cluster).await;
+        let expected = does_not_exist(resource, &cluster);
+        let actual = message(&answer);
+        assert_eq!(
+            (status, error_code(&answer).as_str(), actual.as_str()),
+            (400, "ValidationException", expected.as_str()),
+            "case {operation} with an unstored {cluster}: expected 400 ValidationException \
+             {expected:?}, got {status} {answer:?}"
+        );
+    }
+}
+
+/// RULE, on the value the sentence echoes: it is the ARN the REQUEST carried, decoded as
+/// the route binds it — so a path label that percent-encodes characters no ARN carries is
+/// echoed as the caller wrote it, not as the wire spelled it.
+#[tokio::test]
+async fn the_sentence_echoes_the_submitted_value_decoded() {
+    let router = router();
+
+    // (case, the path label as sent, the value it decodes to)
+    let rows: Vec<(&str, &str, &str)> = vec![
+        ("spaces and punctuation, percent-encoded", "not%20a%20valid%20arn%21%21", "not a valid arn!!"),
+        ("a colon-free value", "cluster%2Fabc", "cluster/abc"),
+        ("an encoded ARN separator run", "arn%3Aaws", "arn:aws"),
+    ];
+
+    for (case, label, decoded) in &rows {
+        let (status, answer) = call(
+            &router,
+            "GET",
+            &format!("/safetyrule/{label}"),
+            None,
+        )
+        .await;
+        let expected = invalid_arn_format(decoded);
+        let actual = message(&answer);
+        assert_eq!(
+            (status, error_code(&answer).as_str(), actual.as_str()),
+            (400, "ValidationException", expected.as_str()),
+            "case {case} ({label}): expected 400 ValidationException {expected:?}, got {status} \
+             {answer:?}"
+        );
+    }
 }

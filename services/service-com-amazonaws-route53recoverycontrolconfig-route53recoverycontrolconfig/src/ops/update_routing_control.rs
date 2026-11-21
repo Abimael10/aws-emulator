@@ -180,8 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         // The authorization check this service's ARN-addressed operations share: decided
         // from the request alone, so it runs before the ARN is looked up.
-        crate::state::authorize_resource_arn(Self::NAME, &input.routing_control_arn)
-            .map_err(UpdateRoutingControlErrorModeled::AccessDeniedException)?;
+        crate::state::read_resource_arn(Self::NAME, &input.routing_control_arn).map_err(
+            |refused| {
+                refused.lifted(
+                    UpdateRoutingControlErrorModeled::ValidationException,
+                    UpdateRoutingControlErrorModeled::AccessDeniedException,
+                )
+            },
+        )?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateRoutingControlErrorModeled::InternalServerException(

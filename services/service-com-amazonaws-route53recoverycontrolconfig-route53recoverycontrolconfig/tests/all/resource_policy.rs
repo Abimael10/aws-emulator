@@ -405,11 +405,11 @@ async fn an_arn_resolving_to_nothing_is_refused_with_not_found() {
             "safety rule",
         ),
         (
+            // A well-formed ARN of a kind this service does not store.
             "an ARN of a resource kind this service does not store",
             arn(CALLER_ACCOUNT, &format!("widget/{missing}")),
             "resource",
         ),
-        ("a value that is not an ARN at all", "not-an-arn".to_string(), "resource"),
         (
             "an ARN whose account segment is empty",
             arn("", &format!("cluster/{missing}")),

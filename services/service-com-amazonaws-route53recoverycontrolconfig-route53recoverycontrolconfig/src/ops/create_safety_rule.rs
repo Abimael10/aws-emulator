@@ -9,7 +9,8 @@
 //!
 //! A request carries EXACTLY ONE of `AssertionRule` and `GatingRule`, and the stored rule
 //! is of that kind: the response fills the member of the kind created and leaves the other
-//! empty.
+//! empty. A request carrying both, or neither, is refused `ValidationException` (400) on
+//! its input.
 //!
 //! ## Shape of an operation
 //!
@@ -210,6 +211,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
                 _ => return Err(invalid(crate::state::INVALID_RULE_MESSAGE.to_string())),
             };
+
+        // Every ARN the rule names is read for its FORM before anything is looked up and
+        // before the request's idempotency token is honoured: a value that is not a
+        // well-formed ARN references nothing in any account, so it is the malformed-input
+        // refusal rather than a statement about what this account holds.
+        crate::state::read_arn_format(&panel_arn).map_err(invalid)?;
+        for referenced in controls.referenced() {
+            crate::state::read_arn_format(referenced).map_err(invalid)?;
+        }
 
         // The rule configuration is stored as the request sends it: the threshold is how
         // many of the rule's controls must be set, which the DATA plane evaluates, so the

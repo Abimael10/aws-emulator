@@ -694,9 +694,11 @@ async fn an_arn_resolving_to_nothing_is_refused_with_the_no_record_sentence() {
         ));
         rows.push((format!("{panel}/safetyrule/{id}"), "safety rule"));
     }
-    // A value that names no resource kind of this service at all: the sentence names the
-    // kind-agnostic noun.
-    rows.push(("not-an-arn".to_string(), "resource"));
+    // A value that names no resource kind of this service, but IS a well-formed ARN: the
+    // sentence names the kind-agnostic noun. (A value that is not a well-formed ARN is
+    // malformed input, not an absent resource — see
+    // `every_operation_taking_an_arn_refuses_a_malformed_one_as_input` in
+    // `tests/all/rejection_error_classes.rs`.)
     rows.push((
         arn(CALLER_ACCOUNT, "somethingelse/abc"),
         "resource",

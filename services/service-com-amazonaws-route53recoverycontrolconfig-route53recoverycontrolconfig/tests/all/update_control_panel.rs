@@ -539,7 +539,10 @@ async fn renaming_an_unknown_panel_is_not_found() {
             format!("{missing_panel}/routingcontrol/11111111-1111-1111-1111-111111111111"),
         ),
         ("a deleted panel's ARN", doomed_arn),
-        ("a value that is not an ARN at all", "not-an-arn".to_string()),
+        // A value that is not a well-formed ARN is NOT this class: it is malformed input
+        // (400 `ValidationException`), pinned by
+        // `every_operation_taking_an_arn_refuses_a_malformed_one_as_input` in
+        // `tests/all/rejection_error_classes.rs`.
     ];
 
     for (case, arn) in cases {

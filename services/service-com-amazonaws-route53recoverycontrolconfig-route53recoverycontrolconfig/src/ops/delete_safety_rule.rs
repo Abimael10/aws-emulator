@@ -133,6 +133,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The ARN this delete ADDRESSES is read for its FORM before anything resolves it:
+        // a value that is not a well-formed ARN names no safety rule in any account, so it
+        // is refused as malformed input rather than as an absent rule.
+        crate::state::read_arn_format(&input.safety_rule_arn).map_err(|message| {
+            DeleteSafetyRuleErrorModeled::ValidationException(ValidationException { message })
+        })?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteSafetyRuleErrorModeled::InternalServerException(
                 InternalServerException {

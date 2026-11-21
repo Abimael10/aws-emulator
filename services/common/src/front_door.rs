@@ -58,17 +58,147 @@
 //! word them differently, one operation to the next. [`FrontDoor::wording_uri`] is where
 //! that choice lives: the wording is attached to ONE wrapped operation, so the sentence
 //! belongs to the operation that raised the refusal.
+//!
+//! # The stage ahead of the body: the caller
+//!
+//! A REST front door decides WHO is calling before it reads what the call says, and the
+//! services reached through one answer a caller it could not verify with that layer's own
+//! refusal rather than with any of their modelled errors: HTTP [`UNAUTHORIZED_STATUS`],
+//! the wire code [`UNAUTHORIZED_CODE`] and the one fixed sentence
+//! [`UNAUTHORIZED_MESSAGE`], and nothing else in the body
+//! ([`unauthorized_response`]). The emulator verifies every signature centrally and a
+//! service never checks one itself, so the only seam handed that verdict is the service's
+//! own definition, where `refusal_response` renders it: [`UnauthorizedDefinition`] wraps a
+//! generated definition there. It is the sibling of
+//! [`crate::authentication_refusal::AuthenticationRefusalDefinition`], which restates the
+//! same verdict for the services whose answer is a MODELLED shape at the protocol's own
+//! status; this one answers a shape no model declares, on its own status, which a wording
+//! seam cannot do.
 
-use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::path;
 use aws_smithy_schema_server::ProtocolError;
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
-    BoxFuture, ErasedOperation, Operation, OperationContext, Refused, ServerHttpProtocol, Service,
-    Violation,
+    BoxFuture, ErasedOperation, ErasedServiceDefinition, Operation, OperationContext,
+    OperationRoutingTable, Refused, ServerHttpProtocol, Service, ServiceIdentity, Violation,
+    WireProtocol,
 };
 
 use crate::validation::SubmittedEcho;
+
+/// The HTTP status a REST front door refuses a caller it could not verify with: the
+/// CALLER was refused, rather than the request's body (400), its permissions on a resource
+/// (403) or the resource it named (404).
+pub const UNAUTHORIZED_STATUS: u16 = 401;
+
+/// The wire error code that refusal names, in `x-amzn-errortype` — the header `restJson1`
+/// resolves an error shape from. No model declares it: the layer that states the refusal
+/// is not the service, so a client finds no modelled shape behind the code, which is what
+/// tells it which layer answered.
+pub const UNAUTHORIZED_CODE: &str = "UnauthorizedException";
+
+/// The one sentence that refusal states, for every caller it refuses.
+///
+/// Wholly fixed text: it names no member, no value, no resource and no principal, so
+/// nothing about this account — or about which half of the credential was wrong — reaches
+/// a caller the layer refused.
+pub const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
+
+/// The member that sentence travels under: LOWERCASE `message`, which is how the layer
+/// ahead of the service writes it — the modelled errors of the services behind one often
+/// carry theirs under `Message`, so which member holds the sentence is part of what tells
+/// a client that this refusal is not one of theirs.
+const UNAUTHORIZED_MESSAGE_MEMBER: &str = "message";
+
+/// The media type a `restJson1` service renders a body in.
+const JSON_CONTENT_TYPE: &str = "application/json";
+
+/// The front door's refusal of a caller it could not verify: the status, the wire error
+/// code in the header a client resolves an error from, and a body carrying the one fixed
+/// sentence under its own lowercase member — and nothing else.
+///
+/// Built here rather than through the framework's refusal renderer because that renderer
+/// takes the status from the protocol (400 for a constraint refusal) and the envelope from
+/// the service's model, and this refusal is neither the protocol's status nor a modelled
+/// shape.
+#[must_use]
+pub fn unauthorized_response() -> RtResponse {
+    let body = ::serde_json::json!({ UNAUTHORIZED_MESSAGE_MEMBER: UNAUTHORIZED_MESSAGE });
+    let status =
+        StatusCode::try_from(UNAUTHORIZED_STATUS).expect("the refusal's status is a constant");
+    let mut response = RtResponse::new(status, SdkBody::from(body.to_string()));
+    let headers = response.headers_mut();
+    headers.insert("content-type", JSON_CONTENT_TYPE);
+    headers.insert("x-amzn-errortype", UNAUTHORIZED_CODE);
+    response
+}
+
+/// A service's model-derived half with the AUTHENTICATION layer's refusal stated as the
+/// front door ahead of that service states it (see the module docs): HTTP
+/// [`UNAUTHORIZED_STATUS`], [`UNAUTHORIZED_CODE`], [`UNAUTHORIZED_MESSAGE`].
+///
+/// Identity, the routing table, the protocol and every other rendering come from the
+/// wrapped definition untouched — nothing model-derived is restated here. Generic over
+/// that definition rather than over an engine, so this crate names no service's generated
+/// type.
+///
+/// A refusal the service worded itself through
+/// [`smithy_server_runtime::Service::override_refusal`] is passed through, and so is every
+/// other refusal class: this wrapper answers the one verdict a wording seam cannot, the
+/// one the layer itself reached about the CALLER.
+pub struct UnauthorizedDefinition<D> {
+    inner: D,
+}
+
+impl<D: ErasedServiceDefinition> UnauthorizedDefinition<D> {
+    /// Wrap a service's generated definition.
+    pub fn new(inner: D) -> Self {
+        Self { inner }
+    }
+}
+
+impl<D: ErasedServiceDefinition> ErasedServiceDefinition for UnauthorizedDefinition<D> {
+    fn identity(&self) -> &ServiceIdentity {
+        self.inner.identity()
+    }
+
+    fn protocol(&self) -> &dyn ServerHttpProtocol {
+        self.inner.protocol()
+    }
+
+    fn routing_table(&self) -> &OperationRoutingTable {
+        self.inner.routing_table()
+    }
+
+    fn routing_error_response(&self, req: &RtRequest) -> RtResponse {
+        self.inner.routing_error_response(req)
+    }
+
+    fn framework_error_response(&self, error: ProtocolError, req: &RtRequest) -> RtResponse {
+        self.inner.framework_error_response(error, req)
+    }
+
+    fn refusal_response(
+        &self,
+        error: ProtocolError,
+        chosen: Option<Refused>,
+        req: &RtRequest,
+    ) -> RtResponse {
+        match (&chosen, &error) {
+            // The authentication layer refused the caller: the endpoint states that
+            // refusal itself, whichever way the credential failed — the sentence names no
+            // half of it, so there is nothing per-failure to word.
+            (None, ProtocolError::Unauthenticated { .. }) => unauthorized_response(),
+            _ => self.inner.refusal_response(error, chosen, req),
+        }
+    }
+
+    fn wire_protocol(&self, req: &RtRequest) -> WireProtocol<'_> {
+        self.inner.wire_protocol(req)
+    }
+}
 
 /// The error code a front door names for a request body that breaks a modelled
 /// constraint. NOT a shape in the serving service's model: the rejection happens ahead

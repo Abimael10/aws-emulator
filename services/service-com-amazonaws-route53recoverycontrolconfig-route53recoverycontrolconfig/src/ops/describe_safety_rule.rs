@@ -2,8 +2,10 @@
 
 //! @op DescribeSafetyRule
 //! Implemented: a pure read of the safety rule the request's ARN addresses, projected
-//! from the record `CreateSafetyRule` stored in [`crate::state`] — an ARN holding no rule
-//! is `ResourceNotFoundException` (404). The kind of the stored rule decides which of
+//! from the record `CreateSafetyRule` stored in [`crate::state`] — a value that is not a
+//! well-formed ARN is malformed input, `ValidationException` (400), and a WELL-FORMED ARN
+//! holding no rule is `ResourceNotFoundException` (404)
+//! ([`crate::state::read_arn_format`]). The kind of the stored rule decides which of
 //! `AssertionRule` and `GatingRule` the response carries.
 //!
 //! ## Shape of an operation
@@ -136,6 +138,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // The ARN this read ADDRESSES is read for its FORM before anything resolves it: a
+        // value that is not a well-formed ARN names no safety rule in any account, so it
+        // is refused as malformed input rather than as an absent rule.
+        crate::state::read_arn_format(&input.safety_rule_arn).map_err(|message| {
+            DescribeSafetyRuleErrorModeled::ValidationException(ValidationException { message })
+        })?;
         // This operation models no server error, so the only way it can report an engine
         // that carries no store for this service — unreachable through the router, which
         // mounts the service on the shared in-memory engine — is as a refusal.

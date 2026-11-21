@@ -25,9 +25,10 @@
 //!
 //! The refusals every handler shares are worded here as well, so two operations cannot
 //! say the same thing differently: the sentences a lookup, a reference and a dependent
-//! refusal state, and [`authorize_resource_arn`], the one check that decides \u2014 from the
-//! request alone, before any ARN is resolved \u2014 whether the caller may act on the resource
-//! an ARN names.
+//! refusal state, and [`read_resource_arn`], the gate every caller-supplied ARN passes
+//! before it is resolved — its FORM ([`read_arn_format`]), then whether the caller may act
+//! on the resource it names ([`authorize_resource_arn`]), both decided from the request
+//! alone.
 //!
 //! [`routing_controls`]: Store::routing_controls
 
@@ -36,7 +37,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AccessDeniedException, AssertionRule, Cluster, ClusterEndpoint, ControlPanel, GatingRule,
-    RoutingControl, Rule, RuleConfig,
+    RoutingControl, Rule, RuleConfig, ValidationException,
 };
 
 /// The ARN service segment Route 53 Application Recovery Controller's recovery-control
@@ -1167,20 +1168,97 @@ pub const SAFETY_RULE_RESOURCE: &str = "Safety Rule";
 /// RESOURCE ARNs carry.
 pub const IAM_ACTION_NAMESPACE: &str = "route53-recovery-control-config";
 
+/// The `ValidationException$Message` for a caller-supplied ARN whose SYNTAX is not an
+/// ARN's at all.
+///
+/// Route 53 ARC reads such a value as a fact about the request rather than about the
+/// account's state: the fixed clause `ARN format is invalid: ` followed by the value the
+/// request sent, echoed exactly as it arrived, and closed by a full stop. That echoed
+/// value is the sentence's only variable part.
+pub fn invalid_arn_format_message(arn: &str) -> String {
+    format!("ARN format is invalid: {arn}.")
+}
+
+/// Refuse a caller-supplied `arn` that is not a well-formed ARN, before anything resolves
+/// it.
+///
+/// A value whose syntax is not an ARN's addresses no resource in any account, so it can
+/// only be a request the caller built wrongly: it is refused as malformed INPUT
+/// ([`invalid_arn_format_message`], `ValidationException`/400) and never as an absent
+/// resource, which is a statement about what this account holds and is reserved for a
+/// well-formed ARN that holds nothing ([`not_found_message`], 404).
+///
+/// The syntax is the tree's one ARN parse ([`::service_common::arn::parse`]), so this
+/// service cannot disagree with another about what an ARN is: six colon-separated fields
+/// led by `arn`, with a non-empty partition, vendor and resource. An empty Region and an
+/// empty account are well formed — this service's own resource ARNs carry an empty Region
+/// ([`ARN_REGION`]) — so neither is refused here.
+pub fn read_arn_format(arn: &str) -> Result<(), String> {
+    if ::service_common::arn::parse(arn).is_none() {
+        return Err(invalid_arn_format_message(arn));
+    }
+    Ok(())
+}
+
+/// Why a caller-supplied ARN is refused before the handler resolves it, in the order the
+/// two stages of [`read_resource_arn`] take them.
+#[derive(Debug)]
+pub enum ArnRefused {
+    /// The value is not a well-formed ARN: `ValidationException` (400) carrying this
+    /// sentence ([`invalid_arn_format_message`]).
+    Malformed(String),
+    /// The ARN is well formed and names ANOTHER account: `AccessDeniedException` (403).
+    Denied(AccessDeniedException),
+}
+
+impl ArnRefused {
+    /// This refusal as ONE operation's modelled error, built by that operation's own
+    /// variant constructors.
+    ///
+    /// Which shape states each class is the same for every operation — a malformed value
+    /// is wrong INPUT (400) and another account's ARN is a denial (403) — so the mapping
+    /// lives here rather than being written out at each call site.
+    pub fn lifted<E>(
+        self,
+        validation: impl FnOnce(ValidationException) -> E,
+        denied: impl FnOnce(AccessDeniedException) -> E,
+    ) -> E {
+        match self {
+            Self::Malformed(message) => validation(ValidationException { message }),
+            Self::Denied(denial) => denied(denial),
+        }
+    }
+}
+
+/// The whole gate an operation passes a caller-supplied ARN through before resolving it:
+/// its FORM first ([`read_arn_format`]), then whose it is ([`authorize_resource_arn`]).
+///
+/// The order is forced by what each stage reads: no account can be read out of a value
+/// that is not an ARN, so the syntax is decided first, and only a well-formed ARN has an
+/// owner to compare the caller against. An operation lifts each arm into its own modelled
+/// shape ([`ArnRefused::lifted`]), so every operation of this service that takes such an
+/// ARN refuses the two classes alike.
+pub fn read_resource_arn(action: &str, arn: &str) -> Result<(), ArnRefused> {
+    read_arn_format(arn).map_err(ArnRefused::Malformed)?;
+    authorize_resource_arn(action, arn).map_err(ArnRefused::Denied)
+}
+
 /// Refuse a request that names `arn` when that ARN belongs to another account.
 ///
 /// Whether the caller may act on a resource is decided from the REQUEST alone — the
 /// principal that signed it, the action it asked for and the ARN it named — so it is
 /// decided before the ARN is resolved: a caller who may not act on another account's
 /// resource never learns from the answer whether one is stored under it. Every operation
-/// that takes a caller-supplied ARN of this service's resources asks here first, with its
-/// own modelled name as `action`, and lifts the payload into its own
-/// `AccessDeniedException` (403).
+/// that takes a caller-supplied ARN of this service's resources asks here first, through
+/// [`read_resource_arn`], with its own modelled name as `action`, and lifts the payload
+/// into its own `AccessDeniedException` (403).
 ///
 /// `Ok` means only that the ARN names no OTHER account: an ARN of the caller's own
-/// account, and a value no account can be read out of at all (one that is not a
-/// well-formed ARN, or whose account field is empty), are both left to the lookup the
-/// handler goes on to do, which is what refuses them.
+/// account, and a well-formed ARN whose account field is empty, are both left to the
+/// lookup the handler goes on to do, which is what refuses them. A value that is not a
+/// well-formed ARN never reaches this stage — [`read_resource_arn`] refuses it as
+/// malformed input first, because an ARN no account can be read out of addresses nothing
+/// to authorize.
 pub fn authorize_resource_arn(action: &str, arn: &str) -> Result<(), AccessDeniedException> {
     // The tree's one ARN parse, so this service cannot disagree with another about which
     // account an ARN names.

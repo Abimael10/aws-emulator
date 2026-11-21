@@ -17,10 +17,27 @@
 //! an ARN bound to the URI and one carried in the body or the query string, and three
 //! foreign accounts (including the account swapped on an ARN this service really minted,
 //! so the refusal is demonstrably not about the resource being absent).
+//!
+//! The last rule here is the stage AHEAD of all of that: who the CALLER is. This API is
+//! reached through a REST front door that verifies the request's credentials before
+//! anything reads what the call says, so a caller the emulator's authentication layer
+//! cannot verify is refused by that layer — HTTP 401, `x-amzn-errortype:
+//! UnauthorizedException`, body exactly `{"message":"Unauthorized"}` — whatever operation
+//! the request names and whatever its payload carries, and never with one of this
+//! service's modelled errors (whose sentences travel at the model's own statuses: 400
+//! `ValidationException`, 403 `AccessDeniedException`, 404 `ResourceNotFoundException`).
+//! That case drives a router with request authentication ON, the `--auth on` path the
+//! production front door runs; every other suite in this crate drives the same routes over
+//! the open router, which is what shows the 401 is the verification layer's verdict rather
+//! than an operation's.
+
+use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_route53recoverycontrolconfig_route53recoverycontrolconfig::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
 
-use super::common::{call, create_cluster, enc, error_code, router};
+use super::common::{call, create_cluster, enc, error_code, router, REGION, SIGNING_NAME};
 
 /// The account the emulator's own credential belongs to: the caller of every request in
 /// this suite.
@@ -284,8 +301,8 @@ async fn an_arn_of_another_account_is_refused_with_access_denied() {
 }
 
 /// RULE, at its boundary: the check refuses an ARN that names ANOTHER account and nothing
-/// else, so a value no account can be read out of — and one of the caller's own account —
-/// reaches the lookup, which answers for it.
+/// else, so a well-formed ARN with no account to read — and one of the caller's own
+/// account — reaches the lookup, which answers for it.
 #[tokio::test]
 async fn an_arn_naming_no_other_account_reaches_the_lookup() {
     let router = router();
@@ -308,14 +325,12 @@ async fn an_arn_naming_no_other_account_reaches_the_lookup() {
             "ResourceNotFoundException",
         ),
         (
-            // Nothing to compare an account against, so authorization refuses nothing and
-            // the lookup answers.
-            "a value that is not an ARN at all",
-            "not-an-arn".to_string(),
-            404,
-            "ResourceNotFoundException",
-        ),
-        (
+            // Well formed, with nothing in the account field to compare: authorization
+            // refuses nothing and the lookup answers. (A value that is not a well-formed
+            // ARN never reaches either stage: it is malformed input, 400
+            // `ValidationException`, pinned by
+            // `every_operation_taking_an_arn_refuses_a_malformed_one_as_input` in
+            // `tests/all/rejection_error_classes.rs`.)
             "an ARN whose account segment is empty",
             arn("", "cluster/00000000-0000-0000-0000-000000000000"),
             404,
@@ -343,4 +358,289 @@ async fn an_arn_naming_no_other_account_reaches_the_lookup() {
             );
         }
     }
+}
+
+/// The status the front door refuses a caller it could not verify with, the wire error code
+/// that refusal names and the whole sentence it states — none of them a shape this
+/// service's model declares (`smithy_query(query="shape",shape="UnauthorizedException")`
+/// reports no such shape), because the layer that answers is not the service.
+const UNAUTHORIZED: (u16, &str, &str) = (401, "UnauthorizedException", "Unauthorized");
+
+/// A fixed signing date, as SigV4 writes it, and its credential-scope date.
+const AMZ_DATE: &str = "20260101T000000Z";
+const SCOPE_DATE: &str = "20260101";
+
+/// How one caller presents its credentials: the `Authorization` header when it carries
+/// one, the signing date when it sends one, and the query string a presigned caller
+/// carries its scope in.
+struct Presentation {
+    what: &'static str,
+    authorization: Option<String>,
+    amz_date: Option<&'static str>,
+    query: String,
+}
+
+/// A header-signed presentation carrying `scope` under `algorithm`, with no valid
+/// signature: the verifier reads the algorithm and the scope before it compares one.
+fn header_signed(
+    what: &'static str,
+    algorithm: &str,
+    scope: &str,
+    amz_date: Option<&'static str>,
+) -> Presentation {
+    Presentation {
+        what,
+        authorization: Some(format!(
+            "{algorithm} Credential={scope}, SignedHeaders=host;x-amz-date, \
+             Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )),
+        amz_date,
+        query: String::new(),
+    }
+}
+
+/// Every way a caller can fail verification at this endpoint: nothing presented at all, a
+/// key this emulator never minted, a header-signed request with no signing instant, a
+/// scope that does not end in the SigV4 terminator, an algorithm the authenticator cannot
+/// read, and the presigned carrier of the same unknown key.
+fn presentations() -> Vec<Presentation> {
+    let scope = format!("AKIDEXAMPLE/{SCOPE_DATE}/{REGION}/{SIGNING_NAME}/aws4_request");
+    vec![
+        Presentation {
+            what: "unsigned",
+            authorization: None,
+            amz_date: None,
+            query: String::new(),
+        },
+        header_signed(
+            "an access key the emulator never minted",
+            "AWS4-HMAC-SHA256",
+            &scope,
+            Some(AMZ_DATE),
+        ),
+        header_signed(
+            "header-signed with no x-amz-date",
+            "AWS4-HMAC-SHA256",
+            &scope,
+            None,
+        ),
+        header_signed(
+            "a credential scope whose terminator is not aws4_request",
+            "AWS4-HMAC-SHA256",
+            &format!("AKIDEXAMPLE/{SCOPE_DATE}/{REGION}/{SIGNING_NAME}/aws5_request"),
+            Some(AMZ_DATE),
+        ),
+        header_signed(
+            "an AWS4-ECDSA-P256-SHA256 Authorization the authenticator cannot read",
+            "AWS4-ECDSA-P256-SHA256",
+            &scope,
+            Some(AMZ_DATE),
+        ),
+        Presentation {
+            what: "presigned with an access key the emulator never minted",
+            authorization: None,
+            amz_date: None,
+            query: format!(
+                "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={scope}\
+                 &X-Amz-Date={AMZ_DATE}&X-Amz-Expires=300&X-Amz-SignedHeaders=host\
+                 &X-Amz-Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                scope = scope.replace('/', "%2F"),
+            ),
+        },
+    ]
+}
+
+/// One request this suite sends over the authenticating router, named by the operation it
+/// would have reached.
+struct Unverified {
+    operation: &'static str,
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+}
+
+/// A request for each shape of operation this service serves — a read, a create, an
+/// update, a delete, a list and a tagging call — so the rows show the refusal landing
+/// ahead of every one of them, addressed by an ARN that REALLY EXISTS as well as by one
+/// that does not, because the verdict depends on neither.
+fn unverified_calls(stored_cluster: &str) -> Vec<Unverified> {
+    let unstored = arn(CALLER_ACCOUNT, "cluster/00000000-0000-0000-0000-000000000000");
+    vec![
+        Unverified {
+            operation: "DescribeCluster (a stored cluster)",
+            method: "GET",
+            path: format!("/cluster/{}", enc(stored_cluster)),
+            body: None,
+        },
+        Unverified {
+            operation: "DescribeCluster (an unstored ARN)",
+            method: "GET",
+            path: format!("/cluster/{}", enc(&unstored)),
+            body: None,
+        },
+        Unverified {
+            operation: "CreateCluster",
+            method: "POST",
+            path: "/cluster".to_string(),
+            body: Some(json!({ "ClusterName": "unverified-create" })),
+        },
+        Unverified {
+            operation: "UpdateCluster",
+            method: "PUT",
+            path: "/cluster".to_string(),
+            body: Some(json!({ "ClusterArn": stored_cluster, "NetworkType": "IPV4" })),
+        },
+        Unverified {
+            operation: "DeleteCluster",
+            method: "DELETE",
+            path: format!("/cluster/{}", enc(stored_cluster)),
+            body: None,
+        },
+        Unverified {
+            operation: "ListClusters",
+            method: "GET",
+            path: "/cluster?MaxResults=1000".to_string(),
+            body: None,
+        },
+        Unverified {
+            operation: "TagResource",
+            method: "POST",
+            path: format!("/tags/{}", enc(stored_cluster)),
+            body: Some(json!({ "Tags": { "suite": "unverified" } })),
+        },
+        Unverified {
+            operation: "CreateSafetyRule (a body the operation would refuse)",
+            method: "POST",
+            path: "/safetyrule".to_string(),
+            body: Some(json!({ "ClientToken": "unverified-rule" })),
+        },
+    ]
+}
+
+/// Send one request over `router` as `presentation` says, and answer
+/// `(status, error code, message, parsed body)`.
+async fn unverified(
+    router: &MultiServiceRouter,
+    presentation: &Presentation,
+    request: &Unverified,
+) -> (u16, String, String, Value) {
+    let mut builder = http::Request::builder()
+        .method(request.method)
+        .uri(format!(
+            "https://{SIGNING_NAME}.{REGION}.amazonaws.com{path}{query}",
+            path = request.path,
+            query = presentation.query
+        ))
+        .header("host", format!("{SIGNING_NAME}.{REGION}.amazonaws.com"))
+        .header("content-type", "application/json");
+    if let Some(authorization) = &presentation.authorization {
+        builder = builder.header("authorization", authorization.clone());
+    }
+    if let Some(date) = presentation.amz_date {
+        builder = builder.header("x-amz-date", date);
+    }
+    let payload = request.body.as_ref().map_or_else(bytes::Bytes::new, |body| {
+        bytes::Bytes::from(serde_json::to_vec(body).expect("the request body serializes"))
+    });
+    let response = router
+        .dispatch(builder.body(payload).expect("a well-formed test request"))
+        .await;
+    let status = response.status().as_u16();
+    let error_type = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let raw = response.into_body();
+    let parsed: Value = if raw.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&raw).unwrap_or(Value::Null)
+    };
+    let message = parsed["message"].as_str().unwrap_or_default().to_string();
+    (status, error_type, message, parsed)
+}
+
+/// RULE: the stage ahead of every operation is who the CALLER is — a caller the
+/// authentication layer cannot verify is refused by the front door (HTTP 401,
+/// `x-amzn-errortype: UnauthorizedException`, body exactly `{"message":"Unauthorized"}`)
+/// whatever operation it names and whatever its payload carries, and that refusal reaches
+/// no handler: nothing it would have written is applied.
+///
+/// The rows span both dimensions the rule generalises over: WHY the caller cannot be
+/// verified (six presentations, including the presigned carrier) and WHICH operation the
+/// request names (a read of a stored resource and of an unstored one, a create, an update,
+/// a delete, a list, a tagging call, and a body the operation itself would refuse).
+#[tokio::test]
+async fn a_caller_the_authentication_layer_cannot_verify_is_refused_by_the_front_door() {
+    // One engine behind TWO routers: the authenticating one every row drives, and the open
+    // one the rest of this crate's suites drive — which is how the fixture is seeded and
+    // how a refused mutation is shown to have changed nothing.
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut authenticating = MultiServiceRouter::new();
+    authenticating.set_request_authentication(true);
+    authenticating.register_service(EmulatedService::new(Arc::clone(&engine)));
+    let mut open = MultiServiceRouter::new();
+    open.set_request_authentication(false);
+    open.register_service(EmulatedService::new(Arc::clone(&engine)));
+
+    let stored = create_cluster(&open, json!({ "ClusterName": "front-door" })).await;
+    let stored_arn = stored["ClusterArn"].as_str().unwrap_or_default().to_string();
+    let (expected_status, expected_code, expected_message) = UNAUTHORIZED;
+
+    let mut answers = Vec::new();
+    for presentation in presentations() {
+        for request in &unverified_calls(&stored_arn) {
+            let case = format!("{} -> {}", presentation.what, request.operation);
+            let (status, code, message, body) =
+                unverified(&authenticating, &presentation, request).await;
+            assert_eq!(
+                (status, code.as_str(), message.as_str()),
+                (expected_status, expected_code, expected_message),
+                "case {case}: expected {expected_status} {expected_code} \
+                 {expected_message:?}, got {status} {code:?} {body:?}"
+            );
+            // Not one of this service's modelled errors, whose sentences travel under the
+            // same member but at the model's own statuses, and never with `__type`.
+            assert_eq!(
+                body,
+                json!({ "message": expected_message }),
+                "case {case}: the refusal states the sentence and nothing else, got {body:?}"
+            );
+            answers.push((case, body));
+        }
+    }
+
+    // No refused request reached a handler: the seeded cluster is still readable through
+    // the open router, the refused create stored nothing, and the refused tagging call
+    // left it untagged.
+    let (status, read) = call(&open, "GET", &format!("/cluster/{}", enc(&stored_arn)), None).await;
+    assert_eq!(
+        status, 200,
+        "case the seeded cluster after the refusals: expected 200, got {status} {read:?}"
+    );
+    let (status, listed) = call(&open, "GET", "/cluster?MaxResults=1000", None).await;
+    assert_eq!(
+        status, 200,
+        "case list the clusters: expected 200, got {status} {listed:?}"
+    );
+    let clusters = listed["Clusters"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        clusters.len(),
+        1,
+        "case after {} refused requests: expected only the seeded cluster, got {clusters:?}",
+        answers.len()
+    );
+    let (status, tags) = call(&open, "GET", &format!("/tags/{}", enc(&stored_arn)), None).await;
+    assert_eq!(
+        status, 200,
+        "case the seeded cluster's tags: expected 200, got {status} {tags:?}"
+    );
+    assert_eq!(
+        tags["Tags"],
+        json!({}),
+        "case after the refused tagging calls: expected no tag, got {:?}",
+        tags["Tags"]
+    );
 }

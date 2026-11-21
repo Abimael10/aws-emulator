@@ -180,6 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             };
 
+        // The ARN the update ADDRESSES is read for its FORM before anything resolves it: a
+        // value that is not a well-formed ARN names no safety rule in any account, so it
+        // is refused as malformed input rather than as an absent rule.
+        crate::state::read_arn_format(&safety_rule_arn).map_err(|message| {
+            UpdateSafetyRuleErrorModeled::ValidationException(ValidationException { message })
+        })?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateSafetyRuleErrorModeled::InternalServerException(
                 InternalServerException {
