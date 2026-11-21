@@ -181,6 +181,11 @@ mod removals;
 /// rather than items of its own, so there is nothing to re-export from it.
 mod image;
 
+/// Which stopped build a retry may RESUME, which is decided by the phase that build stopped
+/// in, and how a build no retry can resume is refused.
+mod image_retry;
+pub use image_retry::*;
+
 /// The images AWS itself publishes, which a read of this service reaches beside the ones an
 /// account built.
 mod managed_image;
@@ -586,6 +591,10 @@ pub const IMAGE_STATUS_FAILED: &str = "FAILED";
 /// The statuses a build may be retried from: "Retries a failed or canceled image build …
 /// The image must be in the FAILED or CANCELLED state" (`RetryImage` and its own
 /// `imageBuildVersionArn` member).
+///
+/// Being in one of them is the FIRST of the two things a retry needs: a build that has ended in
+/// one of them is then resumed only from a phase a retry resumes from
+/// ([`RESUMABLE_IMAGE_PHASES`]).
 pub const RETRYABLE_IMAGE_STATUSES: &[&str] = &[IMAGE_STATUS_FAILED, IMAGE_STATUS_CANCELLED];
 
 /// The statuses a build has ENDED in, so nothing is still running for it to stop.
@@ -1300,6 +1309,16 @@ pub struct ImageBuildVersionRecord {
     /// of them reports it until something re-runs the build ([`IMAGE_STATUS_CANCELLED`],
     /// [`IMAGE_STATUS_FAILED`]). A record carrying none reports the status its clock decides.
     pub terminal_status: Option<String>,
+    /// The phase the build of this build version was stopped in, when something stopped it:
+    /// the modelled `ImageFailureContext`'s `imageStatus` is "the status that the image had
+    /// when the failure occurred. This indicates the stage of the image creation process where
+    /// the image failed", so the stage a stopped build was at is held here, as one of the
+    /// modelled `ImageStatus` values. It is what decides whether a retry may resume that build
+    /// ([`Self::stopped_in_phase_at`]), it is recorded where a build is stopped
+    /// ([`ComAmazonawsImagebuilderImagebuilderState::cancel_image_build`]), and a build that is
+    /// running again carries none
+    /// ([`ComAmazonawsImagebuilderImagebuilderState::rerun_image_build`]).
+    pub stopped_in_phase: Option<String>,
     /// The instant the cancellation of this build is due to have stopped it, when one was
     /// asked for: `CancelImageCreation`'s "cancellation is asynchronous: the request returns
     /// immediately, then Image Builder stops the running build and moves the image to the
@@ -4276,11 +4295,13 @@ pub fn store_unavailable_message() -> String {
 /// request.
 pub const IMAGE_ARN_MEMBER: &str = "imageArn";
 
-/// Why a retry of a build that may not be retried is refused.
+/// Why a retry of a build that has not ENDED is refused.
 ///
 /// "Retries a failed or canceled image build … The image must be in the FAILED or CANCELLED
 /// state" (`RetryImage` and its own `imageBuildVersionArn` member), so a build in any other
-/// status is a value of that parameter this service cannot act on. Stated in the sentence this
+/// status is a value of that parameter this service cannot act on. A build that HAS ended is
+/// answered by the phase it stopped in instead
+/// ([`image_phase_not_retryable_message`]). Stated in the sentence this
 /// service states every refused parameter in
 /// (`service_common::validation_message::parameter_value_mismatch`), whose variable part is
 /// the member alone: the clause states the requirement and echoes nothing of the request.

@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RetryImage
-//! Re-runs the build of an image build version that FAILED or was CANCELLED, in place.
+//! Re-runs the build of an image build version that stopped in a phase a retry resumes from,
+//! in place.
 //!
 //! What a reference reaches is the store's own reading of an image
-//! ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::resolve_image`]), and what a
-//! re-run does to that build version is the store's own
+//! ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::resolve_image`]), whether that
+//! build may be RESUMED is the store's own reading of the phase it stopped in
+//! ([`crate::state::ImageBuildVersionRecord::stopped_in_phase_at`]) — "the same build version
+//! returns to the test or distribution phase where it failed and continues from there" — and
+//! what a re-run does to that build version is the store's own
 //! ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::rerun_image_build`]): "the
 //! image re-runs asynchronously in place … No new image build version is created".
 //!
@@ -94,7 +98,9 @@
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unable to process your request
 //!   at this time.
 //! * `InvalidParameterValueException` (HTTP 400) — widened in through `extra_errors` (see
-//!   below): the refusal a build that is not FAILED or CANCELLED earns.
+//!   below): the refusal a build no retry can resume earns — one that is not FAILED or
+//!   CANCELLED, and one that stopped in a phase a retry does not resume from
+//!   ([`crate::state::RESUMABLE_IMAGE_PHASES`]).
 //! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors`: the report a
 //!   reference naming no build version of this Region earns.
 
@@ -234,12 +240,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the modelled `ImageBuildVersionArn` names ONE build version, and one of another
             // Region — or of Amazon's published catalog, which no build of this account runs
             // — is reached by no reference of this endpoint, so it is reported MISSING.
-            let Some(status) = store
-                .resolve_image(&input.image_build_version_arn, &region, at)
-                .map(|record| record.status_at(at).to_string())
+            let Some(record) = store.resolve_image(&input.image_build_version_arn, &region, at)
             else {
                 return Err(missing(&input.image_build_version_arn));
             };
+            let status = record.status_at(at).to_string();
+            let stopped_in_phase = record.stopped_in_phase_at(at).map(ToString::to_string);
 
             // "The image must be in the FAILED or CANCELLED state": a build in any other
             // status is not retried, and the one that is running keeps running — nothing
@@ -251,6 +257,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
                 .into());
+            }
+
+            // A retry RESUMES a stopped build: "the same build version returns to the test or
+            // distribution phase where it failed and continues from there", so what decides
+            // whether this build can be retried is the PHASE it stopped in — the stage of the
+            // image creation process this store recorded for it
+            // ([`crate::state::ImageBuildVersionRecord::stopped_in_phase_at`]) — and a build
+            // that stopped anywhere else has no completed phase to continue after, whichever
+            // status it ended in. It keeps the status it ended in: nothing about it is written.
+            match stopped_in_phase {
+                Some(phase) if crate::state::RESUMABLE_IMAGE_PHASES.contains(&phase.as_str()) => {}
+                Some(phase) => {
+                    return Err(RetryImageErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::image_phase_not_retryable_message(&phase)),
+                        },
+                    )
+                    .into());
+                }
+                // A build whose status says it ended but that this store holds no stopped run
+                // of is one no retry resumes either, and it is not a build that stopped in a
+                // phase, so it earns the state refusal rather than a phase it was never in.
+                None => {
+                    return Err(RetryImageErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::image_not_retryable_message()),
+                        },
+                    )
+                    .into());
+                }
             }
 
             // "The image re-runs asynchronously in place … No new image build version is

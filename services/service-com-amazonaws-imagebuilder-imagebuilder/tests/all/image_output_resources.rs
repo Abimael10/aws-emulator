@@ -28,10 +28,12 @@
 //!   reports the Amazon-owned AMI that backs it in the Region the read is served in; an entry
 //!   EC2 publishes no image under reports none, rather than an id nothing resolves.
 //! * `RetryImage` "retries a failed or canceled image build … The image must be in the FAILED
-//!   or CANCELLED state", and "the image re-runs asynchronously in place … No new image build
-//!   version is created": a build in any other status is refused HTTP 400
-//!   `InvalidParameterValueException` and keeps running, and a build that ended is queued
-//!   again under its own ARN.
+//!   or CANCELLED state", and it RESUMES that build: "the same build version returns to the
+//!   test or distribution phase where it failed and continues from there. No new image build
+//!   version is created". So a build that has not ended is refused HTTP 400
+//!   `InvalidParameterValueException` and keeps running; a build that ended is resumed under
+//!   its own ARN only when the phase it stopped in is one of the two a retry resumes from, and
+//!   one that stopped in any other phase is refused with that phase named.
 //! * `CancelImageCreation` "can only be used on images in a non-terminal state", and
 //!   "cancellation is asynchronous: the request returns immediately, then Image Builder stops
 //!   the running build and moves the image to the CANCELLED state": a build version that has
@@ -96,11 +98,36 @@ const FAILED_STATUS: &str = "FAILED";
 /// `@httpError` 400).
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
 
-/// The sentence a retry of a build that may not be retried is refused with: fixed text for
-/// this class, naming the parameter the service's own validator addresses.
+/// The sentence a retry of a build that has not ENDED is refused with: fixed text for this
+/// class, naming the parameter the service's own validator addresses.
 const NOT_RETRYABLE_MESSAGE: &str = "The value supplied for parameter 'imageArn' is not valid. \
                                      The provided image is not in a failed or cancelled state \
                                      and cannot be retried.";
+
+/// The sentence a retry of a build that stopped in a phase no retry resumes from is refused
+/// with: fixed text for this class, whose one variable part is the phase that build stopped in,
+/// stated beside the phases a retry does resume from.
+fn not_resumable_message(stopped_in_phase: &str) -> String {
+    format!(
+        "The value supplied for parameter 'imageArn' is not valid. The provided image cannot be \
+         retried. Retry is not supported for images that failed during '{stopped_in_phase}' \
+         phase. Supported phases: TESTING, DISTRIBUTING"
+    )
+}
+
+/// The phase Image Builder runs the build of an image in, which is the phase a build of this
+/// emulator is in from the instant it was queued until it is due — so the phase a cancellation
+/// of a running build lands in. One of the stages of the image creation process the modelled
+/// `ImageStatus` enum names (`smithy_query(query="shape",shape="ImageFailureContext")`:
+/// `imageStatus` is "the status that the image had when the failure occurred").
+const BUILD_PHASE: &str = "BUILDING";
+
+/// The two phases a retry RESUMES a stopped build from: "the same build version returns to the
+/// test or distribution phase where it failed and continues from there" (`RetryImage`).
+const TEST_PHASE: &str = "TESTING";
+
+/// See [`TEST_PHASE`].
+const DISTRIBUTION_PHASE: &str = "DISTRIBUTING";
 
 /// The sentence a cancellation of a build that has already ended is refused with: fixed text
 /// for this class, naming the parameter the service's own validator addresses — the same one a
@@ -960,15 +987,18 @@ async fn a_published_base_image_reports_no_ami_where_no_ec2_answers() {
 }
 
 /// File one build version directly in the store, as a build that ended in `terminal_status`
-/// would have left it, and answer its ARN.
+/// after stopping in `stopped_in_phase` would have left it, and answer its ARN.
 ///
-/// The two statuses a retry is allowed from are ones something ENDS a build in, so a case
-/// that needs one writes the record the way the build path files one.
+/// The phase a build stopped in is what decides whether a retry resumes it, and this
+/// emulator's own builds only ever stop in their build phase (nothing runs the later phases
+/// yet), so a case that needs a build stopped in one of them writes the record the way the
+/// build path files one.
 fn file_ended_build(
     engine: &Arc<engine::InMemoryEngine>,
     region: &str,
     name: &str,
     terminal_status: Option<&str>,
+    stopped_in_phase: Option<&str>,
 ) -> String {
     let arn = image_build_version_arn(region, name, "1.0.0", 1);
     let filed = engine
@@ -985,17 +1015,18 @@ fn file_ended_build(
             build_type: Some("USER_INITIATED".to_string()),
             date_created: "2026-01-01T00:00:00Z".to_string(),
             terminal_status: terminal_status.map(ToString::to_string),
+            stopped_in_phase: stopped_in_phase.map(ToString::to_string),
             ..ImageBuildVersionRecord::default()
         });
     assert!(filed, "case recording {arn}: expected the store to file it");
     arn
 }
 
-/// RULE: `RetryImage` re-runs a build that is FAILED or CANCELLED in place, under its own ARN,
-/// and refuses a build in any other status with HTTP 400 `InvalidParameterValueException`,
-/// leaving that build's status untouched.
+/// RULE: `RetryImage` re-runs a build that stopped in a phase a retry resumes from in place,
+/// under its own ARN, and refuses a build that has not ENDED at all with HTTP 400
+/// `InvalidParameterValueException`, leaving that build's status untouched.
 #[tokio::test]
-async fn a_retry_re_runs_an_ended_build_and_refuses_one_that_is_not_ended() {
+async fn a_retry_re_runs_a_stopped_build_and_refuses_one_that_is_not_ended() {
     let (router, engine) = emulator_with_ec2();
     let parent_image = held_ami_id(&router).await;
     let component = create_component(&router, REGION, "greet").await;
@@ -1051,13 +1082,25 @@ async fn a_retry_re_runs_an_ended_build_and_refuses_one_that_is_not_ended() {
         NOT_RETRYABLE_MESSAGE,
     );
 
-    // (case, the status the build ended in, the name its build version carries)
-    let retryable: &[(&str, &str, &str)] = &[
-        ("a build that failed", FAILED_STATUS, "failed-image"),
-        ("a build that was cancelled", CANCELLED_STATUS, "cancelled-image"),
+    // (case, the status the build ended in, the phase it stopped in, the name its build
+    // version carries) — both statuses a build ends in, each paired with one of the two phases
+    // a retry resumes from.
+    let retryable: &[(&str, &str, &str, &str)] = &[
+        (
+            "a build that failed in the test phase",
+            FAILED_STATUS,
+            TEST_PHASE,
+            "failed-image",
+        ),
+        (
+            "a build that was cancelled in the distribution phase",
+            CANCELLED_STATUS,
+            DISTRIBUTION_PHASE,
+            "cancelled-image",
+        ),
     ];
-    for (case, ended_in, name) in retryable {
-        let build = file_ended_build(&engine, REGION, name, Some(ended_in));
+    for (case, ended_in, stopped_in_phase, name) in retryable {
+        let build = file_ended_build(&engine, REGION, name, Some(ended_in), Some(stopped_in_phase));
         let ended = read_image(&router, REGION, &build).await;
         let before = image_status(case, &ended);
         assert_eq!(
@@ -1106,8 +1149,20 @@ async fn a_retry_re_runs_an_ended_build_and_refuses_one_that_is_not_ended() {
 #[tokio::test]
 async fn a_retry_reports_a_reference_it_cannot_reach() {
     let (router, engine) = emulator_with_ec2();
-    let held = file_ended_build(&engine, REGION, "ended-image", Some(FAILED_STATUS));
-    let elsewhere = file_ended_build(&engine, OTHER_REGION, "other-region-image", Some(FAILED_STATUS));
+    let held = file_ended_build(
+        &engine,
+        REGION,
+        "ended-image",
+        Some(FAILED_STATUS),
+        Some(TEST_PHASE),
+    );
+    let elsewhere = file_ended_build(
+        &engine,
+        OTHER_REGION,
+        "other-region-image",
+        Some(FAILED_STATUS),
+        Some(TEST_PHASE),
+    );
     let never_built = image_build_version_arn(REGION, "never-built", "9.9.9", 7);
     // (case, the reference, the Region the retry is signed for, the status, the code, the
     // token the retry carries)
@@ -1145,7 +1200,13 @@ async fn a_retry_reports_a_reference_it_cannot_reach() {
     let token = "one-retry-token";
     let (status, answer) = retry_image(&router, REGION, &held, token).await;
     assert_ok("the first retry of a token", status, answer);
-    let second = file_ended_build(&engine, REGION, "second-ended-image", Some(CANCELLED_STATUS));
+    let second = file_ended_build(
+        &engine,
+        REGION,
+        "second-ended-image",
+        Some(CANCELLED_STATUS),
+        Some(DISTRIBUTION_PHASE),
+    );
     let (status, answer) = retry_image(&router, REGION, &second, token).await;
     assert_eq!(
         status, 400,
@@ -1355,9 +1416,20 @@ async fn a_cancel_refuses_a_build_that_has_already_ended() {
     )
     .await;
     poll_for_status(&router, REGION, &available, AVAILABLE_STATUS).await;
-    let failed = file_ended_build(&engine, REGION, "failed-build", Some(FAILED_STATUS));
-    let cancelled =
-        file_ended_build(&engine, REGION, "ended-cancelled-build", Some(CANCELLED_STATUS));
+    let failed = file_ended_build(
+        &engine,
+        REGION,
+        "failed-build",
+        Some(FAILED_STATUS),
+        Some(BUILD_PHASE),
+    );
+    let cancelled = file_ended_build(
+        &engine,
+        REGION,
+        "ended-cancelled-build",
+        Some(CANCELLED_STATUS),
+        Some(BUILD_PHASE),
+    );
 
     // (case, the build version, the status it ended in) — every status the modelled
     // `ImageState`'s own documentation names a build as ending in: "ends in the AVAILABLE,
@@ -1416,7 +1488,7 @@ async fn a_cancel_reports_a_reference_it_cannot_reach() {
     )
     .await;
 
-    let elsewhere = file_ended_build(&engine, OTHER_REGION, "other-region-build", None);
+    let elsewhere = file_ended_build(&engine, OTHER_REGION, "other-region-build", None, None);
     let never_built = image_build_version_arn(REGION, "never-built", "9.9.9", 7);
     // An image of Amazon's published catalog: an owner this store holds no build of, which the
     // modelled `ImageBuildVersionArn` admits as the account field.
@@ -1488,11 +1560,12 @@ async fn a_cancel_reports_a_reference_it_cannot_reach() {
     );
 }
 
-/// RULE: the status a cancellation writes is the one the rest of the service reads, so the
-/// cancelled build version is one `RetryImage` accepts — "retries a failed or canceled image
-/// build" — whose re-run produces an AMI of its own.
+/// RULE: a cancellation stops the build in the phase it was running, so a build this service
+/// stopped while it was being BUILT is a dead end: no retry resumes it, the refusal names the
+/// phase it stopped in, and the build version keeps the status the cancellation left it in and
+/// produces nothing.
 #[tokio::test]
-async fn a_cancelled_build_is_the_one_a_retry_runs_again() {
+async fn a_cancelled_build_is_a_dead_end_no_retry_resumes() {
     let (router, _engine) = emulator_with_ec2();
     let parent_image = held_ami_id(&router).await;
     let component = create_component(&router, REGION, "greet").await;
@@ -1506,44 +1579,156 @@ async fn a_cancelled_build_is_the_one_a_retry_runs_again() {
         None,
     )
     .await;
-    let case = "a cancelled build that is retried";
-    let build = create_image(
+    // One row per path that queues a build: the phase a cancellation lands in is the phase the
+    // build was running, whichever call queued it.
+    let pipeline = create_pipeline(
         &router,
         REGION,
+        "cancelled-then-retried-pipeline",
         &recipe,
         &configuration,
         None,
-        "create-cancelled-then-retried",
     )
     .await;
+    // (case, whether a pipeline execution queued the build, the token that queued it, the
+    // token the cancellation carries, the token the retry carries)
+    let rows: &[(&str, bool, &str, &str, &str)] = &[
+        (
+            "a build a create queued, cancelled while it was being built",
+            false,
+            "create-cancelled-then-retried",
+            "cancel-created-then-retry",
+            "retry-after-cancel-created",
+        ),
+        (
+            "a build a pipeline execution queued, cancelled while it was being built",
+            true,
+            "start-cancelled-then-retried",
+            "cancel-started-then-retry",
+            "retry-after-cancel-started",
+        ),
+    ];
 
-    let (status, answer) =
-        cancel_image_creation(&router, REGION, &build, "cancel-then-retry").await;
-    assert_ok(case, status, answer);
+    for (case, by_pipeline, queue_token, cancel_token, retry_token) in rows {
+        let build = if *by_pipeline {
+            start_pipeline(&router, REGION, &pipeline, queue_token).await
+        } else {
+            create_image(&router, REGION, &recipe, &configuration, None, queue_token).await
+        };
+        let (status, answer) = cancel_image_creation(&router, REGION, &build, cancel_token).await;
+        assert_ok(case, status, answer);
 
-    // The build version reports the cancelled status once the cancellation is due, which is
-    // waited for by polling for the CONDITION rather than for a time.
-    let cancelled = poll_for_status(&router, REGION, &build, CANCELLED_STATUS).await;
-    let reported = image_status(case, &cancelled);
-    assert_eq!(
-        reported, CANCELLED_STATUS,
-        "case {case:?}: expected {CANCELLED_STATUS} before the retry, got {reported:?}"
-    );
+        // The build version reports the cancelled status once the cancellation is due, which is
+        // waited for by polling for the CONDITION rather than for a time.
+        let cancelled = poll_for_status(&router, REGION, &build, CANCELLED_STATUS).await;
+        let reported = image_status(case, &cancelled);
+        assert_eq!(
+            reported, CANCELLED_STATUS,
+            "case {case:?}: expected {CANCELLED_STATUS} before the retry, got {reported:?}"
+        );
 
-    let (status, answer) = retry_image(&router, REGION, &build, "retry-after-cancel").await;
-    let answer = assert_ok(case, status, answer);
-    let retried = text(case, &answer, "imageBuildVersionArn");
-    assert_eq!(
-        retried, build,
-        "case {case:?}: expected the same build version to re-run, got {retried:?}"
-    );
+        // The build stopped in the phase Image Builder was building it in, which is not a phase
+        // a retry resumes from, so the retry is refused and names that phase.
+        let (status, answer) = retry_image(&router, REGION, &build, retry_token).await;
+        assert_refused(
+            case,
+            status,
+            &answer,
+            400,
+            INVALID_PARAMETER_VALUE,
+            &not_resumable_message(BUILD_PHASE),
+        );
 
-    let produced = poll_for_output_ami(&router, REGION, &build).await;
-    let settled = image_status(case, &produced);
-    assert_eq!(
-        settled, AVAILABLE_STATUS,
-        "case {case:?}: expected the re-run to reach {AVAILABLE_STATUS}, got {settled:?}"
-    );
-    let ami = single_ami(case, &produced);
-    assert_backed_by_ec2(case, &router, REGION, &ami).await;
+        // The refused retry wrote nothing: the build version is still the cancelled one, and a
+        // build that never ran again produced no output AMI.
+        let after = read_image(&router, REGION, &build).await;
+        let kept = image_status(case, &after);
+        assert_eq!(
+            kept, CANCELLED_STATUS,
+            "case {case:?}: expected the refused retry to change nothing, got {kept:?}"
+        );
+        let amis = output_amis(&after).unwrap_or_default();
+        assert!(
+            amis.is_empty(),
+            "case {case:?}: expected the cancelled build to produce no AMI, got {amis:?}"
+        );
+    }
+}
+
+/// RULE: a retry RESUMES a stopped build from the phase that build stopped in, so it is
+/// accepted only where that phase is one of the two a retry resumes from — the test and the
+/// distribution phase — and a build that stopped in any other phase is refused HTTP 400
+/// `InvalidParameterValueException` naming the phase it stopped in beside the phases a retry
+/// supports, with its own status left untouched.
+#[tokio::test]
+async fn a_retry_resumes_only_a_build_that_stopped_in_a_resumable_phase() {
+    let (router, engine) = emulator_with_ec2();
+    // The phases are the stages of the image creation process the modelled `ImageStatus` enum
+    // names (`smithy_query(query="shape",shape="ImageStatus")`: PENDING, CREATING, BUILDING,
+    // TESTING, DISTRIBUTING, INTEGRATING, before the statuses a build ENDS in), which is the
+    // enum `ImageFailureContext`'s `imageStatus` reports a stopped build's stage from.
+    //
+    // (the phase the build stopped in, whether a retry resumes from it)
+    let phases: &[(&str, bool)] = &[
+        ("PENDING", false),
+        ("CREATING", false),
+        (BUILD_PHASE, false),
+        (TEST_PHASE, true),
+        (DISTRIBUTION_PHASE, true),
+        ("INTEGRATING", false),
+    ];
+    // Both statuses a stopped build reports: the question is the PHASE, so a build that failed
+    // and one that was cancelled in the same phase are answered alike.
+    for (phase, resumable) in phases {
+        for ended_in in [FAILED_STATUS, CANCELLED_STATUS] {
+            let case = format!("a build that stopped in {phase} and reports {ended_in}");
+            let name = format!(
+                "stopped-in-{}-{}",
+                phase.to_ascii_lowercase(),
+                ended_in.to_ascii_lowercase()
+            );
+            let build = file_ended_build(&engine, REGION, &name, Some(ended_in), Some(phase));
+            let (status, answer) =
+                retry_image(&router, REGION, &build, &format!("retry-{name}")).await;
+            if *resumable {
+                let answer = assert_ok(&case, status, answer);
+                let retried = text(&case, &answer, "imageBuildVersionArn");
+                assert_eq!(
+                    retried, build,
+                    "case {case:?}: expected the same build version to re-run, got {retried:?}"
+                );
+                // "The image re-runs asynchronously in place": the build version is outstanding
+                // again and produces an AMI of its own once it is due.
+                let produced = poll_for_output_ami(&router, REGION, &build).await;
+                let settled = image_status(&case, &produced);
+                assert_eq!(
+                    settled, AVAILABLE_STATUS,
+                    "case {case:?}: expected the re-run to reach {AVAILABLE_STATUS}, got \
+                     {settled:?}"
+                );
+                let ami = single_ami(&case, &produced);
+                assert_backed_by_ec2(&case, &router, REGION, &ami).await;
+            } else {
+                assert_refused(
+                    &case,
+                    status,
+                    &answer,
+                    400,
+                    INVALID_PARAMETER_VALUE,
+                    &not_resumable_message(phase),
+                );
+                let after = read_image(&router, REGION, &build).await;
+                let kept = image_status(&case, &after);
+                assert_eq!(
+                    kept, ended_in,
+                    "case {case:?}: expected the refused retry to change nothing, got {kept:?}"
+                );
+                let amis = output_amis(&after).unwrap_or_default();
+                assert!(
+                    amis.is_empty(),
+                    "case {case:?}: expected the stopped build to produce no AMI, got {amis:?}"
+                );
+            }
+        }
+    }
 }

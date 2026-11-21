@@ -477,8 +477,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateImage<Eng> 
                 // reports is the one its clock decides.
                 terminal_status: None,
                 // Nothing has asked for this build to be stopped either
-                // (`CancelImageCreation`), so no cancellation of it is due.
+                // (`CancelImageCreation`), so no cancellation of it is due and there is no
+                // phase it stopped in.
                 cancelled_at: None,
+                stopped_in_phase: None,
                 // The AMI this build produces is registered with Amazon EC2 below, once the
                 // build version is filed: a build that was only just queued has produced
                 // nothing.

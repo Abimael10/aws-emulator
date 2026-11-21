@@ -533,6 +533,110 @@ fn the_status_of_a_build_version_follows_the_clock_of_its_build_and_its_cancella
     }
 }
 
+/// RULE: the phase a build STOPPED in is read from the record only once that build has
+/// stopped, which the clock decides: a build still running has stopped in no phase however
+/// long it has run and whatever a pending cancellation recorded, one that ran to completion has
+/// stopped in none either, and a stopped build this store recorded no phase for stopped in the
+/// phase every build of this emulator runs. Only the two phases a retry resumes from make that
+/// build resumable.
+#[test]
+fn the_phase_a_build_stopped_in_is_read_once_the_clock_has_stopped_it() {
+    let queued = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let due = queued + IMAGE_BUILD_SPAN;
+    let cancelled = queued + IMAGE_CANCELLATION_SPAN;
+    // (case, the instant the build is due, the instant a cancellation of it is due, the status
+    // something ended it in, the phase this store recorded for it, the instants to read it at
+    // with the phase it reports at each one)
+    type Row<'row> = (
+        &'row str,
+        Option<SystemTime>,
+        Option<SystemTime>,
+        Option<&'row str>,
+        Option<&'row str>,
+        &'row [(Duration, Option<&'row str>)],
+    );
+    let rows: &[Row<'_>] = &[
+        (
+            "a build nothing stopped",
+            Some(due),
+            None,
+            None,
+            None,
+            &[
+                (Duration::ZERO, None),
+                (IMAGE_BUILD_SPAN, None),
+                (Duration::from_secs(600), None),
+            ],
+        ),
+        (
+            "a build whose cancellation is not due yet",
+            Some(due),
+            Some(cancelled),
+            None,
+            Some(IMAGE_PHASE_BUILDING),
+            &[
+                (Duration::ZERO, None),
+                // Stopped, and so carrying the phase it stopped in, only from the instant its
+                // cancellation is due.
+                (IMAGE_CANCELLATION_SPAN, Some(IMAGE_PHASE_BUILDING)),
+            ],
+        ),
+        (
+            "a build something stopped in a phase a retry resumes from",
+            Some(due),
+            None,
+            Some(IMAGE_STATUS_FAILED),
+            Some(IMAGE_PHASE_DISTRIBUTING),
+            &[
+                (Duration::ZERO, Some(IMAGE_PHASE_DISTRIBUTING)),
+                (Duration::from_secs(600), Some(IMAGE_PHASE_DISTRIBUTING)),
+            ],
+        ),
+        (
+            "a stopped build this store recorded no phase for",
+            Some(due),
+            None,
+            Some(IMAGE_STATUS_CANCELLED),
+            None,
+            &[(Duration::ZERO, Some(IMAGE_PHASE_BUILDING))],
+        ),
+        (
+            "a build that ran to completion",
+            None,
+            None,
+            None,
+            Some(IMAGE_PHASE_TESTING),
+            &[(Duration::ZERO, None), (Duration::from_secs(600), None)],
+        ),
+    ];
+    for (case, available_at, cancelled_at, terminal_status, stopped_in_phase, reads) in rows {
+        let record = ImageBuildVersionRecord {
+            available_at: *available_at,
+            cancelled_at: *cancelled_at,
+            terminal_status: terminal_status.map(ToString::to_string),
+            stopped_in_phase: stopped_in_phase.map(ToString::to_string),
+            ..ImageBuildVersionRecord::default()
+        };
+        for (after, expected) in *reads {
+            let at = queued + *after;
+            let actual = record.stopped_in_phase_at(at);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected the stopped phase {expected:?} {after:?} after the \
+                 build was queued, got {actual:?}"
+            );
+            let resumable = record.resumable_at(at);
+            let expected_resumable =
+                expected.is_some_and(|phase| RESUMABLE_IMAGE_PHASES.contains(&phase));
+            assert_eq!(
+                resumable, expected_resumable,
+                "case {case:?}: expected resumable {expected_resumable} {after:?} after the \
+                 build was queued, got {resumable}"
+            );
+        }
+    }
+}
+
 /// RULE: a listing's STATED filter names are the SET that listing filters on, in the order it
 /// states them — so the two orders the image listings state cannot drift into two sets, which
 /// would admit a filter one listing refuses or refuse one it admits.

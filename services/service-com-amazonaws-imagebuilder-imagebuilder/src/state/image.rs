@@ -226,6 +226,15 @@ impl ComAmazonawsImagebuilderImagebuilderState {
     /// ([`ImageBuildVersionRecord::status_at`]); the build it stopped never reaches its
     /// available instant, and what that build already registered stays on the record for a
     /// re-run ([`Self::rerun_image_build`]) to replace.
+    ///
+    /// The PHASE the build was running is recorded on it as well
+    /// ([`ImageBuildVersionRecord::stopped_in_phase`]), since that is the stage of the image
+    /// creation process the build stopped at, and what decides whether a retry may resume it
+    /// ([`ImageBuildVersionRecord::stopped_in_phase_at`]). A build this emulator runs is in its
+    /// build phase from the instant it was queued until it is due
+    /// ([`super::IMAGE_BUILD_SPAN`]), and only a build that has not ended is stopped here, so
+    /// the phase a cancellation lands in is that one. The phase the cancellation asked for
+    /// FIRST is the one that stands, since that is the cancellation that is due.
     pub fn cancel_image_build(&mut self, arn: &str, request_region: &str, at: SystemTime) -> bool {
         let Some(record) = self
             .images
@@ -234,6 +243,9 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         else {
             return false;
         };
+        record
+            .stopped_in_phase
+            .get_or_insert_with(|| super::IMAGE_PHASE_BUILDING.to_string());
         let due = at.checked_add(super::IMAGE_CANCELLATION_SPAN);
         record.cancelled_at = match (record.cancelled_at, due) {
             // A build already being stopped is not made to run longer by a second request to
@@ -250,9 +262,11 @@ impl ComAmazonawsImagebuilderImagebuilderState {
     /// "The image re-runs asynchronously in place: the same build version returns to the test
     /// or distribution phase where it failed and continues from there. No new image build
     /// version is created" (`RetryImage`) — so the SAME record is the one that runs: the
-    /// status it ended in, and any cancellation that stopped it, are no longer what it reports,
-    /// its build is outstanding again until it is due ([`super::IMAGE_BUILD_SPAN`]), and what
-    /// the ended run produced is no longer what this build version produced.
+    /// status it ended in, the phase its stopped run ended in
+    /// ([`ImageBuildVersionRecord::stopped_in_phase`]) and any cancellation that stopped it are
+    /// no longer what it reports, its build is outstanding again until it is due
+    /// ([`super::IMAGE_BUILD_SPAN`]), and what the ended run produced is no longer what this
+    /// build version produced.
     pub fn rerun_image_build(
         &mut self,
         arn: &str,
@@ -268,6 +282,7 @@ impl ComAmazonawsImagebuilderImagebuilderState {
         };
         record.terminal_status = None;
         record.cancelled_at = None;
+        record.stopped_in_phase = None;
         record.available_at = at.checked_add(super::IMAGE_BUILD_SPAN);
         record.output_amis.clear();
         true
