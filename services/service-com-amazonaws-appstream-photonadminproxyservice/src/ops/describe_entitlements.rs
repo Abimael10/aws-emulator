@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEntitlements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEntitlements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEntitlements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation renders the entitlements this service's state holds for the stack the
+//! read names; `CreateEntitlement` writes those same records.
 //!
 //! ## Shape of an operation
 //!
@@ -143,20 +137,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEntitlements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEntitlementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEntitlements"))
+        // The records one page carries, as [`crate::state::page_size`] decides it from
+        // the `MaxResults` the request asked for and this read's own page ceiling.
+        let page_size =
+            crate::state::page_size(input.max_results, crate::state::ENTITLEMENT_PAGE_SIZE)
+                .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::not_implemented("DescribeEntitlements")
+        })?;
+        // A read: the guard is only ever read through, so a Describe can never change
+        // what a later caller sees.
+        let state = state.lock();
+
+        // The entitlements are the stack's, so a read of a stack this account holds none
+        // of is a resource that was not found rather than an empty list.
+        if !state.stacks.contains_key(&input.stack_name) {
+            return Err(DescribeEntitlementsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::STACK_KIND,
+                        &input.stack_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The name of the entitlement" is optional: a read that names one asks about
+        // exactly that entitlement of the stack — and the stack holding none under that
+        // name is an entitlement that can't be found — while a read that names none asks
+        // about every entitlement the stack holds.
+        let selected: ::std::collections::BTreeSet<String> = match &input.name {
+            Some(name) => {
+                if state.entitlement(&input.stack_name, name).is_none() {
+                    return Err(
+                        DescribeEntitlementsErrorModeled::EntitlementNotFoundException(
+                            EntitlementNotFoundException {
+                                message: Some(crate::state::entitlement_not_found_message()),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                ::std::iter::once(name.clone()).collect()
+            }
+            None => state.entitlement_names_for_stack(&input.stack_name),
+        };
+
+        let page = crate::state::paginate_sized(&selected, input.next_token.as_deref(), page_size)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::validation(
+                    "NextToken is not a pagination token this service issued",
+                )
+            })?;
+        let entitlements: Vec<Entitlement> = page
+            .names
+            .iter()
+            .filter_map(|name| state.entitlement(&input.stack_name, name))
+            .map(crate::state::EntitlementRecord::to_entitlement)
+            .collect();
+
+        Ok(DescribeEntitlementsOutput {
+            entitlements: Some(entitlements),
+            next_token: page.next_token,
+        })
     }
 }

@@ -170,6 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The stack's custom branding belongs to the stack, so it goes with it: a stack
         // later created under the same name starts with the default appearance.
         state.themes.remove(&input.name);
+        // So do the stack's entitlements: an entitlement controls access to applications
+        // within one stack and is identified by it, so none can outlive it.
+        state.remove_entitlements_for_stack(&input.name);
         Ok(DeleteStackOutput {})
     }
 }

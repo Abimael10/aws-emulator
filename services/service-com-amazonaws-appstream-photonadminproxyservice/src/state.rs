@@ -85,6 +85,12 @@
 //! is given, and `DescribeUserStackAssociations` reports the edges matching the stack or
 //! the user identity it is asked about, a page at a time.
 //!
+//! A stack's entitlements live here as well, in their own module: `CreateEntitlement`
+//! writes one [`EntitlementRecord`] under the `(StackName, Name)` identity it is created
+//! with ([`EntitlementKey`]), `DescribeEntitlements` renders that stack's stored records
+//! back — one of them, when the read names it — a page at a time, and deleting the stack
+//! removes the entitlements it owns.
+//!
 //! Records hold the MODELLED sub-shapes (`StorageConnector`, `UserSetting`,
 //! `VpcConfig`, …) rather than copies of them, so what a Describe returns is literally
 //! what the Create persisted.
@@ -118,6 +124,7 @@
 //! ([`stack_attribute_conflicts`]).
 
 mod access_endpoints;
+mod entitlements;
 mod images;
 mod stack_attribute_conflicts;
 mod stack_defaults;
@@ -126,6 +133,7 @@ mod vpc_access_endpoints;
 mod wire_refusals;
 
 pub use access_endpoints::*;
+pub use entitlements::*;
 pub use images::*;
 pub use stack_attribute_conflicts::*;
 pub use stack_defaults::*;
@@ -1867,6 +1875,16 @@ pub struct ComAmazonawsAppstreamPhotonadminproxyserviceState {
     /// what `DescribeUserStackAssociations` renders is literally what the batch
     /// persisted. `BTreeMap` so every page of a read walks a stable order.
     pub user_stack_associations: BTreeMap<UserStackAssociationKey, UserStackAssociation>,
+    /// Entitlements by [`EntitlementKey`] — the `(StackName, Name)` identity a
+    /// `CreateEntitlement` mints the resource under, since an entitlement is identified by
+    /// the stack it is associated with as well as by its own name. `BTreeMap` so every
+    /// page of a read walks a stable order, and so one stack's entitlements form a
+    /// contiguous range.
+    ///
+    /// Bounded by [`MAX_RECORDS_PER_STORE`] like every other store a request can grow: one
+    /// stack can be given entitlements without limit unless the store is capped, so
+    /// `CreateEntitlement` refuses a record past that ceiling as an account limit.
+    pub entitlements: BTreeMap<EntitlementKey, EntitlementRecord>,
 }
 
 /// A fresh store holds no caller-created resource and the WHOLE published image catalog:
@@ -1889,6 +1907,7 @@ impl Default for ComAmazonawsAppstreamPhotonadminproxyserviceState {
             usage_report_subscription: None,
             users: BTreeMap::new(),
             user_stack_associations: BTreeMap::new(),
+            entitlements: BTreeMap::new(),
         }
     }
 }

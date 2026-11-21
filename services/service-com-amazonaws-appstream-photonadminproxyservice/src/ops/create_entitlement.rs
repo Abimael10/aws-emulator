@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEntitlement
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEntitlement`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEntitlement::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation writes the entitlement to this service's state and renders the stored
+//! record back; `DescribeEntitlements` reads the same records.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +146,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEntitlement` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEntitlementErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEntitlement"))
+        // See `create_stack.rs` for why an engine without this service's store answers
+        // "not written for that engine" rather than a fabricated success.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::not_implemented("CreateEntitlement"))?;
+        let mut state = state.lock();
+
+        // "Entitlements control access to specific applications within a stack": there is
+        // nothing to control access to until the stack exists, and the entitlement is
+        // identified by that stack, so a request naming no stored stack creates nothing.
+        if !state.stacks.contains_key(&input.stack_name) {
+            return Err(CreateEntitlementErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::STACK_KIND,
+                        &input.stack_name,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A name the stack already holds an entitlement under addresses that entitlement
+        // rather than minting a second one under it; changing it is `UpdateEntitlement`'s
+        // job. The identity is the stack AND the name, so the same name is still free in
+        // another stack.
+        if state.entitlement(&input.stack_name, &input.name).is_some() {
+            return Err(
+                CreateEntitlementErrorModeled::EntitlementAlreadyExistsException(
+                    EntitlementAlreadyExistsException {
+                        message: Some(crate::state::entitlement_already_exists_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store must not grow per request without a ceiling, so a record past it is
+        // refused with the modelled error AWS uses for an account's limit.
+        if state.entitlements.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateEntitlementErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(crate::state::limit_exceeded_message("entitlements")),
+                },
+            )
+            .into());
+        }
+
+        // An entitlement nothing has modified yet was last modified when it was created,
+        // so both instants are the one this call fixed.
+        let created_time = crate::state::now();
+        let record = crate::state::EntitlementRecord {
+            name: input.name,
+            stack_name: input.stack_name,
+            description: input.description,
+            app_visibility: input.app_visibility,
+            attributes: input.attributes,
+            created_time,
+            last_modified_time: created_time,
+        };
+
+        let entitlement = record.to_entitlement();
+        state.entitlements.insert(
+            crate::state::entitlement_key(&record.stack_name, &record.name),
+            record,
+        );
+        Ok(CreateEntitlementOutput {
+            entitlement: Some(entitlement),
+        })
     }
 }
