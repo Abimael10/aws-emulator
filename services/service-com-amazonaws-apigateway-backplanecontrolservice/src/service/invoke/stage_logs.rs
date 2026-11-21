@@ -729,9 +729,10 @@ fn about_request(request_id: &str, line: &str) -> String {
 ///
 /// A payload's size is the CLIENT's choice, and a log event is itself bounded — CloudWatch
 /// Logs takes at most one megabyte per event — so a payload past this is reported by its SIZE
-/// (the line the trace writes when data tracing is off) rather than taking the whole trace
-/// down with it. The figure is generous enough that no payload a method request carries in
-/// practice is reported by its size instead of its bytes.
+/// rather than taking the whole trace down with it. The figure is generous enough that no
+/// payload a method request carries in practice is reported by its size instead of its bytes.
+/// It bounds the line a data trace writes and nothing else: with data tracing off there is no
+/// payload line at all, whatever the payload's size.
 const MAX_TRACED_PAYLOAD_BYTES: usize = 8 * 1024;
 
 /// Emulator resource guard, NOT an AWS limit: the most header NAMES one traced line carries.

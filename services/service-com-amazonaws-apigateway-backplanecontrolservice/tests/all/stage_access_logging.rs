@@ -942,7 +942,7 @@ async fn the_method_settings_in_force_gate_the_execution_log() {
 /// own request transformation, the integration request as it was sent to the backend after it,
 /// the backend's answer as it arrived before the integration response's mapping, and the method
 /// response after that mapping.
-const PAYLOAD_PREFIXES: [&str; 4] = [
+pub(crate) const PAYLOAD_PREFIXES: [&str; 4] = [
     "Method request body before transformations: ",
     "Endpoint request body after transformations: ",
     "Endpoint response body before transformations: ",
@@ -950,7 +950,11 @@ const PAYLOAD_PREFIXES: [&str; 4] = [
 ];
 
 /// Gate every method of `stage` at `level` with `data_trace` beside it.
-async fn gate_execution_logging(
+///
+/// `pub(crate)` for the reason [`emulator`] gives: the sibling suite that drives the level
+/// against the data trace ([`crate::stage_execution_log_data_trace_gate`]) turns the same two
+/// settings on, and one patch is what keeps two suites from addressing the settings differently.
+pub(crate) async fn gate_execution_logging(
     router: &MultiServiceRouter,
     api: &str,
     stage: &str,
@@ -978,7 +982,15 @@ async fn gate_execution_logging(
 }
 
 /// The records of ONE request in the stage's execution log group.
-async fn trace_of(router: &MultiServiceRouter, group: &str, request_id: &str) -> Vec<String> {
+///
+/// `pub(crate)` for the reason [`emulator`] gives: every sibling suite that judges a request's
+/// trace separates it from the traces of the requests before it the same way
+/// ([`crate::stage_execution_log_data_trace_gate`]).
+pub(crate) async fn trace_of(
+    router: &MultiServiceRouter,
+    group: &str,
+    request_id: &str,
+) -> Vec<String> {
     let prefix = traced_line(request_id, "");
     delivered(router, group)
         .await

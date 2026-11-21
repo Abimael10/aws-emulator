@@ -48,8 +48,12 @@ pub(crate) const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambd
 pub(crate) const FUNCTION_TIMEOUT: u64 = 30;
 
 /// How long to wait between polls of a clock-owed transition, and how many polls to make.
+///
+/// The condition is what is waited for, never the clock: the interval is short so a suite moves
+/// on as soon as the transition is due, and the deadline the count makes is generous enough
+/// that a host running every suite at once still reaches it.
 const POLL: Duration = Duration::from_millis(25);
-const POLLS: usize = 400;
+const POLLS: usize = 2_400;
 
 /// The bytes the handler answers with: a PNG signature and four more bytes, which is a
 /// payload no UTF-8 text carries.

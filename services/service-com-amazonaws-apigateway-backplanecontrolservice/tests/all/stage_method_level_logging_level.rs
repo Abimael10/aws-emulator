@@ -48,11 +48,16 @@ use crate::proxy_binary_media_types::{
 use crate::stage_access_logging::{delivered, emulator, install_account_role, invoke, traced_line};
 
 /// The stage every row deploys to.
-const STAGE: &str = "s";
+///
+/// `pub(crate)` with [`given_function`] and [`deployed`]: the sibling suite that drives the
+/// level against the data trace ([`crate::stage_execution_log_data_trace_gate`]) needs the same
+/// stand-up, and one stand-up is what keeps two suites from disagreeing about the api whose
+/// execution logs they gate.
+pub(crate) const STAGE: &str = "s";
 
 /// The path part of the one resource every method below is put on, and the resource path it
 /// makes: `/{RESOURCE_PART}`.
-const RESOURCE_PART: &str = "echo";
+pub(crate) const RESOURCE_PART: &str = "echo";
 
 /// The `methodSettings` key that names every method of the stage.
 const EVERY_METHOD_KEY: &str = "*/*";
@@ -84,7 +89,7 @@ def lambda_handler(event, context):
 
 /// Create the function every integration names, waiting for Lambda to report it `Active`.
 /// Answers its ARN.
-async fn given_function(router: &MultiServiceRouter) -> String {
+pub(crate) async fn given_function(router: &MultiServiceRouter) -> String {
     let created = lambda(
         router,
         "POST",
@@ -119,7 +124,11 @@ async fn given_function(router: &MultiServiceRouter) -> String {
 /// released to [`STAGE`]. Answers the api id.
 ///
 /// `label` separates one row's api, and the grant's own statement, from another's.
-async fn deployed(router: &MultiServiceRouter, function_arn: &str, label: &str) -> String {
+pub(crate) async fn deployed(
+    router: &MultiServiceRouter,
+    function_arn: &str,
+    label: &str,
+) -> String {
     let created = apigw(
         router,
         "CreateRestApi",
