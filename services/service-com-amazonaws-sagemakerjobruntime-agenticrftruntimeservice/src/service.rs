@@ -216,7 +216,9 @@ fn nameable_malformed_arn(violation: &Violation) -> Option<&str> {
 /// ([`LARGEST_MESSAGE_BYTES`]): the ONE renderer both refusal paths of this service reach,
 /// so the bound cannot hold on one path and not the other, and the only part of a sentence
 /// that is the caller's to size — the values its clauses quote — is held to what the prose
-/// leaves ([`held_within_the_message_maximum`]). A sentence already inside the maximum is
+/// leaves, by the one holding this service has ([`each_held_within_the_message_maximum`],
+/// reached for the framework's clauses through [`held_within_the_message_maximum`] and
+/// directly for the single-clause wording below). A sentence already inside the maximum is
 /// returned exactly as it was worded.
 pub(crate) fn refusal_message(violations: &[Violation]) -> Option<String> {
     // This service's own wording stands in for the framework's clause only where it tells
@@ -226,10 +228,12 @@ pub(crate) fn refusal_message(violations: &[Violation]) -> Option<String> {
     // framework's own clause is kept for it instead.
     if let [only] = violations {
         if let Some(value) = nameable_malformed_arn(only) {
-            // One clause, one value: its room is the whole member less this wording's prose.
-            let room = LARGEST_MESSAGE_BYTES.saturating_sub(malformed_arn_prose_bytes());
+            // One clause, one value, held the one way this service holds a caller-sized
+            // value ([`each_held_within_the_message_maximum`]): with a single value there is
+            // no share to divide, so what this wording's prose leaves is its room whole.
+            let held = each_held_within_the_message_maximum(malformed_arn_prose_bytes(), &[value]);
             return Some(malformed_arn_message(
-                &service_common::validation::echo_held_to(value, room),
+                held.first().map_or(value, String::as_str),
             ));
         }
     }
@@ -322,7 +326,8 @@ fn held_within_the_message_maximum(
 /// ([`service_common::validation::echo_held_to`]).
 ///
 /// THE ONE place a refusal of this service holds a caller-sized value, whichever path words
-/// it: the values the framework's clauses quote ([`held_within_the_message_maximum`]) and the
+/// it: the values the framework's clauses quote ([`held_within_the_message_maximum`]), the
+/// value the single-clause malformed-ARN wording names ([`refusal_message`]), and the
 /// principal and resource the authorization gate's own sentence names
 /// ([`authorization`]) — whose principal ARN is read out of the IAM store and is therefore
 /// bounded by THAT model rather than by this one, so a sentence carrying it is not inside

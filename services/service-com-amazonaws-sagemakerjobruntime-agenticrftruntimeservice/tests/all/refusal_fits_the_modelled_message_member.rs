@@ -575,3 +575,125 @@ async fn a_multi_clause_refusal_fits_the_carrying_member() {
         }
     }
 }
+
+/// RULE (one holding, every wording): whichever wording a refusal of this service reaches —
+/// the single-clause malformed-ARN sentence this service words itself, or the framework's
+/// collected clauses — the value it quotes is held the SAME way: to its share of what the
+/// carrying member leaves once that refusal's own prose is in it. So one value is quoted
+/// whole wherever the prose leaves room for it, several values of one sentence are held
+/// together, and no wording overruns the member.
+///
+/// Rows span the wording (this service's own and the framework's), the clause count (one,
+/// two and three), the operation each wording is driven through, and the value's size
+/// relative to what the prose leaves it (inside its share, at the largest size the
+/// single-clause wording can ever carry, and past the share three clauses leave).
+#[tokio::test]
+async fn one_holding_bounds_every_wording_of_a_refusal() {
+    /// A value no job-ARN `@pattern` accepts, of exactly `bytes` bytes — at or under
+    /// `JobArn`'s own `@length` max 256 it breaks the pattern ALONE, so the refusal is the
+    /// single-clause wording this service words itself.
+    fn not_an_arn(bytes: usize) -> String {
+        format!("not-an-arn-{}", "z".repeat(bytes - "not-an-arn-".len()))
+    }
+
+    /// What the single-clause wording states besides the value, read off the sentence the
+    /// service words rather than counted by hand.
+    fn malformed_arn_prose_bytes() -> usize {
+        "Input arn  is malformed".len()
+    }
+
+    // The single-clause wording, driven through every operation that binds the ARN member:
+    // one value, so its share of what the member leaves is the WHOLE of it — and
+    // `JobArn`'s own modelled maximum is far inside that, so the value is quoted whole.
+    for (case, bad_arn) in [
+        ("a short value", not_an_arn(16)),
+        ("at JobArn's own modelled maximum", not_an_arn(JOB_ARN_MAX)),
+    ] {
+        assert!(
+            bad_arn.len() <= LARGEST_MESSAGE_BYTES - malformed_arn_prose_bytes(),
+            "case {case:?}: expected the single-clause wording's one value to fit the room \
+             its prose leaves, got {} bytes of value and {} of room",
+            bad_arn.len(),
+            LARGEST_MESSAGE_BYTES - malformed_arn_prose_bytes()
+        );
+        for path in [
+            SAMPLE_PATH,
+            SAMPLE_STREAM_PATH,
+            COMPLETE_ROLLOUT_PATH,
+            UPDATE_REWARD_PATH,
+        ] {
+            let case = &format!("{case} on {path}");
+            let router = mounted_service_with_job();
+            let reply = call(&router, path, &bad_arn, Some("traj-1"), "ready").await;
+            let message = refusal_within_the_member(case, &reply);
+            assert_eq!(
+                message,
+                format!("Input arn {bad_arn} is malformed"),
+                "case {case:?}: expected the single-clause wording quoting the value whole"
+            );
+            assert_echo(case, &message, &bad_arn, Echo::Whole);
+        }
+    }
+
+    // The framework's clauses, reaching the same holding: two and three values of ONE
+    // sentence, each past the share that sentence's prose leaves it, so every clause states
+    // its submitted byte count and the sentence still fits the member.
+    for (case, three) in [
+        ("two clauses of the framework's own", false),
+        (
+            "the malformed-ARN wording held beside two framework clauses",
+            true,
+        ),
+    ] {
+        let trajectory_id = "t".repeat(1024 * 1024);
+        let status = "s".repeat(1024 * 1024);
+        // At `JobArn`'s own maximum the value breaks the pattern alone, so the third clause
+        // is this service's own wording rather than a length clause — and it is held to its
+        // share like any other.
+        let bad_arn = not_an_arn(JOB_ARN_MAX);
+        let job_arn = if three { bad_arn.clone() } else { well_formed_job() };
+        let clauses = if three { 3 } else { 2 };
+
+        let router = mounted_service_with_job();
+        let reply = call(
+            &router,
+            COMPLETE_ROLLOUT_PATH,
+            &job_arn,
+            Some(&trajectory_id),
+            &status,
+        )
+        .await;
+        let message = refusal_within_the_member(case, &reply);
+        assert!(
+            message.starts_with(&format!("{clauses} validation errors detected: ")),
+            "case {case:?}: expected all {clauses} clauses in one envelope, got {:?}",
+            message.chars().take(200).collect::<String>()
+        );
+        for (member, value) in [("trajectoryId", &trajectory_id), ("status", &status)] {
+            assert!(
+                message.contains(&format!("... [{} bytes]", value.len())),
+                "case {case:?}: expected the clause for {member:?} to be held to its share \
+                 and name the submitted {} bytes, got {:?}",
+                value.len(),
+                message.chars().take(200).collect::<String>()
+            );
+        }
+        if three {
+            // The wording survives the holding, and the value it names is held to its share
+            // of the sentence rather than to the whole room one clause would have left.
+            assert!(
+                message.contains("Input arn "),
+                "case {case:?}: expected this service's own wording among the clauses, got \
+                 {:?}",
+                message.chars().take(200).collect::<String>()
+            );
+            assert!(
+                message.contains(&format!("... [{} bytes]", bad_arn.len())),
+                "case {case:?}: expected the {} byte ARN held to its share of the sentence, \
+                 got {:?}",
+                bad_arn.len(),
+                message.chars().take(200).collect::<String>()
+            );
+        }
+    }
+}
