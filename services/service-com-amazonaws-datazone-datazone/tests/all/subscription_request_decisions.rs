@@ -41,6 +41,11 @@
 //!    as `updatedBy`; `GetSubscription` and the listing report exactly that, a repeat
 //!    revoke leaves the record where the first one left it, and an access given up some
 //!    OTHER way conflicts with the status it carries.
+//! 8. The WINDOW the listing reports through is the model's, not the caller's: the page
+//!    sizes it admits are exactly the modelled `maxResults` range, the order is the one
+//!    the model states whatever `sortBy` names, a later page resumes after the
+//!    subscription the page before it ended on even when the store changed in between,
+//!    and a domain holding no access at all still reports the required `items`.
 
 use crate::harness::Emulator;
 // Percent-encoding a query-parameter value: the one encoder this test target shares, so
@@ -1745,4 +1750,347 @@ async fn an_access_call_addressing_nothing_this_store_holds_is_refused() {
         "the refusals granted and revoked nothing, got {:?}",
         listed.body
     );
+}
+
+/// Grant `count` accesses to `catalog`'s consumer project on `catalog`'s listing, and answer
+/// the one order the listing reports them in.
+///
+/// The order comes from the WIRE rather than from the sequence the accesses were granted in:
+/// the key the listing pages over is the instant a subscription was last changed and then its
+/// own id, so accesses granted inside one millisecond are ordered by id, which is not the
+/// order they were created in.
+async fn accesses_in_reported_order(
+    dz: &Emulator,
+    catalog: &Catalog,
+    count: u32,
+) -> Vec<String> {
+    for index in 0..count {
+        granted_access(
+            dz,
+            &catalog.domain,
+            &catalog.listing,
+            json!({ "project": { "identifier": catalog.consumer } }),
+            &format!("windowed ask {index}"),
+        )
+        .await;
+    }
+    let listed = list_subscriptions(dz, &catalog.domain, "").await;
+    assert_eq!(
+        listed.status, 200,
+        "listing the granted accesses: expected 200, got {} {:?}",
+        listed.status, listed.body
+    );
+    let order = item_ids(&listed.body);
+    assert_eq!(
+        order.len(),
+        count as usize,
+        "every one of the {count} accepts granted an access the listing reports, got {order:?}"
+    );
+    order
+}
+
+/// The page sizes a listing admits are exactly the modelled `maxResults` range (`@range` min
+/// 1, max 50 on the member — smithy_query query="operation" operation="ListSubscriptions"): a
+/// size inside it is served a page of at most that many, with a token exactly while something
+/// is left over, and a size one past either published bound is refused as invalid input with
+/// no page reported at all.
+#[tokio::test]
+async fn a_listing_admits_exactly_the_modelled_page_sizes() {
+    let (dz, _engine) = Emulator::with_engine();
+    let catalog = catalog(&dz, "access-page-size-bounds", "BoundedType").await;
+    // Three accesses, so the bottom of the range leaves something over while the top of it
+    // holds every one of them.
+    let order = accesses_in_reported_order(&dz, &catalog, 3).await;
+
+    // (label, the page size asked for, how many the page reports, whether a token follows)
+    let served: Vec<(&str, u32, usize, bool)> = vec![
+        ("the bottom of the published range", 1, 1, true),
+        ("a size inside the range", 2, 2, true),
+        ("the top of the published range", 50, 3, false),
+    ];
+    for (label, size, reported, token) in served {
+        let page = list_subscriptions(&dz, &catalog.domain, &format!("maxResults={size}")).await;
+        assert_eq!(
+            page.status, 200,
+            "case {label:?}: expected 200, got {} {:?}",
+            page.status, page.body
+        );
+        assert_eq!(
+            item_ids(&page.body),
+            order[..reported].to_vec(),
+            "case {label:?}: expected the first {reported} of the one order, got {:?}",
+            page.body
+        );
+        assert_eq!(
+            page.body.get("nextToken").is_some(),
+            token,
+            "case {label:?}: a token follows exactly while something is left over, got {:?}",
+            page.body
+        );
+    }
+
+    // One past each published bound of that same range.
+    let refused: Vec<(&str, u32)> = vec![
+        ("one below the bottom of the range", 0),
+        ("one above the top of the range", 51),
+    ];
+    for (label, size) in refused {
+        let answer = list_subscriptions(&dz, &catalog.domain, &format!("maxResults={size}")).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {label:?}: expected 400 ValidationException, got {} {:?} {:?}",
+            answer.status,
+            answer.error_code,
+            answer.body
+        );
+        assert_eq!(
+            answer.body.get("items"),
+            None,
+            "case {label:?}: a refused page size reports no page at all, got {:?}",
+            answer.body
+        );
+    }
+
+    // The refused sizes consumed nothing: the whole order is still there to report.
+    let after = list_subscriptions(&dz, &catalog.domain, "").await;
+    assert_eq!(
+        item_ids(&after.body),
+        order,
+        "the refused page sizes left the one order exactly as it was, got {:?}",
+        after.body
+    );
+}
+
+/// The order is not the caller's to pick: `sortBy` is `@deprecated` with "Results are always
+/// sorted by updatedAt" (smithy_query query="operation" operation="ListSubscriptions"), so
+/// every member of it answers the one order, and only `sortOrder` turns that order round.
+#[tokio::test]
+async fn a_listing_reports_one_order_whatever_sort_by_names() {
+    let (dz, _engine) = Emulator::with_engine();
+    let catalog = catalog(&dz, "access-listing-sort-key", "SortedType").await;
+    // Three accesses, so an order has two steps to get wrong.
+    let ascending = accesses_in_reported_order(&dz, &catalog, 3).await;
+    let descending: Vec<String> = ascending.iter().rev().cloned().collect();
+
+    // The rows span the class: each member of `SortKey`, alone and with each member of
+    // `SortOrder` named beside it.
+    let rows: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "no sort key at all",
+            String::new(),
+            ascending.clone(),
+        ),
+        (
+            "the sort key naming the instant of creation",
+            "sortBy=CREATED_AT".to_string(),
+            ascending.clone(),
+        ),
+        (
+            "the sort key naming the instant of the last change",
+            "sortBy=UPDATED_AT".to_string(),
+            ascending.clone(),
+        ),
+        (
+            "a sort key with the ascending order named beside it",
+            "sortBy=CREATED_AT&sortOrder=ASCENDING".to_string(),
+            ascending.clone(),
+        ),
+        (
+            "a sort key with the descending order named beside it",
+            "sortBy=CREATED_AT&sortOrder=DESCENDING".to_string(),
+            descending.clone(),
+        ),
+        (
+            "the other sort key with the descending order",
+            "sortBy=UPDATED_AT&sortOrder=DESCENDING".to_string(),
+            descending.clone(),
+        ),
+    ];
+    for (label, query, expected) in rows {
+        let listed = list_subscriptions(&dz, &catalog.domain, &query).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {label:?}: expected 200, got {} {:?}",
+            listed.status, listed.body
+        );
+        assert_eq!(
+            item_ids(&listed.body),
+            expected,
+            "case {label:?}: expected {expected:?}, got {:?}",
+            listed.body
+        );
+    }
+
+    // The pages a sort key is named on cut that same one order, so naming it changes
+    // nothing about which subscription a page holds either.
+    let first = list_subscriptions(&dz, &catalog.domain, "sortBy=CREATED_AT&maxResults=1").await;
+    assert_eq!(
+        item_ids(&first.body),
+        ascending[..1].to_vec(),
+        "a page of one under a sort key holds the first of the one order, got {:?}",
+        first.body
+    );
+}
+
+/// A page resumes after the subscription the page before it ENDED ON, located by where that
+/// subscription sits in the order rather than by how many were already reported — so a
+/// change to the stored accesses between two pages cannot make the next page skip or repeat
+/// a different one.
+#[tokio::test]
+async fn a_later_page_resumes_after_the_access_the_page_before_it_ended_on() {
+    let (dz, _engine) = Emulator::with_engine();
+    let catalog = catalog(&dz, "access-page-resume", "ResumedType").await;
+    // Five accesses, so a page of two leaves three over and the resume has somewhere to go
+    // wrong.
+    let order = accesses_in_reported_order(&dz, &catalog, 5).await;
+
+    let first = list_subscriptions(&dz, &catalog.domain, "maxResults=2").await;
+    assert_eq!(
+        item_ids(&first.body),
+        order[..2].to_vec(),
+        "the first page holds the first two of the one order, got {:?}",
+        first.body
+    );
+    let mut token = first
+        .body
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    assert!(
+        token.is_some(),
+        "the first page of five leaves something over, got {:?}",
+        first.body
+    );
+
+    // The store CHANGES between the two pages: the access the first page ended on is
+    // revoked, which both moves it out of the default listing and moves the instant the
+    // order is on.
+    let revoked = dz
+        .call(
+            "PUT",
+            &format!(
+                "/v2/domains/{}/subscriptions/{}/revoke",
+                catalog.domain, order[1]
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        revoked.status, 200,
+        "revoking the access the first page ended on: expected 200, got {} {:?}",
+        revoked.status, revoked.body
+    );
+    assert_eq!(
+        revoked.s("status"),
+        SUBSCRIPTION_STATUS_REVOKED,
+        "the change between the pages really gave the access up, got {:?}",
+        revoked.body
+    );
+
+    // The pages that follow still resume after it: the three that were left over, in the
+    // same order, neither skipped nor repeated.
+    let mut collected = order[..2].to_vec();
+    let mut pages = 1;
+    while let Some(resume) = token.take() {
+        let page = list_subscriptions(
+            &dz,
+            &catalog.domain,
+            &format!("maxResults=2&nextToken={resume}"),
+        )
+        .await;
+        assert_eq!(
+            page.status, 200,
+            "the page resuming from {resume:?}: expected 200, got {} {:?}",
+            page.status, page.body
+        );
+        collected.extend(item_ids(&page.body));
+        pages += 1;
+        assert!(
+            pages <= 10,
+            "the pages end rather than resuming for ever, got {collected:?}"
+        );
+        token = page
+            .body
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    assert_eq!(
+        collected, order,
+        "the pages across the change concatenate to the one order"
+    );
+
+    // The access the change gave up is reported by the listing that names the status it
+    // now carries, and by no other.
+    let given_up = list_subscriptions(
+        &dz,
+        &catalog.domain,
+        &format!("status={SUBSCRIPTION_STATUS_REVOKED}"),
+    )
+    .await;
+    assert_eq!(
+        item_ids(&given_up.body),
+        vec![order[1].clone()],
+        "the given-up access is reported under its own status, got {:?}",
+        given_up.body
+    );
+    let standing = list_subscriptions(&dz, &catalog.domain, "").await;
+    assert_eq!(
+        item_ids(&standing.body),
+        vec![
+            order[0].clone(),
+            order[2].clone(),
+            order[3].clone(),
+            order[4].clone(),
+        ],
+        "the default listing reports only the accesses that still stand, got {:?}",
+        standing.body
+    );
+}
+
+/// A domain that holds no access at all still reports `items`, which the model makes a
+/// required output member, as an empty list — and no token, because there is no further page.
+#[tokio::test]
+async fn a_domain_holding_no_access_reports_an_empty_page() {
+    let dz = Emulator::new();
+    let domain = dz.available_domain("access-listing-empty").await;
+
+    // The rows differ along what the request asks for of a store that holds nothing.
+    let rows: Vec<(&str, String)> = vec![
+        ("no filter at all", String::new()),
+        ("a page of one", "maxResults=1".to_string()),
+        (
+            "the status a granted access carries",
+            format!("status={SUBSCRIPTION_STATUS_APPROVED}"),
+        ),
+        (
+            "the status a revoke leaves",
+            format!("status={SUBSCRIPTION_STATUS_REVOKED}"),
+        ),
+        (
+            "a filter naming a listing the domain never published",
+            "subscribedListingId=nosuchlisting".to_string(),
+        ),
+    ];
+    for (label, query) in rows {
+        let listed = list_subscriptions(&dz, &domain, &query).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {label:?}: expected 200, got {} {:?}",
+            listed.status, listed.body
+        );
+        assert_eq!(
+            listed.body.get("items").and_then(Value::as_array),
+            Some(&Vec::new()),
+            "case {label:?}: the required items member is an empty list, got {:?}",
+            listed.body
+        );
+        assert_eq!(
+            listed.body.get("nextToken"),
+            None,
+            "case {label:?}: an empty page is the last one, got {:?}",
+            listed.body
+        );
+    }
 }
