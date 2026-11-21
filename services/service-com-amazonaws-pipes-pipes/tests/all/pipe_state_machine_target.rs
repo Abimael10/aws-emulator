@@ -25,12 +25,21 @@
 //! every message read off a RESULT queue, got there because the pipe started the workflow, so
 //! a pipe that reports `RUNNING` and delivers nothing leaves both empty and the row fails.
 //!
-//! The rows differ along what the rule generalises over: how many records are waiting, the
+//! The last table asserts a further RULE about WHAT one of those records is: a pipe polls its
+//! source for as long as it is RUNNING — so a record waiting before the pipe existed and a
+//! record published while it was already polling are both delivered — and the envelope the
+//! target is handed identifies the record the way the SOURCE API does, its `messageId` being
+//! the `MessageId` that queue's `SendMessage` answered the producer and its `eventSourceARN`
+//! the source queue's own ARN.
+//!
+//! The rows differ along what the rules generalise over: how many records are waiting, the
 //! `BatchSize` they are polled under (one, a divisor of the count, the whole count and the
 //! member's absence), whether the target carries an `InputTemplate`, whether the pipe's
 //! `FilterCriteria` drop one of the records, which `InvocationType` the target parameters
-//! name (both values and the member's absence), which workflow type the target is, and which
-//! of the two start calls the pipe's execution role may make.
+//! name (both values and the member's absence), which workflow type the target is, which of
+//! the two start calls the pipe's execution role may make, and when each record is published
+//! relative to the pipe reaching `RUNNING` (before it exists, in one wave after, and in
+//! several).
 //!
 //! The member names and the invocation types are the model's own
 //! (`smithy_query(query="shape", shape="PipeTargetParameters,PipeTargetStateMachineParameters")`).
@@ -44,7 +53,7 @@ use service_com_amazonaws_pipes_pipes::state::pipe_state::RUNNING;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::pipe_data_plane::{
-    collect_at_least, collect_during, counted, emulator, given_queue, markers, rpc, send,
+    collect_at_least, collect_during, counted, emulator, given_queue, markers, rpc, send, sqs,
     wait_for_counted, LOOK_AGAIN, QUIET, VISIBLE_ATTRIBUTE,
 };
 use crate::pipe_execution_role::{wait_for_state, IN_FLIGHT_ATTRIBUTE};
@@ -754,5 +763,278 @@ async fn an_asynchronous_start_is_authorized_under_states_start_execution() {
                  withheld, the queue holds {held}"
             );
         }
+    }
+}
+
+/// One row of the record-identity table: when the records are published relative to the
+/// pipe's own lifecycle, and the `BatchSize` the pipe polls them under.
+struct Published {
+    /// Also the pipe's, the queue's and the state machine's name.
+    case: &'static str,
+    /// How many records are already waiting on the source when the pipe is created.
+    waiting: usize,
+    /// How many records are sent once the pipe reports `RUNNING`, one entry per wave — so a
+    /// row says both how many arrive after the pipe was already polling and in how many
+    /// separate publications they do.
+    waves: &'static [usize],
+    batch_size: i64,
+}
+
+impl Published {
+    /// Every record this row publishes, waiting and later ones together.
+    fn records(&self) -> usize {
+        self.waiting + self.waves.iter().sum::<usize>()
+    }
+}
+
+/// Send each of `bodies` to the queue at `url`, answering the `MessageId` Amazon SQS assigned
+/// each of them: "an attribute containing the MessageId of the message sent to the queue"
+/// (`SendMessage`'s `SendMessageResult$MessageId`) — the identity its producer is handed, and
+/// so the identity a delivery of that record has to be recognisable by.
+async fn send_identified(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    bodies: &[String],
+) -> BTreeMap<String, String> {
+    let mut identified: BTreeMap<String, String> = BTreeMap::new();
+    for body in bodies {
+        let (status, answered) = sqs(
+            router,
+            "SendMessage",
+            &json!({ "QueueUrl": url, "MessageBody": body }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: SendMessage answered {status} {answered}"
+        );
+        let id = answered["MessageId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no MessageId in {answered}"))
+            .to_string();
+        assert!(
+            identified.insert(id.clone(), body.clone()).is_none(),
+            "case {case:?}: SendMessage answered the message id {id:?} for two records"
+        );
+    }
+    identified
+}
+
+/// Every record the executions of `machine_arn` were started with, as `(messageId, body)`
+/// pairs in the order the executions report them — one pass over every execution there is.
+///
+/// Each execution's input is read as the pipe handed it over: ONE JSON array of record
+/// envelopes, each carrying the source it was polled from.
+async fn delivered_records(
+    router: &MultiServiceRouter,
+    case: &str,
+    machine_arn: &str,
+    source_arn: &str,
+    batch_size: usize,
+) -> Vec<(String, String)> {
+    let mut records: Vec<(String, String)> = Vec::new();
+    for execution in executions(router, case, machine_arn).await {
+        let arn = execution["executionArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no executionArn in {execution}"));
+        let described = described_execution(router, case, arn).await;
+        assert_eq!(
+            described["status"].as_str(),
+            Some(SUCCEEDED),
+            "case {case:?}: expected the execution to succeed, got {described}"
+        );
+        let input: Value = serde_json::from_str(described["input"].as_str().unwrap_or_default())
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: the execution input is not JSON ({error}): {described}")
+            });
+        // The batch of source records itself: an ARRAY, whatever one batch holds — never one
+        // record on its own and never a re-wrapped envelope holding it.
+        let held = input.as_array().cloned().unwrap_or_else(|| {
+            panic!("case {case:?}: expected the input to be an array of records, got {input}")
+        });
+        assert!(
+            !held.is_empty() && held.len() <= batch_size,
+            "case {case:?}: an execution carried {} records, outside the 1..={batch_size} one \
+             batch of this pipe holds: {input}",
+            held.len()
+        );
+        for event in held {
+            assert_eq!(
+                event["eventSource"].as_str(),
+                Some(SQS_EVENT_SOURCE),
+                "case {case:?}: expected the Amazon SQS record envelope, got {event}"
+            );
+            assert_eq!(
+                event["eventSourceARN"].as_str(),
+                Some(source_arn),
+                "case {case:?}: expected the source queue's own ARN on the envelope, got {event}"
+            );
+            let id = event["messageId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no messageId on the record {event}"))
+                .to_string();
+            let body = event["body"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no body on the record {event}"))
+                .to_string();
+            records.push((id, body));
+        }
+    }
+    records
+}
+
+/// The records the executions of `machine_arn` carry, read again until `want` of them have
+/// been delivered or `BUDGET` has elapsed.
+async fn delivered_at_least(
+    router: &MultiServiceRouter,
+    case: &str,
+    machine_arn: &str,
+    source_arn: &str,
+    batch_size: usize,
+    want: usize,
+) -> Vec<(String, String)> {
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        let records = delivered_records(router, case, machine_arn, source_arn, batch_size).await;
+        if records.len() >= want || Instant::now() >= deadline {
+            return records;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// RULE: a pipe polls its source for as long as it is RUNNING, so every record its source
+/// holds is delivered whether it was waiting before the pipe existed or published while the
+/// pipe was already polling; and the envelope the target is handed identifies that record the
+/// way the SOURCE API does — for an Amazon SQS source the `messageId` is the `MessageId` that
+/// queue's `SendMessage` answered its producer and the `eventSourceARN` is the source queue's
+/// own ARN — so a producer can recognise each record it published, exactly once, in what the
+/// target ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delivered_record_carries_the_message_id_its_producer_was_answered() {
+    let rows = [
+        Published {
+            case: "waiting-before-the-pipe-exists",
+            waiting: 2,
+            waves: &[],
+            batch_size: 1,
+        },
+        Published {
+            // The record arrives once the pipe is already RUNNING: its first poll after that
+            // picks the record up, because the record is durable on the queue.
+            case: "published-while-the-pipe-is-running",
+            waiting: 0,
+            waves: &[1],
+            batch_size: 1,
+        },
+        Published {
+            case: "published-in-two-waves-while-running",
+            waiting: 0,
+            waves: &[1, 2],
+            batch_size: 1,
+        },
+        Published {
+            case: "waiting-records-and-a-later-wave",
+            waiting: 2,
+            waves: &[2],
+            batch_size: 2,
+        },
+        Published {
+            // One record under a batch size far above it: the input is still the array of the
+            // records of that batch, with the one record in it.
+            case: "one-record-under-a-wide-batch",
+            waiting: 0,
+            waves: &[1],
+            batch_size: 10,
+        },
+    ];
+    let router = emulator();
+    for row in &rows {
+        let case = row.case;
+        let (source_url, source_arn) = given_queue(&router, &format!("{case}-source")).await;
+        let target_arn = given_state_machine(&router, case, case, STANDARD, ECHO_DEFINITION).await;
+
+        let bodies = markers(case, row.records());
+        let mut published =
+            send_identified(&router, case, &source_url, &bodies[..row.waiting]).await;
+
+        let created = create_pipe(
+            &router,
+            case,
+            json!({
+                "Source": source_arn,
+                "Target": target_arn,
+                "RoleArn": ROLE,
+                "DesiredState": "RUNNING",
+                "SourceParameters": { "SqsQueueParameters": { "BatchSize": row.batch_size } },
+                "TargetParameters": {
+                    "StepFunctionStateMachineParameters": {
+                        "InvocationType": "FIRE_AND_FORGET",
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePipe answered {} {}",
+            created.status, created.body
+        );
+        let state = wait_for_state(&router, case, RUNNING, BUDGET).await;
+        assert_eq!(
+            state, RUNNING,
+            "case {case:?}: expected the pipe running before the later records are sent, got \
+             {state:?}"
+        );
+
+        let mut next = row.waiting;
+        for wave in row.waves {
+            let wave_bodies = &bodies[next..next + wave];
+            next += wave;
+            published.extend(send_identified(&router, case, &source_url, wave_bodies).await);
+        }
+
+        let batch_size = usize::try_from(row.batch_size).unwrap_or(1);
+        let delivered = delivered_at_least(
+            &router,
+            case,
+            &target_arn,
+            &source_arn,
+            batch_size,
+            published.len(),
+        )
+        .await;
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        for (id, body) in &delivered {
+            let before = seen.insert(id.clone(), body.clone());
+            assert!(
+                before.is_none(),
+                "case {case:?}: the record {id:?} was delivered more than once ({delivered:?})"
+            );
+        }
+        assert_eq!(
+            seen, published,
+            "case {case:?}: expected each published record delivered once under the message id \
+             SendMessage answered for it, got {seen:?}"
+        );
+
+        // Nothing MORE is delivered: a record the executions took is deleted from its source,
+        // so no later poll hands it over again.
+        tokio::time::sleep(QUIET).await;
+        let again = delivered_records(&router, case, &target_arn, &source_arn, batch_size).await;
+        assert_eq!(
+            again.len(),
+            delivered.len(),
+            "case {case:?}: expected every record delivered exactly once, {} record(s) stand \
+             after a further watch: {again:?}",
+            again.len()
+        );
+        let held = wait_for_counted(&router, &source_url, &HELD_ATTRIBUTES, 0, BUDGET).await;
+        assert_eq!(
+            held, 0,
+            "case {case:?}: expected the source queue drained once the executions took its \
+             records, it still holds {held}"
+        );
     }
 }
