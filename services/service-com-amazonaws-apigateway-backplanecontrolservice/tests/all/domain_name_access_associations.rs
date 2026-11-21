@@ -873,8 +873,8 @@ async fn the_collection_reports_its_page_member_where_the_page_holds_one() {
     }
 }
 
-/// Assert a listing reports NO page member, because the page holds nothing — and that the
-/// page ending the collection hands back no cursor to carry on at.
+/// Assert a listing reports its page member as the EMPTY list, because the page holds
+/// nothing — and that the page ending the collection hands back no cursor to carry on at.
 async fn assert_empty_page(gateway: &Gateway, query: &str, case: &str) {
     let answer = list_associations(gateway, query).await;
     assert_eq!(
@@ -884,8 +884,8 @@ async fn assert_empty_page(gateway: &Gateway, query: &str, case: &str) {
     );
     assert_eq!(
         answer.body.get("item"),
-        None,
-        "case {case}: expected no page member for a page of nothing, got {:?}",
+        Some(&json!([])),
+        "case {case}: expected the empty page member for a page of nothing, got {:?}",
         answer.body
     );
     assert!(

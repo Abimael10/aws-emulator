@@ -3059,17 +3059,34 @@ impl Page {
         self.applied_limit.filter(|_| self.next_position.is_some())
     }
 
-    /// The page of elements as the answer's collection member REPORTS it: present only where
-    /// the page HOLDS an element. "The current page of elements from this collection" is what
-    /// the member carries, so a page that holds none carries nothing and the member is left
-    /// out of the answer altogether — the empty object a client reads as a collection with
-    /// nothing on this page. That holds however the page came to be empty: a collection that
-    /// holds no element at all, one a caller emptied, a filter that selects none, and the
+    /// The page of elements as the answer's collection member REPORTS it: PRESENT, and the
+    /// empty list where the page holds no element. "The current page of elements from this
+    /// collection" is what the member carries, and a page of nothing is a page of nothing
+    /// rather than an answer that withholds the member — so a client reads "nothing is
+    /// listed" off a list it can count, and a listing of the same collection reports it the
+    /// same way whatever it holds. That holds however the page came to be empty: a collection
+    /// that holds no element at all, one a caller emptied, a filter that selects none, and the
     /// window a caller that walked to the end asks for.
     ///
     /// One copy for every `position`/`limit` collection of this service, so no listing of this
-    /// service reports an empty page a second way.
+    /// service reports an empty page a second way. The base path mappings of one domain name
+    /// are the one collection this service answers otherwise
+    /// ([`Page::items_reported_only_when_held`]).
     pub fn reported_items<Element>(&self, items: Vec<Element>) -> Option<Vec<Element>> {
+        Some(items)
+    }
+
+    /// The page as the ONE collection of this service that leaves its member OUT of an empty
+    /// answer reports it: present where the page holds an element, absent altogether where it
+    /// holds none, so the whole answer is the empty object.
+    ///
+    /// The base path mappings of a domain name are answered this way — a domain name that
+    /// carries no mapping is answered no `item` member at all — against
+    /// [`Page::reported_items`] for every other listing of this service.
+    pub fn items_reported_only_when_held<Element>(
+        &self,
+        items: Vec<Element>,
+    ) -> Option<Vec<Element>> {
         (!items.is_empty()).then_some(items)
     }
 }

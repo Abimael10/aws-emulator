@@ -14,7 +14,10 @@
 //! * a collection that holds no element reports its page member as the EMPTY list — with
 //!   no cursor and no echoed page size beside it — across every listing of this service,
 //!   the deployments collection included (asserted by `crate::deployment_collection`,
-//!   which owns that collection's own answer);
+//!   which owns that collection's own answer), the base path mappings of a domain name
+//!   excepted: that one listing answers an empty page with no page member at all
+//!   (`crate::emptied_collection_page_member::empty_page_body`, the one reading of an empty
+//!   page);
 //! * a limited page of an API's documentation parts holds the parts at the first
 //!   ADDRESSES the request's filters select, and reports the address of the part it
 //!   carries on at as its cursor, so the part a page reports and the cursor beside it
@@ -116,10 +119,9 @@ async fn a_collection_that_holds_no_element_reports_the_empty_page_member() {
 
     for (case, uri) in &rows {
         let answer = listed(&gateway, uri, case).await;
-        // The envelope every listing of this service answers an empty page with: no page
-        // member at all
+        // The envelope this listing answers an empty page with
         // (`crate::emptied_collection_page_member::empty_page_body`).
-        let expected = crate::emptied_collection_page_member::empty_page_body();
+        let expected = crate::emptied_collection_page_member::empty_page_body(case);
         assert_eq!(
             answer.body, expected,
             "case {case}: expected {expected:?} for a collection that holds no \
@@ -147,10 +149,10 @@ async fn a_collection_that_holds_no_element_reports_the_empty_page_member() {
         ("GetDomainNames", "/domainnames"),
     ] {
         let answer = listed(&empty, uri, case).await;
+        let expected = crate::emptied_collection_page_member::empty_page_body(case);
         assert_eq!(
-            answer.body,
-            json!({}),
-            "case {case}: expected no page member for a collection that holds no \
+            answer.body, expected,
+            "case {case}: expected {expected:?} for a collection that holds no \
              element, got {:?}",
             answer.body
         );

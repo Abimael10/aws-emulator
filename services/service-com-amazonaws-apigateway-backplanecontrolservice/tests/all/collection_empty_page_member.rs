@@ -9,9 +9,11 @@
 //! this crate's one wire-test harness, reused from `rest_api_lifecycle`.
 //!
 //! The rule, asserted over a SET of inputs rather than one call: a listing reports "the
-//! current page of elements from this collection" only where the page HOLDS an element — for
-//! every collection of this service, a page that holds nothing is a success carrying no page
-//! member at all
+//! current page of elements from this collection" whatever that page holds — for every
+//! collection of this service, a page that holds nothing is a success carrying the page
+//! member as the EMPTY list, so a client reads "nothing is listed" off a list it can count
+//! rather than off an absent member. The base path mappings of a domain name are the one
+//! collection of this service answered the other way, with no page member at all
 //! (`crate::emptied_collection_page_member::empty_page_body`, the one reading of an empty
 //! page).
 //!
@@ -26,8 +28,10 @@
 //! listing of this suite's table that publishes a filter. `collection_page_boundaries`
 //! covers the third way, a collection that never held an element, and
 //! `collection_page_envelope` the fourth, the window past the last element of a
-//! collection that does hold elements. The last test here reads EVERY paginated listing of
-//! this service once, so no collection is left out of the rule.
+//! collection that does hold elements. The last two tests here read EVERY paginated listing
+//! of this service once, so no collection is left out of the rule, and read the empty answer
+//! of each collection again under every page size the `limit` member publishes and under the
+//! filter or the walked-past cursor that empties its page.
 
 use serde_json::{json, Value};
 
@@ -247,17 +251,9 @@ async fn listed(gateway: &Gateway, uri: &str, case: &str) -> Value {
     answer.body
 }
 
-/// Assert `body` reports a page of `count` element(s): the member carries exactly that many
-/// elements, and a page that holds none carries no member at all.
+/// Assert `body` reports a page of `count` element(s): the member is present and carries
+/// exactly that many elements, a page of none included.
 fn assert_page_of(body: &Value, count: usize, case: &str) {
-    if count == 0 {
-        assert_eq!(
-            body.get("item"),
-            None,
-            "case {case}: expected no page member for a page of nothing, got {body:?}"
-        );
-        return;
-    }
     let items = body
         .get("item")
         .unwrap_or_else(|| panic!("case {case}: expected the page member, got {body:?}"));
@@ -272,13 +268,13 @@ fn assert_page_of(body: &Value, count: usize, case: &str) {
 }
 
 #[tokio::test]
-async fn a_collection_emptied_of_its_last_element_reports_no_page_member() {
+async fn a_collection_emptied_of_its_last_element_reports_the_empty_page_member() {
     for collection in EMPTIED {
         let gateway = Gateway::new();
         let row = stand_up(&gateway, collection).await;
 
-        // The one element it holds is on the page; the emptied listing reports no page at
-        // all.
+        // The one element it holds is on the page; the emptied listing reports a page of
+        // none.
         let case = format!("{collection}(one element)");
         let held = listed(&gateway, &row.listing, &case).await;
         assert_page_of(&held, 1, &case);
@@ -303,7 +299,7 @@ async fn a_collection_emptied_of_its_last_element_reports_no_page_member() {
 }
 
 #[tokio::test]
-async fn a_listing_narrowed_to_no_element_reports_no_page_member() {
+async fn a_listing_narrowed_to_no_element_reports_the_empty_page_member() {
     for collection in COLLECTIONS {
         let gateway = Gateway::new();
         let row = stand_up(&gateway, collection).await;
@@ -426,24 +422,27 @@ async fn every_paginated_listing_of_this_service_reports_its_page_as_the_listing
         ("GetSdkTypes", "/sdktypes".to_string(), None),
     ];
 
-    // The listings of the table above that are NOT `position`/`limit` collections:
-    // `GetStages` publishes neither member
+    // `GetStages` is not a `position`/`limit` collection: it publishes neither member
     // (`smithy_query(query="operation",operation="GetStages")`), so its `item` is the whole
-    // list of what it holds rather than a page of it, and it is the empty list for an api
-    // that holds no stage.
-    const UNPAGED: &[&str] = &["GetStages"];
+    // list of what it holds rather than a page of it — and it is the empty list for an api
+    // that holds no stage, the same answer every paged listing of this service makes.
 
     for (case, uri, held) in &rows {
         let body = listed(&gateway, uri, case).await;
-        // Every PAGED listing of this service reports its page member where the page HOLDS
-        // an element, and none where it does not — the one body the shared reading of an
-        // empty page names (`crate::emptied_collection_page_member::empty_page_body`).
+        // Every listing of this service reports its page member whatever the page holds —
+        // the empty list for a page of nothing — except the one collection the shared
+        // reading of an empty page names as answered otherwise
+        // (`crate::emptied_collection_page_member::empty_page_body`).
         match held {
-            Some(0) if !UNPAGED.contains(case) => assert_eq!(
-                body.get("item"),
-                None,
-                "case {case}: expected no page member for a page of nothing, got {body:?}"
-            ),
+            Some(0) => {
+                let expected = crate::emptied_collection_page_member::empty_page_body(case);
+                assert_eq!(
+                    body.get("item"),
+                    expected.get("item"),
+                    "case {case}: expected the page member of {expected:?} for a page of \
+                     nothing, got {body:?}"
+                );
+            }
             Some(count) => {
                 let Some(reported) = body.get("item") else {
                     panic!("case {case}: expected the page member, got {body:?}");
@@ -470,6 +469,100 @@ async fn every_paginated_listing_of_this_service_reports_its_page_as_the_listing
                      {elements:?}"
                 );
             }
+        }
+    }
+}
+
+/// The page sizes a request may ask a collection for: none at all, the smallest, the
+/// documented default and the published maximum — "The maximum number of returned results
+/// per page. The default value is 25 and the maximum value is 500"
+/// (`smithy_query(query="doc", shape="GetVpcLinksRequest", member="limit")`, the sentence
+/// every paginated `limit` member of this service carries).
+const PAGE_SIZES: &[&str] = &["", "limit=1", "limit=25", "limit=500"];
+
+#[tokio::test]
+async fn an_empty_page_is_the_same_answer_whatever_the_request_asked_for() {
+    // The whole BODY of an empty listing, read across the collections of this service that
+    // hang off each kind of owner — the account's own, an API's children, the keys a usage
+    // plan meters and a domain name's mappings — crossed with every page size the `limit`
+    // member publishes and, where the listing publishes one, the filter or the walked-past
+    // cursor that empties its page while the collection itself is readable.
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "empty-page-queries").await;
+    let plan = created(
+        &gateway,
+        "/usageplans",
+        json!({ "name": "empty-page-queries-plan" }),
+        "CreateUsagePlan",
+    )
+    .await;
+    let plan_id = string_member(&plan, "id", "CreateUsagePlan");
+    let domain_name = "empty-page-queries.example.com";
+    crate::domain_name_collection::created_domain(&gateway, domain_name, json!({})).await;
+
+    // The third column is a query that empties the page a second way: a name no element
+    // carries, and — for the collection addressed by a composite location rather than a
+    // minted id — a cursor past every address there is.
+    let rows: Vec<(&str, String, Option<String>)> = vec![
+        (
+            "GetApiKeys",
+            "/apikeys".to_string(),
+            Some(format!("name={NO_SUCH_NAME}")),
+        ),
+        ("GetVpcLinks", "/vpclinks".to_string(), None),
+        (
+            "GetAuthorizers",
+            format!("/restapis/{api}/authorizers"),
+            None,
+        ),
+        (
+            "GetDocumentationVersions",
+            format!("/restapis/{api}/documentation/versions"),
+            None,
+        ),
+        (
+            "GetDocumentationParts",
+            format!("/restapis/{api}/documentation/parts"),
+            Some("position=ZZZ::::".to_string()),
+        ),
+        (
+            "GetUsagePlanKeys",
+            format!("/usageplans/{plan_id}/keys"),
+            Some(format!("name={NO_SUCH_NAME}")),
+        ),
+        (
+            "GetBasePathMappings",
+            format!("/domainnames/{domain_name}/basepathmappings"),
+            None,
+        ),
+    ];
+
+    for (collection, uri, narrowing) in &rows {
+        let expected = crate::emptied_collection_page_member::empty_page_body(collection);
+        let mut queries: Vec<String> = PAGE_SIZES.iter().map(|size| (*size).to_string()).collect();
+        if let Some(narrowing) = narrowing {
+            for size in PAGE_SIZES {
+                queries.push(if size.is_empty() {
+                    narrowing.clone()
+                } else {
+                    format!("{size}&{narrowing}")
+                });
+            }
+        }
+        for query in &queries {
+            let case = format!("{collection}({query:?})");
+            let read = if query.is_empty() {
+                uri.clone()
+            } else {
+                format!("{uri}?{query}")
+            };
+            let body = listed(&gateway, &read, &case).await;
+            // The page holds nothing, so it carries on at no cursor and echoes no page size
+            // either, whatever size the request asked for.
+            assert_eq!(
+                body, expected,
+                "case {case}: expected {expected:?}, got {body:?}"
+            );
         }
     }
 }

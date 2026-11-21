@@ -96,13 +96,15 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
     let domain_name = "collection.example.com";
     created_domain(&gateway, domain_name, json!({})).await;
 
-    // A domain name that carries no mapping is answered an EMPTY page: no page member at
-    // all, the way every listing of this service answers a page of nothing — and nothing
-    // beside it either, because nothing follows a page that ended the collection.
+    // A domain name that carries no mapping is answered the empty object: the base path
+    // mappings of a domain name are the one collection of this service whose empty page
+    // carries no page member at all, and nothing beside it either, because nothing follows a
+    // page that ended the collection
+    // (`crate::emptied_collection_page_member::empty_page_body`).
     let empty = page_of(&gateway, domain_name, "", "the empty collection").await;
     assert_eq!(
         empty,
-        json!({}),
+        crate::emptied_collection_page_member::empty_page_body("GetBasePathMappings"),
         "case the empty collection: expected no page member, got {empty:?}"
     );
 

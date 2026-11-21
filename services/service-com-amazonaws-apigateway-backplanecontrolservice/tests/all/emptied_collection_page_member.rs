@@ -13,8 +13,10 @@
 //! API.
 //!
 //! The rule, asserted over a TABLE of collections rather than one listing: a collection
-//! emptied of its last element answers with NO page member (`item` on the wire) at all, and
-//! with neither a cursor nor a page-size echo beside it ([`empty_page_body`]).
+//! emptied of its last element answers with its page member (`item` on the wire) PRESENT and
+//! empty, and with neither a cursor nor a page-size echo beside it — except the base path
+//! mappings of a domain name, the one collection of this service whose empty answer carries no
+//! page member at all ([`empty_page_body`], the one reading of an empty page).
 //! The DEPLOYMENTS collection is asserted the same way by
 //! `crate::deployment_collection`, which owns it.
 //!
@@ -176,18 +178,28 @@ async fn emptied(gateway: &Gateway, collection: &str) -> String {
     }
 }
 
-/// The whole body a collection of this service answers once it holds no element: NOTHING —
-/// no page member, because "the current page of elements from this collection" holds none, and
-/// nothing beside it either, no cursor and no page-size echo. One body for every collection,
-/// because which collection it is changes nothing about a page of nothing.
+/// The one collection of this service whose empty answer carries NO page member: the base
+/// path mappings of one domain name, which API Gateway answers with the bare empty object.
+pub(crate) const MEMBERLESS_EMPTY_PAGE: &str = "GetBasePathMappings";
+
+/// The whole body the listing named `collection` answers once its page holds no element: the
+/// page member PRESENT and empty — "the current page of elements from this collection" is a
+/// list a client counts, and a page of nothing is a list of nothing — and nothing beside it,
+/// no cursor and no page-size echo, because a page of nothing carries on nowhere.
 ///
-/// `pub(crate)` so the sibling `collection_empty_page_member` suite reads the same spelling.
-pub(crate) fn empty_page_body() -> Value {
-    json!({})
+/// [`MEMBERLESS_EMPTY_PAGE`] is answered the other way, with no page member at all.
+///
+/// `pub(crate)` so every suite of this crate that reads an empty page reads the same spelling.
+pub(crate) fn empty_page_body(collection: &str) -> Value {
+    if collection == MEMBERLESS_EMPTY_PAGE {
+        json!({})
+    } else {
+        json!({ "item": [] })
+    }
 }
 
 #[tokio::test]
-async fn an_emptied_collection_reports_no_page_member_and_nothing_beside_it() {
+async fn an_emptied_collection_reports_the_page_member_its_listing_answers() {
     for collection in COLLECTIONS {
         let gateway = Gateway::new();
         let uri = emptied(&gateway, collection).await;
@@ -199,10 +211,9 @@ async fn an_emptied_collection_reports_no_page_member_and_nothing_beside_it() {
             "case {case}: expected 200, got {} with {:?}",
             answer.status, answer.body
         );
-        // The envelope every collection of this service answers an emptied page with, and
-        // nothing beside it: the page holds no element, so it carries on at no cursor and
-        // echoes no page size.
-        let expected = empty_page_body();
+        // The envelope this collection answers an emptied page with, and nothing beside it:
+        // the page holds no element, so it carries on at no cursor and echoes no page size.
+        let expected = empty_page_body(collection);
         assert_eq!(
             answer.body, expected,
             "case {case}: expected {expected:?}, got {:?}",
@@ -232,7 +243,7 @@ async fn an_emptied_collection_asked_for_a_page_size_reports_the_same_answer() {
                 "case {case}: expected 200, got {} with {:?}",
                 answer.status, answer.body
             );
-            let expected = empty_page_body();
+            let expected = empty_page_body(collection);
             assert_eq!(
                 answer.body, expected,
                 "case {case}: expected the same {expected:?}, got {:?}",

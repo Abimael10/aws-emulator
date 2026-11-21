@@ -1586,15 +1586,15 @@ async fn a_private_api_is_deployable_only_once_a_resource_policy_is_attached() {
             "case {case}: expected the private-deployment sentence, got {:?}",
             answer.body["message"]
         );
-        // Nothing was deployed: the api holds no deployment and no stage. A listing reports a
-        // page member only where the page HOLDS an element, so what says nothing was deployed
-        // is the absent member (`crate::deployment_collection`).
+        // Nothing was deployed: the api holds no deployment and no stage. A listing reports
+        // its page member whatever the page holds, so what says nothing was deployed is a
+        // page of no elements (`crate::deployment_collection`).
         let deployments = gateway
             .call("GET", &format!("/restapis/{api}/deployments"), None)
             .await;
         assert_eq!(
             deployments.body.get("item"),
-            None,
+            Some(&json!([])),
             "case {case}: expected no deployment to have been created, got {:?}",
             deployments.body
         );

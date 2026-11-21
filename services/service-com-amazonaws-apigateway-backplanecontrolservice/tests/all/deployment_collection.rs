@@ -373,13 +373,13 @@ async fn the_page_member_is_reported_where_the_page_holds_an_element() {
     let gateway = Gateway::new();
     let api = api_with_a_method(&gateway, "deployment-page-member").await;
 
-    // An api that never held a deployment: there is no page of elements to report, so the
-    // member is not in the document at all.
+    // An api that never held a deployment: the page holds no element, so the member is
+    // present and empty.
     let empty = get_deployments(&gateway, &api, "").await;
     assert_eq!(
         empty.body.get("item"),
-        None,
-        "case \"an api that never held a deployment\": expected no page member, got {:?}",
+        Some(&json!([])),
+        "case \"an api that never held a deployment\": expected the empty page member, got {:?}",
         empty.body
     );
 
@@ -424,8 +424,8 @@ async fn the_page_member_is_reported_where_the_page_holds_an_element() {
     let emptied = get_deployments(&gateway, &api, "").await;
     assert_eq!(
         emptied.body.get("item"),
-        None,
-        "case \"an api a caller emptied\": expected no page member, got {:?}",
+        Some(&json!([])),
+        "case \"an api a caller emptied\": expected the empty page member, got {:?}",
         emptied.body
     );
 }
@@ -527,8 +527,8 @@ async fn a_refused_deployment_leaves_the_listing_reporting_the_empty_page_member
         );
         assert_eq!(
             listed.body.get("item"),
-            None,
-            "case {}: expected no page member after the refusal, got {:?}",
+            Some(&json!([])),
+            "case {}: expected the empty page member after the refusal, got {:?}",
             refusal.case,
             listed.body
         );
@@ -612,8 +612,8 @@ async fn a_deployment_the_callers_policies_deny_leaves_the_listing_reporting_the
         );
         assert_eq!(
             answer.body.get("item"),
-            None,
-            "case {case}: expected no page member after the denial, got {:?}",
+            Some(&json!([])),
+            "case {case}: expected the empty page member after the denial, got {:?}",
             answer.body
         );
     }
