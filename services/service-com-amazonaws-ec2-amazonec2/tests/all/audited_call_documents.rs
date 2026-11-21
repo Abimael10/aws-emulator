@@ -35,7 +35,10 @@ use service_common::management_events::{ManagementEventLog, ManagementEvent};
 use super::ec2_query::{call, element};
 
 /// The Region every call here is signed for, and so the Region its records live in.
-const REGION: &str = "us-west-2";
+///
+/// Shared with the suites beside this one that drive a call through [`served`], so a record
+/// and the catalog a case resolves against are read in the ONE Region.
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The CIDR of the VPC these calls launch into.
 const VPC_CIDR: &str = "10.42.0.0/16";
@@ -50,17 +53,20 @@ fn p(key: &str, value: impl Into<String>) -> (String, String) {
 
 /// One call's record: the JSON document a lookup over event history reports, and the
 /// resource pairs that lookup's envelope names.
-struct Recorded {
+///
+/// Shared with the suites beside this one that assert on a record of an EC2 call, so the
+/// record of a call is found the one way rather than once per suite.
+pub(crate) struct Recorded {
     /// The record as `LookupEvents` serves its `CloudTrailEvent`.
-    document: Value,
+    pub(crate) document: Value,
     /// `(ResourceType, ResourceName)` for each resource the event names, as the envelope of
     /// a lookup reports them.
-    resources: Vec<(String, String)>,
+    pub(crate) resources: Vec<(String, String)>,
 }
 
 /// Call `action` and answer the record of that very call — the one naming the request id the
 /// caller was answered under, which is how a client finds the record of its own call.
-async fn served(
+pub(crate) async fn served(
     router: &smithy_server_runtime::MultiServiceRouter,
     engine: &engine::InMemoryEngine,
     case: &str,

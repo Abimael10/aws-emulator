@@ -574,22 +574,42 @@ pub type DescribedTag = (String, String, String, String);
 /// Beside the tag-plane plumbing above, so a suite that seeds a resource's tags at its create
 /// and a suite that writes them afterwards ask for them the same way.
 pub fn tag_specification(resource_type: &str, tags: &[(&str, &str)]) -> Vec<(String, String)> {
-    if tags.is_empty() {
-        return Vec::new();
-    }
-    let mut params = vec![(
-        "TagSpecification.1.ResourceType".to_string(),
-        resource_type.to_string(),
-    )];
-    for (position, (key, value)) in tags.iter().enumerate() {
+    tag_specifications(&[(resource_type, tags)])
+}
+
+/// The `TagSpecification.N.*` form fields of a whole `TagSpecifications` list — one entry per
+/// resource type the create assigns tags to, numbered from 1 as ec2Query numbers a list, and
+/// an entry carrying no tag at all left out.
+///
+/// The general form of [`tag_specification`], which is this with a single entry: a create that
+/// tags more than one of the resources it mints (an instance and its volumes) asks for them
+/// the same way one that tags a single resource does.
+///
+/// The EMITTED entries are what is numbered, so the list a request carries is contiguous from
+/// 1 whichever of the entries given carried no tag at all — an ec2Query list with a position
+/// missing is not the list the caller asked for.
+pub fn tag_specifications(entries: &[(&str, &[(&str, &str)])]) -> Vec<(String, String)> {
+    let mut params = Vec::new();
+    let mut index = 0;
+    for (resource_type, tags) in entries {
+        if tags.is_empty() {
+            continue;
+        }
+        index += 1;
         params.push((
-            format!("TagSpecification.1.Tag.{}.Key", position + 1),
-            (*key).to_string(),
+            format!("TagSpecification.{index}.ResourceType"),
+            (*resource_type).to_string(),
         ));
-        params.push((
-            format!("TagSpecification.1.Tag.{}.Value", position + 1),
-            (*value).to_string(),
-        ));
+        for (tag_position, (key, value)) in tags.iter().enumerate() {
+            params.push((
+                format!("TagSpecification.{index}.Tag.{}.Key", tag_position + 1),
+                (*key).to_string(),
+            ));
+            params.push((
+                format!("TagSpecification.{index}.Tag.{}.Value", tag_position + 1),
+                (*value).to_string(),
+            ));
+        }
     }
     params
 }
