@@ -288,6 +288,25 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // Attempt Count: …)`).
     ("route53", "Route53", SdkDiagnostic::Attempts),
     ("s3", "S3", SdkDiagnostic::Attempts),
+    // AWS Secrets Manager's SDK names it `SecretsManager` — that model's own `sdkId` (`Secrets
+    // Manager`, `smithy_query(query="service_info")` on that service's model) written as one
+    // word, which is also the `cloudFormationName` the type names of its resources carry. The
+    // shape is the bare ENVELOPE, with no attempt count after it, as the recorded
+    // `ResourceStatusReason` of an `AWS::SecretsManager::ResourcePolicy` whose declared document
+    // grants public access while the declaration asks for those to be blocked carries it (in the
+    // behavioral corpus `simparity-behavioral-aws-v1`, check `secretsmanager.deploy-cfn-public-\
+    // resource-policy-rejected-by-block-public-policy-and-rolled-back`, whose reason reads
+    // `Resource handler returned message: "<the service's sentence> (Service: SecretsManager,
+    // Status Code: 400, Request ID: …)" (RequestToken: …, HandlerErrorCode: InvalidRequest)`).
+    // The three resource types this emulator provisions over this signing name are all that
+    // service's ([`provisioning::secretsmanager_secret`],
+    // [`provisioning::secretsmanager_resource_policy`] and
+    // [`provisioning::secretsmanager_rotation_schedule`]).
+    (
+        SECRETSMANAGER_SIGNING_NAME,
+        "SecretsManager",
+        SdkDiagnostic::Envelope,
+    ),
     // AWS Cloud Map's SDK names it by that model's own `sdkId` (`ServiceDiscovery`,
     // `smithy_query(query="service_info")` on that service's model), which is also the
     // `cloudFormationName` the type names of its resources carry. The shape is the
