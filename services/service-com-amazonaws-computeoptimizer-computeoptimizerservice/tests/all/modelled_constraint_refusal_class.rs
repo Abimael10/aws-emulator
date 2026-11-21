@@ -26,6 +26,15 @@
 //! another does not is a bound a client cannot know. The rows there are every reader of this
 //! service that takes an identifier list, each with the identifier form its member
 //! documents, crossed with list lengths either side of the ceiling.
+//!
+//! The ceiling is a property of the REQUEST, not of what its entries turn out to name, so
+//! those suites also cross every reader with the FORMS its entries can take — well-formed
+//! identifiers, one identifier repeated, values of no identifier's form, identifiers of
+//! another account — and with an account that never enrolled: a list past the ceiling is
+//! refused for its length in every one of those, because the length is decided before
+//! anything is parsed, resolved or selected per identifier and before the enrollment gate.
+//! Within the ceiling the entries are what answer, so the bound preempts that work without
+//! replacing it.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::MAX_REQUESTED_IDENTIFIERS;
@@ -38,6 +47,10 @@ use crate::harness::{
 /// parameter is out of range or not valid" (HTTP 400). Every operation that takes an input
 /// lists it, and no operation lists a `ValidationException`.
 const MODELLED_BAD_INPUT: &str = "InvalidParameterValueException";
+
+/// The refusal every reader of this service answers a request from an account that is not
+/// enrolled with (HTTP 403) — the gate a bad input is refused AHEAD of.
+const OPT_IN_REQUIRED: &str = "OptInRequiredException";
 
 /// A request refused for a modelled constraint is refused with the service's own bad-input
 /// class, whatever the operation and whatever the constraint.
@@ -219,6 +232,14 @@ struct IdentifierList {
     /// that a job id it cannot report names no job (404). Either way the request got past the
     /// length bound, which is what the rows assert.
     within_bound: u16,
+    /// The `index`th value this member's documented form does NOT admit, or `None` where no
+    /// string is malformed as one of its identifiers (an export-job id is an opaque string).
+    /// Within the bound such a list is refused on its ENTRIES; past the bound the length is
+    /// what answers, whichever entries the list carries.
+    malformed: Option<fn(usize) -> String>,
+    /// The `index`th identifier of this member's form owned by ANOTHER account, or `None`
+    /// where the identifiers this member takes carry no account (`jobIds`).
+    other_account: Option<fn(usize) -> String>,
 }
 
 /// Every reader of this service that takes a caller-supplied identifier list, from each
@@ -231,54 +252,72 @@ const IDENTIFIER_LISTS: &[IdentifierList] = &[
         member: "instanceArns",
         identifier: nth_instance_arn,
         within_bound: 200,
+        malformed: Some(nth_not_an_identifier),
+        other_account: Some(nth_other_account_instance_arn),
     },
     IdentifierList {
         operation: "GetAutoScalingGroupRecommendations",
         member: "autoScalingGroupArns",
         identifier: nth_group_arn,
         within_bound: 200,
+        malformed: Some(nth_not_an_identifier),
+        other_account: Some(nth_other_account_group_arn),
     },
     IdentifierList {
         operation: "GetEBSVolumeRecommendations",
         member: "volumeArns",
         identifier: nth_volume_arn,
         within_bound: 200,
+        malformed: Some(nth_not_an_identifier),
+        other_account: Some(nth_other_account_volume_arn),
     },
     IdentifierList {
         operation: "GetLambdaFunctionRecommendations",
         member: "functionArns",
         identifier: nth_function_arn,
         within_bound: 200,
+        malformed: Some(nth_not_an_identifier),
+        other_account: Some(nth_other_account_function_arn),
     },
     IdentifierList {
         operation: "GetECSServiceRecommendations",
         member: "serviceArns",
         identifier: nth_ecs_service_arn,
         within_bound: 200,
+        malformed: Some(nth_not_an_identifier),
+        other_account: Some(nth_other_account_ecs_service_arn),
     },
     IdentifierList {
         operation: "GetLicenseRecommendations",
         member: "resourceArns",
         identifier: nth_instance_arn,
         within_bound: 200,
+        malformed: Some(nth_not_an_identifier),
+        other_account: Some(nth_other_account_instance_arn),
     },
     IdentifierList {
         operation: "GetIdleRecommendations",
         member: "resourceArns",
         identifier: nth_instance_arn,
         within_bound: 200,
+        malformed: Some(nth_not_an_identifier),
+        other_account: Some(nth_other_account_instance_arn),
     },
     IdentifierList {
         operation: "GetRDSDatabaseRecommendations",
         member: "resourceArns",
         identifier: nth_database_arn,
         within_bound: 200,
+        malformed: Some(nth_not_an_identifier),
+        other_account: Some(nth_other_account_database_arn),
     },
     IdentifierList {
         operation: "DescribeRecommendationExportJobs",
         member: "jobIds",
         identifier: nth_job_id,
         within_bound: 404,
+        malformed: None,
+        other_account: None,
     },
 ];
 
@@ -317,6 +356,52 @@ fn nth_database_arn(index: usize) -> String {
 /// The `index`th export-job id (`jobIds`).
 fn nth_job_id(index: usize) -> String {
     format!("export-job-{index}")
+}
+
+/// A well-formed 12-digit account id that is NOT the one this service answers for: the
+/// documentation's own example account. An identifier of this account names a resource no
+/// request to this endpoint is answered about, so a list of them is work this service would
+/// never do — which is why the length bound has to answer such a list first.
+const OTHER_ACCOUNT: &str = "123456789012";
+
+/// The `index`th value no member's documented form admits: a bare word is no Amazon Resource
+/// Name, so every reader whose list takes ARNs refuses it on its own merits — within the
+/// bound.
+fn nth_not_an_identifier(index: usize) -> String {
+    format!("not-an-arn-{index}")
+}
+
+/// The `index`th Amazon EC2 instance ARN of [`OTHER_ACCOUNT`].
+fn nth_other_account_instance_arn(index: usize) -> String {
+    format!("arn:aws:ec2:{REGION}:{OTHER_ACCOUNT}:instance/i-{index:017x}")
+}
+
+/// The `index`th Auto Scaling group ARN of [`OTHER_ACCOUNT`].
+fn nth_other_account_group_arn(index: usize) -> String {
+    format!(
+        "arn:aws:autoscaling:{REGION}:{OTHER_ACCOUNT}:autoScalingGroup:\
+         12345678-1234-1234-1234-123456789012:autoScalingGroupName/web-tier-{index}"
+    )
+}
+
+/// The `index`th Amazon EBS volume ARN of [`OTHER_ACCOUNT`].
+fn nth_other_account_volume_arn(index: usize) -> String {
+    format!("arn:aws:ec2:{REGION}:{OTHER_ACCOUNT}:volume/vol-{index:017x}")
+}
+
+/// The `index`th Lambda function ARN of [`OTHER_ACCOUNT`].
+fn nth_other_account_function_arn(index: usize) -> String {
+    format!("arn:aws:lambda:{REGION}:{OTHER_ACCOUNT}:function:checkout-{index}")
+}
+
+/// The `index`th Amazon ECS service ARN of [`OTHER_ACCOUNT`].
+fn nth_other_account_ecs_service_arn(index: usize) -> String {
+    format!("arn:aws:ecs:{REGION}:{OTHER_ACCOUNT}:service/web/checkout-{index}")
+}
+
+/// The `index`th Amazon Aurora or RDS database ARN of [`OTHER_ACCOUNT`].
+fn nth_other_account_database_arn(index: usize) -> String {
+    format!("arn:aws:rds:{REGION}:{OTHER_ACCOUNT}:db:ledger-{index}")
 }
 
 /// A list of `count` distinct identifiers for `row`.
@@ -404,5 +489,155 @@ async fn an_identifier_list_up_to_the_bound_is_not_refused_for_its_length() {
                  got {body}"
             );
         }
+    }
+}
+
+/// The entry forms a list of `count` identifiers can arrive in for one reader: the case name
+/// and the list itself. The length of a list is a property of the REQUEST, so the forms span
+/// what the entries can be — identifiers of the member's own form, one identifier repeated (a
+/// list naming ONE resource is still a list of `count` entries), values of no identifier's
+/// form at all, and identifiers of an account this service answers nothing about.
+fn entry_forms(row: &IdentifierList, count: usize) -> Vec<(&'static str, Vec<String>)> {
+    let mut forms: Vec<(&'static str, Vec<String>)> = vec![
+        ("identifiers of this member's form", identifiers(row, count)),
+        (
+            "one identifier repeated",
+            vec![(row.identifier)(0); count],
+        ),
+    ];
+    if let Some(malformed) = row.malformed {
+        forms.push((
+            "values of no identifier's form",
+            (0..count).map(malformed).collect(),
+        ));
+    }
+    if let Some(other_account) = row.other_account {
+        forms.push((
+            "identifiers of another account",
+            (0..count).map(other_account).collect(),
+        ));
+    }
+    forms
+}
+
+/// The length bound is answered FIRST: a list longer than the ceiling is refused for its
+/// length whatever its entries are — well-formed, one identifier repeated, values of no
+/// identifier's form, or identifiers of another account — because the length is decided
+/// before anything is parsed, resolved or selected per identifier. A reader that parsed the
+/// entries first would answer a parse or permission refusal here, and one of them would
+/// answer a 200 for the entries it tolerates.
+#[tokio::test]
+async fn a_list_past_the_bound_is_refused_for_its_length_whatever_its_entries_are() {
+    assert_ne!(
+        OTHER_ACCOUNT, ACCOUNT,
+        "the other-account rows must not name the account this service answers for ({ACCOUNT})"
+    );
+    let router = emulator();
+    opt_in(&router).await;
+
+    let count = MAX_REQUESTED_IDENTIFIERS + 1;
+    for row in IDENTIFIER_LISTS {
+        for (form, entries) in entry_forms(row, count) {
+            let case = format!("{}${} naming {count} {form}", row.operation, row.member);
+            let request = json!({row.member: entries});
+            let (status, body) = call(&router, row.operation, request).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected 400, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                MODELLED_BAD_INPUT,
+                "case {case:?}: expected {MODELLED_BAD_INPUT}, got {body}"
+            );
+            let message = body["message"].as_str().unwrap_or_default();
+            let expected = too_long_message(row.member, count);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the refusal to state {expected:?}, got {message:?}"
+            );
+        }
+    }
+}
+
+/// Within the bound the ENTRIES are what answer: a list of as many values as the ceiling
+/// admits, none of them of the form the member documents, is refused for what it names rather
+/// than for how much it names — so the length bound above preempts the per-identifier work
+/// without replacing it.
+#[tokio::test]
+async fn a_within_bound_list_is_still_judged_on_its_entries() {
+    let router = emulator();
+    opt_in(&router).await;
+
+    let count = MAX_REQUESTED_IDENTIFIERS;
+    for row in IDENTIFIER_LISTS {
+        let Some(malformed) = row.malformed else {
+            continue;
+        };
+        let case = format!(
+            "{}${} naming {count} values of no identifier's form",
+            row.operation, row.member
+        );
+        let entries: Vec<String> = (0..count).map(malformed).collect();
+        let (status, body) = call(&router, row.operation, json!({row.member: entries})).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the entries to be refused with 400, got {status}: {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert_ne!(
+            message,
+            too_long_message(row.member, count),
+            "case {case:?}: a list within the bound must not be refused for its length, got \
+             {body}"
+        );
+    }
+}
+
+/// The length bound is a property of the request, so it is answered before the account's
+/// enrollment is consulted: on an account that never opted in, a list past the ceiling is
+/// still refused for its length rather than with the opt-in refusal that reader answers every
+/// other request with.
+#[tokio::test]
+async fn a_list_past_the_bound_is_refused_before_the_opt_in_gate() {
+    let router = emulator();
+
+    // The gate is CLOSED on this emulator: nothing opted the account in, so a request that
+    // carries no over-long list is answered with the opt-in refusal.
+    let (status, body) = call(&router, "GetEC2InstanceRecommendations", json!({})).await;
+    assert_eq!(
+        status, 403,
+        "expected the opt-in gate to refuse a request from an account that never opted in, \
+         got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        OPT_IN_REQUIRED,
+        "expected {OPT_IN_REQUIRED}, got {body}"
+    );
+
+    let count = MAX_REQUESTED_IDENTIFIERS + 1;
+    for row in IDENTIFIER_LISTS {
+        let case = format!(
+            "{}${} naming {count} identifiers without opting in",
+            row.operation, row.member
+        );
+        let request = json!({row.member: identifiers(row, count)});
+        let (status, body) = call(&router, row.operation, request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            MODELLED_BAD_INPUT,
+            "case {case:?}: expected {MODELLED_BAD_INPUT}, got {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        let expected = too_long_message(row.member, count);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the refusal to state {expected:?}, got {message:?}"
+        );
     }
 }
