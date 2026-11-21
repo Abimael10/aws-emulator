@@ -66,7 +66,7 @@
 //! within the lengths the model gives them
 //! ([`crate::state::MAX_AMENDMENT_REASON_LEN`], [`crate::state::MAX_CLIENT_TOKEN_LEN`] —
 //! the two strings the record keeps), and an amended document still within
-//! [`crate::state::details_requirement`]'s depth, member-count and byte bounds.
+//! [`crate::state::details_requirement`]'s depth, member-count and text-length bounds.
 //!
 //! The document the amendments produce is judged against the request schema the
 //! application's benefit declares, exactly as a document supplied to the create or the
@@ -865,7 +865,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The two caller-chosen strings this operation PERSISTS, checked at the door of
-        // the store whose byte accounting cites these bounds. The model constrains both
+        // the store whose size accounting cites these bounds. The model constrains both
         // (`AmendmentReason` `@length(max: 1000)`, `ClientToken` `@length(min: 1, max:
         // 64)`), so the centralized walk refuses a longer one first; this is the
         // enforcement the store itself relies on, not a restatement of the walk's job.

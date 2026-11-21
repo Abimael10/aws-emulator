@@ -489,10 +489,16 @@ pub const MAX_APPLIED_WRITE_HISTORY: usize = 20;
 /// from growing one record without limit. Emulator resource guard, NOT an AWS quota.
 pub const MAX_DETAILS_MEMBERS: usize = 256;
 
-/// The most bytes of text (member names and string values) a stored
-/// `BenefitApplicationDetails` document may carry. Emulator resource guard, NOT an AWS
-/// quota; see [`MAX_DETAILS_MEMBERS`].
-pub const MAX_DETAILS_BYTES: usize = 64 * 1024;
+/// The most text (member names and string values) a stored `BenefitApplicationDetails`
+/// document may carry, in CHARACTERS — the unit [`length_clause`] counts every length
+/// this service enforces in, and so the unit the requirement this bound is stated as
+/// ([`details_requirement`]) names. Emulator resource guard, NOT an AWS quota; see
+/// [`MAX_DETAILS_MEMBERS`].
+///
+/// A character costs at most four bytes in UTF-8, so one stored document holds at most
+/// four times this many bytes of text: the store stays bounded whatever script the
+/// caller's text is written in.
+pub const MAX_DETAILS_TEXT_LEN: usize = 64 * 1024;
 
 /// The most AWS resources one benefit application carries.
 ///
@@ -2492,29 +2498,26 @@ pub fn details_depth_requirement() -> String {
 /// Three rules, each an emulator resource guard on a member the model leaves entirely
 /// caller-controlled: the document must nest no deeper than [`MAX_DETAILS_DEPTH`], hold
 /// no more than [`MAX_DETAILS_MEMBERS`] members over the whole tree, and carry no more
-/// than [`MAX_DETAILS_BYTES`] of text. Each is stated as a REQUIREMENT on the member —
+/// than [`MAX_DETAILS_TEXT_LEN`] of text. Each is stated as a REQUIREMENT on the member —
 /// never as a sentence of its own — so [`details_refusal`] can render it through the
-/// same clause and envelope every other refusal of this service goes through. The byte
-/// bound is a length, so it is worded by the walk's own wording helper
-/// ([`crate::service::constraint_requirement`]) rather than by a copy that can drift.
+/// same clause and envelope every other refusal of this service goes through. The text
+/// bound is a length, so it goes through the one length check this service makes for
+/// itself ([`count_length_clause`]): it is counted in the unit that check counts in —
+/// CHARACTERS — and worded by the words it words a length with, so the number the
+/// refusal names is the number of characters the caller may send.
 pub fn details_requirement(details: Option<&Document>) -> Option<String> {
     let document = details?;
     if !document_fits(document, MAX_DETAILS_DEPTH) {
         return Some(details_depth_requirement());
     }
     // Counted only after the depth check, so this walk's recursion is already bounded.
-    let (members, bytes) = document_weight(document);
+    let (members, characters) = document_weight(document);
     if members > MAX_DETAILS_MEMBERS {
         return Some(format!(
             "Member must hold no more than {MAX_DETAILS_MEMBERS} members"
         ));
     }
-    (bytes > MAX_DETAILS_BYTES).then(|| {
-        crate::service::constraint_requirement(&smithy_server_runtime::ViolationKind::MaxLength(
-            MAX_DETAILS_BYTES as i64,
-        ))
-        .unwrap_or_default()
-    })
+    count_length_clause(characters, 0, MAX_DETAILS_TEXT_LEN)
 }
 
 /// The refusal a request whose `BenefitApplicationDetails` breaks one of the document
@@ -2547,28 +2550,31 @@ pub fn details_refusal(
     ))
 }
 
-/// How many members and how many bytes of text `value` holds, over the whole tree: the
-/// two sizes [`details_requirement`] bounds.
+/// How many members and how many CHARACTERS of text `value` holds, over the whole tree:
+/// the two sizes [`details_requirement`] bounds.
 ///
-/// A member is an object member or an array element; the bytes counted are the member
-/// names and the string values, which is all of the document a caller chooses the SIZE
-/// of (a number or a boolean has none).
+/// A member is an object member or an array element; the text counted is the member names
+/// and the string values, which is all of the document a caller chooses the SIZE of (a
+/// number or a boolean has none). It is counted in characters, the unit every length this
+/// service enforces is counted in ([`length_clause`]), so the bound
+/// [`details_requirement`] states as a length is the length it enforces whatever the
+/// UTF-8 width of the caller's text.
 fn document_weight(value: &Document) -> (usize, usize) {
     match value {
         Document::Null | Document::Bool(_) | Document::Number(_) => (0, 0),
-        Document::String(text) => (0, text.len()),
-        Document::Array(items) => items.iter().fold((0, 0), |(members, bytes), item| {
-            let (item_members, item_bytes) = document_weight(item);
-            (members + 1 + item_members, bytes + item_bytes)
+        Document::String(text) => (0, text.chars().count()),
+        Document::Array(items) => items.iter().fold((0, 0), |(members, characters), item| {
+            let (item_members, item_characters) = document_weight(item);
+            (members + 1 + item_members, characters + item_characters)
         }),
         Document::Object(entries) => {
             entries
                 .iter()
-                .fold((0, 0), |(members, bytes), (name, member)| {
-                    let (member_members, member_bytes) = document_weight(member);
+                .fold((0, 0), |(members, characters), (name, member)| {
+                    let (member_members, member_characters) = document_weight(member);
                     (
                         members + 1 + member_members,
-                        bytes + name.len() + member_bytes,
+                        characters + name.chars().count() + member_characters,
                     )
                 })
         }

@@ -65,7 +65,7 @@ use crate::amend_benefit_application::{amend_body, amendment};
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
 use crate::benefit_catalog_record::{catalog_benefits, declared_fields, UNDECLARED_FIELD};
 use crate::details_document_guard::{
-    byte_requirement, flat_object, member_requirement, members_past_the_byte_bound,
+    flat_object, member_requirement, members_past_the_text_bound, text_requirement,
     text_spread_over_members, MEMBER_PATH as DETAILS_PATH,
 };
 use crate::disassociate_benefit_application_resource::{
@@ -687,21 +687,21 @@ async fn an_amend_document_refusal_names_the_amendment_that_wrote_the_refused_po
             requirement: member_requirement(),
         },
         AmendRow {
-            case: "the second amendment adding text past the byte bound".to_string(),
-            seeded: text_spread_over_members(members_past_the_byte_bound() - 1),
+            case: "the second amendment adding text past the text bound".to_string(),
+            seeded: text_spread_over_members(members_past_the_text_bound() - 1),
             amendments: json!([
                 amendment("Name", "amended"),
                 amendment(&format!("{DETAILS_MEMBER}.added"), &long_value),
             ]),
             path: amendment_member_path(1, AMENDMENT_NEW_VALUE),
-            requirement: byte_requirement(),
+            requirement: text_requirement(),
         },
     ];
 
     // The table covers both rules stated about the document — the emulator's own resource
     // guard and the benefit's request schema — and more than one position in the amendment
     // list, so it cannot shrink to one rule or to the first element.
-    for requirement in [member_requirement(), byte_requirement()] {
+    for requirement in [member_requirement(), text_requirement()] {
         assert!(
             rows.iter().any(|row| row.requirement == requirement),
             "case \"table\": expected a row the document guard refuses with {requirement:?}, \

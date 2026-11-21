@@ -28,10 +28,16 @@
 //! nested objects; text in one value, in a member name, or spread over many members), by
 //! how much it breaks it, and every bound exactly AT its published value, which is served
 //! and read back.
+//!
+//! The text bound is a LENGTH, so the last two tables also pin the unit it is counted in:
+//! characters, the unit this service counts every length it enforces in and the unit the
+//! requirement it refuses with names. Their rows span the character width of the text (one
+//! to four UTF-8 bytes), where the text sits, and the count relative to the published
+//! bound, so a document inside the stated maximum is served whatever its byte weight.
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    MAX_DETAILS_BYTES, MAX_DETAILS_DEPTH, MAX_DETAILS_MEMBERS, MAX_DETAILS_VALUE_LEN,
+    MAX_DETAILS_DEPTH, MAX_DETAILS_MEMBERS, MAX_DETAILS_TEXT_LEN, MAX_DETAILS_VALUE_LEN,
 };
 
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
@@ -60,9 +66,10 @@ pub(crate) fn member_requirement() -> String {
 
 /// The requirement a document carrying more text than the service stores fails: a length
 /// bound, so it is worded the way this service words every other length
-/// (`Member must have length less than or equal to <max>`).
-pub(crate) fn byte_requirement() -> String {
-    format!("Member must have length less than or equal to {MAX_DETAILS_BYTES}")
+/// (`Member must have length less than or equal to <max>`) and COUNTED the way this
+/// service counts every other length — in characters.
+pub(crate) fn text_requirement() -> String {
+    format!("Member must have length less than or equal to {MAX_DETAILS_TEXT_LEN}")
 }
 
 // ---------------------------------------------------------------------------
@@ -115,17 +122,17 @@ fn grouped_object(groups: usize, each: usize) -> Value {
     Value::Object(document)
 }
 
-/// An object carrying exactly `bytes` bytes of text in ONE value: a one-character member
-/// name and a value of `bytes - 1` characters.
-fn text_in_one_value(bytes: usize) -> Value {
-    json!({ "m": "v".repeat(bytes.saturating_sub(1)) })
+/// An object carrying exactly `characters` characters of text in ONE value: a
+/// one-character member name and a value of `characters - 1` characters.
+fn text_in_one_value(characters: usize) -> Value {
+    json!({ "m": "v".repeat(characters.saturating_sub(1)) })
 }
 
-/// An object carrying exactly `bytes` bytes of text in its member NAME: a name of
-/// `bytes - 1` characters and a one-character value.
-fn text_in_a_member_name(bytes: usize) -> Value {
+/// An object carrying exactly `characters` characters of text in its member NAME: a name
+/// of `characters - 1` characters and a one-character value.
+fn text_in_a_member_name(characters: usize) -> Value {
     let mut document = Map::new();
-    document.insert("n".repeat(bytes.saturating_sub(1)), json!("v"));
+    document.insert("n".repeat(characters.saturating_sub(1)), json!("v"));
     Value::Object(document)
 }
 
@@ -140,9 +147,10 @@ pub(crate) fn text_spread_over_members(members: usize) -> Value {
     Value::Object(document)
 }
 
-/// How many members over [`MAX_DETAILS_BYTES`] of text it takes to pass the byte bound.
-pub(crate) fn members_past_the_byte_bound() -> usize {
-    MAX_DETAILS_BYTES / MAX_DETAILS_VALUE_LEN + 1
+/// How many members over [`MAX_DETAILS_TEXT_LEN`] of text it takes to pass the text
+/// bound.
+pub(crate) fn members_past_the_text_bound() -> usize {
+    MAX_DETAILS_TEXT_LEN / MAX_DETAILS_VALUE_LEN + 1
 }
 
 /// One row: a document, and the requirement the service must say it failed.
@@ -193,19 +201,19 @@ fn refused_rows() -> Vec<Row> {
             requirement: member_requirement(),
         },
         Row {
-            case: "one value one byte past the byte bound",
-            details: text_in_one_value(MAX_DETAILS_BYTES + 1),
-            requirement: byte_requirement(),
+            case: "one value one character past the text bound",
+            details: text_in_one_value(MAX_DETAILS_TEXT_LEN + 1),
+            requirement: text_requirement(),
         },
         Row {
-            case: "a member name one byte past the byte bound",
-            details: text_in_a_member_name(MAX_DETAILS_BYTES + 1),
-            requirement: byte_requirement(),
+            case: "a member name one character past the text bound",
+            details: text_in_a_member_name(MAX_DETAILS_TEXT_LEN + 1),
+            requirement: text_requirement(),
         },
         Row {
-            case: "text spread over many members, past the byte bound",
-            details: text_spread_over_members(members_past_the_byte_bound()),
-            requirement: byte_requirement(),
+            case: "text spread over many members, past the text bound",
+            details: text_spread_over_members(members_past_the_text_bound()),
+            requirement: text_requirement(),
         },
     ]
 }
@@ -239,15 +247,15 @@ fn accepted_rows() -> Vec<(&'static str, Value)> {
         ),
         (
             "one value carrying exactly the most text",
-            text_in_one_value(MAX_DETAILS_BYTES),
+            text_in_one_value(MAX_DETAILS_TEXT_LEN),
         ),
         (
             "a member name carrying exactly the most text",
-            text_in_a_member_name(MAX_DETAILS_BYTES),
+            text_in_a_member_name(MAX_DETAILS_TEXT_LEN),
         ),
         (
-            "text spread over members, within the byte bound",
-            text_spread_over_members(members_past_the_byte_bound() - 1),
+            "text spread over members, within the text bound",
+            text_spread_over_members(members_past_the_text_bound() - 1),
         ),
     ]
 }
@@ -467,10 +475,10 @@ async fn amend_refuses_a_document_past_a_bound_through_the_envelope() {
             member_requirement(),
         ),
         (
-            "an amendment adding text past the byte bound",
-            text_spread_over_members(members_past_the_byte_bound() - 1),
+            "an amendment adding text past the text bound",
+            text_spread_over_members(members_past_the_text_bound() - 1),
             value.clone(),
-            byte_requirement(),
+            text_requirement(),
         ),
     ];
 
@@ -532,4 +540,221 @@ async fn amend_refuses_a_document_past_a_bound_through_the_envelope() {
             amended["BenefitApplicationDetails"]
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The UNIT the text bound is counted in
+// ---------------------------------------------------------------------------
+
+/// The character widths the text rows are written in: `(case, one character of that
+/// width)`, one, two, three and four UTF-8 bytes per character, so a given CHARACTER
+/// count weighs 1x, 2x, 3x and 4x as many bytes.
+const WIDTHS: [(&str, &str); 4] = [
+    ("one-byte", "a"),
+    ("two-byte", "é"),
+    ("three-byte", "\u{4e2d}"),
+    ("four-byte", "\u{1d11e}"),
+];
+
+/// The text `document` carries, in CHARACTERS and in UTF-8 BYTES: the two units the bound
+/// could be counted in, so a row can state that the two differ and which one the service
+/// held it to.
+fn text_weight(document: &Value) -> (usize, usize) {
+    match document {
+        Value::String(text) => (text.chars().count(), text.len()),
+        Value::Array(items) => items.iter().fold((0, 0), |(characters, bytes), item| {
+            let (item_characters, item_bytes) = text_weight(item);
+            (characters + item_characters, bytes + item_bytes)
+        }),
+        Value::Object(entries) => {
+            entries
+                .iter()
+                .fold((0, 0), |(characters, bytes), (name, member)| {
+                    let (member_characters, member_bytes) = text_weight(member);
+                    (
+                        characters + name.chars().count() + member_characters,
+                        bytes + name.len() + member_bytes,
+                    )
+                })
+        }
+        _ => (0, 0),
+    }
+}
+
+/// An object carrying exactly `characters` characters of text written in `unit` in ONE
+/// value: a one-character ASCII member name and a value of `characters - 1` characters.
+fn wide_text_in_one_value(unit: &str, characters: usize) -> Value {
+    json!({ "m": unit.repeat(characters.saturating_sub(1)) })
+}
+
+/// The same text in the member NAME: a name of `characters - 1` characters written in
+/// `unit` and a one-character ASCII value.
+fn wide_text_in_a_member_name(unit: &str, characters: usize) -> Value {
+    let mut document = Map::new();
+    document.insert(unit.repeat(characters.saturating_sub(1)), json!("v"));
+    Value::Object(document)
+}
+
+/// One form the text can sit in: a label, and how a document of a given character count
+/// in a given character width is built in that form.
+type TextForm = (&'static str, fn(&str, usize) -> Value);
+
+/// The text bound is counted in CHARACTERS — the unit this service counts every length it
+/// enforces in, and the unit the requirement it refuses with names — so a document inside
+/// the stated maximum is stored whatever the UTF-8 width of its text, and one past it is
+/// refused with that length requirement.
+///
+/// The rows span the character WIDTH of the text (one to four bytes per character), the
+/// place the text sits (a member's value, a member's name) and the character count
+/// relative to the published bound (well inside it, one short of it, at it, one past it,
+/// far past it). Every multi-byte row at or near the bound carries MORE bytes than the
+/// bound names, which the row asserts, so a service counting bytes would refuse exactly
+/// the documents these rows are served.
+#[tokio::test]
+async fn the_document_text_bound_counts_characters_not_bytes() {
+    let harness = Harness::new();
+    let forms: [TextForm; 2] = [
+        ("in one value", wide_text_in_one_value),
+        ("in a member name", wide_text_in_a_member_name),
+    ];
+    // Well inside the bound, one character short of it, at it, one past it, far past it.
+    let counts: [usize; 5] = [
+        1024,
+        MAX_DETAILS_TEXT_LEN - 1,
+        MAX_DETAILS_TEXT_LEN,
+        MAX_DETAILS_TEXT_LEN + 1,
+        MAX_DETAILS_TEXT_LEN * 2,
+    ];
+
+    let mut row = 0usize;
+    for (width, unit) in WIDTHS {
+        for (form, build) in forms {
+            for characters in counts {
+                let case = format!("{width} {form}, {characters} characters");
+                let details = build(unit, characters);
+                let (built_characters, built_bytes) = text_weight(&details);
+                assert_eq!(
+                    built_characters, characters,
+                    "case {case:?}: the row must build {characters} characters of text, \
+                     got {built_characters}"
+                );
+                assert_eq!(
+                    built_bytes,
+                    1 + unit.len() * (characters - 1),
+                    "case {case:?}: the row must weigh {} bytes, got {built_bytes}",
+                    1 + unit.len() * (characters - 1)
+                );
+
+                let body = create_body(&harness, &format!("tok-guard-width-{row}"), &details).await;
+                if characters <= MAX_DETAILS_TEXT_LEN {
+                    let created = harness.create(&case, &body).await;
+                    let id = text(&case, &created, "Id");
+                    let stored = harness.get(&case, &id).await;
+                    assert_eq!(
+                        stored["BenefitApplicationDetails"], details,
+                        "case {case:?}: a document inside the character bound must be stored \
+                         and read back unchanged, got {:?}",
+                        stored["BenefitApplicationDetails"]
+                    );
+                } else {
+                    assert_guard_refusal(
+                        &harness,
+                        &case,
+                        "CreateBenefitApplication",
+                        MEMBER_PATH,
+                        &text_requirement(),
+                        &body,
+                    )
+                    .await;
+                }
+
+                row += 1;
+            }
+        }
+    }
+}
+
+/// The same unit through `AmendBenefitApplication`, which judges the document its
+/// amendments PRODUCED: an amendment that leaves the document at the character bound is
+/// applied even though the document carries far more bytes than the bound names, and the
+/// next one, which takes the character count past it, is refused with that length
+/// requirement and changes nothing.
+#[tokio::test]
+async fn amend_counts_the_amended_document_in_characters() {
+    let harness = Harness::new();
+    // Two UTF-8 bytes per character, so a document inside the character bound holds
+    // nearly twice the bound's number of bytes.
+    let unit = "é";
+    let added = "added";
+    // The seed sits one amendment's value short of the bound, so one amendment can reach
+    // the bound exactly and the next must pass it.
+    let seeded_characters = MAX_DETAILS_TEXT_LEN - MAX_DETAILS_VALUE_LEN;
+    let to_the_bound = MAX_DETAILS_VALUE_LEN - added.chars().count();
+    let body = create_body(
+        &harness,
+        "tok-guard-wide-seed",
+        &wide_text_in_one_value(unit, seeded_characters),
+    )
+    .await;
+    let created = harness.create("a wide seeded document", &body).await;
+    let id = text("a wide seeded document", &created, "Id");
+    let before = harness.get("a wide seeded document", &id).await;
+
+    let case = "an amendment reaching the character bound";
+    harness
+        .ok(
+            case,
+            "AmendBenefitApplication",
+            &json!({
+                "Catalog": CATALOG,
+                "ClientToken": "tok-guard-wide-at",
+                "Identifier": id,
+                "Revision": text(case, &before, "Revision"),
+                "AmendmentReason": "the partner corrected the application",
+                "Amendments": [{
+                    "FieldPath": format!("{MEMBER}.{added}"),
+                    "NewValue": unit.repeat(to_the_bound),
+                }],
+            }),
+        )
+        .await;
+    let stored = harness.get(case, &id).await;
+    let (characters, bytes) = text_weight(&stored["BenefitApplicationDetails"]);
+    assert_eq!(
+        characters, MAX_DETAILS_TEXT_LEN,
+        "case {case:?}: the amended document must sit exactly at the bound, \
+         got {characters} characters"
+    );
+    assert!(
+        bytes > MAX_DETAILS_TEXT_LEN,
+        "case {case:?}: the row must carry more bytes than the bound names, so a byte \
+         count would have refused it, got {bytes}"
+    );
+
+    let past = "an amendment past the character bound";
+    let at_the_bound = harness.get(past, &id).await;
+    assert_guard_refusal(
+        &harness,
+        past,
+        "AmendBenefitApplication",
+        &amendment_member_path(0, AMENDMENT_NEW_VALUE),
+        &text_requirement(),
+        &json!({
+            "Catalog": CATALOG,
+            "ClientToken": "tok-guard-wide-past",
+            "Identifier": id,
+            "Revision": text(past, &at_the_bound, "Revision"),
+            "AmendmentReason": "the partner corrected the application",
+            "Amendments": [{
+                "FieldPath": format!("{MEMBER}.extra"),
+                "NewValue": unit.repeat(MAX_DETAILS_VALUE_LEN),
+            }],
+        }),
+    )
+    .await;
+    let after = harness.get(past, &id).await;
+    assert_eq!(
+        after, at_the_bound,
+        "case {past:?}: a refused amendment must change nothing, got {after:?}"
+    );
 }

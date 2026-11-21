@@ -17,7 +17,7 @@
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
     not_found_message, APPLICATION_KIND, MAX_AMENDMENTS_PER_REQUEST, MAX_AMENDMENT_REASON_LEN,
-    MAX_CLIENT_TOKEN_LEN, MAX_DETAILS_BYTES, MAX_DETAILS_MEMBERS, MAX_DETAILS_VALUE_LEN,
+    MAX_CLIENT_TOKEN_LEN, MAX_DETAILS_MEMBERS, MAX_DETAILS_TEXT_LEN, MAX_DETAILS_VALUE_LEN,
     MAX_FIELD_PATH_LEN, MIN_AMENDMENTS_PER_REQUEST,
 };
 
@@ -928,29 +928,30 @@ async fn amend_refuses_a_member_past_the_document_member_bound() {
 /// The same for the document's total text: an amendment that would take it past the
 /// bound is refused, while one that keeps the size is applied.
 #[tokio::test]
-async fn amend_refuses_text_past_the_document_byte_bound() {
+async fn amend_refuses_text_past_the_document_text_bound() {
     let harness = Harness::new();
     let value = "v".repeat(MAX_DETAILS_VALUE_LEN);
     let mut details = Map::new();
-    let mut bytes = 0usize;
+    let mut characters = 0usize;
     // Fill the document as close to the bound as whole members reach.
     for index in 0..MAX_DETAILS_MEMBERS {
         let name = format!("m{index}");
-        let next = bytes + name.len() + value.len();
-        if next > MAX_DETAILS_BYTES {
+        let next = characters + name.chars().count() + value.chars().count();
+        if next > MAX_DETAILS_TEXT_LEN {
             break;
         }
         details.insert(name, json!(value));
-        bytes = next;
+        characters = next;
     }
     assert!(
-        bytes + MAX_DETAILS_VALUE_LEN > MAX_DETAILS_BYTES,
-        "case \"a full document\": the fixture must sit within one member of the bound, got {bytes}"
+        characters + MAX_DETAILS_VALUE_LEN > MAX_DETAILS_TEXT_LEN,
+        "case \"a full document\": the fixture must sit within one member of the bound, \
+         got {characters}"
     );
     let created = seed(
         &harness,
         "seed",
-        "tok-bytes-seed",
+        "tok-text-seed",
         json!({ "BenefitApplicationDetails": Value::Object(details) }),
     )
     .await;
@@ -965,7 +966,7 @@ async fn amend_refuses_text_past_the_document_byte_bound() {
         &amend_body(
             &id,
             &revision,
-            "tok-bytes-same",
+            "tok-text-same",
             json!([amendment("BenefitApplicationDetails.m0", &value)]),
         ),
     )
@@ -979,24 +980,25 @@ async fn amend_refuses_text_past_the_document_byte_bound() {
             &amend_body(
                 &id,
                 &text("after the rewrite", &after, "Revision"),
-                "tok-bytes-more",
+                "tok-text-more",
                 json!([amendment("BenefitApplicationDetails.extra", &value)]),
             ),
         )
         .await;
     assert_eq!(
         status, 400,
-        "case \"one member too many bytes\": expected 400, got {status} {out:?}"
+        "case \"one member too much text\": expected 400, got {status} {out:?}"
     );
     assert_eq!(
         error_code(&out),
         "ValidationException",
-        "case \"one member too many bytes\": expected ValidationException, got {out:?}"
+        "case \"one member too much text\": expected ValidationException, got {out:?}"
     );
-    let unchanged = get(&harness, "one member too many bytes", &id).await;
+    let unchanged = get(&harness, "one member too much text", &id).await;
     assert_eq!(
         unchanged, after,
-        "case \"one member too many bytes\": a refused amendment must change nothing, got {unchanged:?}"
+        "case \"one member too much text\": a refused amendment must change nothing, \
+         got {unchanged:?}"
     );
 }
 
