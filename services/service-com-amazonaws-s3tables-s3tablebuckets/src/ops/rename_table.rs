@@ -212,15 +212,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // Where the table is now: the bucket, the namespace it is keyed under
-        // and the record itself. Any of the three being absent is the
-        // `NotFoundException` the ARN- and name-addressed table operations
-        // model, stated by the fixed sentence for the class that is missing.
+        // The table bucket every coordinate of this request is resolved inside:
+        // it being absent is the `NotFoundException` the ARN-addressed bucket
+        // operations model, stated by the fixed sentence for that class.
         let bucket = store
             .table_buckets
             .get(&input.table_bucket_arn)
             .ok_or_else(|| not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE))?;
         let bucket_arn = bucket.arn.clone();
+
+        // The namespace the move would key the table UNDER is resolved FIRST,
+        // ahead of the coordinates the table is moved from: `newNamespaceName`
+        // when the request names one, and the namespace the table is addressed
+        // in when it does not, since a request that moves only the name leaves
+        // the table where it is. A namespace the bucket does not hold is nowhere
+        // for this operation to key the record — it creates no namespace — and
+        // the refusal states its own fixed sentence, because `NotFoundException`
+        // carries no code that tells a destination the caller has yet to create
+        // from a namespace of its table's that has gone.
+        let target_namespace_name = input
+            .new_namespace_name
+            .clone()
+            .unwrap_or_else(|| input.namespace.clone());
+        let target = bucket
+            .namespaces
+            .get(&target_namespace_name)
+            .ok_or_else(|| not_found(crate::state::DESTINATION_NAMESPACE_NOT_FOUND_MESSAGE))?;
+        let target_namespace_names = target.namespace.clone();
+        let target_namespace_id = target.namespace_id.clone();
+
+        // Where the table is now: the namespace it is keyed under and the
+        // record itself, each absence the `NotFoundException` the name-addressed
+        // table operations model, stated by the fixed sentence for the class
+        // that is missing. This namespace states the plain sentence, so the
+        // refusals a client has to tell apart — the namespace its table lived in
+        // has gone, or the one it is moving the table into was never created —
+        // are told apart by the only member the error carries.
         let source = bucket
             .namespaces
             .get(&input.namespace)
@@ -241,20 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Where the table is going: each coordinate the request leaves out
         // keeps its current value, so a rename moves the name, the namespace or
         // both.
-        let target_namespace_name = input
-            .new_namespace_name
-            .clone()
-            .unwrap_or_else(|| input.namespace.clone());
         let target_name = input.new_name.clone().unwrap_or_else(|| input.name.clone());
-
-        // A table is moved INTO a namespace that already exists; this operation
-        // creates none.
-        let target = bucket
-            .namespaces
-            .get(&target_namespace_name)
-            .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?;
-        let target_namespace_names = target.namespace.clone();
-        let target_namespace_id = target.namespace_id.clone();
 
         // A table name is unique within its namespace — the rule `CreateTable`
         // refuses a second create of a resident name under — so coordinates
@@ -315,7 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .table_buckets
             .get_mut(&input.table_bucket_arn)
             .and_then(|bucket| bucket.namespaces.get_mut(&target_namespace_name))
-            .ok_or_else(|| not_found(crate::state::NAMESPACE_NOT_FOUND_MESSAGE))?
+            .ok_or_else(|| not_found(crate::state::DESTINATION_NAMESPACE_NOT_FOUND_MESSAGE))?
             .tables
             .insert(target_name.clone(), moved);
         store

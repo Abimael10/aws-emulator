@@ -29,7 +29,10 @@
 //! `ConflictException` (HTTP 409) names — the destination is settled first, so a move the
 //! destination rules out is refused as such whatever view of the table the request
 //! carries; a bucket, namespace or table the store does not hold is a `NotFoundException`
-//! (HTTP 404).
+//! (HTTP 404), and the namespace a move would KEY THE RECORD UNDER — resolved ahead of
+//! the coordinates it moves from — states its own fixed sentence rather than the one for
+//! the namespace the table is addressed in
+//! (`rename_destination_namespace_refusal.rs` states that discrimination over the class).
 //!
 //! RULE 4 — the wire forms of a table summary hold on the listing a client reads AFTER a
 //! rename, exactly as on any other listing: `createdAt`/`modifiedAt` are RFC 3339
@@ -56,8 +59,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_s3tables_s3tablebuckets::state::{
     OpenTableFormat, SseAlgorithm, StorageClass, TableMaintenanceType, BUCKET_NOT_FOUND_MESSAGE,
-    NAMESPACE_NOT_FOUND_MESSAGE, TABLE_ALREADY_EXISTS_MESSAGE, TABLE_NOT_FOUND_MESSAGE,
-    TABLE_VERSION_TOKEN_MISMATCH_MESSAGE,
+    DESTINATION_NAMESPACE_NOT_FOUND_MESSAGE, NAMESPACE_NOT_FOUND_MESSAGE,
+    TABLE_ALREADY_EXISTS_MESSAGE, TABLE_NOT_FOUND_MESSAGE, TABLE_VERSION_TOKEN_MISMATCH_MESSAGE,
 };
 
 use crate::harness::{expected_bucket_arn, served, timestamp_seconds, Emulator, Reply};
@@ -516,12 +519,26 @@ const REFUSALS: &[Refusal] = &[
         message: TABLE_NOT_FOUND_MESSAGE,
     },
     Refusal {
-        label: "a source namespace the bucket does not hold",
+        label: "the namespace the table is addressed in, which the bucket does not hold",
         namespace: Some("absent_namespace"),
         name: None,
         absent_bucket: false,
         new_namespace: None,
         new_name: Some("free_name"),
+        stale_version_token: false,
+        status: 404,
+        code: "NotFoundException",
+        // A move of the name alone keys the record under the namespace it is addressed
+        // in, so that namespace is the one the move has nowhere to key it under.
+        message: DESTINATION_NAMESPACE_NOT_FOUND_MESSAGE,
+    },
+    Refusal {
+        label: "a move ACROSS namespaces whose source namespace the bucket does not hold",
+        namespace: Some("absent_namespace"),
+        name: None,
+        absent_bucket: false,
+        new_namespace: Some(TARGET_NAMESPACE),
+        new_name: None,
         stale_version_token: false,
         status: 404,
         code: "NotFoundException",
@@ -537,7 +554,7 @@ const REFUSALS: &[Refusal] = &[
         stale_version_token: false,
         status: 404,
         code: "NotFoundException",
-        message: NAMESPACE_NOT_FOUND_MESSAGE,
+        message: DESTINATION_NAMESPACE_NOT_FOUND_MESSAGE,
     },
     Refusal {
         label: "a table bucket the store does not hold",

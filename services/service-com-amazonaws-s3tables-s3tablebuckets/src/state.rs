@@ -1625,6 +1625,17 @@ pub const ENCRYPTION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
 /// model. FIXED text, as [`BUCKET_NOT_FOUND_MESSAGE`] does for a table bucket.
 pub const NAMESPACE_NOT_FOUND_MESSAGE: &str = "The specified namespace does not exist.";
 
+/// How this service states the namespace a move would put a resource INTO when
+/// the addressed table bucket does not hold it: the same `NotFoundException`
+/// (HTTP 404) as [`NAMESPACE_NOT_FOUND_MESSAGE`], stated as its own fixed
+/// sentence because the error carries no code that tells the two apart — the
+/// namespace the resource lives in is gone, or the namespace it is being moved
+/// into was never created — and the sentence is the only discriminator a client
+/// can match on. FIXED text, as [`NAMESPACE_NOT_FOUND_MESSAGE`]: it names the
+/// class of the failure and takes nothing from the request.
+pub const DESTINATION_NAMESPACE_NOT_FOUND_MESSAGE: &str =
+    "The specified destination namespace does not exist.";
+
 /// How this service states a table the store does not hold: the
 /// `NotFoundException` (HTTP 404) the table operations model. FIXED text, as
 /// [`BUCKET_NOT_FOUND_MESSAGE`] does for a table bucket.
