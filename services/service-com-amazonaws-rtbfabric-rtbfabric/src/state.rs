@@ -14,7 +14,8 @@ use std::time::{Duration, SystemTime};
 
 /// The `/responder-gateway/{gatewayId}/certificate` surface's record.
 mod certificates;
-/// The `/requester-gateway/{gatewayId}/outbound-external-link` surface's record.
+/// The two external-link surfaces' records: the outbound links a requester gateway
+/// opens and the inbound links a responder gateway takes.
 mod external_links;
 /// The one encoding this service's paginated reads state a page boundary in.
 mod page_tokens;
@@ -33,7 +34,10 @@ pub use certificates::{
     CERTIFICATE_STATUS_DISASSOCIATED, CERTIFICATE_STATUS_PENDING_ASSOCIATION,
     CERTIFICATE_STATUS_PENDING_DISASSOCIATION,
 };
-pub use external_links::{OutboundExternalLink, CONNECTIVITY_TYPE_PUBLIC_EGRESS};
+pub use external_links::{
+    inbound_external_link_domain_name, InboundExternalLink, OutboundExternalLink,
+    CONNECTIVITY_TYPE_EXTERNAL_INBOUND, CONNECTIVITY_TYPE_PUBLIC_EGRESS,
+};
 pub use page_tokens::{
     decode_next_token, encode_next_token, PageTokenKey, TokenRefusal, Walk, MAX_TOKEN_LENGTH,
     TOKEN_LIFETIME,
@@ -95,7 +99,7 @@ pub const LINK_QUOTA: usize = 5_000;
 /// with the modelled `ServiceQuotaExceededException` (HTTP 402).
 ///
 /// A record is written ONLY by a create that actually stored a resource whose id
-/// this service minted — the two gateway creates, the outbound-external-link create
+/// this service minted — the two gateway creates, the two external-link creates
 /// and the routing-rule create — so the map cannot hold more than those resources'
 /// own quotas; the bound is checked anyway, so the retention rule survives a future
 /// create that forgets it. Each record is fixed size — both the key and the
@@ -405,6 +409,12 @@ pub struct ComAmazonawsRtbfabricRtbfabricState {
     /// against [`LINK_QUOTA`]; released with its gateway
     /// ([`release_dependents`](Self::release_dependents)).
     pub outbound_external_links: HashMap<(String, String), OutboundExternalLink>,
+    /// Keyed by (the `gatewayId` the link was created on, `linkId`). An inbound
+    /// external link belongs to the responder gateway it was created on and is
+    /// addressed only through it. Counted together with [`links`](Self::links)
+    /// against [`LINK_QUOTA`]; released with its gateway
+    /// ([`release_dependents`](Self::release_dependents)).
+    pub inbound_external_links: HashMap<(String, String), InboundExternalLink>,
     /// Keyed by (`linkId`, `ruleId`). Bounded by [`ROUTING_RULE_QUOTA`]; released
     /// with the link it routes for ([`release_link`](Self::release_link)), and so
     /// is the client-token record that minted it.
@@ -476,6 +486,9 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         for link in self.outbound_external_links.values_mut() {
             link.settle(now);
         }
+        for link in self.inbound_external_links.values_mut() {
+            link.settle(now);
+        }
         for rule in self.routing_rules.values_mut() {
             rule.settle(now);
         }
@@ -498,7 +511,10 @@ impl ComAmazonawsRtbfabricRtbfabricState {
     /// to an endpoint outside the fabric. One bound covers both, because a link of
     /// either kind is a link the store holds ([`LINK_QUOTA`]).
     pub fn links_held(&self) -> usize {
-        self.links.len().saturating_add(self.outbound_external_links.len())
+        self.links
+            .len()
+            .saturating_add(self.outbound_external_links.len())
+            .saturating_add(self.inbound_external_links.len())
     }
 
     /// The outbound external link `link_id` on the requester gateway `gateway_id`.
@@ -513,6 +529,19 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         link_id: &str,
     ) -> Option<&OutboundExternalLink> {
         self.outbound_external_links
+            .get(&(gateway_id.to_string(), link_id.to_string()))
+    }
+
+    /// The inbound external link `link_id` on the responder gateway `gateway_id`,
+    /// resolved exactly as [`find_outbound_external_link`](Self::find_outbound_external_link)
+    /// resolves the other direction's: a link with one end outside the fabric is
+    /// addressed only through the gateway it was created on.
+    pub fn find_inbound_external_link(
+        &self,
+        gateway_id: &str,
+        link_id: &str,
+    ) -> Option<&InboundExternalLink> {
+        self.inbound_external_links
             .get(&(gateway_id.to_string(), link_id.to_string()))
     }
 
@@ -599,11 +628,12 @@ impl ComAmazonawsRtbfabricRtbfabricState {
 
     /// Count the stored links `gateway_id` is an end of, by status.
     ///
-    /// A link to an endpoint OUTSIDE the fabric is one of that gateway's links
+    /// A link with one end OUTSIDE the fabric is one of that gateway's links
     /// too — `RequesterGatewayStatus`'s reader documents `totalLinksCount` as
     /// "The total count of links for the requester gateway" — so it counts here
-    /// exactly as a link between two gateways does. It is never counted as
-    /// REQUESTED: nothing is asked of a peer, so no request of it is outstanding.
+    /// exactly as a link between two gateways does, in either direction. It is
+    /// never counted as REQUESTED: nothing is asked of a peer, so no request of
+    /// it is outstanding.
     pub fn link_counts(&self, gateway_id: &str) -> LinkCounts {
         let mine = self.links.values().filter(|link| link.has_end(gateway_id));
         let mut counts = LinkCounts::default();
@@ -619,10 +649,16 @@ impl ComAmazonawsRtbfabricRtbfabricState {
         let external = self
             .outbound_external_links
             .values()
-            .filter(|link| link.gateway_id == gateway_id);
-        for link in external {
+            .map(|link| (link.gateway_id.as_str(), link.status.as_str()))
+            .chain(
+                self.inbound_external_links
+                    .values()
+                    .map(|link| (link.gateway_id.as_str(), link.status.as_str())),
+            )
+            .filter(|(link_gateway_id, _)| *link_gateway_id == gateway_id);
+        for (_, status) in external {
             counts.total = counts.total.saturating_add(1);
-            if link.status == LINK_STATUS_ACTIVE {
+            if status == LINK_STATUS_ACTIVE {
                 counts.active = counts.active.saturating_add(1);
             }
         }
@@ -659,12 +695,12 @@ impl ComAmazonawsRtbfabricRtbfabricState {
     /// * every link the gateway was an end of — a link is one record joining two
     ///   stored gateways and cannot outlive either of them — and every routing rule
     ///   that routed for one of those links;
-    /// * every outbound external link opened from that gateway, which likewise has
-    ///   one end in the gateway that is gone;
+    /// * every external link, of either direction, created on that gateway, which
+    ///   likewise has one end in the gateway that is gone;
     /// * every certificate association on that gateway, which is a fact about a
     ///   gateway that no longer exists;
     /// * every client-token record that minted one of the resources released here —
-    ///   the gateway itself, its outbound external links and the routing rules of
+    ///   the gateway itself, its external links and the routing rules of
     ///   its links — so the id a replayed token would answer with is never one the
     ///   store no longer holds.
     fn release_dependents(&mut self, gateway_id: &str) {
@@ -676,6 +712,8 @@ impl ComAmazonawsRtbfabricRtbfabricState {
             .collect();
         self.links.retain(|_, link| !link.has_end(gateway_id));
         self.outbound_external_links
+            .retain(|(link_gateway_id, _), _| link_gateway_id != gateway_id);
+        self.inbound_external_links
             .retain(|(link_gateway_id, _), _| link_gateway_id != gateway_id);
         self.routing_rules
             .retain(|(rule_link_id, _), _| !orphaned.contains(rule_link_id.as_str()));
@@ -697,7 +735,7 @@ impl ComAmazonawsRtbfabricRtbfabricState {
     /// resource carries its id.
     fn forget_released_client_tokens(&mut self) {
         // Every id a stored resource of this service carries. A record is written
-        // today by the two gateway creates, the outbound-external-link create and
+        // today by the two gateway creates, the two external-link creates and
         // the routing-rule create (see [`IDEMPOTENCY_QUOTA`]); the ids of links
         // between gateways are here for the rule rather than for a record that
         // exists, so a create that minted one under a token would be retained and
@@ -710,6 +748,11 @@ impl ComAmazonawsRtbfabricRtbfabricState {
             .chain(self.links.values().map(|link| link.link_id.as_str()))
             .chain(
                 self.outbound_external_links
+                    .values()
+                    .map(|link| link.link_id.as_str()),
+            )
+            .chain(
+                self.inbound_external_links
                     .values()
                     .map(|link| link.link_id.as_str()),
             )

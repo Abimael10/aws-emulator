@@ -3,7 +3,8 @@
 //! End-to-end cover for the gateway-pair + link lifecycle: `CreateRequesterGateway`,
 //! `CreateResponderGateway`, `GetRequesterGateway`, `GetResponderGateway`,
 //! `CreateLink`, `GetLink`, `ListLinks`, `DeleteLink`,
-//! `CreateOutboundExternalLink` and `GetOutboundExternalLink`, driven over the wire
+//! `CreateOutboundExternalLink`, `GetOutboundExternalLink`,
+//! `CreateInboundExternalLink` and `GetInboundExternalLink`, driven over the wire
 //! through the router the production emulator uses.
 //!
 //! Every assertion here is about state, not about one recorded request: a create is
@@ -2555,6 +2556,581 @@ async fn an_outbound_external_link_resolves_only_through_the_gateway_that_opened
         status, 404,
         "case {case:?}: expected the link of a released gateway to be gone, got {status} {gone:?}"
     );
+}
+
+// --- the inbound external link -------------------------------------------------
+//
+// `CreateInboundExternalLink` and `GetInboundExternalLink` are the responder
+// gateway's own external-link surface: the far end is a caller OUTSIDE the fabric,
+// which reaches the link on a name this service assigns it. The rules under test:
+//
+// * the create persists the link on the responder gateway the URI addresses and
+//   mints its `linkId`, and the read reports what was persisted — including the
+//   members the create's response shape does not carry;
+// * the `domainName` is assigned PER LINK by the service (the link's own id as the
+//   leftmost label under the gateway's inbound name in the Region addressed), so it
+//   is reported identically by the create and by every later read, whichever way the
+//   gateway itself is reached;
+// * the link is addressed only through the gateway it was created on, is counted
+//   among that gateway's links, cannot outlive it, and the clock owes it `ACTIVE`;
+// * a replayed `clientToken` answers with the link the first call minted, and the
+//   same token with changed parameters is refused.
+
+/// The `ConnectivityType` member an INBOUND external link carries: its traffic
+/// arrives from outside the fabric, from `CONNECTIVITY_TYPE_VALUES`.
+const INBOUND_EXTERNAL_LINK_CONNECTIVITY_TYPE: &str = "EXTERNAL_INBOUND";
+
+/// The route one inbound external link is read at, as the model binds it.
+fn inbound_external_link_path(gateway_id: &str, link_id: &str) -> String {
+    format!("/responder-gateway/{gateway_id}/inbound-external-link/{link_id}")
+}
+
+/// One row of the inbound-external-link table.
+struct InboundRow {
+    case: &'static str,
+    /// Which row of [`ROWS`] the responder gateway is created from, so the table
+    /// spans both forms a responder gateway is reached by (a caller-stated
+    /// `domainName` and a managed endpoint) and both gateway types.
+    gateway_row: usize,
+    /// A `LinkAttributes`, or `Value::Null` for a link that carries none.
+    attributes: Value,
+    /// A `LinkLogSettings`, which the create requires.
+    log_settings: Value,
+    /// A `TagsMap`, or `Value::Null` for a link that carries no tags.
+    tags: Value,
+}
+
+impl InboundRow {
+    fn create_body(&self, token: &str) -> Value {
+        let mut body = json!({
+            "clientToken": token,
+            "logSettings": self.log_settings,
+        });
+        let object = body.as_object_mut().expect("a JSON object body");
+        if !self.attributes.is_null() {
+            object.insert("attributes".to_string(), self.attributes.clone());
+        }
+        if !self.tags.is_null() {
+            object.insert("tags".to_string(), self.tags.clone());
+        }
+        body
+    }
+}
+
+/// The inbound-external-link table. The rows differ along what the rule
+/// generalises over: how the responder gateway taking the link is reached and what
+/// type it is, which members of `attributes` are stated and whether any are, how
+/// many tags the link carries, and the sampling percentages, including each
+/// published bound of that range.
+fn inbound_rows() -> Vec<InboundRow> {
+    vec![
+        InboundRow {
+            case: "a domain-name gateway of no stated type, no attributes, no tags",
+            gateway_row: 0,
+            attributes: Value::Null,
+            log_settings: log_settings_at(100.0, 0.0),
+            tags: Value::Null,
+        },
+        InboundRow {
+            case: "an EXTERNAL gateway behind a managed endpoint, a customer id, one tag",
+            gateway_row: 1,
+            attributes: json!({ "customerProvidedId": "exchange-north-1" }),
+            log_settings: log_settings_at(12.5, 37.25),
+            tags: tags_json(&[("team", "rtb")]),
+        },
+        InboundRow {
+            // `ResponderErrorMaskingForHttpCode`: `httpCode` is
+            // `^DEFAULT|4XX|5XX|\d{3}$`, `action` is NO_BID or PASSTHROUGH and
+            // `loggingTypes` holds one or two of NONE, METRIC, RESPONSE
+            // (`smithy_query(query="shape",
+            // shape="ResponderErrorMaskingForHttpCode")`).
+            case: "an INTERNAL gateway, error masking for two codes, three tags",
+            gateway_row: 2,
+            attributes: json!({
+                "customerProvidedId": "exchange_south-2",
+                "responderErrorMasking": [
+                    {
+                        "httpCode": "4XX",
+                        "action": "PASSTHROUGH",
+                        "loggingTypes": ["METRIC", "RESPONSE"],
+                        "responseLoggingPercentage": 100.0,
+                    },
+                    {
+                        "httpCode": "429",
+                        "action": "NO_BID",
+                        "loggingTypes": ["NONE"],
+                    },
+                ],
+            }),
+            log_settings: log_settings_at(0.0, 100.0),
+            tags: tags_json(&[("team", "rtb"), ("env", "test"), ("owner", "fabric")]),
+        },
+    ]
+}
+
+impl Fabric {
+    /// A stored responder gateway, as `CreateResponderGateway` mints one from the
+    /// lifecycle table's row `gateway_row`.
+    async fn responder_gateway_of(&self, case: &str, gateway_row: usize, token: &str) -> String {
+        let (status, body) = self
+            .send(
+                "POST",
+                "/responder-gateway",
+                Some(ROWS[gateway_row].responder_body(token)),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateResponderGateway to answer 200, got {status} {body:?}"
+        );
+        text(&body, "gatewayId")
+    }
+
+    /// `POST /responder-gateway/{gatewayId}/inbound-external-link`.
+    async fn create_inbound_external_link(&self, gateway_id: &str, body: Value) -> (u16, Value) {
+        self.send(
+            "POST",
+            &format!("/responder-gateway/{gateway_id}/inbound-external-link"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `GET /responder-gateway/{gatewayId}/inbound-external-link/{linkId}`.
+    async fn read_inbound_external_link(&self, gateway_id: &str, link_id: &str) -> (u16, Value) {
+        self.send("GET", &inbound_external_link_path(gateway_id, link_id), None)
+            .await
+    }
+
+    /// Read the inbound external link until it reports the status the clock owes
+    /// it, through the same polling loop every other reader of a clock-owed status
+    /// uses.
+    async fn poll_settled_inbound_external_link(
+        &self,
+        case: &str,
+        gateway_id: &str,
+        link_id: &str,
+    ) -> Value {
+        let path = inbound_external_link_path(gateway_id, link_id);
+        self.poll_until_status(case, &path, EXTERNAL_LINK_SETTLED_STATUS)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn an_inbound_external_link_round_trips_through_state() {
+    for row in inbound_rows() {
+        let case = row.case;
+        let fabric = Fabric::new();
+        let gateway_id = fabric
+            .responder_gateway_of(case, row.gateway_row, "token-responder")
+            .await;
+
+        let (status, created) = fabric
+            .create_inbound_external_link(&gateway_id, row.create_body("token-link"))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateInboundExternalLink to answer 200, got {status} {created:?}"
+        );
+        let link_id = text(&created, "linkId");
+        assert_eq!(
+            text(&created, "gatewayId"),
+            gateway_id,
+            "case {case:?}: expected the create to report the gateway it was called on, got {created:?}"
+        );
+        assert!(
+            is_link_id(&link_id),
+            "case {case:?}: expected a minted linkId matching the modelled pattern, got {link_id:?}"
+        );
+        assert_eq!(
+            text(&created, "status"),
+            EXTERNAL_LINK_PENDING_STATUS,
+            "case {case:?}: expected the create to report an accepted creation, got {created:?}"
+        );
+
+        // The name the service assigned THIS link: a modelled `DomainName`, the
+        // link's own id as its leftmost label, under the addressed gateway's
+        // inbound name in the Region the request was signed for. It is assigned
+        // whichever way the gateway itself is reached, so no row can answer it by
+        // echoing the gateway's own `domainName`.
+        let domain_name = text(&created, "domainName");
+        assert!(
+            is_domain_name(&domain_name),
+            "case {case:?}: expected a domainName matching the modelled pattern, got {domain_name:?}"
+        );
+        assert!(
+            domain_name.starts_with(&format!("{link_id}.")),
+            "case {case:?}: expected the link's own id as the leftmost label of {domain_name:?}"
+        );
+        assert!(
+            domain_name.contains(&gateway_id) && domain_name.contains(REGION),
+            "case {case:?}: expected the name to sit under the gateway's inbound zone in {REGION}, got {domain_name:?}"
+        );
+
+        // The read reports what the create PERSISTED, not what the read was
+        // given: every member below reached state through the create's body or
+        // was assigned by the create itself.
+        let (status, read) = fabric
+            .read_inbound_external_link(&gateway_id, &link_id)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetInboundExternalLink to answer 200, got {status} {read:?}"
+        );
+        assert_eq!(
+            (text(&read, "gatewayId"), text(&read, "linkId")),
+            (gateway_id.clone(), link_id.clone()),
+            "case {case:?}: expected the read to report the link that was stored, got {read:?}"
+        );
+        assert_eq!(
+            text(&read, "domainName"),
+            domain_name,
+            "case {case:?}: expected the read to report the name the create assigned, got {:?}",
+            read["domainName"]
+        );
+        assert!(
+            same_json(&read["attributes"], &row.attributes),
+            "case {case:?}: expected the stored attributes {:?}, got {:?}",
+            row.attributes,
+            read["attributes"]
+        );
+        assert!(
+            same_json(&read["logSettings"], &row.log_settings),
+            "case {case:?}: expected the stored logSettings {:?}, got {:?}",
+            row.log_settings,
+            read["logSettings"]
+        );
+        assert!(
+            same_json(&read["tags"], &row.tags),
+            "case {case:?}: expected the stored tags {:?}, got {:?}",
+            row.tags,
+            read["tags"]
+        );
+        assert_eq!(
+            text(&read, "connectivityType"),
+            INBOUND_EXTERNAL_LINK_CONNECTIVITY_TYPE,
+            "case {case:?}: expected the connectivity type of an inbound external link, got {read:?}"
+        );
+        assert!(
+            CONNECTIVITY_TYPE_VALUES.contains(&text(&read, "connectivityType").as_str())
+                && LINK_STATUS_VALUES.contains(&text(&read, "status").as_str()),
+            "case {case:?}: expected modelled ConnectivityType and LinkStatus members, got {read:?}"
+        );
+        // No module flow is configured until `UpdateLinkModuleFlow` runs, and the
+        // read reports that rather than leaving the member out.
+        for member in ["flowModules", "pendingFlowModules"] {
+            assert_eq!(
+                read[member],
+                json!([]),
+                "case {case:?}: expected {member} to be reported empty, got {:?}",
+                read[member]
+            );
+        }
+        let created_at = read["createdAt"].as_f64();
+        assert!(
+            created_at.is_some() && read["updatedAt"].as_f64() >= created_at,
+            "case {case:?}: expected createdAt and updatedAt to be reported, got {:?} and {:?}",
+            read["createdAt"],
+            read["updatedAt"]
+        );
+
+        // The gateway's own reader counts it: an external link is one of that
+        // gateway's links, and `totalLinksCount` is derived by scanning them.
+        let (status, gateway) = fabric
+            .send("GET", &format!("/responder-gateway/{gateway_id}"), None)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetResponderGateway to answer 200, got {status} {gateway:?}"
+        );
+        assert_eq!(
+            gateway["totalLinksCount"],
+            json!(1),
+            "case {case:?}: expected the gateway to count its one inbound external link, got {:?}",
+            gateway["totalLinksCount"]
+        );
+
+        // A second link on the same gateway is a second record with a name of its
+        // own: the name identifies the link, not the gateway.
+        let (status, second) = fabric
+            .create_inbound_external_link(&gateway_id, row.create_body("token-link-second"))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a second create to answer 200, got {status} {second:?}"
+        );
+        assert_ne!(
+            text(&second, "linkId"),
+            link_id,
+            "case {case:?}: expected a second link of its own, got {second:?}"
+        );
+        assert_ne!(
+            text(&second, "domainName"),
+            domain_name,
+            "case {case:?}: expected the second link its own name, got {second:?}"
+        );
+        let (status, again) = fabric
+            .read_inbound_external_link(&gateway_id, &link_id)
+            .await;
+        assert_eq!(
+            (status, same_json(&again, &read)),
+            (200, true),
+            "case {case:?}: expected the first link to be untouched, got {status} {again:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_inbound_external_link_settles_to_the_status_the_clock_owes_it() {
+    let case = "an inbound link whose creation the clock has made due";
+    let fabric = Fabric::new();
+    let rows = inbound_rows();
+    let row = &rows[1];
+    let gateway_id = fabric
+        .responder_gateway_of(case, row.gateway_row, "token-responder")
+        .await;
+
+    let (status, created) = fabric
+        .create_inbound_external_link(&gateway_id, row.create_body("token-link"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the create to answer 200, got {status} {created:?}"
+    );
+    let link_id = text(&created, "linkId");
+
+    let settled = fabric
+        .poll_settled_inbound_external_link(case, &gateway_id, &link_id)
+        .await;
+    assert_eq!(
+        text(&settled, "domainName"),
+        text(&created, "domainName"),
+        "case {case:?}: expected the settle to leave the assigned name alone, got {settled:?}"
+    );
+    assert!(
+        settled["updatedAt"].as_f64() >= settled["createdAt"].as_f64(),
+        "case {case:?}: expected the settle to date the record at the instant it was owed, got {:?} and {:?}",
+        settled["createdAt"],
+        settled["updatedAt"]
+    );
+
+    // A later read answers the same thing: the settle is a change the clock had
+    // already made due, not one a read makes.
+    let again = fabric
+        .poll_settled_inbound_external_link(case, &gateway_id, &link_id)
+        .await;
+    assert!(
+        same_json(&again, &settled),
+        "case {case:?}: expected a repeated read to report the same link, got {again:?}"
+    );
+
+    // And the gateway now counts it as one of its ACTIVE links.
+    let (status, gateway) = fabric
+        .send("GET", &format!("/responder-gateway/{gateway_id}"), None)
+        .await;
+    assert_eq!(
+        (status, gateway["activeLinksCount"].clone()),
+        (200, json!(1)),
+        "case {case:?}: expected the settled link to count as active, got {status} {gateway:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_inbound_external_link_resolves_only_through_the_gateway_it_was_created_on() {
+    let case = "ids that resolve to no stored inbound external link";
+    let fabric = Fabric::new();
+    let rows = inbound_rows();
+    let row = &rows[0];
+
+    let gateway_id = fabric
+        .responder_gateway_of(case, row.gateway_row, "token-responder")
+        .await;
+    let other_gateway_id = fabric
+        .responder_gateway_of(case, row.gateway_row, "token-other")
+        .await;
+    let requester_id = fabric.requester_gateway(case, "token-requester").await;
+
+    let (status, created) = fabric
+        .create_inbound_external_link(&gateway_id, row.create_body("token-link"))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the create to answer 200, got {status} {created:?}"
+    );
+    let link_id = text(&created, "linkId");
+
+    // An inbound external link is taken BY a responder gateway, so a create on a
+    // gateway this store holds no responder gateway for is refused — and a
+    // requester gateway of that id is no responder gateway.
+    for (what, create_on) in [
+        ("a gateway nothing created", "rtb-gw-nothing".to_string()),
+        ("a requester gateway", requester_id.clone()),
+    ] {
+        let (status, refused) = fabric
+            .create_inbound_external_link(&create_on, row.create_body("token-refused"))
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected a create on {what} to answer 404, got {status} {refused:?}"
+        );
+        assert_eq!(
+            text(&refused, "message"),
+            RESOURCE_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the service's not-found sentence for {what}, got {refused:?}"
+        );
+    }
+
+    // A read misses whenever the pair names no stored link — including this
+    // link's own id read through ANOTHER gateway, which is what keeps one
+    // gateway's links out of another's.
+    for (what, read_gateway, read_link) in [
+        (
+            "a gateway nothing created",
+            "rtb-gw-nothing".to_string(),
+            link_id.clone(),
+        ),
+        (
+            "a link nothing minted",
+            gateway_id.clone(),
+            "link-nothing".to_string(),
+        ),
+        (
+            "this link's id under another responder gateway",
+            other_gateway_id.clone(),
+            link_id.clone(),
+        ),
+        (
+            "a requester gateway's id",
+            requester_id.clone(),
+            link_id.clone(),
+        ),
+    ] {
+        let (status, refused) = fabric
+            .read_inbound_external_link(&read_gateway, &read_link)
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected the read of {what} to answer 404, got {status} {refused:?}"
+        );
+        assert_eq!(
+            text(&refused, "message"),
+            RESOURCE_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the service's not-found sentence for {what}, got {refused:?}"
+        );
+    }
+
+    // A create may assign at most as many tags as a resource holds — the same
+    // per-resource bound `TagResource` enforces — and one past it is refused
+    // before anything is stored.
+    let mut over_quota = row.create_body("token-tags");
+    over_quota["tags"] = Value::Object(
+        (0..=TAGS_PER_RESOURCE_QUOTA)
+            .map(|n| (format!("key-{n}"), json!("v")))
+            .collect(),
+    );
+    let (status, refused) = fabric
+        .create_inbound_external_link(&gateway_id, over_quota)
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected one tag past the per-resource bound to be refused with 400, got {status} {refused:?}"
+    );
+    let mut at_quota = row.create_body("token-tags-at-bound");
+    at_quota["tags"] = Value::Object(
+        (0..TAGS_PER_RESOURCE_QUOTA)
+            .map(|n| (format!("key-{n}"), json!("v")))
+            .collect(),
+    );
+    let (status, accepted) = fabric
+        .create_inbound_external_link(&gateway_id, at_quota)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected a create exactly at the per-resource tag bound to be served, got {status} {accepted:?}"
+    );
+
+    // The link that IS stored still reads back, so the refusals above are the
+    // pair missing rather than the read path being closed.
+    let (status, read) = fabric
+        .read_inbound_external_link(&gateway_id, &link_id)
+        .await;
+    assert_eq!(
+        (status, text(&read, "linkId")),
+        (200, link_id.clone()),
+        "case {case:?}: expected the stored link to read back, got {status} {read:?}"
+    );
+
+    // A link cannot outlive the gateway it was created on: once that gateway is
+    // released, nothing reports the link either.
+    let (status, deleted) = fabric
+        .send("DELETE", &format!("/responder-gateway/{gateway_id}"), None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected DeleteResponderGateway to answer 200, got {status} {deleted:?}"
+    );
+    let (status, gone) = fabric
+        .read_inbound_external_link(&gateway_id, &link_id)
+        .await;
+    assert_eq!(
+        status, 404,
+        "case {case:?}: expected the link of a released gateway to be gone, got {status} {gone:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_repeated_client_token_answers_with_the_first_inbound_external_link() {
+    for row in inbound_rows() {
+        let case = row.case;
+        let fabric = Fabric::new();
+        let gateway_id = fabric
+            .responder_gateway_of(case, row.gateway_row, "token-responder")
+            .await;
+
+        let (status, first) = fabric
+            .create_inbound_external_link(&gateway_id, row.create_body("token-link"))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the first create to answer 200, got {status} {first:?}"
+        );
+        let (status, replay) = fabric
+            .create_inbound_external_link(&gateway_id, row.create_body("token-link"))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the replayed create to answer 200, got {status} {replay:?}"
+        );
+        assert_eq!(
+            (text(&replay, "linkId"), text(&replay, "domainName")),
+            (text(&first, "linkId"), text(&first, "domainName")),
+            "case {case:?}: expected the replay to answer with the first link, got {replay:?}"
+        );
+
+        // The replay minted nothing: the one link the first call stored is what
+        // the gateway holds.
+        let (status, gateway) = fabric
+            .send("GET", &format!("/responder-gateway/{gateway_id}"), None)
+            .await;
+        assert_eq!(
+            (status, gateway["totalLinksCount"].clone()),
+            (200, json!(1)),
+            "case {case:?}: expected the gateway to hold one link, got {status} {gateway:?}"
+        );
+
+        // The same token with different parameters is refused rather than
+        // silently answering for parameters the caller did not send.
+        let mut changed = row.create_body("token-link");
+        changed["logSettings"] = log_settings_at(1.0, 2.0);
+        let (status, refused) = fabric
+            .create_inbound_external_link(&gateway_id, changed)
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a reused clientToken with changed parameters to be refused with 400, got {status} {refused:?}"
+        );
+    }
 }
 
 #[tokio::test]
