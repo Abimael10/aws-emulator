@@ -634,8 +634,8 @@ async fn the_ecr_access_diagnosis_reads_a_uri_that_addresses_the_repository_it_n
         .await;
         let reported_name = string(case, &answered, "/repositories/0/repositoryName");
         let reported_registry = string(case, &answered, "/repositories/0/registryId");
-        let reported_uri = string(case, &answered, "/repositories/0/repositoryUri");
         let reported_arn = string(case, &answered, "/repositories/0/repositoryArn");
+        let reported_uri = string(case, &answered, "/repositories/0/repositoryUri");
 
         // What the read has to establish: the URI ADDRESSES this repository — an authority a
         // client of this emulator can dial, carrying the repository's own name as its path —
