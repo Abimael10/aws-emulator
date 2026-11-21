@@ -23,12 +23,27 @@
 //! the account holds launches, and an AMI REGISTERED through `ec2:RegisterImage` during
 //! the test launches too — so the answer follows Amazon EC2's own image state rather than
 //! anything this crate keeps.
+//!
+//! The image state is spanned in BOTH directions: an AMI the account stops holding (one
+//! deregistered into the Recycle Bin, which "is therefore NOT one of the images the account
+//! can see") stops being launchable, and the same AMI restored through
+//! `ec2:RestoreImageFromRecycleBin` becomes launchable again under the same id — so what a
+//! create is accepted for is the IMAGE, at the moment of the call, and not the shape of its
+//! id or any answer this service remembers. A refused create is also read back through the
+//! TAGS this service reports, not through the id set alone: no instance carrying the tags
+//! the refused call sent exists afterwards.
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_ec2_amazonec2 as ec2_service;
+use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ec2_managed_instance_propagation::ec2_client;
 use crate::workspace_instance_lifecycle::{
-    call, create, error_code, harness, list_all_ids, ok, TEST_IMAGE_ID, TEST_INSTANCE_TYPE,
+    call, create, error_code, harness, list_all_ids, ok, stored_tags, TEST_IMAGE_ID,
+    TEST_INSTANCE_TYPE,
 };
 
 /// The `Message` AWS answers a create whose image cannot be resolved with: fixed text in
@@ -73,28 +88,7 @@ async fn a_create_naming_an_image_the_account_has_not_got_is_refused() {
         let token = "tok-refused";
         let (status, payload) =
             call(&router, "CreateWorkspaceInstance", create_body(image_id, token)).await;
-        assert_eq!(
-            status, VALIDATION_STATUS,
-            "case {case:?} ({image_id:?}): expected HTTP {VALIDATION_STATUS}, got {status} \
-             with {payload}"
-        );
-        assert_eq!(
-            error_code(&payload),
-            "ValidationException",
-            "case {case:?} ({image_id:?}): expected ValidationException, got {payload}"
-        );
-        let message = payload["Message"]
-            .as_str()
-            .or_else(|| payload["message"].as_str());
-        assert_eq!(
-            message,
-            Some(INVALID_IMAGE_MESSAGE),
-            "case {case:?} ({image_id:?}): expected {INVALID_IMAGE_MESSAGE:?}, got {payload}"
-        );
-        assert!(
-            !payload.to_string().contains(image_id),
-            "case {case:?}: the refusal must echo none of the submitted id, got {payload}"
-        );
+        assert_image_refused(case, image_id, status, &payload);
 
         // Nothing was created for it: the id set is the one the accepted create left.
         let ids = list_all_ids(&router, json!({})).await;
@@ -192,9 +186,239 @@ async fn an_ami_registered_through_ec2_becomes_launchable() {
         create_body(unregistered, "tok-unregistered"),
     )
     .await;
+    assert_image_refused("the unregistered id", unregistered, status, &payload);
+}
+
+/// The whole refusal a create whose image cannot be resolved is answered with: the modelled
+/// `ValidationException` at HTTP 400, carrying the fixed message in full and echoing none of
+/// the submitted id.
+fn assert_image_refused(case: &str, image_id: &str, status: u16, payload: &Value) {
     assert_eq!(
         status, VALIDATION_STATUS,
-        "case the unregistered id {unregistered:?}: expected HTTP {VALIDATION_STATUS}, got \
-         {status} with {payload}"
+        "case {case:?} ({image_id:?}): expected HTTP {VALIDATION_STATUS}, got {status} with \
+         {payload}"
     );
+    assert_eq!(
+        error_code(payload),
+        "ValidationException",
+        "case {case:?} ({image_id:?}): expected ValidationException, got {payload}"
+    );
+    let message = payload["Message"]
+        .as_str()
+        .or_else(|| payload["message"].as_str());
+    assert_eq!(
+        message,
+        Some(INVALID_IMAGE_MESSAGE),
+        "case {case:?} ({image_id:?}): expected {INVALID_IMAGE_MESSAGE:?}, got {payload}"
+    );
+    assert!(
+        !payload.to_string().contains(image_id),
+        "case {case:?}: the refusal must echo none of the submitted id, got {payload}"
+    );
+}
+
+/// A create body booting `image_id` with `token` as its `ClientToken`, carrying the one
+/// caller tag `Name=<marker>`: the marker is what makes "this call created nothing" readable
+/// through the tags the service reports for the instances it holds, not through the id set
+/// alone.
+fn tagged_create_body(image_id: &str, token: &str, marker: &str) -> Value {
+    json!({
+        "ClientToken": token,
+        "ManagedInstance": { "ImageId": image_id, "InstanceType": TEST_INSTANCE_TYPE },
+        "Tags": [{ "Key": "Name", "Value": marker }],
+    })
+}
+
+/// The `Name` tag of every WorkSpace Instance this service reports, read back through
+/// `ListWorkspaceInstances` (to the last page) and `ListTagsForResource`.
+async fn reported_name_markers(router: &MultiServiceRouter) -> Vec<String> {
+    let mut markers = Vec::new();
+    for id in list_all_ids(router, json!({})).await {
+        if let Some(marker) = stored_tags(router, &id).await.get("Name") {
+            markers.push(marker.clone());
+        }
+    }
+    markers.sort();
+    markers
+}
+
+#[tokio::test]
+async fn a_refused_create_creates_no_instance_carrying_its_tags() {
+    for (case, image_id) in unresolvable_image_ids() {
+        // One store per row, so what the store holds afterwards is this row's doing.
+        let (router, _engine) = harness();
+        // One instance the account really has, carrying a marker of its own: the tags the
+        // refusal must leave untouched are not the empty set.
+        let held_marker = format!("held-{case}");
+        let held = create(
+            &router,
+            tagged_create_body(TEST_IMAGE_ID, "tok-held", &held_marker),
+        )
+        .await;
+
+        let refused_marker = format!("refused-{case}");
+        let (status, payload) = call(
+            &router,
+            "CreateWorkspaceInstance",
+            tagged_create_body(image_id, "tok-refused", &refused_marker),
+        )
+        .await;
+        assert_image_refused(case, image_id, status, &payload);
+
+        // No instance carries the marker the refused call sent, and the one the accepted
+        // create made still carries its own.
+        let markers = reported_name_markers(&router).await;
+        assert_eq!(
+            markers,
+            vec![held_marker.clone()],
+            "case {case:?} ({image_id:?}): expected only the accepted create's tag, got \
+             {markers:?}"
+        );
+        let tags = stored_tags(&router, &held).await;
+        assert_eq!(
+            tags.get("Name").map(String::as_str),
+            Some(held_marker.as_str()),
+            "case {case:?}: expected the held instance to keep its own tag, got {tags:?}"
+        );
+    }
+}
+
+/// How long a deregistered AMI is held in the Recycle Bin in the rows below: one day, a
+/// retention period a Recycle Bin rule can carry, so the entry is still restorable at the
+/// end of the row however slowly the host runs it.
+const RECYCLE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Deregister the AMI `image_id` into the account's Recycle Bin, where it is no longer one
+/// of the images the account can see.
+///
+/// Driven through Amazon EC2's own store because `ec2:DeregisterImage` is still a scaffold
+/// (`issues/things-that-do-not-work/20261023T102725Z-ec2-deregisterimage-stub.md`, which is
+/// what moves this helper onto the operation once it lands): the image leaves that service's
+/// image store either way, which is the state this row needs — and the row reads the effect
+/// back through `ec2:RestoreImageFromRecycleBin`, which is the operation wired to the bin.
+fn deregister_into_recycle_bin(engine: &Arc<engine::InMemoryEngine>, case: &str, image_id: &str) {
+    let store = ec2_service::state::service_state(&**engine)
+        .expect("the in-memory engine carries the account's EC2 store");
+    let moved = store.lock().recycle_image(image_id, RECYCLE_RETENTION);
+    assert!(
+        moved,
+        "case {case:?}: expected the AMI {image_id:?} to move into the Recycle Bin"
+    );
+}
+
+/// How the AMI a row takes away came to be one of the images the account can see: one it
+/// already held when the row started, and one `ec2:RegisterImage` minted during the row at an
+/// id the test cannot know in advance. The rule turns on the image EXISTING at the moment of
+/// the call, so the rows differ in how it came to exist.
+enum RecyclableImage {
+    /// One of the AMIs the account's own Amazon EC2 already holds, named by its id.
+    AlreadyHeld(&'static str),
+    /// An AMI registered during the row, under this name.
+    RegisteredDuringTheRow(&'static str),
+}
+
+fn recyclable_image_rows() -> Vec<(&'static str, RecyclableImage)> {
+    vec![
+        (
+            "an AMI the account already held",
+            // Not the id this suite's other fixtures boot from, so taking it away cannot
+            // disturb them.
+            RecyclableImage::AlreadyHeld(crate::workspace_instance_lifecycle::ACCOUNT_IMAGES[1]),
+        ),
+        (
+            "an AMI registered during the row",
+            RecyclableImage::RegisteredDuringTheRow("workspaces-instances-recyclable-image"),
+        ),
+    ]
+}
+
+/// The id of this row's AMI, registering it first where the row asks for one it did not hold.
+async fn recyclable_image_id(ec2: &::aws_sdk_ec2::Client, image: &RecyclableImage) -> String {
+    match image {
+        RecyclableImage::AlreadyHeld(image_id) => (*image_id).to_string(),
+        RecyclableImage::RegisteredDuringTheRow(name) => ec2
+            .register_image()
+            .name(*name)
+            // "Either imageLocation or rootDeviceName must be specified" — the register
+            // names the root device of an EBS-backed AMI.
+            .root_device_name("/dev/xvda")
+            .send()
+            .await
+            .expect("ec2:RegisterImage answers")
+            .image_id()
+            .expect("a registered image carries its id")
+            .to_string(),
+    }
+}
+
+#[tokio::test]
+async fn an_image_the_account_stops_holding_stops_being_launchable() {
+    for (index, (case, image)) in recyclable_image_rows().into_iter().enumerate() {
+        // One store per row, so what the account holds is this row's doing.
+        let (router, engine) = harness();
+        let ec2 = ec2_client(&router);
+        let registered = recyclable_image_id(&ec2, &image).await;
+
+        // While the account holds it, a create booting it is accepted and reads back.
+        let launched =
+            create(&router, create_body(&registered, &format!("tok-held-{index}"))).await;
+        let got = ok(
+            &router,
+            "GetWorkspaceInstance",
+            json!({ "WorkspaceInstanceId": &launched }),
+        )
+        .await;
+        assert_eq!(
+            got["WorkspaceInstanceId"].as_str(),
+            Some(launched.as_str()),
+            "case {case:?} ({registered:?}): expected the instance to read back, got {got}"
+        );
+
+        // Once it is deregistered it is no image the account can see, so the SAME id — one
+        // a create was accepted for moments ago — is refused, and nothing is created for it.
+        deregister_into_recycle_bin(&engine, case, &registered);
+        let (status, payload) = call(
+            &router,
+            "CreateWorkspaceInstance",
+            create_body(&registered, &format!("tok-recycled-{index}")),
+        )
+        .await;
+        assert_image_refused(case, &registered, status, &payload);
+        let ids = list_all_ids(&router, json!({})).await;
+        assert_eq!(
+            ids,
+            vec![launched.clone()],
+            "case {case:?} ({registered:?}): expected no instance for the refused create, got \
+             {ids:?}"
+        );
+
+        // And restored through EC2's own operation it is launchable again, under the same
+        // id: the create follows the account's image state at the moment of the call.
+        ec2.restore_image_from_recycle_bin()
+            .image_id(&registered)
+            .send()
+            .await
+            .expect("ec2:RestoreImageFromRecycleBin answers");
+        let relaunched = create(
+            &router,
+            create_body(&registered, &format!("tok-restored-{index}")),
+        )
+        .await;
+        assert_ne!(
+            relaunched, launched,
+            "case {case:?}: expected the restored image to mint a second instance"
+        );
+        let got = ok(
+            &router,
+            "GetWorkspaceInstance",
+            json!({ "WorkspaceInstanceId": &relaunched }),
+        )
+        .await;
+        assert_eq!(
+            got["WorkspaceInstanceId"].as_str(),
+            Some(relaunched.as_str()),
+            "case {case:?} ({registered:?}): expected the second instance to read back, got \
+             {got}"
+        );
+    }
 }
