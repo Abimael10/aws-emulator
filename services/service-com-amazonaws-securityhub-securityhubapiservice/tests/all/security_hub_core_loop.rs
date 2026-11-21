@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_securityhub_securityhubapiservice::ops::types::CONTROL_FINDING_GENERATOR_VALUES;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the test signs for; the handler reads it out of the SigV4 credential
@@ -84,6 +85,13 @@ impl Harness {
 
     pub(crate) async fn disable(&self) -> (u16, Value) {
         self.call("DELETE", "/accounts", None).await
+    }
+
+    /// `UpdateSecurityHubConfiguration` (`PATCH /accounts`, from this service's Smithy
+    /// model: `smithy_query(query="operation",
+    /// operation="UpdateSecurityHubConfiguration")`).
+    async fn update_configuration(&self, body: Value) -> (u16, Value) {
+        self.call("PATCH", "/accounts", Some(body)).await
     }
 
     pub(crate) async fn import(&self, findings: Vec<Value>) -> (u16, Value) {
@@ -419,6 +427,266 @@ async fn describe_hub_rejects_an_arn_that_names_no_hub() {
         assert_eq!(
             status, 404,
             "case {case:?}: expected 404, got {status} with {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UpdateSecurityHubConfiguration
+// ---------------------------------------------------------------------------
+
+/// RULE: `UpdateSecurityHubConfiguration` writes the configuration members the request
+/// carries onto the calling account/Region's subscription and leaves every member it
+/// omits — and the subscription's identity — as it was, so the next `DescribeHub`
+/// reports exactly the last value written for each member.
+///
+/// The rows are applied in sequence to ONE subscription, so each one reads back over
+/// the previous one's writes: that is what catches a member an omitting request resets
+/// instead of keeping. They span the request forms the operation accepts — each member
+/// alone, both together, the same values again, and no members at all.
+#[tokio::test]
+async fn update_security_hub_configuration_writes_what_describe_hub_reports() {
+    // (case, request body, expected AutoEnableControls, expected ControlFindingGenerator)
+    let steps: [(&str, Value, bool, &str); 7] = [
+        (
+            "AutoEnableControls off, generator omitted",
+            json!({ "AutoEnableControls": false }),
+            false,
+            "SECURITY_CONTROL",
+        ),
+        (
+            "no members at all",
+            json!({}),
+            false,
+            "SECURITY_CONTROL",
+        ),
+        (
+            "generator alone, AutoEnableControls omitted",
+            json!({ "ControlFindingGenerator": "STANDARD_CONTROL" }),
+            false,
+            "STANDARD_CONTROL",
+        ),
+        (
+            "AutoEnableControls back on, generator omitted",
+            json!({ "AutoEnableControls": true }),
+            true,
+            "STANDARD_CONTROL",
+        ),
+        (
+            "both members at once",
+            json!({ "AutoEnableControls": false, "ControlFindingGenerator": "SECURITY_CONTROL" }),
+            false,
+            "SECURITY_CONTROL",
+        ),
+        (
+            "the same values a second time",
+            json!({ "AutoEnableControls": false, "ControlFindingGenerator": "SECURITY_CONTROL" }),
+            false,
+            "SECURITY_CONTROL",
+        ),
+        (
+            "generator alone, set to the value it already holds",
+            json!({ "ControlFindingGenerator": "SECURITY_CONTROL" }),
+            false,
+            "SECURITY_CONTROL",
+        ),
+    ];
+
+    let harness = Harness::new();
+    let (status, body) = harness.enable(None).await;
+    assert_eq!(status, 200, "enable: expected 200, got {status} with {body}");
+    let (_, created) = harness.describe_hub(None).await;
+
+    for (case, body, expected_auto, expected_generator) in steps {
+        let (status, answer) = harness.update_configuration(body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {answer}"
+        );
+
+        let (status, hub) = harness.describe_hub(None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeHub expected 200, got {status} with {hub}"
+        );
+        assert_eq!(
+            hub["AutoEnableControls"].as_bool(),
+            Some(expected_auto),
+            "case {case:?}: expected AutoEnableControls {expected_auto}, got {:?}",
+            hub["AutoEnableControls"]
+        );
+        assert_eq!(
+            hub["ControlFindingGenerator"].as_str(),
+            Some(expected_generator),
+            "case {case:?}: expected ControlFindingGenerator {expected_generator}, got {:?}",
+            hub["ControlFindingGenerator"]
+        );
+
+        // The configuration update is not a re-subscription: the hub keeps the identity
+        // and the subscription instant `EnableSecurityHub` gave it.
+        assert_eq!(
+            hub["HubArn"], created["HubArn"],
+            "case {case:?}: expected HubArn {:?}, got {:?}",
+            created["HubArn"], hub["HubArn"]
+        );
+        assert_eq!(
+            hub["SubscribedAt"], created["SubscribedAt"],
+            "case {case:?}: expected SubscribedAt {:?}, got {:?}",
+            created["SubscribedAt"], hub["SubscribedAt"]
+        );
+
+        // Reading again reports the same record: the read changes nothing.
+        let (_, again) = harness.describe_hub(None).await;
+        assert_eq!(
+            again, hub,
+            "case {case:?}: DescribeHub must be stable across calls, got {again:?} after {hub:?}"
+        );
+    }
+}
+
+/// RULE: every value the `ControlFindingGenerator` enum declares is accepted and read
+/// back unchanged; the set comes from the model
+/// (`service_com_amazonaws_securityhub_securityhubapiservice::ops::types::CONTROL_FINDING_GENERATOR_VALUES`,
+/// generated from `smithy_query(query="shape", shape="ControlFindingGenerator")`), so a
+/// value added to the model is covered without editing this test.
+#[tokio::test]
+async fn every_modelled_control_finding_generator_round_trips() {
+    for value in CONTROL_FINDING_GENERATOR_VALUES {
+        // A fresh subscription per row, so each value is written over the documented
+        // default rather than over the previous row's value.
+        let harness = Harness::new();
+        let (status, body) = harness.enable(None).await;
+        assert_eq!(
+            status, 200,
+            "case {value:?}: enable expected 200, got {status} with {body}"
+        );
+
+        let (status, answer) = harness
+            .update_configuration(json!({ "ControlFindingGenerator": value }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {value:?}: expected 200, got {status} with {answer}"
+        );
+
+        let (_, hub) = harness.describe_hub(None).await;
+        assert_eq!(
+            hub["ControlFindingGenerator"].as_str(),
+            Some(*value),
+            "case {value:?}: expected ControlFindingGenerator {value}, got {:?}",
+            hub["ControlFindingGenerator"]
+        );
+    }
+}
+
+/// RULE: a `ControlFindingGenerator` the model does not declare is refused (400
+/// `ValidationException`, the modelled enum constraint) and the subscription keeps the
+/// configuration it had — a refused update writes nothing.
+#[tokio::test]
+async fn update_security_hub_configuration_refuses_an_unmodelled_generator() {
+    // Rows differ in HOW the value misses the declared set: wrong case, a prefix, a
+    // suffix, a neighbouring word, and the empty string.
+    let cases = [
+        "security_control",
+        "SECURITY",
+        "SECURITY_CONTROLS",
+        "STANDARD",
+        "",
+    ];
+
+    let harness = Harness::new();
+    let (status, body) = harness.enable(None).await;
+    assert_eq!(status, 200, "enable: expected 200, got {status} with {body}");
+    let (status, _) = harness
+        .update_configuration(json!({ "AutoEnableControls": false }))
+        .await;
+    assert_eq!(status, 200, "seeding update: expected 200, got {status}");
+    let (_, before) = harness.describe_hub(None).await;
+
+    for case in cases {
+        let (status, body) = harness
+            .update_configuration(json!({ "ControlFindingGenerator": case }))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} with {body}"
+        );
+        let code = body["Code"]
+            .as_str()
+            .or_else(|| body["code"].as_str())
+            .or_else(|| body["__type"].as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
+        );
+
+        let (_, after) = harness.describe_hub(None).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused update must not change the hub, got {after:?} after {before:?}"
+        );
+    }
+}
+
+/// RULE: configuring a subscription that does not exist is refused as a missing
+/// resource (404 `ResourceNotFoundException`), with the service's fixed wording for the
+/// failed subscription precondition, and nothing is created by the refusal.
+///
+/// The rows span both ways an account/Region arrives without a subscription: never
+/// enabled, and enabled and then disabled again.
+#[tokio::test]
+async fn configuring_an_account_with_no_subscription_is_refused() {
+    /// The fixed text of the refusal, written out here rather than read from the
+    /// handler, so re-wording the handler's message fails this test.
+    const EXPECTED_MESSAGE: &str = "Account is not subscribed to Security Hub";
+
+    for case in ["never enabled", "enabled, then disabled"] {
+        let harness = Harness::new();
+        if case == "enabled, then disabled" {
+            let (status, _) = harness.enable(None).await;
+            assert_eq!(status, 200, "case {case:?}: enable expected 200, got {status}");
+            let (status, _) = harness.disable().await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: disable expected 200, got {status}"
+            );
+        }
+
+        for body in [
+            json!({}),
+            json!({ "AutoEnableControls": false }),
+            json!({ "ControlFindingGenerator": "STANDARD_CONTROL" }),
+        ] {
+            let (status, answer) = harness.update_configuration(body.clone()).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}/{body}: expected 404, got {status} with {answer}"
+            );
+            let code = answer["Code"]
+                .as_str()
+                .or_else(|| answer["code"].as_str())
+                .or_else(|| answer["__type"].as_str())
+                .unwrap_or_default();
+            assert_eq!(
+                code, "ResourceNotFoundException",
+                "case {case:?}/{body}: expected ResourceNotFoundException, got {answer}"
+            );
+            let message = answer["Message"]
+                .as_str()
+                .or_else(|| answer["message"].as_str())
+                .unwrap_or_default();
+            assert_eq!(
+                message, EXPECTED_MESSAGE,
+                "case {case:?}/{body}: expected message {EXPECTED_MESSAGE:?}, got {message:?}"
+            );
+        }
+
+        // The refusals created no subscription: the account is still unsubscribed.
+        let (status, hub) = harness.describe_hub(None).await;
+        assert_eq!(
+            status, 401,
+            "case {case:?}: DescribeHub expected 401, got {status} with {hub}"
         );
     }
 }

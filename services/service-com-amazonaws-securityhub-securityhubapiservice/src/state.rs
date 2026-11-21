@@ -385,6 +385,16 @@ pub fn not_subscribed_message(account_id: &str) -> String {
 /// caller that enables-if-not-enabled can match it as a constant.
 pub const ALREADY_SUBSCRIBED_MESSAGE: &str = "Account is already subscribed to Security Hub";
 
+/// The whole message an operation that CONFIGURES the hub resource is refused with
+/// when the calling account/Region holds no subscription. Security Hub states the
+/// failed precondition on the subscription itself and nothing else — the mirror image
+/// of [`ALREADY_SUBSCRIBED_MESSAGE`] — so the message interpolates no account id and
+/// no Region and a caller can match it as a constant.
+///
+/// Distinct from [`not_subscribed_message`], which is what an operation that works
+/// INSIDE the hub (findings, insights, standards, members) refuses with.
+pub const HUB_NOT_SUBSCRIBED_MESSAGE: &str = "Account is not subscribed to Security Hub";
+
 /// The message an operation addressed by an ARN refuses with when that ARN names no
 /// resource of the caller's hub: the ARN the request carried, quoted back as it
 /// arrived, and the bare statement that nothing answers to it.
