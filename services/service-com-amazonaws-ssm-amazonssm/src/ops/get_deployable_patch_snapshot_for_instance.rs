@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeployablePatchSnapshotForInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeployablePatchSnapshotForInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeployablePatchSnapshotForInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! # What this operation does here
+//!
+//! This is the read Patch Manager's own document makes from INSIDE a node, with that node's
+//! own credentials ("This API is primarily used by the AWS-RunPatchBaseline Systems Manager
+//! document … If you run the command locally, such as with the Command Line Interface (CLI),
+//! the system attempts to use your local Amazon Web Services credentials and the operation
+//! fails"), so it is served to the managed node it names and to nobody else:
+//!
+//! 1. the caller's own identity-based policies decide the call first, about the node the
+//!    request NAMED, exactly as they decide every other signed call of this service
+//!    ([`crate::state::identity_authorization`]);
+//! 2. then WHO the caller is decides it: a request that is not the node's own — a client's
+//!    local credentials, another node's session — is refused `AccessDeniedException`
+//!    ([`crate::state::node_identity`]), which no policy can grant;
+//! 3. the node's own snapshot is then taken of the patch baseline in force for it, or of the
+//!    baseline the request overrode it with, and held: a snapshot is frozen at the instant it
+//!    is first taken, so the same node and snapshot id are answered the same thing however
+//!    often they are asked ([`crate::state::patch_snapshots`]).
+//!
+//! An override naming another operating system than the node's cannot be made effective on
+//! that node, which is the modelled `UnsupportedOperatingSystem`.
+//!
+//! `UnsupportedFeatureRequiredException` — "patching for applications released by Microsoft is
+//! only available on EC2 instances and advanced instances" — is NOT raised here, and a
+//! snapshot covering such patches is served instead: deciding it needs both whether the
+//! baseline in force covers the Microsoft APPLICATION patch set and which tier the account's
+//! hybrid machines are managed in (the `/ssm/managed-instance/activation-tier` service
+//! setting), and neither is read by this operation. Stated here so a caller is not left to
+//! infer from a served snapshot that the advanced-instances requirement was checked.
 //!
 //! ## Shape of an operation
 //!
@@ -110,9 +131,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 // here — hence the `GetDeployablePatchSnapshotForInstanceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssm#GetDeployablePatchSnapshotForInstance")]
+// The operation's MODELED errors, plus the refusal a caller this read is not served gets:
+// `AccessDeniedException` is a shape this SERVICE models ("the requester doesn't have
+// permissions to perform the requested operation") that this operation's own `errors` list
+// omits, so it is widened in through `extra_errors` rather than answered as some other
+// status — the identity-based decision and the one about who the caller IS are both that
+// refusal.
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssm#GetDeployablePatchSnapshotForInstance",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetDeployablePatchSnapshotForInstanceErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerError(InternalServerError),
     UnsupportedFeatureRequiredException(UnsupportedFeatureRequiredException),
     UnsupportedOperatingSystem(UnsupportedOperatingSystem),
@@ -169,18 +200,230 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeployablePatchSnapshotForInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeployablePatchSnapshotForInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::{identity_authorization as iam_gate, node_identity, patch_snapshots};
+
+        // `InstanceId`'s pattern and `SnapshotId`'s 36-character length and UUID pattern are
+        // MODELLED constraints the centralized walk has already refused anything outside of.
+        let region = crate::state::request_region(ctx.parts());
+        // The node the request NAMED, built from the id it carried rather than from anything
+        // looked up: both refusals below are decided about it before the store is read, so a
+        // caller this read is not served cannot learn from them what the account holds.
+        let resource = iam_gate::instance_resource(&region, &input.instance_id);
+
+        let denied = |message: String| {
+            GetDeployablePatchSnapshotForInstanceError::from(
+                GetDeployablePatchSnapshotForInstanceErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message },
+                ),
+            )
+        };
+        let store_unavailable = || {
+            GetDeployablePatchSnapshotForInstanceError::from(
+                GetDeployablePatchSnapshotForInstanceErrorModeled::InternalServerError(
+                    InternalServerError {
+                        message: Some("the patch snapshot store is unavailable".to_string()),
+                    },
+                ),
+            )
+        };
+        let unsupported = |operating_system: &str| {
+            GetDeployablePatchSnapshotForInstanceError::from(
+                GetDeployablePatchSnapshotForInstanceErrorModeled::UnsupportedOperatingSystem(
+                    UnsupportedOperatingSystem {
+                        message: Some(crate::state::patch_catalog::unsupported_operating_system(
+                            operating_system,
+                        )),
+                    },
+                ),
+            )
+        };
+
+        // The caller's own identity-based policies decide this call first, with no store guard
+        // held.
+        if let Some(message) = iam_gate::refusal(&*self.engine, ctx, Self::NAME, &resource) {
+            return Err(denied(message));
+        }
+        let caller = iam_gate::caller_arn(&*self.engine, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        // The registration an instance of this Region had already made by now was owed at the
+        // same instant whether or not anybody called, so it is materialised before the node
+        // store is read — with no guard of it held.
+        crate::state::node_registration::settle_registrations(&*self.engine, &region);
+        // The node is copied out and the guard released: what the snapshot is of is worked out
+        // from facts of OTHER stores (the image the node was launched from), which are read
+        // with no guard of this service's own held.
+        let held_node = {
+            let store = state.lock();
+            store.managed_node(&region, &input.instance_id).cloned()
+        };
+        // A node this account holds none of cannot be the caller either, so that request is
+        // refused the same way and says no more: a caller that is not the node learns nothing
+        // about which nodes the account holds.
+        let Some(node) =
+            held_node.filter(|node| node_identity::request_is_from_node(&caller, node))
+        else {
+            return Err(denied(node_identity::not_the_node_message(
+                &caller,
+                Self::NAME,
+                &resource,
+            )));
+        };
+
+        let reported = &node.properties;
+        // The operating system Patch Manager patches the node against, and the specific release
+        // of it the node is of — both read the way every other patch read of this service
+        // reads them.
+        let node_operating_system = crate::state::patch_runs::node_operating_system(
+            &*self.engine,
+            &input.instance_id,
+            reported.platform_type.as_deref(),
+        );
+        let product = patch_snapshots::node_product(
+            &*self.engine,
+            &input.instance_id,
+            node_operating_system,
+            reported.platform_name.as_deref(),
+            reported.platform_version.as_deref(),
+        );
+        // An override states the baseline the snapshot is of, and the operating system it
+        // names is the one that baseline applies to — so an override applying to another
+        // operating system than the node's cannot be made effective on this node.
+        let overridden_operating_system = input
+            .baseline_override
+            .as_ref()
+            .and_then(|overridden| overridden.operating_system.clone());
+        if let Some(named) = overridden_operating_system.as_deref() {
+            if named != node_operating_system {
+                return Err(unsupported(named));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A snapshot already taken is reported as it was taken: a snapshot is frozen, so
+        // nothing here re-evaluates the baseline for one this store already holds.
+        if store
+            .patch_snapshot(&region, &input.instance_id, &input.snapshot_id)
+            .is_none()
+        {
+            let patch_group = crate::state::patch_runs::PATCH_GROUP_TAG_KEYS
+                .iter()
+                .find_map(|key| node.tags.get(*key))
+                .cloned()
+                .unwrap_or_default();
+            // What the snapshot is OF: the baseline the request overrode the node's with, and
+            // otherwise the baseline in force for the node — the one its patch group is
+            // registered with, and the default of its operating system when its group has none
+            // (`ComAmazonawsSsmAmazonssmState::patch_baseline_in_force`) — so what a
+            // patch-group read reports and what a snapshot is taken of cannot disagree.
+            let baseline = match input.baseline_override.as_ref() {
+                Some(overridden) => Some(patch_snapshots::baseline_from_override(
+                    &region,
+                    &input.snapshot_id,
+                    node_operating_system,
+                    overridden,
+                    now,
+                )),
+                None => store
+                    .patch_baseline_in_force(&region, &patch_group, node_operating_system)
+                    .and_then(|resolved| {
+                        store
+                            .patch_baseline(&region, &resolved.baseline_id)
+                            .cloned()
+                            .or_else(|| {
+                                crate::state::patch_baselines::predefined_baseline_with_id(
+                                    &region,
+                                    &resolved.baseline_id,
+                                )
+                                .map(|predefined| {
+                                    crate::state::patch_baselines::predefined_baseline_record(
+                                        &region, predefined,
+                                    )
+                                })
+                            })
+                    }),
+            };
+            // No baseline at all is in force for the node's operating system: there is nothing
+            // deployable on it, which is "the operation isn't supported for the operating
+            // system".
+            let Some(baseline) = baseline else {
+                return Err(unsupported(node_operating_system));
+            };
+            let snapshot = patch_snapshots::PatchSnapshotRecord {
+                snapshot_id: input.snapshot_id.clone(),
+                instance_id: input.instance_id.clone(),
+                object_key: patch_snapshots::mint_object_key(),
+                product: product.clone(),
+                baseline_id: baseline.baseline_id.clone(),
+                created_at: now,
+                document: patch_snapshots::snapshot_document(
+                    &region,
+                    &input.instance_id,
+                    &input.snapshot_id,
+                    &product,
+                    &baseline,
+                    now,
+                ),
+            };
+            if !store.insert_patch_snapshot(&region, snapshot) {
+                return Err(
+                    GetDeployablePatchSnapshotForInstanceErrorModeled::InternalServerError(
+                        InternalServerError {
+                            message: Some(patch_snapshots::snapshot_store_full_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        let Some(held) = store.patch_snapshot(&region, &input.instance_id, &input.snapshot_id)
+        else {
+            return Err(store_unavailable());
+        };
+        let reported_product = held.product.clone();
+        let object_key = held.object_key.clone();
+        drop(store);
+
+        // WHERE the snapshot is downloaded from: the path this emulator serves that object at,
+        // signed for its own endpoint, so the node that was handed the URL can fetch it. The
+        // path carries the key component this endpoint minted for the snapshot, which is what
+        // makes that object reachable at all (`crate::state::patch_snapshots`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeployablePatchSnapshotForInstance"))
+        // `UseS3DualStackEndpoint` asks for "a presigned URL that supports both IPv4 and IPv6
+        // connectivity" instead of "standard IPv4-only endpoints". This emulator publishes ONE
+        // endpoint, reached over whatever the host it is served on provides, so neither value
+        // addresses the snapshot anywhere else and the URL is the same either way.
+        let path = patch_snapshots::snapshot_object_path(
+            &region,
+            &input.instance_id,
+            &input.snapshot_id,
+            &object_key,
+        );
+        let signing = smithy_server_runtime::SignedUrlRequest::new(
+            smithy_server_runtime::http::Method::GET,
+            ctx.identity().signing_name(),
+            &path,
+        );
+        let url = match ctx
+            .url_signer()
+            .sign(signing, patch_snapshots::SNAPSHOT_DOWNLOAD_URL_VALIDITY)
+        {
+            Ok(signed) => signed.as_str().to_string(),
+            // Nothing about a stored id or this emulator's own endpoint makes a request
+            // unsignable, so this is unreachable in practice; the snapshot is still served at
+            // that address, so the address is what is announced rather than no location at
+            // all. The endpoint is `scheme://host[:port]` with no path of its own, and a
+            // trailing separator is dropped so the object's path is the only one it carries.
+            Err(_) => format!("{}{path}", ctx.endpoint().as_str().trim_end_matches('/')),
+        };
+
+        Ok(GetDeployablePatchSnapshotForInstanceOutput {
+            instance_id: Some(input.instance_id),
+            snapshot_id: Some(input.snapshot_id),
+            snapshot_download_url: Some(url),
+            product: Some(reported_product),
+        })
     }
 }

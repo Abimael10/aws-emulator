@@ -63,6 +63,18 @@
 //! Both paths go through [`refusal::stated_refusal`], so the same request cannot be
 //! answered with different words depending on which of them caught it.
 //!
+//! ## The patch snapshot plane
+//!
+//! `GetDeployablePatchSnapshotForInstance` hands out "a pre-signed Amazon Simple Storage
+//! Service (Amazon S3) URL that can be used to download the patch snapshot". AWS serves that
+//! object from a bucket of its own; this emulator serves no AWS bucket, so it publishes the
+//! snapshot on its OWN endpoint, at the path that object is addressed by
+//! (`crate::state::patch_snapshots::snapshot_object_path`) — a path space no modelled
+//! operation of this `awsJson1_1` service uses, every one of which is addressed to `/`. Two
+//! seams carry it: [`Service::can_handle`] also claims a request addressed to a snapshot
+//! object, and [`Service::override_operation`] serves it through [`Snapshots`]. A download
+//! only READS: the bytes are the ones the snapshot was taken as.
+//!
 //! ## What this service adds to an ANSWER
 //!
 //! [`StatedPerOperation`] is also where the member the live wire renders on every step
@@ -74,9 +86,10 @@
 mod recorded_response_members;
 mod refusal;
 
-use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema_server::constraints::Violation;
 use aws_smithy_schema_server::ProtocolError;
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
     Refused, ServerHttpProtocol, Service,
@@ -96,6 +109,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// and built from the SAME shared engine, so a wrapped operation reads and writes the
     /// one store.
     stated: OperationRoutingTable,
+    /// Serves the snapshot download URLs `GetDeployablePatchSnapshotForInstance` announces,
+    /// from the bytes `crate::state` holds for each snapshot. Built from the SAME shared
+    /// engine, so a download reads the one store.
+    snapshots: Snapshots<Eng>,
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
@@ -286,6 +303,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             validate_cloud_connector::ValidateCloudConnector,
         );
         Self {
+            snapshots: Snapshots {
+                engine: Arc::clone(&engine),
+            },
             entry: crate::ServiceDefinition::new(engine),
             stated,
         }
@@ -429,6 +449,144 @@ where
     }
 }
 
+/// Serves one patch snapshot from the bytes [`crate::state::patch_snapshots`] holds for it.
+///
+/// This is the data plane behind the URL `GetDeployablePatchSnapshotForInstance` announces. It
+/// is NOT a modelled operation — AWS serves that object from a presigned S3 URL of its own
+/// snapshot bucket, and this emulator serves it at the path it published in that URL, on its
+/// OWN endpoint, because a URL it announces has to be one a node can reach. It only READS.
+///
+/// WHICH object a request addresses is decided by the key component this endpoint MINTED for
+/// that snapshot and handed to the one caller it answered, not by the ids the path carries
+/// (`crate::state::ComAmazonawsSsmAmazonssmState::addressed_patch_snapshot`): a request that
+/// was never handed the URL addresses no object, however well it guesses the Region, the node
+/// and the snapshot id, which is the reach a presigned URL's signature bounds on the real
+/// bucket.
+struct Snapshots<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for Snapshots<Eng> {
+    fn run<'r>(
+        &'r self,
+        _svc: &'r dyn Service,
+        req: &'r RtRequest,
+        _ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // An object is READ, so `GET` carries it and `HEAD` reports its metadata without
+            // the bytes; anything else is refused as the method it is.
+            if !matches!(req.method(), "GET" | "HEAD") {
+                return snapshot_error(405, "MethodNotAllowed", METHOD_NOT_ALLOWED_MESSAGE);
+            }
+            let Some(target) = snapshot_target(req) else {
+                return snapshot_error(404, "NoSuchKey", NO_SUCH_KEY_MESSAGE);
+            };
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return snapshot_error(
+                    500,
+                    "InternalServerError",
+                    "the patch snapshot store is unavailable",
+                );
+            };
+            let held = {
+                let store = state.lock();
+                store
+                    .addressed_patch_snapshot(&target)
+                    .map(|snapshot| snapshot.document.clone())
+            };
+            // A request this store holds no such object for names none: a snapshot never
+            // taken, one taken for another node than the path names, or a key component this
+            // endpoint minted for no snapshot of that node — which is every request that was
+            // not handed this URL.
+            let Some(document) = held else {
+                return snapshot_error(404, "NoSuchKey", NO_SUCH_KEY_MESSAGE);
+            };
+            snapshot_response(document.as_bytes(), req.method() == "GET")
+        })
+    }
+
+    /// Served UNSIGNED. A snapshot URL is handed to a node to fetch directly, so the fetch
+    /// carries no SigV4 `Authorization` header. The modelled operations are unaffected — the
+    /// router reads their schemes from the model, which this answer cannot weaken.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(&[])
+    }
+}
+
+/// What the snapshot plane says for an object it does not hold.
+const NO_SUCH_KEY_MESSAGE: &str = "The specified key does not exist.";
+
+/// What it says for a method a download does not answer.
+const METHOD_NOT_ALLOWED_MESSAGE: &str =
+    "The specified method is not allowed against this resource.";
+
+/// The snapshot a request to that plane names, or `None` when it names none.
+///
+/// The PATH is what says which snapshot is addressed, and `crate::state::patch_snapshots` reads
+/// it back from the same parts it builds the announced URL out of, so the URL this service
+/// mints and the request it serves cannot disagree about either. The path is taken by
+/// `service_common`'s one reader of a request URI, so this plane and every other service's
+/// claim read a URI the same way.
+fn snapshot_target(req: &RtRequest) -> Option<crate::state::patch_snapshots::SnapshotTarget> {
+    crate::state::patch_snapshots::parse_snapshot_target(::service_common::request_path(req.uri()))
+}
+
+/// Whether the request addresses an object of a published snapshot bucket.
+fn addresses_snapshot_object(req: &RtRequest) -> bool {
+    crate::state::patch_snapshots::addresses_snapshot_store(::service_common::request_path(
+        req.uri(),
+    ))
+}
+
+/// [`addresses_snapshot_object`] for the buffered request `can_handle` is handed, read by the
+/// same rule, so the claim and the serving seam cannot disagree about which requests belong to
+/// this plane.
+fn claims_snapshot_object(parts: &http::request::Parts) -> bool {
+    crate::state::patch_snapshots::addresses_snapshot_store(parts.uri.path())
+}
+
+/// Serve one held snapshot: its own bytes, under its own length.
+///
+/// `with_body` is false for a `HEAD`, which reports the object's metadata without its bytes.
+fn snapshot_response(bytes: &[u8], with_body: bool) -> RtResponse {
+    let body = if with_body {
+        SdkBody::from(bytes.to_vec())
+    } else {
+        SdkBody::empty()
+    };
+    let mut response = RtResponse::new(snapshot_status(200), body);
+    // A snapshot is the JSON document the snapshot was taken as
+    // (`crate::state::patch_snapshots::snapshot_document`).
+    response
+        .headers_mut()
+        .insert("content-type", "application/json");
+    response
+        .headers_mut()
+        .insert("content-length", bytes.len().to_string());
+    response
+}
+
+/// One refusal of a snapshot request, in this service's own JSON error envelope: the path is
+/// not a modelled operation, so there is no modelled error to render.
+fn snapshot_error(code: u16, error_code: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({ "__type": error_code, "message": message }).to_string();
+    let mut response = RtResponse::new(snapshot_status(code), SdkBody::from(body));
+    response
+        .headers_mut()
+        .insert("content-type", "application/json");
+    response
+        .headers_mut()
+        .insert("x-amzn-errortype", error_code.to_string());
+    response
+}
+
+/// A status that plane answers with. Every call site passes a constant, so the conversion
+/// cannot fail.
+fn snapshot_status(code: u16) -> StatusCode {
+    StatusCode::try_from(code).expect("the snapshot plane's statuses are valid constants")
+}
+
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
@@ -441,13 +599,26 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
+        //
+        // And claim a fetch of a snapshot this service announced a URL for: that URL is
+        // signed for this emulator's own endpoint, so such a request arrives here with this
+        // service's signing name in its presigned credential scope — but a fetch of one made
+        // with no scope at all is still this service's, which is why the PATH claims it too.
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+            None => claims_snapshot_object(parts),
         }
     }
 
     fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        // The snapshot plane is the one request of this service that names no modelled
+        // operation: a fetch of a URL this service handed out, addressed by PATH where every
+        // modelled operation of this `awsJson1_1` service is addressed to `/` with an
+        // `X-Amz-Target`. It decides the method itself, so a write to a snapshot's path is
+        // answered as the method it is rather than as a request naming no operation.
+        if addresses_snapshot_object(req) {
+            return Some(&self.snapshots as &dyn ErasedOperation);
+        }
         // NOT a re-route: the key is the one the generated table's own protocol resolves,
         // and the operation it names is the one served — wrapped in `StatedPerOperation` so
         // a refused request is worded the way this service words it. A key the model does

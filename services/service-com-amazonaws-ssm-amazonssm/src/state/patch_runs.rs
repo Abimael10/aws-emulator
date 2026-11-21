@@ -314,15 +314,27 @@ fn distribution_of_image<Eng: Send + Sync + 'static>(
     engine: &Eng,
     instance_id: &str,
 ) -> Option<&'static str> {
-    let ec2 = ec2::service_state(engine)?;
-    let store = ec2.lock();
-    let image_id = store.instances.get(instance_id)?.image_id.clone()?;
-    let name = store.images.get(&image_id)?.name.clone()?;
-    let name = name.to_ascii_lowercase();
+    let name = image_name(engine, instance_id)?.to_ascii_lowercase();
     DISTRIBUTION_IMAGE_NAMES
         .iter()
         .find(|(prefix, _)| name.starts_with(prefix))
         .map(|(_, operating_system)| *operating_system)
+}
+
+/// The NAME of the Amazon EC2 image the instance `instance_id` was launched from, or `None`
+/// when this engine holds no such instance, no such image, or an image published under no
+/// name at all.
+///
+/// The one place this endpoint reads that name: which distribution a node is patched against
+/// is read off it ([`distribution_of_image`]) and so is which release of that distribution a
+/// snapshot names ([`super::patch_snapshots::node_product`]), and both are the same fact about
+/// the same instance. Takes the Amazon EC2 store's guard, so it is asked with no guard of this
+/// service's own held.
+pub fn image_name<Eng: Send + Sync + 'static>(engine: &Eng, instance_id: &str) -> Option<String> {
+    let ec2 = ec2::service_state(engine)?;
+    let store = ec2.lock();
+    let image_id = store.instances.get(instance_id)?.image_id.clone()?;
+    store.images.get(&image_id)?.name.clone()
 }
 
 /// Perform `run` on the node `instance_id` of `region`, which is patched against

@@ -377,6 +377,14 @@ pub mod compliance_items;
 /// publishes for that is sent to one, and the compliance that run reports.
 pub mod patch_runs;
 
+/// The patch SNAPSHOT a managed node deploys its patch baseline from: what one holds, where
+/// this emulator serves it, and what a node's `Product` is.
+pub mod patch_snapshots;
+
+/// Whether a request was made BY the managed node it names — the question the calls a node's
+/// own agent makes ask about their caller.
+pub mod node_identity;
+
 /// The patching a State Manager association's run brings back: the compliance the
 /// patch-baseline document reports for a node one run has applied it on.
 pub mod association_patch_runs;
@@ -2381,6 +2389,15 @@ pub struct ComAmazonawsSsmAmazonssmState {
         maintenance_window_executions::MaintenanceWindowExecutionRecord,
     >,
 
+    /// Every patch snapshot this endpoint has taken, keyed by
+    /// `(region, node id, snapshot id)`: a snapshot is taken through one Region's endpoint,
+    /// for one node, under the id the caller asked for it with — one maintenance-window task
+    /// hands the same snapshot id to many nodes, so the node is part of the key. A
+    /// `BTreeMap` so a walk over them is stable and total. See [`patch_snapshots`], which is
+    /// also where what puts a record here — and what does not — is stated.
+    pub patch_snapshots:
+        BTreeMap<(String, String, String), patch_snapshots::PatchSnapshotRecord>,
+
     /// Every Session Manager session, keyed by `(region, session id)`: a session is started
     /// through one Region's endpoint and is reached there by the id the start minted
     /// ([`sessions::mint_session_id`]). A `BTreeMap` so a report walks a stable, total
@@ -2435,6 +2452,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             default_patch_baselines: BTreeMap::new(),
             patch_group_baselines: BTreeMap::new(),
             instance_patch_states: BTreeMap::new(),
+            patch_snapshots: BTreeMap::new(),
             resource_data_syncs: BTreeMap::new(),
             access_requests: BTreeMap::new(),
             access_request_sequence: 0,

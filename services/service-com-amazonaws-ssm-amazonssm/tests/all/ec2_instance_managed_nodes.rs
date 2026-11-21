@@ -260,6 +260,20 @@ impl Emulator {
         self.ssm_as(ACCOUNT_KEY, region, operation, body).await
     }
 
+    /// FETCH one address this emulator handed out, the way the caller it was handed to does:
+    /// a plain `GET` of that URL carrying no credentials of its own, because a presigned URL
+    /// carries its own in its query string.
+    pub(crate) async fn fetch(&self, url: &str) -> (u16, String) {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(url)
+            .body(Bytes::new())
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (status, String::from_utf8_lossy(response.body()).to_string())
+    }
+
     /// The same call, signed with `access_key_id` in the credential scope — which is where a
     /// service reads WHO the caller is.
     pub(crate) async fn ssm_as(
