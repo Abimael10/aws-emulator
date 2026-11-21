@@ -3954,6 +3954,16 @@ const MEMBERSHIP_IN_SYNC: &str = "in-sync";
 /// ([`ComAmazonawsRdsAmazonrdsv19State::parameter_apply_status`]).
 const PARAMETER_APPLY_STATUS_PENDING_REBOOT: &str = "pending-reboot";
 
+/// The `DBParameterGroupStatus$ParameterApplyStatus` of a DB parameter group RDS is still
+/// ATTACHING to the instance, which is what a modification that moves the instance to
+/// another group starts ("the parameter group name itself is changed immediately" —
+/// `ModifyDBInstance$DBParameterGroupName`).
+///
+/// Transient, like every other change this service owes: the attach is due
+/// [`STATUS_TRANSITION_DELAY`] after the modification, after which the membership rests at
+/// [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`] until a reboot applies the change.
+const PARAMETER_APPLY_STATUS_APPLYING: &str = "applying";
+
 /// The status RDS reports for a security-group membership that is in effect.
 const MEMBERSHIP_ACTIVE: &str = "active";
 
@@ -4034,15 +4044,20 @@ pub fn default_publicly_accessible(engine: &str, db_subnet_group_name: Option<&s
     }
 }
 
-/// The documented default for `StorageType` when the request omits it.
+/// The storage type a DB instance gets when the request names none.
 ///
-/// From `CreateDBInstanceMessage$StorageType`: "Default: `io1`, if the `Iops`
-/// parameter is specified. Otherwise, `gp3`."
+/// `CreateDBInstanceMessage$StorageType` states "Default: `io1`, if the `Iops` parameter is
+/// specified", and the recorded service provisions GENERAL PURPOSE SSD — `gp2`, the first
+/// value the member's own list publishes ("Valid Values: `gp2 | gp3 | io1 | io2 |
+/// standard`") — for a request that specifies neither, where that same sentence names `gp3`.
+/// The recorded answer is what the service does, so it is what this emulator provisions:
+/// such an instance reports `gp2` and, since `StorageThroughput` "applies only to the `gp3`
+/// storage type", no separate throughput ([`default_storage_throughput`]).
 pub fn default_storage_type(iops: Option<i32>) -> &'static str {
     if iops.is_some() {
         "io1"
     } else {
-        "gp3"
+        "gp2"
     }
 }
 

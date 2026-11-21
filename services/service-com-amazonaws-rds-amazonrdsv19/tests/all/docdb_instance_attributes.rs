@@ -305,6 +305,11 @@ async fn an_instance_of_this_doors_own_engine_keeps_reporting_what_its_request_c
         ("MasterUsername", "ownadmin"),
         ("PubliclyAccessible", "true"),
         ("LicenseModel", "postgresql-license"),
+        // The two flags are reported for EVERY instance, each read off the network the
+        // instance is in and the HTTP endpoint it has: this one is in a VPC of its own
+        // and, belonging to no cluster, has no HTTP endpoint.
+        ("VPCNetworkingEnabled", "true"),
+        ("HttpEndpointEnabled", "false"),
     ] {
         let actual = optional_text(&created, member);
         assert_eq!(
@@ -312,16 +317,6 @@ async fn an_instance_of_this_doors_own_engine_keeps_reporting_what_its_request_c
             Some(expected),
             "case \"rds instance\": expected {member}={expected:?}, got {actual:?} in \
              {created}"
-        );
-    }
-    // Neither added member is reported for an instance of an engine whose own control
-    // plane publishes no such flag.
-    for member in ["VPCNetworkingEnabled", "HttpEndpointEnabled"] {
-        let actual = optional_text(&created, member);
-        assert_eq!(
-            actual, None,
-            "case \"rds instance\": {member} belongs to a sibling control plane's \
-             instances, got {actual:?} in {created}"
         );
     }
 }

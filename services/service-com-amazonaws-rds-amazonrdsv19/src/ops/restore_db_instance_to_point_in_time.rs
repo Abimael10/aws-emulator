@@ -863,6 +863,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 deletion_protection: input.deletion_protection.unwrap_or(false),
                 db_subnet_group_name,
                 db_parameter_group_name,
+                // The restored instance is provisioned IN the group it names, so nothing
+                // waits for a reboot to be applied.
+                db_parameter_group_attached_at: None,
                 option_group_name,
                 vpc_security_group_ids: input
                     .vpc_security_group_ids

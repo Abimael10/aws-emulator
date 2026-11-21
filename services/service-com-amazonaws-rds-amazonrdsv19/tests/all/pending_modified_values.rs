@@ -267,9 +267,17 @@ async fn settled_instance(
     .await
 }
 
-/// What `instance` reports as pending, or `None` when it reports no pending element at all.
+/// What `instance` reports as pending, or `None` when it reports no pending change.
+///
+/// The element itself is reported on every instance envelope — "specific changes are
+/// identified by subelements", and an instance with nothing pending carries it with no
+/// subelement inside — so an EMPTY element is what "nothing is pending" reads as here.
 fn pending(instance: &str) -> Option<String> {
-    subtrees(instance, "PendingModifiedValues").into_iter().next()
+    subtrees(instance, "PendingModifiedValues")
+        .into_iter()
+        .zip(texts(instance, "PendingModifiedValues"))
+        .find(|(_, inside)| !inside.trim().is_empty())
+        .map(|(staged, _)| staged)
 }
 
 #[tokio::test]

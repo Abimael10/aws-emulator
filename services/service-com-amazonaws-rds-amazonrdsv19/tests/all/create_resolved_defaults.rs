@@ -18,10 +18,10 @@
 //!   default VPC — which reports that VPC and the default subnets the service that OWNS
 //!   subnets holds for it. An instance that joins a DB cluster takes the cluster's group,
 //!   and one that names a group takes the named one.
-//! * `PendingModifiedValues` is "returned only when there are pending changes": a resource
-//!   still being provisioned with a master credential reports that credential as pending,
-//!   masked because the member is `@sensitive`, and a resource with nothing pending reports
-//!   no such element at all.
+//! * `PendingModifiedValues` carries one subelement per pending change — "specific changes
+//!   are identified by subelements": a resource still being provisioned with a master
+//!   credential reports that credential as pending, masked because the member is
+//!   `@sensitive`, and a resource with nothing pending reports the element EMPTY.
 //! * `MasterUserPassword` and `ManageMasterUserPassword` are mutually exclusive, and a
 //!   request carrying both is refused — HTTP 400 `InvalidParameterValue` with one fixed
 //!   sentence — by EVERY front door that publishes both members, before anything is
@@ -485,7 +485,14 @@ async fn a_master_credential_still_being_applied_is_the_only_pending_value() {
         } else {
             the_instance(case, &created)
         };
-        let pending = subtrees(&envelope, "PendingModifiedValues");
+        // The element is reported on every envelope, with one subelement per pending
+        // change, so a resource with nothing pending carries it EMPTY.
+        let pending: Vec<String> = subtrees(&envelope, "PendingModifiedValues")
+            .into_iter()
+            .zip(texts(&envelope, "PendingModifiedValues"))
+            .filter(|(_, inside)| !inside.trim().is_empty())
+            .map(|(staged, _)| staged)
+            .collect();
         if *with_password {
             let pending = pending.into_iter().next().unwrap_or_else(|| {
                 panic!(
@@ -533,7 +540,9 @@ async fn a_master_credential_still_being_applied_is_the_only_pending_value() {
             the_instance(case, &body)
         };
         assert!(
-            subtrees(&envelope, "PendingModifiedValues").is_empty(),
+            texts(&envelope, "PendingModifiedValues")
+                .iter()
+                .all(|inside| inside.trim().is_empty()),
             "case {case:?}: a resource that is up has nothing pending, got {envelope}"
         );
     }

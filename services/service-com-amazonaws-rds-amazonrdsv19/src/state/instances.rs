@@ -26,29 +26,48 @@ pub fn standby_availability_zone(region: &str, primary: &str, multi_az: bool) ->
         .find(|zone| zone != primary)
 }
 
-/// The members an instance reports from its CLUSTER and its ENGINE rather than from its own
-/// record, for an instance whose control plane models none of them
-/// ([`instance_attributes_are_cluster_managed`]).
+/// Whether a DB cluster running `engine` MANAGES its members' storage, port, master user
+/// and initial database, so that a member of it reports that cluster's values and none of
+/// its own.
 ///
-/// Such a request cannot carry storage, a port, a public-access flag, a licence or a master
-/// user, so whatever the record holds for one of those is the generic default of a member
-/// that create could not set: the instance's storage is the one its cluster manages, its
-/// master user is its cluster's, and the rest are what its engine publishes. Resolved once
-/// for one projection, so every operation that reports such an instance reports the same
-/// values.
+/// `CreateDBInstance` states the rule member by member: `AllocatedStorage` and `StorageType`
+/// "doesn't apply to Amazon Aurora DB instances" because "storage is managed by the DB
+/// cluster", `Port` "doesn't apply to Aurora DB instances. The port number is managed by the
+/// cluster", `MasterUsername` "doesn't apply to Amazon Aurora DB instances. The name for the
+/// master user is managed by the DB cluster", and `DBName` on such a create names "the
+/// database to create when the primary DB instance of the … DB cluster is created", which is
+/// the cluster's database.
+///
+/// So it holds for every AURORA-STYLE cluster — the Aurora engines, and the engines of the
+/// two sibling control planes this front door serves, whose clusters are Aurora-style too —
+/// and not for a Multi-AZ DB cluster, which is created with "the amount of storage in
+/// gibibytes (GiB) to allocate to each DB instance in the Multi-AZ DB cluster" and whose
+/// members therefore have storage of their own ([`is_multi_az_db_cluster`]).
+pub fn cluster_manages_member_attributes(engine: &str) -> bool {
+    !is_multi_az_db_cluster(engine)
+}
+
+/// The members an instance reports from its CLUSTER and its ENGINE rather than from its own
+/// record.
+///
+/// Two kinds of instance report them. A member of a cluster that MANAGES those settings
+/// ([`cluster_manages_member_attributes`]), whose create could carry none of them, so
+/// whatever its record holds for one of them is the generic default of a member nothing
+/// set. And an instance of an engine whose own control plane models none of them at all
+/// ([`instance_attributes_are_cluster_managed`]), which additionally takes its licence model
+/// and its public-access flag from what that engine publishes. Resolved once for one
+/// projection, so every operation that reports such an instance reports the same values.
 ///
 /// `cluster` is `None` for a member whose cluster this store no longer holds, which leaves
-/// the members read OFF that record — its storage size, its storage type and its master
-/// user — unreported rather than invented. The two flags stay the engine's own reading even
-/// then: every resource of it runs inside a virtual private cloud, and none of them has an
-/// HTTP endpoint.
+/// the members read OFF that record — its storage size, its storage type, its master user,
+/// its database name and its encryption type — unreported rather than invented.
 struct ClusterManagedAttributes {
     /// `AllocatedStorage`: the size the CLUSTER reports, since the instance's data sits on
     /// the cluster's storage ([`DbClusterRecord::reported_allocated_storage`]).
     allocated_storage: Option<i32>,
     /// `StorageType`: the type the cluster manages that storage on, which for a cluster
     /// created without one is the default its own `StorageType` publishes
-    /// ([`SIBLING_CLUSTER_DEFAULT_STORAGE_TYPE`]).
+    /// ([`default_db_cluster_storage_type`]).
     storage_type: Option<String>,
     /// `StorageThroughput`: throughput is provisioned with INSTANCE storage, and a
     /// cluster's storage throughput is "not configurable", so none is provisioned here —
@@ -57,37 +76,41 @@ struct ClusterManagedAttributes {
     storage_throughput: i32,
     /// `MasterUsername`: the master user of the cluster, the only one a member has.
     master_username: Option<String>,
-    /// `LicenseModel`: the one value the engine's catalogue publishes
-    /// ([`cluster_managed_license_model`]).
-    license_model: Option<&'static str>,
+    /// `DBName`: the database the CLUSTER was created with, the only one a member has.
+    db_name: Option<String>,
+    /// `StorageEncryptionType`: how the data at rest on the cluster's volume is protected,
+    /// which is the CLUSTER's reading of it ([`DbClusterRecord::storage_encryption_type`]).
+    storage_encryption_type: Option<&'static str>,
+    /// `LicenseModel`: the one value the engine's catalogue publishes, for an engine whose
+    /// control plane models no `LicenseModel` at all ([`cluster_managed_license_model`]);
+    /// `None` leaves the instance reporting its own.
+    license_model: Option<Option<&'static str>>,
     /// `PubliclyAccessible`: `com.amazonaws.docdb#DBInstance$PubliclyAccessible` states
-    /// that the value "is always `false`" for this engine, which supports no public
-    /// endpoint at all.
-    publicly_accessible: bool,
-    /// `VPCNetworkingEnabled`: whether the CLUSTER this instance belongs to runs inside a
-    /// virtual private cloud, which every cluster of this engine does.
-    vpc_networking_enabled: bool,
-    /// `HttpEndpointEnabled`: whether an HTTP endpoint answers for that cluster.
-    http_endpoint_enabled: bool,
+    /// that the value "is always `false`" for that engine, which supports no public
+    /// endpoint at all; `None` leaves the instance reporting its own flag, which the
+    /// Aurora engines' own requests do carry.
+    publicly_accessible: Option<bool>,
 }
 
 impl ClusterManagedAttributes {
     /// Resolve them for an instance of `engine` that belongs to `cluster`.
     fn of(engine: &str, cluster: Option<&DbClusterRecord>) -> Self {
+        // The two members an engine whose own control plane models neither of them fixes,
+        // which are the instance's own on every other engine.
+        let engine_fixes_them = instance_attributes_are_cluster_managed(engine);
         Self {
             allocated_storage: cluster.and_then(DbClusterRecord::reported_allocated_storage),
-            storage_type: cluster.map(|cluster| {
-                cluster
-                    .storage_type
-                    .clone()
-                    .unwrap_or_else(|| SIBLING_CLUSTER_DEFAULT_STORAGE_TYPE.to_string())
+            storage_type: cluster.and_then(|cluster| {
+                cluster.storage_type.clone().or_else(|| {
+                    default_db_cluster_storage_type(&cluster.engine).map(str::to_string)
+                })
             }),
             storage_throughput: 0,
             master_username: cluster.and_then(|cluster| cluster.master_username.clone()),
-            license_model: cluster_managed_license_model(engine),
-            publicly_accessible: false,
-            vpc_networking_enabled: cluster.is_none_or(|cluster| cluster.vpc_networking_enabled),
-            http_endpoint_enabled: cluster.is_some_and(|cluster| cluster.http_endpoint_enabled),
+            db_name: cluster.and_then(|cluster| cluster.database_name.clone()),
+            storage_encryption_type: cluster.map(DbClusterRecord::storage_encryption_type),
+            license_model: engine_fixes_them.then(|| cluster_managed_license_model(engine)),
+            publicly_accessible: engine_fixes_them.then_some(false),
         }
     }
 }
@@ -177,6 +200,17 @@ pub struct DbInstanceRecord {
     /// The DB parameter group applied to the instance: the one the request named, or
     /// the default group of the engine version it was created with.
     pub db_parameter_group_name: Option<String>,
+    /// When the group a modification SWITCHED this instance to finishes being attached, for
+    /// an instance that has been moved to another group and not rebooted since.
+    ///
+    /// `ModifyDBInstance$DBParameterGroupName` is the rule: "the parameter group name itself
+    /// is changed immediately, but the actual parameter changes are not applied until you
+    /// reboot the instance without failover" — so the switch is a change the group's
+    /// membership reports until that reboot happens
+    /// ([`Self::parameter_apply_status`]), and the attach itself takes the span every
+    /// transition this service owes takes. `None` for an instance whose group nothing has
+    /// switched since its engine last came up, which has no such change to apply.
+    pub db_parameter_group_attached_at: Option<Instant>,
     /// The option group applied to the instance: the one the request named, or the
     /// default group of its engine and major engine version. It is a REFERENCE, which
     /// is what keeps a group an instance uses from being deleted under it
@@ -324,6 +358,15 @@ impl DbInstanceRecord {
                 // performs on it, and a status the clock just made due is one of them.
                 self.engine_log
                     .record(format!("DB instance status is now {status}"));
+                // "Rebooting a DB instance results in a momentary outage, during which the
+                // DB instance status is set to rebooting" and "restarts the database engine
+                // service": the engine's new run begins when that outage is OVER, not when
+                // the reboot was accepted, so a parameter change the reboot applies is
+                // still waiting for it while the instance is out
+                // ([`Self::parameter_apply_status`]).
+                if self.status == DB_INSTANCE_STATUS_REBOOTING {
+                    self.restart_engine();
+                }
                 self.status = status;
                 // A reboot "conducted through a Multi-AZ failover" promotes the standby, and
                 // the promotion is part of coming back up: the zones have traded places by
@@ -381,6 +424,35 @@ impl DbInstanceRecord {
             }
             None => false,
         }
+    }
+
+    /// The instance's database engine comes UP: the run every parameter value the engine is
+    /// serving is read against, which is what `pg_postmaster_start_time()` reports.
+    ///
+    /// A parameter change that was waiting for a reboot is in force from this instant, and so
+    /// is the group a modification switched the instance to — "the actual parameter changes
+    /// are not applied until you reboot the instance without failover"
+    /// ([`Self::parameter_apply_status`]), and this is that reboot having happened.
+    pub fn restart_engine(&mut self) {
+        self.engine_started_at = now_as_wire_timestamp();
+        self.db_parameter_group_attached_at = None;
+    }
+
+    /// Record that a modification MOVED this instance to another DB parameter group.
+    ///
+    /// `ModifyDBInstance$DBParameterGroupName`: "The parameter group name itself is changed
+    /// immediately, but the actual parameter changes are not applied until you reboot the
+    /// instance without failover." So the attach is owed the span every transition this
+    /// service owes takes, and the change it carries waits for a reboot after that
+    /// ([`Self::parameter_apply_status`] reports both halves).
+    pub fn switch_db_parameter_group(&mut self, name: String) {
+        if self.db_parameter_group_name.as_deref() == Some(name.as_str()) {
+            // The group the instance is already in: nothing is attached and nothing waits
+            // for a reboot, because nothing changed.
+            return;
+        }
+        self.db_parameter_group_name = Some(name);
+        self.db_parameter_group_attached_at = Some(Instant::now() + STATUS_TRANSITION_DELAY);
     }
 
     /// Place this instance's Multi-AZ standby, or take it away: a Multi-AZ deployment has a
@@ -517,20 +589,34 @@ impl DbInstanceRecord {
     /// `DBParameterGroupStatus$ParameterApplyStatus` for the group this instance names:
     /// whether the values that group holds are the ones its engine is RUNNING.
     ///
-    /// `ModifyDBParameterGroup` documents the rule: "changes to dynamic parameters are
-    /// applied immediately" while "changes to static parameters require a reboot ... before
-    /// the change can take effect". So a group holding a change this instance's engine has
-    /// not come up again since — one whose apply method or published apply type makes it
-    /// pending ([`change_is_pending_for`]), set after the engine last started — leaves the
-    /// membership `pending-reboot`, which is what tells a caller that a reboot is what applies
-    /// it; every other membership is `in-sync`. Decided by the SAME comparison the engine data
-    /// plane makes when it picks the value it is running
-    /// ([`data_plane::pg_server::running_parameters`]), so the status a caller reads and the
-    /// value a session reads cannot disagree.
+    /// Two changes leave the membership out of sync, and both are documented as waiting for a
+    /// reboot. `ModifyDBInstance$DBParameterGroupName` is the first: when a modification moves
+    /// the instance to another group, "the parameter group name itself is changed immediately,
+    /// but the actual parameter changes are not applied until you reboot the instance without
+    /// failover" — so while RDS is still attaching that group the membership is `applying`,
+    /// and once attached it rests at `pending-reboot` until the engine comes up again
+    /// ([`Self::switch_db_parameter_group`], [`Self::restart_engine`]).
+    /// `ModifyDBParameterGroup` is the second: "changes to dynamic parameters are applied
+    /// immediately" while "changes to static parameters require a reboot ... before the change
+    /// can take effect", so a group holding a change this instance's engine has not come up
+    /// again since — one whose apply method or published apply type makes it pending
+    /// ([`change_is_pending_for`]), set after the engine last started — is `pending-reboot`
+    /// too. Every other membership is `in-sync`.
+    ///
+    /// The second half is decided by the SAME comparison the engine data plane makes when it
+    /// picks the value it is running ([`data_plane::pg_server::running_parameters`]), so the
+    /// status a caller reads and the value a session reads cannot disagree.
     pub fn parameter_apply_status(
         &self,
         db_parameter_group: Option<&DbParameterGroupRecord>,
     ) -> &'static str {
+        if let Some(attached_at) = self.db_parameter_group_attached_at {
+            return if Instant::now() < attached_at {
+                PARAMETER_APPLY_STATUS_APPLYING
+            } else {
+                PARAMETER_APPLY_STATUS_PENDING_REBOOT
+            };
+        }
         let pending = db_parameter_group.is_some_and(|group| {
             group.parameters.iter().any(|(name, setting)| {
                 let spec = published_db_parameter(&group.family, name)
@@ -683,9 +769,10 @@ impl DbInstanceRecord {
     /// for the DB instance") reports, masked because the member is `@sensitive`
     /// ([`MASKED_PENDING_MASTER_USER_PASSWORD`]).
     ///
-    /// `None` once nothing is pending — the structure "is returned only when there are
-    /// pending changes" — so an EMPTY element never claims there are changes whose
-    /// subelements this answer does not identify.
+    /// The element is reported on EVERY instance envelope, as the recorded service reports
+    /// it: an instance with nothing pending carries it EMPTY — "specific changes are
+    /// identified by subelements", and an element with no subelement identifies no change —
+    /// rather than being left out.
     pub fn pending_modified_values(&self) -> Option<PendingModifiedValues> {
         let staged = self
             .deferred_modification
@@ -704,29 +791,73 @@ impl DbInstanceRecord {
                 master_user_password: Some(MASKED_PENDING_MASTER_USER_PASSWORD.to_string()),
                 ..PendingModifiedValues::default()
             }),
-            (None, false) => None,
+            (None, false) => Some(PendingModifiedValues::default()),
         }
+    }
+
+    /// `VPCNetworkingEnabled`: whether the instance runs inside a virtual private cloud.
+    ///
+    /// Every DB instance RDS creates now runs in one — `DBSecurityGroups` "applies to the
+    /// legacy EC2-Classic platform, which is no longer used to create new DB instances" —
+    /// so the flag is set for every instance this service holds. A MEMBER of a DB cluster
+    /// reports its cluster's network instead, which is the network it is placed in: a
+    /// cluster restored without a VPC network interface
+    /// (`RestoreDBClusterFromSnapshot$EnableVPCNetworking`) has it off, and so do its
+    /// members.
+    pub fn vpc_networking_enabled(&self, db_cluster: Option<&DbClusterRecord>) -> bool {
+        db_cluster.is_none_or(|cluster| cluster.vpc_networking_enabled)
+    }
+
+    /// `HttpEndpointEnabled`: whether an HTTP endpoint answers for the instance.
+    ///
+    /// The HTTP endpoint is the RDS Data API, and `EnableHttpEndpoint` is a DB CLUSTER
+    /// setting (`ModifyDBCluster$EnableHttpEndpoint`, `EnableHttpEndpoint`/
+    /// `DisableHttpEndpoint`): no operation enables one for a DB instance. So a member of a
+    /// cluster reports whether that cluster's endpoint answers, and an instance that belongs
+    /// to no cluster has no HTTP endpoint at all.
+    pub fn http_endpoint_enabled(&self, db_cluster: Option<&DbClusterRecord>) -> bool {
+        db_cluster.is_some_and(|cluster| cluster.http_endpoint_enabled)
+    }
+
+    /// `StorageEncryptionType`: how the data at rest of this instance is protected, or
+    /// `None` for an instance whose data at rest is not encrypted, which reports no type.
+    ///
+    /// The member publishes three values: "`sse-kms` - The DB instance is encrypted using a
+    /// customer managed KMS key or Amazon Web Services managed KMS key", which is what an
+    /// instance created with `StorageEncrypted` is, and "`sse-rds` - The DB instance is
+    /// encrypted using an Amazon Web Services owned KMS key", which is what a cluster volume
+    /// RDS encrypts itself is. A MEMBER of a cluster has its data on that CLUSTER's volume,
+    /// so it reports the cluster's reading of the same storage
+    /// ([`DbClusterRecord::storage_encryption_type`]) and the two cannot disagree.
+    fn storage_encryption_type(
+        &self,
+        cluster_managed: Option<&ClusterManagedAttributes>,
+    ) -> Option<&'static str> {
+        let reported = match cluster_managed.and_then(|managed| managed.storage_encryption_type) {
+            Some(cluster) => cluster,
+            None if self.storage_encrypted => STORAGE_ENCRYPTION_TYPE_SSE_KMS,
+            None => STORAGE_ENCRYPTION_TYPE_NONE,
+        };
+        (reported != STORAGE_ENCRYPTION_TYPE_NONE).then_some(reported)
     }
 
     /// `DbInstancePort`: "The port that the DB instance listens on. If the DB instance
     /// is part of a DB cluster, this can be a different port than the DB cluster port."
     ///
-    /// The member reports the port of a CLUSTER MEMBER, which is why it is separate from
-    /// `Endpoint.Port`: an instance that belongs to no DB cluster has no such port, and
-    /// RDS reports zero for it. It reports the CONFIGURED port — the one `Port` and
-    /// `DBPortNumber` set, which the record keeps — where `Endpoint.Port` reports the
-    /// port the instance's engine listener was assigned ([`Self::published_port`]): the
-    /// endpoint has to be the one a client can reach, and this member is what still says
-    /// which port the request asked the instance to listen on.
-    pub fn db_instance_port(&self) -> i32 {
-        // An instance whose port is its CLUSTER's has none of its own: its control plane
-        // models no `Port` member at all, so no request could set one, and the port a
-        // client dials is the cluster's, which `Endpoint$Port` reports.
-        if instance_attributes_are_cluster_managed(&self.engine) {
-            return 0;
-        }
-        match self.db_cluster_identifier {
+    /// The member reports the port a cluster member listens on OF ITS OWN, which is why it
+    /// is separate from `Endpoint.Port`: an instance that belongs to no DB cluster has no
+    /// such port and RDS reports zero for it, and so does a member whose port its CLUSTER
+    /// manages — `Port` "doesn't apply to Aurora DB instances. The port number is managed by
+    /// the cluster", so such a member cannot be listening on a port of its own and the port
+    /// a client dials is the cluster's. Only a member whose own request could set a port
+    /// reports the CONFIGURED one — the port `Port` and `DBPortNumber` set, which the record
+    /// keeps — where `Endpoint.Port` reports the port the instance's engine listener was
+    /// assigned ([`Self::published_port`]).
+    pub fn db_instance_port(&self, db_cluster: Option<&DbClusterRecord>) -> i32 {
+        match db_cluster {
+            Some(cluster) if cluster_manages_member_attributes(&cluster.engine) => 0,
             Some(_) => self.endpoint_port,
+            // An instance that belongs to no DB cluster has no cluster-member port at all.
             None => 0,
         }
     }
@@ -827,24 +958,26 @@ impl DbInstanceRecord {
     /// about the group and this instance's engine run together.
     /// `db_cluster` is the DB CLUSTER this instance is a member of, read by the store for
     /// this projection ([`ComAmazonawsRdsAmazonrdsv19State::db_cluster_of`]): an instance
-    /// whose storage and master user belong to its cluster
-    /// ([`instance_attributes_are_cluster_managed`]) reports THAT record's values, so the
-    /// member and the cluster cannot disagree about storage the cluster manages for both.
+    /// whose storage, port, master user and database its cluster manages
+    /// ([`cluster_manages_member_attributes`]) reports THAT record's values, so the member
+    /// and the cluster cannot disagree about storage the cluster manages for both.
     pub fn to_wire(
         &self,
         db_subnet_group: Option<&DbSubnetGroupRecord>,
         db_parameter_group: Option<&DbParameterGroupRecord>,
         db_cluster: Option<&DbClusterRecord>,
     ) -> DBInstance {
-        // An instance ordered through a control plane that models no instance-level
-        // storage, port, public-access, license or master-user member at all: every one of
-        // those is its CLUSTER's or its engine's, so they are projected from the cluster
-        // record and from what that engine publishes rather than from what this record was
-        // created with. `None` for an instance of one of this front door's own engines,
-        // whose request carried each of them.
-        let cluster_managed = instance_attributes_are_cluster_managed(&self.engine)
-            .then_some(db_cluster)
-            .map(|cluster| ClusterManagedAttributes::of(&self.engine, cluster));
+        // The members this instance reports from its CLUSTER rather than from its own
+        // record: a member of a cluster that manages its storage, port, master user and
+        // database reports that cluster's, and an instance of an engine whose own control
+        // plane models none of those members takes its licence model and public-access flag
+        // from what that engine publishes as well. `None` for an instance that belongs to
+        // no such cluster, whose own request carried each of them.
+        let cluster_managed = (db_cluster
+            .is_some_and(|cluster| cluster_manages_member_attributes(&cluster.engine))
+            || instance_attributes_are_cluster_managed(&self.engine))
+        .then_some(db_cluster)
+        .map(|cluster| ClusterManagedAttributes::of(&self.engine, cluster));
         DBInstance {
             db_instance_identifier: Some(self.identifier.clone()),
             db_instance_class: Some(self.db_instance_class.clone()),
@@ -861,7 +994,18 @@ impl DbInstanceRecord {
                 .master_user_secret
                 .as_ref()
                 .map(ManagedMasterSecret::to_wire),
-            db_name: self.db_name.clone(),
+            // `DBName`: "the initial database name that you provided (if required) when you
+            // created the DB instance" — and for a member whose database its cluster
+            // manages, the database that CLUSTER was created with.
+            db_name: cluster_managed.as_ref().map_or_else(
+                || self.db_name.clone(),
+                |managed| managed.db_name.clone(),
+            ),
+            // How the data at rest of this instance is protected
+            // ([`Self::storage_encryption_type`]).
+            storage_encryption_type: self
+                .storage_encryption_type(cluster_managed.as_ref())
+                .map(str::to_string),
             endpoint: Some(Endpoint {
                 address: Some(self.endpoint_address()),
                 port: Some(self.published_port()),
@@ -870,23 +1014,20 @@ impl DbInstanceRecord {
                     endpoint_domain(&self.engine),
                 )),
             }),
-            // The storage this instance's data sits on, in gibibytes: the size the request
-            // asked for, and for an instance whose request could carry no size at all the
-            // size its CLUSTER reports for the storage it manages.
-            allocated_storage: self.allocated_storage.or_else(|| {
-                cluster_managed
-                    .as_ref()
-                    .and_then(|managed| managed.allocated_storage)
-            }),
+            // The storage this instance's data sits on, in gibibytes: the size its CLUSTER
+            // reports for the storage it manages where the cluster manages it — the setting
+            // "doesn't apply" to such an instance, so its own request could carry no size —
+            // and otherwise the size the request asked for.
+            allocated_storage: cluster_managed.as_ref().map_or_else(
+                || self.allocated_storage,
+                |managed| managed.allocated_storage.or(self.allocated_storage),
+            ),
             // Whether the instance runs in a virtual private cloud, and whether an HTTP
-            // endpoint answers for it: both are facts about the CLUSTER a member belongs
-            // to, reported only for an instance whose control plane publishes them.
-            vpc_networking_enabled: cluster_managed
-                .as_ref()
-                .map(|managed| managed.vpc_networking_enabled),
-            http_endpoint_enabled: cluster_managed
-                .as_ref()
-                .map(|managed| managed.http_endpoint_enabled),
+            // endpoint answers for it: reported for every instance, each read off the
+            // network and the endpoint the instance actually has
+            // ([`Self::vpc_networking_enabled`], [`Self::http_endpoint_enabled`]).
+            vpc_networking_enabled: Some(self.vpc_networking_enabled(db_cluster)),
+            http_endpoint_enabled: Some(self.http_endpoint_enabled(db_cluster)),
             instance_create_time: Some(self.instance_create_time),
             preferred_backup_window: self.preferred_backup_window.clone(),
             backup_retention_period: Some(self.backup_retention_period),
@@ -942,16 +1083,11 @@ impl DbInstanceRecord {
             // `DescribeDBSubnetGroups` reports for the same group.
             db_subnet_group: db_subnet_group.map(DbSubnetGroupRecord::to_wire),
             preferred_maintenance_window: self.preferred_maintenance_window.clone(),
-            // `PendingModifiedValues` is "returned only when there are pending changes":
-            // what this instance still has pending, and nothing at all once it has none
-            // ([`Self::pending_modified_values`]) — except on an instance whose control
-            // plane reports the element on every instance it returns, where one with
-            // nothing pending carries it EMPTY, the form that identifies no change.
-            pending_modified_values: self.pending_modified_values().or_else(|| {
-                cluster_managed
-                    .as_ref()
-                    .map(|_| PendingModifiedValues::default())
-            }),
+            // `PendingModifiedValues`: what this instance still has pending, reported on
+            // every envelope and EMPTY for one with nothing pending — "specific changes
+            // are identified by subelements", so an element with no subelement is the form
+            // that identifies no change ([`Self::pending_modified_values`]).
+            pending_modified_values: self.pending_modified_values(),
             upgrade_rollout_order: Some(DEFAULT_UPGRADE_ROLLOUT_ORDER.to_string()),
             multi_az: Some(self.multi_az),
             engine_version: self.engine_version.clone(),
@@ -979,24 +1115,32 @@ impl DbInstanceRecord {
             // `ReplicaMode`: the open mode of a read replica of an engine that has one
             // ([`Self::replica_mode`]).
             replica_mode: self.replica_mode(),
-            license_model: cluster_managed.as_ref().map_or_else(
-                || self.license_model.clone(),
-                |managed| managed.license_model.map(str::to_string),
-            ),
+            // `LicenseModel` and `PubliclyAccessible`: the values the instance's own
+            // request carried, except on an engine whose control plane models neither and
+            // publishes one value for each.
+            license_model: match cluster_managed
+                .as_ref()
+                .and_then(|managed| managed.license_model)
+            {
+                Some(published) => published.map(str::to_string),
+                None => self.license_model.clone(),
+            },
             iops: cluster_managed.as_ref().map_or(self.iops, |_| None),
             storage_throughput: Some(cluster_managed.as_ref().map_or(
                 self.storage_throughput,
                 |managed| managed.storage_throughput,
             )),
-            publicly_accessible: Some(cluster_managed.as_ref().map_or(
-                self.publicly_accessible,
-                |managed| managed.publicly_accessible,
-            )),
+            publicly_accessible: Some(
+                cluster_managed
+                    .as_ref()
+                    .and_then(|managed| managed.publicly_accessible)
+                    .unwrap_or(self.publicly_accessible),
+            ),
             storage_type: cluster_managed.as_ref().map_or_else(
                 || Some(self.storage_type.clone()),
                 |managed| managed.storage_type.clone(),
             ),
-            db_instance_port: Some(self.db_instance_port()),
+            db_instance_port: Some(self.db_instance_port(db_cluster)),
             // `PromotionTier`: the failover order of a cluster member
             // ([`Self::promotion_tier`]).
             promotion_tier: self.promotion_tier(),

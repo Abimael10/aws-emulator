@@ -257,9 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // next settle, which every handler runs before it reads the store.
         record.apply_deferred_modification();
         // "Rebooting a DB instance restarts the database engine service": the engine's run
-        // starts again here, which is what `pg_postmaster_start_time()` reports and what
-        // puts a parameter change that was waiting for a reboot into force.
-        record.engine_started_at = crate::state::now_as_wire_timestamp();
+        // starts again when the momentary outage is OVER — the instant the clock owes the
+        // instance `available` above — so a parameter change that was waiting for a reboot
+        // is still waiting while the instance is out, and is in force once it is back up
+        // ([`crate::state::DbInstanceRecord::restart_engine`], called from the settle).
         let instance_arn = record.arn();
         let db_instance = record.to_wire(
             db_subnet_group.as_ref(),

@@ -710,6 +710,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or(source.deletion_protection),
                 db_subnet_group_name: db_subnet_group_name.or(source.db_subnet_group_name.clone()),
                 db_parameter_group_name,
+                // The replica is provisioned IN the group it names, so nothing is being
+                // attached to a running engine and nothing waits for a reboot.
+                db_parameter_group_attached_at: None,
                 option_group_name,
                 vpc_security_group_ids: input
                     .vpc_security_group_ids
@@ -1397,6 +1400,8 @@ fn resolve_source_cluster(
         db_subnet_group_name: cluster.db_subnet_group_name.clone(),
         db_parameter_group_name: resolved_version
             .map(|entry| crate::state::default_db_parameter_group_name(entry.parameter_group_family)),
+        // Provisioned IN that group, so nothing waits for a reboot to be applied.
+        db_parameter_group_attached_at: None,
         option_group_name: cluster.option_group_name.clone().or_else(|| {
             resolved_version.map(|entry| {
                 crate::state::default_option_group_name(&cluster.engine, entry.major_engine_version)

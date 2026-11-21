@@ -133,6 +133,7 @@ mod tests {
             deletion_protection: false,
             db_subnet_group_name: None,
             db_parameter_group_name: None,
+            db_parameter_group_attached_at: None,
             option_group_name: None,
             vpc_security_group_ids: Vec::new(),
             db_security_group_names: Vec::new(),

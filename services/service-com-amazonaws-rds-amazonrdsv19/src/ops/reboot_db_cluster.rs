@@ -263,7 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 instance.pending_status = Some(crate::state::PendingStatus::in_a_moment(
                     crate::state::DB_INSTANCE_STATUS_AVAILABLE,
                 ));
-                instance.engine_started_at = crate::state::now_as_wire_timestamp();
+                // Each member's engine comes up again when its own momentary outage is
+                // over, which the settle of the status above performs
+                // ([`crate::state::DbInstanceRecord::restart_engine`]).
             }
         }
         // The sessions the engines held do not survive the restart, and whatever they had

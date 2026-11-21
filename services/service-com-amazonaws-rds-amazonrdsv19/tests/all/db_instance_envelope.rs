@@ -29,7 +29,7 @@ use service_com_amazonaws_rds_amazonrdsv19::state::STATUS_TRANSITION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{
-    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, REGION,
+    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts, REGION,
 };
 
 /// How long a test waits before expecting the `creating` → `available` transition this
@@ -284,8 +284,9 @@ const ENGINE_CASES: &[EngineCase] = &[
 /// scalar the record always holds, or a list that is EMPTY when the instance has no
 /// such association. `DBSubnetGroup` is among them: every DB instance is placed in a DB
 /// subnet group — the one the request named, or the account's `default` group — so every
-/// envelope reports one. `PendingModifiedValues` is NOT: the model returns it "only when
-/// there are pending changes", and these instances have none.
+/// envelope reports one. `PendingModifiedValues` is among them too: "specific changes are
+/// identified by subelements", so an instance with nothing pending carries the element with
+/// no subelement inside it.
 const ALWAYS_PROJECTED: &[&str] = &[
     "DBInstanceIdentifier",
     "DBInstanceClass",
@@ -303,6 +304,9 @@ const ALWAYS_PROJECTED: &[&str] = &[
     "DBSubnetGroup",
     "PreferredMaintenanceWindow",
     "UpgradeRolloutOrder",
+    "PendingModifiedValues",
+    "VPCNetworkingEnabled",
+    "HttpEndpointEnabled",
     "MultiAZ",
     "EngineVersion",
     "AutoMinorVersionUpgrade",
@@ -357,10 +361,16 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("ActivityStreamStatus", "stopped"),
     ("UpgradeRolloutOrder", "second"),
     ("IsStorageConfigUpgradeAvailable", "false"),
-    // `StorageType` "Default: io1, if the Iops parameter is specified. Otherwise,
-    // gp3", and `StorageThroughput` is the gp3 baseline.
-    ("StorageType", "gp3"),
-    ("StorageThroughput", "125"),
+    // `StorageType` "Default: io1, if the Iops parameter is specified", and the recorded
+    // service provisions general purpose SSD for a request that specifies neither;
+    // `StorageThroughput` "applies only to the gp3 storage type", so this instance is
+    // provisioned none.
+    ("StorageType", "gp2"),
+    ("StorageThroughput", "0"),
+    // Every DB instance runs inside a virtual private cloud, and none of them has an HTTP
+    // endpoint: that endpoint is a DB CLUSTER's.
+    ("VPCNetworkingEnabled", "true"),
+    ("HttpEndpointEnabled", "false"),
     // An instance that belongs to no DB cluster has no cluster-member port.
     ("DbInstancePort", "0"),
 ];
@@ -398,12 +408,14 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
                 "DBSubnetGroupName",
                 "default",
             );
-            // `PendingModifiedValues` is "returned only when there are pending changes",
-            // and nothing is pending for an instance nothing has modified: an EMPTY
-            // element would claim there are changes whose subelements are not reported.
+            // `PendingModifiedValues` carries one subelement per pending change, and
+            // nothing is pending for an instance nothing has modified: the element is
+            // there (above) with nothing inside it.
             assert!(
-                subtrees(instance, "PendingModifiedValues").is_empty(),
-                "case {:?}: the {envelope} envelope must report no PendingModifiedValues \
+                texts(instance, "PendingModifiedValues")
+                    .iter()
+                    .all(|inside| inside.trim().is_empty()),
+                "case {:?}: the {envelope} envelope must report no pending change \
                  for an instance with no pending change, got {instance}",
                 row.case
             );

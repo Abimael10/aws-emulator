@@ -1180,6 +1180,27 @@ async fn the_reported_bounds_are_the_ones_modify_enforces() {
     for (index, row) in MODIFY_ROWS.iter().enumerate() {
         let identifier = format!("emu-vdbim-mod-{index}");
         let case = row.case;
+        // What the instance reports BEFORE the modification: the size and type a refused
+        // modification has to leave exactly as they are. Read off the instance rather than
+        // off the row, because an instance whose storage its CLUSTER manages reports that
+        // cluster's size and type whatever its own create named.
+        let before = expect_ok(
+            case,
+            call(
+                &router,
+                "DescribeDBInstances",
+                &[("DBInstanceIdentifier", identifier.clone())],
+            )
+            .await,
+        );
+        let before = subtrees(&before, "DBInstance")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("case {case:?}: no DBInstance in {before}"));
+        let (was_allocated, was_storage_type) = (
+            text(&before, "AllocatedStorage"),
+            text(&before, "StorageType"),
+        );
 
         let mut params: Vec<(&str, String)> = vec![
             ("DBInstanceIdentifier", identifier.clone()),
@@ -1235,13 +1256,13 @@ async fn the_reported_bounds_are_the_ones_modify_enforces() {
                     .unwrap_or_else(|| panic!("case {case:?}: no DBInstance in {body}"));
                 assert_eq!(
                     text(&instance, "AllocatedStorage"),
-                    row.allocated.to_string(),
+                    was_allocated,
                     "case {case:?}: the refused modification changed the stored \
                      allocation: {instance}"
                 );
                 assert_eq!(
                     text(&instance, "StorageType"),
-                    row.storage_type,
+                    was_storage_type,
                     "case {case:?}: the refused modification changed the stored storage \
                      type: {instance}"
                 );

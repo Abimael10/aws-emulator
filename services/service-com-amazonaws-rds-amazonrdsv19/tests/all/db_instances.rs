@@ -849,10 +849,11 @@ async fn one_identifier_names_a_different_instance_in_each_region() {
 async fn an_omitted_member_takes_its_documented_default() {
     let router = emulator();
 
-    // `StorageType` "Default: io1, if the Iops parameter is specified. Otherwise,
-    // gp3." — the two branches of the one documented rule.
+    // `StorageType` "Default: io1, if the Iops parameter is specified", and the recorded
+    // service provisions general purpose SSD — `gp2` — for a request that specifies
+    // neither: the two branches of the one rule.
     let storage_type_rows: &[(&str, &str, Params, &str)] = &[
-        ("no Iops", "emu-default-gp3", Vec::new(), "gp3"),
+        ("no Iops", "emu-default-gp2", Vec::new(), "gp2"),
         (
             "Iops supplied",
             "emu-default-io1",
@@ -869,7 +870,7 @@ async fn an_omitted_member_takes_its_documented_default() {
         let actual = text(&read_back, "StorageType");
         assert_eq!(
             actual, *expected,
-            "case {case:?}: expected the documented StorageType default {expected:?}, \
+            "case {case:?}: expected the StorageType default {expected:?}, \
              got {actual:?}"
         );
     }
@@ -879,7 +880,7 @@ async fn an_omitted_member_takes_its_documented_default() {
     // encrypted"; `AutoMinorVersionUpgrade` "By default, minor engine upgrades are
     // applied automatically"; `CopyTagsToSnapshot` "By default, tags are not copied";
     // `DeletionProtection` "By default, deletion protection isn't enabled".
-    let read_back = describe_one(&router, "no optional members at all", "emu-default-gp3").await;
+    let read_back = describe_one(&router, "no optional members at all", "emu-default-gp2").await;
     let defaults = [
         ("BackupRetentionPeriod", "1"),
         ("StorageEncrypted", "false"),

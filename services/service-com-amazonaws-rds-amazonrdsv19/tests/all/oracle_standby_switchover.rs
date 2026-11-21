@@ -18,7 +18,7 @@
 //!   names a DB instance of the region (else HTTP 404 `DBInstanceNotFound`) which is a read
 //!   replica whose engine is running (else HTTP 400 `InvalidDBInstanceState`);
 //! * a DB instance of an engine this emulator serves no data plane for, and a read replica of
-//!   it, each reach `available` with no `PendingModifiedValues` on their own, and a
+//!   it, each reach `available` with nothing inside their `PendingModifiedValues`, and a
 //!   modification applied immediately settles them back there — the advance-to-terminal-state
 //!   contract every waiter and provisioning step depends on.
 //!
@@ -436,9 +436,11 @@ async fn an_oracle_primary_and_its_mounted_standby_each_reach_their_terminal_sta
     )
     .await;
     let up = awaited_instance(&router, case, "lifecycle-oracle-primary").await;
+    // `PendingModifiedValues` carries one subelement per pending change, so an instance
+    // that is up carries the element with nothing inside it.
     assert_eq!(
-        optional_text(&up, "PendingModifiedValues"),
-        None,
+        optional_text(&up, "PendingModifiedValues").as_deref(),
+        Some(""),
         "case {case:?}: an instance that is up has nothing pending: {up}"
     );
     assert_eq!(
@@ -458,12 +460,12 @@ async fn an_oracle_primary_and_its_mounted_standby_each_reach_their_terminal_sta
     let standby = awaited_instance(&router, case, "lifecycle-oracle-standby").await;
     assert_eq!(
         (
-            optional_text(&standby, "PendingModifiedValues"),
+            optional_text(&standby, "PendingModifiedValues").as_deref(),
             text(&standby, "ReadReplicaSourceDBInstanceIdentifier"),
             replication_status(&standby),
         ),
         (
-            None,
+            Some(""),
             "lifecycle-oracle-primary".to_string(),
             Some(("read replication".to_string(), "replicating".to_string())),
         ),
@@ -505,8 +507,8 @@ async fn an_oracle_primary_and_its_mounted_standby_each_reach_their_terminal_sta
     .await
     .0;
     assert_eq!(
-        optional_text(&settled, "PendingModifiedValues"),
-        None,
+        optional_text(&settled, "PendingModifiedValues").as_deref(),
+        Some(""),
         "case {case:?}: a settled instance has nothing pending: {settled}"
     );
 }

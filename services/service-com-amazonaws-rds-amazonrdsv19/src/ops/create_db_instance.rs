@@ -865,6 +865,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deletion_protection: input.deletion_protection.unwrap_or(false),
             db_subnet_group_name: Some(placed_in_db_subnet_group),
             db_parameter_group_name,
+            // A create provisions the instance IN the group it names, so nothing is being
+            // attached to a running engine and nothing waits for a reboot.
+            db_parameter_group_attached_at: None,
             option_group_name,
             vpc_security_group_ids: input.vpc_security_group_ids.unwrap_or_default(),
             db_security_group_names: input.db_security_groups.unwrap_or_default(),
