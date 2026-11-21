@@ -43,10 +43,13 @@
 //!    itself carries, read out of the owning service's own store
 //!    ([`super::event_source_resource_policy`]). A read of a source is a call on another
 //!    service's resource, and such a resource is fenced by its own document whoever calls:
-//!    an explicit `Deny` about one of the poller's reads withholds it whatever the role is
-//!    granted, and a grant in it stands on its own, because "the resource-based policy and
-//!    the identity-based policy are evaluated together, and access is granted if either
-//!    allows it" ([`read_is_withheld`]);
+//!    an explicit `Deny` the source states about its READERS — about every principal, or
+//!    about the whole account consuming it — withholds the poller's reads whatever the role
+//!    is granted, while one naming that role alone is about the calls the role itself signs
+//!    and leaves these reads to the role's own documents; a grant in it stands on its own,
+//!    because "the resource-based policy and the identity-based policy are evaluated
+//!    together, and access is granted if either allows it"
+//!    ([`read_is_withheld`], [`reader_principals`]);
 //! 5. **the decision** — [`::service_common::iam_authorization`], the tree's ONE evaluation
 //!    of policy documents against a request, so this service and every other one handed the
 //!    same documents decide alike. How the documents in force combine — an attachment whose
@@ -70,7 +73,7 @@
 //! explicit `Deny` refuses, a grant allows, and policies that state nothing about a read
 //! withhold it, because the documents in force are the authority on what may be done. A role
 //! nothing is known about is the one case where only the SOURCE's document can withhold a
-//! read: an explicit `Deny` in it is evidence this emulator does have.
+//! read: a `Deny` it states about its readers is evidence this emulator does have.
 //!
 //! This reading is a service's own because [`::service_common`] cannot hold it: the IAM
 //! store's type lives in the IAM service's crate, which depends on `service_common` itself.
@@ -530,22 +533,51 @@ impl RolePolicies {
     }
 }
 
+/// Every spelling of the READER of an event source a statement in that source's own policy
+/// may name to be about the reads a mapping's poller makes: the whole account the mapping's
+/// function belongs to, in each spelling that account is named by
+/// ([`::service_common::iam_authorization::account_principals`]) — beside the whole-element
+/// `"*"`, which the evaluation matches against any principal set, so a source that denies
+/// every principal denies this reader too.
+///
+/// The execution role's OWN ARN is not among them, and that is the whole of what this list
+/// states. A poller reads the source with the grants of that role — which is why the role's
+/// identity-based documents decide these reads — but the read is not one of the calls that
+/// role signs: those are the calls a RUNNING handler makes with the credential of its
+/// function's execution-role session ([`super::execution::execution_role_session`]), and a
+/// statement naming the role is about them. So a source fences its readers off by stating a
+/// `Deny` about its readers — every principal, or the whole account consuming it — and that
+/// deny binds a mapping's poller like any other consumer, while a `Deny` aimed at the
+/// execution role alone leaves the poller's reads to the documents in force on that role.
+fn reader_principals(role_arn: &str) -> Vec<String> {
+    iam::account_principals(role_arn)
+}
+
 /// Whether the read `action` on `resource` is WITHHELD from the role `role_arn`, by the
 /// documents in force on that role and the resource-based policy in force on the source
 /// together, read in IAM's own order.
 ///
 /// A read of a source is a call ON a resource of another service, so BOTH halves decide it:
 /// "the resource-based policy and the identity-based policy are evaluated together, and
-/// access is granted if either allows it", while an explicit `Deny` in either refuses
-/// whatever the other grants. The halves are compared against different spellings of the
-/// role for the reason [`::service_common::iam_authorization::account_principals`] states: a
-/// resource statement that DENIES the role's account denies each of its principals, while
-/// one that ALLOWS the account delegates to that account's own identity-based policies
+/// access is granted if either allows it", while an explicit `Deny` about the read refuses
+/// it whatever the other grants.
+///
+/// The halves are compared against different spellings of the role, and the DENY half
+/// against the ones that bind the READER of the source rather than the role resource (see
+/// [`reader_principals`]): a statement about every principal, or about the whole account the
+/// mapping's function runs in, binds every reader of that source and so binds this poller,
+/// while one that names the execution role alone is about the requests that role itself
+/// signs and leaves the poller's reads to the identity-based documents in force on it. The
+/// GRANT half is the role's own spelling, because a grant in the source's document naming the
+/// execution role is how a mapping onto a source of another account is wired at all —
+/// and because
+/// [`::service_common::iam_authorization::account_principals`] states the other half of it: a
+/// statement that ALLOWS an account delegates to that account's own identity-based policies
 /// rather than granting.
 ///
 /// `role` is `None` when nothing is known about the role at all ([`RolePolicies::read`]):
-/// such a role is refused nothing on evidence this emulator does not have, so only an
-/// explicit deny on the SOURCE withholds a read from it.
+/// such a role is refused nothing on evidence this emulator does not have, so only a deny
+/// the SOURCE states about its readers withholds a read from it.
 fn read_is_withheld(
     role: Option<&RolePolicies>,
     source_policy: Option<&iam::PreparedDocument>,
@@ -554,8 +586,7 @@ fn read_is_withheld(
     resource: &str,
 ) -> bool {
     let own = [role_arn.to_string()];
-    let mut named = own.to_vec();
-    named.extend(iam::account_principals(role_arn));
+    let reader = reader_principals(role_arn);
     let source_said = |principals: &[String]| {
         source_policy.map_or(Decision::NotStated, |document| {
             iam::resource_outcome_prepared(
@@ -565,7 +596,7 @@ fn read_is_withheld(
             .decision
         })
     };
-    if source_said(&named) == Decision::Denied {
+    if source_said(&reader) == Decision::Denied {
         return true;
     }
     let Some(role) = role else {
@@ -679,7 +710,106 @@ pub(super) fn unreadable_event_source_held(
 
 #[cfg(test)]
 mod tests {
-    use super::{access_of, EVENT_SOURCE_ACCESS};
+    use super::{access_of, iam, read_is_withheld, EVENT_SOURCE_ACCESS};
+
+    /// A one-statement resource-based document denying `action` on `resource` to the
+    /// `Principal` element `principal` — the shape a source's own policy fences a reader off
+    /// with.
+    fn source_deny(principal: &::serde_json::Value, action: &str, resource: &str) -> String {
+        ::serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": principal,
+                "Action": action,
+                "Resource": resource,
+            }],
+        })
+        .to_string()
+    }
+
+    /// RULE: a `Deny` in the SOURCE's own document withholds the reads a mapping's poller
+    /// makes when the source states it about its READERS — every principal, or the whole
+    /// account consuming the source — and not when it names the execution role itself, whose
+    /// own ARN is about the calls that role signs.
+    ///
+    /// Decided with nothing known about the role at all, so the source's document is the only
+    /// thing that can withhold a read and the rows read that decision alone.
+    ///
+    /// The rows differ along what the rule generalises over: WHO the statement names (every
+    /// principal in both spellings of the element, the account's root ARN, the account's bare
+    /// id, the execution role, another role of the account), the partition and account the
+    /// role belongs to, the path its name carries, and a role value that names no account at
+    /// all — where only the whole-element `"*"` can still bind.
+    #[test]
+    fn only_a_deny_about_the_reader_withholds_a_pollers_read() {
+        const RESOURCE: &str = "arn:aws:sqs:us-east-1:000000000000:order-intake";
+        const ACTION: &str = "sqs:ReceiveMessage";
+        // (case, the execution role, the `Principal` element the deny names, withheld)
+        let rows: [(&str, &str, ::serde_json::Value, bool); 8] = [
+            (
+                "every principal",
+                "arn:aws:iam::000000000000:role/order-consumer",
+                ::serde_json::json!("*"),
+                true,
+            ),
+            (
+                "every principal under the AWS key",
+                "arn:aws:iam::000000000000:role/order-consumer",
+                ::serde_json::json!({ "AWS": "*" }),
+                true,
+            ),
+            (
+                "the consuming account's root",
+                "arn:aws:iam::000000000000:role/order-consumer",
+                ::serde_json::json!({ "AWS": "arn:aws:iam::000000000000:root" }),
+                true,
+            ),
+            (
+                "the consuming account's id",
+                "arn:aws:iam::000000000000:role/order-consumer",
+                ::serde_json::json!({ "AWS": "000000000000" }),
+                true,
+            ),
+            (
+                "the execution role itself",
+                "arn:aws:iam::000000000000:role/order-consumer",
+                ::serde_json::json!({ "AWS": "arn:aws:iam::000000000000:role/order-consumer" }),
+                false,
+            ),
+            (
+                "the execution role itself, carrying a path, in another partition",
+                "arn:aws-us-gov:iam::210987654321:role/service-role/order-consumer",
+                ::serde_json::json!({
+                    "AWS": "arn:aws-us-gov:iam::210987654321:role/service-role/order-consumer",
+                }),
+                false,
+            ),
+            (
+                "another role of the consuming account",
+                "arn:aws:iam::000000000000:role/order-consumer",
+                ::serde_json::json!({ "AWS": "arn:aws:iam::000000000000:role/other" }),
+                false,
+            ),
+            (
+                // A value that names no account has no account spelling to be denied by, so
+                // the whole-element `"*"` is the one statement that still binds it.
+                "every principal, for a role value naming no account",
+                "order-consumer",
+                ::serde_json::json!("*"),
+                true,
+            ),
+        ];
+        for (case, role_arn, principal, withheld) in rows {
+            let document = iam::PreparedDocument::read(&source_deny(&principal, ACTION, RESOURCE));
+            let decided = read_is_withheld(None, Some(&document), role_arn, ACTION, RESOURCE);
+            assert_eq!(
+                decided, withheld,
+                "case {case:?}: expected the read to be withheld={withheld} from {role_arn:?}, \
+                 got {decided}"
+            );
+        }
+    }
 
     /// The action list of the sentence is AWS's prose list: comma separated, with `and`
     /// before the last, whatever the length of the catalog entry.

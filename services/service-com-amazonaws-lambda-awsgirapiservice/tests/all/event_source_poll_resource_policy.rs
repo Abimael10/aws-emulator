@@ -9,12 +9,14 @@
 //! (`FunctionConfiguration$Role`) — so each of those reads is a call on another service's
 //! resource and is decided by the RESOURCE-based policy that resource carries beside the
 //! identity-based documents in force on the role, in IAM's own order: an explicit `Deny`
-//! about one of the reads — in the source's own document or in the role's — withholds it
-//! whatever the other grants, and a grant in either is enough within one account, because
-//! "the resource-based policy and the identity-based policy are evaluated together, and
-//! access is granted if either allows it". A pass whose read is withheld takes nothing out of
-//! the source: nothing is handed over, invoked or deleted, and the source keeps everything it
-//! holds until the document in force says otherwise.
+//! about one of those reads withholds it whatever the other grants WHEN the source states it
+//! about the READER — about every principal, or about the whole account consuming the source
+//! — while one naming the execution role alone is about the calls that role itself signs and
+//! leaves these reads to the role's own documents; and a grant in either is enough within one
+//! account, because "the resource-based policy and the identity-based policy are evaluated
+//! together, and access is granted if either allows it". A pass whose read is withheld takes
+//! nothing out of the source: nothing is handed over, invoked or deleted, and the source keeps
+//! everything it holds until the document in force says otherwise.
 //!
 //! Every row drives real HTTP requests through the production `MultiServiceRouter` with IAM
 //! and the source's own service mounted beside Lambda on ONE engine: the role is written
@@ -28,9 +30,10 @@
 //! something (the source's document alone, the role's alone, both), WHAT the source's
 //! document states (a deny of one of the poller's reads, a deny of every action of the
 //! service, a deny of an action the poller never makes, a grant of every read), WHO it names
-//! (the role itself, the role's whole account, another principal of the account), and WHICH
-//! kind of source is polled (a queue, whose reads are its own API's calls, and a data stream,
-//! which is read with three calls of its service's).
+//! (every principal in either spelling of that element, the whole account, the role itself,
+//! another principal of the account), and WHICH kind of source is polled (a queue, whose
+//! reads are its own API's calls, and a data stream, which is read with three calls of its
+//! service's).
 
 use std::time::Instant;
 
@@ -97,7 +100,16 @@ impl Kind {
 enum SourcePolicy {
     /// Nothing at all: the source carries no resource-based policy.
     None,
-    /// An explicit deny of ONE of the poller's reads, naming the execution role.
+    /// An explicit deny of ONE of the poller's reads, stated about EVERY principal through
+    /// the whole-element `"*"` — the deny a source fences every one of its readers off
+    /// with, this poller included.
+    DenyReadToEveryPrincipal(usize),
+    /// The same deny, with every principal named as the `AWS` key's own `"*"`: the other
+    /// spelling of that element.
+    DenyReadToEveryAwsPrincipal(usize),
+    /// An explicit deny of ONE of the poller's reads, naming the execution role — a
+    /// statement about the calls that role itself signs rather than about the reads the
+    /// mapping's poller makes.
     DenyReadToRole(usize),
     /// An explicit deny of every action of the source service, naming the role.
     DenyEveryActionToRole,
@@ -127,20 +139,25 @@ impl SourcePolicy {
     ) -> Option<Value> {
         let namespace = kind.namespace();
         let reads = kind.reads();
-        let statement = |effect: &str, actions: Vec<String>, principal: &str| {
+        let about = |effect: &str, actions: Vec<String>, principal: Value| {
             Some(json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": effect,
-                    "Principal": { "AWS": principal },
+                    "Principal": principal,
                     "Action": actions,
                     "Resource": source_arn,
                 }],
             }))
         };
+        let statement = |effect: &str, actions: Vec<String>, principal: &str| {
+            about(effect, actions, json!({ "AWS": principal }))
+        };
         let named = |read: usize| vec![format!("{namespace}:{}", reads[read])];
         match self {
             Self::None => None,
+            Self::DenyReadToEveryPrincipal(read) => about("Deny", named(read), json!("*")),
+            Self::DenyReadToEveryAwsPrincipal(read) => statement("Deny", named(read), "*"),
             Self::DenyReadToRole(read) => statement("Deny", named(read), role_arn),
             Self::DenyEveryActionToRole => {
                 statement("Deny", vec![format!("{namespace}:*")], role_arn)
@@ -200,24 +217,39 @@ fn rows() -> Vec<Row> {
             polls: true,
         },
         Row {
-            case: "the source denies the first read the poller makes to the role",
-            policy: SourcePolicy::DenyReadToRole(0),
+            case: "the source denies the first read the poller makes to every principal",
+            policy: SourcePolicy::DenyReadToEveryPrincipal(0),
             polls: false,
         },
         Row {
-            case: "the source denies the last read the poller makes to the role",
-            policy: SourcePolicy::DenyReadToRole(2),
+            case: "the source denies another read the poller makes to every principal",
+            policy: SourcePolicy::DenyReadToEveryPrincipal(1),
             polls: false,
         },
         Row {
-            case: "the source denies every action of its service to the role",
-            policy: SourcePolicy::DenyEveryActionToRole,
+            case: "the source denies a read to every principal named under the AWS key",
+            policy: SourcePolicy::DenyReadToEveryAwsPrincipal(0),
             polls: false,
         },
         Row {
             case: "the source denies a read to the role's whole account",
             policy: SourcePolicy::DenyReadToAccount(0),
             polls: false,
+        },
+        Row {
+            case: "the source denies the first read the poller makes to the role itself",
+            policy: SourcePolicy::DenyReadToRole(0),
+            polls: true,
+        },
+        Row {
+            case: "the source denies the last read the poller makes to the role itself",
+            policy: SourcePolicy::DenyReadToRole(2),
+            polls: true,
+        },
+        Row {
+            case: "the source denies every action of its service to the role itself",
+            policy: SourcePolicy::DenyEveryActionToRole,
+            polls: true,
         },
         Row {
             case: "the source denies an action the poller never makes",
@@ -489,7 +521,7 @@ async fn a_queue_backlog_left_while_the_queue_denied_the_read_is_polled_once_the
         &router,
         case,
         &url,
-        SourcePolicy::DenyReadToRole(0).document(Kind::Queue, &role, &arn, &role),
+        SourcePolicy::DenyReadToEveryPrincipal(0).document(Kind::Queue, &role, &arn, &role),
     )
     .await;
     for index in 0..messages {

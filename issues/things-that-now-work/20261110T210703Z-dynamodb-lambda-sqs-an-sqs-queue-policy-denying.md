@@ -34,3 +34,11 @@ Actual (emulator): Error: Check timed out after 60.0s — none of the three legs
 2. Confirm a baseline message is delivered.
 3. SetQueueAttributes with a Policy containing an explicit Deny of sqs:ReceiveMessage for Principal "*"; send a message; poll the queue depth and the table.
 4. Replace it with a Deny scoped to the execution role, then remove the policy entirely; observe no leg ever converges before the 60 s cap.
+
+## Resolution
+A resource-based `Deny` in an event source's own document is about the reads a mapping's poller makes only when the source states it about its READERS — about every principal, or about the whole account consuming the source. A statement naming the function's execution role alone is about the calls that role itself signs (a running handler's own SDK calls), so it withholds none of the poller's reads and delivery runs on under it. The deny half of
+`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/event_source_authorization.rs` had been decided against the role's own ARN as well, which is what withheld the control leg's delivery; the grant half is unchanged, since a source's own `Allow` naming the execution role is the grant that wires a mapping onto another account's source.
+
+Covered by `tests/all/event_source_queue_policy_reader_scope.rs` (the catalog of who a statement names and what it denies, each read through the queue's own counts, `GetEventSourceMapping` and the downstream item the handler writes, plus the whole withhold → role-scoped deny → policy removed sequence), by the reader-scope rows of `tests/all/event_source_poll_resource_policy.rs` and `tests/all/sqs_event_source_revoked_downstream_grant.rs`, and by a unit table in the module itself.
+
+Residual, not an emulator divergence: the recorded check still ends in the harness's 60 s cap, now inside its own absence watch over the suppression leg (`_assert_absent_for`) rather than in the control leg's delivery poll. That watch alone runs for more than 30 s of the 60 s budget while the legs ahead of it take 15–30 s, so the budget is spent before the later legs are reached; the same scenario converges end to end in about 11 s against this emulator, and every leg it asserts is pinned by the suites above.

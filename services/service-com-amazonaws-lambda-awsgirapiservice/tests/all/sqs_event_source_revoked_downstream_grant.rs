@@ -35,15 +35,20 @@
 //! The SECOND suite pins the other fence over the same chain, at the other end of it: the
 //! reads a mapping's poller makes on its source are calls on another service's resource, so
 //! the RESOURCE-based policy that source carries decides them beside the role's own documents
-//! — an explicit `Deny` about one of those reads withholds it whatever the role is granted, so
-//! the pass takes nothing out of the queue, the function is never invoked, and the item that
-//! function would have written downstream does not exist. Its rows differ along what the
-//! queue's own `Policy` states and who it names, and what is NEW in them is where each is
-//! read: at the END of the chain, in the downstream table. What a document in force does to
-//! the poller's own reads — the same catalog of statements over both kinds of event source, and
-//! the backlog polled once a deny is cleared — belongs to
+//! — a `Deny` the source states about its READERS (every principal, or the whole account
+//! consuming it) withholds the read whatever the role is granted, so the pass takes nothing
+//! out of the queue, the function is never invoked, and the item that function would have
+//! written downstream does not exist, while one naming the execution role alone is about the
+//! calls that role itself signs and leaves those reads to the role's own documents. Its rows
+//! differ along what the queue's own `Policy` states and who it names, and what is NEW in
+//! them is where each is read: at the END of the chain, in the downstream table. What a
+//! document in force does to the poller's own reads — the same catalog of statements over both
+//! kinds of event source, and the backlog polled once a deny is cleared — belongs to
 //! `tests/all/event_source_poll_resource_policy.rs`, whose writer of a queue's `Policy` and
-//! whose spelling of an account this suite reaches rather than copies.
+//! whose spelling of an account this suite reaches rather than copies. WHO such a statement has
+//! to name for it to bind the poller at all is read over the same chain by
+//! `tests/all/event_source_queue_policy_reader_scope.rs`, which shares this suite's assembly,
+//! handler and downstream read.
 //!
 //! Nothing waits a span of its own choosing: every state a row needs is waited for by looking
 //! again until it holds ([`WATCH_BUDGET`] is only the backstop against a chain that never gets
@@ -98,7 +103,10 @@ const TARGET_VARIABLE: &str = "TARGET_TABLE";
 
 /// The attribute each written item records the event source of the record it came from on, so
 /// an item in the table is a consequence of the record having reached the handler.
-const SOURCE_ATTRIBUTE: &str = "source";
+///
+/// `pub(crate)` for the reason [`driven_emulator`] is: the suite over WHO a queue's own
+/// `Policy` names reads the same written item.
+pub(crate) const SOURCE_ATTRIBUTE: &str = "source";
 
 /// What the handler prints before the refusal the addressed service answered. ONE spelling of
 /// it, bound into the handler's source and into what the assertions look for.
@@ -174,7 +182,12 @@ fn emulator() -> MultiServiceRouter {
 /// yet, so a row that waited a span of its own choosing for one would be betting on how fast
 /// the host runs. The second suite makes each pass itself and awaits it, and then reads what
 /// that pass did — which is what lets it assert that a pass delivered NOTHING.
-fn driven_emulator() -> (MultiServiceRouter, DrivenPolling) {
+///
+/// `pub(crate)` because the suite that reads WHO a queue's own `Policy` has to name for it to
+/// decide that pass (`tests/all/event_source_queue_policy_reader_scope.rs`) drives the same
+/// four services beside Lambda with the same driven passes, and shares this assembly rather
+/// than keeping a second copy of it.
+pub(crate) fn driven_emulator() -> (MultiServiceRouter, DrivenPolling) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = router_over(&engine);
     let driven = DrivenPolling::claiming(&engine, &router);
@@ -222,7 +235,11 @@ def lambda_handler(event, context):
 
 /// Create the function `name`, running [`writing_handler`] as `role_arn` with
 /// [`TARGET_VARIABLE`] naming `table`, and wait until it reports `Active`.
-async fn given_function(
+///
+/// `pub(crate)` for the reason [`driven_emulator`] is: the suite over WHO a queue's own
+/// `Policy` names runs this same handler against the same downstream table, and shares this
+/// one writer of it.
+pub(crate) async fn given_function(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -282,7 +299,15 @@ async fn put_downstream_policy(
 }
 
 /// The item the table `table` holds under `key`, or [`Value::Null`] when it holds none.
-async fn held_item(router: &MultiServiceRouter, case: &str, table: &str, key: &str) -> Value {
+///
+/// `pub(crate)` for the reason [`driven_emulator`] is: the suite over WHO a queue's own
+/// `Policy` names reads the downstream table exactly this way.
+pub(crate) async fn held_item(
+    router: &MultiServiceRouter,
+    case: &str,
+    table: &str,
+    key: &str,
+) -> Value {
     let (status, answered) = dynamodb(
         router,
         "GetItem",
@@ -625,13 +650,20 @@ async fn a_revoked_downstream_grant_denies_the_handler_and_dead_letters_the_mess
 enum QueuePolicy {
     /// Nothing at all: the queue carries no resource-based policy.
     None,
-    /// An explicit deny of the receive the poller makes, naming the execution role.
-    DenyReceiveToRole,
-    /// An explicit deny of every action of Amazon SQS, naming the role.
-    DenyEveryActionToRole,
+    /// An explicit deny of the receive the poller makes, stated about EVERY principal.
+    DenyReceiveToEveryPrincipal,
+    /// An explicit deny of the DELETE the poller makes, stated about every principal — one of
+    /// the same reads, so the decision is not pinned to the receive alone. (A deny of every
+    /// action of the service stated about every principal fences this suite's own client off
+    /// the queue as well, exactly as it does on AWS, so what it does to the poller's reads is
+    /// read in `tests/all/event_source_queue_policy_reader_scope.rs`.)
+    DenyDeleteToEveryPrincipal,
     /// An explicit deny of that receive, naming the role's whole ACCOUNT — which denies each
     /// of that account's principals.
     DenyReceiveToAccount,
+    /// An explicit deny of that receive, naming the execution ROLE — a statement about the
+    /// calls that role itself signs rather than about the reads the mapping's poller makes.
+    DenyReceiveToRole,
     /// An explicit deny of an action no consumer of a queue makes, naming the role.
     DenyUnrelatedActionToRole,
 }
@@ -639,30 +671,35 @@ enum QueuePolicy {
 impl QueuePolicy {
     /// The document this row attaches to the queue, or `None` when it attaches none.
     fn document(self, role_arn: &str, queue_arn: &str) -> Option<Value> {
-        // `QUEUE_READS[0]` is the receive the poller makes, which is the read the denies below
-        // are about; the catalog those names come from is the suite that owns it.
+        // `QUEUE_READS[0]` and `[1]` are the receive and the delete the poller makes, which
+        // are the reads the denies below are about; the catalog those names come from is the
+        // suite that owns it.
         let receive = format!("sqs:{}", QUEUE_READS[0]);
-        let statement = |actions: Vec<&str>, principal: &str| {
+        let delete = format!("sqs:{}", QUEUE_READS[1]);
+        let about = |actions: Vec<&str>, principal: Value| {
             Some(json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Deny",
-                    "Principal": { "AWS": principal },
+                    "Principal": principal,
                     "Action": actions,
                     "Resource": queue_arn,
                 }],
             }))
         };
+        let naming =
+            |actions: Vec<&str>, principal: &str| about(actions, json!({ "AWS": principal }));
         match self {
             Self::None => None,
-            Self::DenyReceiveToRole => statement(vec![receive.as_str()], role_arn),
-            Self::DenyEveryActionToRole => statement(vec!["sqs:*"], role_arn),
+            Self::DenyReceiveToEveryPrincipal => about(vec![receive.as_str()], json!("*")),
+            Self::DenyDeleteToEveryPrincipal => about(vec![delete.as_str()], json!("*")),
             Self::DenyReceiveToAccount => {
-                statement(vec![receive.as_str()], &account_root_of(role_arn))
+                naming(vec![receive.as_str()], &account_root_of(role_arn))
             }
+            Self::DenyReceiveToRole => naming(vec![receive.as_str()], role_arn),
             // The WRITE half of the queue's own API, which no consumer of a queue calls, so a
             // statement about it is about none of the poller's reads.
-            Self::DenyUnrelatedActionToRole => statement(vec!["sqs:SendMessage"], role_arn),
+            Self::DenyUnrelatedActionToRole => naming(vec!["sqs:SendMessage"], role_arn),
         }
     }
 }
@@ -680,10 +717,12 @@ struct PolicyRow {
 
 /// RULE: a mapping's poller reads its event source acting as the invoked function's execution
 /// role, so each read is a call on another service's resource and is decided by the
-/// RESOURCE-based policy that resource carries beside the role's own documents — an explicit
-/// `Deny` about one of those reads withholds it whatever the role is granted. A pass whose
-/// read is withheld takes nothing out of the queue: the message stays, the function is never
-/// invoked, and the item that function writes downstream does not exist.
+/// RESOURCE-based policy that resource carries beside the role's own documents — a `Deny` the
+/// queue states about its READERS (every principal, or the whole account consuming it)
+/// withholds those reads whatever the role is granted, while one naming the execution role
+/// alone is about the calls that role itself signs. A pass whose read is withheld takes
+/// nothing out of the queue: the message stays, the function is never invoked, and the item
+/// that function writes downstream does not exist.
 #[tokio::test]
 async fn a_queue_policy_deny_suppresses_the_delivery_and_the_downstream_write() {
     let _stream = crate::invoke_request_id::one_invocation_stream_at_a_time().await;
@@ -695,15 +734,15 @@ async fn a_queue_policy_deny_suppresses_the_delivery_and_the_downstream_write() 
             delivers: true,
         },
         PolicyRow {
-            case: "the queue denies the receive to the role",
+            case: "the queue denies the receive to every principal",
             slug: "deny-receive",
-            policy: QueuePolicy::DenyReceiveToRole,
+            policy: QueuePolicy::DenyReceiveToEveryPrincipal,
             delivers: false,
         },
         PolicyRow {
-            case: "the queue denies every action of its service to the role",
-            slug: "deny-all",
-            policy: QueuePolicy::DenyEveryActionToRole,
+            case: "the queue denies the delete the poller makes to every principal",
+            slug: "deny-delete",
+            policy: QueuePolicy::DenyDeleteToEveryPrincipal,
             delivers: false,
         },
         PolicyRow {
@@ -711,6 +750,12 @@ async fn a_queue_policy_deny_suppresses_the_delivery_and_the_downstream_write() 
             slug: "deny-account",
             policy: QueuePolicy::DenyReceiveToAccount,
             delivers: false,
+        },
+        PolicyRow {
+            case: "the queue denies the receive to the execution role itself",
+            slug: "deny-role",
+            policy: QueuePolicy::DenyReceiveToRole,
+            delivers: true,
         },
         PolicyRow {
             case: "the queue denies an action the poller never makes",
