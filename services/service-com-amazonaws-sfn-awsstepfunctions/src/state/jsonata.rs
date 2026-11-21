@@ -24,8 +24,9 @@
 //! ## A template and a field
 //!
 //! A TEMPLATE — an `Output`, an `Assign`, a `Task`'s `Arguments` — builds a document
-//! out of whatever its members produce, and a member whose expression produced nothing
-//! has no value for its place in that document ([`render`]). A FIELD holds ONE value the
+//! out of what its members produce, and a member whose expression produced NOTHING has
+//! no value for its place in that document, so the document is not built at all and the
+//! member is reported ([`render`]). A FIELD holds ONE value the
 //! language requires a type of — a `Choice` rule's boolean `Condition`, a `Wait`'s
 //! numeric `Seconds`, a `Map`'s array of `Items`, a `Fail`'s string `Error` — so a field
 //! whose expression produced another type, or produced nothing, is reported rather than
@@ -42,6 +43,11 @@
 //! expression for reading out of scope. Every variable a state `Assign`ed is bound
 //! under its own name (`$total`), and the expression's context item (`$`) is the
 //! state's input, so a bare field reference reads the input.
+//!
+//! What the scope reaching an expression does NOT hold is bound to nothing — the scope
+//! is what the path the run TOOK assigned, not what the definition declares somewhere —
+//! so a reference to such a name produces nothing, and the member or field it is written
+//! in is reported exactly as any other expression that produced nothing is.
 //!
 //! ## What bounds one state's whole template
 //!
