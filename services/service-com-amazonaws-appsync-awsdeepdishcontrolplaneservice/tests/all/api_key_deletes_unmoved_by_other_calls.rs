@@ -132,8 +132,11 @@ async fn list_keys(router: &MultiServiceRouter, case: &str, api_id: &str) -> Vec
 }
 
 /// The ARN `GetGraphqlApi` reports for `api_id` — what the tagging operations bind as
-/// their `resourceArn` label.
-async fn api_arn(router: &MultiServiceRouter, api_id: &str) -> String {
+/// their `resourceArn` label, and the second form a request can name the API in.
+///
+/// The one reading of the published ARN this test crate keeps: the sibling suites that
+/// address an API by it call this rather than keeping a copy.
+pub(crate) async fn api_arn(router: &MultiServiceRouter, api_id: &str) -> String {
     let answer = call(router, "GET", &format!("/v1/apis/{api_id}"), None).await;
     assert_eq!(
         answer.status, 200,

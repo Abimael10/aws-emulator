@@ -90,24 +90,27 @@ const CACHING_TTLS: &[i64] = &[1, 3_600];
 const METRICS_CONFIGS: &[&str] = &["ENABLED", "DISABLED"];
 
 /// One row of the round-trip table: a resolver to attach, minus the field it goes on.
+///
+/// The one resolver-definition table this test crate keeps: the sibling resolver suites
+/// state their rules over these rows rather than over tables of their own.
 #[derive(Debug, Clone)]
-struct Row {
+pub(crate) struct Row {
     /// What the row exercises, named in every assertion of it.
-    label: &'static str,
+    pub(crate) label: &'static str,
     /// The `ResolverKind` the request names, or `None` where it names none — which asks
     /// for a `UNIT` resolver, "the default resolver type" (`Resolver$kind`).
-    kind: Option<&'static str>,
+    pub(crate) kind: Option<&'static str>,
     /// Whether the request names the data source the resolver resolves against.
-    data_source: bool,
+    pub(crate) data_source: bool,
     /// Whether the request carries a `pipelineConfig` naming the seeded function.
-    pipeline: bool,
-    request_template: Option<&'static str>,
-    response_template: Option<&'static str>,
-    code: Option<&'static str>,
-    caching_config: Option<Value>,
-    sync_config: Option<Value>,
-    max_batch_size: Option<i64>,
-    metrics_config: Option<&'static str>,
+    pub(crate) pipeline: bool,
+    pub(crate) request_template: Option<&'static str>,
+    pub(crate) response_template: Option<&'static str>,
+    pub(crate) code: Option<&'static str>,
+    pub(crate) caching_config: Option<Value>,
+    pub(crate) sync_config: Option<Value>,
+    pub(crate) max_batch_size: Option<i64>,
+    pub(crate) metrics_config: Option<&'static str>,
 }
 
 impl Row {
@@ -140,7 +143,7 @@ impl Row {
 /// Source for the value sets: `smithy_query(query="shape",
 /// shape="Resolver,ResolverKind,PipelineConfig,CachingConfig,SyncConfig,
 /// ResolverLevelMetricsConfig,MaxBatchSize,AppSyncRuntime")`.
-fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     vec![
         Row {
             // The smallest resolver, and a request that names no kind at all.
@@ -214,7 +217,7 @@ fn rows() -> Vec<Row> {
 }
 
 /// `row` as a `CreateResolver` request body attaching it to `field`.
-fn request_body(row: &Row, field: &str, function_id: &str) -> Value {
+pub(crate) fn request_body(row: &Row, field: &str, function_id: &str) -> Value {
     let mut body = json!({"fieldName": field});
     let object = body.as_object_mut().expect("the body is an object");
     if let Some(kind) = row.kind {
@@ -429,7 +432,7 @@ async fn walk(
 }
 
 /// The field names of the entries a walk reported, in the order it reported them.
-fn listed_fields(listed: &[Value]) -> Vec<String> {
+pub(crate) fn listed_fields(listed: &[Value]) -> Vec<String> {
     listed
         .iter()
         .map(|resolver| {

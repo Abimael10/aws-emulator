@@ -38,8 +38,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::error_contract::{call, create_api, router, Answer};
 // The data sources and functions under test are created through the function suite's own
-// helpers rather than through second copies of them.
+// helpers rather than through second copies of them, and a resolver is detached through the
+// delete suite's own call.
 use super::functions::{create_data_source, create_function, Row, RUNTIME};
+use super::resolver_delete::delete_resolver;
 
 /// The name of the data source the functions under test resolve against.
 const DATA_SOURCE: &str = "ds_dependencies";
@@ -156,22 +158,6 @@ async fn get_resolver(
     .await
 }
 
-/// Send one `DeleteResolver` for the resolver on `type_name`/`field`.
-async fn delete_resolver(
-    router: &MultiServiceRouter,
-    api_id: &str,
-    type_name: &str,
-    field: &str,
-) -> Answer {
-    call(
-        router,
-        "DELETE",
-        &format!("/v1/apis/{api_id}/types/{type_name}/resolvers/{field}"),
-        None,
-    )
-    .await
-}
-
 /// A `PIPELINE` resolver body invoking `function_ids`.
 fn pipeline_body(field: &str, function_ids: &[String]) -> Value {
     json!({
@@ -186,7 +172,10 @@ fn pipeline_body(field: &str, function_ids: &[String]) -> Value {
 /// Assert `answer` is the empty 200 a delete that removed the resource answers with:
 /// `DeleteDataSourceResponse`, `DeleteFunctionResponse` and `DeleteResolverResponse`
 /// declare no members at all, so the body is an empty document.
-fn assert_empty_ok(case: &str, answer: &Answer) {
+///
+/// The one reading of that answer this test crate keeps: the sibling delete suites assert
+/// it through this rather than through a copy of it.
+pub(crate) fn assert_empty_ok(case: &str, answer: &Answer) {
     assert_eq!(
         (answer.status, &answer.body),
         (200, &json!({})),

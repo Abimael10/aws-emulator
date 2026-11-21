@@ -96,7 +96,10 @@ async fn publish(router: &MultiServiceRouter, name: &str) -> Published {
 }
 
 /// `reference` as it travels in the single non-greedy `{apiId}` path segment.
-fn label(reference: &str) -> String {
+///
+/// The one encoder of an API reference into a path label this test crate keeps: the sibling
+/// suites that address an API by its ARN call this rather than keeping a second copy.
+pub(crate) fn label(reference: &str) -> String {
     utf8_percent_encode(reference, NON_ALPHANUMERIC).to_string()
 }
 
