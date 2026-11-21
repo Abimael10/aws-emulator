@@ -109,7 +109,7 @@ async fn call(
 
 /// The address the control plane publishes for the account's ATS data endpoint — which is
 /// also the call that OPENS the broker's socket.
-async fn discover(router: &MultiServiceRouter) -> String {
+pub(crate) async fn discover(router: &MultiServiceRouter) -> String {
     let (status, rendered) = call(
         router,
         "GET",
@@ -131,34 +131,46 @@ async fn discover(router: &MultiServiceRouter) -> String {
 }
 
 /// The shadow route of one shadow, with the `name` query parameter only when it is named.
-fn shadow_uri(row: &Row) -> String {
-    match row.shadow_name {
-        Some(name) => format!("{SERVED_AT}/things/{}/shadow?name={name}", row.thing_name),
-        None => format!("{SERVED_AT}/things/{}/shadow", row.thing_name),
+fn shadow_uri(thing_name: &str, shadow_name: Option<&str>) -> String {
+    match shadow_name {
+        Some(name) => format!("{SERVED_AT}/things/{thing_name}/shadow?name={name}"),
+        None => format!("{SERVED_AT}/things/{thing_name}/shadow"),
     }
 }
 
 /// `POST /things/{thingName}/shadow` with `state`, asserting the update was accepted.
-async fn update_shadow(router: &MultiServiceRouter, row: &Row, state: &Value) {
+pub(crate) async fn update_shadow(
+    case: &str,
+    router: &MultiServiceRouter,
+    thing_name: &str,
+    shadow_name: Option<&str>,
+    state: &Value,
+) {
     let document = json!({ "state": state });
     let (status, rendered) = call(
         router,
         "POST",
-        &shadow_uri(row),
+        &shadow_uri(thing_name, shadow_name),
         "iotdata",
         serde_json::to_vec(&document).expect("the document serializes"),
     )
     .await;
     assert_eq!(
         status, 200,
-        "case {:?}: the update {document} must be accepted, got {status} with {rendered}",
-        row.case
+        "case {case:?}: the update {document} must be accepted, got {status} with {rendered}"
     );
 }
 
 /// `DELETE /things/{thingName}/shadow`, asserting the delete was accepted.
 async fn delete_shadow(router: &MultiServiceRouter, row: &Row) {
-    let (status, rendered) = call(router, "DELETE", &shadow_uri(row), "iotdata", Vec::new()).await;
+    let (status, rendered) = call(
+        router,
+        "DELETE",
+        &shadow_uri(row.thing_name, row.shadow_name),
+        "iotdata",
+        Vec::new(),
+    )
+    .await;
     assert_eq!(
         status, 200,
         "case {:?}: the delete must be accepted, got {status} with {rendered}",
@@ -169,10 +181,10 @@ async fn delete_shadow(router: &MultiServiceRouter, row: &Row) {
 /// The reserved topic prefix of one shadow, written out here rather than read from the
 /// service: `$aws/things/{thingName}/shadow` for the unnamed shadow and its
 /// `name/{shadowName}` subtree for a named one.
-fn reserved_prefix(row: &Row) -> String {
-    match row.shadow_name {
-        Some(name) => format!("$aws/things/{}/shadow/name/{name}", row.thing_name),
-        None => format!("$aws/things/{}/shadow", row.thing_name),
+pub(crate) fn reserved_prefix(thing_name: &str, shadow_name: Option<&str>) -> String {
+    match shadow_name {
+        Some(name) => format!("$aws/things/{thing_name}/shadow/name/{name}"),
+        None => format!("$aws/things/{thing_name}/shadow"),
     }
 }
 
@@ -192,7 +204,7 @@ fn loopback_port(case: &str, address: &str) -> u16 {
 }
 
 /// A DEVICE: a real socket to the published address, speaking MQTT 3.1.1 on it.
-struct Device {
+pub(crate) struct Device {
     case: &'static str,
     stream: TcpStream,
     buffer: BytesMut,
@@ -200,7 +212,7 @@ struct Device {
 
 impl Device {
     /// Dial `address`, send the CONNECT and assert the session was opened.
-    async fn connect(case: &'static str, address: &str, client_id: &str) -> Self {
+    pub(crate) async fn connect(case: &'static str, address: &str, client_id: &str) -> Self {
         let port = loopback_port(case, address);
         let dialling = TcpStream::connect((Ipv4Addr::LOCALHOST, port));
         let stream = tokio::time::timeout(EXCHANGE_DEADLINE, dialling)
@@ -272,7 +284,7 @@ impl Device {
     }
 
     /// Subscribe to `filters` at QoS 1, answering with the QoS granted for each.
-    async fn subscribe(&mut self, filters: &[String]) -> Vec<v4::SubscribeReasonCode> {
+    pub(crate) async fn subscribe(&mut self, filters: &[String]) -> Vec<v4::SubscribeReasonCode> {
         let mut subscribe = v4::Subscribe::new(filters[0].clone(), QoS::AtLeastOnce);
         subscribe.pkid = 1;
         for path in &filters[1..] {
@@ -290,7 +302,7 @@ impl Device {
 
     /// Read the next `wanted` publications the broker pushed, each as its topic and its
     /// JSON body, acknowledging every one made at QoS 1.
-    async fn read_announcements(&mut self, wanted: usize) -> Vec<(String, Value)> {
+    pub(crate) async fn read_announcements(&mut self, wanted: usize) -> Vec<(String, Value)> {
         let mut read = Vec::with_capacity(wanted);
         while read.len() < wanted {
             let packet = self.read_packet().await;
@@ -329,7 +341,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// Run `body` on a thread with the stack the router's assembly needs, inside a runtime with
 /// the IO the broker's own socket is bound on.
-fn on_the_emulator<Body>(name: &'static str, body: Body)
+pub(crate) fn on_the_emulator<Body>(name: &'static str, body: Body)
 where
     Body: FnOnce(MultiServiceRouter, tokio::runtime::Runtime) + Send + 'static,
 {
@@ -350,7 +362,7 @@ where
 }
 
 /// The member one announcement must carry, read with the case in the failure.
-fn member<'a>(case: &str, topic: &str, body: &'a Value, path: &[&str]) -> &'a Value {
+pub(crate) fn member<'a>(case: &str, topic: &str, body: &'a Value, path: &[&str]) -> &'a Value {
     let mut node = body;
     for name in path {
         node = node.get(name).unwrap_or_else(|| {
@@ -369,7 +381,7 @@ fn an_accepted_shadow_change_is_announced_on_the_shadows_reserved_topics() {
             let address = discover(&router).await;
             for row in ROWS {
                 let case = row.case;
-                let prefix = reserved_prefix(row);
+                let prefix = reserved_prefix(row.thing_name, row.shadow_name);
                 let accepted_topic = format!("{prefix}/update/accepted");
                 let documents_topic = format!("{prefix}/update/documents");
                 let delta_topic = format!("{prefix}/update/delta");
@@ -393,7 +405,14 @@ fn an_accepted_shadow_change_is_announced_on_the_shadows_reserved_topics() {
                 // Leg 1 — a desired-only write: the update is announced, and the whole
                 // desired state is outstanding because nothing has been reported.
                 let desired = json!({"alpha": 1, "beta": {"inner": 2}});
-                update_shadow(&router, row, &json!({"desired": desired.clone()})).await;
+                update_shadow(
+                    case,
+                    &router,
+                    row.thing_name,
+                    row.shadow_name,
+                    &json!({"desired": desired.clone()}),
+                )
+                .await;
                 let announced = device.read_announcements(3).await;
                 let topics: Vec<&str> = announced
                     .iter()
@@ -461,7 +480,14 @@ fn an_accepted_shadow_change_is_announced_on_the_shadows_reserved_topics() {
                 // outstanding, so no delta is pushed. The next leg's own announcements are
                 // read off this same connection, so a delta published here would arrive
                 // ahead of them and fail the ordering assertion below.
-                update_shadow(&router, row, &json!({"reported": desired.clone()})).await;
+                update_shadow(
+                    case,
+                    &router,
+                    row.thing_name,
+                    row.shadow_name,
+                    &json!({"reported": desired.clone()}),
+                )
+                .await;
                 let converged = device.read_announcements(2).await;
                 let topics: Vec<&str> = converged
                     .iter()
@@ -495,7 +521,14 @@ fn an_accepted_shadow_change_is_announced_on_the_shadows_reserved_topics() {
 
                 // Leg 3 — one leaf diverges again: the delta holds that leaf ALONE, because
                 // it is recomputed against the whole reported state rather than accumulated.
-                update_shadow(&router, row, &json!({"desired": {"beta": {"inner": 9}}})).await;
+                update_shadow(
+                    case,
+                    &router,
+                    row.thing_name,
+                    row.shadow_name,
+                    &json!({"desired": {"beta": {"inner": 9}}}),
+                )
+                .await;
                 let rediverged = device.read_announcements(3).await;
                 let topics: Vec<&str> = rediverged
                     .iter()
