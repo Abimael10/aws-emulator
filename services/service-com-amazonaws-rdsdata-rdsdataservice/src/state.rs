@@ -885,6 +885,11 @@ impl Cluster {
     /// UPDATE NOWAIT` on a native session is refused for a row this transaction holds, and a
     /// statement here waits for a row a native transaction holds.
     ///
+    /// They are the rows the transaction CHANGED and did not itself insert: a row it created
+    /// is one nothing else can address until the transaction is installed, so two
+    /// transactions inserting into one table hold nothing against each other, exactly as on
+    /// either engine this API serves.
+    ///
     /// Nothing is held for a cluster whose storage this service does not share: there is no
     /// other surface of it to hold a row against.
     ///
@@ -1752,7 +1757,27 @@ pub struct Database {
     /// the engine reports each row it writes, so nothing here reads a statement's text to
     /// decide which rows it touched. Cleared before each statement, so it holds one
     /// statement's rows and never grows across requests.
+    ///
+    /// A row this database's own statements CREATED is not among them, see [`Self::created`].
     changed: Arc<Mutex<Vec<(String, i64)>>>,
+    /// The rows this database's own statements have INSERTED since it was opened, which is
+    /// since the transaction writing into it began ([`Self::snapshot`]).
+    ///
+    /// A row a transaction inserts does not exist for anybody else: no other transaction can
+    /// be holding it, reading it or writing it, so it is not a row two transactions can
+    /// contend for — which is why it is kept OUT of the rows a transaction holds
+    /// ([`Self::rows_it_changed`]) instead of being locked like a row that was already in the
+    /// database. Both engines this API serves hold the same: concurrent inserts block nothing,
+    /// only a change to a row that is already committed does.
+    ///
+    /// Kept for the whole of the transaction rather than for one statement, because a later
+    /// statement of it that updates or deletes such a row is still writing a row of its own.
+    /// Bounded like the lock table itself, one past [`MAX_LOCKED_ROWS`] exactly as
+    /// [`Self::changed`] is, and one past that ceiling is what says this database's statements
+    /// created MORE rows than this set can tell apart from the committed ones: the transaction
+    /// then holds NO row at all ([`Self::rows_it_changed`]) rather than holding a row of its
+    /// own as if another transaction had committed it.
+    created: Arc<Mutex<HashSet<(String, i64)>>>,
 }
 
 /// What a table's declaration said about a column whose values the ENGINE assigns.
@@ -2010,6 +2035,7 @@ impl Database {
             engine,
             backed: backing.is_some(),
             changed: Arc::new(Mutex::new(Vec::new())),
+            created: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -2021,34 +2047,74 @@ impl Database {
     /// is writing into records nothing and costs nothing.
     fn record_what_changes(&mut self) -> Result<(), SqlError> {
         let recorded = Arc::clone(&self.changed);
+        let created = Arc::clone(&self.created);
         self.conn
             .update_hook(Some(
-                move |_action: ::rusqlite::hooks::Action,
+                move |action: ::rusqlite::hooks::Action,
                       _schema: &str,
                       table: &str,
                       rowid: i64| {
+                    let row = (table.to_ascii_lowercase(), rowid);
+                    // A row THIS database's statements created is a row of their own, which
+                    // nothing else can hold or see: it is remembered as such rather than
+                    // taken as a contended row (see [`Self::created`]).
+                    if action == ::rusqlite::hooks::Action::SQLITE_INSERT {
+                        let mut created = created
+                            .lock()
+                            .unwrap_or_else(::std::sync::PoisonError::into_inner);
+                        // One past the ceiling is kept, which is what says the statements
+                        // created more rows than this set can tell apart from the committed
+                        // ones ([`Self::rows_it_changed`]).
+                        if created.len() <= MAX_LOCKED_ROWS {
+                            created.insert(row);
+                        }
+                        return;
+                    }
+                    // And an update or a delete of one of those rows is still a write of a
+                    // row of their own.
+                    if created
+                        .lock()
+                        .unwrap_or_else(::std::sync::PoisonError::into_inner)
+                        .contains(&row)
+                    {
+                        return;
+                    }
                     let mut held = recorded
                         .lock()
                         .unwrap_or_else(::std::sync::PoisonError::into_inner);
                     // One past the ceiling is kept, which is what says the statements changed
                     // MORE rows than locks are taken over ([`Self::rows_it_changed`]).
                     if held.len() <= MAX_LOCKED_ROWS {
-                        held.push((table.to_ascii_lowercase(), rowid));
+                        held.push(row);
                     }
                 },
             ))
             .map_err(SqlError::unavailable)
     }
 
-    /// The rows the statements that have run since [`Self::forget_what_changed`] CHANGED, as
-    /// the engine reported them, and `None` when they changed MORE than [`MAX_LOCKED_ROWS`]
-    /// of them.
+    /// The rows the statements that have run since [`Self::forget_what_changed`] CHANGED and
+    /// did not themselves create, as the engine reported them, and `None` when they changed
+    /// MORE than [`MAX_LOCKED_ROWS`] of them — or created more than that many, since past that
+    /// ceiling a row of their own can no longer be told from a committed one.
+    ///
+    /// A row these statements INSERTED is excluded ([`Self::created`]): it exists for nobody
+    /// but them until the transaction is installed, so no two transactions can contend for
+    /// it.
     ///
     /// Work over more rows than that is run with NO row locks rather than with a lock table
     /// the size of the table it wrote — the same ceiling the cluster's engine endpoints hold
     /// their own locks to — which is a bound on this emulator's bookkeeping and never a
     /// refusal: the statement itself ran.
     fn rows_it_changed(&self) -> Option<Vec<(String, i64)>> {
+        if self
+            .created
+            .lock()
+            .unwrap_or_else(::std::sync::PoisonError::into_inner)
+            .len()
+            > MAX_LOCKED_ROWS
+        {
+            return None;
+        }
         let held = self
             .changed
             .lock()
