@@ -1308,6 +1308,16 @@ pub fn connection_test_did_not_reach_the_source(connection_type: &str) -> String
     format!("Unable to connect to the {connection_type} data source.")
 }
 
+/// A read of the options of a connection TYPE (`DescribeConnectionType`) for a name that
+/// names no connection type the service serves — neither one of the connector kinds it
+/// ships ([`crate::state::connection_type_family`]) nor a custom one registered in this
+/// account.
+///
+/// Recorded CONSTANT, reproduced as the service words this error class: the sentence states
+/// that the connection type asked about is not available and names NOTHING of the request,
+/// so a client sees the same wording whichever name it asked for.
+pub const CONNECTION_TYPE_NOT_AVAILABLE: &str = "The connection type is not available.";
+
 /// `GetTable` for an address it cannot resolve — a table the database does not hold, or
 /// a `DatabaseName` the catalog holds no database under. Recorded constant: this read
 /// answers ONE wording whichever step of the address missed, and it names neither the

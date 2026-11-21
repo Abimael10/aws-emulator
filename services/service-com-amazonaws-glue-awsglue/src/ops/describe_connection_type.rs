@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConnectionType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConnectionType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the full set of options of ONE connection type — the connector
+//! kinds this service serves are the values of the modelled `ConnectionType` enum, which is
+//! the key space of `ConnectionInput$ConnectionType`, so a type a connection can be created
+//! with is a type this read describes. What each one is configured with is read off the
+//! catalogue in [`crate::state::describe_connection_type`]: the capabilities, the create's
+//! connection properties, the Spark script's connection options, the authentication
+//! configuration, one configuration per compute environment, and the physical placement of
+//! a connection reached inside a VPC.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConnectionType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A name that is no connection type this service serves is refused with the modelled
+//! `InvalidInputException`. This read reports what the service itself ships, which is the
+//! same for every caller, so it reads no per-account record and writes nothing.
+//!
+//! Members this handler reports nothing for: `RestConfiguration` is "HTTP request and
+//! response configuration ... for REST based data source", which a connection type carries
+//! only when it was REGISTERED with one (`RegisterConnectionType`), and the three
+//! per-compute-environment property maps (`AthenaConnectionProperties`,
+//! `PythonConnectionProperties`, `SparkConnectionProperties`) hold the properties that
+//! differ per environment, where the catalogue holds one set of properties common to them
+//! all and reports each environment's own options in `ComputeEnvironmentConfigurations`.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +180,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConnectionType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConnectionTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConnectionType"))
+        // The connector kinds described here are the ones the service itself ships, so
+        // there is no record of this account to read: every caller is served the same
+        // description, and reading it changes nothing. The engine this operation was
+        // constructed with therefore goes untouched.
+        let _ = &self.engine;
+        let Some(details) = crate::state::describe_connection_type(&input.connection_type) else {
+            return Err(DescribeConnectionTypeErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(
+                        crate::state::messages::CONNECTION_TYPE_NOT_AVAILABLE.to_string(),
+                    ),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeConnectionTypeOutput {
+            connection_type: Some(details.connection_type),
+            description: Some(details.description),
+            capabilities: Some(details.capabilities),
+            connection_properties: Some(details.connection_properties),
+            connection_options: Some(details.connection_options),
+            authentication_configuration: details.authentication_configuration,
+            compute_environment_configurations: Some(details.compute_environment_configurations),
+            physical_connection_requirements: details.physical_connection_requirements,
+            // See the module docs: the per-compute-environment property maps and the REST
+            // configuration carry what a connection type holds beyond this catalogue.
+            athena_connection_properties: None,
+            python_connection_properties: None,
+            spark_connection_properties: None,
+            rest_configuration: None,
+        })
     }
 }
