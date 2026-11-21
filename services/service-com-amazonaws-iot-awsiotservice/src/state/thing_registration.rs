@@ -32,7 +32,7 @@
 //! against the length Amazon S3's own answer declares, before a byte reaches this process,
 //! and against the bytes that arrive ([`MAX_INPUT_FILE_BYTES`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use ::serde_json::{Map, Value};
@@ -104,7 +104,11 @@ const PROPERTIES_MEMBER: &str = "Properties";
 
 /// The intrinsic function a template property substitutes a parameter value with:
 /// `{"Ref": "<parameter name>"}`.
-const REF_FUNCTION: &str = "Ref";
+///
+/// Reachable from the rest of the state module because the single-device provisioning path
+/// ([`super::thing_provisioning`]) names the function in the refusal it states a reference it
+/// could not resolve with.
+pub(super) const REF_FUNCTION: &str = "Ref";
 
 /// The properties of the `AWS::IoT::Thing` resource this registry can provision: the thing's
 /// name, its attributes, its thing type and its billing group — which is exactly the
@@ -379,6 +383,45 @@ pub(super) fn render_text(
         }
         scalar => scalar_text(scalar),
     }
+}
+
+/// The parameter named by a reference inside `value` that `substitutions` gives no value
+/// for, and `None` when every reference it carries resolves.
+///
+/// A template refers to its parameters wherever a property's value may be — a property's own
+/// value, an attribute of the payload, an element of a list — so the whole value is walked
+/// rather than only its top level, and the SHALLOWEST reference the walk finds unresolved is
+/// the one answered. What resolves is what [`render_text`] substitutes: the parameter values
+/// the call supplied over the `Default`s the template declares.
+///
+/// The walk keeps its own queue rather than recursing, because how deeply a body nests is the
+/// CALLER's: nothing here grows the stack with it, and the queue is bounded by the body, whose
+/// own length the modelled `TemplateBody` caps.
+pub(super) fn unresolved_reference<'a>(
+    value: &'a Value,
+    substitutions: &BTreeMap<String, String>,
+) -> Option<&'a str> {
+    let mut pending = VecDeque::from([value]);
+    while let Some(value) = pending.pop_front() {
+        // The reference itself: a single-member object whose member is the intrinsic
+        // function, which is the shape [`render_text`] reads one as.
+        if let Value::Object(function) = value {
+            if function.len() == 1 {
+                if let Some(parameter) = function.get(REF_FUNCTION).and_then(Value::as_str) {
+                    if substitutions.contains_key(parameter) {
+                        continue;
+                    }
+                    return Some(parameter);
+                }
+            }
+        }
+        match value {
+            Value::Object(members) => pending.extend(members.values()),
+            Value::Array(items) => pending.extend(items.iter()),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// A JSON scalar as the text a template property or a parameter value means. A structure, a

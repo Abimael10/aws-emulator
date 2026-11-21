@@ -30,8 +30,8 @@ use service_com_amazonaws_iot_awsiotservice::state::thing_provisioning::{
     json_syntax_detail, template_format_error_message, undescribed_resource_message,
     unheld_certificate_message, unmodeled_certificate_status_message, unnamed_certificate_message,
     unnamed_policy_message, unprovisionable_thing_message, unreadable_policy_document_message,
-    unsupported_resource_type_message, NOT_AN_OBJECT_DETAIL, NO_RESOURCES_DETAIL,
-    NO_THING_RESOURCE_DETAIL,
+    unresolvable_reference_message, unsupported_resource_type_message, NOT_AN_OBJECT_DETAIL,
+    NO_RESOURCES_DETAIL, NO_THING_RESOURCE_DETAIL,
 };
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -910,9 +910,29 @@ async fn a_declaration_that_names_nothing_to_provision_is_refused() {
             undescribed_resource_message("blank"),
         ),
         (
+            // The name is a reference, and the parameter it names has no value here, so the
+            // refusal is about the REFERENCE rather than about the resource: the rule that
+            // owns it is pinned by `a_reference_nothing_resolves_is_refused_as_the_reference`.
             "a thing whose name no parameter supplies",
             json!({ "Resources": { "thing": thing_resource.clone() } }),
             json!({ "Model": "x1" }),
+            unresolvable_reference_message("SerialNumber"),
+        ),
+        (
+            // Every reference resolves here, and the resource still describes no thing the
+            // registry can be addressed by: a thing is named by its `ThingName`.
+            "a thing resource stating no ThingName",
+            json!({
+                "Resources": {
+                    "thing": {
+                        "Type": "AWS::IoT::Thing",
+                        "Properties": {
+                            "AttributePayload": { "serialNumber": { "Ref": "SerialNumber" } },
+                        },
+                    },
+                },
+            }),
+            json!({ "SerialNumber": "sn-nameless" }),
             unprovisionable_thing_message(),
         ),
     ];
@@ -1205,4 +1225,325 @@ async fn a_policy_the_certificate_cannot_take_leaves_nothing_provisioned() {
         policy.status,
         policy.text()
     );
+}
+
+/// The one-based line, and the one-based column in bytes, at which `token` first occurs in
+/// `body`: where a caller reading the refusal's position is pointed in its own body.
+fn position_of(body: &str, token: &str) -> (usize, usize) {
+    let at = body
+        .find(token)
+        .unwrap_or_else(|| panic!("the case body {body:?} must carry {token:?}"));
+    let before = &body[..at];
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    (1 + before.matches('\n').count(), 1 + at - line_start)
+}
+
+/// RULE: where a `templateBody` is not well-formed JSON, the position the refusal reports is
+/// the one-based line and column of the FIRST character of the construct the parse could not
+/// read — never a position inside it or past it.
+#[tokio::test]
+async fn a_template_syntax_refusal_reports_where_the_fault_starts() {
+    // Each row names the body and the TEXT of the construct at fault; what is asserted is
+    // that the reported position is where that text starts. The rows span the two ways a
+    // parse stops — part-way THROUGH the offending text (a bare word that begins one of
+    // JSON's literal tokens `null`, `true` and `false` is matched character by character
+    // until one does not match) and ON its first character (nothing that could start a value
+    // or a member name was there) — at the body's very first character, later on its first
+    // line, and on a line further down.
+    let cases = [
+        (
+            "a word beginning a literal, at the first character of the body",
+            "not a provisioning template".to_string(),
+            "not",
+        ),
+        (
+            "a word beginning another literal, at the first character of the body",
+            "this is not a provisioning template".to_string(),
+            "this",
+        ),
+        (
+            "a word beginning the third literal, at the first character of the body",
+            "fleet template, unquoted".to_string(),
+            "fleet",
+        ),
+        (
+            "a character that can start no value, at the first character of the body",
+            "#not a provisioning template".to_string(),
+            "#",
+        ),
+        (
+            "text after a value that parsed",
+            "false-ish".to_string(),
+            "-",
+        ),
+        (
+            "a word beginning a literal inside a declaration",
+            "{\"Resources\": [nope]}".to_string(),
+            "nope",
+        ),
+        (
+            "a word beginning a literal on a later line",
+            "{\n  \"Resources\": nothing\n}".to_string(),
+            "nothing",
+        ),
+        (
+            "an unquoted member name on a later line",
+            "{\n  Resources: {}\n}".to_string(),
+            "Resources",
+        ),
+        (
+            "a member name quoted the way JSON does not",
+            "{ 'Resources': {} }".to_string(),
+            "'",
+        ),
+    ];
+
+    for (label, body, offender) in cases {
+        let emulator = Emulator::new();
+        let refused = emulator.register_thing_with_text(&body).await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {label}: expected 400, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidRequestException",
+            "case {label}: got {}",
+            refused.text()
+        );
+        let (line, column) = position_of(&body, offender);
+        assert_eq!(
+            refused.error_message(),
+            template_format_error_message(&json_syntax_detail(line, column)),
+            "case {label}: the refusal must report line {line}, column {column} — where \
+             {offender:?} starts in {body:?} — got {}",
+            refused.error_message()
+        );
+    }
+}
+
+/// RULE: a template reference `{"Ref": "<parameter>"}` the call supplies no value for and the
+/// template declares no `Default` for is refused with the modelled `InvalidRequestException`
+/// naming the REFERENCE it could not resolve, whichever resource and whichever property
+/// carries it.
+#[tokio::test]
+async fn a_reference_nothing_resolves_is_refused_as_the_reference() {
+    // The rows span where a reference may sit — the thing's name, an attribute of its
+    // payload, a certificate property and a policy property — and the parameter names differ
+    // from row to row, because the name reported is the one the reference carries.
+    let cases: Vec<(&str, Value, Value, &str, Option<&str>)> = vec![
+        (
+            "the thing's name, with nothing supplied at all",
+            json!({
+                "Resources": {
+                    "thing": {
+                        "Type": "AWS::IoT::Thing",
+                        "Properties": { "ThingName": { "Ref": "ThingName" } },
+                    },
+                },
+            }),
+            json!({}),
+            "ThingName",
+            None,
+        ),
+        (
+            "the thing's name, with another parameter supplied",
+            json!({
+                "Resources": {
+                    "thing": {
+                        "Type": "AWS::IoT::Thing",
+                        "Properties": { "ThingName": { "Ref": "SerialNumber" } },
+                    },
+                },
+            }),
+            json!({ "Model": "x1" }),
+            "SerialNumber",
+            None,
+        ),
+        (
+            "an attribute of the thing's payload",
+            json!({
+                "Resources": {
+                    "thing": {
+                        "Type": "AWS::IoT::Thing",
+                        "Properties": {
+                            "ThingName": "referencing-attribute-thing",
+                            "AttributePayload": {
+                                "attributes": { "location": { "Ref": "Location" } },
+                            },
+                        },
+                    },
+                },
+            }),
+            json!({ "SerialNumber": "sn-attribute" }),
+            "Location",
+            Some("referencing-attribute-thing"),
+        ),
+        (
+            "the thing's type",
+            json!({
+                "Resources": {
+                    "thing": {
+                        "Type": "AWS::IoT::Thing",
+                        "Properties": {
+                            "ThingName": "referencing-type-thing",
+                            "ThingTypeName": { "Ref": "DeviceFamily" },
+                        },
+                    },
+                },
+            }),
+            json!({}),
+            "DeviceFamily",
+            Some("referencing-type-thing"),
+        ),
+        (
+            "a certificate's id",
+            json!({
+                "Resources": {
+                    "thing": {
+                        "Type": "AWS::IoT::Thing",
+                        "Properties": { "ThingName": "referencing-certificate-thing" },
+                    },
+                    "cert": {
+                        "Type": "AWS::IoT::Certificate",
+                        "Properties": { "CertificateId": { "Ref": "CertificateId" } },
+                    },
+                },
+            }),
+            json!({}),
+            "CertificateId",
+            Some("referencing-certificate-thing"),
+        ),
+        (
+            "a policy's name",
+            json!({
+                "Resources": {
+                    "thing": {
+                        "Type": "AWS::IoT::Thing",
+                        "Properties": { "ThingName": "referencing-policy-thing" },
+                    },
+                    "pol": {
+                        "Type": "AWS::IoT::Policy",
+                        "Properties": { "PolicyName": { "Ref": "PolicyName" } },
+                    },
+                },
+            }),
+            json!({}),
+            "PolicyName",
+            Some("referencing-policy-thing"),
+        ),
+    ];
+
+    for (label, template, parameters, parameter, unprovisioned_thing) in cases {
+        let emulator = Emulator::new();
+        let refused = emulator.register_thing(&template, &parameters).await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {label}: expected 400, got {} body {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidRequestException",
+            "case {label}: got {}",
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_message(),
+            unresolvable_reference_message(parameter),
+            "case {label}: the refusal must name the reference to {parameter}, got {}",
+            refused.error_message()
+        );
+
+        // Nothing was provisioned: a reference the call cannot resolve refuses the whole
+        // template, so the thing it named by a literal is not in the registry either.
+        if let Some(thing_name) = unprovisioned_thing {
+            let thing = emulator.describe_thing(thing_name).await;
+            assert_eq!(
+                thing.status,
+                404,
+                "case {label}: a refused registration registers no thing, got {} body {}",
+                thing.status,
+                thing.text()
+            );
+        }
+    }
+}
+
+/// RULE: a reference resolves from the parameters the call supplies OVER the `Default`s the
+/// template declares, so a template whose references all resolve provisions the thing they
+/// describe.
+#[tokio::test]
+async fn a_reference_a_parameter_or_a_default_resolves_is_provisioned() {
+    // The rows span the two sources a reference resolves from, and the third case is the
+    // precedence between them: a supplied value wins over the declared default.
+    let cases = [
+        (
+            "the call supplies the parameter",
+            json!({ "SerialNumber": "sn-supplied" }),
+            json!({ "SerialNumber": { "Type": "String" } }),
+            "sn-supplied",
+        ),
+        (
+            "the template's Default supplies it",
+            json!({}),
+            json!({ "SerialNumber": { "Type": "String", "Default": "sn-defaulted" } }),
+            "sn-defaulted",
+        ),
+        (
+            "the call's value is taken over the Default",
+            json!({ "SerialNumber": "sn-overridden" }),
+            json!({ "SerialNumber": { "Type": "String", "Default": "sn-defaulted" } }),
+            "sn-overridden",
+        ),
+    ];
+
+    for (label, parameters, declared_parameters, expected_thing_name) in cases {
+        let emulator = Emulator::new();
+        let template = json!({
+            "Parameters": declared_parameters,
+            "Resources": {
+                "thing": {
+                    "Type": "AWS::IoT::Thing",
+                    "Properties": { "ThingName": { "Ref": "SerialNumber" } },
+                },
+            },
+        });
+
+        let registered = emulator.register_thing(&template, &parameters).await;
+        assert_eq!(
+            registered.status,
+            200,
+            "case {label}: expected 200, got {} body {}",
+            registered.status,
+            registered.text()
+        );
+        assert_eq!(
+            registered.json()["resourceArns"]["thing"],
+            json!(thing_arn(expected_thing_name)),
+            "case {label}: the reference must resolve to {expected_thing_name}, got {}",
+            registered.text()
+        );
+
+        // The thing is on record under the name the reference resolved to.
+        let thing = emulator.describe_thing(expected_thing_name).await;
+        assert_eq!(
+            thing.status,
+            200,
+            "case {label}: the provisioned thing must read back, got {} body {}",
+            thing.status,
+            thing.text()
+        );
+        assert_eq!(
+            thing.json()["thingName"],
+            json!(expected_thing_name),
+            "case {label}: got {}",
+            thing.text()
+        );
+    }
 }

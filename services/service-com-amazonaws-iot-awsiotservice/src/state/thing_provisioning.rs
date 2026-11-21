@@ -38,7 +38,7 @@ use std::time::SystemTime;
 
 use ::serde_json::{Map, Value};
 
-use super::thing_registration::{render_text, ProvisioningTemplate};
+use super::thing_registration::{render_text, unresolved_reference, ProvisioningTemplate, REF_FUNCTION};
 use super::ComAmazonawsIotAwsiotserviceState;
 use crate::ops::types::CERTIFICATE_STATUS_VALUES;
 
@@ -72,18 +72,60 @@ const CERTIFICATE_STATUS_PROPERTY: &str = "Status";
 const POLICY_NAME_PROPERTY: &str = "PolicyName";
 const POLICY_DOCUMENT_PROPERTY: &str = "PolicyDocument";
 
-/// The clause every refusal of a template BODY opens with, and the family every such
-/// refusal's detail hangs off: AWS IoT refuses a `RegisterThing` whose `templateBody` it
-/// cannot read with "Invalid registration template. Template format error: <detail>", so a
-/// caller reads one wording whichever part of the body is at fault.
+/// The clause every refusal of a `templateBody` opens with: AWS IoT refuses a
+/// `RegisterThing` whose template it cannot carry out with "Invalid registration template.
+/// <detail>", so a caller reads one wording whichever part of the body is at fault.
+pub fn invalid_template_message(detail: &str) -> String {
+    format!("Invalid registration template. {detail}")
+}
+
+/// The family a refusal of the BODY's FORM hangs off: a body this service cannot read as a
+/// provisioning template at all is a template-format fault, and the detail says which.
 pub fn template_format_error_message(detail: &str) -> String {
-    format!("Invalid registration template. Template format error: {detail}")
+    invalid_template_message(&format!("Template format error: {detail}"))
+}
+
+/// How this service states that a reference the template uses names a parameter the call
+/// supplied no value for and the template declares no `Default` for, so there is nothing to
+/// substitute for it.
+///
+/// A template's properties are filled in from its parameters, so an unresolvable reference is
+/// a fault about the REFERENCE rather than about the resource that carries it: the fixed text
+/// is the family's and the variable part is the reference itself, written as the template
+/// states it.
+pub fn unresolvable_reference_message(parameter: &str) -> String {
+    invalid_template_message(&format!(
+        "Cannot resolve reference value: {{{REF_FUNCTION}={parameter}}}"
+    ))
 }
 
 /// The detail a body that is not JSON at all carries: the LINE and COLUMN the JSON parser
 /// stopped at, so the caller is told where in its own body to look.
 pub fn json_syntax_detail(line: usize, column: usize) -> String {
     format!("JSON syntax error at line {line}, column {column}")
+}
+
+/// WHERE a body that is not JSON went wrong, as the refusal above reports it: the one-based
+/// line and the one-based column of the FIRST character of the construct the parse could not
+/// read.
+///
+/// The position a caller is handed is what it slices, highlights or logs its own body at, so
+/// it has to name the start of the fault. `serde_json` reports the cursor it stopped at, and
+/// that cursor is already INSIDE the offending text whenever the parse had begun consuming it
+/// — a bare word that starts one of JSON's literal tokens is consumed character by character
+/// until one does not match, so the column reported for it lands one or more positions to the
+/// right of the word. The word is the fault, so the position is extended back to where it
+/// starts; that reading of a submitted JSON document is
+/// [`::service_common::json_parse_fault::unrecognized_token`], shared with every other
+/// service that reports where a document a caller handed it stopped parsing.
+///
+/// Every other fault stopped ON the offending character rather than after it — the parse had
+/// only PEEKED it — so the position is the one the parse itself reports.
+fn json_syntax_position(body: &str, error: &::serde_json::Error) -> (usize, usize) {
+    ::service_common::json_parse_fault::unrecognized_token(body, error).map_or(
+        (error.line(), error.column()),
+        |(_, line, column)| (line, column),
+    )
 }
 
 /// The detail a body that parses as JSON but is no JSON object carries: a provisioning
@@ -124,15 +166,16 @@ impl ProvisioningRefusal {
 }
 
 /// How this service refuses a `templateBody` it cannot read as a provisioning template at
-/// all: the parser's own line and column for a body that is not JSON, and the rule it
-/// broke for one that is JSON but no template.
+/// all: where the parse of a body that is not JSON went wrong
+/// ([`json_syntax_position`]), and the rule it broke for one that is JSON but no template.
 ///
 /// Reading the body again is what tells the two apart, and it happens only on the refusal
 /// path.
 fn unreadable_template_message(body: &str) -> String {
     match ::serde_json::from_str::<Value>(body) {
         Err(error) => {
-            template_format_error_message(&json_syntax_detail(error.line(), error.column()))
+            let (line, column) = json_syntax_position(body, &error);
+            template_format_error_message(&json_syntax_detail(line, column))
         }
         Ok(Value::Object(sections)) if !sections.contains_key(RESOURCES_MEMBER) => {
             template_format_error_message(NO_RESOURCES_DETAIL)
@@ -299,6 +342,23 @@ pub fn provision_template(
         .map(|(name, value)| (name.clone(), Value::String(value.clone())))
         .collect();
     let substitutions = template.substitutions(&supplied);
+
+    // A property is filled in from the parameters the call supplied over the `Default`s the
+    // template declares, so a reference to a parameter with neither is one this call cannot
+    // resolve — a fact about the REQUEST whichever resource carries the reference, so every
+    // declaration's properties are read for one before any of them is provisioned, and the
+    // refusal names the reference rather than the resource.
+    let unresolved = declared.iter().find_map(|resource| {
+        resource
+            .properties
+            .values()
+            .find_map(|property| unresolved_reference(property, &substitutions))
+    });
+    if let Some(parameter) = unresolved {
+        return Err(ProvisioningRefusal::Template(
+            unresolvable_reference_message(parameter),
+        ));
+    }
 
     // Everything the declarations need is resolved BEFORE the first write, so a resource
     // this service cannot provision leaves the store untouched rather than half-written.
