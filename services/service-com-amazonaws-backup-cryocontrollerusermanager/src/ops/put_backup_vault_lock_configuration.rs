@@ -113,6 +113,17 @@ use super::types::*;
 /// configuration becomes immutable.
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
+/// The one sentence AWS answers for the WHOLE vault-lock retention-days rule
+/// class: a retention bound outside the span the model documents
+/// ([`crate::state::MIN_LOCK_RETENTION_DAYS`] ..=
+/// [`crate::state::MAX_LOCK_RETENTION_DAYS`]) and a minimum above the maximum
+/// are the same rule, so both are refused with this text. It is fixed in full —
+/// it states the span in the service's own spelling (a thousands separator and a
+/// closing period) and names neither member nor any value the request carried.
+const RETENTION_DAYS_REFUSAL: &str = "Backup vault Lock configuration retention days must be \
+                                      between 1 and 36,500, and minimum must be less than or \
+                                      equal to maximum.";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -223,57 +234,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ChangeableForDays`, `MinRetentionDays` and `MaxRetentionDays` target
         // `Long` with no `@range`, so the framework cannot refuse a value
         // outside the span the model documents for each; AWS does, with
-        // `InvalidParameterValueException`.
-        let out_of_range = |member: &str, value: i64, min: i64, max: i64| {
-            PutBackupVaultLockConfigurationErrorModeled::InvalidParameterValueException(
-                InvalidParameterValueException {
-                    message: Some(format!(
-                        "{member} must be between {min} and {max} days, got {value}"
-                    )),
-                    ..Default::default()
-                },
-            )
-        };
+        // `InvalidParameterValueException`, and each span has its OWN sentence:
+        // the cooling-off span's below, the retention bounds' in
+        // [`RETENTION_DAYS_REFUSAL`].
         if let Some(days) = input.changeable_for_days {
             if !(crate::state::MIN_CHANGEABLE_FOR_DAYS..=crate::state::MAX_CHANGEABLE_FOR_DAYS)
                 .contains(&days)
             {
-                return Err(out_of_range(
-                    "ChangeableForDays",
-                    days,
-                    crate::state::MIN_CHANGEABLE_FOR_DAYS,
-                    crate::state::MAX_CHANGEABLE_FOR_DAYS,
-                )
-                .into());
-            }
-        }
-        for (member, value) in [
-            ("MinRetentionDays", input.min_retention_days),
-            ("MaxRetentionDays", input.max_retention_days),
-        ] {
-            let Some(days) = value else { continue };
-            if !(crate::state::MIN_LOCK_RETENTION_DAYS..=crate::state::MAX_LOCK_RETENTION_DAYS)
-                .contains(&days)
-            {
-                return Err(out_of_range(
-                    member,
-                    days,
-                    crate::state::MIN_LOCK_RETENTION_DAYS,
-                    crate::state::MAX_LOCK_RETENTION_DAYS,
-                )
-                .into());
-            }
-        }
-        // A vault cannot enforce a minimum retention longer than the maximum it
-        // also enforces: no backup could satisfy both, so the configuration is
-        // refused rather than stored.
-        if let (Some(min), Some(max)) = (input.min_retention_days, input.max_retention_days) {
-            if min > max {
                 return Err(
                     PutBackupVaultLockConfigurationErrorModeled::InvalidParameterValueException(
                         InvalidParameterValueException {
                             message: Some(format!(
-                                "MinRetentionDays ({min}) must not exceed MaxRetentionDays ({max})"
+                                "ChangeableForDays must be between {} and {} days, got {days}",
+                                crate::state::MIN_CHANGEABLE_FOR_DAYS,
+                                crate::state::MAX_CHANGEABLE_FOR_DAYS,
                             )),
                             ..Default::default()
                         },
@@ -281,6 +255,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
+        }
+        // The retention bounds form ONE rule: each must fall inside the span the
+        // model documents, and the minimum must not exceed the maximum — a vault
+        // cannot enforce a minimum retention longer than the maximum it also
+        // enforces, because no backup could satisfy both. Either violation is
+        // refused with the service's single retention-days sentence rather than
+        // stored, so the refusal carries no member name and echoes nothing the
+        // request submitted.
+        let bound_outside_span = [input.min_retention_days, input.max_retention_days]
+            .into_iter()
+            .flatten()
+            .any(|days| {
+                !(crate::state::MIN_LOCK_RETENTION_DAYS..=crate::state::MAX_LOCK_RETENTION_DAYS)
+                    .contains(&days)
+            });
+        let inverted_bounds = match (input.min_retention_days, input.max_retention_days) {
+            (Some(min), Some(max)) => min > max,
+            _ => false,
+        };
+        if bound_outside_span || inverted_bounds {
+            return Err(
+                PutBackupVaultLockConfigurationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(RETENTION_DAYS_REFUSAL.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .into(),
+            );
         }
 
         let mut store = state.lock();

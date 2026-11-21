@@ -279,6 +279,9 @@ async fn a_visible_vault_still_takes_and_drops_its_lock() {
 ///
 /// The rows walk each day count past a published bound and the pair that cannot
 /// hold together; each is sent to a vault that exists and to one that never did.
+/// The third column is the text each refusal must carry: the cooling-off span and
+/// the retention bounds are separate rule classes, each with its own sentence —
+/// `vault_lock_retention_bounds.rs` pins the retention one in full.
 #[tokio::test]
 async fn a_parameter_refusal_is_the_same_for_a_visible_and_an_invisible_vault() {
     let refused: Vec<(&str, &str, &str)> = vec![
@@ -295,21 +298,21 @@ async fn a_parameter_refusal_is_the_same_for_a_visible_and_an_invisible_vault() 
         (
             "a minimum retention below 1 day",
             r#"{"MinRetentionDays":0}"#,
-            "MinRetentionDays",
+            "retention days must be between",
         ),
         (
             "a maximum retention past 36500 days",
             r#"{"MaxRetentionDays":36501}"#,
-            "MaxRetentionDays",
+            "retention days must be between",
         ),
         (
             "a minimum retention longer than the maximum",
             r#"{"MinRetentionDays":30,"MaxRetentionDays":7}"#,
-            "MinRetentionDays",
+            "minimum must be less than or equal to maximum",
         ),
     ];
 
-    for (case, body, member) in refused {
+    for (case, body, expected) in refused {
         let router = router();
         prepare(&router, Setup::Created, "param-vault").await;
 
@@ -326,8 +329,8 @@ async fn a_parameter_refusal_is_the_same_for_a_visible_and_an_invisible_vault() 
              exists, got {on_visible:?} and {on_invisible:?}"
         );
         assert!(
-            message(&on_visible.body).contains(member),
-            "case {case:?}: expected the refusal to name {member}, got {:?}",
+            message(&on_visible.body).contains(expected),
+            "case {case:?}: expected the refusal to carry {expected:?}, got {:?}",
             on_visible.body
         );
 
