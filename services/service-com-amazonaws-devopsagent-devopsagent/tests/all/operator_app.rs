@@ -24,7 +24,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::agent_space_not_found::{assert_not_found, missing_identifiers};
+use crate::agent_space_not_found::{assert_operator_app_space_not_found, missing_identifiers};
 
 /// The `AuthFlow` value set, from the model's enum
 /// (`smithy_query(query="shape", shape="AuthFlow")`). Every value is enabled by some
@@ -402,7 +402,7 @@ async fn reading_the_operator_app_of_an_agent_space_that_does_not_exist_is_refus
         );
         let case = format!("GetOperatorApp {agent_space_id:?}");
         let (status, refused) = get_operator_app(&router, &agent_space_id, REGION).await;
-        assert_not_found(&case, &agent_space_id, status, &refused);
+        assert_operator_app_space_not_found(&case, &agent_space_id, status, &refused);
     }
 }
 
@@ -647,7 +647,7 @@ async fn enabling_the_operator_app_of_an_agent_space_that_does_not_exist_is_refu
         let case = format!("EnableOperatorApp {agent_space_id:?}");
         let (status, refused) =
             enable_operator_app(&router, &agent_space_id, body.clone(), REGION).await;
-        assert_not_found(&case, &agent_space_id, status, &refused);
+        assert_operator_app_space_not_found(&case, &agent_space_id, status, &refused);
     }
 }
 

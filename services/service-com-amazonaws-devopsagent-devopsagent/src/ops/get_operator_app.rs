@@ -163,7 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let record = store.agent_spaces.get(&input.agent_space_id).ok_or_else(|| {
             GetOperatorAppErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::agent_space_not_found_message(&input.agent_space_id),
+                message: crate::state::operator_app_space_not_found_message(
+                    &input.agent_space_id,
+                ),
             })
         })?;
 

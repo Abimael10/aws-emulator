@@ -145,6 +145,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `@readonly`: this reports the stored resource and writes nothing.
+        //
+        // The AgentSpace is this operation's target resource, so an id naming none is
+        // refused with the wording of that resource — not with the Operator App
+        // plane's missing-parent wording.
         let store = state.lock();
         let record = store.agent_spaces.get(&input.agent_space_id).ok_or_else(|| {
             GetAgentSpaceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {

@@ -394,16 +394,38 @@ pub fn caller_account_id() -> &'static str {
     ::emulator_server::emulator_account_id()
 }
 
-/// The refusal message a control-plane operation answers with when the
+/// The refusal message an operation whose target resource IS the AgentSpace
+/// answers with when the `agentSpaceId` it was given names none.
+///
+/// A not-found refusal is worded after the resource the operation resolved: this
+/// one names the resource type, the member the identifier arrived on and the
+/// value itself — "AgentSpace with agentSpaceId <agentSpaceId> not found." The
+/// fixed text is "AgentSpace with agentSpaceId " + " not found."; the single
+/// variable part is the identifier, taken verbatim from the request, unquoted and
+/// followed by the terminal period, with no account clause. The model states no
+/// message text, so the wording is the service's own.
+///
+/// The Operator App plane resolves a resource INSIDE the space and words its own
+/// missing-space refusal differently: see
+/// [`operator_app_space_not_found_message`].
+pub fn agent_space_not_found_message(agent_space_id: &str) -> String {
+    format!("AgentSpace with agentSpaceId {agent_space_id} not found.")
+}
+
+/// The refusal message an Operator App operation answers with when the
 /// `agentSpaceId` it was given names no AgentSpace in the caller's account.
 ///
-/// The not-found refusal of this service's control plane names BOTH the identifier
-/// the request carried and the account the lookup ran in, each double-quoted, so an
-/// operator can tell an AgentSpace that was deleted from a lookup performed against
-/// a different account than they expected. The id is taken verbatim from the
-/// request and the account from the calling identity ([`caller_account_id`]); the
-/// model states no message text, so the wording is the service's own.
-pub fn agent_space_not_found_message(agent_space_id: &str) -> String {
+/// The Operator App is a resource inside an AgentSpace, and the lookup that
+/// resolves its parent names BOTH the identifier the request carried and the
+/// account the lookup ran in, each double-quoted, so an operator can tell an
+/// AgentSpace that was deleted from a lookup performed against a different
+/// account than they expected. The id is taken verbatim from the request and the
+/// account from the calling identity ([`caller_account_id`]).
+///
+/// This is NOT the wording of a refusal from an operation addressed to the
+/// AgentSpace itself, which names the resource it resolved
+/// ([`agent_space_not_found_message`]).
+pub fn operator_app_space_not_found_message(agent_space_id: &str) -> String {
     let account_id = caller_account_id();
     format!(
         "Could not find Agent Space with provided agentSpaceId \"{agent_space_id}\" in accountId \"{account_id}\""

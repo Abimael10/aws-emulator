@@ -147,7 +147,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The model declares `ResourceNotFoundException` for this operation, so an
             // id that names no agent space is answered with that 404 — `@idempotent`
             // means a repeat causes no second deletion, not that a missing resource is
-            // reported as a success.
+            // reported as a success. The AgentSpace is this operation's target
+            // resource, so the refusal carries that resource's wording.
             return Err(DeleteAgentSpaceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::agent_space_not_found_message(&input.agent_space_id),

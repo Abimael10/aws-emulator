@@ -1,20 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The one wording this service's control plane answers an `agentSpaceId` that names
-//! no AgentSpace with, and the identifiers that name none — shared by every suite
-//! that drives such a lookup.
+//! The wordings this service answers an `agentSpaceId` that names no AgentSpace
+//! with, and the identifiers that name none — shared by every suite that drives
+//! such a lookup.
 //!
-//! The rule it encodes: a control-plane operation that resolves an `agentSpaceId` and
-//! holds no AgentSpace under it for the calling account refuses the request with HTTP
-//! 404 `ResourceNotFoundException` whose message names BOTH the identifier the
-//! request carried and the account the lookup ran in, each double-quoted — one
-//! wording for every such operation, computed from the request and the store rather
-//! than from which operation was called.
+//! The rule it encodes: a not-found refusal is worded after the resource the
+//! operation actually resolved. An operation whose target resource IS the
+//! AgentSpace (`GetAgentSpace`, `DeleteAgentSpace` on
+//! `/v1/agentspaces/{agentSpaceId}`) names that resource, the member its
+//! identifier arrived on and the value itself — unquoted, with a terminal period
+//! and no account clause. An Operator App operation resolves a resource INSIDE
+//! the space, and its missing-parent refusal names both the identifier the
+//! request carried and the account the lookup ran in, each double-quoted. Both
+//! are HTTP 404 `ResourceNotFoundException`, computed from the request and the
+//! store rather than from a literal.
 //!
-//! This module holds no test of its own: it is the single copy of that expectation,
-//! so a suite for one slice of the service (the Operator App, the AgentSpace
-//! lifecycle) asserts the same text as every other and the text cannot drift between
-//! them.
+//! This module holds no test of its own: it is the single copy of those
+//! expectations, so a suite for one slice of the service (the Operator App, the
+//! AgentSpace lifecycle) asserts the same text as every other and the text cannot
+//! drift between them.
 
 use serde_json::Value;
 
@@ -29,10 +33,19 @@ pub(crate) fn caller_account() -> &'static str {
     ::emulator_server::emulator_account_id()
 }
 
-/// The whole not-found wording: fixed text around two double-quoted slots, the
-/// requested identifier and the account the lookup ran in. Written out here rather
-/// than reused from the service so the tests pin the text itself.
-pub(crate) fn expected_message(agent_space_id: &str) -> String {
+/// The whole wording an operation addressed to the AgentSpace itself refuses a
+/// missing identifier with: fixed text naming the resource and the member the
+/// identifier arrived on, the requested value verbatim and unquoted, and a
+/// terminal period. Written out here rather than reused from the service so the
+/// tests pin the text itself.
+pub(crate) fn agent_space_expected_message(agent_space_id: &str) -> String {
+    format!("AgentSpace with agentSpaceId {agent_space_id} not found.")
+}
+
+/// The whole wording an Operator App operation refuses a request naming no
+/// AgentSpace with: fixed text around two double-quoted slots, the requested
+/// identifier and the account the lookup ran in.
+pub(crate) fn operator_app_expected_message(agent_space_id: &str) -> String {
     format!(
         "Could not find Agent Space with provided agentSpaceId \"{agent_space_id}\" in accountId \"{}\"",
         caller_account()
@@ -65,9 +78,9 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-/// Assert one call's refusal: HTTP 404, `ResourceNotFoundException`, and exactly the
-/// not-found wording for the identifier the request carried.
-pub(crate) fn assert_not_found(case: &str, agent_space_id: &str, status: u16, body: &Value) {
+/// Assert one call's refusal: HTTP 404, `ResourceNotFoundException`, and exactly
+/// `expected` as the message.
+pub(crate) fn assert_not_found(case: &str, expected: &str, status: u16, body: &Value) {
     assert_eq!(
         status, 404,
         "case {case:?}: expected 404 for an agentSpaceId naming no AgentSpace, got {status} ({body})"
@@ -79,8 +92,23 @@ pub(crate) fn assert_not_found(case: &str, agent_space_id: &str, status: u16, bo
     );
     let actual = body["message"].as_str().unwrap_or("<no message>");
     assert_eq!(
-        actual,
-        expected_message(agent_space_id),
-        "case {case:?}: expected the not-found wording naming the agentSpaceId and the account, got {actual:?}"
+        actual, expected,
+        "case {case:?}: expected the not-found wording {expected:?}, got {actual:?}"
+    );
+}
+
+/// Assert the refusal of an Operator App operation whose parent AgentSpace is
+/// absent.
+pub(crate) fn assert_operator_app_space_not_found(
+    case: &str,
+    agent_space_id: &str,
+    status: u16,
+    body: &Value,
+) {
+    assert_not_found(
+        case,
+        &operator_app_expected_message(agent_space_id),
+        status,
+        body,
     );
 }
