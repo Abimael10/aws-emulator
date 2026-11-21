@@ -202,6 +202,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ListRecommendationResourcesErrorModeled::AccessDeniedException(denied).into(),
             );
         }
+        // The three filters this read cuts on, and the ONE predicate they
+        // select a stored resource with — the same one the organization-level
+        // view of these resources applies
+        // ([`crate::state::ResourceFilters`]), so the two cannot select
+        // differently. Each summary is likewise the one shared projection of
+        // the stored resource ([`crate::state::resource_summary`]).
+        let filters = crate::state::ResourceFilters {
+            status: input.status.as_deref(),
+            exclusion_status: input.exclusion_status.as_deref(),
+            region_code: input.region_code.as_deref(),
+        };
+        // The cursor's scope names this recommendation AND this read's filters,
+        // so a token issued for one recommendation's resources (or under another
+        // filter set) cannot resume another sequence. Built from the request
+        // alone, so the refusal it decides below needs nothing off the store.
+        let scope = crate::state::list_scope(
+            &format!("resources/{}", input.recommendation_identifier),
+            &filters.scope(),
+        );
+        // Request well-formedness, ahead of the support-level gate and of every
+        // lookup: a `nextToken` that is not a cursor this read issued is one of
+        // this service's input-validation refusals (`crate::service::validation`),
+        // and those are answered before the caller's entitlement is consulted, so
+        // one malformed request has one status on every support plan. See
+        // [`crate::state::unissued_page_token_refusal`].
+        if let Some(malformed) = crate::state::unissued_page_token_refusal(
+            &*self.engine,
+            &scope,
+            input.next_token.as_deref(),
+        ) {
+            return Err(
+                ListRecommendationResourcesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: validation::page_token_refusal(malformed.token()),
+                    },
+                )
+                .into(),
+            );
+        }
         // The support-level gate, ahead of everything else this handler does —
         // ahead of resolving the identifier and of paginating, so an unentitled
         // caller is never told whether a recommendation exists. See
@@ -243,32 +282,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The three filters this read cuts on, and the ONE predicate they
-        // select a stored resource with — the same one the organization-level
-        // view of these resources applies
-        // ([`crate::state::ResourceFilters`]), so the two cannot select
-        // differently. Each summary is likewise the one shared projection of
-        // the stored resource ([`crate::state::resource_summary`]).
-        let filters = crate::state::ResourceFilters {
-            status: input.status.as_deref(),
-            exclusion_status: input.exclusion_status.as_deref(),
-            region_code: input.region_code.as_deref(),
-        };
+        // The three filters above select the stored resources of this
+        // recommendation.
         let matching: Vec<(String, RecommendationResourceSummary)> = state
             .resources_of(&input.recommendation_identifier)
             .filter(|(_, resource)| filters.keeps(resource))
             .map(|(arn, resource)| (arn.clone(), crate::state::resource_summary(resource)))
             .collect();
 
-        // The cursor's scope names this recommendation AND this read's filters,
-        // so a token issued for one recommendation's resources (or under another
-        // filter set) cannot resume another sequence.
+        // The page itself, cut under the scope the token was already checked
+        // against above: both go through the one cursor decoding, so the refusal
+        // raised ahead of the gate and the sequence resumed here cannot differ.
         let page = crate::state::paginate(
             &token_key,
-            &crate::state::list_scope(
-                &format!("resources/{}", input.recommendation_identifier),
-                &filters.scope(),
-            ),
+            &scope,
             matching,
             input.next_token.as_deref(),
             input.max_results,

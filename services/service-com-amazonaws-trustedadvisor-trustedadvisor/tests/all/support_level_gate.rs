@@ -13,11 +13,13 @@
 //! still scaffolded; every support plan AWS offers; and several identifier forms. The
 //! calls the issue happened to record are single rows among them.
 //!
-//! The gate's ORDER is pinned too, from both sides: the modelled constraints are refused
-//! ahead of it (a malformed request is still a 400 `ValidationException`), and it is
-//! applied ahead of every lookup and every write (an unentitled caller is never told
-//! whether a recommendation exists, and a mutation it may not make leaves the store as
-//! it was).
+//! The gate's ORDER is pinned too, from both sides: this service's input-validation
+//! refusals are answered ahead of it (a malformed request is still a 400
+//! `ValidationException`) — both the modelled constraints and a well-formedness condition
+//! those traits cannot express, which is a handler's own: a `nextToken` that is not a
+//! cursor the read it was sent to issued. And the gate is applied ahead of every lookup
+//! and every write (an unentitled caller is never told whether a recommendation exists,
+//! and a mutation it may not make leaves the store as it was).
 //!
 //! The last two tests pin the stage AHEAD of it, for the one operation whose input names
 //! an arbitrary AWS resource: **a resource in another AWS account is refused for that
@@ -34,6 +36,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_trustedadvisor_trustedadvisor::state::SupportPlan;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::organization_recommendation_lifecycle::organization_recommendation_arn;
 use crate::recommendation_loop::{
     dispatch, emulator_on_plan, error_code, label, recommendation_arn, resource_arn,
     set_support_plan,
@@ -547,6 +550,237 @@ async fn a_refused_mutation_leaves_the_store_untouched() {
         exclusion, "included",
         "a refused exclusion batch must not change the resource, got {got}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The handler-owned half of the validation stage: an unissued page token
+// ---------------------------------------------------------------------------
+
+/// Every paginated read this service binds, as `(operation, base path)` — the modelled
+/// URI, already carrying whatever else the request sends, so appending a `nextToken` to it
+/// is the only difference between a well-formed row and a malformed one.
+///
+/// The seven reads are `ListChecks`, `ListRecommendations`, `ListRecommendationResources`,
+/// `ListRecommendationsForResource`, `ListOrganizationRecommendations`,
+/// `ListOrganizationRecommendationAccounts` and `ListOrganizationRecommendationResources`
+/// — every operation whose input models `nextToken`
+/// (`smithy_query(query="digest",
+/// model_path="services/service-com-amazonaws-trustedadvisor-trustedadvisor/smithy-model/com-amazonaws-trustedadvisor-trustedadvisor.json")`).
+/// Two rows carry filters and a page size beside the token, so the refusal is shown not to
+/// depend on the rest of the request either.
+fn paginated_reads() -> Vec<(&'static str, String)> {
+    let recommendation = recommendation_arn("amazon-ebs-snapshots");
+    // A seeded organization recommendation: the organization surface aggregates the
+    // prioritized checks only.
+    let organization = organization_recommendation_arn("low-utilization-ec2-instances");
+    vec![
+        ("ListChecks", "/v1/checks".to_string()),
+        (
+            "ListChecks with filters and a page size",
+            "/v1/checks?pillar=cost_optimizing&source=ta_check&maxResults=1".to_string(),
+        ),
+        ("ListRecommendations", "/v1/recommendations".to_string()),
+        (
+            "ListRecommendations with filters and a page size",
+            "/v1/recommendations?type=standard&status=warning&maxResults=2".to_string(),
+        ),
+        (
+            "ListRecommendationResources",
+            format!(
+                "/v1/recommendations/{}/resources",
+                label(&recommendation)
+            ),
+        ),
+        (
+            "ListRecommendationsForResource",
+            format!(
+                "/v1/recommendations-for-resource/{}",
+                label(&aws_resource_arn())
+            ),
+        ),
+        (
+            "ListOrganizationRecommendations",
+            "/v1/organization-recommendations".to_string(),
+        ),
+        (
+            "ListOrganizationRecommendationAccounts",
+            format!(
+                "/v1/organization-recommendations/{}/accounts",
+                label(&organization)
+            ),
+        ),
+        (
+            "ListOrganizationRecommendationResources",
+            format!(
+                "/v1/organization-recommendations/{}/resources",
+                label(&organization)
+            ),
+        ),
+    ]
+}
+
+/// `base` with `token` added as its `nextToken`, whether or not it already carries a query
+/// string.
+fn with_token(base: &str, token: &str) -> String {
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}nextToken={}", label(token))
+}
+
+/// The `nextToken` values no read of this service ever issued, each inside the modelled
+/// `@length(4, 10000)` so no constraint trait can express the objection and the refusal is
+/// the handler's own. The rows differ along the FORM of the value: whether it is base64 at
+/// all, how long it is, and whether its bytes spell out the scope and key a cursor carries
+/// inside it — the half a caller can derive from its own request, without the
+/// authenticator it cannot.
+fn unissued_tokens() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "four characters that are not base64, at the modelled minimum length",
+            "!!!!".to_string(),
+        ),
+        (
+            "base64 of bytes this service never minted",
+            "aaaa".to_string(),
+        ),
+        (
+            "a long value that is not base64 at all",
+            "not-a-token-this-service-issued".to_string(),
+        ),
+        (
+            "base64 of the scope and key a cursor carries, with no authenticator over them",
+            ::aws_smithy_types::base64::encode("[\"checks\",[]]\u{1f}amazon-ebs-snapshots"),
+        ),
+    ]
+}
+
+/// Send one request carrying an unissued `nextToken` and assert the refusal: the status
+/// the model binds `ValidationException` to, the error shape in both places restJson1
+/// carries it, and a sentence that echoes the value the request sent. Returns the body, so
+/// the caller can compare one plan's answer with another's.
+async fn assert_page_token_refusal(
+    router: &MultiServiceRouter,
+    case: &str,
+    path_and_query: &str,
+    token: &str,
+) -> Value {
+    let (status, errortype, response) = dispatch(router, "GET", path_and_query, None).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400 ahead of the gate, got {status} with {response}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "ValidationException",
+        "case {case:?}: expected __type ValidationException, got {response}"
+    );
+    assert_eq!(
+        errortype.as_deref(),
+        Some("ValidationException"),
+        "case {case:?}: expected x-amzn-errortype ValidationException, got {errortype:?} with \
+         {response}"
+    );
+    assert!(
+        message_of(&response).contains(token),
+        "case {case:?}: expected the refusal to echo the submitted token {token:?}, got \
+         {response}"
+    );
+    response
+}
+
+/// A condition the model's constraint traits CANNOT express is refused AHEAD of the gate
+/// too, exactly as the modelled ones are: a `nextToken` that is not a cursor the read it
+/// was sent to issued is 400 `ValidationException` on every support plan, with the same
+/// answer whether the calling account's plan includes the API or not — the well-formedness
+/// of a request is a property of the request, not of the plan the caller is on.
+///
+/// The table spans every paginated read the service binds, four forms of unissued token,
+/// and every plan the service classifies; the recorded call is one row of it.
+#[tokio::test]
+async fn an_unissued_page_token_is_refused_ahead_of_the_gate_on_every_plan() {
+    for (operation, base) in paginated_reads() {
+        for (form, token) in unissued_tokens() {
+            // The answer the first plan gave, which every other plan's must equal: the
+            // refusal is the request's, so it cannot differ by plan.
+            let mut first: Option<(String, Value)> = None;
+            for plan in SupportPlan::ALL {
+                let (router, _engine) = emulator_on_plan(*plan);
+                let case = format!("{operation} with {form} on {plan:?}");
+                let path = with_token(&base, &token);
+                let response = assert_page_token_refusal(&router, &case, &path, &token).await;
+                match &first {
+                    None => first = Some((case, response)),
+                    Some((first_case, first_response)) => assert_eq!(
+                        &response, first_response,
+                        "case {case:?}: expected the same refusal every plan gets, got \
+                         {response} where {first_case:?} answered {first_response}"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+/// The other side of it, over ONE store: a token the service really issued is refused by
+/// every OTHER read as malformed — ahead of the gate, so on every plan and with the same
+/// answer — while the read that ISSUED it has nothing to object to and answers as its
+/// caller's entitlement decides: the gate's 403 unentitled, the page itself entitled.
+///
+/// A genuine token is what separates the ordering rule from "these reads refuse
+/// everything": the same value, in the same store, is this 400 on six paths and a served
+/// page on the seventh.
+#[tokio::test]
+async fn a_token_issued_for_one_read_is_refused_by_the_others_on_every_plan() {
+    let (router, engine) = emulator_on_plan(SupportPlan::Business);
+
+    // A cursor `ListChecks` issued, taken from a truncated page of the catalog.
+    let (status, _errortype, page) = dispatch(&router, "GET", "/v1/checks?maxResults=1", None).await;
+    assert_eq!(
+        status, 200,
+        "an entitled ListChecks must be served, got {status} with {page}"
+    );
+    let issued = page["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no nextToken on a truncated ListChecks page: {page}"))
+        .to_string();
+
+    let others: Vec<(&str, String)> = paginated_reads()
+        .into_iter()
+        .filter(|(operation, _)| !operation.starts_with("ListChecks"))
+        .collect();
+    assert!(
+        !others.is_empty(),
+        "the table must hold reads other than ListChecks, or this test asserts nothing"
+    );
+
+    for plan in SupportPlan::ALL {
+        set_support_plan(&engine, *plan);
+        for (operation, base) in &others {
+            let case = format!("a ListChecks cursor on {operation} on {plan:?}");
+            let path = with_token(base, &issued);
+            assert_page_token_refusal(&router, &case, &path, &issued).await;
+        }
+
+        // The read that issued it: the token is well-formed there, so the answer is the
+        // one the account's entitlement decides.
+        let path = with_token("/v1/checks?maxResults=1", &issued);
+        if plan.includes_trusted_advisor_api() {
+            let (status, _errortype, response) = dispatch(&router, "GET", &path, None).await;
+            assert_eq!(
+                status, 200,
+                "case the issuing read on {plan:?}: expected the next page, got {status} with \
+                 {response}"
+            );
+        } else {
+            assert_denied(
+                &router,
+                &format!("the issuing read on {plan:?}"),
+                "GET",
+                &path,
+                None,
+            )
+            .await;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

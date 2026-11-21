@@ -15,13 +15,24 @@
 //! well-formed request each; the rows here vary what the request CARRIES, so a gate that
 //! fired only for the simplest form of a call — or that let a filtered, paged or
 //! differently-identified call through to the handler — would fail here and nowhere else.
-//! Two consequences of the rule are rows rather than separate tests: a page token the
-//! service never issued is a 403 for an unentitled account and the handler's own 400 for
-//! an entitled one, and an identifier that names nothing is a 403 and the handler's own
-//! 404 — so the gate is shown to precede both resolutions. The identifier rows deliberately
-//! overlap `tests/all/support_level_gate.rs::the_gate_precedes_identifier_resolution`: they
-//! are here as members of this one table, so that what each row varies is the request's
-//! shape and nothing else.
+//! One consequence of the rule is a row rather than a separate test: an identifier that
+//! names nothing is a 403 for an unentitled account and the handler's own 404 for an
+//! entitled one, so the gate is shown to precede identifier resolution. Those rows
+//! deliberately overlap
+//! `tests/all/support_level_gate.rs::the_gate_precedes_identifier_resolution`: they are
+//! here as members of this one table, so that what each row varies is the request's shape
+//! and nothing else.
+//!
+//! Every row is WELL-FORMED, which is what the rule is stated over: a request this
+//! service refuses as malformed is not one the gate decides at all — an input-validation
+//! refusal of this service, whether the model's constraint traits express the condition or
+//! a handler owns it because they cannot, is answered ahead of the gate and so carries one
+//! status on every plan. A `nextToken` that is not a cursor the read it was sent to issued
+//! is such a condition, and the suites that pin it where it belongs are
+//! `tests/all/support_level_gate.rs` (`shape_validation_precedes_the_gate` for the
+//! modelled half, `an_unissued_page_token_is_refused_ahead_of_the_gate_on_every_plan` and
+//! `a_token_issued_for_one_read_is_refused_by_the_others_on_every_plan` for this one) and
+//! `tests/all/malformed_batch_precedes_the_gate.rs`.
 //!
 //! Every status, error shape, filter name, enum value and bound below comes from the
 //! model, not from a recording:
@@ -58,13 +69,6 @@ const DENIED: (u16, &str, &str) = (
 /// Compared as a SET, so the assertion is about which members are there and not about the
 /// order a serializer happens to write them in.
 const REFUSAL_MEMBERS: [&str; 2] = ["__type", "message"];
-
-/// A `nextToken` the service never issued, at the modelled minimum length (4).
-const UNISSUED_SHORT_TOKEN: &str = "aaaa";
-
-/// Another one, longer and not base64 at all, so the two token rows differ in form as
-/// well as in length.
-const UNISSUED_TOKEN: &str = "not-a-token-this-service-issued";
 
 /// An `updateReason` the modelled `@length(10, 4096)` admits.
 const UPDATE_REASON: &str = "handled by the standing runbook";
@@ -148,16 +152,6 @@ fn rows() -> Vec<Row> {
             own_errortype: None,
         },
         Row {
-            // The gate precedes the handler's own token resolution: an entitled caller
-            // gets the modelled 400 for this token, an unentitled one the 403.
-            case: "ListChecks with a page token this service never issued",
-            method: "GET",
-            path: format!("/v1/checks?nextToken={UNISSUED_SHORT_TOKEN}"),
-            body: None,
-            own_status: 400,
-            own_errortype: Some("ValidationException"),
-        },
-        Row {
             case: "ListRecommendations at the modelled maximum page size",
             method: "GET",
             path: "/v1/recommendations?maxResults=200".to_string(),
@@ -185,14 +179,6 @@ fn rows() -> Vec<Row> {
             body: None,
             own_status: 200,
             own_errortype: None,
-        },
-        Row {
-            case: "ListRecommendations with a page token this service never issued",
-            method: "GET",
-            path: format!("/v1/recommendations?nextToken={UNISSUED_TOKEN}"),
-            body: None,
-            own_status: 400,
-            own_errortype: Some("ValidationException"),
         },
         Row {
             case: "GetRecommendation on a seeded recommendation",
@@ -406,8 +392,8 @@ async fn the_refusal_does_not_depend_on_what_the_request_carries() {
 /// The other side of the rule, and what makes the refusals above the GATE's doing rather
 /// than some other objection to the request: every row is a request an account whose plan
 /// covers the API is answered by the operation itself — served, or refused for a reason of
-/// the operation's own (an unissued page token, an identifier that names nothing, a
-/// recommendation of the wrong type), never with the gate's 403.
+/// the operation's own (an identifier that names nothing, a recommendation of the wrong
+/// type), never with the gate's 403.
 #[tokio::test]
 async fn an_entitled_account_is_answered_by_the_operation_for_every_row() {
     let (denied_status, denied_code, _message) = DENIED;

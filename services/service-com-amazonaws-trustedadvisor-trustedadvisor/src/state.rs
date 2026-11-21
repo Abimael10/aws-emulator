@@ -1879,6 +1879,43 @@ pub fn paginate<T>(
     })
 }
 
+/// The malformed-`nextToken` refusal of a paginated read, decided from the
+/// REQUEST alone: `Some(..)` when the request carries a `nextToken` that is not
+/// a cursor this store issued for `scope`, so the read is refused with the
+/// modelled `ValidationException` whose sentence is
+/// [`crate::service::validation::page_token_refusal`].
+///
+/// Every paginated operation of this service applies this as one of its OWN
+/// input-validation refusals — a condition no constraint trait can express, so
+/// the centralized request walk never collects it — and this service answers
+/// those where it answers the modelled ones: AHEAD of the support-level gate
+/// [`support_level_refusal`], so one malformed request carries one status on
+/// every support plan. The well-formedness of a request is a property of the
+/// request and not of the plan the calling account holds.
+///
+/// Deciding it ahead of the gate reports nothing the gate guards: the cursor
+/// scope of every one of these reads is built from the request's own list and
+/// filters ([`list_scope`]), and the only thing taken off the store is the
+/// secret a cursor is authenticated under ([`PageTokenKey`]), which is never
+/// reported. The decision itself is [`decode_token`]'s — the same single
+/// decoding [`paginate`] makes when it resumes from a token — so the refusal
+/// raised here and the sequence resumed there cannot disagree about which
+/// values are cursors this read issued.
+///
+/// A store that cannot be reached answers `None`: unknown is not "malformed",
+/// and the handler's own store check turns it into the modelled server error.
+pub fn unissued_page_token_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    scope: &str,
+    next_token: Option<&str>,
+) -> Option<MalformedToken> {
+    // A request that names no token names no position, so there is nothing to
+    // refuse.
+    let token = next_token?;
+    let token_key = service_state(engine)?.lock().page_token_key();
+    decode_token(&token_key, scope, token).err()
+}
+
 // ---------------------------------------------------------------------------
 // The seeded catalog
 // ---------------------------------------------------------------------------

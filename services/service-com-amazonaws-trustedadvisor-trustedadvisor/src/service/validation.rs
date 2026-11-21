@@ -302,6 +302,11 @@ const PAGE_TOKEN_REQUIREMENT: &str =
 /// The clause echoes the value the member held, as rule 2 states, and nothing more: the
 /// echo is the request's own `nextToken`, whose size the model's `@length(4, 10000)`
 /// bounds before any handler runs, so the sentence is bounded whatever the request holds.
+///
+/// WHERE each of those handlers raises it is the ordering this module states for every
+/// handler-owned refusal: ahead of the support-level gate, through the one shared
+/// decision [`crate::state::unissued_page_token_refusal`] — so this sentence is the
+/// answer to a malformed page token on every support plan.
 pub(crate) fn page_token_refusal(token: &str) -> String {
     let clauses = [clause(
         &echoed_value(token),

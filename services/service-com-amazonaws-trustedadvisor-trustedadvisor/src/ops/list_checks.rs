@@ -194,6 +194,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; this operation reads nothing from it.
         let _ = ctx;
+        // The cursor's scope: this list and every filter in force, built from the
+        // request alone, so the refusal it decides below needs nothing off the
+        // store.
+        let scope = crate::state::list_scope(
+            "checks",
+            &[
+                ("pillar", input.pillar.as_deref()),
+                ("awsService", input.aws_service.as_deref()),
+                ("source", input.source.as_deref()),
+            ],
+        );
+        // Request well-formedness, ahead of the support-level gate and of every
+        // lookup: a `nextToken` that is not a cursor this read issued is one of
+        // this service's input-validation refusals (`crate::service::validation`),
+        // and those are answered before the caller's entitlement is consulted, so
+        // one malformed request has one status on every support plan. See
+        // [`crate::state::unissued_page_token_refusal`].
+        if let Some(malformed) = crate::state::unissued_page_token_refusal(
+            &*self.engine,
+            &scope,
+            input.next_token.as_deref(),
+        ) {
+            return Err(
+                ListChecksErrorModeled::ValidationException(ValidationException {
+                    message: validation::page_token_refusal(malformed.token()),
+                })
+                .into(),
+            );
+        }
         // The support-level gate, ahead of everything else this handler does —
         // ahead of serving the check catalog in particular. See
         // [`crate::state::support_level_refusal`].
@@ -238,16 +267,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
+        // The page itself, cut under the scope the token was already checked
+        // against above: both go through the one cursor decoding, so the refusal
+        // raised ahead of the gate and the sequence resumed here cannot differ.
         let page = crate::state::paginate(
             &token_key,
-            &crate::state::list_scope(
-                "checks",
-                &[
-                    ("pillar", input.pillar.as_deref()),
-                    ("awsService", input.aws_service.as_deref()),
-                    ("source", input.source.as_deref()),
-                ],
-            ),
+            &scope,
             matching,
             input.next_token.as_deref(),
             input.max_results,

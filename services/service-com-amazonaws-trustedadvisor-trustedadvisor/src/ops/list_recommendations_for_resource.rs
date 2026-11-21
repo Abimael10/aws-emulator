@@ -241,6 +241,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ListRecommendationsForResourceErrorModeled::AccessDeniedException(denied).into(),
             );
         }
+        // The cursor's scope names this AWS resource AND this read's filters,
+        // so a token issued for one resource (or under another filter set)
+        // cannot resume another sequence. `language` is deliberately not part of
+        // it: it changes no row and no order. Built from the request alone, so
+        // the refusal it decides below needs nothing off the store.
+        let scope = crate::state::list_scope(
+            &format!("recommendations-for-resource/{}", input.aws_resource_arn),
+            &[
+                ("status", input.status.as_deref()),
+                ("pillar", input.pillar.as_deref()),
+                ("checkArn", input.check_arn.as_deref()),
+            ],
+        );
+        // Request well-formedness, ahead of the support-level gate and of every
+        // lookup: a `nextToken` that is not a cursor this read issued is one of
+        // this service's input-validation refusals (`crate::service::validation`),
+        // and those are answered before the caller's entitlement is consulted, so
+        // one malformed request has one status on every support plan. See
+        // [`crate::state::unissued_page_token_refusal`].
+        if let Some(malformed) = crate::state::unissued_page_token_refusal(
+            &*self.engine,
+            &scope,
+            input.next_token.as_deref(),
+        ) {
+            return Err(
+                ListRecommendationsForResourceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: validation::page_token_refusal(malformed.token()),
+                    },
+                )
+                .into(),
+            );
+        }
         // The support-level gate is a service-wide stage, so it sits ahead of
         // everything else this handler does — ahead of resolving the resource
         // ARN and of paginating: a caller whose account's support plan does not
@@ -316,20 +349,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // The cursor's scope names this AWS resource AND this read's filters,
-        // so a token issued for one resource (or under another filter set)
-        // cannot resume another sequence. `language` is deliberately not part of
-        // it: it changes no row and no order.
+        // The page itself, cut under the scope the token was already checked
+        // against above: both go through the one cursor decoding, so the refusal
+        // raised ahead of the gate and the sequence resumed here cannot differ.
         let page = crate::state::paginate(
             &token_key,
-            &crate::state::list_scope(
-                &format!("recommendations-for-resource/{}", input.aws_resource_arn),
-                &[
-                    ("status", input.status.as_deref()),
-                    ("pillar", input.pillar.as_deref()),
-                    ("checkArn", input.check_arn.as_deref()),
-                ],
-            ),
+            &scope,
             matching,
             input.next_token.as_deref(),
             input.max_results,

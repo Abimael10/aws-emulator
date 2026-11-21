@@ -190,6 +190,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `ctx` carries only request metadata; this operation reads nothing from it.
         let _ = ctx;
+        let identifier = &input.organization_recommendation_identifier;
+        // The three filters the account-level view of these same resources cuts
+        // on, selected with that ONE shared predicate
+        // ([`crate::state::ResourceFilters`]), built from the request alone.
+        let filters = crate::state::ResourceFilters {
+            status: input.status.as_deref(),
+            exclusion_status: input.exclusion_status.as_deref(),
+            region_code: input.region_code.as_deref(),
+        };
+        // The cursor's scope names this organization recommendation AND this
+        // read's filters, so a token issued for one organization
+        // recommendation's resources (or under another filter set) cannot
+        // resume another sequence. Built from the request alone, so the refusal
+        // it decides below needs nothing off the store.
+        let mut scope_filters = filters.scope();
+        scope_filters.push(("affectedAccountId", input.affected_account_id.as_deref()));
+        let scope = crate::state::list_scope(
+            &format!("organizationRecommendationResources/{identifier}"),
+            &scope_filters,
+        );
+        // Request well-formedness, ahead of the support-level gate and of every
+        // lookup: a `nextToken` that is not a cursor this read issued is one of
+        // this service's input-validation refusals (`crate::service::validation`),
+        // and those are answered before the caller's entitlement is consulted, so
+        // one malformed request has one status on every support plan. See
+        // [`crate::state::unissued_page_token_refusal`].
+        if let Some(malformed) = crate::state::unissued_page_token_refusal(
+            &*self.engine,
+            &scope,
+            input.next_token.as_deref(),
+        ) {
+            return Err(
+                ListOrganizationRecommendationResourcesErrorModeled::ValidationException(
+                    ValidationException {
+                        message: validation::page_token_refusal(malformed.token()),
+                    },
+                )
+                .into(),
+            );
+        }
         // The support-level gate, ahead of everything else this handler does —
         // ahead of resolving the identifier and of paginating, so an unentitled
         // caller is never told whether an organization recommendation exists.
@@ -217,7 +257,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // [`crate::state::encode_token`]).
         let token_key = state.page_token_key();
 
-        let identifier = &input.organization_recommendation_identifier;
         let Some(entry) = state.organization_recommendations.get(identifier) else {
             return Err(
                 ListOrganizationRecommendationResourcesErrorModeled::ResourceNotFoundException(
@@ -247,20 +286,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // recommendation for, since an ARN naming no stored recommendation
         // names no resources of this organization either.
         //
-        // The three filters the account-level view of these same resources cuts
-        // on, selected with that ONE shared predicate
-        // ([`crate::state::ResourceFilters`]), and this operation's own
-        // `affectedAccountId` test layered on top of it, made through the ONE
-        // predicate both organization-level lists share
+        // The three filters above, and this operation's own `affectedAccountId`
+        // test layered on top of them, made through the ONE predicate both
+        // organization-level lists share
         // ([`crate::state::affected_account_keeps`]): the account that owns a
         // resource is the account segment of its own ARN
         // ([`crate::state::arn_account_id`]), which is what this list reports as
         // `accountId` beside it.
-        let filters = crate::state::ResourceFilters {
-            status: input.status.as_deref(),
-            exclusion_status: input.exclusion_status.as_deref(),
-            region_code: input.region_code.as_deref(),
-        };
         let mut matching: Vec<(String, OrganizationRecommendationResourceSummary)> = state
             .member_recommendations_of(identifier)
             .into_iter()
@@ -281,18 +313,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         matching.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-        // The cursor's scope names this organization recommendation AND this
-        // read's filters, so a token issued for one organization
-        // recommendation's resources (or under another filter set) cannot
-        // resume another sequence.
-        let mut scope_filters = filters.scope();
-        scope_filters.push(("affectedAccountId", input.affected_account_id.as_deref()));
+        // The page itself, cut under the scope the token was already checked
+        // against above: both go through the one cursor decoding, so the refusal
+        // raised ahead of the gate and the sequence resumed here cannot differ.
         let page = crate::state::paginate(
             &token_key,
-            &crate::state::list_scope(
-                &format!("organizationRecommendationResources/{identifier}"),
-                &scope_filters,
-            ),
+            &scope,
             matching,
             input.next_token.as_deref(),
             input.max_results,
