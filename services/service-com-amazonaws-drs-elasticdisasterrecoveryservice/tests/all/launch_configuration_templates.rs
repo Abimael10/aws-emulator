@@ -113,8 +113,9 @@ async fn all_ids(router: &MultiServiceRouter) -> Vec<String> {
 }
 
 /// A one-entry tag map built from values a test holds, which `json!` cannot take as a
-/// key.
-fn one_tag(key: &str, value: &str) -> Value {
+/// key. `pub(crate)` so a sibling suite of this target reuses it rather than keeping a
+/// second copy.
+pub(crate) fn one_tag(key: &str, value: &str) -> Value {
     let mut map = Map::new();
     map.insert(key.to_string(), Value::String(value.to_string()));
     Value::Object(map)
