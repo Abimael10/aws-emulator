@@ -2712,34 +2712,69 @@ const SYSTEM_BROWSER_ARN_RESOURCE: &str = "browser";
 /// ([`CODE_INTERPRETER_ARN_RESOURCE`]).
 const SYSTEM_CODE_INTERPRETER_ARN_RESOURCE: &str = "code-interpreter";
 
-/// The `name` the service-provided browser reports.
+/// The account segment an ARN carries for a resource the SERVICE ITSELF owns.
 ///
-/// `SandboxName` is `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` (`smithy_query
-/// operation=GetBrowser`), which admits no `.`, so the tool is named after the
-/// reserved id it answers to with that id's separators spelled as `_`.
-pub const SYSTEM_BROWSER_NAME: &str = "aws_browser_v1";
+/// `BrowserArn` and `CodeInterpreterArn` are
+/// `…:bedrock-agentcore:{region}:(aws|[0-9]{12}):…` (`smithy_query
+/// shape=BrowserArn,CodeInterpreterArn`): the twelve-digit alternative is the
+/// account that created the resource, and this one is the service's own, which
+/// is why those patterns admit it beside the reserved tool ids. A tool nothing
+/// of the caller's account created belongs to the service, so its ARN is scoped
+/// to the service rather than to whoever happens to be reading it.
+const SERVICE_OWNED_ACCOUNT: &str = "aws";
 
-/// The `name` the service-provided code interpreter reports, rendered from its
-/// reserved id exactly as [`SYSTEM_BROWSER_NAME`] is.
+/// `arn:aws:bedrock-agentcore:{region}:aws:{resource}` — the ARN of a resource
+/// this service owns itself.
+///
+/// [`::engine::emulator_arn`] stamps the account the emulator presents, which is
+/// the CALLER's account, so it cannot build this ARN: the account segment of a
+/// service-owned resource is [`SERVICE_OWNED_ACCOUNT`] and carries nothing of
+/// the caller.
+fn service_owned_arn(region: &str, resource: &str) -> String {
+    format!("arn:aws:{ARN_SERVICE}:{region}:{SERVICE_OWNED_ACCOUNT}:{resource}")
+}
+
+/// The `name` the service-provided browser reports: the display name the service
+/// publishes for its built-in browser tool, as its inventory reports it.
+///
+/// A value of the SERVICE's own catalog, not of this account: nothing created
+/// the tool, so there is no caller-supplied name to report and none is derived
+/// from the id the tool answers to. `SandboxName`'s pattern
+/// `^[a-zA-Z][a-zA-Z0-9_]{0,47}$` (`smithy_query operation=GetBrowser`)
+/// constrains the name a CREATE may carry — the request member the boundary walk
+/// refuses — and says nothing about what the service names a tool of its own.
+pub const SYSTEM_BROWSER_NAME: &str = "AgentCore Browser Tool";
+
+/// The `description` the service-provided browser reports: the service's own
+/// description of the built-in sandbox, from the same catalog as
+/// [`SYSTEM_BROWSER_NAME`].
+pub const SYSTEM_BROWSER_DESCRIPTION: &str = "AWS built-in browser sandbox for secure web browsing";
+
+/// The `name` the service-provided code interpreter reports.
+///
+/// The display name the service publishes for its built-in code interpreter is
+/// stated by nothing this crate can read — neither the model nor any served
+/// response of the tool — so the tool is named after the reserved id it answers
+/// to, with that id's separators spelled as `_`, rather than after a value no
+/// source states. The browser's own published name is [`SYSTEM_BROWSER_NAME`].
 pub const SYSTEM_CODE_INTERPRETER_NAME: &str = "aws_codeinterpreter_v1";
 
-/// `arn:aws:bedrock-agentcore:{region}:{account}:browser/{browserId}` — the
-/// service-provided alternative of `BrowserArn`'s pattern, whose resource type
-/// carries no `-custom` because nothing of this account created the tool.
+/// `arn:aws:bedrock-agentcore:{region}:aws:browser/{browserId}` — the
+/// service-provided alternative of `BrowserArn`'s pattern: its resource type
+/// carries no `-custom` and its account segment is the service's
+/// ([`service_owned_arn`]), because nothing of this account created the tool.
 pub fn system_browser_arn(region: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_SERVICE,
+    service_owned_arn(
         region,
         &format!("{SYSTEM_BROWSER_ARN_RESOURCE}/{SYSTEM_BROWSER_ID}"),
     )
 }
 
-/// `arn:aws:bedrock-agentcore:{region}:{account}:code-interpreter/{codeInterpreterId}`
+/// `arn:aws:bedrock-agentcore:{region}:aws:code-interpreter/{codeInterpreterId}`
 /// — the service-provided alternative of `CodeInterpreterArn`'s pattern, for the
 /// same reason as [`system_browser_arn`].
 pub fn system_code_interpreter_arn(region: &str) -> String {
-    ::engine::emulator_arn(
-        ARN_SERVICE,
+    service_owned_arn(
         region,
         &format!("{SYSTEM_CODE_INTERPRETER_ARN_RESOURCE}/{SYSTEM_CODE_INTERPRETER_ID}"),
     )
@@ -2777,18 +2812,19 @@ impl SystemTools {
     /// browser is, so every read reports it through one envelope.
     ///
     /// It is `READY` from the instant the state is and stays there: the clock
-    /// owes a tool nobody created no transition, and nothing can delete it. It
-    /// carries no execution role, description, recording, signing, certificate,
-    /// enterprise policy, mounted file system or tag — those are what a CREATE
-    /// persists for a browser of the caller's own — and its network mode is the
-    /// modelled default [`BROWSER_NETWORK_MODE_PUBLIC`], with no VPC of the
-    /// caller's.
+    /// owes a tool nobody created no transition, and nothing can delete it. Its
+    /// name and description are the SERVICE's own for the tool
+    /// ([`SYSTEM_BROWSER_NAME`] / [`SYSTEM_BROWSER_DESCRIPTION`]); it carries no
+    /// execution role, recording, signing, certificate, enterprise policy,
+    /// mounted file system or tag — those are what a CREATE persists for a
+    /// browser of the caller's own — and its network mode is the modelled
+    /// default [`BROWSER_NETWORK_MODE_PUBLIC`], with no VPC of the caller's.
     pub fn browser(&self, region: &str) -> BrowserRecord {
         BrowserRecord {
             browser_id: SYSTEM_BROWSER_ID.to_string(),
             browser_arn: system_browser_arn(region),
             name: SYSTEM_BROWSER_NAME.to_string(),
-            description: None,
+            description: Some(SYSTEM_BROWSER_DESCRIPTION.to_string()),
             execution_role_arn: None,
             network_configuration: BrowserNetworkConfiguration {
                 network_mode: BROWSER_NETWORK_MODE_PUBLIC.to_string(),

@@ -6,13 +6,19 @@
 //! anything having created one.
 //!
 //! The rule under test: a read of a reserved tool id reports the tool the service
-//! provides — `READY`, ARN-stamped for the region the request was signed for and with
-//! the resource type that carries no `-custom` — while a DELETE, which addresses only a
-//! tool this account created, does not find it and changes nothing. The same rule
-//! bounds the tool: it holds none of the state a CREATE keeps for the account's own
-//! tools (so its `name` is free for a created tool), and every OTHER id — any id the
-//! shape admits for a created tool but nothing has created — is still the modelled 404
-//! on both the read and the delete route.
+//! provides — `READY`, ARN-stamped for the region the request was signed for, with the
+//! resource type that carries no `-custom` and the account segment of the SERVICE rather
+//! than of the caller — while a DELETE, which addresses only a tool this account created,
+//! does not find it and changes nothing. The same rule bounds the tool: it holds none of
+//! the state a CREATE keeps for the account's own tools (so the name it reports occupies
+//! no created name), and every OTHER id — any id the shape admits for a created tool but
+//! nothing has created — is still the modelled 404 on both the read and the delete route.
+//!
+//! The same rule decides what a tool the service owns REPORTS, in the inventory
+//! (`ListBrowsers`) as in the read: the name and the description the SERVICE publishes for
+//! the tool rather than values derived from the caller's account or from the tool's own id,
+//! beside a tool the ACCOUNT created, which carries the account's id, the `-custom`
+//! resource type and the values its create supplied.
 //!
 //! Every test drives the service the way the router does: an `http::Request` through
 //! [`MultiServiceRouter::dispatch`], so the wire protocol (`restJson1`), the boundary
@@ -29,41 +35,54 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_bedrockagentcorecontrol_amazonbedrockagentcorecontrol::EmulatedService;
 
-/// The account id every emulated ARN carries (`engine::mock_account_id`).
-const ACCOUNT: &str = "000000000000";
+/// The account id every ARN of a resource this ACCOUNT created carries
+/// (`engine::mock_account_id`).
+pub(crate) const ACCOUNT: &str = "000000000000";
+
+/// The account segment an ARN of a resource the SERVICE owns carries: the `aws`
+/// alternative of `BrowserArn` / `CodeInterpreterArn`'s `(aws|[0-9]{12})`
+/// (`smithy_query shape=BrowserArn,CodeInterpreterArn`), which goes with the bare
+/// resource type the built-in tools are published under.
+pub(crate) const SERVICE_OWNED_ACCOUNT: &str = "aws";
 
 /// One tool the service provides, as the routes and responses spell it.
-struct Tool {
+pub(crate) struct Tool {
     /// The case name every assertion of this row names.
-    case: &'static str,
+    pub(crate) case: &'static str,
     /// The path segment the tool's routes hang off (`smithy_query
     /// operation=GetBrowser,GetCodeInterpreter`).
-    route: &'static str,
+    pub(crate) route: &'static str,
     /// The id the tool's own id shape reserves for it.
-    reserved_id: &'static str,
+    pub(crate) reserved_id: &'static str,
     /// The response member carrying the tool's id.
-    id_member: &'static str,
+    pub(crate) id_member: &'static str,
     /// The response member carrying the tool's ARN.
-    arn_member: &'static str,
+    pub(crate) arn_member: &'static str,
     /// The ARN resource type of the SERVICE-provided tool: the spelling of
     /// `browser(-custom)?` / `code-interpreter(-custom)?` without `-custom`.
-    arn_resource: &'static str,
+    pub(crate) arn_resource: &'static str,
     /// The `networkMode` the tool reports: the modelled default of its own network
     /// configuration shape (`smithy_query shape=BrowserNetworkConfiguration,
     /// CodeInterpreterNetworkConfiguration`).
     network_mode: &'static str,
     /// How the tool's own not-found sentence words a missing resource.
     not_found_message: fn(&str) -> String,
+    /// The `name` the SERVICE publishes for this tool, which every report of it carries.
+    pub(crate) published_name: &'static str,
+    /// The `description` the SERVICE publishes for this tool, where it publishes one.
+    pub(crate) published_description: Option<&'static str>,
     /// A `name` + `networkConfiguration` body that creates a tool of this kind, so the
     /// account's own tool can be told apart from the service's.
-    create_body: fn(&str) -> Value,
+    pub(crate) create_body: fn(&str) -> Value,
 }
 
 /// The tools under test: every reserved id this service's model declares.
 ///
 /// Source for the ids: the first alternative of `BrowserId` and of
-/// `CodeInterpreterId` (`smithy_query operation=GetBrowser,GetCodeInterpreter`).
-fn tools() -> [Tool; 2] {
+/// `CodeInterpreterId` (`smithy_query operation=GetBrowser,GetCodeInterpreter`). Source for
+/// the browser's published name and description: the inventory AWS answers `ListBrowsers`
+/// with for the built-in tool.
+pub(crate) fn tools() -> [Tool; 2] {
     [
         Tool {
             case: "the service-provided browser",
@@ -74,6 +93,8 @@ fn tools() -> [Tool; 2] {
             arn_resource: "browser",
             network_mode: "PUBLIC",
             not_found_message: |id| format!("Browser with ID {id} does not exist"),
+            published_name: "AgentCore Browser Tool",
+            published_description: Some("AWS built-in browser sandbox for secure web browsing"),
             create_body: |name| {
                 json!({"name": name, "networkConfiguration": {"networkMode": "PUBLIC"}})
             },
@@ -87,6 +108,11 @@ fn tools() -> [Tool; 2] {
             arn_resource: "code-interpreter",
             network_mode: "SANDBOX",
             not_found_message: |id| format!("Code interpreter with ID {id} does not exist"),
+            // Nothing this crate can cite states a published name or description for the
+            // built-in code interpreter, so it reports the reserved id's own spelling and
+            // no description (`crate::state::SYSTEM_CODE_INTERPRETER_NAME`).
+            published_name: "aws_codeinterpreter_v1",
+            published_description: None,
             create_body: |name| {
                 json!({"name": name, "networkConfiguration": {"networkMode": "SANDBOX"}})
             },
@@ -97,9 +123,9 @@ fn tools() -> [Tool; 2] {
 /// The regions the reads are signed for, so the region the ARN carries is the request's
 /// own rather than one baked into the handler. One is the emulator's default
 /// (`us-east-1`), the others are not.
-const REGIONS: [&str; 3] = ["us-east-1", "eu-west-2", "ap-northeast-3"];
+pub(crate) const REGIONS: [&str; 3] = ["us-east-1", "eu-west-2", "ap-northeast-3"];
 
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::default();
     router.register_service(EmulatedService::new(engine));
@@ -145,7 +171,7 @@ async fn send(
 }
 
 /// `GetBrowser` / `GetCodeInterpreter`: `GET /{route}/{id}`.
-async fn get_tool(
+pub(crate) async fn get_tool(
     router: &MultiServiceRouter,
     tool: &Tool,
     id: &str,
@@ -179,13 +205,49 @@ async fn delete_tool(
 }
 
 /// `CreateBrowser` / `CreateCodeInterpreter`: `PUT /{route}`.
-async fn create_tool(
+pub(crate) async fn create_tool(
     router: &MultiServiceRouter,
     tool: &Tool,
     body: &Value,
     region: &str,
 ) -> (u16, Value) {
     send(router, "PUT", &format!("/{}", tool.route), region, Some(body)).await
+}
+
+/// `ListBrowsers`: `POST /browsers`, optionally filtered by `type` (`smithy_query
+/// operation=ListBrowsers` binds `type` to the query string).
+pub(crate) async fn list_browsers(
+    router: &MultiServiceRouter,
+    region: &str,
+    kind: Option<&str>,
+) -> (u16, Value) {
+    let uri = match kind {
+        Some(kind) => format!("/browsers?type={kind}"),
+        None => "/browsers".to_string(),
+    };
+    send(router, "POST", &uri, region, Some(&json!({}))).await
+}
+
+/// The entry of `browserSummaries` naming `browser_id`, if the listing reports one.
+pub(crate) fn browser_summary(listing: &Value, browser_id: &str) -> Option<Value> {
+    listing
+        .get("browserSummaries")?
+        .as_array()?
+        .iter()
+        .find(|entry| text(entry, "browserId") == browser_id)
+        .cloned()
+}
+
+/// The ARN a resource the SERVICE owns carries: the bare resource type under the
+/// service's own account segment.
+pub(crate) fn service_owned_arn(region: &str, arn_resource: &str, id: &str) -> String {
+    format!("arn:aws:bedrock-agentcore:{region}:{SERVICE_OWNED_ACCOUNT}:{arn_resource}/{id}")
+}
+
+/// The ARN a resource THIS ACCOUNT created carries: the same form with the account's own
+/// id and the `-custom` resource type.
+pub(crate) fn account_owned_arn(region: &str, arn_resource: &str, id: &str) -> String {
+    format!("arn:aws:bedrock-agentcore:{region}:{ACCOUNT}:{arn_resource}-custom/{id}")
 }
 
 /// The error code `restJson1` puts in `__type` / `x-amzn-errortype`.
@@ -199,7 +261,7 @@ fn error_code(body: &Value) -> String {
         .to_string()
 }
 
-fn text(body: &Value, member: &str) -> String {
+pub(crate) fn text(body: &Value, member: &str) -> String {
     body.get(member)
         .and_then(Value::as_str)
         .unwrap_or_default()
@@ -220,7 +282,7 @@ fn is_modelled_sandbox_name(name: &str) -> bool {
 
 /// Assert one `DateTimestamp` member's wire form: a JSON STRING in the canonical RFC
 /// 3339 form, naming a real instant.
-fn assert_date_time(case: &str, member: &str, value: &Value) {
+pub(crate) fn assert_date_time(case: &str, member: &str, value: &Value) {
     let rendered = value.as_str().unwrap_or_else(|| {
         panic!("case {case:?}: {member} must be an RFC 3339 date-time string, got {value:?}")
     });
@@ -256,10 +318,7 @@ async fn a_system_tool_is_readable_by_its_reserved_id_in_every_region() {
             );
             assert_eq!(
                 text(&read, tool.arn_member),
-                format!(
-                    "arn:aws:bedrock-agentcore:{region}:{ACCOUNT}:{}/{}",
-                    tool.arn_resource, tool.reserved_id
-                ),
+                service_owned_arn(region, tool.arn_resource, tool.reserved_id),
                 "case {case:?}: expected the service-provided ARN for {}, got {}",
                 tool.reserved_id,
                 text(&read, tool.arn_member)
@@ -270,9 +329,10 @@ async fn a_system_tool_is_readable_by_its_reserved_id_in_every_region() {
                 "case {case:?}: a tool nobody created is READY, got {}",
                 text(&read, "status")
             );
-            assert!(
-                is_modelled_sandbox_name(&text(&read, "name")),
-                "case {case:?}: the name must satisfy SandboxName, got {:?}",
+            assert_eq!(
+                text(&read, "name"),
+                tool.published_name,
+                "case {case:?}: expected the name the SERVICE publishes for the tool, got {:?}",
                 text(&read, "name")
             );
             assert_eq!(
@@ -384,10 +444,7 @@ async fn a_created_tool_is_its_own_resource_beside_the_system_one() {
         );
         assert_eq!(
             text(&created, tool.arn_member),
-            format!(
-                "arn:aws:bedrock-agentcore:{region}:{ACCOUNT}:{}-custom/{created_id}",
-                tool.arn_resource
-            ),
+            account_owned_arn(region, tool.arn_resource, &created_id),
             "case {case:?}: a created tool carries the -custom resource type, got {}",
             text(&created, tool.arn_member)
         );
@@ -500,10 +557,15 @@ async fn an_id_that_names_no_created_tool_is_the_modelled_404_on_read_and_on_del
 }
 
 /// The tool the service provides holds none of the state a CREATE keeps for the account's
-/// own tools: the `name` it reports is free for a created tool (the uniqueness index
-/// "the name must be unique within your account" holds only created names), the created
-/// tool is a second, distinct resource readable by its minted id, and a repeat of THAT
-/// name is the conflict.
+/// own tools: the name a create may carry is free whatever the service-provided tool
+/// reports (the uniqueness index "the name must be unique within your account" holds only
+/// created names), the created tool is a second, distinct resource readable by its minted
+/// id, and a repeat of THAT name is the conflict.
+///
+/// The name the create carries is the service-provided tool's own where `SandboxName`
+/// admits it — the row where a collision with the service's name is expressible at all —
+/// and otherwise a name of that pattern, because the name the SERVICE publishes for a tool
+/// of its own is not bound by the pattern constraining the name a REQUEST may carry.
 #[tokio::test]
 async fn the_service_provided_tool_does_not_occupy_the_created_tool_name_index() {
     let router = router();
@@ -518,13 +580,18 @@ async fn the_service_provided_tool_does_not_occupy_the_created_tool_name_index()
              ({system})"
         );
         let system_name = text(&system, "name");
+        let create_name = if is_modelled_sandbox_name(&system_name) {
+            system_name
+        } else {
+            "builtinNameProbe".to_string()
+        };
 
-        let body = (tool.create_body)(&system_name);
+        let body = (tool.create_body)(&create_name);
         let (status, created) = create_tool(&router, &tool, &body, region).await;
         assert_eq!(
             status, 202,
-            "case {case:?}: the name the service-provided tool reports is free for a created \
-             tool, got {status} ({created})"
+            "case {case:?}: the name {create_name:?} is free for a created tool, got {status} \
+             ({created})"
         );
         let created_id = text(&created, tool.id_member);
         assert_ne!(
@@ -540,16 +607,13 @@ async fn the_service_provided_tool_does_not_occupy_the_created_tool_name_index()
         );
         assert_eq!(
             text(&read_back, "name"),
-            system_name,
+            create_name,
             "case {case:?}: the created tool keeps the name the create supplied, got {}",
             text(&read_back, "name")
         );
         assert_eq!(
             text(&read_back, tool.arn_member),
-            format!(
-                "arn:aws:bedrock-agentcore:{region}:{ACCOUNT}:{}-custom/{created_id}",
-                tool.arn_resource
-            ),
+            account_owned_arn(region, tool.arn_resource, &created_id),
             "case {case:?}: the created tool carries the -custom resource type, got {}",
             text(&read_back, tool.arn_member)
         );

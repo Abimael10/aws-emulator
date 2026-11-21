@@ -26,7 +26,15 @@ pub struct ListBrowsersOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#BrowserSummary")]
+/// `BrowserSummary`, the row `ListBrowsers` carries. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `lastUpdatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape", shape="BrowserSummary")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct BrowserSummary {
     pub browser_id: String,
@@ -37,4 +45,26 @@ pub struct BrowserSummary {
     pub created_at: ::aws_smithy_types::DateTime,
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+agentcore_schema_and_codec!(
+    BrowserSummary,
+    BROWSER_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#BrowserSummary",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "BrowserSummary",
+    (M_BROWSER_ID, browser_id, "browserId", 0, req, string),
+    (M_BROWSER_ARN, browser_arn, "browserArn", 1, req, string),
+    (M_NAME, name, "name", 2, opt, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (M_STATUS, status, "status", 4, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 5, req, date_time),
+    (
+        M_LAST_UPDATED_AT,
+        last_updated_at,
+        "lastUpdatedAt",
+        6,
+        opt,
+        date_time
+    ),
+);
 

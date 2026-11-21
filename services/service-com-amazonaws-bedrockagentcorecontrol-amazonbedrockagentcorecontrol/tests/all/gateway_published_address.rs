@@ -244,6 +244,72 @@ async fn published_endpoint(
     (host, base, path)
 }
 
+/// RULE, through the MUTATION of a gateway: every call that reports `gatewayUrl` reports
+/// the one address this emulator answers that gateway on, so an `UpdateGateway` publishes
+/// what the create published and that address is still served afterwards.
+///
+/// The rows are the two kinds of client, which decide the form of the published address;
+/// an update renames nothing (the model requires the name the gateway was created with),
+/// so what varies between the calls is which caller asked.
+#[tokio::test]
+async fn an_update_publishes_the_address_the_emulator_answers_the_gateway_on() {
+    for (caller, name) in [
+        (Caller::AwsEndpoint, "awsupdatedgw"),
+        (Caller::EmulatorEndpoint, "ownupdatedgw"),
+    ] {
+        let (router, engine) = router();
+        let case = caller.case();
+        let (host, _, path) = published_endpoint(&router, &engine, caller, name).await;
+        let published = format!("https://{host}{path}");
+
+        let (status, updated) = control(
+            &router,
+            caller,
+            "PUT",
+            &format!("/gateways/{}/", gateway_id_of(&host, &path)),
+            Some(&json!({
+                "name": name,
+                "roleArn": ROLE_ARN,
+                "authorizerType": "AWS_IAM",
+                "description": "the configuration this update replaces it with",
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected HTTP 202 from UpdateGateway, got {status} ({updated})"
+        );
+        assert_eq!(
+            text(&updated, "gatewayUrl"),
+            published,
+            "case {case:?}: an update publishes the address the gateway is answered on \
+             ({published:?}), got {:?}",
+            text(&updated, "gatewayUrl")
+        );
+
+        // The address the update published is still the one that answers: an update
+        // re-announces an endpoint, it does not move it.
+        settle_now(&engine);
+        let (status, answer) = mcp(&router, &host, &path, true).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the address the update published must be served, got {status} \
+             ({answer})"
+        );
+    }
+}
+
+/// The `gatewayId` a published endpoint names: the last path segment before the transport
+/// path for a client on the emulator's own endpoint, and the first host label for a client
+/// on AWS's own hostnames — the two forms [`published_endpoint`] asserts.
+fn gateway_id_of(host: &str, path: &str) -> String {
+    let base = path.strip_suffix(TRANSPORT_PATH).unwrap_or(path);
+    match base.rsplit('/').next().unwrap_or_default() {
+        "" => host.split('.').next().unwrap_or_default().to_string(),
+        last => last.to_string(),
+    }
+}
+
 /// RULE: the published address is served, the transport-path join is idempotent, and
 /// nothing else under that address answers — for both kinds of client.
 #[tokio::test]
