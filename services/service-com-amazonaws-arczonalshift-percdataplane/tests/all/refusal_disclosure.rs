@@ -231,18 +231,23 @@ async fn a_denial_on_a_shift_id_states_no_reason_at_all() {
     for id in UNKNOWN_IDS {
         for (method, payload) in [("DELETE", ""), ("PATCH", r#"{"comment":"a comment"}"#)] {
             let case = format!("{method} /zonalshifts/{id}");
-            let (status, body) = call(&router, method, &format!("/zonalshifts/{id}"), payload).await;
+            let (status, class, body) = super::zonal_shift_lifecycle::refused(
+                &router,
+                method,
+                &format!("/zonalshifts/{id}"),
+                payload,
+            )
+            .await;
             assert_eq!(
                 status, 403,
                 "case {case:?}: an unheld shift id is denied 403, got {status} {body}"
             );
             assert_eq!(
-                error_code(&body),
-                "AccessDeniedException",
+                class, "AccessDeniedException",
                 "case {case:?}: expected AccessDeniedException, got {body}"
             );
             assert!(
-                body["message"].is_null() || body["message"].as_str() == Some(""),
+                body["Message"].is_null() || body["Message"].as_str() == Some(""),
                 "case {case:?}: the denial states no reason, got {body}"
             );
             assert!(
@@ -265,7 +270,7 @@ async fn a_denial_on_a_resource_states_arcs_reason_about_it() {
             "a load balancer ARN in another account",
         ),
     ] {
-        let (status, body) = call(
+        let (status, class_answered, body) = super::zonal_shift_lifecycle::refused(
             &router,
             "POST",
             "/zonalshifts",
@@ -277,12 +282,11 @@ async fn a_denial_on_a_resource_states_arcs_reason_about_it() {
             "case {class:?}: an unheld resource is denied 403, got {status} {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "AccessDeniedException",
+            class_answered, "AccessDeniedException",
             "case {class:?}: expected AccessDeniedException, got {body}"
         );
         assert_eq!(
-            body["message"].as_str(),
+            body["Message"].as_str(),
             Some(TARGET_UNAVAILABLE_MESSAGE),
             "case {class:?}: expected the reason ARC states about a resource, got {body}"
         );

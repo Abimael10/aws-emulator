@@ -415,18 +415,19 @@ async fn a_configuration_for_a_target_arc_holds_nothing_for_is_refused_403() {
         // the branch is shown to be taken whatever else the request asks for.
         let row = &ROWS[index % ROWS.len()];
         let case = format!("{class}, {}", row.case);
-        let (status, body) = create(&router, &row.create_body(target)).await;
+        let (status, answered, body) =
+            super::zonal_shift_lifecycle::refused(&router, "POST", "/configuration", &row.create_body(target))
+                .await;
         assert_eq!(
             status, 403,
             "case {case}: an unauthorized target is refused 403, got {status} {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "AccessDeniedException",
+            answered, "AccessDeniedException",
             "case {case}: expected AccessDeniedException, got {body}"
         );
         assert_eq!(
-            body["message"].as_str(),
+            body["Message"].as_str(),
             Some(TARGET_UNAVAILABLE_MESSAGE),
             "case {case}: expected the non-disclosing refusal message, got {body}"
         );

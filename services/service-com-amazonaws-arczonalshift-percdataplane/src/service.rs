@@ -13,7 +13,7 @@
 //! table — built from the Smithy model at compile time. You do not edit the
 //! entry; you edit the behavioral seams below.
 //!
-//! Five opt-in seams are yours to change; every one defaults to the framework's
+//! Six opt-in seams are yours to change; every one defaults to the framework's
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
@@ -37,11 +37,35 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — EDITED HERE. The codec every request is served in: the shared
+//!   `restJson1` codec whose failures carry the error shape's own modelled members and
+//!   nothing else ([`service_common::rest_json_error_body`]), narrowed to the ONE error
+//!   class ARC answers from the layer in front of its operations — the access denial. See
+//!   "How this service answers an access denial" below.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # How this service answers an access denial
+//!
+//! ARC decides the caller's authorization on a call's target in the layer in front of the
+//! operation and answers the denial from THERE: the recorded 403s name the error class in
+//! `x-amzn-errortype` as a shape of that framework rather than as a shape of this service's
+//! own model, and the JSON document they carry is that layer's — the denial text alone,
+//! under the member name the overlay model declares (`Message`, see
+//! `smithy-model/LOCAL-ADDITIONS.md`), with NO `__type` discriminator for the class. A
+//! denial that states no reason therefore answers the empty JSON document.
+//!
+//! Both halves are taken rather than written: the member name from the overlay model
+//! (`crate::ops::types::AccessDeniedException`), and the document — the error shape's own
+//! modelled members and nothing else — from the one codec of that class in the tree
+//! ([`service_common::rest_json_error_body::ServedErrorBodyRestJson`]), held in a field
+//! because the seam hands back a borrow. It is narrowed to one error class by shape name,
+//! so the rule holds for every operation of this service that declares the class, however
+//! the denial was reached, and is keyed on no operation, route or request. See
+//! [`denial_envelope`] for the whole of it.
 //!
 //! # How this service words a refusal
 //!
@@ -82,9 +106,15 @@
 //! service's issue, so it is inlined here with this note, exactly as that module asks.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, ErasedOperation, Refusal, Refused, ServerHttpProtocol, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
+
+/// What this service's error body carries for the one class ARC answers from the layer in
+/// front of its operations — the access denial — and the codec it holds for it.
+mod denial_envelope;
+
+use denial_envelope::{ZonalShiftRestJson, ACCESS_DENIAL};
 
 /// The wire error code for a request this service refuses as invalid: the shape
 /// `com.amazonaws.arczonalshift#ValidationException`, which every operation of this
@@ -252,6 +282,9 @@ fn stated(violations: &[Violation]) -> Option<String> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The protocol `override_protocol` serves every request in. Built once, here, because
+    /// the seam hands back a reference borrowed from `&self`.
+    protocol: ZonalShiftRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -261,6 +294,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: ZonalShiftRestJson::for_error_classes(ACCESS_DENIAL),
         }
     }
 }
@@ -271,6 +305,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // table, and the default error renderers — lives in the generated entry.
         // The router reads it through this one accessor. Do not edit the entry.
         &self.entry
+    }
+
+    fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {
+        // The shared codec of this class: the model's own protocol in every respect but
+        // the document of a failure whose error shape this service answers from the layer
+        // in front of its operations — the access denial. See "How this service answers an
+        // access denial" in the module docs. A request's OPERATION is still resolved
+        // through the generated entry's own protocol, so this one carries no routes.
+        Some(&self.protocol)
     }
 
     fn can_handle(&self, parts: &http::request::Parts) -> bool {

@@ -434,18 +434,23 @@ async fn a_deletion_for_a_target_arc_holds_nothing_for_is_refused_403() {
     let held = hold(&router, &ROWS[0], &held_target).await;
 
     for (target, class) in &targets {
-        let (status, body) = delete(&router, target).await;
+        let (status, answered, body) = super::zonal_shift_lifecycle::refused(
+            &router,
+            "DELETE",
+            &format!("/configuration/{}", encoded(target)),
+            "",
+        )
+        .await;
         assert_eq!(
             status, 403,
             "case {class}: an unauthorized target is refused 403, got {status} {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "AccessDeniedException",
+            answered, "AccessDeniedException",
             "case {class}: expected AccessDeniedException, got {body}"
         );
         assert_eq!(
-            body["message"].as_str(),
+            body["Message"].as_str(),
             Some(TARGET_UNAVAILABLE_MESSAGE),
             "case {class}: expected the non-disclosing refusal message, got {body}"
         );

@@ -11,11 +11,9 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-arczonalshift-percdataplane.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.arczonalshift#AccessDeniedException")]
-#[derive(Debug, Clone, Default)]
-pub struct AccessDeniedException {
-    pub message: Option<String>,
-}
+// `AccessDeniedException` is in `access_denied_types`: the document AWS answers a
+// denial with names its one member differently from the model snapshot, so it is
+// generated from the overlay model beside it (see `smithy-model/LOCAL-ADDITIONS.md`).
 
 #[smithy_macros::smithy(shape = "com.amazonaws.arczonalshift#InternalServerException")]
 #[derive(Debug, Clone, Default)]

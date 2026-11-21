@@ -33,7 +33,9 @@
 //! consulted, while an ARN-shaped identifier ARC holds no record of is resolved and
 //! reported as `ResourceNotFoundException` (404).
 
-use super::zonal_shift_lifecycle::{call, emulator, encoded, error_code, seeded, start_body};
+use super::zonal_shift_lifecycle::{
+    call, emulator, encoded, error_code, refused, seeded, start_body,
+};
 use service_com_amazonaws_arczonalshift_percdataplane::state::TARGET_UNAVAILABLE_MESSAGE;
 
 /// ARN-shaped `resourceIdentifier`s no managed resource carries, as
@@ -124,11 +126,16 @@ const UPDATE_PAYLOADS: &[&str] = &[
 /// nothing about the target it was asked about. `reason` is what ARC states about it:
 /// the resource message for a call that named a resource, nothing at all for one that
 /// named a shift id.
+///
+/// ARC answers a denial from the layer that decides authorization, so the class is named
+/// in `x-amzn-errortype` and the document carries the text alone, under `Message`
+/// (`access_denial_envelope.rs` states that rule over the whole class).
 fn assert_refused(
     case: &str,
     target: &str,
     reason: Option<&str>,
     status: u16,
+    class: &str,
     body: &serde_json::Value,
 ) {
     assert_eq!(
@@ -136,8 +143,7 @@ fn assert_refused(
         "case {case:?}: an unauthorized target is refused 403, got {status} {body}"
     );
     assert_eq!(
-        error_code(body),
-        "AccessDeniedException",
+        class, "AccessDeniedException",
         "case {case:?}: expected AccessDeniedException, got {body}"
     );
     let rendered = body.to_string();
@@ -147,13 +153,13 @@ fn assert_refused(
     );
     match reason {
         Some(expected) => assert_eq!(
-            body["message"].as_str(),
+            body["Message"].as_str(),
             Some(expected),
             "case {case:?}: expected the non-disclosing refusal message {expected:?}, \
              got {body}"
         ),
         None => assert!(
-            body["message"].is_null() || body["message"].as_str() == Some(""),
+            body["Message"].is_null() || body["Message"].as_str() == Some(""),
             "case {case:?}: a denial on a shift id states no reason, got {body}"
         ),
     }
@@ -184,14 +190,21 @@ async fn starting_a_shift_for_a_target_arc_holds_nothing_for_is_refused_403() {
     for (row, (target, class)) in targets.iter().enumerate() {
         let (away_from, expires_in) = shapes[row % shapes.len()];
         let case = format!("StartZonalShift/{class}/awayFrom={away_from}");
-        let (status, body) = call(
+        let (status, class, body) = refused(
             &router,
             "POST",
             "/zonalshifts",
             &start_body(target, away_from, expires_in, "shifting an unheld target"),
         )
         .await;
-        assert_refused(&case, target, Some(TARGET_UNAVAILABLE_MESSAGE), status, &body);
+        assert_refused(
+            &case,
+            target,
+            Some(TARGET_UNAVAILABLE_MESSAGE),
+            status,
+            &class,
+            &body,
+        );
     }
 }
 
@@ -199,22 +212,26 @@ async fn starting_a_shift_for_a_target_arc_holds_nothing_for_is_refused_403() {
 async fn cancelling_or_updating_an_id_arc_holds_nothing_for_is_refused_403() {
     let (router, _engine) = emulator();
     for (row, (id, class)) in UNKNOWN_ZONAL_SHIFT_IDS.iter().enumerate() {
-        let (status, body) = call(&router, "DELETE", &format!("/zonalshifts/{id}"), "").await;
+        let (status, answered, body) =
+            refused(&router, "DELETE", &format!("/zonalshifts/{id}"), "").await;
         assert_refused(
             &format!("CancelZonalShift/{class}"),
             id,
             None,
             status,
+            &answered,
             &body,
         );
 
         let payload = UPDATE_PAYLOADS[row % UPDATE_PAYLOADS.len()];
-        let (status, body) = call(&router, "PATCH", &format!("/zonalshifts/{id}"), payload).await;
+        let (status, answered, body) =
+            refused(&router, "PATCH", &format!("/zonalshifts/{id}"), payload).await;
         assert_refused(
             &format!("UpdateZonalShift/{class}/payload={payload}"),
             id,
             None,
             status,
+            &answered,
             &body,
         );
     }
@@ -249,9 +266,16 @@ async fn an_id_the_store_held_and_dropped_is_refused_the_same_way() {
 
     for method in ["DELETE", "PATCH"] {
         let body_text = if method == "PATCH" { "{}" } else { "" };
-        let (status, body) =
-            call(&router, method, &format!("/zonalshifts/{id}"), body_text).await;
-        assert_refused(&format!("{method} a dropped id"), &id, None, status, &body);
+        let (status, class, body) =
+            refused(&router, method, &format!("/zonalshifts/{id}"), body_text).await;
+        assert_refused(
+            &format!("{method} a dropped id"),
+            &id,
+            None,
+            status,
+            &class,
+            &body,
+        );
     }
 }
 
@@ -388,7 +412,7 @@ async fn a_read_of_an_identifier_that_is_not_arn_shaped_is_denied_403() {
     // and never reports whether anything is registered.
     let (router, _engine) = emulator();
     for (identifier, class) in NON_ARN_RESOURCE_IDENTIFIERS {
-        let (status, body) = call(
+        let (status, answered, body) = refused(
             &router,
             "GET",
             &format!("/managedresources/{}", encoded(identifier)),
@@ -400,14 +424,13 @@ async fn a_read_of_an_identifier_that_is_not_arn_shaped_is_denied_403() {
             "case {class:?}: a non-ARN identifier is denied 403, got {status} {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "AccessDeniedException",
+            answered, "AccessDeniedException",
             "case {class:?}: expected AccessDeniedException, got {body}"
         );
         // `AccessDeniedException$message` is optional, and a denial taken before the
         // target was resolved reports nothing about it.
         assert!(
-            body["message"].is_null() || body["message"].as_str() == Some(""),
+            body["Message"].is_null() || body["Message"].as_str() == Some(""),
             "case {class:?}: the denial carries no message, got {body}"
         );
         assert!(

@@ -14,6 +14,10 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+/// The access denial every operation of this service answers an unauthorized call
+/// with, generated from the overlay model beside the snapshot: AWS names its one member
+/// differently from the snapshot (see `smithy-model/LOCAL-ADDITIONS.md`).
+pub mod access_denied_types;
 pub mod cancel_practice_run_types;
 pub mod cancel_zonal_shift_types;
 pub mod create_practice_run_configuration_types;
@@ -35,6 +39,8 @@ pub mod update_zonal_shift_types;
 /// does not declare (see `smithy-model/LOCAL-ADDITIONS.md`).
 pub mod zonal_shift_types;
 
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use access_denied_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use cancel_practice_run_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

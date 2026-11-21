@@ -77,8 +77,36 @@ pub(crate) async fn call(
     uri: &str,
     body: &str,
 ) -> (u16, serde_json::Value) {
+    let (status, _error_type, parsed) = refused(router, method, uri, body).await;
+    (status, parsed)
+}
+
+/// Dispatch a call and read back its status, the error CLASS the answer names, and its
+/// JSON body.
+///
+/// The class is the shape `x-amzn-errortype` names — the header restJson1 resolves an
+/// error shape from. That is the one place every refusal of this service names its class:
+/// the access denial ARC answers from its authorization layer carries no discriminator in
+/// its document at all (`src/service/denial_envelope.rs`), so it is this helper rather
+/// than [`error_code`] that reads a denial's class. The SHAPE is read out of the value by
+/// the tree's own reader of it, so a value qualified by the locator of the namespace that
+/// declares it, or carrying that namespace as a `#` prefix, names the same class. The
+/// header is absent on a success, where the class is the empty string.
+pub(crate) async fn refused(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> (u16, String, serde_json::Value) {
     let response = router.dispatch(request(method, uri, body)).await;
     let status = response.status().as_u16();
+    let class = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(::service_common::error_type_locator::header_shape_named)
+        .unwrap_or_default()
+        .to_string();
     let parsed = if response.body().is_empty() {
         serde_json::Value::Null
     } else {
@@ -89,7 +117,7 @@ pub(crate) async fn call(
             )
         })
     };
-    (status, parsed)
+    (status, class, parsed)
 }
 
 /// Percent-encode the reserved characters an ARN `resourceIdentifier` or a base64
@@ -127,6 +155,11 @@ pub(crate) fn seeded(engine: &engine::InMemoryEngine) -> Vec<(String, Vec<String
 
 /// `__type` as the restJson1 error envelope carries it, with any `shapeId#` prefix
 /// dropped.
+///
+/// Every error this service's OPERATIONS answer, and every framework-level refusal,
+/// carries that discriminator. The access denial does not — ARC answers one from the
+/// layer in front of the operation, whose document carries the text alone — so a
+/// denial's class is read with [`refused`] instead.
 pub(crate) fn error_code(body: &serde_json::Value) -> String {
     body["__type"]
         .as_str()
@@ -552,7 +585,7 @@ async fn unknown_identifiers_are_refused_and_a_shift_that_is_over_is_a_conflict(
         "arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/absent/0",
         "arn:aws:autoscaling:us-west-2:000000000000:autoScalingGroupName/absent",
     ] {
-        let (status, body) = call(
+        let (status, class, body) = refused(
             &router,
             "POST",
             "/zonalshifts",
@@ -564,8 +597,7 @@ async fn unknown_identifiers_are_refused_and_a_shift_that_is_over_is_a_conflict(
             "case {unknown}: an unregistered resource is refused, got {status} {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "AccessDeniedException",
+            class, "AccessDeniedException",
             "case {unknown}: expected AccessDeniedException, got {body}"
         );
 
@@ -603,14 +635,14 @@ async fn unknown_identifiers_are_refused_and_a_shift_that_is_over_is_a_conflict(
 
     // An id no shift carries is refused, for both operations keyed by one.
     for (method, name) in [("PATCH", "UpdateZonalShift"), ("DELETE", "CancelZonalShift")] {
-        let (status, body) = call(&router, method, "/zonalshifts/zs-0000009999", "{}").await;
+        let (status, class, body) =
+            refused(&router, method, "/zonalshifts/zs-0000009999", "{}").await;
         assert_eq!(
             status, 403,
             "case {name}: an unknown zonalShiftId is refused, got {status} {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "AccessDeniedException",
+            class, "AccessDeniedException",
             "case {name}: expected AccessDeniedException, got {body}"
         );
     }

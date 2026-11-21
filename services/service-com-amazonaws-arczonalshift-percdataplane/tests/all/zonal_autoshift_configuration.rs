@@ -379,18 +379,23 @@ async fn an_update_for_a_target_arc_holds_nothing_for_is_refused_403() {
         // the call asks for.
         for wanted in ZONAL_AUTOSHIFT_STATUS_VALUES {
             let case = format!("{class}, {wanted}");
-            let (status, body) = update(&router, target, wanted).await;
+            let (status, answered, body) = super::zonal_shift_lifecycle::refused(
+                &router,
+                "PUT",
+                &format!("/managedresources/{}", encoded(target)),
+                &json!({ "zonalAutoshiftStatus": wanted }).to_string(),
+            )
+            .await;
             assert_eq!(
                 status, 403,
                 "case {case}: an unauthorized target is refused 403, got {status} {body}"
             );
             assert_eq!(
-                error_code(&body),
-                "AccessDeniedException",
+                answered, "AccessDeniedException",
                 "case {case}: expected AccessDeniedException, got {body}"
             );
             assert_eq!(
-                body["message"].as_str(),
+                body["Message"].as_str(),
                 Some(TARGET_UNAVAILABLE_MESSAGE),
                 "case {case}: expected the non-disclosing refusal message, got {body}"
             );

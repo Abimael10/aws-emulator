@@ -383,7 +383,7 @@ async fn arc_follows_the_registry_when_the_owner_changes_or_withdraws_a_registra
 
     // And a shift cannot be started for it any more: the target is one ARC holds nothing
     // for, which is refused before existence is reported.
-    let (status, body) = call(
+    let (status, answered, body) = super::zonal_shift_lifecycle::refused(
         &router,
         "POST",
         "/zonalshifts",
@@ -391,7 +391,7 @@ async fn arc_follows_the_registry_when_the_owner_changes_or_withdraws_a_registra
     )
     .await;
     assert_eq!(
-        (status, error_code(&body).as_str()),
+        (status, answered.as_str()),
         (403, "AccessDeniedException"),
         "case {case}: a shift for a deregistered resource is refused, got {status} {body}"
     );

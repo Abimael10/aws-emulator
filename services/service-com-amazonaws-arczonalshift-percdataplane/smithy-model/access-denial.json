@@ -1,0 +1,19 @@
+{
+  "smithy": "2.0",
+  "shapes": {
+    "com.amazonaws.arczonalshift#AccessDeniedException": {
+      "type": "structure",
+      "members": {
+        "message": {
+          "target": "smithy.api#String",
+          "traits": { "smithy.api#jsonName": "Message" }
+        }
+      },
+      "traits": {
+        "smithy.api#documentation": "<p>You do not have sufficient access to perform this action.</p>",
+        "smithy.api#error": "client",
+        "smithy.api#httpError": 403
+      }
+    }
+  }
+}

@@ -325,18 +325,23 @@ async fn a_change_for_a_target_arc_holds_nothing_for_is_refused_403() {
     for (index, (target, class)) in targets.iter().enumerate() {
         let (change_case, change) = &table[index % table.len()];
         let case = format!("{class}, a change that {change_case}");
-        let (status, body) = update(&router, target, change).await;
+        let (status, answered, body) = super::zonal_shift_lifecycle::refused(
+            &router,
+            "PATCH",
+            &format!("/configuration/{}", encoded(target)),
+            &Value::Object(change.clone()).to_string(),
+        )
+        .await;
         assert_eq!(
             status, 403,
             "case {case}: an unauthorized target is refused 403, got {status} {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "AccessDeniedException",
+            answered, "AccessDeniedException",
             "case {case}: expected AccessDeniedException, got {body}"
         );
         assert_eq!(
-            body["message"].as_str(),
+            body["Message"].as_str(),
             Some(TARGET_UNAVAILABLE_MESSAGE),
             "case {case}: expected the non-disclosing refusal message, got {body}"
         );

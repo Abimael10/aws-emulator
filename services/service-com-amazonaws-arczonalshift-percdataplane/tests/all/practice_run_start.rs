@@ -563,10 +563,18 @@ async fn an_unheld_target_or_an_undeployed_zone_is_refused() {
             status, *expected_status,
             "case {case:?}: expected {expected_status}, got {status} {refused}"
         );
+        // A denial is the authorization layer's answer and states its text under
+        // `Message`; the zone refusal is the operation's own `ValidationException` and
+        // states it under the modelled `message` (`src/service/denial_envelope.rs`).
+        let member = if *expected_status == 403 {
+            "Message"
+        } else {
+            "message"
+        };
         assert_eq!(
-            refused["message"].as_str(),
+            refused[member].as_str(),
             Some(*expected_message),
-            "case {case:?}: expected the sentence for the class, got {refused}"
+            "case {case:?}: expected the sentence for the class at {member}, got {refused}"
         );
         if *expected_status == 400 {
             assert_eq!(

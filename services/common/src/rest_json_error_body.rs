@@ -35,6 +35,13 @@
 //! }
 //! ```
 //!
+//! A service only SOME of whose failures are rendered by the layer that answers that way —
+//! one whose authorization denials come from the stack in front of its operations, while
+//! the operations answer their own refusals — names those error shapes with
+//! [`ServedErrorBodyRestJson::for_error_classes`] and holds that instead. The rule, the
+//! rewrite and the narrowing all stay here, so a service takes any of them by holding one
+//! protocol rather than by copying a codec.
+//!
 //! A service that also answers requests naming no modelled operation in this envelope passes
 //! its routing failure through [`crate::error_type_locator::without_error_shape_in_body`] at
 //! `Service::override_routing_error`, which is the other seam a service owns.
@@ -68,6 +75,15 @@ use aws_smithy_schema_server::RestJsonServerProtocol;
 #[derive(Debug)]
 pub struct ServedErrorBodyRestJson {
     inner: RestJsonServerProtocol,
+    /// The error SHAPES the correction applies to, or `None` for every one of them.
+    ///
+    /// A service whose whole wire answers failures without the discriminator takes `None`,
+    /// which is the protocol's own reading and the default. A service only SOME of whose
+    /// failures are rendered by the layer that answers that way — one whose authorization
+    /// denials come from the stack in front of its operations, say — names those shapes, so
+    /// the correction reaches the classes that stack answers and leaves the classes the
+    /// operation answers to the renderer that wrote them.
+    classes: Option<&'static [&'static str]>,
 }
 
 impl ServedErrorBodyRestJson {
@@ -83,6 +99,33 @@ impl ServedErrorBodyRestJson {
     pub fn new() -> Self {
         Self {
             inner: RestJsonServerProtocol::new(&[]),
+            classes: None,
+        }
+    }
+
+    /// The same codec, correcting only the failures whose error shape is one of `classes`.
+    ///
+    /// For a service whose wire answers SOME classes in that envelope and the rest in the
+    /// renderer's own — see [`Self::classes`]. `classes` names shapes, so a value the
+    /// renderer spells namespaced or locator-qualified matches the name it carries
+    /// ([`crate::error_type_locator::shape_named`]). An EMPTY list corrects nothing.
+    #[must_use]
+    pub fn for_error_classes(classes: &'static [&'static str]) -> Self {
+        Self {
+            inner: RestJsonServerProtocol::new(&[]),
+            classes: Some(classes),
+        }
+    }
+
+    /// Whether a failure rendered under the error shape `error_code` names takes the
+    /// correction.
+    fn corrects(&self, error_code: &str) -> bool {
+        match self.classes {
+            None => true,
+            Some(classes) => {
+                let named = crate::error_type_locator::shape_named(error_code);
+                classes.contains(&named)
+            }
         }
     }
 }
@@ -136,6 +179,10 @@ impl ServerProtocol for ServedErrorBodyRestJson {
         let resp = self
             .inner
             .serialize_error(error, error_schema, error_code, http_status)?;
+        if !self.corrects(error_code) {
+            // A class this service's wire answers in the renderer's own envelope.
+            return Ok(resp);
+        }
         Ok(crate::error_type_locator::without_error_shape_in_body(resp))
     }
 
@@ -257,6 +304,71 @@ mod tests {
             assert_eq!(
                 document, expected,
                 "case {case:?}: expected the body {expected}, got {document}"
+            );
+        }
+    }
+
+    /// RULE: a codec narrowed to a set of error shapes corrects the failures whose shape is
+    /// one of them and leaves every other failure the renderer's own. The rows differ along
+    /// what the rule generalises over: a named shape, a shape not in the set, a named shape
+    /// spelled with its namespace, the empty set, which names none, and the default, which
+    /// names every one.
+    #[test]
+    fn a_narrowed_codec_corrects_only_the_shapes_it_names() {
+        /// The shapes a service whose authorization denials come from another stack names.
+        const DENIAL: &[&str] = &["AccessDeniedException"];
+        // (case, the codec, the code, whether the body still names the shape)
+        let rows: Vec<(&str, ServedErrorBodyRestJson, &str, bool)> = vec![
+            (
+                "a shape the codec names",
+                ServedErrorBodyRestJson::for_error_classes(DENIAL),
+                "AccessDeniedException",
+                false,
+            ),
+            (
+                "a shape the codec does not name",
+                ServedErrorBodyRestJson::for_error_classes(DENIAL),
+                "InvalidInputException",
+                true,
+            ),
+            (
+                "a named shape spelled with its namespace",
+                ServedErrorBodyRestJson::for_error_classes(DENIAL),
+                "example#AccessDeniedException",
+                false,
+            ),
+            (
+                "the empty set, which names none",
+                ServedErrorBodyRestJson::for_error_classes(&[]),
+                "AccessDeniedException",
+                true,
+            ),
+            (
+                "every shape, the default",
+                ServedErrorBodyRestJson::new(),
+                "AccessDeniedException",
+                false,
+            ),
+        ];
+
+        for (case, protocol, code, keeps_the_shape) in rows {
+            let answered = protocol
+                .serialize_error(&Refused(Some("denied")), &REFUSED_SCHEMA, code, 403)
+                .unwrap_or_else(|e| panic!("case {case:?}: the failure must render ({e})"));
+            let body = answered.body().bytes().expect("an in-memory body");
+            let document: Value = serde_json::from_slice(body)
+                .unwrap_or_else(|e| panic!("case {case:?}: the body must be JSON ({e})"));
+            assert_eq!(
+                !document["__type"].is_null(),
+                keeps_the_shape,
+                "case {case:?}: expected the body to name the shape: {keeps_the_shape}, \
+                 got {document}"
+            );
+            assert_eq!(
+                document["Message"].as_str(),
+                Some("denied"),
+                "case {case:?}: the shape's own modelled member is the renderer's, \
+                 got {document}"
             );
         }
     }

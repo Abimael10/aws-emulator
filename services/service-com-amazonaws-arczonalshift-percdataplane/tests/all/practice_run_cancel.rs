@@ -431,18 +431,23 @@ async fn cancelling_a_practice_run_that_is_no_longer_active_conflicts_409() {
 async fn cancelling_a_run_arc_holds_no_shift_for_is_refused_403() {
     let (router, _engine) = emulator();
     for (id, class) in UNKNOWN_ZONAL_SHIFT_IDS {
-        let (status, refused) = cancel_practice_run(&router, id).await;
+        let (status, answered, refused) = super::zonal_shift_lifecycle::refused(
+            &router,
+            "DELETE",
+            &format!("/practiceruns/{id}"),
+            "",
+        )
+        .await;
         assert_eq!(
             status, 403,
             "case {class:?}: an unauthorized target is refused 403, got {status} {refused}"
         );
         assert_eq!(
-            error_code(&refused).as_str(),
-            "AccessDeniedException",
+            answered, "AccessDeniedException",
             "case {class:?}: expected AccessDeniedException, got {refused}"
         );
         assert!(
-            refused["message"].is_null() || refused["message"].as_str() == Some(""),
+            refused["Message"].is_null() || refused["Message"].as_str() == Some(""),
             "case {class:?}: a denial on a shift id states no reason, got {refused}"
         );
         assert!(
