@@ -15,9 +15,9 @@
 //! * a delete answers the `ClusterArn` the create minted — never a second ARN, and the
 //!   same one whether the cluster was named by name or by ARN — for clusters differing in
 //!   name shape, instance-group count and declared instance counts;
-//! * the cluster reports `Deleting` from the call that asked for it until the clock
-//!   completes the teardown, after which every reader answers as if it were gone and the
-//!   name is free for another cluster, which gets a DIFFERENT ARN;
+//! * the cluster is `Deleting` from the call that asked for it, and the clock owes the
+//!   teardown from that instant, so every reader after it answers as if the cluster were
+//!   gone and the name is free for another cluster, which gets a DIFFERENT ARN;
 //! * a cluster the service is already moving — one still `Creating`, or one already
 //!   `Deleting` — is refused with the modelled `ConflictException` and keeps its status;
 //! * an identifier this account holds no cluster under is refused with the modelled
@@ -25,18 +25,14 @@
 //! * a delete touches only the cluster it names: every other cluster in the store is
 //!   still readable afterwards, with its own status.
 
-use std::time::Duration;
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_sagemaker_sagemaker::state as sm;
 
 use crate::hyperpod_cluster_audit_record::{audit_capture, seed_not_due};
-use crate::inference_deployment_lifecycle::{
-    error_code, message, str_field, Emulator, ACCOUNT, PAST_IN_SERVICE_DUE,
-};
-
-/// Longer than `state::CLUSTER_RELEASED_AFTER` (300 ms), so the clock owes a requested
-/// deletion its completion by the time the next call runs.
-const PAST_RELEASE_DUE: Duration = Duration::from_millis(600);
+use crate::hyperpod_cluster_clock::{owe_removal_at, store, FAR_FROM_DUE};
+use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
 /// An IAM role ARN matching `RoleArn`'s modelled pattern
 /// (`^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`).
@@ -126,6 +122,28 @@ async fn listed_names(emulator: &Emulator) -> Vec<String> {
     }
 }
 
+/// Seed one cluster whose teardown has been asked for and is owed [`FAR_FROM_DUE`] out,
+/// straight into the shared store the handler reads — the seam `seed_not_due` uses for a
+/// cluster still `Creating`. Answers its `ClusterArn`.
+///
+/// `DeleteCluster` owes the teardown from the instant it answers
+/// (`state::transition_owed_at`), so a cluster the next request still finds `Deleting` is
+/// seeded rather than raced for.
+fn seed_deleting(emulator: &Emulator, name: &str) -> String {
+    let arn = seed_not_due(emulator, name);
+    {
+        let state = store(&emulator.engine);
+        let mut guard = state.lock();
+        let cluster = guard
+            .clusters
+            .get_mut(name)
+            .unwrap_or_else(|| panic!("expected the seeded cluster {name:?}"));
+        cluster.status = sm::STATUS_DELETING.to_string();
+    }
+    owe_removal_at(&emulator.engine, name, SystemTime::now() + FAR_FROM_DUE);
+    arn
+}
+
 /// One row of the delete round trip: a case name, the cluster's name, and the instance
 /// groups it is created with.
 struct DeleteCase {
@@ -176,7 +194,6 @@ async fn a_delete_answers_the_created_arn_for_either_identifier_form() {
         for DeleteCase { case, name, groups } in &cases {
             let emulator = Emulator::new();
             let created = create_cluster(&emulator, &create_body(name, groups)).await;
-            tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
 
             let identifier = if by_arn { created.clone() } else { name.clone() };
             let deleted = delete_cluster(&emulator, &identifier).await;
@@ -186,16 +203,8 @@ async fn a_delete_answers_the_created_arn_for_either_identifier_form() {
                  ARN, got {deleted:?}"
             );
 
-            // Asked for, not finished: the cluster reports `Deleting` straight after.
-            assert_eq!(
-                cluster_status(&emulator, case, &created).await.as_deref(),
-                Some("Deleting"),
-                "case {case:?} by_arn={by_arn}: expected Deleting straight after the \
-                 delete"
-            );
-
-            // And once the clock has completed the teardown, it is gone for every reader.
-            tokio::time::sleep(PAST_RELEASE_DUE).await;
+            // The teardown is owed from the instant the delete answered, so every reader
+            // after it answers as if the cluster were gone — by either identifier form.
             assert_eq!(
                 cluster_status(&emulator, case, &created).await,
                 None,
@@ -233,14 +242,7 @@ async fn a_completed_deletion_frees_the_name_for_a_new_cluster() {
         );
         seen.push(created.clone());
 
-        tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
-        let deleted = delete_cluster(&emulator, "recycled").await;
-        assert_eq!(
-            deleted, created,
-            "round {round}: the delete must answer the live cluster's ARN"
-        );
-
-        // The name is taken until the teardown completes, and free afterwards.
+        // The name is in use while the cluster is: a create under it is refused.
         let (status, refused) = emulator
             .call(
                 "CreateCluster",
@@ -249,7 +251,7 @@ async fn a_completed_deletion_frees_the_name_for_a_new_cluster() {
             .await;
         assert_eq!(
             status, 400,
-            "round {round}: a create against a cluster still deleting must be refused, \
+            "round {round}: a create against a live cluster of that name must be refused, \
              got {status} with {refused}"
         );
         assert_eq!(
@@ -257,7 +259,19 @@ async fn a_completed_deletion_frees_the_name_for_a_new_cluster() {
             "ResourceInUse",
             "round {round}: expected ResourceInUse, got {refused}"
         );
-        tokio::time::sleep(PAST_RELEASE_DUE).await;
+
+        let deleted = delete_cluster(&emulator, "recycled").await;
+        assert_eq!(
+            deleted, created,
+            "round {round}: the delete must answer the live cluster's ARN"
+        );
+        // The teardown is owed from that call, so the name is free for the next round's
+        // create — which the loop proves by getting a distinct ARN back.
+        assert_eq!(
+            cluster_status(&emulator, "recycled is gone", &created).await,
+            None,
+            "round {round}: expected the deleted cluster to be gone"
+        );
     }
 
     // Every round's ARN was distinct, and the last round's cluster is gone too.
@@ -276,18 +290,10 @@ async fn a_cluster_the_service_is_already_moving_is_refused_as_a_conflict() {
     // Row 1: a cluster still provisioning. Seeded with its `InService` far from due, so
     // "still Creating" is a fact rather than a race on a loaded host.
     let provisioning = seed_not_due(&emulator, "provisioning");
-    // Row 2: a cluster whose deletion has already been asked for.
-    let deleting_arn = create_cluster(
-        &emulator,
-        &create_body("deleting", &[("workers", 1, "ml.m5.large")]),
-    )
-    .await;
-    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
-    assert_eq!(
-        delete_cluster(&emulator, "deleting").await,
-        deleting_arn,
-        "the first delete must answer the cluster's ARN"
-    );
+    // Row 2: a cluster whose deletion has already been asked for, seeded the same way —
+    // the teardown a `DeleteCluster` owes is due from the instant it answers, so a
+    // cluster a later request still finds `Deleting` is one whose removal is not yet due.
+    let deleting_arn = seed_deleting(&emulator, "deleting");
 
     let cases = [
         ("still Creating, by name", "provisioning".to_string(), "Creating"),
@@ -323,19 +329,20 @@ async fn a_cluster_the_service_is_already_moving_is_refused_as_a_conflict() {
         );
     }
 
-    // The cluster that was never deleted is still there once the deleting one is gone.
-    tokio::time::sleep(PAST_RELEASE_DUE).await;
+    // Neither cluster was touched by the other's refusals.
     assert_eq!(
         cluster_status(&emulator, "provisioning survives", &provisioning)
             .await
             .as_deref(),
         Some("Creating"),
-        "the untouched cluster must survive every refusal and the other's deletion"
+        "the untouched cluster must survive every refusal"
     );
     assert_eq!(
-        cluster_status(&emulator, "deleting is gone", &deleting_arn).await,
-        None,
-        "the deleted cluster must be gone once the clock completed its teardown"
+        cluster_status(&emulator, "deleting survives", &deleting_arn)
+            .await
+            .as_deref(),
+        Some("Deleting"),
+        "the cluster whose teardown is not yet due must still report Deleting"
     );
 }
 
@@ -353,16 +360,14 @@ async fn an_unknown_identifier_is_refused_as_resource_not_found() {
         .expect("a cluster ARN carries an id")
         .to_string();
 
-    // A cluster that was deleted and whose teardown completed is one of the rows: past
-    // that instant it is an identifier nothing answers to.
+    // A cluster that was deleted is one of the rows: the teardown is owed from that call,
+    // so from the next request on it is an identifier nothing answers to.
     let gone = create_cluster(
         &emulator,
         &create_body("gone", &[("workers", 1, "ml.m5.large")]),
     )
     .await;
-    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
     delete_cluster(&emulator, "gone").await;
-    tokio::time::sleep(PAST_RELEASE_DUE).await;
 
     // Every row satisfies `ClusterNameOrArn`'s pattern, so the refusal comes from the
     // handler rather than from boundary validation.
@@ -428,7 +433,6 @@ async fn a_delete_emits_one_audit_record_and_a_refusal_emits_none() {
             &create_body(&name, &[("workers", 1, "ml.m5.large")]),
         )
         .await;
-        tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
 
         let identifier = if by_arn { created.clone() } else { name.clone() };
         assert_eq!(
@@ -453,22 +457,17 @@ async fn a_delete_emits_one_audit_record_and_a_refusal_emits_none() {
         );
     }
 
-    // A refused delete records nothing: the second delete of a cluster lands while it is
-    // still `Deleting`, so it is refused — and the one record the first delete left is
-    // still the only one.
+    // A refused delete records nothing: a second delete of a cluster whose teardown is
+    // not yet due is refused for the `Deleting` status — and the one record the first
+    // delete left is still the only one. The cluster is seeded in that state, since the
+    // teardown a real delete owes is due from the instant it answers.
     let repeat_name = "audited-delete-repeat";
-    let repeated = create_cluster(
-        &emulator,
-        &create_body(repeat_name, &[("workers", 1, "ml.m5.large")]),
-    )
-    .await;
-    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
-    assert_eq!(
-        delete_cluster(&emulator, repeat_name).await,
-        repeated,
-        "case repeat: the first delete must answer the cluster's ARN"
-    );
+    let repeated = seed_deleting(&emulator, repeat_name);
     let own = vec![repeated.clone()];
+    assert!(
+        capture.records_for("DeleteCluster", &own).is_empty(),
+        "case repeat: the seeded cluster has no delete record of its own yet"
+    );
     let (status, refused) = emulator
         .call("DeleteCluster", &json!({ "ClusterName": repeat_name }))
         .await;
@@ -482,10 +481,9 @@ async fn a_delete_emits_one_audit_record_and_a_refusal_emits_none() {
         "case repeat: expected ConflictException, got {refused}"
     );
     let after_refusal = capture.records_for("DeleteCluster", &own);
-    assert_eq!(
-        after_refusal.len(),
-        1,
-        "case repeat: a refused delete must emit no further record, got {after_refusal:?}"
+    assert!(
+        after_refusal.is_empty(),
+        "case repeat: a refused delete must emit no record, got {after_refusal:?}"
     );
 }
 
@@ -497,7 +495,6 @@ async fn a_delete_touches_only_the_cluster_it_names() {
     for name in names {
         arns.push(create_cluster(&emulator, &create_body(name, &[("workers", 1, "ml.m5.large")])).await);
     }
-    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
 
     // Delete them one at a time, in a different order than they were created: after each
     // delete exactly the remaining clusters are listed, each still `InService`.
@@ -511,7 +508,6 @@ async fn a_delete_touches_only_the_cluster_it_names() {
             names[index]
         );
         remaining.retain(|held| *held != index);
-        tokio::time::sleep(PAST_RELEASE_DUE).await;
 
         let mut expected: Vec<String> = remaining.iter().map(|held| names[*held].to_string()).collect();
         expected.sort();

@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::hyperpod_node_identity_reporting::{
-    add_nodes, create_slurm_cluster, listed_logical_ids, summaries, PAST_SETTLE_DUE,
+    add_nodes, create_slurm_cluster, listed_logical_ids, summaries,
 };
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator};
 
@@ -44,7 +44,6 @@ async fn a_node_is_tracked_through_its_lifecycle_by_the_id_the_add_answered() {
         let emulator = Emulator::new();
         let cluster = format!("tracked-{count}");
         create_slurm_cluster(&emulator, &cluster, 0).await;
-        tokio::time::sleep(PAST_SETTLE_DUE).await;
         let added = add_nodes(&emulator, &cluster, "compute", count).await;
         assert_eq!(
             added.len(),
@@ -52,7 +51,8 @@ async fn a_node_is_tracked_through_its_lifecycle_by_the_id_the_add_answered() {
             "case {case}: the add answers one identifier per node, got {added:?}"
         );
 
-        tokio::time::sleep(PAST_SETTLE_DUE).await;
+        // The add owes each node its `Running` from the instant it answers, so the
+        // listing below — the next request — reports every one of them provisioned.
         let listed = emulator
             .ok("ListClusterNodes", &json!({ "ClusterName": cluster }))
             .await;
@@ -124,7 +124,6 @@ async fn a_node_is_tracked_through_its_lifecycle_by_the_id_the_add_answered() {
 
         // The cluster still takes nodes: the stale identifiers refused nothing else.
         let fresh = add_nodes(&emulator, &cluster, "compute", 1).await;
-        tokio::time::sleep(PAST_SETTLE_DUE).await;
         let listed = emulator
             .ok("ListClusterNodes", &json!({ "ClusterName": cluster }))
             .await;

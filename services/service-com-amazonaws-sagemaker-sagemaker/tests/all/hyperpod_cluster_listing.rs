@@ -13,17 +13,14 @@
 //! members a summary carries, the clock-owed `Creating` -> `InService` transition, and
 //! `ListClusters` for every documented filter, sort key, sort order and page size.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
+use crate::hyperpod_cluster_clock::{owe_in_service_at, FAR_FROM_DUE};
 use crate::inference_deployment_lifecycle::{
     error_code, message, str_field, Emulator, ACCOUNT,
 };
-
-/// Longer than `state::CLUSTER_IN_SERVICE_AFTER` (300 ms), so the clock owes the
-/// `Creating` -> `InService` transition by the time the next call runs.
-const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
 
 /// Spacing between creates, so `CreationTime` ordering is unambiguous and a filter
 /// bound can be placed strictly between two clusters.
@@ -333,36 +330,30 @@ async fn training_plan_arns_are_reported_and_filtered_on() {
 async fn a_cluster_settles_from_creating_to_in_service_when_the_clock_owes_it() {
     let emulator = Emulator::new();
 
-    // Rows: a cluster listed straight away, and one listed only after the due instant,
-    // so the transition cannot be an artefact of the first read.
-    for (case, polls) in [("listed-immediately", 3_u32), ("listed-once-late", 0)] {
+    // Rows: a cluster listed while its transition is still owed, and one listed only
+    // once it is due, so the transition cannot be an artefact of the first read.
+    for (case, polls) in [("listed-before-due", 3_u32), ("listed-once-due", 0)] {
         let name = format!("settle-{case}");
         emulator
             .ok("CreateCluster", &cluster_body(&name, &json!({})))
             .await;
+        // The create owes `InService` from the instant it answers, so the `Creating` half
+        // of this rule is reached by pushing the due instant out.
+        owe_in_service_at(&emulator.engine, &name, SystemTime::now() + FAR_FROM_DUE);
 
         for poll in 0..polls {
             let listed = emulator
                 .ok("ListClusters", &json!({ "NameContains": name }))
                 .await;
             let status = str_field(&summaries(&listed)[0], "ClusterStatus");
-            // The first read happens immediately after the create, so the transient
-            // status must still be observable; a later poll in the same window may
-            // already have crossed the due instant on a loaded host, and either answer
-            // is correct there as long as it is one of the two states of this span.
-            let allowed: &[&str] = if poll == 0 {
-                &["Creating"]
-            } else {
-                &["Creating", "InService"]
-            };
-            assert!(
-                allowed.contains(&status.as_str()),
-                "case {case:?} poll {poll}: expected one of {allowed:?} before the due instant, \
-                 got {status:?} in {listed:?}"
+            assert_eq!(
+                status, "Creating",
+                "case {case:?} poll {poll}: a cluster whose InService is not due yet stays \
+                 Creating however often it is listed, got {status:?} in {listed:?}"
             );
         }
 
-        tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
+        owe_in_service_at(&emulator.engine, &name, SystemTime::now());
 
         for read in 0..2 {
             let listed = emulator
@@ -586,7 +577,6 @@ async fn paging_with_max_results_walks_the_whole_result_exactly_once() {
 async fn listing_clusters_does_not_change_what_a_later_caller_sees() {
     let emulator = Emulator::new();
     seed_clusters(&emulator).await;
-    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
 
     // Rows: the listings a client actually issues, each repeated.
     let bodies = [

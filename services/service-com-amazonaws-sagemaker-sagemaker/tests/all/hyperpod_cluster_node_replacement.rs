@@ -27,12 +27,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::hyperpod_cluster_clock::{owe_nodes_running_at, FAR_FROM_DUE};
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
-
-/// Longer than `state::TRANSIENT_STATE_SETTLES_AFTER` (300 ms), so the clock owes a
-/// cluster its instances, and a replaced node its fresh hardware, by the time the next
-/// call runs.
-pub(crate) const PAST_SETTLE_DUE: Duration = Duration::from_millis(600);
 
 /// How long a poll loop keeps looking for a transition the clock owes before giving up:
 /// far more room than the span itself, so a slow or loaded host cannot decide a case.
@@ -116,6 +112,49 @@ pub(crate) async fn nodes_of(emulator: &Emulator, cluster: &str) -> Vec<Node> {
                 .unwrap_or_else(|| panic!("expected LaunchTime in {summary}")),
         })
         .collect()
+}
+
+/// The node `logical_id` names, once it reports `Running`.
+///
+/// Polled for the CONDITION — the status the clock owes the node — not for a span of time,
+/// so no case depends on how fast the host runs. Shared with the sibling node suites, so
+/// there is one way to wait for a node to come back.
+pub(crate) async fn node_once_running(emulator: &Emulator, cluster: &str, logical_id: &str) -> Node {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let found = nodes_of(emulator, cluster)
+            .await
+            .into_iter()
+            .find(|node| node.logical_id == logical_id);
+        match found {
+            Some(node) if node.status == "Running" => return node,
+            other => assert!(
+                Instant::now() < deadline,
+                "case {logical_id:?}: the node must report Running, got {other:?}"
+            ),
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Every node of `cluster`, once they ALL report `Running`, i.e. no change the clock owes
+/// one is still in flight.
+///
+/// The sibling of [`node_once_running`] for a case that waits on the whole cluster, kept
+/// beside it so there is one place that waits for a node condition.
+pub(crate) async fn nodes_once_all_running(emulator: &Emulator, cluster: &str) -> Vec<Node> {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let held = nodes_of(emulator, cluster).await;
+        if held.iter().all(|node| node.status == "Running") {
+            return held;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cluster {cluster:?}: every node must reach Running, got {held:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Create `cluster` holding one instance group per `(name, type, count)` row, wait for the
@@ -381,7 +420,9 @@ async fn a_replaced_node_keeps_its_identity_and_comes_back_on_fresh_hardware() {
              {details}"
         );
 
-        tokio::time::sleep(PAST_SETTLE_DUE).await;
+        // Look again until the replacement hardware the clock owes the node is up: the
+        // CONDITION, not a span of time.
+        node_once_running(&emulator, &cluster, &node.logical_id).await;
         let details = describe(&emulator, &cluster, &node.logical_id).await;
         assert_eq!(
             str_field(&details, "NodeLogicalId"),
@@ -480,7 +521,7 @@ async fn replacing_a_node_destroys_the_volumes_it_held() {
             &json!({ "ClusterName": cluster, "NodeIds": [node.instance_id.clone()] }),
         )
         .await;
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    node_once_running(&emulator, cluster, &node.logical_id).await;
     let replaced = nodes_of(&emulator, cluster).await;
     let fresh = replaced
         .iter()
@@ -733,7 +774,8 @@ async fn a_node_already_mid_change_is_reported_rather_than_replaced_again() {
     );
 
     // A node that is still coming up has not settled either, so it cannot be replaced
-    // until it has: the add below leaves the node `Pending` for the span the clock owes it.
+    // until it has. The add owes the node its `Running` from the instant it answers, so
+    // the node is held `Pending` by seeding the instant the clock owes it.
     let added = emulator
         .ok(
             "BatchAddClusterNodes",
@@ -750,6 +792,12 @@ async fn a_node_already_mid_change_is_reported_rather_than_replaced_again() {
             .and_then(|entries| entries.first())
             .unwrap_or_else(|| panic!("expected an added node in {added}")),
         "NodeLogicalId",
+    );
+    owe_nodes_running_at(
+        &emulator.engine,
+        cluster,
+        std::slice::from_ref(&provisioning),
+        std::time::SystemTime::now() + FAR_FROM_DUE,
     );
     let refused = emulator
         .ok(

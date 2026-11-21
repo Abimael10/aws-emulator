@@ -26,12 +26,11 @@
 //! * a node the service is already changing is reported rather than rebooted again;
 //! * a request that cannot name the nodes to reboot is refused outright.
 
-use std::time::Instant;
-
 use serde_json::{json, Value};
 
+use crate::hyperpod_cluster_clock::{owe_nodes_running_at, FAR_FROM_DUE};
 use crate::hyperpod_cluster_node_replacement::{
-    describe, in_service_cluster, nodes_of, string_list, Node, POLL_INTERVAL, SETTLE_DEADLINE,
+    describe, in_service_cluster, node_once_running, nodes_of, string_list, Node,
 };
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
@@ -64,28 +63,6 @@ fn cluster_not_found(identifier: &str) -> String {
         return "ClusterNotExistsException: Specified cluster not found".to_string();
     }
     format!("Cluster with name {identifier} not found")
-}
-
-/// The node `logical_id` names, once it reports `Running` again.
-///
-/// Polled for the CONDITION — the status the clock owes the node back — not for a span of
-/// time.
-async fn node_once_running(emulator: &Emulator, cluster: &str, logical_id: &str) -> Node {
-    let deadline = Instant::now() + SETTLE_DEADLINE;
-    loop {
-        let found = nodes_of(emulator, cluster)
-            .await
-            .into_iter()
-            .find(|node| node.logical_id == logical_id);
-        match found {
-            Some(node) if node.status == "Running" => return node,
-            other => assert!(
-                Instant::now() < deadline,
-                "case {logical_id:?}: the rebooted node must report Running again, got {other:?}"
-            ),
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
 }
 
 /// RULE: `ClusterName` names the resource a batch node operation acts on, so a name or ARN
@@ -586,7 +563,8 @@ async fn a_node_already_mid_change_is_reported_rather_than_rebooted_again() {
     );
 
     // A node that is still coming up has not settled either, so it cannot be rebooted until
-    // it has: the add below leaves the node `Pending` for the span the clock owes it.
+    // it has. The add owes the node its `Running` from the instant it answers, so the node
+    // is held `Pending` by seeding the instant the clock owes it.
     let added = emulator
         .ok(
             "BatchAddClusterNodes",
@@ -603,6 +581,12 @@ async fn a_node_already_mid_change_is_reported_rather_than_rebooted_again() {
             .and_then(|entries| entries.first())
             .unwrap_or_else(|| panic!("expected an added node in {added}")),
         "NodeLogicalId",
+    );
+    owe_nodes_running_at(
+        &emulator.engine,
+        cluster,
+        std::slice::from_ref(&provisioning),
+        std::time::SystemTime::now() + FAR_FROM_DUE,
     );
     let refused = emulator
         .ok(

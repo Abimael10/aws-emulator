@@ -29,6 +29,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_sagemaker_sagemaker::state as sm;
 
+use crate::hyperpod_cluster_clock::{owe_in_service_at, owe_nodes_running_at, store, FAR_FROM_DUE};
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
 /// The region every request below signs for, so a minted ARN is comparable to a seeded
@@ -45,19 +46,12 @@ const TERMINAL_DEADLINE: Duration = Duration::from_secs(30);
 /// How long a poll loop waits before looking again.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// This service's one store, as every handler reaches it.
-fn store(
-    emulator: &Emulator,
-) -> engine::ServiceState<service_com_amazonaws_sagemaker_sagemaker::ComAmazonawsSagemakerSagemakerState>
-{
-    sm::service_state(&*emulator.engine).expect("the SageMaker store is on the shared engine")
-}
-
 /// Create a cluster through the implemented `CreateCluster`, with one instance group per
 /// `(instance group name, instance type)` row. Answers its `ClusterArn`.
 ///
-/// A created cluster is `Creating` until the clock settles it to `InService`, which is
-/// what the not-`InService` precondition rows below rely on.
+/// The create owes the cluster its `InService` from the instant it answers, so a row that
+/// needs a cluster still `Creating` seeds that instant through
+/// [`owe_in_service_at`].
 async fn create_cluster(emulator: &Emulator, name: &str, groups: &[(&str, &str)]) -> String {
     let instance_groups: Vec<Value> = groups
         .iter()
@@ -97,7 +91,8 @@ async fn add_running_node(emulator: &Emulator, cluster: &str, group: &str) -> St
         .and_then(|entries| entries.first())
         .map(|entry| str_field(entry, "NodeLogicalId"))
         .expect("the add answered the node it made");
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    // The add owes the node its `Running` from the instant it answers, so the read below
+    // — the next request — is the one that materialises it.
     let described = emulator
         .ok(
             "DescribeClusterNode",
@@ -160,7 +155,7 @@ async fn create_model_package_group(emulator: &Emulator, name: &str) -> String {
 fn seed_partner_app(emulator: &Emulator, app_id: &str, status: &str) -> String {
     let arn = sm::resource_arn(REGION, "partner-app", app_id);
     let now = SystemTime::now();
-    store(emulator).lock().partner_apps.insert(
+    store(&emulator.engine).lock().partner_apps.insert(
         app_id.to_string(),
         sm::PartnerApp {
             app_id: app_id.to_string(),
@@ -204,7 +199,7 @@ fn seed_recommendations_job(
             },
         )
         .collect();
-    store(emulator)
+    store(&emulator.engine)
         .lock()
         .inference_recommendations_jobs
         .insert(
@@ -427,7 +422,7 @@ async fn an_absent_reference_is_refused_with_the_error_the_model_gives_it() {
     }
 
     // A refused call stores nothing: every reader still reports the resource as absent.
-    let state = store(&emulator);
+    let state = store(&emulator.engine);
     let guard = state.lock();
     assert!(
         guard.model_cards.is_empty()
@@ -1115,7 +1110,7 @@ async fn concurrent_creates_against_an_absent_cluster_all_fail_validation() {
              got {status} {parsed}"
         );
     }
-    let state = store(&emulator);
+    let state = store(&emulator.engine);
     assert!(
         state.lock().cluster_policies.configs.is_empty(),
         "case concurrent create: no racer may create a policy against an absent cluster"
@@ -1214,7 +1209,7 @@ async fn batch_add_cluster_nodes_adds_what_it_can_and_reports_what_it_cannot() {
 
     // The accepted increments, and only those, raised the groups' instance counts.
     {
-        let state = store(&emulator);
+        let state = store(&emulator.engine);
         let guard = state.lock();
         let cluster = guard
             .cluster_by_name_or_arn("hyperpod-a")
@@ -1231,8 +1226,19 @@ async fn batch_add_cluster_nodes_adds_what_it_can_and_reports_what_it_cannot() {
         }
     }
 
-    // A node read straight after the add is pending with no instance id yet.
+    // A node read before its `Running` is due is pending with no instance id yet. The add
+    // owes that transition from the instant it answered, so the due instant is seeded.
     let logical_id = str_field(&successful[0], "NodeLogicalId");
+    let provisioning: Vec<String> = successful
+        .iter()
+        .map(|entry| str_field(entry, "NodeLogicalId"))
+        .collect();
+    owe_nodes_running_at(
+        &emulator.engine,
+        "hyperpod-a",
+        &provisioning,
+        SystemTime::now() + FAR_FROM_DUE,
+    );
     let described = emulator
         .ok(
             "DescribeClusterNode",
@@ -1249,7 +1255,7 @@ async fn batch_add_cluster_nodes_adds_what_it_can_and_reports_what_it_cannot() {
             .and_then(|status| status.get("Status"))
             .and_then(Value::as_str),
         Some(sm::NODE_STATUS_PENDING),
-        "a node read straight after the add is pending, got {described}"
+        "a node read before its Running transition is due is pending, got {described}"
     );
     assert!(
         details.get("InstanceId").is_none(),
@@ -1282,7 +1288,7 @@ async fn batch_add_cluster_nodes_adds_what_it_can_and_reports_what_it_cannot() {
         "case client token replay: expected the first call's nodes, got {replayed}"
     );
     {
-        let state = store(&emulator);
+        let state = store(&emulator.engine);
         let guard = state.lock();
         let cluster = guard
             .cluster_by_name_or_arn("hyperpod-a")
@@ -1296,7 +1302,7 @@ async fn batch_add_cluster_nodes_adds_what_it_can_and_reports_what_it_cannot() {
     }
 
     // Once the clock is past due the node is running and has its instance id.
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    owe_nodes_running_at(&emulator.engine, "hyperpod-a", &provisioning, SystemTime::now());
     let described = emulator
         .ok(
             "DescribeClusterNode",
@@ -1583,11 +1589,17 @@ async fn attaching_a_volume_answers_one_attachment_per_volume() {
         "case absent node: expected 400 ValidationException, got {status} {parsed}"
     );
 
-    // ... and a cluster the clock has not settled yet fails the documented `InService`
-    // precondition — judged before the node is resolved, so it refuses even a node id
-    // this cluster does not own.
+    // ... and a cluster whose provisioning the clock has not made due yet fails the
+    // documented `InService` precondition — judged before the node is resolved, so it
+    // refuses even a node id this cluster does not own. The create owes `InService` from
+    // the instant it answers, so the due instant is seeded (`hyperpod_cluster_clock`).
     let creating_arn =
         create_cluster(&emulator, "hyperpod-creating", &[("workers", "ml.m5.large")]).await;
+    owe_in_service_at(
+        &emulator.engine,
+        "hyperpod-creating",
+        SystemTime::now() + FAR_FROM_DUE,
+    );
     let (status, parsed) = emulator
         .call(
             "AttachClusterNodeVolume",
@@ -1602,6 +1614,16 @@ async fn attaching_a_volume_answers_one_attachment_per_volume() {
         (status, error_code(&parsed).as_str()),
         (400, "ValidationException"),
         "case cluster not in service: expected 400 ValidationException, got {status} {parsed}"
+    );
+    assert_eq!(
+        message(&parsed),
+        format!(
+            "Cluster {creating_arn} is {} and must be {} to attach a volume.",
+            sm::STATUS_CREATING,
+            sm::STATUS_IN_SERVICE
+        ),
+        "case cluster not in service: the refusal must name the status precondition, got \
+         {parsed}"
     );
 }
 
@@ -1653,7 +1675,7 @@ async fn a_partner_app_presigned_url_carries_a_recorded_grant() {
             "case {label}: each call mints its own grant, got the earlier {token:?}"
         );
         // The grant the URL names is one the app holds.
-        let state = store(&emulator);
+        let state = store(&emulator.engine);
         let guard = state.lock();
         let app = guard
             .partner_apps

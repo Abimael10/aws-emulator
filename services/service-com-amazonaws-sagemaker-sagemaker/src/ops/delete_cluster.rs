@@ -2,12 +2,14 @@
 
 //! @op DeleteCluster
 //! IMPLEMENTED: begins the deletion of the HyperPod cluster `ClusterName` names (by name
-//! or by ARN) in `crate::state` and answers its `ClusterArn`. The cluster reports
-//! `Deleting` from this call until the clock completes the teardown
-//! ([`crate::state::CLUSTER_RELEASED_AFTER`]), after which it is gone for every caller; a
-//! cluster the service is already moving is refused with the modelled
-//! `ConflictException`, and an identifier this account holds no cluster under with
-//! `ResourceNotFound`. This is the ONLY file to touch for this operation.
+//! or by ARN) in `crate::state` and answers its `ClusterArn`. This call leaves the cluster
+//! `Deleting` and the clock owes the teardown from the instant it answers
+//! ([`crate::state::transition_owed_at`]), after which it is gone for every caller — so a
+//! repeat of the call is answered `ResourceNotFound` rather than for the `Deleting` status
+//! it left. A cluster the service is still moving when the call arrives (one whose own
+//! transition is not due yet) is refused with the modelled `ConflictException`, and an
+//! identifier this account holds no cluster under with `ResourceNotFound`. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,8 +170,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         cluster.settle_status(now);
 
         // A cluster the service is already moving cannot take a second change at the same
-        // time: that is the conflict this operation models. A repeat of this call lands
-        // here too, because the first one left the cluster `Deleting`.
+        // time: that is the conflict this operation models, and it is judged on the status
+        // the record CARRIES. A repeat of this call does not land here: the teardown the
+        // first one started is owed from the instant it answered
+        // (`crate::state::transition_owed_at`), so the repeat finds no cluster at all and
+        // is answered `ResourceNotFound` above. What reaches this branch is a cluster the
+        // service is still moving when the call arrives — one whose `InService` or whose
+        // teardown is not due yet, or one in another non-settled `ClusterStatus`.
         if !cluster.accepts_deletion() {
             return Err(DeleteClusterErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
@@ -180,8 +187,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The record is kept until the clock completes the teardown, so the `Deleting`
-        // status a caller reads straight after this call is observable; past that instant
+        // The record is kept with the `Deleting` status this call leaves behind, and the
+        // clock owes the teardown from the instant this call answers; past that instant
         // every lookup answers as if the cluster were gone.
         cluster.begin_deletion(now);
         let arn = cluster.arn.clone();

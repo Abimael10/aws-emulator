@@ -20,17 +20,10 @@
 //! `hyperpod_slurm_node_convergence`, which reads its helpers from here.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use crate::inference_deployment_lifecycle::{str_field, Emulator, ACCOUNT};
-
-/// Longer than `state::CLUSTER_IN_SERVICE_AFTER` and
-/// `state::TRANSIENT_STATE_SETTLES_AFTER` (300 ms each), so the clock owes a created
-/// cluster its instances, and an added node its `Pending` -> `Running` transition, by the
-/// time the next call runs.
-pub(crate) const PAST_SETTLE_DUE: Duration = Duration::from_millis(600);
 
 /// One instance group of a Slurm-orchestrated HyperPod cluster. `InstanceCount`,
 /// `InstanceGroupName` and `ExecutionRole` are the group's required members (smithy_query
@@ -175,9 +168,7 @@ async fn every_listed_node_carries_its_logical_id() {
         // Two nodes come up with the cluster's own groups and one more is added
         // afterwards, so each case covers both origins a node can have.
         let arn = create_slurm_cluster(&emulator, "identity-cluster", 1).await;
-        tokio::time::sleep(PAST_SETTLE_DUE).await;
         let added = add_nodes(&emulator, "identity-cluster", "compute", 1).await;
-        tokio::time::sleep(PAST_SETTLE_DUE).await;
 
         let identifier = if row.by_arn {
             arn.clone()

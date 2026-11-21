@@ -13,25 +13,25 @@
 //!   region and name shape, and every minted id is distinct;
 //! * `DescribeCluster` replays what `CreateCluster` stored, for every optional member of
 //!   the request, reached by name or by ARN;
-//! * a cluster and its instance groups are `Creating` with nothing realised until the
-//!   clock owes `InService`, after which the realised (`Current*`) half of each details
-//!   shape equals the declared (`Desired*`) half;
+//! * a cluster and its instance groups report nothing realised while its provisioning is
+//!   not yet due, and the realised (`Current*`) half of each details shape equals the
+//!   declared (`Desired*`) half from the first read after the create, which is when the
+//!   clock owes `InService`;
 //! * a name already in use is refused with `ResourceInUse`, an unknown identifier with
 //!   `ResourceNotFound`, and the rule the model cannot express — `Orchestrator` naming
 //!   exactly one configuration — with `ValidationException`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::SystemTime;
 
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::hyperpod_cluster_clock::{owe_in_service_at, FAR_FROM_DUE};
+
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
-
-/// Long enough to pass `state::CLUSTER_IN_SERVICE_AFTER` (300 ms).
-const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
 
 /// An IAM role ARN matching `RoleArn`'s modelled pattern
 /// (`^arn:aws[a-z\-]*:iam::\d{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`).
@@ -43,6 +43,9 @@ const EKS_CLUSTER_ARN: &str = "arn:aws:eks:us-east-1:000000000000:cluster/orches
 /// One emulator: the shared engine plus the SageMaker service mounted on the router.
 struct Emulator {
     router: MultiServiceRouter,
+    /// The ONE shared engine the service is mounted on, so a case that needs a cluster in
+    /// a state no call leaves behind can seed it where the handlers read it.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -53,9 +56,9 @@ impl Emulator {
         // credential scope only so the ARN region is the one the caller signed for.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_sagemaker_sagemaker::EmulatedService::new(engine),
+            service_com_amazonaws_sagemaker_sagemaker::EmulatedService::new(Arc::clone(&engine)),
         );
-        Self { router }
+        Self { router, engine }
     }
 
     /// Call `target` with a SigV4 credential scope naming `region`.
@@ -134,6 +137,17 @@ impl Emulator {
     async fn describe_cluster(&self, name_or_arn: &str) -> Value {
         self.ok("DescribeCluster", &json!({ "ClusterName": name_or_arn }))
             .await
+    }
+
+    /// Move the instant the clock owes `name`'s `Creating` -> `InService` transition to
+    /// `due_at`, through the seam `hyperpod_cluster_clock` declares for it.
+    ///
+    /// `CreateCluster` owes that transition from the instant it answers, so every read
+    /// after it reports a provisioned cluster; a case about the cluster BEFORE its
+    /// provisioning is due therefore seeds the due instant rather than racing the clock
+    /// for it, and a case about the transition itself brings the instant back.
+    fn owe_in_service_at(&self, name: &str, due_at: SystemTime) {
+        owe_in_service_at(&self.engine, name, due_at);
     }
 }
 
@@ -357,7 +371,10 @@ async fn a_cluster_reports_the_node_provisioning_mode_it_runs_in() {
         );
 
         // Reported while the cluster is still provisioning and once it is `InService`:
-        // the mode is a property of the cluster, not of its status.
+        // the mode is a property of the cluster, not of its status. The provisioning
+        // stage is seeded, because the create owes `InService` from the instant it
+        // answers (`state::transition_owed_at`).
+        emulator.owe_in_service_at(&name, SystemTime::now() + FAR_FROM_DUE);
         for stage in ["while provisioning", "once in service"] {
             let (status, described) = emulator
                 .call_in(region, "DescribeCluster", &json!({ "ClusterName": &name }))
@@ -371,8 +388,17 @@ async fn a_cluster_reports_the_node_provisioning_mode_it_runs_in() {
                 Some(named_mode.unwrap_or(default_mode)),
                 "case {case:?} {stage}: NodeProvisioningMode, got {described:?}"
             );
+            assert_eq!(
+                described.get("ClusterStatus").and_then(Value::as_str),
+                Some(if stage == "while provisioning" {
+                    "Creating"
+                } else {
+                    "InService"
+                }),
+                "case {case:?} {stage}: ClusterStatus, got {described:?}"
+            );
             if stage == "while provisioning" {
-                tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
+                emulator.owe_in_service_at(&name, SystemTime::now());
             }
         }
     }
@@ -650,9 +676,9 @@ async fn describe_cluster_replays_what_create_cluster_stored() {
             .create_cluster(&named(&name, &case.request))
             .await;
 
-        // The round trip is asserted once the clock owes `InService`, so the realised
-        // half of every details shape is populated; the transient state has its own test.
-        tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
+        // The round trip is asserted on the first read after the create, which is when
+        // the clock owes `InService`, so the realised half of every details shape is
+        // populated; the state before that transition is due has its own test.
 
         // `ClusterName` is a `ClusterNameOrArn`: both forms must find the one record.
         let by_name = emulator.describe_cluster(&name).await;
@@ -700,6 +726,12 @@ async fn describe_cluster_replays_what_create_cluster_stored() {
     }
 }
 
+/// RULE: a cluster whose `InService` is not yet due reports `Creating` with nothing
+/// realised, and reading it does not move it on; the transition — and with it the
+/// instances its groups declare — is materialised by the first read taken at or after the
+/// instant the clock owes it, which for `CreateCluster` is the instant that call answers
+/// (`state::transition_owed_at`), so the FIRST read after a create reports a provisioned
+/// cluster.
 #[tokio::test]
 async fn a_cluster_is_creating_with_nothing_realised_until_the_clock_owes_in_service() {
     // The counts span the modelled range's lower bound (`ClusterInstanceCount`,
@@ -718,9 +750,22 @@ async fn a_cluster_is_creating_with_nothing_realised_until_the_clock_owes_in_ser
             }),
         );
         emulator.create_cluster(&body).await;
+        // The create owes the transition from the instant it answers, so the state before
+        // it is due is reached by seeding the due instant rather than by racing a span.
+        emulator.owe_in_service_at(&name, SystemTime::now() + FAR_FROM_DUE);
 
-        // Straight after the create: provisioning, so nothing is realised yet.
-        let creating = emulator.describe_cluster(&name).await;
+        // Before the transition is due: provisioning, so nothing is realised yet. Read
+        // repeatedly — an observer must not be what moves the cluster on.
+        let mut creating = emulator.describe_cluster(&name).await;
+        for read in 0..3 {
+            let again = emulator.describe_cluster(&name).await;
+            assert_eq!(
+                again, creating,
+                "case count {count} read {read}: reading a cluster whose InService is not \
+                 due must not move it, got {again} after {creating}"
+            );
+            creating = again;
+        }
         for (path, expected) in [
             ("ClusterStatus", json!("Creating")),
             ("InstanceGroups.0.Status", json!("Creating")),
@@ -749,8 +794,9 @@ async fn a_cluster_is_creating_with_nothing_realised_until_the_clock_owes_in_ser
             );
         }
 
-        // The transition the clock owed, materialised by the next read.
-        tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
+        // The transition the clock owes once its instant has passed, materialised by the
+        // next read — which after a create is the read that follows it.
+        emulator.owe_in_service_at(&name, SystemTime::now());
         let in_service = emulator.describe_cluster(&name).await;
         for (path, expected) in [
             ("ClusterStatus", json!("InService")),

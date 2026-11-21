@@ -840,17 +840,21 @@ pub const STATUS_UPDATING: &str = "Updating";
 /// deletion and the instant the deletion completes. See [`Cluster::begin_deletion`].
 pub const STATUS_DELETING: &str = "Deleting";
 
-/// How long after the call that starts it the clock owes a transient -> ready
-/// transition for the resources in this slice: a scheduler resource's `Creating` ->
-/// `Created`, a cluster node's `Pending` -> `Running`, a volume attachment's
-/// `attaching` -> `attached`, and an export job's `InProgress` -> terminal.
+/// How long after the call that starts it the clock owes a node OPERATION's transient
+/// state to settle: a node's return from a reboot, and the fresh hardware a replacement
+/// owes it, plus a volume attachment's `attaching` -> `attached`.
 ///
-/// Real SageMaker takes minutes; the span is compressed and never zero, so a caller
-/// acting straight after the call still observes the transient state. The due instant is
-/// stored and never slept on.
+/// Real SageMaker takes minutes; the span is compressed and never zero, and the due
+/// instant is stored and never slept on. It is kept for these because the transient state
+/// is one a LATER request has to be able to observe: `ClusterInstanceStatus` declares
+/// `ShuttingDown` for the instance a replacement is terminating, and the per-node
+/// [`NODE_OPERATION_IN_FLIGHT_MESSAGE`] codes refuse a second operation on a node one is
+/// already in progress on — neither of which exists if the operation is over by the next
+/// request. The cluster LIFECYCLE transitions a client polls to drive instead carry no
+/// span of the emulator's own ([`transition_owed_at`]).
 ///
 /// The span itself is stated ONCE for this service, by [`ENDPOINT_IN_SERVICE_AFTER`];
-/// this is that one value under the name the resources above are settled by, so the two
+/// this is that one value under the name the states above are settled by, so the two
 /// cannot drift apart.
 pub const TRANSIENT_STATE_SETTLES_AFTER: Duration = ENDPOINT_IN_SERVICE_AFTER;
 
@@ -2177,8 +2181,9 @@ impl Cluster {
 /// One node of a cluster, as `DescribeClusterNode` replays it.
 ///
 /// `running_at` is the instant the clock owes the `Pending` -> `Running` transition,
-/// which is also when the node gets its EC2 instance id: a caller that describes a node
-/// straight after adding it still observes `Pending` with no instance id.
+/// which is also when the node gets its EC2 instance id: it is owed from the instant the
+/// call that added the node answers ([`transition_owed_at`]), which reports the node
+/// `Pending` with no instance id, and is materialised by the first request after it.
 #[derive(Debug, Clone)]
 pub struct ClusterNode {
     pub logical_id: String,
@@ -2344,7 +2349,9 @@ pub struct VolumeAttachment {
     pub device_name: String,
     pub status: String,
     pub attach_time: SystemTime,
-    /// The instant the clock owes the `attaching` -> `attached` transition.
+    /// The instant the clock owes the `attaching` -> `attached` transition,
+    /// [`TRANSIENT_STATE_SETTLES_AFTER`] past the call that asked for the attachment,
+    /// whose own answer reports the `attaching` it starts with.
     pub attached_at: SystemTime,
 }
 

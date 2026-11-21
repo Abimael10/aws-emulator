@@ -327,8 +327,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 id,
                 arn: arn.clone(),
                 // A freshly created cluster is provisioning: the clock owes it the move
-                // to `InService` at `in_service_at`, which the reporting operations
-                // materialise.
+                // to `InService` from the instant this call answers, which the reporting
+                // operations materialise (`state::transition_owed_at`).
                 status: crate::state::STATUS_CREATING.to_string(),
                 instance_groups: input.instance_groups.unwrap_or_default(),
                 restricted_instance_groups: input.restricted_instance_groups.unwrap_or_default(),
@@ -347,7 +347,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 auto_scaling: input.auto_scaling,
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
-                in_service_at: now + crate::state::CLUSTER_IN_SERVICE_AFTER,
+                in_service_at: crate::state::transition_owed_at(now),
                 // No deletion has been asked for, so the clock owes this cluster none.
                 removal_due_at: None,
                 // A cluster is created with no nodes: provisioning the instances a group

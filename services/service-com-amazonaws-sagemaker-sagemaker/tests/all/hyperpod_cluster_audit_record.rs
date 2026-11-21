@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sagemaker_sagemaker::state::{
@@ -25,17 +25,8 @@ use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 
+use crate::hyperpod_cluster_clock::FAR_FROM_DUE;
 use crate::inference_deployment_lifecycle::{error_code, str_field, Emulator, ACCOUNT};
-
-/// Longer than `state::CLUSTER_IN_SERVICE_AFTER` (300 ms), so the clock owes the
-/// `Creating` -> `InService` transition by the time the next call runs.
-const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
-
-/// How far in the future the seeded cluster's transition is owed, so NO host — however
-/// loaded — can make it due during a case. The negative row needs a cluster the clock
-/// cannot have moved; `CreateCluster` can only ever owe it 300 ms, so that cluster is
-/// seeded straight into the shared store instead of raced.
-const FAR_FROM_DUE: Duration = Duration::from_secs(3_600);
 
 /// The access key id the harness's `authorization` header presents
 /// (`Credential=AKIDEXAMPLE/...`), which is what the record must attribute the call to.
@@ -215,13 +206,14 @@ fn cluster_body(name: &str) -> Value {
 /// The region the harness signs for, and so the region every minted ARN names.
 const REGION: &str = "us-east-1";
 
-/// Seed one cluster whose `Creating` -> `InService` transition is owed [`FAR_FROM_DUE`]
-/// out, straight into the shared store the handler reads — the seam
+/// Seed one cluster whose `Creating` -> `InService` transition is owed
+/// [`FAR_FROM_DUE`] out — the one value `hyperpod_cluster_clock` declares for "not due
+/// during this case" — straight into the shared store the handler reads, the seam
 /// `hub_contents_listing` uses for the same reason. Answers its `ClusterArn`.
 ///
-/// `CreateCluster` can only ever owe the transition 300 ms, which makes "not due yet" a
-/// race on a loaded host; a seeded due instant makes it a fact, so the negative assertion
-/// below always runs.
+/// `CreateCluster` owes that transition from the instant it answers, so "not due yet" is
+/// not something a call leaves behind for a later request; a seeded due instant makes it a
+/// fact, so the negative assertion below always runs.
 ///
 /// `pub(crate)` because `hyperpod_cluster_deletion` needs the same fact — a cluster the
 /// clock cannot have moved out of `Creating` — to assert what `DeleteCluster` answers for
@@ -385,8 +377,9 @@ async fn the_clock_owed_transition_is_audited_once_per_cluster() {
         let created = emulator.ok("CreateCluster", &cluster_body(name)).await;
         arns.push(str_field(&created, "ClusterArn"));
     }
-    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
 
+    // The creates owe the transition from the instant each answered, so the listing below
+    // is the call that materialises both.
     let listed = emulator.ok("ListClusters", &json!({})).await;
     for arn in &arns {
         let settled = listed

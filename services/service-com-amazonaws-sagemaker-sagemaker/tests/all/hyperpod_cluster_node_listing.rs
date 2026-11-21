@@ -30,15 +30,12 @@
 //!   `ResourceNotFound`, whether it was named by name or by ARN.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 
+use crate::hyperpod_cluster_clock::{owe_nodes_running_at, FAR_FROM_DUE};
 use crate::inference_deployment_lifecycle::{error_code, str_field, Emulator, ACCOUNT};
-
-/// Longer than `state::TRANSIENT_STATE_SETTLES_AFTER` (300 ms), so the clock owes every
-/// added node its `Pending` -> `Running` transition by the time the next call runs.
-const PAST_SETTLE_DUE: Duration = Duration::from_millis(600);
 
 /// Spacing between batches, so `LaunchTime` ordering is unambiguous and a filter bound
 /// can be placed strictly between two batches.
@@ -244,7 +241,6 @@ async fn the_instances_a_group_was_created_asking_for_are_the_nodes_it_holds() {
         for (group, count) in &adds {
             add_nodes(&emulator, case, group, *count).await;
         }
-        tokio::time::sleep(PAST_SETTLE_DUE).await;
 
         let listed = all_nodes(&emulator, &with_logical_ids(&json!({ "ClusterName": case }))).await;
         let described = emulator
@@ -355,7 +351,6 @@ async fn every_node_of_a_cluster_is_listed_once_with_the_identity_its_reader_rep
                 expected.push((logical_id, (*group).to_string()));
             }
         }
-        tokio::time::sleep(PAST_SETTLE_DUE).await;
 
         let listed = all_nodes(&emulator, &with_logical_ids(&json!({ "ClusterName": case }))).await;
         assert_eq!(
@@ -447,6 +442,9 @@ async fn include_node_logical_ids_decides_which_nodes_are_reported() {
         let name = format!("provisioning-{node_count}");
         create_cluster(&emulator, &name, &[("pool", "ml.c5.large")]).await;
         let added = add_nodes(&emulator, &name, "pool", node_count).await;
+        // The add owes each node its `Running` from the instant it answers, so a listing
+        // of nodes that have not finished coming up is reached by seeding that instant.
+        owe_nodes_running_at(&emulator.engine, &name, &added, SystemTime::now() + FAR_FROM_DUE);
 
         // Straight after the add every node is still `Pending` with no `InstanceId`, so
         // the default listing reports none of them and the opt-in listing reports all.
@@ -498,7 +496,7 @@ async fn include_node_logical_ids_decides_which_nodes_are_reported() {
 
         // Once the clock owes the transition, both listings report every node, each
         // summary carrying the node's `NodeLogicalId`.
-        tokio::time::sleep(PAST_SETTLE_DUE).await;
+        owe_nodes_running_at(&emulator.engine, &name, &added, SystemTime::now());
         for (flag, body) in [
             ("absent", json!({ "ClusterName": name })),
             (
@@ -550,7 +548,6 @@ async fn seed_nodes(emulator: &Emulator, cluster: &str) -> Vec<(String, Vec<Stri
         ));
         tokio::time::sleep(BATCH_SPACING).await;
     }
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
 
     // The launch times the service recorded, read back from the listing.
     let listed = all_nodes(emulator, &with_logical_ids(&json!({ "ClusterName": cluster }))).await;

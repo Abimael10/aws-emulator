@@ -3,7 +3,8 @@
 //! The HyperPod cluster slice of this service's state.
 //!
 //! One file for the whole slice: the [`Cluster`] record `CreateCluster` writes with its
-//! quota, its clock-owed span and its id minting, and what a reader needs on top of it:
+//! quota, the instant its clock-owed transitions are due from ([`transition_owed_at`])
+//! and its id minting, and what a reader needs on top of it:
 //!
 //! * `ComAmazonawsSagemakerSagemakerState::cluster_key`, the one lookup that resolves
 //!   the `ClusterNameOrArn` every cluster operation takes to the store key, so no
@@ -269,20 +270,51 @@ impl Cluster {
     }
 }
 
-/// How long after `CreateCluster` the clock owes the `Creating` -> `InService`
-/// transition of a HyperPod cluster. Same compressed, never-zero span as
-/// [`ENDPOINT_IN_SERVICE_AFTER`]: a caller that lists clusters straight after creating
-/// one still observes `Creating`, one that waits observes `InService`. Real HyperPod
-/// provisioning takes many minutes; the span is the emulator's own choice.
-pub const CLUSTER_IN_SERVICE_AFTER: Duration = Duration::from_millis(300);
-
-/// How long after `DeleteCluster` the clock owes the `Deleting` -> gone transition of a
-/// HyperPod cluster. The same compressed, never-zero span as
-/// [`CLUSTER_IN_SERVICE_AFTER`]: a caller that describes the cluster straight after
-/// asking for its deletion still observes `Deleting`, one that waits observes the
-/// cluster gone. Real HyperPod teardown takes many minutes; the span is the emulator's
-/// own choice.
-pub const CLUSTER_RELEASED_AFTER: Duration = CLUSTER_IN_SERVICE_AFTER;
+/// The instant a HyperPod cluster LIFECYCLE transition is owed from: the instant the
+/// call that starts it answers.
+///
+/// The lifecycle a client drives a cluster through is three transitions, and each is
+/// DECIDED by the call that starts it: `CreateCluster` admits the cluster, so its
+/// `Creating` -> `InService` (with the instances its groups declare) is settled;
+/// `BatchAddClusterNodes` admits the nodes, so each added node's `Pending` -> `Running`
+/// (with the instance id that comes with it) is settled; `DeleteCluster` admits the
+/// teardown, so the cluster's removal is settled. Nothing is left to compute afterwards,
+/// so the emulator interposes no span of its own between deciding the outcome and letting
+/// a reader observe it: the transition is owed from the instant that call answers, and
+/// the FIRST request after it reports the settled resource. A client driving the cluster
+/// with the documented poll-until-settled loop therefore observes each transition on its
+/// next probe instead of paying one whole polling interval — an interval it sizes against
+/// the many minutes real HyperPod provisioning takes — so a workflow that chains several
+/// of these waits converges as fast as the emulator can answer instead of outliving its
+/// own deadline.
+///
+/// The transient state stays the answer of the call that starts it: `CreateCluster`
+/// stores `Creating`, `BatchAddClusterNodes` reports every node it added `Pending`, and
+/// `DeleteCluster` leaves the cluster `Deleting`. The move out of it is materialised by
+/// the settle pass of the next request ([`Cluster::settle_status`],
+/// [`crate::state::ClusterNode::settle_status`]), which writes only what a stored instant
+/// already in the past had made due — so nothing sleeps, no reader decides anything, and
+/// a transition owed during one request is never materialised by that same request,
+/// because every handler settles what it touches BEFORE it owes anything of its own.
+///
+/// What that costs, stated plainly: since the owed instant is this instant and not a later
+/// one, a cluster's `Creating` and `Deleting` and an added node's `Pending` are reported
+/// only by the call that stores them, so no SEQUENCE of requests observes them — a reader
+/// always answers the settled resource. That is the only way to spend none of a client's
+/// polling interval: a transition still owed when the next probe arrives costs that probe
+/// its whole interval however small the remaining span is, and bringing one forward
+/// BECAUSE something read it would make a reporting call decide a status, which is the one
+/// thing it may never do. This function is therefore deliberately the IDENTITY and hides
+/// no arithmetic; it exists so the three call sites name this rule rather than restate it,
+/// and so changing when a cluster lifecycle transition falls due is one edit. A test that
+/// needs one of those statuses sets the stored instant itself.
+///
+/// A node OPERATION — a reboot, a replacement, a volume attachment — is not one of these
+/// and keeps its span ([`crate::state::TRANSIENT_STATE_SETTLES_AFTER`]), which says why.
+#[inline]
+pub fn transition_owed_at(now: SystemTime) -> SystemTime {
+    now
+}
 
 /// `ClusterStatus`'s terminal failure member. Nothing in this emulator fails a cluster,
 /// so no record carries it — it is named because a delete is admitted for a cluster in
@@ -369,7 +401,9 @@ pub const CLUSTER_DEFAULT_SORT_ORDER: &str = ORDER_ASCENDING;
 ///
 /// `in_service_at` is the instant the clock owes the `Creating` -> `InService`
 /// transition; it is stored, never slept on, and materialised by whichever reporting
-/// call first runs at or after it.
+/// call first runs at or after it — which is the request that follows the create, since
+/// the transition is owed from the instant the create answers
+/// ([`transition_owed_at`]).
 #[derive(Debug, Clone)]
 pub struct Cluster {
     pub name: String,
@@ -422,14 +456,15 @@ impl Cluster {
     }
 
     /// Start the deletion `DeleteCluster` asked for: the cluster reports `Deleting`, and
-    /// the clock owes its release [`CLUSTER_RELEASED_AFTER`] later.
+    /// the clock owes its release from the instant that call answers
+    /// ([`transition_owed_at`]).
     ///
     /// The record is NOT dropped here: SageMaker answers a cluster in `ClusterStatus`'s
-    /// `Deleting` until the teardown finishes, so the transient status is observable and
-    /// the removal is the clock's — stored as an instant and never slept on.
+    /// `Deleting` until the teardown finishes, so that status is what this call leaves
+    /// behind, and the removal is the clock's — stored as an instant and never slept on.
     pub fn begin_deletion(&mut self, now: SystemTime) {
         self.status = STATUS_DELETING.to_string();
-        self.removal_due_at = Some(now + CLUSTER_RELEASED_AFTER);
+        self.removal_due_at = Some(transition_owed_at(now));
     }
 
     /// Whether a `DeleteCluster` has asked for this cluster's deletion, i.e. it is
@@ -483,8 +518,8 @@ impl Cluster {
     /// that [`Cluster::instance_group_details`] reports as realised in `CurrentCount`, so
     /// the cluster's counts and its node list cannot disagree. They come up WITH the
     /// cluster, which is why this runs at the instant it reaches `InService` and never
-    /// before: a caller listing nodes straight after the create sees none, and one that
-    /// waits sees the instances the groups asked for.
+    /// before: the create itself stores no node, and the first request after it reports
+    /// the instances the groups asked for.
     ///
     /// A group is short by however many nodes it does not already hold, so the nodes a
     /// call added to it (which raised its count by the same amount) are not minted twice.

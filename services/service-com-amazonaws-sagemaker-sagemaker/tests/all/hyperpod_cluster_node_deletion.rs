@@ -26,8 +26,9 @@
 
 use serde_json::{json, Value};
 
+use crate::hyperpod_cluster_clock::{owe_nodes_running_at, owe_removal_at, FAR_FROM_DUE};
 use crate::hyperpod_cluster_node_replacement::{
-    in_service_cluster, nodes_of, string_list, Node, IN_USE, PAST_SETTLE_DUE,
+    in_service_cluster, nodes_of, nodes_once_all_running, string_list, Node, IN_USE,
 };
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 
@@ -375,7 +376,7 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
         "case mid-change: a node reported in a failure list is still held, got {after:?}"
     );
     // Once the change it was in finishes, the same node deletes.
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    nodes_once_all_running(&emulator, cluster).await;
     let answered = emulator
         .ok(
             "BatchDeleteClusterNodes",
@@ -403,7 +404,8 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
     );
 
     // A node that is still COMING UP has not settled either, so it cannot be deleted until
-    // it has: the add below leaves the node `Pending` for the span the clock owes it.
+    // it has. The add owes the node its `Running` from the instant it answers, so the node
+    // is held `Pending` by seeding the instant the clock owes it.
     let added = emulator
         .ok(
             "BatchAddClusterNodes",
@@ -420,6 +422,12 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
             .and_then(|entries| entries.first())
             .unwrap_or_else(|| panic!("expected an added node in {added}")),
         "NodeLogicalId",
+    );
+    owe_nodes_running_at(
+        &emulator.engine,
+        cluster,
+        std::slice::from_ref(&provisioning),
+        std::time::SystemTime::now() + FAR_FROM_DUE,
     );
     let refused = emulator
         .call(
@@ -444,7 +452,12 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
     // And once it has come up, the same identifier deletes — while a node added beside it
     // and still coming up is reported as a per-node failure, because this batch has an
     // identifier it CAN delete.
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    owe_nodes_running_at(
+        &emulator.engine,
+        cluster,
+        std::slice::from_ref(&provisioning),
+        std::time::SystemTime::now(),
+    );
     let added_again = emulator
         .ok(
             "BatchAddClusterNodes",
@@ -461,6 +474,12 @@ async fn an_identifier_that_names_no_deletable_node_is_reported_in_the_failure_l
             .and_then(|entries| entries.first())
             .unwrap_or_else(|| panic!("expected an added node in {added_again}")),
         "NodeLogicalId",
+    );
+    owe_nodes_running_at(
+        &emulator.engine,
+        cluster,
+        std::slice::from_ref(&still_coming_up),
+        std::time::SystemTime::now() + FAR_FROM_DUE,
     );
     let answered = emulator
         .ok(
@@ -611,7 +630,7 @@ async fn a_slurm_controller_node_cannot_be_deleted() {
         !str_field(&created, "ClusterArn").is_empty(),
         "CreateCluster must mint an ARN, got {created:?}"
     );
-    tokio::time::sleep(PAST_SETTLE_DUE).await;
+    nodes_once_all_running(&emulator, cluster).await;
     let nodes = nodes_of(&emulator, cluster).await;
     let controller = nodes
         .iter()
@@ -764,8 +783,10 @@ async fn a_cluster_being_deleted_takes_no_node_change() {
         arn,
         "DeleteCluster must answer the cluster's ARN, got {deleted:?}"
     );
-    // The cluster is observably `Deleting` until the clock completes the teardown, so the
-    // rows below run against a cluster every reader still reports.
+    // The teardown is owed from the instant the delete answered, so a cluster a later
+    // request still finds `Deleting` is one whose removal is not due yet: the rows below
+    // run against exactly that cluster, seeded by moving the instant the clock owes.
+    owe_removal_at(&emulator.engine, cluster, std::time::SystemTime::now() + FAR_FROM_DUE);
     let described = emulator
         .ok("DescribeCluster", &json!({ "ClusterName": cluster }))
         .await;
