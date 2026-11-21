@@ -20,6 +20,13 @@ use std::sync::Arc;
 #[path = "state_roundtrip/firewall_domain_lists.rs"]
 mod firewall_domain_lists;
 
+// The idempotency-record half of the same contract: what a create this service
+// REFUSED leaves behind under its `clientToken` (nothing), and what a create it
+// served does. Another child module of this suite, declared here for the same
+// reason as the one above.
+#[path = "state_roundtrip/idempotency_tokens.rs"]
+mod idempotency_tokens;
+
 /// A probe type owned by this test. `state::<T>()` is keyed by TYPE, so a test can use
 /// its own without touching `ComAmazonawsRoute53globalresolverEc2dnsglobalresolvercustomerapiState`.
 #[derive(Default)]
