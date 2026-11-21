@@ -109,6 +109,9 @@ use crate::state::{
     DestinationConfigKind, StoredRecord,
 };
 
+/// What one accepted record is split into before anything else reads it: the sub-records
+/// the destination's `RecordDeAggregation` processor declares.
+pub mod de_aggregation;
 /// Where a delivery the destination did not take is reported.
 pub mod destination_logging;
 /// Converting a buffer's records to the format a `DataFormatConversionConfiguration` asks
@@ -736,6 +739,11 @@ pub struct S3Target {
     /// The jq program of the destination's `MetadataExtraction` processor, when dynamic
     /// partitioning is enabled for this location and such a processor is configured.
     pub metadata_extraction_query: Option<String>,
+    /// What one accepted record is split into on the way here: the sub-records the
+    /// destination's `RecordDeAggregation` processor declares
+    /// ([`de_aggregation::DeAggregation`]), and `None` for a location that delivers every
+    /// record as the producer sent it.
+    pub de_aggregation: Option<de_aggregation::DeAggregation>,
     /// Whether the records of one object are separated by [`RECORD_DELIMITER`], which the
     /// `AppendDelimiterToRecord` processor asks for.
     pub append_delimiter: bool,
@@ -944,6 +952,10 @@ fn plain_target(config: &S3DestinationConfiguration) -> Option<S3Target> {
         compression_format: config.compression_format.clone(),
         file_extension: None,
         metadata_extraction_query: None,
+        // A plain `S3DestinationConfiguration` carries no `DynamicPartitioningConfiguration`
+        // either, and de-aggregation belongs to that mechanism: a location read through here
+        // delivers each record whole.
+        de_aggregation: None,
         append_delimiter: false,
         cloudwatch_logs: CloudWatchLogsPipeline::default(),
         kms_key_arn: kms_key_arn(config.encryption_configuration.as_ref()),
@@ -1075,6 +1087,10 @@ pub fn s3_targets(config: &DestinationConfigKind) -> Vec<S3Target> {
                     compression_format: config.compression_format.clone(),
                     file_extension: config.file_extension.clone(),
                     metadata_extraction_query: metadata_extraction_query(
+                        dynamic_partitioning_enabled,
+                        config.processing_configuration.as_ref(),
+                    ),
+                    de_aggregation: de_aggregation::DeAggregation::of(
                         dynamic_partitioning_enabled,
                         config.processing_configuration.as_ref(),
                     ),
@@ -2776,13 +2792,19 @@ async fn objects_of<Eng: Send + Sync + 'static>(
     let mut inflation_budget =
         crate::state::cloudwatch_logs_pipeline::MAX_INFLATED_BYTES_PER_DELIVERY;
     for target in &delivery.targets {
+        // The records this location delivers are the sub-records its own data processing
+        // splits each accepted record into: de-aggregation runs BEFORE the partition keys
+        // are derived, so each sub-record is partitioned, prefixed and delivered on its own
+        // ([`de_aggregation`]). Declared first, because the groups below borrow from it.
+        let records =
+            de_aggregation::sub_records(&delivery.records, target.de_aggregation.as_ref()).await;
         // The prefix each object of this location is written under, with the records that
         // go in it. A group whose own prefix cannot be resolved — the prefix names a
         // partition key the query derived no value for — joins the failed records, which
         // is what the error output prefix is for: it is never dropped.
         let mut writing: Vec<(String, Vec<&StoredRecord>)> = Vec::new();
         let mut failed: BTreeMap<DeliveryFailure, Vec<&StoredRecord>> = BTreeMap::new();
-        for group in grouped(target, &delivery.records).await? {
+        for group in grouped(target, records.as_ref()).await? {
             match group.keys {
                 GroupKeys::Derived(keys) => {
                     match expand_prefix(&target.prefix, &keys, None, now, target.time_zone) {

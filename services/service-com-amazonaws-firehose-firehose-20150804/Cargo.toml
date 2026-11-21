@@ -109,6 +109,10 @@ jaq-core = "2"
 # `serde_json`: the record a `MetadataExtraction` query reads is JSON, so the jq value is
 # converted to and from the JSON value the rest of this crate parses it as.
 jaq-json = { version = "1", features = ["serde_json"] }
+# `memchr::memmem`: the search that finds the `Delimiter` of a `RecordDeAggregation` processor
+# in a record's bytes. Linear in the record, so the scan of one flush costs the bytes the
+# producer put rather than those bytes times the length of the delimiter a caller configured.
+memchr = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

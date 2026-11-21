@@ -683,7 +683,11 @@ fn keys_of(document: &str) -> Vec<String> {
 
 /// A .zip deployment package holding `source` as `lambda_function.py`, written in memory the
 /// way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
+///
+/// `pub(crate)` so a sibling suite that also needs a function to transform with — the
+/// de-aggregation suite, whose sub-records are handed to one — packages it the same way
+/// instead of copying this.
+pub(crate) fn package(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);

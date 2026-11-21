@@ -30,6 +30,14 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::delivery_stream_lifecycle::{PAST_THE_TRANSITION, REGION, ROLE_ARN};
 
+/// What a destination declaring a `RecordDeAggregation` processor delivers: the sub-records
+/// one accepted record packs, each partitioned on its own. The `#[path]` is what keeps it a
+/// child of THIS suite rather than a second suite beside it: this crate's `tests/all.rs`
+/// declares the suites directly under `tests/all/`, and a module of a `#[path]`-declared file
+/// resolves next to that file unless it says otherwise.
+#[path = "destination_delivery/record_de_aggregation.rs"]
+mod record_de_aggregation;
+
 /// The endpoint every request here reaches the emulator on.
 const HOST: &str = "127.0.0.1:9297";
 
@@ -104,6 +112,14 @@ impl Emulator {
         // drives such a destination needs the Glue service mounted here as well.
         router.register_service(
             service_com_amazonaws_glue_awsglue::EmulatedService::new(Arc::clone(&engine)),
+        );
+        // A destination whose `ProcessingConfiguration` names a `Lambda` processor hands each
+        // record to that function, so the suite that drives a transformation over the records
+        // a de-aggregation split needs Lambda mounted on the same engine.
+        router.register_service(
+            service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
         Self { router, engine }
     }

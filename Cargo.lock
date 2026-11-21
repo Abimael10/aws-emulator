@@ -14350,6 +14350,7 @@ dependencies = [
  "http",
  "jaq-core",
  "jaq-json",
+ "memchr",
  "parquet",
  "quick-xml",
  "rand 0.9.5",
