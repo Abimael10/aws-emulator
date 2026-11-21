@@ -43,6 +43,7 @@ use crate::addon_catalog_publication::{configuration_schema, schema_root};
 use crate::addon_deletion::delete_addon;
 use crate::addon_lifecycle::{create_addon, describe_addon};
 use crate::addon_versions::{addons, describe_addon_versions, string_member, versions_of};
+use crate::marketplace_listing_reference_data::marketplace_product_page;
 use crate::wire::{call, emulator};
 
 /// The region every request in this suite is signed for — the one the shared
@@ -417,15 +418,27 @@ async fn a_vendor_rebuild_publishes_the_surface_of_the_addon_it_rebuilds() {
             "case {case}: the seller's published name is not the lower-case name token, got {:?}",
             rebuild["publisher"]
         );
-        for member in ["productId", "productUrl"] {
-            assert!(
-                rebuild["marketplaceInformation"][member]
+        // The listing it is subscribed through: its Marketplace product id, and
+        // the AWS Marketplace address of that product's page where the catalog
+        // carries one — a listing whose published page the catalog cannot cite
+        // reports no `productUrl` rather than an address that identifies no
+        // product.
+        let listing = &rebuild["marketplaceInformation"];
+        assert!(
+            listing["productId"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty()),
+            "case {case}: the listing must report its productId, got {listing:?}"
+        );
+        assert!(
+            listing.get("productUrl").is_none_or(|product_url| {
+                product_url
                     .as_str()
-                    .is_some_and(|value| !value.is_empty()),
-                "case {case}: the listing must report its {member}, got {:?}",
-                rebuild["marketplaceInformation"]
-            );
-        }
+                    .is_some_and(|url| marketplace_product_page(url).is_some())
+            }),
+            "case {case}: a published productUrl is the listing's product page on the AWS \
+             Marketplace site, got {listing:?}"
+        );
 
         // The same software, so the same configurable keys: the schema served for
         // the rebuild's newest build declares exactly the keys the rebuilt

@@ -9,12 +9,10 @@
 //! This is a REPORTING operation: it writes nothing. The catalog is a
 //! PUBLICATION, not per-account data — "Describes the versions for an add-on" —
 //! so it is seeded once and every member of a reported `AddonInfo` comes from
-//! that seed, with ONE exception: a Marketplace add-on's
-//! `marketplaceInformation.productUrl` is an address a SUBSCRIBER FOLLOWS, so it
-//! so it names the endpoint this emulator serves its whole surface at followed by
-//! the path this emulator serves that listing's page on
-//! (`crate::state::addon_marketplace_listing`) — the listing's own product id and
-//! the unit that address carries are the seed's. Which builds are OFFERED is
+//! that seed — a Marketplace add-on's `marketplaceInformation` is the LISTING's
+//! own published data, its Marketplace product id and the product URL the AWS
+//! Marketplace catalog publishes for it, omitted where that catalog publishes
+//! none (`crate::state::addon_marketplace_listing`). Which builds are OFFERED is
 //! derived per request from the clock:
 //! a build is published alongside the Kubernetes version it supports, so a build
 //! for a Kubernetes version the calendar has not released yet is not reported,
@@ -206,12 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changes nothing.
         let _ = (&input.max_results, &input.next_token);
 
-        // Where a Marketplace add-on's listing is published: the one endpoint this
-        // emulator serves its whole surface at, because
-        // `marketplaceInformation.productUrl` is an address a subscriber opens and
-        // this emulator answers on no AWS Marketplace host (see
-        // `crate::state::addon_marketplace_listing`).
-        let listing_base = crate::state::announced_listing_base(ctx);
+        // Nothing in a reported listing depends on the request that read it: the
+        // catalog is a publication, and a Marketplace add-on's product id and
+        // product URL are the listing's own data in the AWS Marketplace catalog
+        // (see `crate::state::addon_marketplace_listing`).
+        let _ = ctx;
 
         let requested_name = input.addon_name.as_deref();
         let kubernetes_version = input.kubernetes_version.as_deref();
@@ -231,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|addon| keeps(&types, &addon.addon_type))
             .filter(|addon| keeps(&publishers, &addon.publisher))
             .filter(|addon| keeps(&owners, &addon.owner))
-            .filter_map(|addon| describe(addon, kubernetes_version, now, &listing_base))
+            .filter_map(|addon| describe(addon, kubernetes_version, now))
             .collect();
 
         Ok(DescribeAddonVersionsOutput {
@@ -252,8 +249,7 @@ fn describe(
     addon: &AddonCatalogRecord,
     kubernetes_version: Option<&str>,
     now: SystemTime,
-    listing_base: &str,
 ) -> Option<AddonInfo> {
     let versions = addon.to_addon_version_infos(now, kubernetes_version);
-    (!versions.is_empty()).then(|| addon.to_addon_info(versions, listing_base))
+    (!versions.is_empty()).then(|| addon.to_addon_info(versions))
 }

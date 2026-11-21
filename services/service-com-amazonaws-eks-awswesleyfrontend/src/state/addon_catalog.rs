@@ -1471,11 +1471,11 @@ pub struct AddonCatalogRecord {
     /// add-on owned by [`ADDON_OWNER_MARKETPLACE`]; `None` for an Amazon
     /// EKS-managed one, which is not listed on Marketplace at all.
     ///
-    /// The listing's own published data ([`AddonMarketplaceListing`]). The
-    /// `marketplaceInformation` a listing is REPORTED as carries the ADDRESS this
-    /// emulator serves that listing at beside it, which depends on the endpoint
-    /// the reading request arrived on and so is composed per read
-    /// ([`Self::to_addon_info`]) rather than stored.
+    /// The listing's own published data ([`AddonMarketplaceListing`]): the product
+    /// id and the product URL the Marketplace catalog publishes for it, which is
+    /// what the `marketplaceInformation` a listing is REPORTED as carries
+    /// ([`Self::to_addon_info`]). Neither member depends on the request that read
+    /// the catalog, so neither is composed per read.
     pub marketplace_listing: Option<AddonMarketplaceListing>,
     /// The service accounts the add-on runs as, with the managed policies
     /// recommended for each; see [`AddonCatalogSeed::pod_identity`].
@@ -1509,14 +1509,14 @@ impl AddonCatalogRecord {
 
     /// This add-on as the modelled `AddonInfo` shape, reporting `versions`.
     ///
-    /// `listing_base` is the endpoint this emulator is reached at
-    /// ([`announced_listing_base`]), which is where a Marketplace add-on's
-    /// `marketplaceInformation.productUrl` leads: the address a subscriber follows
-    /// has to lead back to this emulator, so it is composed from the base the
-    /// reading request arrived on rather than copied from the AWS Marketplace host
-    /// nothing here answers (see [`addon_marketplace_listing_url`]). An add-on on
-    /// no listing reports no `marketplaceInformation` at all.
-    pub fn to_addon_info(&self, versions: Vec<AddonVersionInfo>, listing_base: &str) -> AddonInfo {
+    /// A Marketplace add-on's `marketplaceInformation` is the LISTING's own
+    /// published data, carried per listing by the catalog: its Marketplace product
+    /// id, and the product URL the Marketplace catalog publishes for it — omitted
+    /// for a listing whose published page the catalog cannot cite, because an
+    /// address nobody published identifies no product (see
+    /// [`AddonMarketplaceListing`]). An add-on on no listing reports no
+    /// `marketplaceInformation` at all.
+    pub fn to_addon_info(&self, versions: Vec<AddonVersionInfo>) -> AddonInfo {
         AddonInfo {
             addon_name: Some(self.addon_name.clone()),
             r#type: Some(self.addon_type.clone()),
@@ -1526,10 +1526,7 @@ impl AddonCatalogRecord {
             marketplace_information: self.marketplace_listing.as_ref().map(|listing| {
                 MarketplaceInformation {
                     product_id: Some(listing.product_id.clone()),
-                    product_url: Some(addon_marketplace_listing_url(
-                        listing_base,
-                        &listing.listing_unit,
-                    )),
+                    product_url: listing.product_url.clone(),
                 }
             }),
             default_namespace: Some(self.default_namespace.clone()),
@@ -2356,169 +2353,173 @@ pub(super) fn pod_identity_first_build(
 }
 
 /// The AWS Marketplace listing each Marketplace add-on is subscribed through, as
-/// `(the add-on's name, the listing's product id, the key the listing's page is
-/// addressed by)`.
+/// `(the add-on's name, the listing's product id, the page AWS Marketplace
+/// publishes that product at)`.
 ///
 /// `MarketplaceInformation` is "The product ID from the Amazon Web Services
-/// Marketplace" and "The product URL from the Amazon Web Services Marketplace".
-/// The product id IDENTIFIES the listing, so it is reference data this table
-/// carries per listing — as the Kubernetes release calendar carries its dates
-/// ([`VERSION_CALENDAR`]) — in the `prod-` form an AWS Marketplace product
-/// identifier takes, and it is not computed from the name the add-on is installed
-/// by. The product URL is an ADDRESS a subscriber FOLLOWS to accept the seller's
-/// terms, so it leads back to this emulator and is composed per read
-/// ([`addon_marketplace_listing_url`]) rather than carried here: an address on a
-/// host this emulator does not answer on is one a client can render but never
-/// dereference.
+/// Marketplace" and "The product URL from the Amazon Web Services Marketplace":
+/// BOTH are the LISTING's own data in the Marketplace catalog, so both are
+/// reference data this table carries per listing — as the Kubernetes release
+/// calendar carries its dates ([`VERSION_CALENDAR`]) — and neither is computed
+/// from the name the add-on is installed by, from the endpoint this emulator is
+/// served at, or from the other member. The product id is written in the `prod-`
+/// form an AWS Marketplace product identifier takes; the product page in
+/// whichever of the two forms AWS Marketplace publishes that product at
+/// ([`MarketplaceProductPage`]).
 ///
-/// The third column is therefore THIS EMULATOR'S OWN key for the listing — the
-/// stock-keeping-unit segment its published page is addressed by, written in the
-/// lower-case alphanumeric form a Marketplace stock-keeping unit takes, one per
-/// listing and carrying nothing of the add-on's name or of the product id above.
-/// It is not recorded AWS data and names no address of AWS's: the page it addresses
-/// is the one this service serves
-/// ([`ComAmazonawsEksAwswesleyfrontendState::addon_marketplace_listing_page`]).
+/// A listing whose published page this catalog cannot CITE carries
+/// [`MarketplaceProductPage::Uncited`] and is reported with no `productUrl` at
+/// all: the member is optional, and an address nobody published — one on a host
+/// of this emulator's, or one built from the listing's product id — identifies no
+/// product, so a subscriber following it could never reach the terms that gate
+/// installing the add-on.
 ///
 /// Rows are in add-on NAME order, like [`ADDON_CATALOG`]. EVERY add-on the
 /// catalog publishes as owned by [`ADDON_OWNER_MARKETPLACE`] has a row here —
 /// [`seed_addon_catalog`] panics on one that has none rather than publishing a
-/// listing a subscriber cannot reach — and an add-on Amazon EKS publishes itself
-/// has none, because it is not sold on AWS Marketplace at all.
-pub(super) const ADDON_MARKETPLACE_LISTINGS: &[(&str, &str, &str)] = &[
+/// Marketplace add-on with no listing at all — and an add-on Amazon EKS publishes
+/// itself has none, because it is not sold on AWS Marketplace at all.
+pub(super) const ADDON_MARKETPLACE_LISTINGS: &[(&str, &str, MarketplaceProductPage)] = &[
+    // The AccuKnox KubeArmor listing, published as a product view: the form
+    // `.../marketplace/pp/prodview-<id>` addresses.
     (
         "accuknox_kubearmor",
         "prod-6qf2hbwtzmk3d",
-        "d4hnqz7wmvbt3xkrl9jpsc26f",
+        MarketplaceProductPage::ProductView("prodview-5npox4ixz64qk"),
     ),
     (
         "akuity_akuity-agent",
         "prod-tn4sxcbr7jvqw",
-        "g5mptz2wqvbn8xkrh4jlsd37c",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "chainguard_aws-ebs-csi-driver-fips",
         "prod-zd93lpmkcqrvh",
-        "qf3m7kzrv5twbn28dhjxla9cs",
+        MarketplaceProductPage::Uncited,
     ),
+    // The Chainguard FIPS EFS CSI driver listing, published as the stock-keeping
+    // unit it is sold under: the form `.../marketplace/pp?sku=<sku>` addresses.
     (
         "chainguard_aws-efs-csi-driver-fips",
         "prod-butapz3xfcrww",
-        "ev1rr6qr2ftfm4qjeljc5och7",
+        MarketplaceProductPage::StockKeepingUnit("ev1rr6qr2ftfm4qjeljc5och7"),
     ),
     (
         "chainguard_cert-manager-fips",
         "prod-5wkjqtbnzmrdh",
-        "k3wfp9bzrmxq7nsvj5dah28lc",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "chainguard_coredns-fips",
         "prod-hm2qvzcrxtbkl",
-        "h8dmv2sxhlzb6rnp4kcfjw73t",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "chainguard_external-dns-fips",
         "prod-pq8wrzbmvkjdt",
-        "m5xtqwrcz3hjb8nlpdv6fs49k",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "chainguard_kube-proxy-fips",
         "prod-j7bqzmwrvtxkc",
-        "t7pfhzjqwm4xbs2dnvkl9c38r",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "chainguard_kube-state-metrics-fips",
         "prod-cv6zqnbmrwkts",
-        "b4ncxqtwmzv8rjhl5psdk723f",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "chainguard_metrics-server-fips",
         "prod-sw4mqzbrtvxkn",
-        "w9jmrnvqtz3hxb6klcpds42f8",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "chainguard_prometheus-node-exporter-fips",
         "prod-xp3kqzrmbwtvj",
-        "f2vhqmzjwt7xnbr5kldcs986p",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "chainguard_vpc-cni-fips",
         "prod-vz9kqmrbtwxjn",
-        "r6qkmzvwht4xbjn7pldcs53f9",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "datadog_operator",
         "prod-2mdqkwzbrhtvx",
-        "h6nqtz3wrvbm9xkpl5jfsd84b",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "dynatrace_dynatrace-operator",
         "prod-9nbkwqzxrmvht",
-        "j7prvz4wtbnm2xkql6hfsd95d",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "eg-innovations_eg-universal-agent-operator",
         "prod-f5tkwqzmxrhbv",
-        "k8qsvz5wtbnm3xjrl7hfpd26g",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "haproxy-technologies_kubernetes-ingress-ee",
         "prod-8gxkwmqzthrbv",
-        "l9rtwz6xubnm4yjpk8hgqd37h",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "kong_konnect-ri",
         "prod-d6vkzmqwthxrb",
-        "m2svxz7yubnp5zjqk9hgrd48j",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "kubecost_kubecost",
         "prod-r4jkzwqmthxbv",
-        "n3twxz8zucnp6ajrl2hgsd59k",
+        MarketplaceProductPage::Uncited,
     ),
+    // The NetApp Trident operator listing, published as the stock-keeping unit it
+    // is sold under.
     (
         "netapp_trident-operator",
         "prod-g7nzkwqmbhtsx",
-        "p4uxyz9bvdnq7bksm3jhtd62l",
+        MarketplaceProductPage::StockKeepingUnit("3anbrahbid63isddiigf6j5qy"),
     ),
     (
         "rafay-systems_rafay-operator",
         "prod-h3plmdcsbwrqz",
-        "q5vyza2cwdnr8clsn4khud73m",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "solo-io_istio-distro",
         "prod-j8clmdsbwrqzt",
-        "r6wzab3dxenq9dmsp5lhvd84n",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "splunk_splunk-otel-collector-chart",
         "prod-k2nvbshdlqwrm",
-        "s7xabc4eyfnr2ensq6mhwd95p",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "stormforge_optimize-live",
         "prod-l9vbshdnqwrmt",
-        "t8ybcd5fzgns3fotr7nhxd26q",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "teleport_teleport-kube-agent",
         "prod-n5dbshvlqwrmt",
-        "u9zcde6gahnt4gpus8phyd37r",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "tetrate-io_istio-distro",
         "prod-p6hbsdvlqwrnm",
-        "v2adef7hbjnu5hqvt9qhzd48s",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "upbound_universal-crossplane",
         "prod-q4sbhdvlwrnmt",
-        "w3befg8jcknv6irwu2rhad59t",
+        MarketplaceProductPage::Uncited,
     ),
     (
         "upwind-security_upwind-operator",
         "prod-t8bshdvlwrnmq",
-        "x4cfgh9kdlnw7jsxv3shbd62u",
+        MarketplaceProductPage::Uncited,
     ),
 ];
 
@@ -2529,9 +2530,9 @@ pub(super) fn marketplace_listing(addon_name: &str) -> Option<AddonMarketplaceLi
     ADDON_MARKETPLACE_LISTINGS
         .iter()
         .find(|(listed, _, _)| *listed == addon_name)
-        .map(|(_, product_id, listing_unit)| AddonMarketplaceListing {
+        .map(|(_, product_id, product_page)| AddonMarketplaceListing {
             product_id: (*product_id).to_string(),
-            listing_unit: (*listing_unit).to_string(),
+            product_url: product_page.product_url(),
         })
 }
 

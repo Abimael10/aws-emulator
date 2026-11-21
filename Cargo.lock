@@ -13765,7 +13765,6 @@ dependencies = [
  "aws-smithy-types",
  "bytes",
  "hex",
- "html-escape",
  "http",
  "http-body-util",
  "hyper",

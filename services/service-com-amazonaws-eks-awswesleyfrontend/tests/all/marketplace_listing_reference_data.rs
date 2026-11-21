@@ -12,25 +12,27 @@
 //! computed from the other. An add-on Amazon EKS publishes itself is on no
 //! listing and reports no `marketplaceInformation` at all.
 //!
-//! The RULE the third suite asserts: `marketplaceInformation.productUrl` is an
-//! address a SUBSCRIBER FOLLOWS, so the catalog publishes the address THIS
-//! EMULATOR serves that listing's page at — the one endpoint it serves its whole
-//! surface at, followed by the listing's own path — and that address really
-//! answers with that listing.
+//! The RULE the remaining suites assert: `marketplaceInformation.productUrl` is
+//! the AWS Marketplace product URL the catalog carries for that listing — an
+//! address on the AWS Marketplace site, in one of the two forms it publishes a
+//! product page under — and it is ABSENT for a listing the catalog carries no
+//! published page for. It is reference data, so it does not depend on where this
+//! emulator is served or on the host the reading request carried, and it is never
+//! composed from either.
 //!
 //! Every suite walks EVERY Marketplace add-on the catalog publishes, read from the
 //! publication itself, so the rows differ along what the rules generalise over:
 //! which seller publishes the add-on (single-word, multi-word and dotted
 //! published names), whether the add-on is a vendor's own product or its rebuild
-//! of an Amazon EKS-managed add-on, which stock-keeping unit its listing is sold
-//! under, and — for the address — where this emulator is served and which host the
-//! request that reads the catalog carried.
+//! of an Amazon EKS-managed add-on, which of the two published address forms its
+//! product page takes (or neither), and — for the address — where this emulator is
+//! served and which host the request that reads the catalog carried.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    addon_marketplace_listing_path, addon_marketplace_listing_route, ADDON_OWNER_MARKETPLACE,
-    ADDON_PUBLISHER_EKS, ADDON_PUBLISHER_SAGEMAKER,
+    MarketplaceProductPage, ADDON_OWNER_MARKETPLACE, ADDON_PUBLISHER_EKS, ADDON_PUBLISHER_SAGEMAKER,
+    MARKETPLACE_PRODUCT_PAGE_ADDRESS,
 };
 use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
 
@@ -113,23 +115,34 @@ pub(crate) fn is_marketplace_product_id(product_id: &str) -> bool {
             .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
 }
 
-/// The stock-keeping unit one listing is sold under, read off the address the
-/// catalog publishes for it — `None` for an address that leads to no listing of
-/// this emulator at all.
+/// The listing key an AWS Marketplace product URL addresses its product page by —
+/// the `prodview-<id>` segment of the product-view form, or the `<sku>` of the
+/// stock-keeping-unit form — and `None` for every address that is not a product
+/// page on the AWS Marketplace site.
 ///
-/// The address is this emulator's OWN (a URL a subscriber follows has to lead back
-/// to the emulator that handed it over), so the reading is the service's own route:
-/// an address it published resolves back to the listing behind it.
-pub(crate) fn marketplace_listing_unit(product_url: &str) -> Option<&str> {
-    addon_marketplace_listing_route(product_url)
+/// Source: the two forms AWS Marketplace publishes a product page under
+/// (`MARKETPLACE_PRODUCT_PAGE_ADDRESS` plus `/prodview-<id>`, and that address
+/// plus `?sku=<sku>`), which is what `MarketplaceInformation$productUrl` ("The
+/// product URL from the Amazon Web Services Marketplace") carries.
+pub(crate) fn marketplace_product_page(product_url: &str) -> Option<&str> {
+    let rest = product_url.strip_prefix(MARKETPLACE_PRODUCT_PAGE_ADDRESS)?;
+    let key = rest
+        .strip_prefix("?sku=")
+        .or_else(|| rest.strip_prefix('/').filter(|view| view.starts_with("prodview-")))?;
+    let identifier = key.strip_prefix("prodview-").unwrap_or(key);
+    (!identifier.is_empty()
+        && identifier
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit()))
+    .then_some(key)
 }
 
 // ---------------------------------------------------------------------------
 // RULE: a Marketplace add-on's publisher and marketplaceInformation are the
 // LISTING's own published data, carried per listing by the catalog — the seller's
-// published name, that listing's Marketplace product identifier and that
-// listing's product address — and an add-on Amazon EKS publishes itself carries
-// no listing.
+// published name, that listing's Marketplace product identifier and the AWS
+// Marketplace address of its product page — and an add-on Amazon EKS publishes
+// itself carries no listing.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -172,7 +185,8 @@ async fn every_marketplace_addon_publishes_its_sellers_own_listing() {
         );
 
         // The listing it is subscribed through: the Marketplace product
-        // identifier and the address that product is published at.
+        // identifier, and the Marketplace address of that product's page where the
+        // catalog carries one.
         let listing = addon
             .get("marketplaceInformation")
             .filter(|listing| !listing.is_null())
@@ -180,44 +194,54 @@ async fn every_marketplace_addon_publishes_its_sellers_own_listing() {
                 panic!("case {case}: a Marketplace add-on reports its listing, got {addon:?}")
             });
         let product_id = text(listing, "productId");
-        let product_url = text(listing, "productUrl");
         assert!(
             is_marketplace_product_id(&product_id),
             "case {case}: expected a Marketplace product identifier, got {product_id:?}"
         );
-        let listing_unit = marketplace_listing_unit(&product_url).unwrap_or_else(|| {
-            panic!(
-                "case {case}: expected an address this emulator serves the listing at, \
-                 got {product_url:?}"
-            )
+        let published_url = listing.get("productUrl").map(|url| {
+            url.as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case}: a published product URL is text, got {url:?}")
+                })
+                .to_string()
         });
 
-        // Two pieces of one listing's published data, so neither is computed from
-        // the other: the address does not carry the product identifier.
-        let identifier = product_id.trim_start_matches("prod-");
-        assert!(
-            !listing_unit.contains(identifier),
-            "case {case}: the listing's address must not be built from its product id \
-             {product_id:?}, got {product_url:?}"
-        );
-        // Nor from the add-on's own name, or the name of the software a rebuild
-        // rebuilds.
-        for name in [case, token.as_str()] {
+        if let Some(product_url) = &published_url {
+            let page = marketplace_product_page(product_url).unwrap_or_else(|| {
+                panic!(
+                    "case {case}: expected the listing's product page on the AWS Marketplace \
+                     site, got {product_url:?}"
+                )
+            });
+
+            // Two pieces of one listing's published data, so neither is computed
+            // from the other: the address does not carry the product identifier.
+            let identifier = product_id.trim_start_matches("prod-");
             assert!(
-                !product_url.contains(name) && !product_id.contains(name),
-                "case {case}: the listing is the seller's data, not the add-on's name \
-                 {name:?}, got {product_id:?} and {product_url:?}"
+                !page.contains(identifier),
+                "case {case}: the listing's address must not be built from its product id \
+                 {product_id:?}, got {product_url:?}"
+            );
+            // Nor from the add-on's own name, or the name of the software a rebuild
+            // rebuilds.
+            for name in [case, token.as_str()] {
+                assert!(
+                    !page.contains(name) && !product_id.contains(name),
+                    "case {case}: the listing is the seller's data, not the add-on's name \
+                     {name:?}, got {product_id:?} and {product_url:?}"
+                );
+            }
+
+            // One listing per add-on: no two add-ons are sold as one product.
+            assert!(
+                product_urls.insert(product_url.clone()),
+                "case {case}: two add-ons report one product address, got {product_url:?} twice"
             );
         }
 
-        // One listing per add-on: no two add-ons are sold as one product.
         assert!(
             product_ids.insert(product_id.clone()),
             "case {case}: two add-ons report one product id, got {product_id:?} twice"
-        );
-        assert!(
-            product_urls.insert(product_url.clone()),
-            "case {case}: two add-ons report one product address, got {product_url:?} twice"
         );
 
         // The same listing whichever filter path reaches the add-on, and the same
@@ -331,33 +355,32 @@ async fn the_publishers_filter_matches_the_sellers_published_name() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: `marketplaceInformation.productUrl` is an address a SUBSCRIBER FOLLOWS, so
-// what the catalog publishes is the address THIS EMULATOR serves that listing's
-// page at — the one endpoint it serves its whole surface at, followed by the
-// listing's own path — and a fetch of it really answers with that listing. An
-// address on a host this emulator is not reached on is one a client can render but
-// never dereference.
+// RULE: `marketplaceInformation.productUrl` is the AWS Marketplace product URL the
+// catalog carries for that listing — reference data, so the same whatever endpoint
+// this emulator is served at and whatever host the reading request carried, and
+// never an address of this emulator's own.
 // ---------------------------------------------------------------------------
 
-/// One addressing: where this emulator is SERVED, which host the reading request
-/// carried, and the authority every address that read announces must name.
+/// One addressing: where this emulator is SERVED, and which host the reading
+/// request carried — neither of which a published listing depends on.
 struct Addressing {
     case: &'static str,
     /// The base `OperationContext::endpoint` reports — the data port's own URL for
-    /// a router served on a port, and `UNSERVED_URL_BASE` for one that is not.
+    /// a router served on a port, and the unserved base for one that is not.
     served_at: Option<&'static str>,
     /// The `Host` the reading request carried, or `None` for the request an SDK
     /// sends, which names this service's published endpoint in the URI.
     host: Option<&'static str>,
-    /// The `host[:port]` of the one endpoint this emulator serves its whole surface
-    /// at, which is the authority a published listing address has to name.
+    /// An address THIS emulator answers that read on — the endpoint it is served
+    /// at, or the host the reading request carried — which no published product
+    /// URL may name.
     authority: &'static str,
 }
 
 /// The rows the address rule is read over: where this emulator is served (on no
 /// port at all, on a loopback port, on an IPv6 port, at a name) crossed with the
 /// host the reading request carried (a loopback address, a loopback name, one of
-/// AWS's own hostnames, none at all), which no announced address depends on.
+/// AWS's own hostnames, none at all).
 fn addressings() -> Vec<Addressing> {
     vec![
         Addressing {
@@ -365,14 +388,14 @@ fn addressings() -> Vec<Addressing> {
             served_at: None,
             host: None,
             // `smithy_server_runtime::UNSERVED_URL_BASE`: the one base an emulator
-            // served on no port reports, and still this emulator's own.
+            // served on no port reports.
             authority: "emulator.invalid",
         },
         Addressing {
             case: "a client on the loopback address of an unserved emulator",
             served_at: None,
             host: Some("127.0.0.1:9297"),
-            authority: "emulator.invalid",
+            authority: "127.0.0.1:9297",
         },
         Addressing {
             case: "an SDK client on an emulator served on a loopback port",
@@ -390,7 +413,7 @@ fn addressings() -> Vec<Addressing> {
             case: "a client naming the loopback by name, on an emulator served elsewhere",
             served_at: Some("https://127.0.0.1:40305"),
             host: Some("localhost:9297"),
-            authority: "127.0.0.1:40305",
+            authority: "localhost:9297",
         },
         Addressing {
             case: "a client on an IPv6 literal, on an emulator served on an IPv6 port",
@@ -462,41 +485,11 @@ async fn describe_addon_versions_from(
     }
 }
 
-/// What a fetch of a published address answers: its status, its `content-type`, its
-/// `content-length` and the document itself — a page request as a browser sends
-/// one, carrying no credential at all.
-async fn fetch(
-    router: &MultiServiceRouter,
-    method: &str,
-    url: &str,
-) -> (u16, String, String, String) {
-    let request = http::Request::builder()
-        .method(method)
-        .uri(url)
-        .body(bytes::Bytes::new())
-        .expect("a well-formed page request");
-    let response = router.dispatch(request).await;
-    let header = |name: &str| {
-        response
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default()
-            .to_string()
-    };
-    (
-        response.status().as_u16(),
-        header("content-type"),
-        header("content-length"),
-        String::from_utf8_lossy(response.body()).to_string(),
-    )
-}
-
 #[tokio::test]
-async fn a_listings_address_names_the_endpoint_this_emulator_is_served_at() {
+async fn a_listings_product_url_is_the_marketplace_address_the_catalog_carries() {
     // One read per addressing, each walking every Marketplace add-on the catalog
     // publishes.
-    let mut units_per_addressing: Vec<(&str, BTreeMap<String, String>)> = Vec::new();
+    let mut listings_per_addressing: Vec<(&str, BTreeMap<String, serde_json::Value>)> = Vec::new();
     for Addressing {
         case: addressing,
         served_at,
@@ -517,170 +510,173 @@ async fn a_listings_address_names_the_endpoint_this_emulator_is_served_at() {
             "case {addressing:?}: the catalog must publish several Marketplace add-ons, got {:?}",
             answer.body["addons"]
         );
-        let mut units: BTreeMap<String, String> = BTreeMap::new();
+        let mut listings: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         for addon in &published {
             let addon_name = text(addon, "addonName");
             let case = format!("{addressing:?} {addon_name}");
             let listing = &addon["marketplaceInformation"];
-            let product_url = text(listing, "productUrl");
-            let unit = marketplace_listing_unit(&product_url).unwrap_or_else(|| {
-                panic!(
-                    "case {case}: expected an address this emulator serves the listing at, \
-                     got {product_url:?}"
-                )
-            });
-            // The whole address: the endpoint this emulator is served at, and the
-            // path it serves that listing's page on. Nothing of the AWS Marketplace
-            // host, which this emulator is not reached on.
-            let expected = format!("https://{authority}{}", addon_marketplace_listing_path(unit));
-            assert_eq!(
-                product_url, expected,
-                "case {case}: expected the listing published at {expected:?}, got {product_url:?}"
-            );
-            for foreign in ["aws.amazon.com", "amazonaws.com", "api.aws"] {
+            if let Some(product_url) = listing.get("productUrl") {
+                let product_url = product_url.as_str().unwrap_or_default();
                 assert!(
-                    !product_url.contains(foreign),
-                    "case {case}: expected no address on a {foreign} host, got {product_url:?}"
+                    marketplace_product_page(product_url).is_some(),
+                    "case {case}: expected the listing's product page on the AWS Marketplace \
+                     site, got {product_url:?}"
                 );
+                // Nothing of the address this read was answered on, and nothing of
+                // the path namespace this emulator serves its own planes under: a
+                // product URL identifies a product, not an endpoint.
+                for local in [authority, "_aws", "emulator.invalid"] {
+                    assert!(
+                        !product_url.contains(local),
+                        "case {case}: a product URL must not be composed from the address this \
+                         emulator is reached on ({local}), got {product_url:?}"
+                    );
+                }
             }
-            units.insert(addon_name, unit.to_string());
+            listings.insert(addon_name, listing.clone());
         }
-        units_per_addressing.push((addressing, units));
+        listings_per_addressing.push((addressing, listings));
     }
 
-    // The listing itself does not move with the addressing: only the address it is
-    // announced on does.
-    let (first_case, first) = &units_per_addressing[0];
-    for (case, units) in &units_per_addressing {
+    // The listing does not move with the addressing at all: it is the Marketplace
+    // catalog's data, not this emulator's.
+    let (first_case, first) = &listings_per_addressing[0];
+    for (case, listings) in &listings_per_addressing {
         assert_eq!(
-            units, first,
-            "case {case:?}: the listings must be the ones {first_case:?} read too, got {units:?}"
+            listings, first,
+            "case {case:?}: the listings must be the ones {first_case:?} read too, got {listings:?}"
         );
     }
 }
 
 #[tokio::test]
-async fn every_published_listing_address_answers_with_that_listing() {
+async fn a_listing_with_no_published_product_page_reports_no_product_url() {
     let router = emulator_served_at(Some("https://127.0.0.1:40305"));
     let answer =
         describe_addon_versions_from(&router, None, &format!("owners={ADDON_OWNER_MARKETPLACE}"))
             .await;
 
+    // Which add-ons publish a product page and which do not is the catalog's
+    // business; what the rule fixes is that the member is either that page's
+    // address or ABSENT — never null, never empty, and never an address of this
+    // emulator's.
+    let mut with_page = 0_usize;
+    let mut without_page = 0_usize;
     for addon in &addons(&answer) {
-        let addon_name = text(addon, "addonName");
-        let case = addon_name.as_str();
+        let case = text(addon, "addonName");
         let listing = &addon["marketplaceInformation"];
-        let product_id = text(listing, "productId");
-        let product_url = text(listing, "productUrl");
-        let publisher = text(addon, "publisher");
-
-        // A subscriber opens the address, so it answers that listing's page.
-        let (status, media_type, length, page) = fetch(&router, "GET", &product_url).await;
-        assert_eq!(
-            status, 200,
-            "case {case}: expected the listing page at {product_url:?} to answer 200, \
-             got {status} {page:?}"
-        );
         assert!(
-            media_type.starts_with("text/html"),
-            "case {case}: expected a web page, got {media_type:?}"
+            !text(listing, "productId").is_empty(),
+            "case {case}: a listing reports its Marketplace product id, got {listing:?}"
         );
-        assert_eq!(
-            length,
-            page.len().to_string(),
-            "case {case}: expected the page's own length, got {length:?}"
-        );
-        for named in [case, product_id.as_str(), publisher.as_str()] {
-            assert!(
-                page.contains(named),
-                "case {case}: expected the page to state {named:?}, got {page:?}"
-            );
+        match listing.get("productUrl") {
+            None => without_page += 1,
+            Some(product_url) => {
+                let product_url = product_url.as_str().unwrap_or_else(|| {
+                    panic!("case {case}: a published product URL is text, got {product_url:?}")
+                });
+                assert!(
+                    marketplace_product_page(product_url).is_some(),
+                    "case {case}: expected the listing's product page on the AWS Marketplace \
+                     site, got {product_url:?}"
+                );
+                with_page += 1;
+            }
         }
+    }
+    assert!(
+        with_page > 0,
+        "the catalog must publish at least one listing's product page, got {with_page} with and \
+         {without_page} without"
+    );
+}
 
-        // And asking only what is there answers the same page's length with no body.
-        let (head_status, _, head_length, head_body) = fetch(&router, "HEAD", &product_url).await;
-        assert_eq!(
-            (head_status, head_length.as_str()),
-            (200, length.as_str()),
-            "case {case}: expected HEAD to report the page, got {head_status} {head_length:?}"
-        );
-        assert!(
-            head_body.is_empty(),
-            "case {case}: expected HEAD to carry no body, got {head_body:?}"
-        );
+#[tokio::test]
+async fn each_listing_reports_the_product_page_the_catalog_carries_for_it() {
+    let router = emulator();
 
-        // The listing a name-filtered read reports is the same one, with the add-on's
-        // builds beside it: the read a client version-pins from.
-        let by_name = describe_addon_versions_from(&router, None, &format!("addonName={case}")).await;
-        let named = addons(&by_name);
+    // The rows name, per add-on, the page the catalog carries for its listing, each
+    // in the form AWS Marketplace publishes that product page under. They span both
+    // published forms, two sellers and a vendor's rebuild of an Amazon EKS-managed
+    // add-on. A listing the catalog cites no page for reports no member at all,
+    // which the suites above read over the whole catalog rather than per name, so
+    // citing a page for one of them is never a failure here.
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "accuknox_kubearmor",
+            "https://aws.amazon.com/marketplace/pp/prodview-5npox4ixz64qk",
+        ),
+        (
+            "chainguard_aws-efs-csi-driver-fips",
+            "https://aws.amazon.com/marketplace/pp?sku=ev1rr6qr2ftfm4qjeljc5och7",
+        ),
+        (
+            "netapp_trident-operator",
+            "https://aws.amazon.com/marketplace/pp?sku=3anbrahbid63isddiigf6j5qy",
+        ),
+    ];
+
+    for (case, expected) in cases {
+        let answer = describe_addon_versions(&router, &format!("addonName={case}")).await;
+        let published = addons(&answer);
         assert_eq!(
-            named.len(),
+            published.len(),
             1,
             "case {case}: a name the catalog publishes answers exactly that add-on, got {:?}",
-            by_name.body["addons"]
+            answer.body["addons"]
         );
+        let listing = &published[0]["marketplaceInformation"];
+        let product_url = listing
+            .get("productUrl")
+            .and_then(serde_json::Value::as_str);
         assert_eq!(
-            named[0]["marketplaceInformation"], *listing,
-            "case {case}: expected the same listing on the filtered read, got {:?}",
-            named[0]["marketplaceInformation"]
-        );
-        assert!(
-            named[0]["addonVersions"]
-                .as_array()
-                .is_some_and(|versions| !versions.is_empty()),
-            "case {case}: expected the add-on's published builds, got {:?}",
-            named[0]["addonVersions"]
+            product_url,
+            Some(expected),
+            "case {case}: expected the product page the catalog carries, {expected:?}, got {:?}",
+            listing["productUrl"]
         );
     }
 }
 
-#[tokio::test]
-async fn an_address_of_the_listing_shape_that_names_no_listing_serves_no_page() {
-    let authority = "127.0.0.1:40305";
-    let router = emulator_served_at(Some(&format!("https://{authority}")));
-    let answer =
-        describe_addon_versions_from(&router, None, &format!("owners={ADDON_OWNER_MARKETPLACE}"))
-            .await;
-    let published = addons(&answer);
-    let listing = &published[0]["marketplaceInformation"];
-    let product_id = text(listing, "productId");
-    let unit = marketplace_listing_unit(&text(listing, "productUrl"))
-        .expect("a published listing address")
-        .to_string();
+// ---------------------------------------------------------------------------
+// RULE: a product page is published at the AWS Marketplace product page address
+// followed by the listing's own key, in one of the two forms AWS Marketplace
+// publishes — and a listing the catalog cannot cite a page for publishes none.
+// ---------------------------------------------------------------------------
 
-    // The rows span the addresses of this shape that name no listing: a unit nothing
-    // is sold under, the listing's PRODUCT ID in the unit's place (the address is not
-    // built from it), the unit of a published listing with something below it, and
-    // the plane with no unit at all.
-    let cases: Vec<(&str, String)> = vec![
+#[test]
+fn a_published_product_page_is_addressed_in_one_of_the_marketplace_forms() {
+    // The rows span the two published forms and the listing that carries neither.
+    let cases: Vec<(&str, MarketplaceProductPage, Option<&str>)> = vec![
         (
-            "a unit nothing is sold under",
-            addon_marketplace_listing_path("d4hnqz7wmvbt3xkrl9jpsc26z"),
+            "the product-view form",
+            MarketplaceProductPage::ProductView("prodview-5npox4ixz64qk"),
+            Some("https://aws.amazon.com/marketplace/pp/prodview-5npox4ixz64qk"),
         ),
         (
-            "the listing's product id in the unit's place",
-            addon_marketplace_listing_path(&product_id),
+            "the stock-keeping-unit form",
+            MarketplaceProductPage::StockKeepingUnit("ev1rr6qr2ftfm4qjeljc5och7"),
+            Some("https://aws.amazon.com/marketplace/pp?sku=ev1rr6qr2ftfm4qjeljc5och7"),
         ),
         (
-            "a path below a published listing",
-            format!("{}/terms", addon_marketplace_listing_path(&unit)),
-        ),
-        (
-            "the plane with no unit at all",
-            addon_marketplace_listing_path(""),
+            "a listing whose page the catalog cannot cite",
+            MarketplaceProductPage::Uncited,
+            None,
         ),
     ];
 
-    for (case, path) in cases {
-        let (status, _, _, page) =
-            fetch(&router, "GET", &format!("https://{authority}{path}")).await;
-        assert_ne!(
-            status, 200,
-            "case {case:?} ({path}): expected no listing page, got 200 {page:?}"
+    for (case, page, expected) in cases {
+        let product_url = page.product_url();
+        assert_eq!(
+            product_url.as_deref(),
+            expected,
+            "case {case}: expected {expected:?}, got {product_url:?}"
         );
-        assert!(
-            !page.contains("Product ID"),
-            "case {case:?} ({path}): expected no listing's data, got {page:?}"
-        );
+        if let Some(product_url) = &product_url {
+            assert!(
+                marketplace_product_page(product_url).is_some(),
+                "case {case}: expected an AWS Marketplace product page, got {product_url:?}"
+            );
+        }
     }
 }

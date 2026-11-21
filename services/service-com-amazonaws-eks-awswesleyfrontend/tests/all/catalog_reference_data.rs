@@ -43,7 +43,7 @@ use service_com_amazonaws_eks_awswesleyfrontend::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::marketplace_listing_reference_data::{
-    is_marketplace_product_id, marketplace_listing_unit,
+    is_marketplace_product_id, marketplace_product_page,
 };
 use crate::wire::{call, emulator, encode_label, error_code, Answer};
 
@@ -199,19 +199,23 @@ async fn marketplace_addons_are_published_with_their_listing_and_builds() {
             );
         }
 
-        // The listing the add-on is subscribed through: a product id, and the
-        // address that product is published at.
+        // The listing the add-on is subscribed through: a product id, and the AWS
+        // Marketplace address of that product's page where the catalog carries
+        // one.
         let listing = &addon["marketplaceInformation"];
         let product_id = text(listing, "productId");
-        let product_url = text(listing, "productUrl");
         assert!(
             is_marketplace_product_id(&product_id),
             "case {case}: expected the listing's Marketplace product id, got {listing:?}"
         );
         assert!(
-            marketplace_listing_unit(&product_url).is_some(),
-            "case {case}: expected the address this emulator serves the listing at, \
-             got {product_url:?}"
+            listing.get("productUrl").is_none_or(|product_url| {
+                product_url
+                    .as_str()
+                    .is_some_and(|url| marketplace_product_page(url).is_some())
+            }),
+            "case {case}: a published product URL is the listing's product page on the AWS \
+             Marketplace site, got {listing:?}"
         );
         assert!(
             listings.insert(product_id.clone()),

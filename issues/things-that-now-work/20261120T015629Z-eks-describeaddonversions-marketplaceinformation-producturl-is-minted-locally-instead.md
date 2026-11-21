@@ -64,3 +64,30 @@ Smithy model consulted: services/service-com-amazonaws-eks-awswesleyfrontend/smi
    - GET /addons/supported-versions?addonName=<a Marketplace-owned add-on>&kubernetesVersion=<an older supported minor> and inspect addons[0]: marketplaceInformation.productUrl is an /_aws/eks-addon-marketplace-listings/<id> URL on the emulator's own host:port rather than the AWS Marketplace product URL, and addonVersions is a single newest synthesised release instead of the releases compatible with the requested minor.
    - GET /addons/supported-versions (unfiltered) and check marketplaceInformation on every entry: the emulator populates productUrl on entries AWS returns without one, and substitutes its own URL on the entry that has one.
    - Restart the emulator on a different port and repeat: the productUrl changes with the listener's address, which shows it is derived from the serving endpoint instead of read from the add-on catalog.
+
+## Fix note
+
+`marketplaceInformation.productUrl` is now reference data the add-on catalog carries per listing
+(`src/state/addon_marketplace_listing.rs`, `ADDON_MARKETPLACE_LISTINGS` in
+`src/state/addon_catalog.rs`): the AWS Marketplace address of that product's page, in whichever of
+the two published forms addresses it (`…/marketplace/pp/prodview-<id>` or `…/marketplace/pp?sku=<sku>`),
+and the member is omitted for a listing whose published page the catalog cannot cite. Nothing is
+composed from the request, the account or the endpoint the emulator is served at, and the local
+listing-page plane that address used to point at is gone.
+
+Which listings carry a page is the catalog's data, and a page is cited or omitted, never composed:
+an invented `prodview-<id>` would identify some other product or none, which is this issue's own
+finding. Three listings are cited from the published addresses this report and the related reports
+quote (the AccuKnox KubeArmor product view, and the Chainguard FIPS EFS CSI driver and NetApp Trident
+stock-keeping units); the rest publish none, because the replay withholds recorded values
+("recorded values withheld" on every divergence it reports), so no published address is available
+for them from here.
+
+Causes 2 and 3 are closed. Cause 1 is closed for the local-URL substitution itself — the
+representative step now matches on this key — but only PARTIALLY for the cause as a whole: one
+replay unit (`eks-catalog-describe-addon-versions-eks-node-monitoring-agent-vpc-cni`) still diverges
+on `$.addons[*].marketplaceInformation.productUrl`, for a listing whose published page this catalog
+cannot cite, and cause 1's version-row half belongs to
+`20261114T010332Z-eks-read-only-catalog-listings-serve-synthesised-add.md`. The remaining work here
+is to add those listings' published Marketplace addresses to the table above once they can be cited;
+nothing in the fix mints an address for them in the meantime.
