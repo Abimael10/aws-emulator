@@ -35,6 +35,9 @@ hex = { workspace = true }
 # The digest an upload target's write presents its data key under
 # (`x-amz-server-side-encryption-customer-key-MD5`), which the service checks it against.
 md-5 = "0.10"
+# `StartUploadJob` ingests the CSV file written to an upload job's target ("the mapping
+# between CSV Columns and Profile Object attributes"), which this reader decodes.
+csv = "1.4"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

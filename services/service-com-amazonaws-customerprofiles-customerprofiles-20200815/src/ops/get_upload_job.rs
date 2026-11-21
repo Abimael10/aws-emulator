@@ -181,20 +181,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.domain_name,
             ))
         })?;
+        // How far a started job's processing has got is a function of the clock, so the
+        // four members that depend on it are resolved against this instant rather than
+        // stored — see `crate::state::upload_job_run`.
+        let reported = job.reported(::std::time::SystemTime::now());
 
         Ok(GetUploadJobOutput {
             job_id: Some(job.job_id.clone()),
             display_name: Some(job.display_name.clone()),
-            status: Some(job.status.clone()),
-            status_reason: job.status_reason.clone(),
+            status: Some(reported.status),
+            status_reason: reported.status_reason,
             created_at: Some(crate::state::to_date_time(job.created_at)),
-            completed_at: job.completed_at.map(crate::state::to_date_time),
+            completed_at: reported.completed_at.map(crate::state::to_date_time),
             fields: Some(job.fields.clone()),
             unique_key: Some(job.unique_key.clone()),
             // Always reported for a job that is stored: the summary is part of the
             // record, and it is its counters that are unset until the job has processed
             // records.
-            results_summary: Some(job.results_summary.clone()),
+            results_summary: Some(reported.results_summary),
             data_expiry: Some(job.data_expiry),
         })
     }

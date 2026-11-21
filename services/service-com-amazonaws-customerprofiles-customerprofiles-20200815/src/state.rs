@@ -21,7 +21,7 @@ use crate::ops::types::{
     Address, AttributeDetails, Conditions, CreateCalculatedAttributeDefinitionInput,
     DataStoreResponse, DomainStats, Filter, MatchingRequest, MatchingResponse, ObjectTypeField,
     ObjectTypeKey, Profile, Readiness, RecommenderSchemaField, ReportedConditions, ReportedFilter,
-    ResultsSummary, RuleBasedMatchingRequest, RuleBasedMatchingResponse,
+    RuleBasedMatchingRequest, RuleBasedMatchingResponse,
 };
 
 /// The resources the tagging operations address by ARN, and the `resourceArn` check the
@@ -35,6 +35,16 @@ pub mod profile_history;
 /// The upload target of an upload job: the address and data key `GetUploadJobPath` reports,
 /// and the file a write to that address leaves on the job.
 pub mod upload_job_file;
+
+/// The run of an upload job: the ingest `StartUploadJob` performs out of the job's file,
+/// and the completion the clock owes the job afterwards.
+pub mod upload_job_run;
+
+pub use upload_job_run::{
+    ReportedUploadJob, UploadJobCounters, UploadJobOutcome, UploadJobRun, MAX_UPLOAD_JOB_RECORDS,
+    UPLOAD_JOB_FAILED, UPLOAD_JOB_IN_PROGRESS, UPLOAD_JOB_PARTIALLY_SUCCEEDED,
+    UPLOAD_JOB_PROCESSING_SPAN, UPLOAD_JOB_SUCCEEDED, UPLOAD_JOB_VALIDATION_FAILURE,
+};
 
 pub use upload_job_file::{
     data_key_md5, parse_upload_path, upload_path, write_is_authorized, UploadTarget,
@@ -646,9 +656,11 @@ impl StoredObjectType {
 /// created for the job with the provided field mapping and unique key") and the progress
 /// the service keeps for it.
 ///
-/// The progress members are stored rather than derived: a job leaves
-/// [`UPLOAD_JOB_CREATED`] only when a caller starts or stops it, never because the clock
-/// moved, so a read reports exactly what the last call wrote.
+/// A job leaves [`UPLOAD_JOB_CREATED`] only when a caller starts or stops it, so the
+/// members below are what the last call wrote. What the clock owes a STARTED job is its
+/// completion, which is why the reported status, reason, `CompletedAt` and
+/// `ResultsSummary` of one are resolved against the clock by
+/// [`StoredUploadJob::reported`] out of the [`run`](StoredUploadJob::run) below.
 #[derive(Debug, Clone)]
 pub struct StoredUploadJob {
     /// `JobId`, as minted (also this record's key in [`Domain::upload_jobs`]).
@@ -672,12 +684,6 @@ pub struct StoredUploadJob {
     pub created_at: SystemTime,
     /// `CompletedAt`: when the job finished processing, so unset until it has.
     pub completed_at: Option<SystemTime>,
-    /// `ResultsSummary`: "The summary of results for the upload job, including the
-    /// number of updated, created, and failed records." The summary itself is part of
-    /// every job record from the moment it is created — a reader of a stored job always
-    /// gets the structure — and it is its three counters that stay unset until the job
-    /// has processed records.
-    pub results_summary: ResultsSummary,
     /// `ClientToken`, as minted with the job: "the plaintext data key used to encrypt the
     /// upload file", which `GetUploadJobPath` reports and a write to the job's upload
     /// target presents ([`upload_job_file`]). Minted once, with the job, because the file
@@ -687,6 +693,11 @@ pub struct StoredUploadJob {
     /// uploaded for yet — which is every job until a caller performs the write
     /// `GetUploadJobPath`'s address and token document.
     pub uploaded_file: Option<Vec<u8>>,
+    /// The processing `StartUploadJob` commissioned, or `None` for a job no call has
+    /// started. The run holds the instant the processing falls due and what it came to, so
+    /// the job reports `IN_PROGRESS` until then and its outcome from then on — see
+    /// [`upload_job_run`].
+    pub run: Option<UploadJobRun>,
 }
 
 impl StoredUploadJob {
@@ -710,15 +721,14 @@ impl StoredUploadJob {
             status_reason: None,
             created_at: now,
             completed_at: None,
-            // Nothing has been processed yet, so the summary is present with none of
-            // its three counters populated.
-            results_summary: ResultsSummary::default(),
             // The data key the job's upload file is encrypted under, minted here so every
             // read of the job's upload path reports the same one and a file written under
             // it stays readable.
             client_token: upload_job_file::new_data_key(),
             // Nothing has been uploaded for a job that was just created.
             uploaded_file: None,
+            // Nothing has started a job that was just created.
+            run: None,
         }
     }
 }
@@ -2577,6 +2587,14 @@ pub fn upload_job_domain_not_found(domain_name: &str) -> String {
 /// whichever of them was called.
 pub fn upload_job_not_found(job_id: &str, domain_name: &str) -> String {
     format!("The upload job {job_id} does not exist in domain {domain_name}")
+}
+
+/// The `BadRequestException` message for a `StartUploadJob` call naming a job that is not
+/// in the one status processing can be started from, as the service words that refusal:
+/// one fixed sentence naming that status ([`UPLOAD_JOB_CREATED`]), which interpolates
+/// nothing — neither the job the request named nor the status that job is actually in.
+pub fn upload_job_not_startable() -> String {
+    format!("Job status is not in {UPLOAD_JOB_CREATED} status and cannot be started")
 }
 
 /// The `ResourceNotFoundException` message for a profile a domain does not hold, as the
