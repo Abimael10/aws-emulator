@@ -125,8 +125,13 @@ async fn a_rewritten_baseline_and_the_default_that_named_it_both_go() {
     let router = router();
 
     // (case, the Region the endpoint is, the operating system the baseline applies to).
+    // Each operating system here publishes the classification the rewriting update's rule
+    // selects on: a Debian-based distribution publishes priorities instead ("UBUNTU Valid
+    // properties: PRODUCT | PRIORITY", `smithy_query(query="doc",
+    // shape="DescribePatchProperties")`), so a rule stating a classification names no
+    // property of one of those.
     let cases: &[(&str, &str, &str)] = &[
-        ("a non-windows default at this endpoint", REGION, "UBUNTU"),
+        ("a non-windows default at this endpoint", REGION, "SUSE"),
         (
             "a default at another Region's endpoint",
             OTHER_REGION,

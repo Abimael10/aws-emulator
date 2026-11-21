@@ -63,6 +63,7 @@ use super::patch_catalog::{
     DEPLOYMENT_STATUS_APPROVED, DEPLOYMENT_STATUS_EXPLICIT_APPROVED,
     DEPLOYMENT_STATUS_EXPLICIT_REJECTED,
 };
+use super::patch_properties::MACOS_OPERATING_SYSTEM;
 use super::ComAmazonawsSsmAmazonssmState;
 
 /// The name of the Command document Patch Manager publishes to run a patch baseline on a
@@ -200,8 +201,9 @@ pub const DISTRIBUTION_IMAGE_NAMES: &[(&str, &str)] = &[
 /// The `OperatingSystem` of the one platform type that names a distribution of its own.
 const WINDOWS_OPERATING_SYSTEM: &str = "WINDOWS";
 
-/// The `OperatingSystem` of a node whose platform type is Apple's.
-const MACOS_OPERATING_SYSTEM: &str = "MACOS";
+// The `OperatingSystem` of a node whose platform type is Apple's is the one the published
+// patch metadata names ([`super::patch_properties::MACOS_OPERATING_SYSTEM`], imported
+// above), so this module states it nowhere of its own.
 
 /// What one send asked a node's agent to do: the patch-baseline step of the document it
 /// resolved, with that step's inputs taken from the parameters the send supplied and the

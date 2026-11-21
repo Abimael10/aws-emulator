@@ -223,6 +223,35 @@ fn rule_group(count: usize) -> Value {
     })
 }
 
+/// A rule group of `count` rules for a baseline of a Debian-based distribution, each
+/// selecting its own package priority.
+///
+/// Those distributions publish no classification at all — "DEBIAN Valid properties:
+/// `PRODUCT` | `PRIORITY`", "UBUNTU Valid properties: `PRODUCT` | `PRIORITY`"
+/// (`smithy_query(query="doc", shape="DescribePatchProperties")`) — so a baseline of one of
+/// them states its criteria as the priorities its packages carry, the way a Windows baseline
+/// states classifications ([`rule_group`]).
+fn priority_rule_group(count: usize) -> Value {
+    // The priorities a Debian-based distribution publishes, in the order
+    // `DescribePatchProperties` reports them for one.
+    const PRIORITIES: &[&str] = &["Extra", "Important", "Optional", "Required", "Standard"];
+    json!({
+        "PatchRules": (0..count)
+            .map(|index| json!({
+                "PatchFilterGroup": {
+                    "PatchFilters": [{
+                        "Key": "PRIORITY",
+                        "Values": [PRIORITIES[index % PRIORITIES.len()]],
+                    }],
+                },
+                "ApproveAfterDays": 1,
+                "ComplianceLevel": "HIGH",
+                "EnableNonSecurity": true,
+            }))
+            .collect::<Vec<Value>>(),
+    })
+}
+
 /// `count` patch ids starting at `first`, in the `KB…` form a Windows patch id takes.
 fn patch_ids(first: usize, count: usize) -> Value {
     json!((0..count)
@@ -376,7 +405,7 @@ async fn a_read_reports_every_member_the_create_persisted() {
             body: json!({
                 "Name": "Rules.Only.Baseline",
                 "OperatingSystem": "UBUNTU",
-                "ApprovalRules": rule_group(1),
+                "ApprovalRules": priority_rule_group(1),
             }),
         },
         RoundTripCase {
@@ -911,7 +940,7 @@ async fn an_update_writes_the_members_it_supplies_and_leaves_the_rest() {
             created: json!({
                 "Name": "Filters.And.Sources",
                 "OperatingSystem": "UBUNTU",
-                "ApprovalRules": rule_group(1),
+                "ApprovalRules": priority_rule_group(1),
             }),
             update: json!({
                 "GlobalFilters": {
@@ -1003,7 +1032,7 @@ async fn an_update_writes_the_members_it_supplies_and_leaves_the_rest() {
                 "GlobalFilters": {
                     "PatchFilters": [{ "Key": "PRODUCT", "Values": ["Debian12"] }],
                 },
-                "ApprovalRules": rule_group(2),
+                "ApprovalRules": priority_rule_group(2),
                 "ApprovedPatches": patch_ids(9_000_000, 2),
                 "ApprovedPatchesComplianceLevel": "CRITICAL",
                 "ApprovedPatchesEnableNonSecurity": true,

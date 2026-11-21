@@ -336,6 +336,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(why));
         }
 
+        // "The key for the filter. Run the DescribePatchProperties command to view lists of
+        // valid keys for each operating system type": every key the baseline would be left
+        // stating has to name a property the patches of its own operating system carry — no
+        // input member moves that operating system, so it is the one the create persisted.
+        // Decided on the baseline the update WOULD leave behind, like the rule above, and
+        // before anything is written, so a criterion that could never select a patch cannot
+        // be updated into the store either.
+        if let Some(why) = crate::state::patch_filter_keys::patch_filter_key_rejection(
+            &record.operating_system,
+            record.global_filters.as_ref(),
+            record.approval_rules.as_ref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
         // What the update persisted is what this call reports and what a later read reports:
         // the two patch selectors are sets, so a baseline that names neither reports the
         // empty set of each rather than nothing at all, exactly as a read of it does.

@@ -342,6 +342,11 @@ pub mod patch_properties;
 /// each of them.
 pub mod patch_catalog;
 
+/// Which `PatchFilter` keys a baseline of one operating system may select on — the patch
+/// properties that operating system's own patches carry, which every write of a baseline is
+/// held to.
+pub mod patch_filter_keys;
+
 /// Which of the published patches are AVAILABLE to be put in a patch baseline — the
 /// catalogues an available-patch read walks and the filters it narrows them by.
 pub mod available_patches;

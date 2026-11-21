@@ -230,7 +230,12 @@ async fn a_baseline_that_approves_something_is_admitted() {
         AdmittedCase {
             case: "one approval rule and no approved patch",
             name: "One.Rule.Baseline",
-            operating_system: "UBUNTU",
+            // A distribution whose patches carry the classifications this rule group selects
+            // on: a Debian-based one publishes priorities instead ("UBUNTU Valid properties:
+            // PRODUCT | PRIORITY", `smithy_query(query="doc",
+            // shape="DescribePatchProperties")`), so a rule stating a classification names
+            // no property of one of those.
+            operating_system: "ORACLE_LINUX",
             region: REGION,
             approves: json!({ "ApprovalRules": rule_group(1) }),
         },

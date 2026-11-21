@@ -56,6 +56,12 @@ pub const PATCH_SET_APPLICATION: &str = "APPLICATION";
 /// alone that has an application set beside its operating-system set.
 pub const PATCH_SET_OPERATING_SYSTEM: &str = "WINDOWS";
 
+/// The operating system whose patches are Apple's software updates rather than the packages
+/// of a Linux distribution — the other operating system the properties of a Linux package
+/// are no properties of. One of the modelled `OperatingSystem` values
+/// (`crate::ops::types::OPERATING_SYSTEM_VALUES`).
+pub const MACOS_OPERATING_SYSTEM: &str = "MACOS";
+
 /// The property whose values are the specific products a patch applies to, e.g.
 /// `WindowsServer2016` or `AmazonLinux2018.03` (`Patch$Product`). One of the modelled
 /// `PatchProperty` values (`crate::ops::types::PATCH_PROPERTY_VALUES`).

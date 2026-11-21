@@ -226,6 +226,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(why));
         }
 
+        // "Defines the operating system the patch baseline applies to. The default value is
+        // WINDOWS": which operating system this create is about decides which criteria it
+        // may state, so it is resolved before the filters are held to it.
+        let operating_system = input.operating_system.clone().unwrap_or_else(|| {
+            crate::state::patch_baselines::DEFAULT_OPERATING_SYSTEM.to_string()
+        });
+
+        // "The key for the filter. Run the DescribePatchProperties command to view lists of
+        // valid keys for each operating system type": a filter key is a patch property, so
+        // every key this create states — in the global filters and in each approval rule's
+        // own filter group — has to name a property the patches of THIS baseline's operating
+        // system carry. One naming a property of another operating system's patches could
+        // never select a patch, and is refused before anything is minted or stored.
+        if let Some(why) = crate::state::patch_filter_keys::patch_filter_key_rejection(
+            &operating_system,
+            input.global_filters.as_ref(),
+            input.approval_rules.as_ref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -237,9 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             // "Defines the operating system the patch baseline applies to. The default
             // value is WINDOWS."
-            operating_system: input.operating_system.unwrap_or_else(|| {
-                crate::state::patch_baselines::DEFAULT_OPERATING_SYSTEM.to_string()
-            }),
+            operating_system,
             global_filters: input.global_filters,
             approval_rules: input.approval_rules,
             approved_patches: input.approved_patches.unwrap_or_default(),
