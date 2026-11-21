@@ -36,8 +36,8 @@ use crate::metric_stream_delivery::{
 
 /// The namespace a metric stream's own metrics live in, and the series this suite reads.
 const METRIC_STREAMS_NAMESPACE: &str = "AWS/CloudWatch/MetricStreams";
-const METRIC_UPDATE: &str = "MetricUpdate";
-const PUBLISH_ERROR_RATE: &str = "PublishErrorRate";
+pub(crate) const METRIC_UPDATE: &str = "MetricUpdate";
+pub(crate) const PUBLISH_ERROR_RATE: &str = "PublishErrorRate";
 
 /// The dimension naming which stream a metering series is about.
 const STREAM_NAME_DIMENSION: &str = "MetricStreamName";
@@ -53,7 +53,7 @@ const ACTIVE: &str = "ACTIVE";
 /// pipeline's own clocks need, so a loaded machine does not fail a case the clock would have
 /// served. Nothing below waits a fixed time — every wait polls for the condition and ends as
 /// soon as it holds.
-const DEADLINE: Duration = Duration::from_secs(120);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(120);
 
 /// How far back and ahead a metering read looks, in periods: enough to hold every observation a
 /// case makes whichever minute the case straddles.
@@ -63,26 +63,26 @@ const READ_PERIODS_AHEAD: f64 = 2.0;
 /// The role the Firehose destination itself writes its objects under: Firehose resolves every
 /// `RoleARN` a stream's configuration names against IAM when the stream is written, so this role
 /// has to exist, trust Firehose and be allowed the object write.
-const DELIVERY_ROLE: &str = "firehose-delivery";
+pub(crate) const DELIVERY_ROLE: &str = "firehose-delivery";
 
 /// The permissions every metric-stream role in this suite carries: "This IAM role must include
 /// the following permissions: firehose:PutRecord firehose:PutRecordBatch"
 /// (`PutMetricStreamInput$RoleArn`). Identical on every row, so the trust document is the one
 /// thing a row varies.
-const EXPORT_PERMISSIONS: &str = concat!(
+pub(crate) const EXPORT_PERMISSIONS: &str = concat!(
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"#,
     r#"["firehose:PutRecord","firehose:PutRecordBatch"],"Resource":"*"}]}"#
 );
 
 /// The permissions the delivery role carries: the object write a delivery makes.
-const DELIVERY_PERMISSIONS: &str = concat!(
+pub(crate) const DELIVERY_PERMISSIONS: &str = concat!(
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:PutObject","#,
     r#""Resource":"*"}]}"#
 );
 
 /// A trust policy with one statement naming `services` (a JSON string or array), `action` and
 /// `effect`, as a client would send it.
-fn trust(effect: &str, action: &str, services: &str) -> String {
+pub(crate) fn trust(effect: &str, action: &str, services: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"{effect}\",\
          \"Principal\":{{\"Service\":{services}}},\"Action\":\"{action}\"}}]}}"
@@ -90,12 +90,18 @@ fn trust(effect: &str, action: &str, services: &str) -> String {
 }
 
 /// The role ARN of this account's role `name`.
-fn role_arn(name: &str) -> String {
+pub(crate) fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/{name}")
 }
 
 /// Create the role `name` with `document` as its trust policy and `permissions` inline.
-async fn given_role(emulator: &Emulator, case: &str, name: &str, document: &str, permissions: &str) {
+pub(crate) async fn given_role(
+    emulator: &Emulator,
+    case: &str,
+    name: &str,
+    document: &str,
+    permissions: &str,
+) {
     emulator
         .iam(
             case,
@@ -120,7 +126,7 @@ async fn given_role(emulator: &Emulator, case: &str, name: &str, document: &str,
 }
 
 /// The destination bucket and the delivery stream writing into it, under the delivery role.
-async fn given_destination(emulator: &Emulator, bucket: &str, delivery_stream: &str) {
+pub(crate) async fn given_destination(emulator: &Emulator, bucket: &str, delivery_stream: &str) {
     emulator.create_bucket(bucket).await;
     emulator
         .firehose(
@@ -140,7 +146,7 @@ async fn given_destination(emulator: &Emulator, bucket: &str, delivery_stream: &
 }
 
 /// Wait until `delivery_stream` is `ACTIVE`, which is when it takes records.
-async fn until_active(emulator: &Emulator, delivery_stream: &str) {
+pub(crate) async fn until_active(emulator: &Emulator, delivery_stream: &str) {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let described = emulator
@@ -200,7 +206,11 @@ async fn publish(emulator: &Emulator) {
 /// The `Sum` and the `Maximum` of one metering series of `stream` over the window around now,
 /// and how many datapoints it holds — read through `GetMetricStatistics` exactly as a client
 /// reads it.
-async fn metered(emulator: &Emulator, metric_name: &str, stream: &str) -> (f64, f64, usize) {
+pub(crate) async fn metered(
+    emulator: &Emulator,
+    metric_name: &str,
+    stream: &str,
+) -> (f64, f64, usize) {
     let answer = emulator
         .cloudwatch(
             "GetMetricStatistics",
@@ -233,7 +243,7 @@ async fn metered(emulator: &Emulator, metric_name: &str, stream: &str) -> (f64, 
 /// The POSITIVE signal both legs produce: a stream that published reports a rate of 0 and one
 /// that could not reports a non-zero rate, so neither leg of a row is decided by waiting a fixed
 /// time for nothing to happen.
-async fn reported_error_rate(emulator: &Emulator, case: &str, stream: &str) -> f64 {
+pub(crate) async fn reported_error_rate(emulator: &Emulator, case: &str, stream: &str) -> f64 {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let (_, maximum, datapoints) = metered(emulator, PUBLISH_ERROR_RATE, stream).await;

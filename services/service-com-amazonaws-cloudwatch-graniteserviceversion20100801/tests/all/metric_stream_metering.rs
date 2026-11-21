@@ -29,8 +29,8 @@ use crate::metric_stream_delivery::{
 
 /// The namespace a metric stream's own metrics live in, and the two series this suite reads.
 const METRIC_STREAMS_NAMESPACE: &str = "AWS/CloudWatch/MetricStreams";
-const METRIC_UPDATE: &str = "MetricUpdate";
-const TOTAL_METRIC_UPDATE: &str = "TotalMetricUpdate";
+pub(crate) const METRIC_UPDATE: &str = "MetricUpdate";
+pub(crate) const TOTAL_METRIC_UPDATE: &str = "TotalMetricUpdate";
 
 /// The dimension naming which stream a metering series is about.
 const STREAM_NAME_DIMENSION: &str = "MetricStreamName";
@@ -196,7 +196,12 @@ fn stream_dimension(stream: &str) -> Value {
 
 /// Wait until `stream` has been metered for `updates` metric updates, then answer what both
 /// counters hold — or fail naming `case` once [`METERING_DEADLINE`] has passed.
-async fn metering_of(emulator: &Emulator, case: &str, stream: &str, updates: f64) -> (f64, f64) {
+pub(crate) async fn metering_of(
+    emulator: &Emulator,
+    case: &str,
+    stream: &str,
+    updates: f64,
+) -> (f64, f64) {
     let deadline = Instant::now() + METERING_DEADLINE;
     loop {
         let (counted, _) = metered(emulator, METRIC_UPDATE, stream_dimension(stream)).await;

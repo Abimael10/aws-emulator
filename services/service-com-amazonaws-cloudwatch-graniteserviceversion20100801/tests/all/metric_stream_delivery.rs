@@ -288,7 +288,7 @@ impl Emulator {
     /// The exported records every object in `bucket` holds, one list per object, in key order:
     /// a delivered object is the records of one buffer concatenated, and each record is one
     /// JSON document on its own line.
-    async fn delivered_objects(&self, bucket: &str) -> Vec<Vec<Value>> {
+    pub(crate) async fn delivered_objects(&self, bucket: &str) -> Vec<Vec<Value>> {
         let mut objects = Vec::new();
         for key in self.keys(bucket).await {
             let body = self.object(bucket, &key).await;
@@ -531,7 +531,7 @@ fn text(record: &Value, member: &str) -> String {
 }
 
 /// A number member of a record's `value` object.
-fn statistic(record: &Value, name: &str) -> Option<f64> {
+pub(crate) fn statistic(record: &Value, name: &str) -> Option<f64> {
     record.get("value")?.get(name)?.as_f64()
 }
 
@@ -544,7 +544,7 @@ fn timestamp(record: &Value) -> i64 {
 }
 
 /// The `(namespace, metric_name)` of a record.
-fn metric_of(record: &Value) -> (String, String) {
+pub(crate) fn metric_of(record: &Value) -> (String, String) {
     (text(record, "namespace"), text(record, "metric_name"))
 }
 
