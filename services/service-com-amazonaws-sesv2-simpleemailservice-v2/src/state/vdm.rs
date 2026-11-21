@@ -7,9 +7,12 @@
 //! Virtual Deliverability Manager is a facility the ACCOUNT switches on
 //! (`PutAccountVdmAttributes`), and the data it collects exists only while it is on. An
 //! operation whose answer is that data therefore has nothing to report for an account
-//! that never switched it on: the condition is a missing FEATURE rather than a malformed
-//! request, so it is answered with the error the model binds for a resource that does not
-//! exist and with one fixed sentence telling the caller which feature to enable.
+//! that never switched it on, and one that would start work on that data has nothing for
+//! that work to draw on: the condition is a missing FEATURE rather than a malformed
+//! request, so it is answered with one fixed sentence telling the caller which feature
+//! to enable, carried by the error each operation's own model binds for the condition —
+//! the error for a resource that does not exist where the call is a read of that data,
+//! and the operation's input error where the call asks for work on it.
 //!
 //! Stated once here, keyed by neither operation nor member, so every call this gate
 //! guards reports the same condition the same way — and so the next one to need it reads

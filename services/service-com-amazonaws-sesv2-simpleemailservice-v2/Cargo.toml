@@ -113,6 +113,9 @@ emulator-core-build-support = { workspace = true }
 
 # The scaffold's dev-dependency block, as generated for every service crate.
 [dev-dependencies]
+# `automod`: declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so a
+# suite is picked up from its file instead of from a hand-written list.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # SNS is mounted beside this service on one engine in the event-destination

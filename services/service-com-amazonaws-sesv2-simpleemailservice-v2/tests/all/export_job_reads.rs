@@ -43,7 +43,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
-    ComAmazonawsSesv2SimpleemailserviceV2State, ExportJobStatus, SentMessage,
+    ComAmazonawsSesv2SimpleemailserviceV2State, ExportJobStatus, SentMessage, FEATURE_ENABLED,
     MAX_EXPORT_FILES_PER_CALL,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
@@ -253,6 +253,17 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // A metrics export is created here only to read it back, and such an export is
+        // served under the account's Virtual Deliverability Manager configuration — the
+        // switch `PutAccountVdmAttributes` writes and `GetAccount` reports — so these
+        // cases run with it on. It is set on the account record because this
+        // constructor is not a request; the gate itself is pinned in
+        // `export_job_vdm_gate`.
+        engine
+            .state::<ComAmazonawsSesv2SimpleemailserviceV2State>()
+            .lock()
+            .account
+            .vdm_enabled = FEATURE_ENABLED.to_string();
         Self { engine, router }
     }
 

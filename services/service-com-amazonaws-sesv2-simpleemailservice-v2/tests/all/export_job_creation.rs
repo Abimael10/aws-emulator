@@ -41,7 +41,7 @@ use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::{
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
     custom_s3_url_is_not_supported, invalid_export_data_source, window_runs_backwards,
     ComAmazonawsSesv2SimpleemailserviceV2State, ExportJobRecord, EXPORT_JOB_COMPLETION_SETTLE,
-    EXPORT_JOB_PROCESSING_SETTLE, MAX_EXPORT_JOBS,
+    EXPORT_JOB_PROCESSING_SETTLE, FEATURE_ENABLED, MAX_EXPORT_JOBS,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -249,6 +249,17 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // A metrics export is served under the account's Virtual Deliverability Manager
+        // configuration, so these cases, which are about everything else a create
+        // decides, run with that switch on. It is the switch
+        // `PutAccountVdmAttributes` writes and `GetAccount` reports, set on the account
+        // record here because this constructor is not a request. The gate itself is
+        // pinned in `export_job_vdm_gate`.
+        engine
+            .state::<ComAmazonawsSesv2SimpleemailserviceV2State>()
+            .lock()
+            .account
+            .vdm_enabled = FEATURE_ENABLED.to_string();
         Self { engine, router }
     }
 

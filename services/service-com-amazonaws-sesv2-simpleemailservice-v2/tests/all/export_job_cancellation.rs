@@ -30,7 +30,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sesv2_simpleemailservice_v2::state::ComAmazonawsSesv2SimpleemailserviceV2State;
+use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
+    ComAmazonawsSesv2SimpleemailserviceV2State, FEATURE_ENABLED,
+};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -218,6 +220,17 @@ impl Ses {
         // These cases exercise handler behaviour, not SigV4.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // These cases cancel a metrics export as well as a Message Insights one, and a
+        // metrics export is served under the account's Virtual Deliverability Manager
+        // configuration — the switch `PutAccountVdmAttributes` writes and `GetAccount`
+        // reports — so they run with it on. It is set on the account record because
+        // this constructor is not a request; the gate itself is pinned in
+        // `export_job_vdm_gate`.
+        engine
+            .state::<ComAmazonawsSesv2SimpleemailserviceV2State>()
+            .lock()
+            .account
+            .vdm_enabled = FEATURE_ENABLED.to_string();
         Self { engine, router }
     }
 

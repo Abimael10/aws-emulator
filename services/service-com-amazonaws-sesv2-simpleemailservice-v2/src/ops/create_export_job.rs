@@ -6,6 +6,16 @@
 //! ([`crate::state::ExportJobRecord`]), and the `JobId` it answers with is the only
 //! name the job has. This is the ONLY file to touch for this operation.
 //!
+//! One rule beyond the request's own well-formedness decides whether a create is
+//! served: an export that draws on the account's Virtual Deliverability Manager data —
+//! the metrics export, whose `MetricsDataSource` names the VDM namespace — exists only
+//! while the account's VDM configuration is enabled, so while that switch is off the
+//! job is refused rather than minted, with the one sentence this service names the
+//! feature to enable with ([`crate::state::enable_vdm_to_use_this_feature`]). The gate
+//! is taken after the request's own members are checked, so a request that is malformed
+//! as well is still told what is wrong with it, and before anything is allocated or
+//! stored, so a refused create leaves the account's export jobs exactly as they were.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -187,6 +197,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // A metrics export draws on the account's Virtual Deliverability Manager data
+        // (`MetricsDataSource$Namespace` names the VDM namespace), and that data exists
+        // only while the account's VDM configuration is enabled
+        // (`VdmAttributes$VdmEnabled`, which `PutAccountVdmAttributes` writes and
+        // `GetAccount` reports). While the feature is off there is nothing for such a
+        // run to draw on at all, so the job is refused — before an id is minted or
+        // anything is stored — with this service's one sentence naming the feature to
+        // enable, carried by the error this operation models for a request it cannot
+        // accept. The reads of the same feature's data refuse it with the error their
+        // own models bind for it; the sentence is the same because the condition is.
+        if source_type == crate::state::EXPORT_SOURCE_METRICS_DATA
+            && !crate::state::vdm_is_enabled(&store.account)
+        {
+            return Err(bad_request(crate::state::enable_vdm_to_use_this_feature()));
+        }
+
         // Whatever progress the stored runs had already made at `now` was due whether
         // or not anybody called, so materialising it changes nothing a later caller
         // would otherwise have seen.
