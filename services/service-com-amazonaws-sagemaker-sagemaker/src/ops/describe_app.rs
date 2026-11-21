@@ -2,9 +2,10 @@
 
 //! @op DescribeApp
 //! IMPLEMENTED: replays the app `CreateApp` stored under the same
-//! [`crate::state::AppKey`], materialising the `Pending` -> `InService` transition the
-//! clock already owes, and refuses a key nothing created with the modelled
-//! `ResourceNotFound`. This is the ONLY file to touch for this operation.
+//! [`crate::state::AppKey`], materialising the transition the clock already owes — the
+//! launch of an app coming up, or the `Deleted` of one `DeleteApp` tore down, whose record
+//! stays readable for the retention window — and refuses a key nothing created with the
+//! modelled `ResourceNotFound`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -192,7 +193,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = crate::state::app_arn(&crate::state::request_region(ctx), &key);
 
         let mut store = state.lock();
-        let Some(app) = store.apps.get_mut(&key) else {
+        let now = ::std::time::SystemTime::now();
+        // The removals the clock already completed are materialised first, so a key whose
+        // deleted app has left the retention window answers as one nothing created. Each
+        // was due at its stored instant whether or not anybody read the app.
+        store.release_purged_apps(now);
+        // The domains and profiles whose removal the clock completed go too, and with them
+        // the apps that hung off them: an app cannot outlive the domain it lives in or the
+        // profile it runs for.
+        store.release_deleted_domains(now);
+        store.release_deleted_user_profiles(now);
+
+        // The crate's one app lookup: it answers for a key nothing is stored under, and
+        // materialises the transition the clock already owed — the launch of an app that is
+        // coming up, or the `Deleted` of one being torn down. It was due at the stored
+        // instant whether or not anybody described the app, so a waiter terminates and no
+        // caller's read changes the outcome.
+        let Some((app, settled)) = store.app_mut(&key, now) else {
             return Err(DescribeAppErrorModeled::ResourceNotFound(ResourceNotFound {
                 // Same wording `DeleteApp` refuses with: the app's ARN, which names every
                 // member that identifies it, inside the sentence that says it is not there.
@@ -201,10 +218,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The only write a reporting call makes: the launch the clock already owed. It
-        // was due at the stored instant whether or not anybody described the app, so a
-        // waiter terminates and no caller's read changes the outcome.
-        let settled = app.settle_status(::std::time::SystemTime::now());
         // The ARN the create stored, which the output reports and the state-change record
         // below names — cloned once, since `output` borrows nothing of the store.
         let app_arn = app.arn.clone();

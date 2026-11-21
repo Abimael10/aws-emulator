@@ -164,6 +164,8 @@ pub(crate) fn seed_studio_owner(
             creation_time: when,
             last_modified_time: when,
             in_service_due_at: when,
+            // Nothing has asked for this profile's removal, so the clock owes it none.
+            removal_due_at: None,
         },
     );
 }
@@ -175,6 +177,10 @@ async fn created_domain(emulator: &Emulator, region: &str, name: &str) -> String
 
 /// Create a domain in `region` whose members authenticate with `auth_mode`, and answer the
 /// `DomainId` it minted.
+///
+/// The create leaves the domain `Pending`, and a domain only admits members once its own
+/// provisioning has settled, so this waits for the CONDITION — the `InService` the clock
+/// owes it — before answering, the way a real integration's retry loop does.
 async fn created_domain_with_auth(
     emulator: &Emulator,
     region: &str,
@@ -193,7 +199,30 @@ async fn created_domain_with_auth(
         "case create-domain-{name}: expected HTTP 200 from CreateDomain, got {status} with \
          {created}"
     );
-    str_field(&created, "DomainId")
+    let domain_id = str_field(&created, "DomainId");
+    wait_for_domain_in_service(emulator, region, &domain_id).await;
+    domain_id
+}
+
+/// Poll `DescribeDomain` in `region` until `domain_id` reports `InService`.
+///
+/// Waits for the CONDITION, never for a fixed time: the domain's provisioning is the
+/// clock's, and no call has to make it happen.
+pub(crate) async fn wait_for_domain_in_service(emulator: &Emulator, region: &str, domain_id: &str) {
+    let describe = json!({ "DomainId": domain_id });
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, described) = emulator.call_in(region, "DescribeDomain", &describe).await;
+        if status == 200 && str_field(&described, "Status") == DOMAIN_STATUS_IN_SERVICE {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case in-service-{domain_id}: the domain must reach {DOMAIN_STATUS_IN_SERVICE} on \
+             the clock, last read {status} {described}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// One row of the profile round-trip table: the Region it is signed for, the `AuthMode` of
@@ -572,8 +601,8 @@ async fn create_user_profile_refuses_what_it_cannot_create() {
         );
         assert_eq!(
             message(&parsed),
-            format!("Domain [{}] does not exist.", domain_arn(region, domain_id)),
-            "case {case}: the refusal names the domain it could not resolve, got {parsed}"
+            format!("Domain [{domain_id}] does not exist"),
+            "case {case}: the refusal names the domain id the request supplied, got {parsed}"
         );
         // Nothing was stored for the refused create.
         let (status, parsed) = emulator
@@ -590,7 +619,10 @@ async fn create_user_profile_refuses_what_it_cannot_create() {
         );
         assert_eq!(
             message(&parsed),
-            "UserProfile [studio-user] does not exist.",
+            format!(
+                "UserProfile [{}] does not exist.",
+                user_profile_arn(region, domain_id, "studio-user")
+            ),
             "case {case}: the reader's refusal names the profile it could not resolve, got \
              {parsed}"
         );
@@ -635,9 +667,13 @@ async fn create_user_profile_refuses_what_it_cannot_create() {
             "ResourceInUse",
             "case {case}: expected ResourceInUse, got {parsed}"
         );
-        assert!(
-            message(&parsed).contains(&user_profile_arn(region, &domain_id, duplicate)),
-            "case {case}: the refusal names the profile already in use, got {parsed}"
+        assert_eq!(
+            message(&parsed),
+            format!(
+                "A UserProfile with name '{duplicate}' already exists in Domain {domain_id}."
+            ),
+            "case {case}: the refusal names the profile already in use and its domain, got \
+             {parsed}"
         );
         // The refused create did not overwrite the stored profile: it still reports the
         // spelling the first create carried.
@@ -711,7 +747,7 @@ async fn create_app_refuses_a_user_profile_the_domain_does_not_hold() {
             case: "another-profile-exists",
             profile: Some("analyst"),
             named: "studio-user".to_string(),
-            app_type: "KernelGateway",
+            app_type: "JupyterLab",
             app_name: "kernel",
         },
         OwnerRow {
@@ -884,7 +920,7 @@ async fn delete_domain_is_served_for_a_domain_left_holding_no_app() {
                 }),
                 json!({
                     "UserProfileName": "other-user",
-                    "AppType": "KernelGateway",
+                    "AppType": "TensorBoard",
                     "AppName": "kernel"
                 }),
             ],
@@ -1000,11 +1036,19 @@ async fn delete_domain_is_served_for_a_domain_left_holding_no_app() {
     );
 
     emulator.ok("DeleteApp", &app).await;
+    // The profile the app ran for is a member of the domain too, and members go first, so
+    // the teardown is served only once that profile has been released as well.
+    emulator
+        .ok(
+            "DeleteUserProfile",
+            &json!({ "DomainId": domain_id, "UserProfileName": "studio-user" }),
+        )
+        .await;
     let (status, parsed) = emulator.call("DeleteDomain", &addressed).await;
     assert_eq!(
         status, 200,
-        "case holds-a-real-app: the teardown is served once the app is gone, got {status} \
-         with {parsed}"
+        "case holds-a-real-app: the teardown is served once the app and the profile are gone, \
+         got {status} with {parsed}"
     );
 }
 
@@ -1021,6 +1065,17 @@ async fn a_user_profile_goes_with_the_domain_it_lives_in() {
         emulator
             .ok(
                 "CreateUserProfile",
+                &json!({ "DomainId": domain_id, "UserProfileName": name }),
+            )
+            .await;
+    }
+    // "All of the members of the domain must be deleted first", so each profile's own
+    // removal is asked for before the domain's; what this case asserts is that the records
+    // left behind go with the domain rather than outliving it.
+    for name in ["studio-user", "analyst"] {
+        emulator
+            .ok(
+                "DeleteUserProfile",
                 &json!({ "DomainId": domain_id, "UserProfileName": name }),
             )
             .await;
@@ -1062,7 +1117,10 @@ async fn a_user_profile_goes_with_the_domain_it_lives_in() {
         );
         assert_eq!(
             message(&parsed),
-            format!("UserProfile [{name}] does not exist."),
+            format!(
+                "UserProfile [{}] does not exist.",
+                user_profile_arn(region, &domain_id, name)
+            ),
             "case released-with-its-domain: the refusal names the profile, got {parsed}"
         );
     }

@@ -157,6 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| DescribeUserProfileError::validation(crate::state::NO_STATE))?;
 
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
         // The two members that address a profile, resolved through the crate's one
         // user-profile lookup so this reader, the app create and whatever resolves the
@@ -166,7 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DescribeUserProfileErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(crate::state::user_profile_not_found(
+                    // This reader's SUBJECT is the profile, so the refusal names it by the
+                    // ARN the requested pair resolves to, the way the domain's own reader
+                    // does.
+                    message: Some(crate::state::user_profile_arn_not_found(
+                        &region,
+                        &input.domain_id,
                         &input.user_profile_name,
                     )),
                 },

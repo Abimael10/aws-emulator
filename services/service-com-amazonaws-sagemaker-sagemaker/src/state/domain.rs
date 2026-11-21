@@ -109,6 +109,20 @@ pub fn domain_not_found(region: &str, domain_id: &str) -> String {
     )
 }
 
+/// How an operation whose subject is a resource INSIDE the domain states a `DomainId` this
+/// account holds no domain under: the entity, then the id THE REQUEST SUPPLIED in square
+/// brackets, then `does not exist` — recorded AWS behaviour, closing period included, i.e.
+/// without one.
+///
+/// Distinct from [`domain_not_found`] on purpose: AWS words the one fact for the reader it
+/// answers. An operation addressing the DOMAIN itself (`DescribeDomain`, `DeleteDomain`)
+/// names it by the ARN its id resolves to, while one whose subject is a member of the
+/// domain (`CreateUserProfile`) names the id the caller passed, which is all that caller
+/// said about the domain.
+pub fn domain_id_not_found(domain_id: &str) -> String {
+    format!("Domain [{domain_id}] does not exist")
+}
+
 /// How the domain operations state that a domain cannot take the change asked of it while
 /// the service is already moving it: the entity, then the ARN the request resolves to IN
 /// SQUARE BRACKETS — the subject form [`domain_not_found`] names the same resource with —
@@ -128,6 +142,32 @@ pub fn domain_not_deletable(arn: &str, status: &str) -> String {
 /// [`ComAmazonawsSagemakerSagemakerState::domain_holds_apps`], which is what ASKS it.
 pub fn domain_holds_apps_refusal(arn: &str) -> String {
     format!("Domain [{arn}] has non-deleted Apps.")
+}
+
+/// How `DeleteDomain` states that the domain still holds Studio user profiles, which have
+/// to be deleted first ("All of the members of the domain must be deleted first"): the
+/// same bracketed-ARN subject as [`domain_not_found`], then the members that stand in the
+/// way.
+///
+/// Named for the sentence rather than for the question, like
+/// [`domain_holds_apps_refusal`] beside it.
+pub fn domain_holds_user_profiles_refusal(arn: &str) -> String {
+    format!("Unable to delete Domain [{arn}] because UserProfile(s) are associated with it.")
+}
+
+/// How the Studio operations state that a resource cannot be created in a domain the
+/// service has not finished provisioning: the would-be resource's ARN IN SQUARE BRACKETS,
+/// then the domain's, then the status the create needs it in.
+///
+/// A domain only admits members once it reports [`DOMAIN_STATUS_IN_SERVICE`], so this is
+/// what a create addressing a `Pending` (or failed, or tearing-down) domain is refused
+/// with. Stated once here so every create that hangs a resource off a domain words the one
+/// fact the same way.
+pub fn domain_not_in_service_refusal(entity: &str, resource_arn: &str, domain_arn: &str) -> String {
+    format!(
+        "Unable to create {entity} [{resource_arn}] because Domain [{domain_arn}] is not in \
+         {DOMAIN_STATUS_IN_SERVICE}."
+    )
 }
 
 /// A Studio domain created by `CreateDomain`, as `DescribeDomain` replays it and
@@ -290,11 +330,11 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// asked for each removal already recorded it, so nothing is answered back.
     ///
     /// The profiles go WITH the domain rather than standing in the way of its teardown:
-    /// AWS refuses a teardown while the domain still holds non-deleted user profiles, but
-    /// `DeleteUserProfile` is still a scaffold here, so gating `DeleteDomain` on profiles
-    /// no caller can release would leave the domain unrecoverable. That precondition
-    /// belongs with `DeleteUserProfile`'s own implementation; until then a released domain
-    /// takes its profiles with it so no record addresses a domain no reader resolves.
+    /// `DeleteDomain` already refuses while the domain holds a profile no
+    /// `DeleteUserProfile` has released ([`Self::domain_holds_user_profiles`]), so what is
+    /// left here is a profile whose own removal the caller asked for first — it goes when
+    /// the domain does, and so do the apps that hung off it, so no record addresses a
+    /// domain no reader resolves.
     pub fn release_deleted_domains(&mut self, now: SystemTime) {
         let released: Vec<String> = self
             .domains
@@ -306,16 +346,34 @@ impl ComAmazonawsSagemakerSagemakerState {
             self.domains.remove(id);
         }
         self.release_domain_user_profiles(&released);
+        self.release_domain_apps(&released);
     }
 
     /// Whether the domain `domain_id` still holds Studio apps, i.e. apps created in it
-    /// that no `DeleteApp` has released.
+    /// that no `DeleteApp` has torn down.
     ///
     /// An app hangs off the domain it was created in ([`AppKey::domain_id`]), so this is
     /// what `DeleteDomain` weighs before tearing the domain down: releasing the domain
     /// while its apps stayed behind would leave records addressing a domain no reader
-    /// resolves.
+    /// resolves. The retained record of a deleted app ([`App::is_released`]) is not a
+    /// running app, so it stands in nothing's way.
     pub fn domain_holds_apps(&self, domain_id: &str) -> bool {
-        self.apps.keys().any(|key| key.domain_id == domain_id)
+        self.apps
+            .iter()
+            .any(|(key, app)| key.domain_id == domain_id && !app.is_released())
+    }
+
+    /// Whether the domain `domain_id` still holds Studio user profiles, i.e. profiles
+    /// created in it that no `DeleteUserProfile` has released.
+    ///
+    /// A user profile is "a single user within a domain", so it is one of the members AWS
+    /// requires to be deleted before the domain itself: this is what `DeleteDomain` weighs
+    /// beside [`Self::domain_holds_apps`]. A profile already on its way out
+    /// ([`UserProfile::is_deleting`]) is not counted — the caller has asked for its
+    /// removal, which is the order the teardown has to follow.
+    pub fn domain_holds_user_profiles(&self, domain_id: &str) -> bool {
+        self.user_profiles
+            .values()
+            .any(|profile| profile.domain_id == domain_id && !profile.is_deleting())
     }
 }

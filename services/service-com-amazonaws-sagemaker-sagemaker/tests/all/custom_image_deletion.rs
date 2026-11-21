@@ -162,6 +162,30 @@ fn str_field(body: &Value, member: &str) -> String {
         .to_string()
 }
 
+/// Poll `DescribeDomain` in `region` until `domain_id` reports `InService`.
+///
+/// A Studio domain comes up `Pending` and admits members only once its own provisioning
+/// has settled, which is the clock's: this waits for the CONDITION, never for a fixed time.
+async fn wait_for_domain_in_service(emulator: &Emulator, region: &str, domain_id: &str) {
+    // Far longer than the span the state gives a domain's provisioning, so a loaded host
+    // still settles well inside it; only the loop's condition decides when it stops.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let (status, described) = emulator
+            .call_in(region, "DescribeDomain", &json!({ "DomainId": domain_id }))
+            .await;
+        if status == 200 && str_field(&described, "Status") == "InService" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case in-service-{domain_id}: the domain must reach InService on the clock, last \
+             read {status} {described}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 /// RULE: an accepted `DeleteImage` releases the named image together with EVERY version of
 /// it, so neither the image nor any of its versions is readable afterwards and the name is
 /// free for a new image whose versions number from 1 again.
@@ -400,6 +424,8 @@ async fn an_image_a_studio_app_runs_on_is_in_use_and_refused() {
             )
             .await;
         let domain_id = str_field(&domain, "DomainId");
+        // A domain admits members only once its own provisioning has settled.
+        wait_for_domain_in_service(&emulator, "us-east-1", &domain_id).await;
         emulator
             .ok(
                 "CreateUserProfile",
@@ -409,7 +435,7 @@ async fn an_image_a_studio_app_runs_on_is_in_use_and_refused() {
         let app = json!({
             "DomainId": domain_id,
             "UserProfileName": "studio-user",
-            "AppType": "KernelGateway",
+            "AppType": "JupyterLab",
             "AppName": format!("app-{case}"),
         });
         let mut create_app = app
@@ -491,6 +517,7 @@ async fn an_image_a_studio_app_runs_on_is_in_use_and_refused() {
         )
         .await;
     let domain_id = str_field(&domain, "DomainId");
+    wait_for_domain_in_service(&emulator, "us-east-1", &domain_id).await;
     emulator
         .ok(
             "CreateUserProfile",

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUserProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUserProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUserProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the Studio user profiles stored in `crate::state`, filtered by the
+//! members the request searches on and sorted as it asks. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUserProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUserProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUserProfiles"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| ListUserProfilesError::validation(crate::state::NO_STATE))?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a profile
+        // whose own removal is done — or whose domain's is — is left out of the page and the
+        // quota slot it held is free again. Each was due at its stored instant whether or
+        // not anybody listed the profiles.
+        store.release_deleted_domains(now);
+        store.release_deleted_user_profiles(now);
+        // The only other write this reporting call makes: the `Pending` -> `InService`
+        // moves the clock already owed. Each was due at the profile's stored instant
+        // whether or not anybody listed them, so no caller's read changes what a later one
+        // sees.
+        let mut settled: Vec<String> = Vec::new();
+        for profile in store.user_profiles.values_mut() {
+            if profile.settle_status(now) {
+                settled.push(profile.arn.clone());
+            }
+        }
+        for arn in &settled {
+            // Each transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+
+        // Each search member narrows the page: `DomainIdEquals` to the profiles of that
+        // domain, `UserProfileNameContains` to the names that CONTAIN the value (the member
+        // is named for the test it applies, unlike the `…Equals` ones), case-insensitively,
+        // since `UserProfileName` "is not case sensitive". An absent member narrows
+        // nothing.
+        let contains = input
+            .user_profile_name_contains
+            .as_deref()
+            .map(str::to_ascii_lowercase);
+        let listed: Vec<(String, ::std::time::SystemTime, UserProfileDetails)> = store
+            .user_profiles
+            .values()
+            .filter(|profile| {
+                input
+                    .domain_id_equals
+                    .as_deref()
+                    .is_none_or(|domain_id| profile.domain_id == domain_id)
+                    && contains.as_deref().is_none_or(|fragment| {
+                        profile.name.to_ascii_lowercase().contains(fragment)
+                    })
+            })
+            .map(|profile| {
+                // `SortBy`'s members are `CreationTime` (its documented default) and
+                // `LastModifiedTime`, so the instant the page is ordered by is the one the
+                // request asked for.
+                let sort_key = match input.sort_by.as_deref() {
+                    Some(crate::state::USER_PROFILE_SORT_BY_LAST_MODIFIED_TIME) => {
+                        profile.last_modified_time
+                    }
+                    _ => profile.creation_time,
+                };
+                (
+                    crate::state::user_profile_page_id(&profile.domain_id, &profile.name),
+                    sort_key,
+                    UserProfileDetails {
+                        domain_id: Some(profile.domain_id.clone()),
+                        // The name as the create spelled it, not the case-folded store key.
+                        user_profile_name: Some(profile.name.clone()),
+                        status: Some(profile.status.clone()),
+                        creation_time: Some(crate::state::timestamp(profile.creation_time)),
+                        last_modified_time: Some(crate::state::timestamp(
+                            profile.last_modified_time,
+                        )),
+                    },
+                )
+            })
+            .collect();
+        drop(store);
+
+        // The page is ordered by the instant the request named, with the profile's own id
+        // breaking a tie so two profiles of the same instant keep ONE stable order across
+        // calls. `SortOrder` defaults to `Ascending` on this operation ("The sort order for
+        // the results. The default is Ascending.").
+        let mut listed = listed;
+        listed.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+        if input.sort_order.as_deref() == Some(crate::state::ORDER_DESCENDING) {
+            listed.reverse();
+        }
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|page_id| listed.iter().position(|listed| listed.0 == page_id))
+                    .ok_or_else(|| {
+                        ListUserProfilesError::validation(crate::state::STALE_PAGE_TOKEN)
+                    })?;
+                resumed_after + 1
+            }
+        };
+        let start = start.min(listed.len());
+
+        // `MaxResults` caps the page ("an upper bound, not a target", defaulting to 10),
+        // and so does the service's own ceiling: one call can never serialise the whole
+        // store. The token below is emitted whenever anything is left, so a paginating
+        // client walks the full result set exactly once either way.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::USER_PROFILE_DEFAULT_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE)
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(listed.len());
+
+        let next_token = match listed.get(end.saturating_sub(1)) {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end > start && end < listed.len() => {
+                Some(crate::state::encode_page_token(&last.0))
+            }
+            _ => None,
+        };
+        Ok(ListUserProfilesOutput {
+            user_profiles: Some(
+                listed[start..end]
+                    .iter()
+                    .map(|(_, _, details)| details.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

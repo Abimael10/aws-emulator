@@ -3,8 +3,9 @@
 //! @op CreateApp
 //! IMPLEMENTED: stores a Studio app in `crate::state` under the [`crate::state::AppKey`]
 //! its five input members name, launching it `Pending` with the `InService` transition
-//! the clock owes recorded, and refuses a key that is already in use with the modelled
-//! `ResourceInUse`. This is the ONLY file to touch for this operation.
+//! the clock owes recorded; refuses an `AppType` the service has withdrawn, and a key
+//! whose app has not reached a terminal status with the modelled `ResourceInUse`. This is
+//! the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -175,8 +176,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let arn = crate::state::app_arn(&region, &key);
 
+        // The service has withdrawn some of the modelled `AppType`s, and refuses to launch
+        // an app of one of them at all — weighed here, before the store is even reached, so
+        // such a request can never leave a record behind. The model marks no member
+        // deprecated, so the refusal travels as the service-common `ValidationException`.
+        if crate::state::DEPRECATED_APP_TYPES.contains(&input.app_type.as_str()) {
+            return Err(CreateAppError::validation(
+                crate::state::deprecated_app_type_refusal(&input.app_type),
+            ));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The records whose retention window the clock already closed are dropped first, so
+        // a key whose deleted app has left that window is free again here. Each was due at
+        // its stored instant whether or not anybody called, so this call's observer makes no
+        // difference to the result.
+        store.release_purged_apps(now);
+        // The domains and profiles whose removal the clock completed go too, and with them
+        // the apps that hung off them.
+        store.release_deleted_domains(now);
+        store.release_deleted_user_profiles(now);
         // An app lives in the domain the request names and runs FOR its owner ("Creates a
         // running app for the specified UserProfile"), so both parents have to be ones this
         // service holds: a `DomainId` that resolves to no domain, or a user profile that
@@ -206,18 +226,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "The account-level service limit for apps is {}, with current \
                      utilization of {} and a request delta of 1.",
                     crate::state::APP_QUOTA,
-                    store.apps.len()
+                    store.running_app_count()
                 )),
             })
             .into());
         }
-        // An app already running under this key is the resource this call would have to
-        // take over, so the create is refused rather than overwriting it.
-        if store.apps.contains_key(&key) {
-            return Err(CreateAppErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(format!("App [{arn}] already exists.")),
-            })
-            .into());
+        // An app under this key the service has not finished with is the resource this call
+        // would have to take over, so the create is refused rather than overwriting it, and
+        // the refusal reports the status the caller has to wait for. An app that reached a
+        // terminal status — the retained record of a deleted one — is NOT in the way: AWS's
+        // own sentence says a restart waits for exactly that, so the launch below replaces
+        // it. The status is resolved through the crate's one app lookup, so the transition
+        // the clock already owed is weighed, not the status the record was left in.
+        if let Some((app, _)) = store.app_mut(&key, now) {
+            if !app.is_restartable() {
+                let refusal = crate::state::app_in_use_refusal(&app.arn, &app.status);
+                return Err(CreateAppErrorModeled::ResourceInUse(ResourceInUse {
+                    message: Some(refusal),
+                })
+                .into());
+            }
         }
 
         store.apps.insert(
@@ -236,6 +264,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 in_service_at: now + crate::state::APP_IN_SERVICE_AFTER,
+                // Nothing has asked for this app's teardown, so the clock owes it none.
+                deletion_requested_at: None,
             },
         );
         drop(store);

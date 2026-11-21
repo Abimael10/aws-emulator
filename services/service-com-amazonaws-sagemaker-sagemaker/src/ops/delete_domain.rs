@@ -164,10 +164,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // again. Each was due at its stored instant whether or not anybody called, so
         // this call's observer makes no difference to the result.
         store.release_deleted_domains(now);
+        store.release_deleted_user_profiles(now);
 
-        // Whether the domain still holds Studio apps is asked before the record is taken
-        // mutably, so the one store answers both questions under one lock.
+        // Whether the domain still holds Studio apps or user profiles is asked before the
+        // record is taken mutably, so the one store answers every question under one lock.
         let holds_apps = store.domain_holds_apps(&input.domain_id);
+        let holds_user_profiles = store.domain_holds_user_profiles(&input.domain_id);
 
         // `DomainId` is the only member that addresses a domain, resolved through the
         // crate's one domain lookup so this call and every reader agree on which ids
@@ -205,6 +207,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no reader resolves.
         if holds_apps {
             let refusal = crate::state::domain_holds_apps_refusal(&domain.arn);
+            return Err(DeleteDomainErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(refusal),
+            })
+            .into());
+        }
+
+        // The same rule for the domain's other members: "All of the members of the domain
+        // must be deleted first", so a domain that still holds a user profile no
+        // `DeleteUserProfile` has released is in use and nothing is torn down — the domain
+        // and the profile are both left exactly as they were. `ResourceInUse` is what this
+        // operation models for a domain whose members stand in the way.
+        if holds_user_profiles {
+            let refusal = crate::state::domain_holds_user_profiles_refusal(&domain.arn);
             return Err(DeleteDomainErrorModeled::ResourceInUse(ResourceInUse {
                 message: Some(refusal),
             })

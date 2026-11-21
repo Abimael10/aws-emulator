@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListApps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListApps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: pages the Studio apps stored in `crate::state`, filtered by the members
+//! the request searches on and sorted as it asks. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListApps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A deleted app is reported too, for as long as its record is retained
+//! ([`crate::state::APP_RETAINED_AFTER`]): "apps are available in the ListApps API results
+//! for only 24 hours after deletion", which is what lets an audit flow list the apps that
+//! were torn down recently.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +151,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListApps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAppsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListApps"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| ListAppsError::validation(crate::state::NO_STATE))?;
+
+        // "A parameter to search by space name. If UserProfileNameEquals is set, then this
+        // value cannot be set" — and the mirror of it on the other member, so a request
+        // naming both searches for an app that cannot exist. The model marks neither
+        // member exclusive, so the refusal travels as the service-common
+        // `ValidationException`.
+        if input.user_profile_name_equals.is_some() && input.space_name_equals.is_some() {
+            return Err(ListAppsError::validation(
+                crate::state::APP_SEARCH_OWNER_EXCLUSIVE,
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so an app whose
+        // retention window has closed is left out of the page. Each was due at its stored
+        // instant whether or not anybody listed the apps.
+        store.release_purged_apps(now);
+        // The domains and profiles whose removal the clock completed go too, and with them
+        // the apps that hung off them: an app cannot outlive the domain it lives in or the
+        // profile it runs for.
+        store.release_deleted_domains(now);
+        store.release_deleted_user_profiles(now);
+        // The only other write this reporting call makes: the transitions the clock already
+        // owed each app — the launch of one coming up, the `Deleted` of one being torn
+        // down. Each was due at the app's stored instant whether or not anybody listed the
+        // apps, so no caller's read changes what a later one sees.
+        let mut settled: Vec<String> = Vec::new();
+        for app in store.apps.values_mut() {
+            if app.settle_status(now) {
+                settled.push(app.arn.clone());
+            }
+        }
+        for arn in &settled {
+            // Each transition is a state change, so it leaves the same record a create
+            // does rather than happening unobservably on a read path.
+            crate::state::record_state_change(Self::NAME, arn, ctx);
+        }
+
+        // Each search member narrows the page to the apps whose own member equals it; an
+        // absent one narrows nothing. The summaries are built here, so the store guard is
+        // released before the response is, and each is paired with the id the page token
+        // names it by — the five members that identify it, which is what makes a token land
+        // on the same boundary on the next page.
+        let listed: Vec<(String, AppDetails)> = store
+            .apps
+            .iter()
+            .filter(|(key, _)| {
+                input
+                    .domain_id_equals
+                    .as_deref()
+                    .is_none_or(|domain_id| key.domain_id == domain_id)
+                    && input
+                        .user_profile_name_equals
+                        .as_deref()
+                        .is_none_or(|owner| key.owner.user_profile_name().as_deref() == Some(owner))
+                    && input
+                        .space_name_equals
+                        .as_deref()
+                        .is_none_or(|owner| key.owner.space_name().as_deref() == Some(owner))
+            })
+            .map(|(key, app)| {
+                (
+                    crate::state::app_page_id(key),
+                    AppDetails {
+                        domain_id: Some(key.domain_id.clone()),
+                        user_profile_name: key.owner.user_profile_name(),
+                        space_name: key.owner.space_name(),
+                        app_type: Some(key.app_type.clone()),
+                        app_name: Some(key.app_name.clone()),
+                        status: Some(app.status.clone()),
+                        creation_time: Some(crate::state::timestamp(app.creation_time)),
+                        resource_spec: app.resource_spec.clone(),
+                    },
+                )
+            })
+            .collect();
+        // The creation instants the sort below orders by, read under the same lock.
+        let created_at: ::std::collections::BTreeMap<String, ::std::time::SystemTime> = store
+            .apps
+            .iter()
+            .map(|(key, app)| (crate::state::app_page_id(key), app.creation_time))
+            .collect();
+        drop(store);
+
+        // `SortBy`'s only modelled member is `CreationTime`, which is also its documented
+        // default, so every page is ordered by the instant each app was created, with the
+        // app's own id breaking a tie so two apps created in the same instant keep ONE
+        // stable order across calls. `SortOrder` defaults to `Ascending` on this operation
+        // ("The sort order for the results. The default is Ascending.").
+        let mut listed = listed;
+        listed.sort_by(|left, right| {
+            created_at
+                .get(&left.0)
+                .cmp(&created_at.get(&right.0))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        if input.sort_order.as_deref() == Some(crate::state::ORDER_DESCENDING) {
+            listed.reverse();
+        }
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|page_id| listed.iter().position(|listed| listed.0 == page_id))
+                    .ok_or_else(|| ListAppsError::validation(crate::state::STALE_PAGE_TOKEN))?;
+                resumed_after + 1
+            }
+        };
+        let start = start.min(listed.len());
+
+        // `MaxResults` caps the page ("an upper bound, not a target", defaulting to 10),
+        // and so does the service's own ceiling: one call can never serialise the whole
+        // store. The token below is emitted whenever anything is left, so a paginating
+        // client walks the full result set exactly once either way.
+        let page_size = input
+            .max_results
+            .unwrap_or(crate::state::APP_DEFAULT_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE)
+            .unsigned_abs() as usize;
+        let end = start.saturating_add(page_size).min(listed.len());
+
+        let next_token = match listed.get(end.saturating_sub(1)) {
+            // A token only where a further page exists, so a paginating client stops.
+            Some(last) if end > start && end < listed.len() => {
+                Some(crate::state::encode_page_token(&last.0))
+            }
+            _ => None,
+        };
+        Ok(ListAppsOutput {
+            apps: Some(
+                listed[start..end]
+                    .iter()
+                    .map(|(_, details)| details.clone())
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

@@ -26,6 +26,7 @@ use service_com_amazonaws_sagemaker_sagemaker::state::{
 
 use crate::hyperpod_cluster_audit_record::audit_capture;
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
+use crate::studio_user_profiles::wait_for_domain_in_service;
 
 /// An execution role inside `RoleArn`'s modelled pattern, for the `DefaultUserSettings`
 /// every create must carry.
@@ -520,7 +521,7 @@ async fn delete_domain_refuses_a_domain_that_still_holds_apps() {
         ),
         (
             "one-space-app",
-            vec![json!({ "SpaceName": "shared", "AppType": "KernelGateway", "AppName": "kernel" })],
+            vec![json!({ "SpaceName": "shared", "AppType": "JupyterLab", "AppName": "kernel" })],
         ),
         (
             "apps-under-both-owner-members",
@@ -533,6 +534,9 @@ async fn delete_domain_refuses_a_domain_that_still_holds_apps() {
         let created = emulator.ok("CreateDomain", &minimal("hosting", "IAM")).await;
         let domain_id = str_field(&created, "DomainId");
         let request = json!({ "DomainId": domain_id });
+        // A domain admits members only once its own provisioning has settled, so each row
+        // waits for the CONDITION the clock owes it before creating anything in it.
+        wait_for_domain_in_service(&emulator, "us-east-1", &domain_id).await;
         // An app runs for the user profile its request names, and `CreateApp` resolves
         // that owner in the domain, so each row's user-profile owner is created first. A
         // space owner is not a resource this service holds records of.
@@ -585,7 +589,8 @@ async fn delete_domain_refuses_a_domain_that_still_holds_apps() {
         );
 
         // Releasing the apps is what unblocks the call, so the same request is served
-        // once the domain holds none.
+        // once the domain holds none — and, with them, the user profiles those apps ran
+        // for, since every member of the domain has to be deleted before the domain is.
         for (index, app) in apps.iter().enumerate() {
             let body = with_members(&request, app);
             let (status, parsed) = emulator.call("DeleteApp", &body).await;
@@ -602,6 +607,17 @@ async fn delete_domain_refuses_a_domain_that_still_holds_apps() {
                     "case {case}: the teardown is refused while {} app(s) are left, got \
                      {status} with {parsed}",
                     apps.len() - index - 1
+                );
+            }
+        }
+        for app in &apps {
+            if let Some(owner) = app.get("UserProfileName").and_then(Value::as_str) {
+                let profile = with_members(&request, &json!({ "UserProfileName": owner }));
+                let (status, parsed) = emulator.call("DeleteUserProfile", &profile).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: expected HTTP 200 from DeleteUserProfile {profile}, got \
+                     {status} with {parsed}"
                 );
             }
         }

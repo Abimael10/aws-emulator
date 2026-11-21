@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApp
-//! IMPLEMENTED: stops and deletes the app stored under the [`crate::state::AppKey`] its
-//! five input members name, so a later `DescribeApp` or `DeleteApp` for that key is
-//! refused with the modelled `ResourceNotFound`. This is the ONLY file to touch for this
-//! operation.
+//! IMPLEMENTED: tears down the app stored under the [`crate::state::AppKey`] its five
+//! input members name, parking the record in `AppStatus`'s `Deleting` with the `Deleted`
+//! transition the clock owes recorded. This is the ONLY file to touch for this operation.
 //!
-//! The record is RELEASED here rather than parked in `AppStatus`'s `Deleting` and then
-//! `Deleted`: this emulator runs no app teardown, so there is no work for a transient
-//! status to report, and holding a deleted record would grow the store without end. An
-//! issue that needs those two statuses observable is the one that should add them.
+//! The record is RETAINED rather than released: SageMaker keeps answering for a deleted
+//! app while it is inside the retention window ([`crate::state::APP_RETAINED_AFTER`]), so
+//! a client polling `DescribeApp` watches the teardown settle instead of being told the
+//! app never existed. A second delete is refused over the status the app is in — in flight
+//! or already settled — and the modelled `ResourceNotFound` is reserved for a key nothing
+//! ever created, or one whose retained record has left the window.
 //!
 //! ## Shape of an operation
 //!
@@ -177,11 +178,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(DeleteAppError::validation)?;
         let arn = crate::state::app_arn(&crate::state::request_region(ctx), &key);
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // Deleting releases the record, so the app is gone for every later caller. A key
-        // nothing created — or one a previous delete already released — is the
-        // not-found case the operation models.
-        if store.apps.remove(&key).is_none() {
+        // The records whose retention window the clock already closed are dropped first, so
+        // a key whose deleted app has left that window answers as one nothing created. Each
+        // was due at its stored instant whether or not anybody called, so this call's
+        // observer makes no difference to the result.
+        store.release_purged_apps(now);
+        // The domains and profiles whose removal the clock completed go too, and with them
+        // the apps that hung off them: an app cannot outlive the domain it lives in or the
+        // profile it runs for.
+        store.release_deleted_domains(now);
+        store.release_deleted_user_profiles(now);
+
+        // The crate's one app lookup, so this call weighs the status the clock already owed
+        // the app rather than the one the record was left in. A key nothing created — or one
+        // whose retained record has left the window — is the not-found case the operation
+        // models.
+        let Some((app, _)) = store.app_mut(&key, now) else {
             return Err(DeleteAppErrorModeled::ResourceNotFound(ResourceNotFound {
                 // The wording the service builds from the request: the app's ARN, which
                 // names every member that identifies it, inside the sentence that says
@@ -189,7 +203,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(format!("App [{arn}] does not exist.")),
             })
             .into());
+        };
+
+        // A teardown this call cannot ask for again: the first `DeleteApp` already started
+        // it, so the app is either still on its way out or already settled, and each state
+        // has its own sentence. Neither is `ResourceNotFound` — the app IS there, which is
+        // what lets an idempotent teardown tell "already deleted" from "never existed". The
+        // model declares no validation error for this operation, so both refusals travel as
+        // the service-common `ValidationException`.
+        if app.is_released() {
+            let refusal = if app.status == crate::state::APP_STATUS_DELETED {
+                crate::state::app_already_deleted_refusal(&input.app_name)
+            } else {
+                crate::state::app_already_deleting_refusal(&input.app_name)
+            };
+            return Err(DeleteAppError::validation(refusal));
         }
+
+        // The record is kept until the retention window closes, so the `Deleting` status a
+        // caller reads straight after this call — and the `Deleted` the clock settles it on
+        // — are both observable.
+        app.begin_deletion(now);
+        // The retention window is a day, so the records of deleted apps are bounded here
+        // rather than only by the clock.
+        store.prune_deleted_apps();
         drop(store);
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);

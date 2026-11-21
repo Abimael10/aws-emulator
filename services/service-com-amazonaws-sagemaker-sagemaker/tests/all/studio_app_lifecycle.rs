@@ -11,13 +11,15 @@
 //! The tests assert RULES over a TABLE of inputs rather than one recorded call: an app
 //! is identified by all five of `DomainId`, the owning `UserProfileName` **or**
 //! `SpaceName`, `AppType` and `AppName`, so the round trip, the not-found refusal and
-//! the release-on-delete are asserted for every app type in the modelled catalog, for
-//! both owner kinds, and for a request that differs from a stored app in each single
-//! component.
+//! the teardown are asserted for every app type a create accepts, for both owner kinds,
+//! and for a request that differs from a stored app in each single component.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_sagemaker_sagemaker::state::{
+    self, ComAmazonawsSagemakerSagemakerState,
+};
 
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
 use crate::studio_user_profiles::{seed_studio_domain, seed_studio_owner};
@@ -36,6 +38,11 @@ const APP_TYPES: [&str; 9] = [
     "RStudioServerPro",
     "TensorBoard",
 ];
+
+/// The `AppType`s the service has WITHDRAWN, which no `CreateApp` launches an app of
+/// (`state::DEPRECATED_APP_TYPES`). They are still members of the modelled enum, so an app
+/// of one is still addressed, read and deleted.
+const DEPRECATED_APP_TYPES: [&str; 1] = ["KernelGateway"];
 
 /// How long a poll below gives the clock to launch an app: far longer than the span the
 /// state gives `state::APP_IN_SERVICE_AFTER`, so a loaded host still settles well inside
@@ -145,6 +152,44 @@ fn seed_owner(emulator: &Emulator, app: &AppRef, region: &str) {
     }
 }
 
+/// Put `app` into the store as one whose teardown was asked for at `requested_at`, so a
+/// case can drive the states a deleted app reports without depending on how fast the host
+/// runs: a `requested_at` in the future keeps it `Deleting`, one in the past settles it on
+/// `Deleted` for the first reader.
+///
+/// Seeded directly into the store the handlers read, the way this suite seeds the domain
+/// and the profile an app hangs off ([`seed_owner`]): what is under test is what the
+/// handlers answer FOR each state, not how the record got into it.
+fn seed_deleting_app(emulator: &Emulator, app: &AppRef, region: &str, requested_at: SystemTime) {
+    seed_owner(emulator, app, region);
+    let key = state::app_key(
+        &app.domain,
+        (app.owner_member == "UserProfileName").then_some(app.owner_name.as_str()),
+        (app.owner_member == "SpaceName").then_some(app.owner_name.as_str()),
+        app.app_type,
+        &app.app_name,
+    )
+    .expect("the row names exactly one owner");
+    let store = emulator
+        .engine
+        .state::<ComAmazonawsSagemakerSagemakerState>();
+    let mut store = store.lock();
+    let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600);
+    store.apps.insert(
+        key,
+        state::App {
+            arn: app.arn_in(region),
+            status: state::APP_STATUS_DELETING.to_string(),
+            resource_spec: None,
+            recovery_mode: None,
+            tags: Vec::new(),
+            creation_time: created,
+            in_service_at: created,
+            deletion_requested_at: Some(requested_at),
+        },
+    );
+}
+
 /// The rows the round-trip and release rules are asserted over: every app type in the
 /// catalog, alternating owner kind, domain ids and app names at their modelled extremes,
 /// and the optional members present on some rows and absent on others.
@@ -221,12 +266,12 @@ fn round_trip_rows() -> Vec<(AppRef, Value, Value)> {
         ),
         (
             AppRef::new(
-                "kernel-gateway-full-resource-spec",
+                "jupyter-lab-full-resource-spec",
                 "d-abc123",
                 "SpaceName",
                 "team-space",
-                "KernelGateway",
-                "kg-1",
+                "JupyterLab",
+                "full-spec",
             ),
             json!({
                 "ResourceSpec": {
@@ -375,13 +420,15 @@ async fn an_app_arn_names_the_region_the_caller_signed_for() {
     let emulator = Emulator::new();
 
     for region in ["us-east-1", "eu-west-2", "ap-southeast-4"] {
+        // The app's key carries no Region, so each row names its own app: a key whose app
+        // a previous row tore down is retained, not free.
         let app = AppRef::new(
             region,
             "d-abc123",
             "UserProfileName",
             "studio-user",
             "JupyterLab",
-            "regional",
+            &format!("regional-{region}"),
         );
         seed_owner(&emulator, &app, region);
         let (status, created) = emulator.call_in(region, "CreateApp", &app.body()).await;
@@ -558,7 +605,9 @@ async fn deleting_an_app_that_is_not_stored_is_refused_with_resource_not_found()
         "case stored-app-survives: AppArn, got {described:?}"
     );
 
-    // And a key a delete already released is refused the same way.
+    // And a key whose app a delete has already torn down is NOT answered as not found:
+    // the record is retained, so the second delete reports the teardown instead — which is
+    // what lets idempotent teardown code tell "already deleted" from "never existed".
     let (status, parsed) = emulator.call("DeleteApp", &stored.body()).await;
     assert_eq!(
         status, 200,
@@ -571,16 +620,35 @@ async fn deleting_an_app_that_is_not_stored_is_refused_with_resource_not_found()
     );
     assert_eq!(
         error_code(&parsed),
-        "ResourceNotFound",
+        "ValidationException",
         "case second-delete: error code, got {parsed:?}"
+    );
+    // Either sentence is correct here, because WHICH status the app is in is the clock's:
+    // each one is asserted on its own, against a seeded app in that exact state, by
+    // `deleting_or_recreating_an_app_being_torn_down_is_refused_over_its_status`.
+    let sentences = [
+        format!(
+            "App [{}] is already being deleted. Wait until the app is deleted.",
+            stored.app_name
+        ),
+        format!(
+            "App [{}] has already been deleted. For tracking purposes, apps are available \
+             in the ListApps API results for only 24 hours after deletion.",
+            stored.app_name
+        ),
+    ];
+    assert!(
+        sentences.contains(&message(&parsed)),
+        "case second-delete: the refusal must report the teardown, got {parsed:?}"
     );
 }
 
-/// RULE: a delete releases exactly the app its five members name — that app becomes
-/// unreadable (HTTP 400 `ResourceNotFound`) and its key is free to create again, while
-/// every app differing in any single member is untouched.
+/// RULE: a delete tears down exactly the app its five members name — that app reports the
+/// non-terminal `Deleting` from the call and settles on `Deleted`, which its record keeps
+/// answering for the whole retention window, while every app differing in any single member
+/// is untouched; once it has settled, its key takes a fresh app again.
 #[tokio::test]
-async fn deleting_an_app_releases_it_and_leaves_every_other_app_alone() {
+async fn deleting_an_app_tears_down_only_that_app_and_keeps_reporting_it() {
     let emulator = Emulator::new();
 
     // Four apps that pairwise differ in exactly one identifying member, so a delete
@@ -599,7 +667,7 @@ async fn deleting_an_app_releases_it_and_leaves_every_other_app_alone() {
             "d-abc123",
             "UserProfileName",
             "studio-user",
-            "KernelGateway",
+            "Canvas",
             "shared-name",
         ),
         AppRef::new(
@@ -626,20 +694,38 @@ async fn deleting_an_app_releases_it_and_leaves_every_other_app_alone() {
 
     emulator.ok("DeleteApp", &apps[0].body()).await;
 
-    let (status, parsed) = emulator.call("DescribeApp", &apps[0].body()).await;
+    // The deleted app is still readable, and reports a status from the teardown rather
+    // than the one it was launched in.
+    let described = emulator.ok("DescribeApp", &apps[0].body()).await;
     assert_eq!(
-        status, 400,
-        "case deleted-app: expected HTTP 400 from DescribeApp, got {status} with {parsed:?}"
+        str_field(&described, "AppArn"),
+        apps[0].arn(),
+        "case deleted-app: a deleted app's record is retained, got {described:?}"
     );
-    assert_eq!(
-        error_code(&parsed),
-        "ResourceNotFound",
-        "case deleted-app: error code, got {parsed:?}"
+    assert!(
+        ["Deleting", "Deleted"].contains(&str_field(&described, "Status").as_str()),
+        "case deleted-app: a deleted app reports its teardown, got {described:?}"
     );
+
+    // Wait for the CONDITION: the `Deleted` status is the clock's, and no call has to make
+    // it happen.
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    let settled = loop {
+        let described = emulator.ok("DescribeApp", &apps[0].body()).await;
+        if str_field(&described, "Status") == "Deleted" {
+            break described;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case deleted-app: the app must reach Deleted on the clock, last read \
+             {described:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
+    let again = emulator.ok("DescribeApp", &apps[0].body()).await;
     assert_eq!(
-        message(&parsed),
-        format!("App [{}] does not exist.", apps[0].arn()),
-        "case deleted-app: the refusal must name the released app, got {parsed:?}"
+        again, settled,
+        "case deleted-app-repeated-read: a settled app must read back identically"
     );
 
     for app in &apps[1..] {
@@ -650,9 +736,15 @@ async fn deleting_an_app_releases_it_and_leaves_every_other_app_alone() {
             "case {}: a sibling app must be untouched by the delete, got {described:?}",
             app.case
         );
+        assert!(
+            ["Pending", "InService"].contains(&str_field(&described, "Status").as_str()),
+            "case {}: a sibling app must still be running, got {described:?}",
+            app.case
+        );
     }
 
-    // The released key is free again, and the app created under it is a fresh one.
+    // A settled app's key takes a fresh app again — the status AWS's own refusal names as
+    // the one to wait for — and the new app is launching rather than deleted.
     let recreated = emulator.ok("CreateApp", &apps[0].body()).await;
     assert_eq!(
         str_field(&recreated, "AppArn"),
@@ -667,8 +759,188 @@ async fn deleting_an_app_releases_it_and_leaves_every_other_app_alone() {
     );
 }
 
-/// RULE: a `CreateApp` whose five identifying members are already in use is refused with
-/// the modelled `ResourceInUse`, so the running app is never silently replaced.
+/// RULE: every `AppType` the service has withdrawn is refused by `CreateApp` with HTTP 400
+/// `ValidationException` — `Invalid AppType [<AppType>]. This AppType has been deprecated.`
+/// — before any app is stored, while every other member of the enum is launched.
+#[tokio::test]
+async fn creating_an_app_of_a_withdrawn_app_type_is_refused() {
+    let emulator = Emulator::new();
+
+    // Rows: each withdrawn type under each owner kind, so the refusal is about the type
+    // rather than about who owns the app.
+    for app_type in DEPRECATED_APP_TYPES {
+        for owner_member in OWNER_MEMBERS {
+            let app = AppRef::new(
+                &format!("{app_type}-{owner_member}"),
+                "d-abc123",
+                owner_member,
+                "studio-user",
+                app_type,
+                "withdrawn",
+            );
+            let case = &app.case;
+            seed_owner(&emulator, &app, "us-east-1");
+            let (status, parsed) = emulator.call("CreateApp", &app.body()).await;
+            assert_eq!(
+                status, 400,
+                "case {case}: expected HTTP 400 from CreateApp, got {status} with {parsed:?}"
+            );
+            assert_eq!(
+                error_code(&parsed),
+                "ValidationException",
+                "case {case}: error code, got {parsed:?}"
+            );
+            assert_eq!(
+                message(&parsed),
+                format!("Invalid AppType [{app_type}]. This AppType has been deprecated."),
+                "case {case}: the refusal must name the withdrawn app type, got {parsed:?}"
+            );
+
+            // Nothing was stored for the refused create.
+            let (status, parsed) = emulator.call("DescribeApp", &app.body()).await;
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "ResourceNotFound"),
+                "case {case}: the refused create stored nothing, got {status} with {parsed:?}"
+            );
+        }
+    }
+
+    // The positive control: every type the service still serves is launched.
+    for app_type in APP_TYPES
+        .iter()
+        .filter(|app_type| !DEPRECATED_APP_TYPES.contains(app_type))
+    {
+        let app = AppRef::new(
+            app_type,
+            "d-abc123",
+            "UserProfileName",
+            "studio-user",
+            app_type,
+            "served",
+        );
+        seed_owner(&emulator, &app, "us-east-1");
+        let (status, created) = emulator.call("CreateApp", &app.body()).await;
+        assert_eq!(
+            status, 200,
+            "case {app_type}: a type the service serves is launched, got {status} with \
+             {created:?}"
+        );
+    }
+}
+
+/// RULE: a second `DeleteApp` for an app the service is already tearing down, or has torn
+/// down, is refused with HTTP 400 `ValidationException` and the sentence for the status the
+/// app is in — never with the not-found refusal, which is reserved for a key nothing
+/// created — and a `CreateApp` for that key is refused as in use until the app settles.
+#[tokio::test]
+async fn deleting_or_recreating_an_app_being_torn_down_is_refused_over_its_status() {
+    let emulator = Emulator::new();
+
+    // Rows: an app whose `Deleted` status the clock does NOT yet owe (the teardown is in
+    // flight) and one whose record has already settled, each under an owner kind. WHICH
+    // state the app is in is seeded, so neither case depends on how fast the host runs.
+    let in_flight = AppRef::new(
+        "still-deleting",
+        "d-abc123",
+        "UserProfileName",
+        "studio-user",
+        "JupyterServer",
+        "tearing-down",
+    );
+    let settled = AppRef::new(
+        "already-deleted",
+        "d-abc123",
+        "SpaceName",
+        "team-space",
+        "JupyterLab",
+        "torn-down",
+    );
+    let now = SystemTime::now();
+    seed_deleting_app(&emulator, &in_flight, "us-east-1", now + SETTLE_DEADLINE);
+    // Past the span the clock owes the `Deleted` status, and far inside the retention
+    // window, so the first reader settles this one and the record is still there.
+    seed_deleting_app(
+        &emulator,
+        &settled,
+        "us-east-1",
+        now - (state::APP_DELETED_AFTER + Duration::from_secs(1)),
+    );
+
+    // The app still being torn down: the reader reports `Deleting`, the delete says the
+    // teardown is in flight, and the create cannot take the key over.
+    let described = emulator.ok("DescribeApp", &in_flight.body()).await;
+    assert_eq!(
+        str_field(&described, "Status"),
+        "Deleting",
+        "case still-deleting: Status, got {described:?}"
+    );
+    let (status, parsed) = emulator.call("DeleteApp", &in_flight.body()).await;
+    assert_eq!(
+        (status, error_code(&parsed).as_str()),
+        (400, "ValidationException"),
+        "case still-deleting: expected a 400 ValidationException, got {status} with {parsed:?}"
+    );
+    assert_eq!(
+        message(&parsed),
+        format!(
+            "App [{}] is already being deleted. Wait until the app is deleted.",
+            in_flight.app_name
+        ),
+        "case still-deleting: the refusal must report the teardown in flight, got {parsed:?}"
+    );
+    let (status, parsed) = emulator.call("CreateApp", &in_flight.body()).await;
+    assert_eq!(
+        (status, error_code(&parsed).as_str()),
+        (400, "ResourceInUse"),
+        "case still-deleting: expected a 400 ResourceInUse, got {status} with {parsed:?}"
+    );
+    assert_eq!(
+        message(&parsed),
+        format!(
+            "App [{}] is currently in [Deleting] status. To restart the App, wait until it \
+             is in Deleted or Failed status.",
+            in_flight.arn()
+        ),
+        "case still-deleting: the refusal must report the status to wait for, got {parsed:?}"
+    );
+
+    // The app already torn down: the reader reports `Deleted` for as long as the record is
+    // retained, the delete says so, and the create may take the key over.
+    let described = emulator.ok("DescribeApp", &settled.body()).await;
+    assert_eq!(
+        str_field(&described, "Status"),
+        "Deleted",
+        "case already-deleted: Status, got {described:?}"
+    );
+    let (status, parsed) = emulator.call("DeleteApp", &settled.body()).await;
+    assert_eq!(
+        (status, error_code(&parsed).as_str()),
+        (400, "ValidationException"),
+        "case already-deleted: expected a 400 ValidationException, got {status} with {parsed:?}"
+    );
+    assert_eq!(
+        message(&parsed),
+        format!(
+            "App [{}] has already been deleted. For tracking purposes, apps are available \
+             in the ListApps API results for only 24 hours after deletion.",
+            settled.app_name
+        ),
+        "case already-deleted: the refusal must report the completed teardown, got {parsed:?}"
+    );
+    let (status, created) = emulator.call("CreateApp", &settled.body()).await;
+    assert_eq!(
+        status, 200,
+        "case already-deleted: a settled app's key takes a fresh app, got {status} with \
+         {created:?}"
+    );
+}
+
+/// RULE: a `CreateApp` whose five identifying members address an app the service has not
+/// finished with is refused with the modelled `ResourceInUse`, so the running app is never
+/// silently replaced, and the refusal reports the status the caller has to wait for:
+/// `App [<arn>] is currently in [<AppStatus>] status. To restart the App, wait until it is
+/// in Deleted or Failed status.`
 #[tokio::test]
 async fn creating_an_app_whose_key_is_in_use_is_refused_with_resource_in_use() {
     let emulator = Emulator::new();
@@ -679,6 +951,22 @@ async fn creating_an_app_whose_key_is_in_use_is_refused_with_resource_in_use() {
         emulator
             .ok("CreateApp", &with_members(&app.body(), &extra))
             .await;
+
+        // Wait for the CONDITION the clock owes the launch, so the status the refusal
+        // reports is the settled one rather than whichever the host raced to.
+        let deadline = Instant::now() + SETTLE_DEADLINE;
+        loop {
+            let described = emulator.ok("DescribeApp", &app.body()).await;
+            if str_field(&described, "Status") == "InService" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case}: the app must reach InService on the clock, last read \
+                 {described:?}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
 
         // A second create of the same key, carrying different optional members, must
         // neither succeed nor overwrite what is stored.
@@ -700,11 +988,15 @@ async fn creating_an_app_whose_key_is_in_use_is_refused_with_resource_in_use() {
             "ResourceInUse",
             "case {case}: error code, got {parsed:?}"
         );
-        // The wording of a duplicate-create refusal is not a documented rule, so only
-        // the ARN it is built from is asserted.
-        assert!(
-            message(&parsed).contains(&app.arn()),
-            "case {case}: the refusal must name the app already in use, got {parsed:?}"
+        assert_eq!(
+            message(&parsed),
+            format!(
+                "App [{}] is currently in [InService] status. To restart the App, wait \
+                 until it is in Deleted or Failed status.",
+                app.arn()
+            ),
+            "case {case}: the refusal must name the app and the status it is in, got \
+             {parsed:?}"
         );
 
         let described = emulator.ok("DescribeApp", &app.body()).await;

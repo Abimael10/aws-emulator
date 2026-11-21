@@ -3,8 +3,9 @@
 //! @op CreateUserProfile
 //! IMPLEMENTED: stores a Studio user profile in `crate::state` under the domain and name
 //! the request pairs, launching it `Pending` with the `InService` transition the clock
-//! owes recorded, and refuses a name the domain already holds with the modelled
-//! `ResourceInUse`. This is the ONLY file to touch for this operation.
+//! owes recorded; refuses a domain that does not resolve or has not reached `InService`,
+//! and a name the domain already holds with the modelled `ResourceInUse`. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -178,24 +179,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it. Each was due at its stored instant whether or not anybody called, so this
         // call's observer makes no difference to the result.
         store.release_deleted_domains(now);
+        store.release_deleted_user_profiles(now);
 
         // "A user profile represents a single user WITHIN A DOMAIN": the profile belongs to
         // the domain the request names, so an id this account holds no domain under cannot
         // take one, and the domain's own `AuthMode` decides the next precondition. The
         // model declares no not-found error for this operation, so the refusal travels as
-        // the service-common `ValidationException`, worded with the crate's one sentence
-        // for a `DomainId` that resolves to nothing. A domain the service is already
-        // tearing down still resolves until the clock completes its removal, which is the
-        // one rule every reader of a `DomainId` follows here; whether a create into a
-        // `Deleting` domain is refused is the teardown path's own question, left to it.
-        let Some(auth_mode) = store
-            .domain_mut(&input.domain_id, now)
-            .map(|domain| domain.auth_mode.clone())
-        else {
+        // the service-common `ValidationException`, worded from the `DomainId` the REQUEST
+        // supplied — the only thing this caller said about the domain — rather than with
+        // the ARN form a reader of the domain itself answers with. A domain the service is
+        // already tearing down still resolves until the clock completes its removal, which
+        // is the one rule every reader of a `DomainId` follows here; the status gate below
+        // is what weighs which of the resolved domains admits a member.
+        let Some(domain) = store.domain_mut(&input.domain_id, now) else {
             return Err(CreateUserProfileError::validation(
-                crate::state::domain_not_found(&region, &input.domain_id),
+                crate::state::domain_id_not_found(&input.domain_id),
             ));
         };
+        // The provisioning the clock already owed is materialised BEFORE the create is
+        // weighed, so a domain whose `InService` had fallen due admits the profile rather
+        // than being refused from the `Pending` it had already left.
+        domain.settle_status(now);
+        let auth_mode = domain.auth_mode.clone();
+        let domain_status = domain.status.clone();
+        let domain_arn = domain.arn.clone();
+
+        // A user profile is a MEMBER of the domain, and a domain admits members only once
+        // its own provisioning has settled: while it is still `Pending` — or `Failed`, or on
+        // its way out — the create is refused, so a profile is never attached to a domain
+        // whose networking and file system have not resolved. Recorded behaviour, and the
+        // model declares no state error for this operation, so it travels as the
+        // service-common `ValidationException`.
+        if domain_status != crate::state::DOMAIN_STATUS_IN_SERVICE {
+            return Err(CreateUserProfileError::validation(
+                crate::state::domain_not_in_service_refusal(
+                    crate::state::USER_PROFILE_ENTITY,
+                    &arn,
+                    &domain_arn,
+                ),
+            ));
+        }
 
         // Both single-sign-on members are the user's identity in the directory the domain
         // authenticates against, so whether they belong on the request is the domain's
@@ -244,10 +267,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A profile already stored under this name is the resource this call would have to
         // take over, so the create is refused rather than overwriting it. The name "is not
         // case sensitive", and the key is case-folded, so a second spelling of one name
-        // lands here too.
+        // lands here too. The refusal names the profile the way AWS does — the name the
+        // request carried, in the domain it is taken in — so it cannot be mistaken for the
+        // app-level collision.
         if store.user_profiles.contains_key(&key) {
             return Err(CreateUserProfileErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(crate::state::user_profile_already_exists(&arn)),
+                message: Some(crate::state::user_profile_already_exists(
+                    &input.user_profile_name,
+                    &input.domain_id,
+                )),
             })
             .into());
         }
@@ -271,6 +299,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: now,
                 last_modified_time: now,
                 in_service_due_at: now + crate::state::USER_PROFILE_IN_SERVICE_AFTER,
+                // Nothing has asked for this profile's removal, so the clock owes it none.
+                removal_due_at: None,
             },
         );
         drop(store);

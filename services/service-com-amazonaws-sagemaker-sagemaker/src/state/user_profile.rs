@@ -27,12 +27,36 @@ pub const USER_PROFILE_ARN_KIND: &str = "user-profile";
 /// after profile cannot grow the store without end.
 pub const USER_PROFILE_QUOTA: usize = 1_000;
 
+/// The page `ListUserProfiles` serves when the request names no `MaxResults`: its
+/// `MaxResults` doc says "The default value for MaxResults is 10". [`MAX_PAGE_SIZE`] still
+/// caps the page above it, as it does for every listing here.
+pub const USER_PROFILE_DEFAULT_PAGE_SIZE: i32 = 10;
+
+/// `UserProfileSortKey`'s member that orders a listing by the instant each profile last
+/// changed, as opposed to [`DEFAULT_SORT_BY`], the enum's other member and the documented
+/// default (`smithy_query(query="shape", shape="UserProfileSortKey")`).
+pub const USER_PROFILE_SORT_BY_LAST_MODIFIED_TIME: &str = "LastModifiedTime";
+
+/// How a page token names one user profile: the domain it lives in and its name, the pair
+/// that identifies it.
+///
+/// A listing's `NextToken` names the item the page stopped at ([`encode_page_token`]), so
+/// the id has to identify one profile across calls without depending on the Region the
+/// caller signed for — which a profile's ARN does carry.
+pub fn user_profile_page_id(domain_id: &str, user_profile_name: &str) -> String {
+    format!("{domain_id}/{user_profile_name}")
+}
+
 /// `UserProfileStatus`'s members a user profile of this emulator moves through. The
-/// modelled enum also carries the update, delete and failure states, which no implemented
+/// modelled enum also carries the update and failure states, which no implemented
 /// operation reaches yet.
 pub const USER_PROFILE_STATUS_PENDING: &str = "Pending";
 /// See [`USER_PROFILE_STATUS_PENDING`].
 pub const USER_PROFILE_STATUS_IN_SERVICE: &str = "InService";
+/// See [`USER_PROFILE_STATUS_PENDING`]. What a profile reports from the
+/// `DeleteUserProfile` that asked for its removal until the clock completes it
+/// ([`UserProfile::begin_deletion`]).
+pub const USER_PROFILE_STATUS_DELETING: &str = "Deleting";
 
 /// How long after `CreateUserProfile` the clock owes the `Pending` -> `InService`
 /// transition.
@@ -42,6 +66,15 @@ pub const USER_PROFILE_STATUS_IN_SERVICE: &str = "InService";
 /// creating it still observes `Pending`, and one that waits observes `InService`. The due
 /// instant is stored rather than slept on ([`UserProfile::settle_status`]).
 pub const USER_PROFILE_IN_SERVICE_AFTER: Duration = DOMAIN_IN_SERVICE_AFTER;
+
+/// How long after `DeleteUserProfile` the clock owes the `Deleting` -> gone transition of a
+/// user profile.
+///
+/// The same compressed, never-zero span the domain's own teardown takes
+/// ([`DOMAIN_RELEASED_AFTER`]): a caller that describes the profile straight after asking
+/// for its deletion still observes `Deleting`, and one that polls observes it gone. The due
+/// instant is stored rather than slept on ([`UserProfile::is_released`]).
+pub const USER_PROFILE_RELEASED_AFTER: Duration = DOMAIN_RELEASED_AFTER;
 
 /// The store key a `(DomainId, UserProfileName)` pair maps to.
 ///
@@ -64,12 +97,51 @@ pub fn user_profile_not_found(user_profile_name: &str) -> String {
     format!("UserProfile [{user_profile_name}] does not exist.")
 }
 
-/// How `CreateUserProfile` states that the profile it was asked to create is already
-/// there: the ARN the request resolves to IN SQUARE BRACKETS, then `already exists.` — the
-/// subject form the Studio family's "already exists" refusals use (`App [<arn>] already
-/// exists.`), which is what `ResourceInUse` reports for a create whose resource is taken.
-pub fn user_profile_already_exists(arn: &str) -> String {
-    format!("UserProfile [{arn}] already exists.")
+/// How the operations whose SUBJECT is the profile itself state a `(DomainId,
+/// UserProfileName)` pair this account holds no profile under: the entity, then the ARN the
+/// requested pair resolves to in the Region the request signed for IN SQUARE BRACKETS, then
+/// `does not exist.` — the sentence the Studio family's readers word this fact with, as
+/// [`crate::state::domain_not_found`] does for the domain.
+///
+/// Distinct from [`user_profile_not_found`] on purpose, the way the domain's two sentences
+/// are: AWS words the one fact for the reader it answers. `DescribeUserProfile` and
+/// `DeleteUserProfile` address the PROFILE, so they name it by the ARN their request
+/// resolves to, while an operation whose subject is something else and that merely resolves
+/// the profile as a member (`CreateApp`'s owner) names the value the caller passed.
+pub fn user_profile_arn_not_found(region: &str, domain_id: &str, user_profile_name: &str) -> String {
+    format!(
+        "UserProfile [{}] does not exist.",
+        resource_arn(
+            region,
+            USER_PROFILE_ARN_KIND,
+            &format!("{domain_id}/{user_profile_name}")
+        )
+    )
+}
+
+/// How `CreateUserProfile` states that the domain already holds a profile under the name
+/// the request carried: the name IN SINGLE QUOTES, then the `DomainId` it is taken in —
+/// recorded AWS behaviour, whose whole sentence is fixed text but for those two values.
+///
+/// The domain is named by the bare `d-…` id the request supplied rather than by an ARN,
+/// which is also what tells this collision apart from the one an app's own "already in
+/// use" refusal reports.
+pub fn user_profile_already_exists(user_profile_name: &str, domain_id: &str) -> String {
+    format!("A UserProfile with name '{user_profile_name}' already exists in Domain {domain_id}.")
+}
+
+/// The entity label the Studio refusals name a user profile by, i.e. the subject of
+/// [`crate::state::domain_not_in_service_refusal`] when the resource being created is a
+/// profile.
+pub const USER_PROFILE_ENTITY: &str = "UserProfile";
+
+/// How `DeleteUserProfile` states that the profile cannot take the removal asked of it
+/// while the service is already removing it: the same subject form
+/// [`user_profile_arn_not_found`] names the profile with, then the status that stands in the
+/// way — the wording [`crate::state::domain_not_deletable`] uses for the domain it lives
+/// in.
+pub fn user_profile_not_deletable(arn: &str, status: &str) -> String {
+    format!("UserProfile [{arn}] cannot be deleted while it is in {status} status.")
 }
 
 /// `AuthMode`'s member that means the domain authenticates its members against IAM
@@ -138,6 +210,12 @@ pub struct UserProfile {
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
     pub in_service_due_at: SystemTime,
+    /// The instant the clock owes this profile's removal, set by
+    /// [`UserProfile::begin_deletion`]; `None` while no `DeleteUserProfile` has asked for
+    /// one. Past it the profile is gone for every caller ([`UserProfile::is_released`]),
+    /// whether or not a sweep has dropped the record yet — the way
+    /// [`Domain::removal_due_at`] carries the same fact for the domain it lives in.
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl UserProfile {
@@ -156,6 +234,35 @@ impl UserProfile {
         }
         false
     }
+
+    /// Start the removal `DeleteUserProfile` asked for: the profile reports `Deleting`, and
+    /// the clock owes its removal [`USER_PROFILE_RELEASED_AFTER`] later.
+    ///
+    /// The record is NOT dropped here: `UserProfileStatus` carries `Deleting` and SageMaker
+    /// answers it until the removal finishes, so the transient status is observable and the
+    /// removal is the clock's — stored as an instant and never slept on. The status change
+    /// is a change to the profile, so it moves `last_modified_time` too.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.status = USER_PROFILE_STATUS_DELETING.to_string();
+        self.last_modified_time = now;
+        self.removal_due_at = Some(now + USER_PROFILE_RELEASED_AFTER);
+    }
+
+    /// Whether a `DeleteUserProfile` has asked for this profile's removal, i.e. it is
+    /// `Deleting` and on its way out.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Whether the removal the clock owed has completed, i.e. the profile is gone.
+    ///
+    /// A lookup answers `None` for such a profile, so no caller sees one whose removal was
+    /// already due — the record itself is dropped by
+    /// [`ComAmazonawsSagemakerSagemakerState::release_deleted_user_profiles`], which frees
+    /// the quota slot it still held.
+    pub fn is_released(&self, now: SystemTime) -> bool {
+        self.removal_due_at.is_some_and(|due| now >= due)
+    }
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -171,7 +278,9 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// re-implements it: a profile hangs off its domain, so one whose domain no longer
     /// resolves ([`Domain::is_released`]) resolves to nothing either — past that instant
     /// the domain and everything in it is gone, whether or not the records have been
-    /// dropped yet ([`Self::release_deleted_domains`]).
+    /// dropped yet ([`Self::release_deleted_domains`]). A profile whose own removal the
+    /// clock already completed resolves to nothing the same way
+    /// ([`UserProfile::is_released`]).
     ///
     /// `now` is the caller's instant, so one request weighs the store against ONE clock
     /// reading: the same instant its sweep and its transitions used.
@@ -186,6 +295,7 @@ impl ComAmazonawsSagemakerSagemakerState {
         }
         self.user_profiles
             .get_mut(&user_profile_key(domain_id, user_profile_name))
+            .filter(|profile| !profile.is_released(now))
     }
 
     /// Whether the domain `domain_id` holds a user profile under `user_profile_name`, i.e.
@@ -202,7 +312,28 @@ impl ComAmazonawsSagemakerSagemakerState {
         self.domain_resolves(domain_id, now)
             && self
                 .user_profiles
-                .contains_key(&user_profile_key(domain_id, user_profile_name))
+                .get(&user_profile_key(domain_id, user_profile_name))
+                .is_some_and(|profile| !profile.is_released(now))
+    }
+
+    /// Drop every user profile whose removal the clock already completed, and with it the
+    /// retained records of the apps that hung off it.
+    ///
+    /// Materialises only what was already due: the removal was owed at the stored instant
+    /// whether or not anybody called, and a lookup already answers `None` for such a profile
+    /// ([`UserProfile::is_released`]), so this changes nothing a later caller sees — it
+    /// frees the quota slot it still held. The call that asked for each removal already
+    /// recorded it, so nothing is answered back.
+    pub fn release_deleted_user_profiles(&mut self, now: SystemTime) {
+        let released: Vec<(String, String)> = self
+            .user_profiles
+            .values()
+            .filter(|profile| profile.is_released(now))
+            .map(|profile| (profile.domain_id.clone(), profile.name.clone()))
+            .collect();
+        self.user_profiles
+            .retain(|_, profile| !profile.is_released(now));
+        self.release_owner_apps(&released);
     }
 
     /// Drop every user profile of the domains `domain_ids`, i.e. the profiles of domains

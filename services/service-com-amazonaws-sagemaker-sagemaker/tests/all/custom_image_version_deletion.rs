@@ -575,6 +575,25 @@ async fn a_version_a_studio_app_runs_on_is_in_use_and_refused() {
         )
         .await;
     let domain_id = str_field(&domain, "DomainId");
+    // A domain admits members only once its own provisioning has settled, which is the
+    // clock's: wait for the CONDITION before creating anything in it.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let (status, described) = emulator
+                .call("DescribeDomain", &json!({ "DomainId": domain_id }))
+                .await;
+            if status == 200 && str_field(&described, "Status") == "InService" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case in-service-{domain_id}: the domain must reach InService on the clock, \
+                 last read {status} {described}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
     emulator
         .ok(
             "CreateUserProfile",
@@ -584,7 +603,7 @@ async fn a_version_a_studio_app_runs_on_is_in_use_and_refused() {
     let app = json!({
         "DomainId": domain_id,
         "UserProfileName": "studio-user",
-        "AppType": "KernelGateway",
+        "AppType": "JupyterLab",
         "AppName": "app-on-v1",
     });
     let mut create_app = app

@@ -305,12 +305,14 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// `None` when no stored app does.
     ///
     /// An app keeps the spec it launched with (`CreateApp` stores it verbatim), so an app
-    /// in the store is one still running on that image: releasing the image would leave
-    /// the app naming an image nothing holds.
+    /// the service is still running is one still running on that image: releasing the image
+    /// would leave the app naming an image nothing holds. An app a `DeleteApp` has torn
+    /// down runs nothing, so its retained record ([`App::is_released`]) is not counted.
     pub fn app_running_on_image(&self, image_name: &str) -> Option<&str> {
         let image_arn = self.images.get(image_name).map(|image| image.arn.as_str())?;
         self.apps
             .values()
+            .filter(|app| !app.is_released())
             .find_map(|app| {
                 let spec = app.resource_spec.as_ref()?;
                 (spec.sage_maker_image_arn.as_deref() == Some(image_arn))
@@ -326,14 +328,19 @@ impl ComAmazonawsSagemakerSagemakerState {
     /// or `None` when no stored app names it.
     ///
     /// An app keeps the spec it launched with (`CreateApp` stores it verbatim), so an app
-    /// in the store is one still running on that version: releasing the version would
-    /// leave the app naming a version nothing holds. This is what `DeleteImageVersion`
-    /// refuses on, and the version half of what [`Self::app_running_on_image`] answers.
+    /// the service is still running is one still running on that version: releasing the
+    /// version would leave the app naming a version nothing holds. This is what
+    /// `DeleteImageVersion` refuses on, and the version half of what
+    /// [`Self::app_running_on_image`] answers. A torn-down app's retained record
+    /// ([`App::is_released`]) runs nothing, so it is not counted.
     pub fn app_running_on_image_version(&self, version_arn: &str) -> Option<&str> {
-        self.apps.values().find_map(|app| {
-            let spec = app.resource_spec.as_ref()?;
-            (spec.sage_maker_image_version_arn.as_deref() == Some(version_arn))
-                .then_some(app.arn.as_str())
-        })
+        self.apps
+            .values()
+            .filter(|app| !app.is_released())
+            .find_map(|app| {
+                let spec = app.resource_spec.as_ref()?;
+                (spec.sage_maker_image_version_arn.as_deref() == Some(version_arn))
+                    .then_some(app.arn.as_str())
+            })
     }
 }
