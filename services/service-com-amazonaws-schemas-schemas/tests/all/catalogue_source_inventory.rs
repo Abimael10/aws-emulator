@@ -24,7 +24,9 @@ use service_com_amazonaws_schemas_schemas::state::{
     AWS_MANAGED_REGISTRY, CLOUD_TRAIL_EVENT_FAMILY, MAX_PAGE_SIZE,
 };
 
-use crate::registry_schema_lifecycle::{schema_names, schema_uri, versions_uri, walk, Emulator};
+use crate::registry_schema_lifecycle::{
+    listed_versions, published_summary, schema_names, schema_uri, versions_uri, walk, Emulator,
+};
 
 /// The listing of the AWS-managed registry's schemas.
 fn catalogue_uri() -> String {
@@ -52,8 +54,10 @@ struct SourceRow {
 /// of the registry reads back). They differ along what the rule generalises over: a
 /// source carrying the CloudTrail-delivered family alone, one carrying that family
 /// beside an event type of its own, sources publishing only their own event types (ten
-/// of them, seven, five, two and one), a source whose namespace is a prefix of another
-/// source's namespace, and event names that run their words together.
+/// of them, seven, five, two and one), sources carrying that family beside a whole
+/// family of their own (seventeen event types, six, four, three and two), a source whose
+/// namespace is a prefix of another source's namespace, event names that run their words
+/// together, and event names that carry a hyphen from their `detail-type`.
 fn source_rows() -> Vec<SourceRow> {
     vec![
         SourceRow {
@@ -149,6 +153,120 @@ fn source_rows() -> Vec<SourceRow> {
             own: &[],
             cloud_trail_family: true,
         },
+        SourceRow {
+            source: "aws.dms",
+            own: &[
+                "DMSDataMigrationStateChange",
+                "DMSReplicationEndpointStateChange",
+                "DMSReplicationInstanceStateChange",
+                "DMSReplicationTaskStateChange",
+            ],
+            cloud_trail_family: true,
+        },
+        SourceRow {
+            source: "aws.ds",
+            own: &["DirectoryServiceDomainControllerDiscoveryUpdate"],
+            cloud_trail_family: true,
+        },
+        SourceRow {
+            source: "aws.ec2spotfleet",
+            own: &[
+                "EC2FleetError",
+                "EC2FleetInformation",
+                "EC2FleetInstanceChange",
+                "EC2FleetSpotInstanceRequestChange",
+                "EC2FleetStateChange",
+                "EC2SpotFleetError",
+                "EC2SpotFleetInformation",
+                "EC2SpotFleetInstanceChange",
+                "EC2SpotFleetSpotInstanceRequestChange",
+                "EC2SpotFleetStateChange",
+            ],
+            cloud_trail_family: false,
+        },
+        SourceRow {
+            source: "aws.gamelift",
+            own: &[
+                "GameLiftFleetEvent",
+                "GameLiftMatchmakingEvent",
+                "GameLiftQueuePlacementEvent",
+            ],
+            cloud_trail_family: true,
+        },
+        SourceRow {
+            source: "aws.ivs",
+            own: &[
+                "IVSAdBreakStateChange",
+                "IVSChannelAgentSessionStateChange",
+                "IVSLimitBreach",
+                "IVSRecordingStateChange",
+                "IVSStageUpdate",
+                "IVSStreamStateChange",
+            ],
+            cloud_trail_family: true,
+        },
+        SourceRow {
+            source: "aws.kafka-cluster",
+            own: &[],
+            cloud_trail_family: true,
+        },
+        SourceRow {
+            source: "aws.oam",
+            own: &["AttachedLinkCreated"],
+            cloud_trail_family: true,
+        },
+        SourceRow {
+            source: "aws.ses",
+            own: &[
+                "AdvisorRecommendationStatusOpen",
+                "AdvisorRecommendationStatusResolved",
+            ],
+            cloud_trail_family: true,
+        },
+        SourceRow {
+            source: "aws.social-messaging",
+            own: &[
+                "WhatsAppCallAccepted",
+                "WhatsAppCallConnect",
+                "WhatsAppCallFailed",
+                "WhatsAppCallHandoverFailed",
+                "WhatsAppCallHandoverSucceeded",
+                "WhatsAppCallRejected",
+                "WhatsAppCallRinging",
+                "WhatsAppCallTerminate",
+                "WhatsAppMessageDelivered",
+                "WhatsAppMessageFailed",
+                "WhatsAppMessageHandoverFailed",
+                "WhatsAppMessageHandoverSucceeded",
+                "WhatsAppMessageRead",
+                "WhatsAppMessageReceived",
+                "WhatsAppMessageSent",
+            ],
+            cloud_trail_family: false,
+        },
+        SourceRow {
+            source: "aws.ssm",
+            own: &[
+                "ApproverAccessRequestStatusUpdate",
+                "CalendarStateChange",
+                "ConfigurationComplianceStateChange",
+                "EC2AutomationExecutionStatus-changeNotification",
+                "EC2AutomationStepStatus-changeNotification",
+                "EC2CommandInvocationStatus-changeNotification",
+                "EC2CommandStatus-changeNotification",
+                "EC2StateManagerAssociationStateChange",
+                "EC2StateManagerInstanceAssociationStateChange",
+                "InventoryResourceStateChange",
+                "MaintenanceWindowExecutionState-changeNotification",
+                "MaintenanceWindowState-changeNotification",
+                "MaintenanceWindowTargetRegistrationNotification",
+                "MaintenanceWindowTaskExecutionState-changeNotification",
+                "MaintenanceWindowTaskTargetInvocationState-changeNotification",
+                "ParameterStoreChange",
+                "ParameterStorePolicyAction",
+            ],
+            cloud_trail_family: true,
+        },
     ]
 }
 
@@ -225,15 +343,26 @@ async fn one_source_block_follows_another_at_the_offset_membership_implies() {
         ("aws.b2bi@", "aws.backup@"),
         ("aws.chime-sdk-media-pipelines@", "aws.chime-sdk-voice@"),
         ("aws.chime-sdk-voice@", "aws.chime@"),
-        ("aws.ec2fleet@", "aws.ecr@"),
+        ("aws.dms@", "aws.drs@"),
+        ("aws.ds@", "aws.dynamodb@"),
+        ("aws.ec2fleet@", "aws.ec2spotfleet@"),
+        ("aws.ec2spotfleet@", "aws.ecr@"),
         ("aws.epfs@", "aws.es@"),
         ("aws.factstore@", "aws.finspace-api@"),
         ("aws.finspace-api@", "aws.finspace@"),
+        ("aws.gamelift@", "aws.glacier@"),
         ("aws.glue-autodebug@", "aws.glue@"),
         ("aws.goshawk@", "aws.grafana@"),
         ("aws.health-agent@", "aws.health@"),
         ("aws.inspector-scan@", "aws.inspector2@"),
         ("aws.iotsecuredtunneling@", "aws.iotsitewise@"),
+        ("aws.ivs@", "aws.kafka-cluster@"),
+        ("aws.kafka-cluster@", "aws.kafka@"),
+        ("aws.oam@", "aws.opensearch@"),
+        ("aws.ses@", "aws.shield@"),
+        ("aws.sns@", "aws.social-messaging@"),
+        ("aws.social-messaging@", "aws.sqs@"),
+        ("aws.ssm-contacts@", "aws.ssm@"),
     ];
 
     // Page sizes: the default, a size the catalogue is no multiple of, and the largest
@@ -288,6 +417,15 @@ struct EntryRow {
     published: Option<&'static str>,
 }
 
+/// How many versions of the schema named `schema` the store holds, read back through the
+/// listing that serves them (the harness's one reducer over that listing).
+async fn versions_held(emulator: &Emulator, schema: &str) -> usize {
+    let versions = emulator
+        .call("GET", &versions_uri(AWS_MANAGED_REGISTRY, schema), None)
+        .await;
+    listed_versions(&versions).len()
+}
+
 /// RULE: `ListSchemas` reports each entry's own published `VersionCount` — and every
 /// version it claims is readable — and, for an entry the catalogue publishes a
 /// publication instant for, that instant rather than one derived from the entry's name.
@@ -327,30 +465,7 @@ async fn a_published_entry_of_a_new_source_reports_its_own_count_and_instant() {
     ];
 
     for row in rows {
-        let listed = emulator
-            .call(
-                "GET",
-                &format!("{}?schemaNamePrefix={}", catalogue_uri(), row.schema),
-                None,
-            )
-            .await;
-        assert_eq!(
-            listed.status, 200,
-            "case {:?}: expected 200 from ListSchemas, got {} {:?}",
-            row.schema, listed.status, listed.body
-        );
-        let summary = listed.body["Schemas"]
-            .as_array()
-            .unwrap_or_else(|| panic!("case {:?}: expected a Schemas array", row.schema))
-            .iter()
-            .find(|item| item["SchemaName"].as_str() == Some(row.schema))
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {:?}: the catalogue must publish it, got {:?}",
-                    row.schema, listed.body
-                )
-            })
-            .clone();
+        let summary = published_summary(&emulator, AWS_MANAGED_REGISTRY, row.schema).await;
         assert_eq!(
             summary["VersionCount"],
             json!(row.version_count),
@@ -367,23 +482,77 @@ async fn a_published_entry_of_a_new_source_reports_its_own_count_and_instant() {
             );
         }
 
-        let versions = emulator
-            .call("GET", &versions_uri(AWS_MANAGED_REGISTRY, row.schema), None)
-            .await;
-        let held = versions.body["SchemaVersions"]
-            .as_array()
-            .unwrap_or_else(|| {
-                panic!(
-                    "case {:?}: expected SchemaVersions in {:?}",
-                    row.schema, versions.body
-                )
-            })
-            .len();
+        let versions = versions_held(&emulator, row.schema).await;
         assert_eq!(
-            u64::try_from(held).unwrap_or(u64::MAX),
+            u64::try_from(versions).unwrap_or(u64::MAX),
             row.version_count,
             "case {:?}: the store must hold every version the count claims",
             row.schema
+        );
+    }
+}
+
+/// RULE: a summary of a catalogue entry carries the members `SchemaSummary` models for a
+/// published schema — the `<source>@<EventName>` name, the number of versions the store
+/// actually holds for it, the (empty) tag set of a schema no caller tagged and the
+/// instant the read of that same schema reports — whichever source published it, so an
+/// entry of one source is reported exactly as an entry of any other.
+///
+/// Driven over the FIRST entry of each source the inventory above names, selected by its
+/// own name so the case does not depend on which page it lands on. Nothing here is
+/// compared against a constant this suite carries: the count is checked against the
+/// versions `ListSchemaVersions` serves and the instant against the one
+/// `DescribeSchema` serves, so a summary composed from anything but the stored schema
+/// fails the case.
+#[tokio::test]
+async fn a_summary_reports_the_modelled_members_of_every_published_source() {
+    let emulator = Emulator::new();
+
+    for row in source_rows() {
+        let names = published_names(&row);
+        let schema = names
+            .first()
+            .unwrap_or_else(|| panic!("case {:?}: the row publishes no entry", row.source))
+            .clone();
+        let summary = published_summary(&emulator, AWS_MANAGED_REGISTRY, &schema).await;
+        assert_eq!(
+            summary["tags"],
+            json!({}),
+            "case {schema:?}: a schema no caller tagged reports an empty tag set, got \
+             {summary:?}"
+        );
+
+        // The count the summary reports is the number of versions the store holds for
+        // that schema, read back through the listing that serves them.
+        let held = versions_held(&emulator, &schema).await;
+        assert_eq!(
+            summary["VersionCount"],
+            json!(held),
+            "case {schema:?}: the summary counts the versions the store holds ({held}), \
+             got {summary:?}"
+        );
+
+        // And the instant it reports is the one the read of that same schema reports:
+        // two reads of one published entry cannot disagree about when it was published.
+        let described = emulator
+            .call("GET", &schema_uri(AWS_MANAGED_REGISTRY, &schema), None)
+            .await;
+        assert_eq!(
+            described.status, 200,
+            "case {schema:?}: expected 200 from DescribeSchema, got {} {:?}",
+            described.status, described.body
+        );
+        assert_eq!(
+            summary["LastModified"], described.body["LastModified"],
+            "case {schema:?}: the summary reports the instant the read reports, got \
+             {summary:?} and {:?}",
+            described.body
+        );
+        assert!(
+            summary["LastModified"]
+                .as_str()
+                .is_some_and(|instant| instant.contains('T') && instant.ends_with('Z')),
+            "case {schema:?}: the instant is a date-time, got {summary:?}"
         );
     }
 }

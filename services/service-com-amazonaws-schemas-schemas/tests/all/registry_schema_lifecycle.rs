@@ -251,6 +251,42 @@ pub(crate) fn versions_uri(registry: &str, schema: &str) -> String {
     format!("{}/versions", schema_uri(registry, schema))
 }
 
+/// The `ListSchemas` URI of `registry`, restricted to the names starting with `prefix`.
+pub(crate) fn schemas_listing_uri(registry: &str, prefix: &str) -> String {
+    format!("{}/schemas?schemaNamePrefix={prefix}", registry_uri(registry))
+}
+
+/// The summary a `ListSchemas` answer reports for the schema named `schema`.
+///
+/// Shared with the sibling suites: every case that asks what a listing said about ONE
+/// entry reads it through this one reducer, so two suites cannot disagree about it.
+pub(crate) fn summary_of(listed: &Value, schema: &str) -> Value {
+    listed["Schemas"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a Schemas array in {listed:?}"))
+        .iter()
+        .find(|item| item["SchemaName"].as_str() == Some(schema))
+        .unwrap_or_else(|| panic!("expected {schema:?} among {listed:?}"))
+        .clone()
+}
+
+/// The listing summary `registry` reports for the entry named `schema`, selected by its
+/// own name so a case does not depend on which page the entry lands on.
+///
+/// Shared with the sibling suites for the same reason as [`summary_of`]: one listing
+/// request, one 200 check, one lookup.
+pub(crate) async fn published_summary(emulator: &Emulator, registry: &str, schema: &str) -> Value {
+    let listed = emulator
+        .call("GET", &schemas_listing_uri(registry, schema), None)
+        .await;
+    assert_eq!(
+        listed.status, 200,
+        "case {schema:?}: expected 200 from ListSchemas, got {} {:?}",
+        listed.status, listed.body
+    );
+    summary_of(&listed.body, schema)
+}
+
 /// The names of a document object's members, in the order the document writes them.
 ///
 /// Shared with the sibling suites: a document this service serves is TEXT whose member

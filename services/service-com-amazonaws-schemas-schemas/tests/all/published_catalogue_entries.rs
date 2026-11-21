@@ -27,7 +27,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_schemas_schemas::state::{AWS_MANAGED_REGISTRY, CLOUD_TRAIL_EVENT_FAMILY};
 
-use crate::registry_schema_lifecycle::{schema_names, schema_uri, versions_uri, walk, Emulator};
+use crate::registry_schema_lifecycle::{
+    published_summary, schema_names, schema_uri, versions_uri, walk, Emulator,
+};
 
 /// The listing of the AWS-managed registry's schemas.
 fn catalogue_uri() -> String {
@@ -39,34 +41,6 @@ fn source_listing_uri(source: &str) -> String {
     format!("{}?schemaNamePrefix={source}@", catalogue_uri())
 }
 
-/// One entry of a `Schemas` listing, by schema name.
-fn summary_of(emulator_answer: &Value, name: &str) -> Value {
-    emulator_answer["Schemas"]
-        .as_array()
-        .unwrap_or_else(|| panic!("expected a Schemas array in {emulator_answer:?}"))
-        .iter()
-        .find(|item| item["SchemaName"].as_str() == Some(name))
-        .unwrap_or_else(|| panic!("expected {name:?} among {emulator_answer:?}"))
-        .clone()
-}
-
-/// The listing summary the catalogue reports for one entry, selected by its own name so
-/// the case does not depend on which page the entry lands on.
-async fn published_summary(emulator: &Emulator, name: &str) -> Value {
-    let listed = emulator
-        .call(
-            "GET",
-            &format!("{}?schemaNamePrefix={name}", catalogue_uri()),
-            None,
-        )
-        .await;
-    assert_eq!(
-        listed.status, 200,
-        "case {name:?}: expected 200 from ListSchemas, got {} {:?}",
-        listed.status, listed.body
-    );
-    summary_of(&listed.body, name)
-}
 
 /// What the catalogue publishes for one event source.
 ///
@@ -389,7 +363,7 @@ async fn a_published_entry_reports_the_version_count_the_catalogue_publishes() {
     ];
 
     for row in rows {
-        let summary = published_summary(&emulator, row.schema).await;
+        let summary = published_summary(&emulator, AWS_MANAGED_REGISTRY, row.schema).await;
         assert_eq!(
             summary["VersionCount"],
             json!(row.published),
@@ -499,7 +473,7 @@ async fn a_published_entry_reports_the_publication_instant_the_catalogue_publish
     ];
 
     for row in rows {
-        let summary = published_summary(&emulator, row.schema).await;
+        let summary = published_summary(&emulator, AWS_MANAGED_REGISTRY, row.schema).await;
         assert_eq!(
             summary["LastModified"],
             json!(row.published),
@@ -528,8 +502,10 @@ async fn a_published_entry_reports_the_publication_instant_the_catalogue_publish
     // The instant is the entry's own and no function of its name: two names that differ
     // only in a letter's case report different instants, and the second one — which the
     // catalogue publishes no instant for — is not the first's.
-    let publishes = published_summary(&emulator, "aws.tag@TagChangeOnResource").await;
-    let derives = published_summary(&emulator, "aws.tag@TagChangeonResource").await;
+    let publishes =
+        published_summary(&emulator, AWS_MANAGED_REGISTRY, "aws.tag@TagChangeOnResource").await;
+    let derives =
+        published_summary(&emulator, AWS_MANAGED_REGISTRY, "aws.tag@TagChangeonResource").await;
     assert_ne!(
         publishes["LastModified"], derives["LastModified"],
         "two entries a letter's case apart must report their own instants, got \
@@ -544,7 +520,8 @@ async fn a_published_entry_reports_the_publication_instant_the_catalogue_publish
         "an entry's instant is whole-second, got {derived:?}"
     );
     // And it does not move between stores either.
-    let elsewhere_derived = published_summary(&elsewhere, "aws.tag@TagChangeonResource").await;
+    let elsewhere_derived =
+        published_summary(&elsewhere, AWS_MANAGED_REGISTRY, "aws.tag@TagChangeonResource").await;
     assert_eq!(
         elsewhere_derived["LastModified"],
         json!(derived),
