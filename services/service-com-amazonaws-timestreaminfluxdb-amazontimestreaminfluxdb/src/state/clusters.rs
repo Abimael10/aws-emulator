@@ -88,7 +88,7 @@ pub const DEFAULT_ALLOCATED_STORAGE: i32 = 20;
 /// reads straight after its nodes settled still sees the cluster coming up.
 ///
 /// Derived from the one span this service settles a DB instance over rather than restating
-/// it, so both stay an order of magnitude below a client's round trip together.
+/// it: one span per level of the resources a cluster depends on.
 pub const CLUSTER_TRANSITION_SPAN: Duration = TRANSITION_SPAN.saturating_mul(2);
 
 /// How many DB clusters the store holds before `CreateDbCluster` refuses with the

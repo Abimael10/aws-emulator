@@ -51,11 +51,9 @@ fn router() -> MultiServiceRouter {
 /// reads a record as the STORE holds it, rather than as a reporting read reports it,
 /// needs.
 ///
-/// A transient status is read from the store because the span this service settles one
-/// over (`state::TRANSITION_SPAN`) is deliberately shorter than the round trip a client
-/// needs to issue its next request, so a reporting read issued after the announcing call
-/// is entitled to find the settle already due; the store keeps the status and the instant
-/// the settle falls due until a reporting operation materialises it.
+/// A transient status is read from the store because the store keeps both the status and
+/// the instant its settle falls due until a reporting operation materialises it, so a row
+/// asserting what the CLOCK OWES does not depend on when it reads the record back.
 fn router_and_store() -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>) {
     let (router, engine) = router_and_engine();
     influxdb::state::subscribe_account_to_marketplace_offering(
@@ -406,9 +404,9 @@ async fn create_cases(router: &MultiServiceRouter) -> Vec<ClusterCase> {
 /// Read the cluster `id` back until the clock-owed settle to `AVAILABLE` has been
 /// materialised, the way a client polls, and hand back the settled record.
 ///
-/// The settle is read rather than waited for by the clock: the span this service settles a
-/// transient status over (`state::TRANSITION_SPAN`) is deliberately shorter than a
-/// client's round trip, so WHICH read observes it is not something a test asserts.
+/// The settle is polled for rather than waited out by the clock: the test looks again
+/// until the record reports the settled status or the generous deadline above passes, so
+/// WHICH read observes it is not something a test asserts.
 async fn settled_cluster(router: &MultiServiceRouter, id: &str, case: &str) -> Value {
     let started = Instant::now();
     loop {

@@ -1017,11 +1017,11 @@ async fn a_new_instance_is_creating_until_the_clock_settles_it_to_available() {
         created["status"]
     );
 
-    // The span is not zero: the record the create left behind is CREATING and owes its
-    // settle one transition span after the create. Read from the STORE, because that span
-    // is deliberately shorter than the round trip a client needs to issue its next
-    // request — a reporting read is entitled to find the settle already due — and the
-    // store keeps the transient status until a reporting operation materialises it.
+    // The record the create left behind is CREATING and owes its settle one transition
+    // span after the create. Read from the STORE, which keeps the transient status and the
+    // instant the settle falls due until a reporting operation materialises it, so what is
+    // asserted here is the owed instant itself rather than how fast this test reads it
+    // back.
     {
         let state = influxdb::state::service_state(&*engine)
             .expect("the shared engine holds this service's store");
@@ -1299,31 +1299,183 @@ fn every_status_and_resource_type_this_service_reports_is_a_modelled_value() {
 /// chained workflow issues its next read as soon as the previous call answers.
 const CLIENT_ROUND_TRIP_ORDER: Duration = Duration::from_millis(10);
 
+/// How long a client may be left polling through ONE transient status: a span of this
+/// order keeps a workflow that chains several of them (provision, back up, restore, wait
+/// for each) converging in seconds.
+const POLLING_CLIENT_PATIENCE: Duration = Duration::from_secs(10);
+
 #[test]
-fn the_clock_owed_transition_span_settles_before_a_clients_next_read() {
+fn the_clock_owed_transition_span_outlasts_a_clients_next_request() {
     let span = influxdb::state::TRANSITION_SPAN;
-    // Non-zero: the transient status a lifecycle call announces is the record's real
-    // status at the instant that call answers, so the state errors keyed to it are
-    // reachable rather than dead code.
+    // An ORDER OF MAGNITUDE ABOVE that round trip: the transient status a lifecycle call
+    // announces is still the record's status when the client's very next request arrives,
+    // so the state refusals keyed to it (a restart of an instance that is still coming up,
+    // say) are reachable by a client and not only by a test that writes the store. A span
+    // below the round trip settles every record before the next request can observe it.
     assert!(
-        !span.is_zero(),
-        "case \"transition span\": a transient status must be observable, got {span:?}"
+        span >= CLIENT_ROUND_TRIP_ORDER * 10,
+        "case \"transition span\": a transient status must outlast a client's round trip \
+         ({CLIENT_ROUND_TRIP_ORDER:?}) by an order of magnitude, got {span:?}"
     );
-    // An ORDER OF MAGNITUDE below that round trip: the settle is already due when a
-    // polling client's first probe after the announcing call arrives, so no workflow
-    // spends one of the client's probe intervals per transition it waits through — which
-    // is what lets a workflow that chains several of them converge at all.
+    // And bounded above, so a client that polls through a transition — or a chain of
+    // them — converges in seconds.
     assert!(
-        span * 10 <= CLIENT_ROUND_TRIP_ORDER,
-        "case \"transition span\": a transient status must be settled an order of \
-         magnitude inside a client's round trip ({CLIENT_ROUND_TRIP_ORDER:?}), got {span:?}"
+        span <= POLLING_CLIENT_PATIENCE,
+        "case \"transition span\": a transient status must settle inside a polling \
+         client's patience ({POLLING_CLIENT_PATIENCE:?}), got {span:?}"
     );
     // The composite span a DB cluster settles over is this same span once per dependency
-    // level (its nodes, then the cluster itself), so it stays inside that round trip too.
-    assert!(
-        influxdb::state::CLUSTER_TRANSITION_SPAN < CLIENT_ROUND_TRIP_ORDER,
-        "case \"cluster transition span\": a composite's settle must be due inside a \
-         client's round trip ({CLIENT_ROUND_TRIP_ORDER:?}), got {:?}",
+    // level (its nodes, then the cluster itself), so a cluster's own transient status is
+    // observable just as long.
+    assert_eq!(
+        influxdb::state::CLUSTER_TRANSITION_SPAN,
+        span * 2,
+        "case \"cluster transition span\": a composite settles one span per dependency \
+         level, got {:?}",
         influxdb::state::CLUSTER_TRANSITION_SPAN
     );
+}
+
+/// The call that starts a transition on an AVAILABLE instance: the operation, and the
+/// request body built from the instance's id.
+type AnnouncingCall = (&'static str, fn(&str) -> Value);
+
+/// One row of the transient-window table: the call that announces a transient status on a
+/// DB instance, and the status it announces.
+struct WindowCase {
+    label: &'static str,
+    name: &'static str,
+    /// `None` when the create itself is the announcing call; otherwise the call that
+    /// announces the transient status.
+    announce: Option<AnnouncingCall>,
+    status: &'static str,
+}
+
+/// Rows spanning the lifecycle calls that put a DB instance into a transient status: the
+/// provision, each flavour of reconfiguration the modelled `Status` enum names separately,
+/// and a restart.
+fn window_cases() -> Vec<WindowCase> {
+    vec![
+        WindowCase {
+            label: "a provision",
+            name: "window-creating",
+            announce: None,
+            status: "CREATING",
+        },
+        WindowCase {
+            label: "a plain reconfiguration",
+            name: "window-updating",
+            announce: Some(("UpdateDbInstance", |id| {
+                json!({ "identifier": id, "allocatedStorage": 400 })
+            })),
+            status: "UPDATING",
+        },
+        WindowCase {
+            label: "an instance-type change",
+            name: "window-resizing",
+            announce: Some(("UpdateDbInstance", |id| {
+                json!({ "identifier": id, "dbInstanceType": "db.influx.large" })
+            })),
+            status: "UPDATING_INSTANCE_TYPE",
+        },
+        WindowCase {
+            label: "a deployment-type change",
+            name: "window-redeploying",
+            announce: Some(("UpdateDbInstance", |id| {
+                json!({ "identifier": id, "deploymentType": "WITH_MULTIAZ_STANDBY" })
+            })),
+            status: "UPDATING_DEPLOYMENT_TYPE",
+        },
+        WindowCase {
+            label: "a restart",
+            name: "window-rebooting",
+            announce: Some(("RebootDbInstance", |id| json!({ "identifier": id }))),
+            status: "REBOOTING",
+        },
+    ]
+}
+
+/// RULE: the transient status a lifecycle call announces is still the record's status when
+/// the client's VERY NEXT request arrives — the window the clock settles it over outlasts
+/// a client's round trip — and the clock closes that window on its own, changing nothing
+/// but the status.
+///
+/// Asserted with nothing but the wire: no test here writes the store or waits out a span,
+/// so what each row observes is what a client observes. The rows span the calls that
+/// announce a transient status and the statuses they announce, and each one is read back
+/// through both reporting paths (the reader and the listing).
+#[tokio::test]
+async fn the_transient_status_a_call_announces_is_what_the_clients_next_request_reads() {
+    for case in window_cases() {
+        // One router per row, so what the row asserts is about its own state alone.
+        let router = router();
+        let created = ok(
+            case.label,
+            call(&router, "CreateDbInstance", minimal_create(case.name)).await,
+        );
+        let id = id_of(case.label, &created);
+
+        let announced = match case.announce {
+            None => created,
+            Some((operation, body)) => {
+                poll_to_status(&router, &id, "AVAILABLE", case.label).await;
+                ok(case.label, call(&router, operation, body(&id)).await)
+            }
+        };
+        assert_eq!(
+            announced["status"].as_str(),
+            Some(case.status),
+            "case {:?}: the announcing call must report {}, got {announced}",
+            case.label,
+            case.status
+        );
+
+        // THE VERY NEXT REQUEST: no poll, no sleep, no store surgery.
+        let next = ok(
+            case.label,
+            call(&router, "GetDbInstance", json!({ "identifier": &id })).await,
+        );
+        assert_eq!(
+            next["status"].as_str(),
+            Some(case.status),
+            "case {:?}: a client's next request must still read {}, got {next}",
+            case.label,
+            case.status
+        );
+        // The listing reads the same records the reader does, so it reports the same
+        // window.
+        let listed = ok(case.label, call(&router, "ListDbInstances", json!({})).await);
+        let summary = listed["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {:?}: expected `items`, got {listed}", case.label))
+            .iter()
+            .find(|item| item["id"].as_str() == Some(id.as_str()))
+            .unwrap_or_else(|| {
+                panic!("case {:?}: {id} must be listed, got {listed}", case.label)
+            })
+            .clone();
+        assert_eq!(
+            summary["status"].as_str(),
+            Some(case.status),
+            "case {:?}: the listing must report {} too, got {summary}",
+            case.label,
+            case.status
+        );
+
+        // And the window closes on the CLOCK: the record settles to AVAILABLE on its own,
+        // with every member but the status left as the announcing call reported it.
+        let settled = poll_to_status(&router, &id, "AVAILABLE", case.label).await;
+        for (member, value) in announced.as_object().expect("an object response") {
+            if member == "status" {
+                continue;
+            }
+            assert_eq!(
+                settled.get(member),
+                Some(value),
+                "case {:?}: the settle must change {member} for nothing, got {:?}",
+                case.label,
+                settled.get(member)
+            );
+        }
+    }
 }

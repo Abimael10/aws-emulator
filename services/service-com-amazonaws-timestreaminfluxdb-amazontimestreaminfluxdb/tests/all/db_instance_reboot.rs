@@ -24,6 +24,13 @@
 //! port, and the Region the instance was created in. The refused rows span every transient
 //! status this API can put an instance into — the provision, the three flavours of
 //! reconfiguration, and a restart already running.
+//!
+//! The refusal is reachable BY A CLIENT, not only by a test: an instance is reported in
+//! the status its create announced for longer than a client needs to issue its next
+//! request, so the reboot a provisioning instance refuses is refused for a client that
+//! issues it straight after the create
+//! ([`a_reboot_issued_as_the_next_request_after_a_create_is_refused`], which reaches the
+//! service over the wire alone).
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -36,12 +43,13 @@ use crate::db_instance_lifecycle::{call_in, ok, router, router_and_engine, REGIO
 /// Hold the instance `id` in the transient status it is in, by moving the instant the
 /// clock owes its settle far beyond the end of this test.
 ///
-/// The span this service settles a transient status over
-/// (`influxdb::state::TRANSITION_SPAN`) is deliberately shorter than the round trip a
-/// client needs to issue its next request, so the refusal a transient status answers with
-/// is asserted on a record HELD in that status rather than on a race against that span.
-/// Nothing else about the record changes: the status is the one the announcing call
-/// reported.
+/// What this buys a row is DETERMINISM, not reachability: the window the service settles a
+/// transient status over outlasts a client's next request
+/// (`influxdb::state::TRANSITION_SPAN`, asserted on by
+/// [`a_reboot_issued_as_the_next_request_after_a_create_is_refused`] with nothing but the
+/// wire), so holding the record only takes the host's speed out of a row that asserts the
+/// refusal a status answers with rather than the window it is reported for. Nothing else
+/// about the record changes: the status is the one the announcing call reported.
 fn hold_transient(engine: &engine::InMemoryEngine, id: &str, case: &str) {
     with_record(engine, id, case, |record| {
         record.settles_at = Some(SystemTime::now() + Duration::from_secs(3_600));
@@ -607,4 +615,136 @@ async fn a_reboot_of_an_identifier_that_resolves_to_nothing_is_not_found() {
         "a 404 on another identifier must not disturb a live record, got \
          {live_still_there}"
     );
+}
+
+/// RULE: a DB instance is reported in the status its create announced for longer than a
+/// client needs to issue its next request, so a reboot issued straight after the create is
+/// refused — HTTP 400 `ValidationException`, the rebootable-state sentence, and a record
+/// the refusal leaves alone — and the identical reboot is accepted once the clock has
+/// settled the instance to `AVAILABLE`.
+///
+/// This is the same refusal
+/// [`a_reboot_is_refused_while_the_instance_is_in_a_transient_status`] asserts, driven as a
+/// CLIENT drives it: every call here goes over the wire, nothing writes the store and
+/// nothing waits out a span, so a window no client could observe fails this test. The rows
+/// are the create requests of [`reboot_cases`], which span the instance and storage types,
+/// the deployment type, the port, the list lengths, how many optional members the record
+/// carries and the Region.
+#[tokio::test]
+async fn a_reboot_issued_as_the_next_request_after_a_create_is_refused() {
+    for case in reboot_cases() {
+        // One router per row, so what the row asserts is about its own state alone.
+        let router = router();
+        let created = ok(
+            case.label,
+            call_in(&router, case.region, "CreateDbInstance", case.body.clone()).await,
+        );
+        let id = id_of(case.label, &created);
+        assert_eq!(
+            created["status"].as_str(),
+            Some("CREATING"),
+            "case {:?}: a freshly created instance is provisioning, got {created}",
+            case.label
+        );
+        // The modelled `Arn` pattern fixes the account segment at `[0-9]{12}`
+        // (`smithy_query(query="shape", shape="Arn")`), so the owning account the refusal
+        // names is field 5 of the record's own ARN.
+        let account_id = created["arn"]
+            .as_str()
+            .and_then(|arn| arn.split(':').nth(4))
+            .unwrap_or_else(|| panic!("case {:?}: expected an `arn` on {created}", case.label))
+            .to_string();
+        assert!(
+            account_id.len() == 12 && account_id.bytes().all(|byte| byte.is_ascii_digit()),
+            "case {:?}: expected a 12-digit account id in the arn, got {account_id:?}",
+            case.label
+        );
+
+        // THE VERY NEXT REQUEST: the instance is still being provisioned, so a restart of
+        // it is refused with the rebootable-state sentence.
+        let (status, body) = call_in(
+            &router,
+            case.region,
+            "RebootDbInstance",
+            json!({ "identifier": &id }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: a reboot issued while the instance is still provisioning must be \
+             refused, got {status} with {body}",
+            case.label
+        );
+        assert!(
+            body["__type"]
+                .as_str()
+                .unwrap_or_default()
+                .ends_with("ValidationException"),
+            "case {:?}: expected a ValidationException, got {body}",
+            case.label
+        );
+        assert_eq!(
+            body["reason"].as_str(),
+            Some("OTHER"),
+            "case {:?}: unexpected reason in {body}",
+            case.label
+        );
+        let expected = format!(
+            "DbInstance with identifier {id} and customer id {account_id} is not in a \
+             rebootable state"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(expected.as_str()),
+            "case {:?}: expected {expected:?}, got {body}",
+            case.label
+        );
+
+        // The refusal is INERT: the record is the one the create left behind, still
+        // provisioning — or settled, if the clock got there first — and never REBOOTING.
+        let after = ok(
+            case.label,
+            call_in(
+                &router,
+                case.region,
+                "GetDbInstance",
+                json!({ "identifier": &id }),
+            )
+            .await,
+        );
+        let reported = after["status"].as_str().unwrap_or_default();
+        assert!(
+            reported == "CREATING" || reported == "AVAILABLE",
+            "case {:?}: a refused reboot must leave the instance provisioning or settled, \
+             got {reported:?}",
+            case.label
+        );
+
+        // And the identical reboot is accepted once the clock has settled the instance,
+        // which then settles the restart the same way.
+        let available = poll_until_status(&router, case.region, &id, "AVAILABLE", case.label).await;
+        let accepted = ok(
+            case.label,
+            call_in(
+                &router,
+                case.region,
+                "RebootDbInstance",
+                json!({ "identifier": &id }),
+            )
+            .await,
+        );
+        assert_eq!(
+            accepted["status"].as_str(),
+            Some("REBOOTING"),
+            "case {:?}: the same reboot must be accepted once the instance is AVAILABLE, \
+             got {accepted}",
+            case.label
+        );
+        let settled = poll_until_status(&router, case.region, &id, "AVAILABLE", case.label).await;
+        assert_eq!(
+            settled, available,
+            "case {:?}: after the restart the record must read back unchanged",
+            case.label
+        );
+    }
 }

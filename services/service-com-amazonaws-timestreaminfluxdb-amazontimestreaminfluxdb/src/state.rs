@@ -212,20 +212,20 @@ pub const ARN_NAMESPACE: &str = "timestream-influxdb";
 /// one span every record of this service settles over, so a workflow that chains several
 /// transitions pays the same cost for each.
 ///
-/// It is non-zero, so the transient status a lifecycle call announces is the record's real
-/// status at the instant that call answers, and the state errors keyed to it (a restart of
-/// an instance that is not running, say) are reachable rather than dead code.
+/// It is WELL ABOVE the round trip a client needs to issue its next request, so the
+/// transient status a lifecycle call announces is still the record's status when that
+/// client's very next call arrives: a create followed immediately by a restart, a
+/// reconfiguration or a read sees `CREATING`, and the state refusals keyed to that status
+/// are reachable by a client rather than dead code. A span below that round trip settles
+/// every record before the next request can observe it, which leaves no transient status
+/// client-visible anywhere in this service.
 ///
-/// It is an ORDER OF MAGNITUDE below the round trip a client needs to issue its next
-/// request, and it is dated from the call that announced the transition rather than from
-/// anything that call does afterwards, which is what keeps a polling client live: the
-/// settle is already due when the client's first probe after that answer arrives, so a
-/// workflow that waits through a transition never spends one of its probe intervals on it
-/// and one that chains several (provision, back up, restore, wait for each) converges in
-/// the time the chain itself takes. A span of the order of the round trip — let alone of a
-/// probe interval — leaves that first probe reading the transient status and the client
-/// sleeping one whole interval per transition.
-pub const TRANSITION_SPAN: Duration = Duration::from_millis(1);
+/// It is dated from the call that announced the transition rather than from anything that
+/// call does afterwards, and it is small enough that a client polling through a transition
+/// — or through a chain of them (provision, back up, restore, wait for each) — converges
+/// in seconds. Nothing ever sleeps for it: the settle is materialised by the first
+/// reporting read taken once it has fallen due.
+pub const TRANSITION_SPAN: Duration = Duration::from_secs(3);
 
 /// The default `maxResults` for the paginated list operations: the maximum the model's
 /// `MaxResults` range (1..100) allows, so an unbounded request pages at the modelled cap.

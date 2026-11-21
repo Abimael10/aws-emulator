@@ -7,14 +7,14 @@
 //! RULE, in two halves, both about LIVENESS of this service's DB-instance lifecycle:
 //!
 //! * Every transient status this service reports is settled by the CLOCK, and the settle
-//!   it owes falls due one transition span after the call that announced it — a span an
-//!   order of magnitude below the round trip a client needs to issue its next read, dated
-//!   from that call and not from the work the handler does before answering. So a client
-//!   that polls `GetDbInstance` observes the settled status on its first probe after the
-//!   call, and a workflow that waits through several transitions — including one that
+//!   it owes falls due one transition span after the call that announced it — dated from
+//!   that call and not from the work the handler does before answering. The span outlasts
+//!   the round trip a client needs to issue its next read, so a client that polls
+//!   `GetDbInstance` reads the transient status until that span has passed and the settled
+//!   one after it; a workflow that waits through several transitions — including one that
 //!   CHAINS them, provision then back up then restore
-//!   ([`a_chained_create_backup_restore_workflow_converges_for_a_polling_client`]) — never
-//!   spends one of its probe intervals per transition.
+//!   ([`a_chained_create_backup_restore_workflow_converges_for_a_polling_client`]) — pays
+//!   that one span per transition and nothing more, so it converges in seconds.
 //! * A name a live DB instance owns is a STATE, not an always-invalid input: while the
 //!   instance lives a second create under that name is refused `ConflictException`, and
 //!   `DeleteDbInstance` releases both the id and the name AT ONCE, so the identical
@@ -51,18 +51,16 @@ use crate::influx_data_plane_round_trip::{address, basic, exchange, poll_health,
 /// is about the settle happening at all.
 const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
 
-/// How long a polling client waits before looking again. Longer than the transition span,
-/// which is what the rule's first half is about: a probe that lands one interval after the
-/// call finds the settle already due.
+/// How long a polling client waits before looking again.
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The most probes a client may need to see a transient status settled: the one that
-/// lands while the span is still running, and the next one. A client that needs more than
-/// this is burning more than one of its probe intervals on a transition the clock should
-/// already have made due. (A client of THIS harness reaches the service in microseconds,
-/// far inside the span, so its first probe is the one that lands early; a client that
-/// reaches it over a network sees the settle on its first probe.)
-const MAX_PROBES: usize = 2;
+/// The most probes a client may need to see a transient status settled: the probes that
+/// land while the span the clock settles it over is still running, the one that lands
+/// after it falls due, and one more for a loaded host. A client that needs more than this
+/// is waiting on something other than the ONE span the announcing call dated — a settle
+/// re-dated by a later call, or a transition the clock never made due.
+const MAX_PROBES: usize =
+    (influxdb::state::TRANSITION_SPAN.as_millis() / PROBE_INTERVAL.as_millis()) as usize + 2;
 
 /// One row of the table: a create request, the Region it is made in, and the status the
 /// record must reach.
@@ -304,8 +302,8 @@ async fn create_and_settle(
         "case {label:?}: exactly the created instance must own the name"
     );
 
-    // The settle the create owes is due before this client's next probe, so the poll
-    // converges without burning an interval on every transition.
+    // The settle the create owes falls due one span after the create, so the poll
+    // converges within that span and spends no interval on anything else.
     let (settled, probes) = poll_to_available(router, case.region, &id, &label, "CREATING").await;
     assert_eq!(
         settled["id"].as_str(),
@@ -843,7 +841,7 @@ async fn a_restore_builds_the_resource_the_backup_captured() {
         );
 
         // Restoring is work the service does, so the record is RESTORING until the clock
-        // settles it — and that settle is due before this client's next probe.
+        // settles it — one span after the restore call, and not one span per probe.
         let (settled, probes) =
             poll_to_available(&router, case.region, &restored_id, label, "RESTORING").await;
         assert!(
@@ -1560,13 +1558,11 @@ async fn poll_to_completed(
 }
 
 /// RULE: every status transition this service owes on the clock falls due one transition
-/// span after the CALL that announced it, and that span is an order of magnitude below the
-/// round trip a client needs to issue its next request. So the first probe a polling client
-/// makes after such a call finds the settle already due, no transition costs the client one
-/// of its probe intervals, and a workflow that CHAINS transitions — provision a DB
-/// instance and wait for it, back it up and wait for the backup, restore the backup and
-/// wait for the resource it mints — converges in the time the chain itself takes rather
-/// than in one probe interval per link.
+/// span after the CALL that announced it — not one span per probe a client makes, and not
+/// one per unit of work the handler does before answering. So a client polling through a
+/// CHAIN of transitions — provision a DB instance and wait for it, back it up and wait for
+/// the backup, restore the backup and wait for the resource it mints — pays one span per
+/// link and converges in the time the chain itself takes.
 ///
 /// Each row drives exactly that chain, the way a client drives it, and asserts for each of
 /// the three records it walks that the settle is owed one span after the announcing call
