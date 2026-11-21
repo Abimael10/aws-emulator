@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         let max_results = usize::try_from(requested).unwrap_or(MAX_MAX_RESULTS as usize);
-        let query = input.search_query.to_lowercase();
+        let terms = query_terms(&input.search_query);
 
         // Validate the metadata filter ONCE, before any record is read: whether the
         // request is well formed cannot depend on how many records the store holds.
@@ -245,7 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !matches_metadata_filter(input.filters.as_ref(), record)? {
                     continue;
                 }
-                let Some(rank) = relevance(record, &query) else {
+                let Some(rank) = relevance(record, &terms) else {
                     continue;
                 };
                 ranked.push((rank, record.summary()));
@@ -302,25 +302,57 @@ const FILTERABLE_RECORD_FIELDS: &[&str] = &[
     "status",
 ];
 
-/// How relevant `record` is to `query` (lower is more relevant), or `None` when it
-/// does not match at all.
+/// The record fields a `searchQuery` is matched against, most specific first: `name`,
+/// `displayName`, `description` — the text members `RegistryRecordSummary` publishes.
+const SEARCHABLE_FIELDS: usize = 3;
+
+/// The terms of a natural-language `searchQuery`: the words it is written in, folded
+/// to lower case so matching is case-insensitive.
 ///
-/// The rank is the position of the first stored text field the query occurs in,
-/// most specific first: the record's `name`, then its `displayName`, then its
-/// `description`. An empty `searchQuery` matches every discoverable record, all at
-/// the same rank.
-fn relevance(record: &RegistryRecord, query: &str) -> Option<usize> {
-    if query.is_empty() {
+/// The query is a phrase a person wrote, not a literal to look up, so it is matched
+/// term by term; one carrying no term at all (`SearchQuery` is modelled
+/// `@length{min:0}`) narrows nothing.
+fn query_terms(search_query: &str) -> Vec<String> {
+    search_query
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// How relevant `record` is to the query's `terms` (lower is more relevant), or
+/// `None` when it does not match at all.
+///
+/// A record matches when EVERY term of the query occurs in its searchable text — its
+/// `name`, its `displayName` or its `description` — in any order and not necessarily
+/// adjacently, so a multi-word query matches the record it describes and not only one
+/// that quotes the whole phrase. The rank is the position of the most specific field
+/// a term occurs in, most specific first: `name`, then `displayName`, then
+/// `description`. A query with no terms matches every discoverable record, all at the
+/// same rank.
+fn relevance(record: &RegistryRecord, terms: &[String]) -> Option<usize> {
+    if terms.is_empty() {
         return Some(0);
     }
-    let fields = [
-        Some(record.name.as_str()),
-        record.display_name.as_deref(),
-        record.description.as_deref(),
+    let searchable: [Option<String>; SEARCHABLE_FIELDS] = [
+        Some(record.name.to_lowercase()),
+        record.display_name.as_deref().map(str::to_lowercase),
+        record.description.as_deref().map(str::to_lowercase),
     ];
-    fields
-        .into_iter()
-        .position(|field| field.is_some_and(|text| text.to_lowercase().contains(query)))
+    let occurs_anywhere = |term: &String| {
+        searchable
+            .iter()
+            .flatten()
+            .any(|text| text.contains(term.as_str()))
+    };
+    if !terms.iter().all(occurs_anywhere) {
+        return None;
+    }
+    searchable.iter().position(|field| {
+        field
+            .as_ref()
+            .is_some_and(|text| terms.iter().any(|term| text.contains(term.as_str())))
+    })
 }
 
 /// A value a metadata filter can compare against: the member's doc says custom

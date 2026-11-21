@@ -1321,3 +1321,55 @@ async fn reading_does_not_change_what_a_later_caller_sees() {
         "a read must not change what a later caller sees, got {seen:?}"
     );
 }
+
+/// A `searchQuery` is a natural-language phrase, so a record matches when every term
+/// of the query occurs in its searchable text — in any order, across fields, and not
+/// necessarily adjacently — and a term no record carries narrows the answer to none.
+#[tokio::test]
+async fn search_matches_every_term_of_a_phrase_in_any_order() {
+    let router = seeded_router();
+    // (searchQuery, expected recordIds in relevance order). The seeded text is
+    // rec000000001 "payments-mcp" / "Payments MCP" / "Processes payment intents",
+    // rec000000002 "support-agent" / "Handles support conversations" and
+    // rec000000004 "skills-pack" / "Payments skills".
+    let cases: [(&str, Vec<&str>); 10] = [
+        // Every term of the phrase is in one description, in another order than the
+        // description words them.
+        ("intents processes payment", vec!["rec000000001"]),
+        ("payment intents", vec!["rec000000001"]),
+        // Both terms in the record's name.
+        ("mcp payments", vec!["rec000000001"]),
+        // One term in the name, the other only in the description.
+        ("support conversations", vec!["rec000000002"]),
+        // Casing is not part of the match.
+        ("HANDLES Support", vec!["rec000000002"]),
+        // One term in the name, the other only in the displayName, and the query is
+        // written with the whitespace a person types.
+        ("  skills   payments  ", vec!["rec000000004"]),
+        // Terms are conjunctive: no record carries both of these.
+        ("payments conversations", vec![]),
+        ("payments mcp skills", vec![]),
+        // A phrase nothing in the registry is described by.
+        ("tide forecast harbor", vec![]),
+        // A single term in two records ranks the one matching the more specific field
+        // first: a name match before a displayName match.
+        ("payments", vec!["rec000000001", "rec000000004"]),
+    ];
+    for (query, expected) in cases {
+        let (status, body) = post(
+            &router,
+            "/discoverable-records-search",
+            &json!({ "searchQuery": query, "registryIds": [REGISTRY], "maxResults": 20 }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {query:?}: expected 200, got {status}: {body}"
+        );
+        let found = record_ids(query, &body);
+        assert_eq!(
+            found, expected,
+            "case {query:?}: expected {expected:?}, got {found:?}"
+        );
+    }
+}
