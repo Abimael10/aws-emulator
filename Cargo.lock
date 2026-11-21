@@ -20556,6 +20556,7 @@ dependencies = [
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-backup-cryocontrollerusermanager",
+ "service-com-amazonaws-cloudtrail-cloudtrail-20131101",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",

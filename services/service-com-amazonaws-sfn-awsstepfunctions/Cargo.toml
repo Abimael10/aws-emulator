@@ -183,6 +183,12 @@ service-com-amazonaws-xray-awsxray = { workspace = true }
 # served by that api's own `execute-api` data plane out of the records its control plane
 # stored.
 service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
+# The service that holds the account's TRAILS, mounted beside Step Functions in
+# `tests/all/sync_execution_trail_data_selector.rs`: the trail there is created, given its
+# advanced event selectors and started through CloudTrail's OWN API, so what a synchronous
+# run is delivered as is decided by the selectors a client really wrote rather than by a
+# projection the suite installed itself.
+service-com-amazonaws-cloudtrail-cloudtrail-20131101 = { workspace = true }
 
 [lints]
 workspace = true
