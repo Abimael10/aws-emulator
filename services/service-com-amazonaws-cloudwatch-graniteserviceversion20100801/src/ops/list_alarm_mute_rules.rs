@@ -182,8 +182,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Where this page resumes from, read off the token the request offered
         // ([`crate::state::ResumedAt`], the one rule every listing of this service that SERVES an
         // unreadable token shares): a value this listing can read a cursor out of names the rule
-        // the page starts at, one it cannot names the position past the last rule, and no
-        // token at all asks for the first page.
+        // the page starts at, and one it cannot names no position of the enumeration at all, so
+        // it is ignored — the first page, which is what no token at all asks for too.
         let resume = crate::state::ResumedAt::of(input.next_token.as_deref());
 
         let now = crate::state::now_secs();

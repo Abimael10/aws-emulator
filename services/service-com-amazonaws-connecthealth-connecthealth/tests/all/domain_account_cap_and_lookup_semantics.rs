@@ -14,11 +14,12 @@
 //!    succeeds with status `ACTIVE`. (That the count is per Region rather than
 //!    cross-Region is asserted in `tests/all/region_scoping.rs`; every row here is signed
 //!    for one Region.)
-//! 2. `DeleteDomain` answers every `domainId` it resolves no domain for with the modelled
-//!    404 `ResourceNotFoundException`, whose detail member names the requested id — an id
-//!    this service minted and no longer holds and one it never minted read the same, which
-//!    is the ONE error the operation models. A READ of either (`GetDomain`) answers the
-//!    same 404.
+//! 2. `DeleteDomain` splits the `domainId`s it resolves no domain for by ALLOCATION
+//!    HISTORY: an id this service minted and no longer holds earns the modelled 404
+//!    `ResourceNotFoundException` whose detail member names the requested id, while an id
+//!    with no allocation history resolves to no resource ARN at the front door and is
+//!    refused by the authorizer itself, with its own code and no detail at all. A READ
+//!    (`GetDomain`) resolves the domain itself, so it answers the modelled 404 for either.
 //! 3. A Domain-not-found answer reports `Domain not found: <domainId>`, the requested id
 //!    verbatim, from whichever operation resolved the Domain.
 //! 4. `GetMedicalScribeListeningSession` resolves a session only under the exact
@@ -42,6 +43,9 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_connecthealth_connecthealth::ops::types::MedicalScribeChannelDefinition;
+use service_com_amazonaws_connecthealth_connecthealth::service::authorizer_refusal::{
+    AUTHORIZER_CONFIGURATION_EXCEPTION, AUTHORIZER_CONFIGURATION_STATUS,
+};
 use service_com_amazonaws_connecthealth_connecthealth::state::{
     self, ScribeSession, ScribeStreamStatus, MAX_DOMAINS_PER_ACCOUNT,
 };
@@ -310,7 +314,7 @@ async fn a_domain_whose_deletion_is_still_in_flight_keeps_its_slot_until_the_pur
 }
 
 #[tokio::test]
-async fn delete_domain_answers_every_unresolvable_id_the_modelled_not_found() {
+async fn delete_domain_splits_an_unresolvable_id_by_allocation_history() {
     let emulator = Emulator::new("us-east-1");
 
     // Well-formed ids this service never allocated: both modelled prefixes, both ends of
@@ -328,25 +332,30 @@ async fn delete_domain_answers_every_unresolvable_id_the_modelled_not_found() {
     ];
 
     for (case, domain_id) in &unallocated {
-        // `DeleteDomain` models ONE error, so an id this Region resolves no domain for is
-        // that 404 naming the requested id, whatever allocation history the id has.
+        // An id with no allocation history anywhere resolves to no resource ARN at the
+        // front door, so `DeleteDomain` is refused by the authorizer itself — its own code,
+        // a client-side status, and no detail member at all — before the component that
+        // owns the domain is reached.
         let (status, body) = emulator
             .send("DELETE", &format!("/domain/{domain_id}"), None)
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?} ({domain_id}): expected the modelled not-found, got \
+            (
+                AUTHORIZER_CONFIGURATION_STATUS,
+                AUTHORIZER_CONFIGURATION_EXCEPTION
+            ),
+            "case {case:?} ({domain_id}): expected the authorizer's own refusal, got \
              {status} {body:?}"
         );
-        assert_eq!(
-            detail_text(case, &body),
-            format!("Domain not found: {domain_id}"),
-            "case {case:?}: the not-found must name the requested id, got {body:?}"
+        assert!(
+            body.get("message").is_none_or(serde_json::Value::is_null),
+            "case {case:?}: the authorizer refusal carries no detail, got {body:?}"
         );
 
-        // A READ of the same id is worded the same way: `GetDomain` answers every id it
-        // resolves no domain for with the modelled not-found, naming the requested id.
+        // The READ of the same id resolves the domain itself, so it keeps the modelled
+        // not-found naming the requested id: `GetDomain` answers every id it resolves no
+        // domain for that way.
         let (status, read) = emulator
             .send("GET", &format!("/domain/{domain_id}"), None)
             .await;

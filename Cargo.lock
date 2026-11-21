@@ -16446,6 +16446,7 @@ dependencies = [
 name = "service-com-amazonaws-lexruntimev2-awsdeepsenseruntimeserviceapi2-0"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

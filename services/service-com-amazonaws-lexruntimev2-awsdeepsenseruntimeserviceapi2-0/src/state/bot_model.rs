@@ -406,6 +406,49 @@ pub fn built_locale<Eng: Send + Sync + 'static>(
     })
 }
 
+/// The bot, alias and locale a SESSION call addresses, resolved WITHOUT requiring
+/// a runtime model to have been built.
+///
+/// "Returns session information for a specified bot, alias, and user. … If the
+/// bot, alias, or session identifier doesn't exist, Amazon Lex V2 returns a
+/// BadRequestException. If the locale doesn't exist or is not enabled for the
+/// alias, you receive a BadRequestException."
+/// (`smithy_query(query="doc",shape="GetSession")`) — what the ADDRESS of a
+/// session is, then, is the bot/alias pair and a locale that EXISTS for the
+/// version that alias points at. Being BUILT is what gives the locale a runtime
+/// MODEL ([`built_locale`]), which only a call that INTERPRETS input needs: a
+/// call that just reads or removes a stored session interprets nothing, so a
+/// locale that exists but was never built addresses its sessions perfectly well
+/// and an absent session there is a missing SESSION, not a bad bot address.
+///
+/// The refusals are the same two the address has anywhere
+/// ([`LocaleUnavailable::refusal`]): a pair that is no alias of that bot names
+/// both ids, and a locale the alias's version does not hold at all carries the
+/// fixed `BotId`/`BotLocale` sentence.
+pub fn addressed_locale<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    bot_id: &str,
+    bot_alias_id: &str,
+    locale_id: &str,
+) -> Result<(), LocaleUnavailable> {
+    let control_plane =
+        lexmodels::state::service_state(engine).ok_or(LocaleUnavailable::StoreUnavailable)?;
+    let mut control_plane = control_plane.lock();
+
+    let bot_version = control_plane
+        .bot_aliases
+        .get(&lexmodels::state::bot_alias_key(bot_id, bot_alias_id))
+        .map(|alias| alias.bot_version.clone())
+        .ok_or(LocaleUnavailable::UnknownBotAlias)?;
+
+    // Read through the same settling step [`built_locale`] reads it through, so
+    // this resolution and `DescribeBotLocale` observe the same record.
+    control_plane
+        .settled_bot_locale(bot_id, &bot_version, locale_id)
+        .ok_or(LocaleUnavailable::NotBuilt)?;
+    Ok(())
+}
+
 /// The slots of `intent`, in the order Amazon Lex V2 elicits them: the order its
 /// `slotPriorities` fixes, which is the list a build requires every slot of the
 /// intent to appear in. A slot nothing orders is elicited after the ordered

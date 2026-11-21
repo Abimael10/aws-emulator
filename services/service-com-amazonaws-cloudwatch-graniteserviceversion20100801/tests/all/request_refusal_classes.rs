@@ -15,9 +15,8 @@
 //!   own coded sentence**, naming that member and the contributor query the read is served by;
 //! * **a paginated listing answers a `NextToken` it cannot resume from in ITS OWN terms**: the
 //!   alarm HISTORY refuses it naming the value at fault, the Contributor Insights listings
-//!   refuse it with their coded sentence, and the alarm listing refuses it not at all — it
-//!   serves the position such a value names, the one PAST its last alarm, which is the empty
-//!   page that ends a walk;
+//!   refuse it with their coded sentence, and the alarm listing refuses it not at all — such a
+//!   value names no position of its enumeration, so it is ignored and the first page is served;
 //! * **`SetAlarmState` refuses a `StateReasonData` that is not a JSON document with
 //!   `InvalidFormat` and leaves the alarm's state untouched**, whatever the value is wrong
 //!   about;
@@ -281,9 +280,9 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
         }
 
         // The alarm LISTING refuses no token: a value it cannot read a cursor out of names no
-        // alarm this enumeration holds, so it names the position PAST the last one and the
-        // EMPTY page is served (`tests/all/paginated_read_cursor.rs` holds that rule over
-        // every listing of this service that serves such a token).
+        // position of this enumeration, so it is IGNORED and the first page is served
+        // (`tests/all/paginated_read_cursor.rs` holds that rule over every listing of this
+        // service that serves such a token).
         let listed = ok(&router, "DescribeAlarms", &json!({"NextToken": token})).await;
         let named: Vec<String> = listed["MetricAlarms"]
             .as_array()
@@ -293,15 +292,17 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
             .filter_map(|alarm| alarm.get("AlarmName").and_then(Value::as_str))
             .map(ToString::to_string)
             .collect();
-        assert!(
-            named.is_empty(),
-            "case {case:?}: a token the alarm listing cannot resume from must answer the \
-             empty page, got {listed}"
+        assert_eq!(
+            named,
+            vec!["paged-alarm".to_string()],
+            "case {case:?}: a token the alarm listing cannot resume from must be ignored and \
+             its first page served, got {listed}"
         );
         assert_eq!(
             listed.get("NextToken"),
             None,
-            "case {case:?}: an empty page owes no further token, got {listed}"
+            "case {case:?}: the first page holds the only alarm, so no token is owed, got \
+             {listed}"
         );
     }
 }

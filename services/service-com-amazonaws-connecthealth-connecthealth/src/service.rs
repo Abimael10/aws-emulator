@@ -55,6 +55,7 @@
 //! service does not state as the framework does — a `domainId` outside what `DomainId`
 //! declares, which it refuses with its own domain-id sentence ([`domain_id_refusal`]).
 
+pub mod authorizer_refusal;
 pub mod domain_id_refusal;
 pub mod error_detail;
 pub mod required_query_route;

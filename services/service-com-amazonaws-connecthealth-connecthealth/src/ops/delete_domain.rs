@@ -204,17 +204,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialise_due(now);
 
         let Some(domain) = store.held_domain_mut(&region, &input.domain_id) else {
-            // An id this Region resolves no domain for names a domain that is not there —
-            // purged after an earlier delete, held in another Region, or never minted at
-            // all — and that is the ONE error `DeleteDomain` models,
-            // `ResourceNotFoundException` at 404 (`smithy_query(query="operation",
-            // operation="DeleteDomain")`), which is what the recorded answers of this route
-            // carry for a well-formed id this account was never allocated as well. The id
-            // the request addressed is what tells one 404 from another, so the sentence
-            // names it through the shared constructor. A permanent client-side condition is
-            // never a 5xx: an SDK retries a server fault, so the normal idempotent-cleanup
-            // path — delete a domain that is already gone — has to terminate in "already
-            // gone".
+            // An id this Region resolves no domain for is answered by what the id's own
+            // ALLOCATION HISTORY says, because the two conditions are answered by two
+            // different components of the service:
+            //
+            // * an id this service once minted — purged after an earlier delete, or held in
+            //   another Region — resolves to a resource ARN at the front door, so the
+            //   component that owns the domain is reached and answers the ONE error
+            //   `DeleteDomain` models, `ResourceNotFoundException` at 404
+            //   (`smithy_query(query="operation", operation="DeleteDomain")`), naming the id
+            //   the request addressed through the shared constructor. This is the
+            //   idempotent-cleanup path — delete a domain that is already gone — and it has
+            //   to terminate in "already gone";
+            // * an id with no allocation history anywhere resolves to no ARN at all, so the
+            //   authorizer's own configuration failure answers the call before any resource
+            //   lookup runs ([`crate::service::authorizer_refusal`]).
+            //
+            // Neither is a 5xx: both conditions are permanent and lie in the request's own
+            // id, and an SDK retries a server fault.
+            if !store.has_allocated_domain(&input.domain_id) {
+                return Err(crate::service::authorizer_refusal::unresolvable_domain_id());
+            }
             return Err(DeleteDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::service::error_detail::domain_not_found_message(

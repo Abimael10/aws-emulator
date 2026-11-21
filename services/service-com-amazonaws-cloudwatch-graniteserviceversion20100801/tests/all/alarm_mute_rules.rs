@@ -993,8 +993,8 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         );
     }
 
-    // A token this service cannot read a cursor out of names no rule this listing holds, so it
-    // names the position PAST the last one and the EMPTY page is served rather than the request
+    // A token this service cannot read a cursor out of names no position of this listing's
+    // enumeration, so it is IGNORED and the first page is served rather than the request
     // refused. Rows differ along how the token misses: text that is no token at all, a truncated
     // one, and one with text appended.
     let minted = text(
@@ -1002,6 +1002,8 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         "NextToken",
     )
     .unwrap_or_default();
+    let first_page = ok(&router, "ListAlarmMuteRules", &json!({})).await;
+    let every_rule = listed_arns(&first_page);
     for (case, token) in [
         ("a token that is not one", "not-a-token".to_string()),
         (
@@ -1021,8 +1023,8 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         .await;
         assert_eq!(
             (status, listed_arns(&body), body.get("NextToken")),
-            (200, Vec::new(), None),
-            "case {case:?}: expected HTTP 200 with the empty page past the last rule, \
+            (200, every_rule.clone(), None),
+            "case {case:?}: expected HTTP 200 with the first page {every_rule:?}, \
              got {status} with {body}"
         );
     }
@@ -1299,12 +1301,12 @@ async fn deleting_a_mute_rule_is_idempotent_and_reaches_only_its_own_region() {
 }
 
 #[tokio::test]
-async fn a_next_token_this_listing_cannot_resume_from_asks_for_the_empty_page() {
+async fn a_next_token_this_listing_cannot_resume_from_is_ignored() {
     // The rule: a `NextToken` names a POSITION in the enumeration — "The token returned from a
     // previous call to indicate where to continue retrieving results."
     // (`ListAlarmMuteRulesInput$NextToken`) — and one this listing cannot read a cursor out of
-    // names no rule it holds, so it names the position PAST the last one: the EMPTY page is
-    // served, not a refusal that aborts the walk and not the first page again.
+    // names no position of it at all, so it is IGNORED: the first page is served, not a refusal
+    // that aborts the walk and not an empty page that ends it.
     //
     // Rows differ along the FORM of the value offered: no token at all, the empty string, a token
     // this listing minted, and four shapes of value it cannot read a cursor out of (text that is
@@ -1344,19 +1346,19 @@ async fn a_next_token_this_listing_cannot_resume_from_asks_for_the_empty_page() 
         (
             "text that is no cursor",
             Some("not-a-token".to_string()),
-            Vec::new(),
+            every_rule.clone(),
         ),
         (
             "an opaque blob of another service's form",
             Some("eyJuZXh0Ijoibm90aGluZyJ9".to_string()),
-            Vec::new(),
+            every_rule.clone(),
         ),
         (
             "a blob whose bytes are no text",
             Some("AAAA".to_string()),
-            Vec::new(),
+            every_rule.clone(),
         ),
-        ("a minted cursor truncated", Some(truncated), Vec::new()),
+        ("a minted cursor truncated", Some(truncated), every_rule.clone()),
     ];
 
     for (case, token, expected) in cases {
@@ -1370,11 +1372,10 @@ async fn a_next_token_this_listing_cannot_resume_from_asks_for_the_empty_page() 
             (200, expected.clone()),
             "case {case:?}: expected HTTP 200 with {expected:?}, got {status} with {body}"
         );
-        if expected.is_empty() {
+        if expected == every_rule {
             assert!(
                 body.get("NextToken").is_none(),
-                "case {case:?}: an empty page has no page after it, so no token is owed, \
-                 got {body}"
+                "case {case:?}: the page holds every rule, so no token is owed, got {body}"
             );
         }
     }

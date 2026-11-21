@@ -13,11 +13,15 @@
 //!
 //! 1. A call addressed by the four session labels (`GetSession`,
 //!    `DeleteSession`, `PutSession`, `RecognizeText`, `RecognizeUtterance`)
-//!    resolves the `botId`/`botAliasId` PAIR and the addressed locale's build
-//!    state before it touches the session store: an alias that is not an alias
-//!    of that bot, and a locale with no built model, are refused with
-//!    HTTP 404 `ResourceNotFoundException` in AWS's own words — and the refusal
-//!    has no effect, so no session comes into existence and none is removed.
+//!    resolves the `botId`/`botAliasId` PAIR and the addressed locale before it
+//!    touches the session store: an alias that is not an alias of that bot, and
+//!    a locale the alias's version does not hold, are refused with HTTP 404
+//!    `ResourceNotFoundException` in AWS's own words — and the refusal has no
+//!    effect, so no session comes into existence and none is removed. A locale
+//!    that EXISTS but was never BUILT has no runtime MODEL, which only a call
+//!    that INTERPRETS input needs: the two calls that merely read or remove a
+//!    stored session are served there and refuse an absent session as a missing
+//!    SESSION, while a turn and a `PutSession` are refused as the address.
 //! 2. A `sessionState` seeded by `PutSession` names resources the resolved
 //!    locale defines: an intent it does not declare, or an elicited slot that
 //!    intent does not declare, is HTTP 400 `ValidationException` and stores
@@ -318,16 +322,17 @@ async fn a_call_is_refused_until_the_locale_is_built() {
         locales: vec!["en_US".to_string()],
     };
 
-    // (case, localeId) — every row is a locale with no built model: one created
-    // but never built, one the bot has no locale for at all, and one outside the
-    // locales the service supports.
-    let unbuilt: [(&str, &str); 3] = [
-        ("a created locale that was never built", "en_US"),
-        ("a locale the bot has no record for", "de_DE"),
-        ("a locale the service does not support", "xx_XX"),
+    // (case, localeId, whether the locale EXISTS for the alias) — every row is a
+    // locale with no built model: one created but never built, which exists and
+    // therefore still addresses its sessions, one the bot has no locale for at
+    // all, and one outside the locales the service supports.
+    let unbuilt: [(&str, &str, bool); 3] = [
+        ("a created locale that was never built", "en_US", true),
+        ("a locale the bot has no record for", "de_DE", false),
+        ("a locale the service does not support", "xx_XX", false),
     ];
 
-    for (case, locale_id) in unbuilt {
+    for (case, locale_id, locale_exists) in unbuilt {
         for call in session_calls() {
             let session_id = format!("locale-{}", call.name());
             let path = format!(
@@ -349,11 +354,21 @@ async fn a_call_is_refused_until_the_locale_is_built() {
                 call.name(),
                 reply.error_type()
             );
+            // A locale that EXISTS addresses its sessions whether or not it was
+            // built, so the two calls that only read or remove a stored session
+            // are refused for the SESSION there; every other combination of call
+            // and row is refused as the address.
+            let reads_the_session_only =
+                matches!(call, Call::GetSession | Call::DeleteSession) && locale_exists;
+            let expected = if reads_the_session_only {
+                format!("The session for user {session_id} doesn\u{2019}t exist or has expired.")
+            } else {
+                LOCALE_NOT_VALID.to_string()
+            };
             let message = reply.error_message();
             assert_eq!(
-                message,
-                LOCALE_NOT_VALID,
-                "case {case:?} on {}: expected the locale's own sentence, got {message:?}",
+                message, expected,
+                "case {case:?} on {}: expected {expected:?}, got {message:?}",
                 call.name()
             );
         }

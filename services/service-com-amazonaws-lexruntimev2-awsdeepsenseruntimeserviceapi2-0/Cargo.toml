@@ -35,6 +35,11 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
+[dev-dependencies]
+# automod declares one module per `tests/all/<name>.rs`, so the single integration
+# target picks up a suite from the file alone.
+automod = { workspace = true }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

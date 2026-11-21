@@ -7,7 +7,10 @@
 //! what a later caller sees.
 //!
 //! The bot/alias pair and the locale are resolved against the control plane
-//! first, so an address that names no built model is refused as the address.
+//! first, so an address that names no alias of that bot, or no locale of the
+//! version it points at, is refused as the address — but a locale that EXISTS
+//! and was never BUILT still addresses its sessions, so an absent session there
+//! is refused as a missing session.
 //!
 //! ## Shape of an operation
 //!
@@ -88,7 +91,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::bot_model::{built_locale, AddressRefused, LocaleUnavailable};
+use crate::state::bot_model::{addressed_locale, AddressRefused, LocaleUnavailable};
 use crate::state::SessionKey;
 use std::time::SystemTime;
 
@@ -205,13 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.session_id,
         );
 
-        // The address is resolved BEFORE the store is read: the three labels
-        // that name the conversation have to resolve to a model Amazon Lex V2
-        // has built — the bot/alias PAIR, then that version's locale — so a
-        // read addressed to a pair that is not an alias of that bot, or to a
-        // locale with no built model, is refused as the address rather than
-        // answered as a missing session.
-        built_locale(
+        // The ADDRESS is resolved BEFORE the store is read: the bot/alias PAIR,
+        // then that version's locale. A read of a session needs no runtime MODEL
+        // behind that locale — it interprets nothing — so resolution here is the
+        // locale EXISTING for the alias ([`addressed_locale`]), and an addressed
+        // session that is not in the store is answered as a missing session even
+        // on a locale that was never built. A pair that is not an alias of that
+        // bot, or a locale the alias's version does not hold, is refused as the
+        // address.
+        addressed_locale(
             &*self.engine,
             &input.bot_id,
             &input.bot_alias_id,
