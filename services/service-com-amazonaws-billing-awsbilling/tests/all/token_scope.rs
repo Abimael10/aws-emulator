@@ -21,6 +21,14 @@
 //! Support charge reads are the sharpest rows: they page over the same spend
 //! store, so their payloads are drawn from one key space and only the read named
 //! in the token tells their cut points apart.
+//!
+//! The second half of the suite is about the other half of that one rule: WHICH
+//! SEQUENCE a token is a cut point in. A read handed its own token under request
+//! members naming another sequence — another billing view, another period,
+//! another billing month — refuses it rather than comparing that cursor against
+//! the keys of the walk the request asks for; a member that only narrows one and
+//! the same walk leaves the cursor a cut point of it, and the page size is no
+//! part of a sequence at all.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -38,7 +46,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // `error_code` — already exists for the billing-view lifecycle suite, so this
 // module reuses it instead of building a second one.
 use crate::billing_views::{
-    call, emulator_with_engine, error_code, plant_source_views, ACCOUNT_ID, PRIMARY_ARN,
+    call, emulator_with_engine, error_code, plant_source_views, plant_view, ACCOUNT_ID, PRIMARY_ARN,
 };
 // The epoch-seconds helper the credit-allocation suite already carries, so the
 // date ranges below need no second copy of it.
@@ -62,6 +70,19 @@ const THIRD_MEMBER_ACCOUNT_ID: &str = "333333333333";
 /// every Support read answers for it whatever day the suite runs on.
 const PAST_MONTH: &str = "2024-03";
 
+/// A second such month, EARLIER than [`PAST_MONTH`], so its bills sort below
+/// that month's in the spend store's month-first keys: a cut point of the later
+/// month's walk compares above every key of this one, which is how a token
+/// honoured across months would drop a whole month of bills.
+const EARLIER_MONTH: &str = "2024-01";
+
+/// Two further `PRIMARY` billing views of the caller's own account
+/// ([`ACCOUNT_ID`]), one whose ARN sorts BELOW the account's own `PRIMARY` view
+/// and one above it: the segment store is keyed by the walked view's ARN, so the
+/// two sort on either side of a cut point of that view's timeline.
+const LOWER_PRIMARY_ARN: &str = "arn:aws:billing::000000000000:billingview/alt-primary";
+const UPPER_PRIMARY_ARN: &str = "arn:aws:billing::000000000000:billingview/zeta-primary";
+
 /// The `message` every paginated read refuses an unusable `nextToken` with.
 const PAGE_TOKEN_REFUSAL: &str = "nextToken is not a token this service issued";
 
@@ -84,19 +105,34 @@ fn instant(secs: i64) -> SystemTime {
 /// One segment of the caller's PRIMARY billing view, over the half-open period
 /// `begin..end`.
 fn segment(begin: i64, end: i64) -> BillingViewSegment {
+    segment_of(PRIMARY_ARN, begin, end)
+}
+
+/// One segment of the billing view `arn`'s timeline, over the half-open period
+/// `begin..end`.
+fn segment_of(arn: &str, begin: i64, end: i64) -> BillingViewSegment {
     BillingViewSegment {
         begin_date_inclusive: Some(instant(begin)),
         end_date_exclusive: Some(instant(end)),
-        ..BillingViewSegment::in_effect(PRIMARY_ARN, BILLING_DOMAIN_BILLABLE)
+        ..BillingViewSegment::in_effect(arn, BILLING_DOMAIN_BILLABLE)
     }
 }
 
 /// One account-month of Support-eligible spend, under the Support plan the row
 /// names.
 fn spend(account_id: &str, support_plan_name: &str) -> SupportEligibleSpend {
+    spend_in(PAST_MONTH, account_id, support_plan_name)
+}
+
+/// The same bill, for the billing month `billing_month`.
+fn spend_in(
+    billing_month: &str,
+    account_id: &str,
+    support_plan_name: &str,
+) -> SupportEligibleSpend {
     SupportEligibleSpend {
         account_id: account_id.to_string(),
-        billing_month: PAST_MONTH.to_string(),
+        billing_month: billing_month.to_string(),
         support_plan_name: support_plan_name.to_string(),
         currency_code: "USD".to_string(),
         by_service: vec![SupportServiceSpend {
@@ -110,6 +146,19 @@ fn spend(account_id: &str, support_plan_name: &str) -> SupportEligibleSpend {
         savings_plan_spend_minor: 0,
         is_estimated_bill: false,
     }
+}
+
+/// The accounts of the seeded consolidated billing family and the Support plan
+/// each one's bills record: two under the Enterprise plan, two under the
+/// Business plan, so the Enterprise report and the subscription history each
+/// have entries of their own.
+fn family_plans() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (ACCOUNT_ID, SUPPORT_PLAN_ENTERPRISE),
+        (MEMBER_ACCOUNT_ID, SUPPORT_PLAN_ENTERPRISE),
+        (OTHER_MEMBER_ACCOUNT_ID, SUPPORT_PLAN_BUSINESS),
+        (THIRD_MEMBER_ACCOUNT_ID, SUPPORT_PLAN_BUSINESS),
+    ]
 }
 
 /// One credit applied to the caller's bill for `billing_month`.
@@ -149,12 +198,7 @@ fn seed(engine: &Arc<engine::InMemoryEngine>) {
             .consolidated_billing_family
             .insert(account_id.to_string(), "Linked Account".to_string());
     }
-    for (account_id, plan) in [
-        (ACCOUNT_ID, SUPPORT_PLAN_ENTERPRISE),
-        (MEMBER_ACCOUNT_ID, SUPPORT_PLAN_ENTERPRISE),
-        (OTHER_MEMBER_ACCOUNT_ID, SUPPORT_PLAN_BUSINESS),
-        (THIRD_MEMBER_ACCOUNT_ID, SUPPORT_PLAN_BUSINESS),
-    ] {
+    for (account_id, plan) in family_plans() {
         assert!(
             state.record_support_eligible_spend(spend(account_id, plan)),
             "setup: the seeded spend of {account_id:?} must fit in the store"
@@ -615,4 +659,407 @@ async fn the_preference_read_refuses_a_cut_point_of_its_own_walk_a_caller_assemb
         status,
         &refused,
     );
+}
+
+// ---------------------------------------------------------------------------
+// A token is a cut point in the ONE sequence the request selected.
+//
+// The rule the rest of this suite asserts is about WHICH READ issued a token.
+// The rows below are about the other half of it: a read handed its OWN token
+// under request members that select another sequence refuses it, instead of
+// comparing a cursor of that other sequence against the keys of this one — a
+// comparison that answers an empty page for a walk that is not empty, or
+// restarts it. A member that only NARROWS one and the same walk leaves the
+// cursor a cut point of it, and `maxResults` is no part of a sequence at all.
+// ---------------------------------------------------------------------------
+
+/// One replay of a `nextToken` a read really issued: the request it is replayed
+/// with, and what the read owes that request.
+struct Replay {
+    case: &'static str,
+    request: Value,
+    /// `None` when the token is a cut point of the sequence this request
+    /// selects, so the read resumes the walk; `Some(what)` when it is a cut
+    /// point of another sequence, so the read refuses a token issued for
+    /// another `what`.
+    issued_for: Option<&'static str>,
+}
+
+/// A `ListBillingViewSegments` request for the billing view `arn` over the
+/// half-open period `begin..end`.
+fn segments_over(arn: &str, begin: i64, end: i64) -> Value {
+    json!({
+        "arn": arn,
+        "timeRange": { "beginDateInclusive": begin, "endDateExclusive": end },
+    })
+}
+
+/// Assert that `refused` is the refusal a paginated read answers a token it
+/// minted while walking ANOTHER sequence with: 400 `ValidationException`, a
+/// message naming the member that carried the token and what the token was
+/// issued for, and a `fieldList` naming that member.
+///
+/// Told apart from the refusal of a token no read issued ([`PAGE_TOKEN_REFUSAL`],
+/// `cannotParse`): this token IS one this service minted, and what makes it
+/// unusable is the sequence it is a cut point of.
+fn assert_other_sequence_refusal(case: &str, status: u16, refused: &Value, issued_for: &str) {
+    assert_eq!(
+        (status, error_code(refused).as_str()),
+        (400, "ValidationException"),
+        "case {case:?}: expected 400 ValidationException, got {status} {refused:?}"
+    );
+    let message = refused["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("nextToken") && message.contains(issued_for),
+        "case {case:?}: expected a message naming nextToken and the {issued_for} the token was \
+         issued for, got {refused:?}"
+    );
+    assert_ne!(
+        message, PAGE_TOKEN_REFUSAL,
+        "case {case:?}: a token this service DID mint must not be refused as one it did not, \
+         got {refused:?}"
+    );
+    assert_eq!(
+        refused["fieldList"][0]["name"].as_str(),
+        Some("nextToken"),
+        "case {case:?}: expected the fieldList to name nextToken, got {refused:?}"
+    );
+}
+
+/// Whether `reported` is a contiguous TAIL of `walk`: what a cursor of one
+/// ordered sequence leaves of a narrowed view of that same sequence.
+fn is_tail(walk: &[String], reported: &[String]) -> bool {
+    walk.len() >= reported.len() && walk[walk.len() - reported.len()..] == *reported
+}
+
+/// Record the two-segment timeline [`seed`] gives the caller's PRIMARY view for
+/// the billing view `arn` as well, so each view below has a walk of its own.
+fn record_timeline(engine: &Arc<engine::InMemoryEngine>, arn: &str) {
+    let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
+    let mut state = state.lock();
+    for (begin, end) in [
+        (SEGMENTS_BEGIN, SEGMENTS_MIDDLE),
+        (SEGMENTS_MIDDLE, SEGMENTS_END),
+    ] {
+        assert!(
+            state.record_billing_view_segment(segment_of(arn, begin, end)),
+            "setup: the seeded segment of {arn:?} over {begin}..{end} must fit in the store"
+        );
+    }
+}
+
+/// One month of bills for every account of the seeded family in
+/// [`EARLIER_MONTH`], so the month a token was NOT minted for has a walk of its
+/// own to be dropped.
+fn seed_earlier_month(engine: &Arc<engine::InMemoryEngine>) {
+    let state = engine.state::<ComAmazonawsBillingAwsbillingState>();
+    let mut state = state.lock();
+    for (account_id, plan) in family_plans() {
+        assert!(
+            state.record_support_eligible_spend(spend_in(EARLIER_MONTH, account_id, plan)),
+            "setup: the seeded {EARLIER_MONTH} spend of {account_id:?} must fit in the store"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_segment_token_is_a_cut_point_in_one_view_s_timeline_over_one_period() {
+    let (router, engine) = emulator_with_engine();
+    seed(&engine);
+    // Two more PRIMARY views of the caller's account, with the same timeline
+    // each: the view a request names is what chooses the sequence this read
+    // walks, and the segment store is keyed by that ARN.
+    for arn in [LOWER_PRIMARY_ARN, UPPER_PRIMARY_ARN] {
+        plant_view(&engine, arn, |_| {});
+        record_timeline(&engine, arn);
+    }
+
+    let read = Read {
+        operation: "ListBillingViewSegments",
+        base: segments_over(PRIMARY_ARN, SEGMENTS_BEGIN, SEGMENTS_END),
+    };
+    let (every, token) = whole_walk_and_first_token(&router, &read).await;
+
+    // What each of the other views reports over the same period, before any
+    // token of this view's walk is replayed against it.
+    let mut other_timelines: Vec<(&str, Vec<String>)> = Vec::new();
+    for arn in [LOWER_PRIMARY_ARN, UPPER_PRIMARY_ARN] {
+        let (status, body) = call(
+            &router,
+            read.operation,
+            &segments_over(arn, SEGMENTS_BEGIN, SEGMENTS_END),
+        )
+        .await;
+        let reported = entries(read.operation, &body);
+        assert_eq!(
+            status, 200,
+            "setup {arn:?}: expected 200 for the view's own walk, got {status} {body:?}"
+        );
+        assert!(
+            !reported.is_empty(),
+            "setup {arn:?}: the view must have a timeline to drop, got {body:?}"
+        );
+        other_timelines.push((arn, reported));
+    }
+
+    // The rows differ along what the rule generalises over: which view the next
+    // request names (the walked one, one sorting below it, one sorting above it,
+    // none at all), how the period differs (a second at either end, a strict
+    // part of it, a disjoint one, none at all) and the page size, which is no
+    // part of a sequence.
+    let replays: Vec<Replay> = vec![
+        Replay {
+            case: "the walked view over the walked period",
+            request: read.base.clone(),
+            issued_for: None,
+        },
+        Replay {
+            case: "the same walk with a larger page size",
+            request: json!({
+                "arn": PRIMARY_ARN,
+                "timeRange": {
+                    "beginDateInclusive": SEGMENTS_BEGIN,
+                    "endDateExclusive": SEGMENTS_END,
+                },
+                "maxResults": 100,
+            }),
+            issued_for: None,
+        },
+        Replay {
+            case: "a view whose ARN sorts below the walked one",
+            request: segments_over(LOWER_PRIMARY_ARN, SEGMENTS_BEGIN, SEGMENTS_END),
+            issued_for: Some("billing view"),
+        },
+        Replay {
+            case: "a view whose ARN sorts above the walked one",
+            request: segments_over(UPPER_PRIMARY_ARN, SEGMENTS_BEGIN, SEGMENTS_END),
+            issued_for: Some("billing view"),
+        },
+        Replay {
+            case: "no arn at all, which is answered for another PRIMARY view",
+            request: json!({
+                "timeRange": {
+                    "beginDateInclusive": SEGMENTS_BEGIN,
+                    "endDateExclusive": SEGMENTS_END,
+                },
+            }),
+            issued_for: Some("billing view"),
+        },
+        Replay {
+            case: "a period beginning one second earlier",
+            request: segments_over(PRIMARY_ARN, SEGMENTS_BEGIN - 1, SEGMENTS_END),
+            issued_for: Some("time range"),
+        },
+        Replay {
+            case: "a period ending one second earlier",
+            request: segments_over(PRIMARY_ARN, SEGMENTS_BEGIN, SEGMENTS_END - 1),
+            issued_for: Some("time range"),
+        },
+        Replay {
+            case: "a period covering only the segment the page reported",
+            request: segments_over(PRIMARY_ARN, SEGMENTS_BEGIN, SEGMENTS_MIDDLE),
+            issued_for: Some("time range"),
+        },
+        Replay {
+            case: "a period disjoint from the walked one",
+            request: segments_over(PRIMARY_ARN, SEGMENTS_END, SEGMENTS_END + 86_400),
+            issued_for: Some("time range"),
+        },
+        Replay {
+            case: "no timeRange at all, which asks about the current month",
+            request: json!({ "arn": PRIMARY_ARN }),
+            issued_for: Some("time range"),
+        },
+    ];
+
+    for replay in replays {
+        let mut request = replay.request.clone();
+        request["nextToken"] = json!(token.clone());
+        let (status, body) = call(&router, read.operation, &request).await;
+        match replay.issued_for {
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {:?}: expected 200, got {status} {body:?}",
+                    replay.case
+                );
+                assert_eq!(
+                    entries(read.operation, &body),
+                    every[1..].to_vec(),
+                    "case {:?}: expected the segments after the first, got {body:?}",
+                    replay.case
+                );
+            }
+            Some(issued_for) => {
+                assert_other_sequence_refusal(replay.case, status, &body, issued_for);
+            }
+        }
+    }
+
+    // Nothing of the other views' timelines was dropped, and the refusals
+    // consumed no cut point: each view still reports its whole walk, and the
+    // token still resumes the walk it was minted for.
+    for (arn, timeline) in other_timelines {
+        let (status, body) = call(
+            &router,
+            read.operation,
+            &segments_over(arn, SEGMENTS_BEGIN, SEGMENTS_END),
+        )
+        .await;
+        assert_eq!(
+            (status, entries(read.operation, &body)),
+            (200, timeline),
+            "case {arn:?}: the view's whole timeline must still be reported, got {body:?}"
+        );
+    }
+    let mut resumed = read.base.clone();
+    resumed["nextToken"] = json!(token);
+    let (status, body) = call(&router, read.operation, &resumed).await;
+    assert_eq!(
+        (status, entries(read.operation, &body)),
+        (200, every[1..].to_vec()),
+        "case \"the walked view after the refusals\": expected the segments after the first, \
+         got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_support_charge_token_is_a_cut_point_in_one_billing_month() {
+    let (router, engine) = emulator_with_engine();
+    seed(&engine);
+    seed_earlier_month(&engine);
+
+    // Both reads page over bills the spend store keys month FIRST, so the month
+    // a request names chooses which keys are walked at all.
+    for operation in [
+        "ListBusinessSupportAccountCharges",
+        "ListEnterpriseSupportLinkedAccountCharges",
+    ] {
+        let read = Read {
+            operation,
+            base: json!({ "billingMonth": PAST_MONTH }),
+        };
+        let (every, token) = whole_walk_and_first_token(&router, &read).await;
+
+        let mut resumed = read.base.clone();
+        resumed["nextToken"] = json!(token.clone());
+        let (status, body) = call(&router, operation, &resumed).await;
+        assert_eq!(
+            (status, entries(operation, &body)),
+            (200, every[1..].to_vec()),
+            "case {operation:?}: the walked month's token must resume its own walk, got {body:?}"
+        );
+
+        let mut replayed = json!({ "billingMonth": EARLIER_MONTH });
+        replayed["nextToken"] = json!(token.clone());
+        let (status, refused) = call(&router, operation, &replayed).await;
+        assert_other_sequence_refusal(
+            &format!("{operation} resuming {EARLIER_MONTH} from a {PAST_MONTH} token"),
+            status,
+            &refused,
+            "billing month",
+        );
+
+        // The month the token was not minted for still reports its own bills in
+        // full: the refusal is what keeps them from being dropped.
+        let (status, body) = call(&router, operation, &json!({ "billingMonth": EARLIER_MONTH })).await;
+        let earlier = entries(operation, &body);
+        assert_eq!(
+            (status, earlier.len()),
+            (200, every.len()),
+            "case {operation:?}: expected {EARLIER_MONTH} to report as many bills as \
+             {PAST_MONTH}, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_token_still_resumes_a_read_whose_members_only_narrow_one_sequence() {
+    let (router, engine) = emulator_with_engine();
+    seed(&engine);
+    seed_earlier_month(&engine);
+    // Two CUSTOM views beside the account's PRIMARY one, so the billing-view
+    // list has a walk of three and a type filter narrows it.
+    plant_source_views(
+        &engine,
+        &[source_arn("narrowing-a"), source_arn("narrowing-b")],
+    );
+
+    // Each row is a read whose members only choose which entries of ONE ordered
+    // walk are reported: the date range of the account's credit history, the
+    // month a contract of the account's Support history has to overlap, the type
+    // of the account's billing views. The cursor is still a position in that one
+    // walk, so the narrowed request resumes from it rather than refusing it, and
+    // what it reports is exactly the tail of its own walk that follows the
+    // cursor — which each row names.
+    let rows: Vec<(&'static str, Value, Value, Vec<String>)> = vec![
+        (
+            "GetCreditAllocationHistory",
+            json!({
+                "accountId": ACCOUNT_ID,
+                "startDate": at(2025, 1, 1, 0),
+                "endDate": at(2025, 4, 1, 0),
+            }),
+            json!({
+                "accountId": ACCOUNT_ID,
+                "startDate": at(2025, 1, 1, 0),
+                "endDate": at(2025, 2, 1, 0),
+            }),
+            // The walk descends by month and the cursor is at 2025-03, so both
+            // months the narrowed range covers still follow it (its `endDate`
+            // falls in 2025-02, which the month-keyed range includes).
+            vec!["2025-02".to_string(), "2025-01".to_string()],
+        ),
+        (
+            "ListBusinessSupportSubscriptionHistory",
+            json!({ "billingMonth": PAST_MONTH }),
+            json!({ "billingMonth": EARLIER_MONTH }),
+            // The walk ascends by account and then by the month a contract
+            // starts in, and the cursor is the lower Business-plan account's
+            // PAST_MONTH contract, so the other account's EARLIER_MONTH
+            // contract is what follows it.
+            vec![THIRD_MEMBER_ACCOUNT_ID.to_string()],
+        ),
+        (
+            "ListBillingViews",
+            json!({}),
+            json!({ "billingViewTypes": ["PRIMARY"] }),
+            // The walk ascends by ARN and the cursor is the first CUSTOM view
+            // (`billingview/narrowing-a` sorts below `billingview/primary`), so
+            // the account's PRIMARY view is what the type filter leaves after
+            // it.
+            vec![PRIMARY_ARN.to_string()],
+        ),
+    ];
+
+    for (operation, base, narrowed, expected_after) in rows {
+        let read = Read { operation, base };
+        let (_, token) = whole_walk_and_first_token(&router, &read).await;
+
+        let (status, whole) = call(&router, operation, &narrowed).await;
+        assert_eq!(
+            status, 200,
+            "case {operation:?}: expected 200 for the narrowed walk, got {status} {whole:?}"
+        );
+        let narrowed_walk = entries(operation, &whole);
+
+        let mut resumed = narrowed.clone();
+        resumed["nextToken"] = json!(token);
+        let (status, body) = call(&router, operation, &resumed).await;
+        assert_eq!(
+            status, 200,
+            "case {operation:?}: expected 200 for a cursor of the same walk, got {status} {body:?}"
+        );
+        let reported = entries(operation, &body);
+        assert_eq!(
+            reported, expected_after,
+            "case {operation:?}: expected the entries of the narrowed walk {narrowed_walk:?} \
+             that follow the cursor, got {reported:?}"
+        );
+        assert!(
+            !reported.is_empty() && is_tail(&narrowed_walk, &reported),
+            "case {operation:?}: the cursor must leave a non-empty tail of the narrowed walk \
+             {narrowed_walk:?}, got {reported:?}"
+        );
+    }
 }

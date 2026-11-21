@@ -180,11 +180,18 @@ fn invalid_field(member: &str, why: &str) -> ListSourceViewsForBillingViewError 
     .into()
 }
 
-/// The separator between the fields a `nextToken` carries. The modeled
+/// The separator between the entries this read's cursor carries. It is the one
+/// [`crate::state::PAGE_TOKEN_FIELD_SEPARATOR`] separates a scoped payload's
+/// fields with, so one payload is spelled one way crate-wide; the modeled
 /// `BillingViewArn` pattern
 /// (`^arn:aws[a-z-]*:(billing)::[0-9]{12}:billingview/[a-zA-Z0-9/:_\+=\.\-@]{0,75}[a-zA-Z0-9]$`)
 /// admits no `#`, so every ARN the token carries reads back whole.
-const PAGE_TOKEN_SEPARATOR: char = '#';
+const PAGE_TOKEN_SEPARATOR: char = crate::state::PAGE_TOKEN_FIELD_SEPARATOR;
+
+/// What the member that chooses the sequence this read walks names — the
+/// billing view whose source views are paged — as the refusal of a token minted
+/// for another one words it.
+const SCOPE_BILLING_VIEW: &str = "billing view";
 
 /// The `nextToken` for a page of the view `arn` after which the walk has
 /// reported `reported` — the source-view entries, in the order the view stores
@@ -206,23 +213,32 @@ const PAGE_TOKEN_SEPARATOR: char = '#';
 /// each, which the codec's expansion keeps well inside the modeled `PageToken`
 /// length (1..4095).
 ///
-/// Only that payload is this operation's own: the transcoding is the crate's one
-/// page-token codec, [`crate::state::encode_page_token`], which authenticates
-/// the cursor under the store's key, binds it to the read that minted it and
-/// keeps the token inside the modeled `PageToken` pattern
-/// (`^[-a-zA-Z0-9+=/_]+$`), so the minting rule lives in one place.
+/// Only the cursor is this operation's own: the ARN travels as the walk's SCOPE
+/// through the crate's one page-token codec,
+/// [`crate::state::encode_scoped_page_token`], which authenticates the payload
+/// under the store's key, binds it to the read that minted it, refuses one
+/// minted for another view, and keeps the token inside the modeled `PageToken`
+/// pattern (`^[-a-zA-Z0-9+=/_]+$`) — so the minting rule and the acceptance rule
+/// each live in one place.
 fn encode_page_token(
     key: &crate::state::PageTokenKey,
     minted_by: &str,
     arn: &str,
     reported: &[&str],
 ) -> String {
-    let mut payload = String::from(arn);
+    let mut payload = String::new();
     for entry in reported {
-        payload.push(PAGE_TOKEN_SEPARATOR);
+        if !payload.is_empty() {
+            payload.push(PAGE_TOKEN_SEPARATOR);
+        }
         payload.push_str(entry);
     }
-    crate::state::encode_page_token(key, minted_by, &payload)
+    crate::state::encode_scoped_page_token(
+        key,
+        minted_by,
+        &[(SCOPE_BILLING_VIEW, arn)],
+        &payload,
+    )
 }
 
 /// The entries a `nextToken` says the walk has already reported, or a
@@ -231,50 +247,52 @@ fn encode_page_token(
 /// another of its paginated reads, and one minted while walking another billing
 /// view, which is a cut point in that view's list and not in this one's.
 ///
-/// The transcoding and the unparseable-token wording are the ones in
+/// The transcoding, the SCOPE comparison that tells a cut point of this walk
+/// from one of another view's, and the unparseable-token wording are the ones in
 /// `crate::state`, shared with this service's other paginated reads so a client
-/// sees the same acceptance rule and the same refusal whichever read answered
-/// it; only the decoded payload is parsed here.
+/// sees the same acceptance rule and the same refusals whichever read answered
+/// it; only the cursor behind the scope is parsed here.
 fn decode_page_token(
     key: &crate::state::PageTokenKey,
     read_by: &str,
     token: &str,
     arn: &str,
 ) -> Result<Vec<String>, ListSourceViewsForBillingViewError> {
-    let decoded = crate::state::decode_page_token(key, read_by, token).and_then(|text| {
-        let (stored_arn, rest) = text.split_once(PAGE_TOKEN_SEPARATOR)?;
-        if rest.is_empty() {
-            // Every token this read mints carries at least the entry its page
-            // ended on, so a payload naming none is not one it minted.
-            return None;
+    let cursor = match crate::state::decode_scoped_page_token(
+        key,
+        read_by,
+        token,
+        &[(SCOPE_BILLING_VIEW, arn)],
+    ) {
+        // Every token this read mints carries at least the entry its page ended
+        // on, so a cursor naming none is not one it minted.
+        crate::state::ScopedPageToken::Cursor(cursor) if !cursor.is_empty() => cursor,
+        crate::state::ScopedPageToken::OtherSequence(names) => {
+            return Err(invalid_field(
+                "nextToken",
+                &format!("the pagination token was issued for another {names}"),
+            ));
         }
-        Some((
-            stored_arn.to_string(),
-            rest.split(PAGE_TOKEN_SEPARATOR)
-                .map(str::to_string)
-                .collect::<Vec<String>>(),
-        ))
-    });
-    let Some((stored_arn, reported)) = decoded else {
-        return Err(
-            ListSourceViewsForBillingViewErrorModeled::ValidationException(ValidationException {
-                message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
-                reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
-                field_list: Some(vec![ValidationExceptionField {
-                    name: "nextToken".to_string(),
-                    message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
-                }]),
-            })
-            .into(),
-        );
+        _ => {
+            return Err(
+                ListSourceViewsForBillingViewErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+                        reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "nextToken".to_string(),
+                            message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
     };
-    if stored_arn != arn {
-        return Err(invalid_field(
-            "nextToken",
-            "the pagination token was issued for another billing view",
-        ));
-    }
-    Ok(reported)
+    Ok(cursor
+        .split(PAGE_TOKEN_SEPARATOR)
+        .map(str::to_string)
+        .collect())
 }
 
 /// The entries of `stored` this walk has yet to report, beside the ones the

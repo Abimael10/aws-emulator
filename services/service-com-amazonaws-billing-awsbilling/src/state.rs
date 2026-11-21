@@ -1767,6 +1767,110 @@ pub fn decode_page_token(key: &PageTokenKey, read_by: &str, token: &str) -> Opti
     (minted_by == read_by).then(|| payload.to_string())
 }
 
+/// Separates the fields a scoped token's payload carries: the values of the
+/// request members that choose WHICH sequence the read walks, and then the
+/// cursor inside that sequence.
+///
+/// `#` is the separator `ops::list_source_views_for_billing_view` already
+/// carries its own scoped payload in, so the crate spells one payload one way.
+/// No scope value can contain it: a scope value is a modeled `BillingViewArn`,
+/// `BillingMonth` or `Timestamp` value, and none of those patterns admits `#`.
+/// Only the scope fields are read back by position, so a cursor that spelled a
+/// `#` would still read back whole — it is everything behind the last scope
+/// field.
+pub const PAGE_TOKEN_FIELD_SEPARATOR: char = '#';
+
+/// The opaque `nextToken` of `minted_by` for the cut point `last` of the ONE
+/// sequence `scope` selects.
+///
+/// A cursor is a position among the entries a request selected, so it is a cut
+/// point of that sequence and of no other: every request member that decides
+/// which entries the walk holds, or what each of them reports, travels in the
+/// token beside the cursor, and [`decode_scoped_page_token`] hands the cursor
+/// back only to a request that selected the same sequence. Each `scope` entry
+/// pairs what the member names — the word the refusal of a token from another
+/// sequence uses — with the value this request carries for it; `maxResults` is
+/// deliberately NOT one of them, because a page size is how much of one walk a
+/// caller takes rather than which entries the walk is over.
+///
+/// The transcoding, the binding to the read that minted the token and the
+/// authentication under the store's key are [`encode_page_token`]'s, so this
+/// crate keeps one page-token codec and one acceptance rule.
+pub fn encode_scoped_page_token(
+    key: &PageTokenKey,
+    minted_by: &str,
+    scope: &[(&str, &str)],
+    last: &str,
+) -> String {
+    let mut payload = String::new();
+    for (names, value) in scope {
+        // A scope field is read back by POSITION, so a value that spelled the
+        // separator would be read back as two fields and a token minted for the
+        // right sequence would be refused as one of another. No modeled value a
+        // read scopes by admits it; this is what says so where it is written.
+        debug_assert!(
+            !value.contains(PAGE_TOKEN_FIELD_SEPARATOR),
+            "the {names} a page token is scoped by cannot spell \
+             {PAGE_TOKEN_FIELD_SEPARATOR}"
+        );
+        payload.push_str(value);
+        payload.push(PAGE_TOKEN_FIELD_SEPARATOR);
+    }
+    payload.push_str(last);
+    encode_page_token(key, minted_by, &payload)
+}
+
+/// What a `nextToken` offered to a scoped paginated read names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopedPageToken<'scope> {
+    /// A cut point in the very sequence the request selects: the value the walk
+    /// resumes strictly after.
+    Cursor(String),
+    /// A cut point this read minted while walking ANOTHER sequence, which names
+    /// some other entry of the requested one or no entry at all. Carries what
+    /// the first differing scope member names, for the refusal's wording.
+    OtherSequence(&'scope str),
+    /// Not a token this read issued at all: one the store cannot read back, one
+    /// a caller assembled, and one minted for another of this service's reads.
+    Unusable,
+}
+
+/// The cut point a `nextToken` names for the read `read_by` walking the sequence
+/// `scope` selects, as [`encode_scoped_page_token`] minted it.
+///
+/// A token whose scope disagrees with this request's names a cut point of
+/// another sequence — of another resource's walk, or of another period — so it
+/// is reported as [`ScopedPageToken::OtherSequence`] rather than compared
+/// against the keys of the sequence being walked, a comparison that would
+/// silently drop or repeat entries.
+pub fn decode_scoped_page_token<'scope>(
+    key: &PageTokenKey,
+    read_by: &str,
+    token: &str,
+    scope: &'scope [(&str, &str)],
+) -> ScopedPageToken<'scope> {
+    let Some(payload) = decode_page_token(key, read_by, token) else {
+        return ScopedPageToken::Unusable;
+    };
+    // The scope fields come first, one per member, and everything behind them is
+    // the cursor.
+    let mut fields = payload.splitn(scope.len() + 1, PAGE_TOKEN_FIELD_SEPARATOR);
+    for (names, value) in scope {
+        let Some(stored) = fields.next() else {
+            return ScopedPageToken::Unusable;
+        };
+        if stored != *value {
+            return ScopedPageToken::OtherSequence(names);
+        }
+    }
+    match fields.next() {
+        Some(cursor) => ScopedPageToken::Cursor(cursor.to_string()),
+        // Every token this codec mints carries the cursor behind its scope, so a
+        // payload with nothing behind it is not one it produced.
+        None => ScopedPageToken::Unusable,
+    }
+}
+
 /// The `BillingViewHealthStatus` a read reports for `view`.
 ///
 /// Both members are always present: the stored status code and the stored

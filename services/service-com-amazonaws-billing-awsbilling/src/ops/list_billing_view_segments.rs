@@ -11,7 +11,8 @@
 //! omitted, so the answer can cover less than the requested period.
 //! The segments are ordered oldest first and paginated with `maxResults` and an
 //! opaque `nextToken` that resumes after the last segment the previous page
-//! returned.
+//! returned. That token is a cut point in ONE view's timeline over ONE period,
+//! so it carries both and is refused when it is replayed against another walk.
 //! The `arn` names a resource, so it is resolved first: one outside the
 //! caller's account is an `AccessDeniedException` (403), one this account
 //! stores no view under a `ResourceNotFoundException` (404), and one naming a
@@ -183,28 +184,63 @@ fn unavailable(why: &str) -> ListBillingViewSegmentsError {
     .into()
 }
 
+/// The refusal of a `nextToken` that is not one THIS read issued under this
+/// store's key — one this service cannot read back, one a caller assembled, and
+/// one it minted for another of its paginated reads, whose payload is a cut
+/// point of another sequence and names nothing in this one. The token format and
+/// this wording live in `crate::state`, shared with every other paginated read.
+fn unusable_page_token() -> ListBillingViewSegmentsError {
+    ListBillingViewSegmentsErrorModeled::ValidationException(ValidationException {
+        message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+        reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "nextToken".to_string(),
+            message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
+        }]),
+    })
+    .into()
+}
+
+/// What the two members that choose the sequence this read walks name, in the
+/// order a `nextToken` carries their values: the billing view whose timeline is
+/// being paged, and the period its segments are reported over.
+const SCOPE_BILLING_VIEW: &str = "billing view";
+const SCOPE_TIME_RANGE: &str = "time range";
+
+/// The requested period as the one scope field a `nextToken` carries for it.
+///
+/// Both bounds, because both decide what a page reports: a segment is walked
+/// only while it overlaps the period, and the period is also what each reported
+/// segment's own time range is clipped to, so the same stored record is a
+/// different entry under a different period.
+fn time_range_scope(begin_secs: f64, end_secs: f64) -> String {
+    format!("{begin_secs}..{end_secs}")
+}
+
 /// The key a `nextToken` resumes after, or a `ValidationException` when the
-/// token is not one THIS read issued under this store's key — one this service
-/// cannot read back, one a caller assembled, and one it minted for another of
-/// its paginated reads, whose payload is a cut point of another sequence and
-/// names nothing in this one. The token format and the refusal's wording live
-/// in `crate::state`, shared with every other paginated read.
-fn decode_page_token(
+/// token is no cut point of the sequence THIS request selects.
+///
+/// A cursor is a position in one billing view's timeline over one period, so a
+/// token minted while walking another view — or the same view over another
+/// period — is refused the way this crate's other per-view paginated read
+/// refuses one "issued for another billing view", rather than compared against
+/// the keys of the walk this request asks for: those keys begin with the walked
+/// view's own ARN, so such a comparison would answer an empty page for a view
+/// whose timeline is not empty, or restart the walk at its oldest segment.
+fn cut_point(
     key: &crate::state::PageTokenKey,
     read_by: &str,
     token: &str,
+    scope: &[(&str, &str)],
 ) -> Result<String, ListBillingViewSegmentsError> {
-    crate::state::decode_page_token(key, read_by, token).ok_or_else(|| {
-        ListBillingViewSegmentsErrorModeled::ValidationException(ValidationException {
-            message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
-            reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
-            field_list: Some(vec![ValidationExceptionField {
-                name: "nextToken".to_string(),
-                message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
-            }]),
-        })
-        .into()
-    })
+    match crate::state::decode_scoped_page_token(key, read_by, token, scope) {
+        crate::state::ScopedPageToken::Cursor(cursor) => Ok(cursor),
+        crate::state::ScopedPageToken::OtherSequence(names) => Err(invalid_field(
+            "nextToken",
+            &format!("the pagination token was issued for another {names}"),
+        )),
+        crate::state::ScopedPageToken::Unusable => Err(unusable_page_token()),
+    }
 }
 
 /// The half-open period the request asks about, in seconds since the epoch.
@@ -364,16 +400,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| unavailable("the billing view store is unavailable"))?;
         let state = state.lock();
 
-        // The token is read back before the view is resolved, so the order the
-        // refusals come in is the one this read already had; the key it is
-        // authenticated under lives on the store, so the store is reached
-        // first.
-        let page_key = state.page_token_key();
-        let resume_after = match input.next_token.as_deref() {
-            Some(token) => Some(decode_page_token(&page_key, Self::NAME, token)?),
-            None => None,
-        };
-
         let view = resolve_view(&input, &state)?;
         // A view whose health status is not HEALTHY is one no operation may act
         // on — the modeled `BillingViewHealthStatusException` this operation
@@ -390,6 +416,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+
+        // The sequence this request selects — the view whose timeline is walked
+        // and the period its segments are reported over — which every
+        // `nextToken` of this walk is bound to, so a cut point of another view's
+        // timeline (or of another period over this one's) is refused instead of
+        // being applied to this walk. The view is resolved FIRST, because a
+        // token is read back against the walk it has to be a cut point of.
+        // The key the store's tokens are authenticated under, taken off the
+        // store by value so the walk below can borrow the segments it reports.
+        let page_key = state.page_token_key();
+        let time_range = time_range_scope(begin_secs, end_secs);
+        let scope = [
+            (SCOPE_BILLING_VIEW, view.arn.as_str()),
+            (SCOPE_TIME_RANGE, time_range.as_str()),
+        ];
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(cut_point(&page_key, Self::NAME, token, &scope)?),
+            None => None,
+        };
 
         // The view's timeline, oldest first: the stored segments that overlap
         // the requested period and are not hidden. The page resumes strictly
@@ -420,7 +465,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let next_token = if matched.len() > limit {
             matched.truncate(limit);
             matched.last().map(|(key, _)| {
-                crate::state::encode_page_token(&page_key, Self::NAME, key)
+                crate::state::encode_scoped_page_token(&page_key, Self::NAME, &scope, key)
             })
         } else {
             None

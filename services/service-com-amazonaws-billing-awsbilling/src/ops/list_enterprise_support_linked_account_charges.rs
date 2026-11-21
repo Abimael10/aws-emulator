@@ -215,30 +215,44 @@ fn unavailable(what: &str) -> ListEnterpriseSupportLinkedAccountChargesError {
     .into()
 }
 
+/// What the member that chooses the sequence this read walks names — the
+/// billing month whose charges are paged — as the refusal of a token minted for
+/// another one words it.
+const SCOPE_BILLING_MONTH: &str = "billing month";
+
 /// The store key a `nextToken` resumes after, or a `ValidationException` when
-/// the token is not one THIS read issued under this store's key — one this
-/// service cannot read back, one a caller assembled, and one it minted for
-/// another of its paginated reads, whose payload is a cut point of another
-/// sequence. The token format and the refusal's wording live in `crate::state`,
-/// shared with this service's other paginated reads.
+/// the token is no cut point of the sequence THIS request selects: one this
+/// service cannot read back, one a caller assembled, one it minted for another
+/// of its paginated reads, and one it minted while paging another billing
+/// month, whose keys are that month's and name no charge of this one. The token
+/// format and the unusable-token wording live in `crate::state`, shared with
+/// this service's other paginated reads.
 fn resume_key(
     key: &crate::state::PageTokenKey,
     read_by: &str,
     token: &str,
+    scope: &[(&str, &str)],
 ) -> Result<String, ListEnterpriseSupportLinkedAccountChargesError> {
-    crate::state::decode_page_token(key, read_by, token).ok_or_else(|| {
-        ListEnterpriseSupportLinkedAccountChargesErrorModeled::ValidationException(
-            ValidationException {
-                message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
-                reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
-                field_list: Some(vec![ValidationExceptionField {
-                    name: "nextToken".to_string(),
-                    message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
-                }]),
-            },
-        )
-        .into()
-    })
+    match crate::state::decode_scoped_page_token(key, read_by, token, scope) {
+        crate::state::ScopedPageToken::Cursor(cursor) => Ok(cursor),
+        crate::state::ScopedPageToken::OtherSequence(names) => Err(invalid_field(
+            "nextToken",
+            &format!("must have been issued for the {names} the request names"),
+        )),
+        crate::state::ScopedPageToken::Unusable => Err(
+            ListEnterpriseSupportLinkedAccountChargesErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::PAGE_TOKEN_REFUSAL.to_string(),
+                    reason: crate::state::VALIDATION_REASON_CANNOT_PARSE.to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: crate::state::PAGE_TOKEN_FIELD_REFUSAL.to_string(),
+                    }]),
+                },
+            )
+            .into(),
+        ),
+    }
 }
 
 /// A window of whole seconds past the epoch, as the modeled
@@ -389,9 +403,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The key the store's tokens are authenticated under, taken off the
         // store by value so the walk below can borrow the records it reports.
+        // The month the request names selects WHICH charges are walked — the
+        // store is keyed month first, so a cut point of another month is a key
+        // of another sequence — so every token of this walk carries it and one
+        // minted for another month is refused rather than compared against this
+        // month's keys.
         let page_key = state.page_token_key();
+        let scope = [(SCOPE_BILLING_MONTH, input.billing_month.as_str())];
         let resume_after = match input.next_token.as_deref() {
-            Some(token) => Some(resume_key(&page_key, Self::NAME, token)?),
+            Some(token) => Some(resume_key(&page_key, Self::NAME, token, &scope)?),
             None => None,
         };
         let limit = input
@@ -421,8 +441,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             selected.filter(|(key, _)| resume_after.as_ref().is_none_or(|after| *key > after));
         let page: Vec<(&String, &SupportEligibleSpend)> = remaining.by_ref().take(limit).collect();
         let next_token = if remaining.next().is_some() {
-            page.last()
-                .map(|(key, _)| crate::state::encode_page_token(&page_key, Self::NAME, key))
+            page.last().map(|(key, _)| {
+                crate::state::encode_scoped_page_token(&page_key, Self::NAME, &scope, key)
+            })
         } else {
             None
         };
