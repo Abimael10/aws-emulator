@@ -10,6 +10,9 @@
 //! one that selects the rule back.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+use ::tokio::time::Instant;
 
 use super::{
     ComAmazonawsXrayAwsxrayState, SamplingRuleLookupError, ARN_NAMESPACE, MAX_SAMPLING_RULES,
@@ -330,6 +333,13 @@ pub fn sampling_rule_refused_by_the_name_read(on_arrival: SamplingRuleNameOnArri
 /// holding the name ([`sampling_rule_exists_message`]). So the handler reports
 /// its arrival here ([`ComAmazonawsXrayAwsxrayState::sampling_rule_create_arrived`])
 /// and hands back what that arrival found.
+///
+/// What separates the two is whether the caller could have been TOLD the name
+/// was taken before it sent this request, which is a question about time: the
+/// read and the write of one create are separated by the span the service spends
+/// serving it ([`SAMPLING_RULE_CREATE_SPAN`]), and every create of the name that
+/// arrives inside that span is one a caller sent while no answer about the name
+/// existed yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SamplingRuleNameOnArrival {
     /// This create RACED another create of the name: either the account held no
@@ -357,6 +367,70 @@ pub enum SamplingRuleNameOnArrival {
 #[must_use]
 pub fn sampling_rule_internal_id(rule_name: &str, sequence: u64) -> String {
     ::service_common::stable_hex_id(&["sampling-rule", rule_name, &sequence.to_string()])
+}
+
+/// How long the span between a `CreateSamplingRule`'s read of the `RuleName` and
+/// its write of the rule under that name lasts: the window in which a create of
+/// the same name that arrives beside it is RACING it
+/// ([`SamplingRuleNameOnArrival`]) rather than reading a name settled before its
+/// caller sent it.
+///
+/// CHOSEN rather than documented — what it stands in for is the time the service
+/// itself spends between those two steps, which is what makes the creates a
+/// client dispatches together overlap one another. It is what the distinction
+/// between the two duplicate-name refusals rests on: a store that committed in
+/// the same instant it read would have written the name before any other
+/// caller's request could be taken in, so every loser would be answered as a
+/// late duplicate and the uniqueness constraint's refusal
+/// ([`sampling_rule_exists_message`]) would be unreachable. A caller that waits
+/// for its answer before asking again is never inside the span, because the
+/// answer is only sent once the span has elapsed, so sequential callers still
+/// read the name as held ([`SAMPLING_RULE_EXISTS_MESSAGE`]).
+///
+/// Short enough that it costs a create about as much as one network round trip,
+/// and it is spent only by a create that may still take the name: a create whose
+/// name is already held and settled is refused by the read straight away.
+pub const SAMPLING_RULE_CREATE_SPAN: Duration = Duration::from_millis(100);
+
+/// The longest a create can be held in that span, however many creates of its
+/// name keep arriving beside it.
+///
+/// Each arrival for one name pushes the span out from itself, so a burst of
+/// callers dispatched together all take their reads before any of them commits,
+/// however the host spreads their arrivals; this bounds the total, so a name
+/// that keeps being asked for cannot hold a create open indefinitely.
+pub const MAX_SAMPLING_RULE_CREATE_SPAN: Duration = Duration::from_secs(2);
+
+/// The `CreateSamplingRule` requests BEING SERVED for one `RuleName`, and when
+/// they arrived — what the two duplicate-name refusals are selected by
+/// ([`SamplingRuleNameOnArrival`]).
+///
+/// The arrivals are instants of the RUNTIME's clock, which is the clock the span
+/// between a create's read and its write is spent on, so a test can drive that
+/// span instead of waiting for it.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingRuleCreatesInFlight {
+    /// How many creates of this name have arrived and not yet been answered.
+    pub count: u64,
+    /// When the FIRST of them arrived, which bounds how far the span can be
+    /// pushed out ([`MAX_SAMPLING_RULE_CREATE_SPAN`]).
+    pub first_arrival: Instant,
+    /// When the most recent of them arrived, from which the span runs
+    /// ([`SAMPLING_RULE_CREATE_SPAN`]).
+    pub last_arrival: Instant,
+}
+
+impl SamplingRuleCreatesInFlight {
+    /// The instant from which a create of this name may take its write: the end
+    /// of the service's span between the read of the name and the write
+    /// ([`SAMPLING_RULE_CREATE_SPAN`]), measured from the latest arrival so a
+    /// caller that arrived beside this one has its own read in first, and capped
+    /// ([`MAX_SAMPLING_RULE_CREATE_SPAN`]).
+    #[must_use]
+    pub fn commit_due(&self) -> Instant {
+        (self.last_arrival + SAMPLING_RULE_CREATE_SPAN)
+            .min(self.first_arrival + MAX_SAMPLING_RULE_CREATE_SPAN)
+    }
 }
 
 /// The sequence number the account's service-managed rule's internal id is
@@ -588,31 +662,63 @@ impl ComAmazonawsXrayAwsxrayState {
     /// whichever way it ends, or a name would stay in flight for the life of the
     /// store.
     pub fn sampling_rule_create_arrived(&mut self, rule_name: &str) -> SamplingRuleNameOnArrival {
-        let in_flight = self
-            .sampling_rule_creates_in_flight
-            .get(rule_name)
-            .copied()
-            .unwrap_or_default();
-        *self
-            .sampling_rule_creates_in_flight
-            .entry(rule_name.to_string())
-            .or_default() += 1;
-        if in_flight == 0 && self.holds_sampling_rule_name(rule_name) {
-            SamplingRuleNameOnArrival::Held
-        } else {
-            SamplingRuleNameOnArrival::Free
+        // Sampled HERE, under the lock that is also taking the read, so the
+        // arrival this create is placed at is the one the read was taken at.
+        let arrived_at = Instant::now();
+        let held = self.holds_sampling_rule_name(rule_name);
+        match self.sampling_rule_creates_in_flight.get_mut(rule_name) {
+            // A create of this name is still being served beside this one, so
+            // this caller cannot have been told the name was taken, whatever the
+            // store holds under it: the two are racing, and the arrival pushes
+            // the span out so the create already waiting cannot commit before
+            // this one's read ([`SamplingRuleCreatesInFlight::commit_due`]).
+            Some(in_flight) => {
+                in_flight.count += 1;
+                in_flight.last_arrival = arrived_at;
+                SamplingRuleNameOnArrival::Free
+            }
+            None => {
+                self.sampling_rule_creates_in_flight.insert(
+                    rule_name.to_string(),
+                    SamplingRuleCreatesInFlight {
+                        count: 1,
+                        first_arrival: arrived_at,
+                        last_arrival: arrived_at,
+                    },
+                );
+                if held {
+                    SamplingRuleNameOnArrival::Held
+                } else {
+                    SamplingRuleNameOnArrival::Free
+                }
+            }
         }
+    }
+
+    /// When a create of `rule_name` that is being served may take its WRITE: the
+    /// instant the service's span between the read of the name and the write
+    /// elapses ([`SamplingRuleCreatesInFlight::commit_due`]), or `None` when no
+    /// create of that name is in flight.
+    ///
+    /// Read again after each wait, because a create of the same name that
+    /// arrives meanwhile pushes the instant out: the write may not land before
+    /// every create a caller sent without an answer has read the name.
+    #[must_use]
+    pub fn sampling_rule_create_commit_due(&self, rule_name: &str) -> Option<Instant> {
+        self.sampling_rule_creates_in_flight
+            .get(rule_name)
+            .map(SamplingRuleCreatesInFlight::commit_due)
     }
 
     /// Report that the `CreateSamplingRule` for `rule_name` registered by
     /// [`sampling_rule_create_arrived`](Self::sampling_rule_create_arrived) has
     /// been answered, however it ended.
     pub fn sampling_rule_create_finished(&mut self, rule_name: &str) {
-        let Some(count) = self.sampling_rule_creates_in_flight.get_mut(rule_name) else {
+        let Some(in_flight) = self.sampling_rule_creates_in_flight.get_mut(rule_name) else {
             return;
         };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
+        in_flight.count = in_flight.count.saturating_sub(1);
+        if in_flight.count == 0 {
             self.sampling_rule_creates_in_flight.remove(rule_name);
         }
     }

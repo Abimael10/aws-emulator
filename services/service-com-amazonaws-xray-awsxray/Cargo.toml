@@ -16,7 +16,11 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time`: `CreateSamplingRule` spends the service's own span between its read of
+# a `RuleName` and the write of the rule under it
+# (`crate::state::SAMPLING_RULE_CREATE_SPAN`), which is what makes the creates a
+# client dispatches together race one another.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 # `preserve_order`: every reader that reports a stored segment document answers
@@ -55,6 +59,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `test-util`: a suite that drives the span `CreateSamplingRule` spends between
+# its read of a `RuleName` and the write
+# (`crate::state::SAMPLING_RULE_CREATE_SPAN`) on a PAUSED clock, so virtual time
+# carries that span instead of the suite waiting for it.
+tokio = { workspace = true, features = ["time", "test-util"] }
 # The KMS this emulator's own X-Ray resolves an encryption key selector
 # through, mounted beside it on one engine so the key the configuration reports
 # is the key KMS holds.

@@ -748,17 +748,19 @@ pub struct ComAmazonawsXrayAwsxrayState {
     /// ([`sampling_rule_internal_id`]); never reset, so a rule created again
     /// under a name a deleted rule had is a different resource from it.
     pub sampling_rule_seq: u64,
-    /// How many `CreateSamplingRule` requests are BEING SERVED for each
-    /// `RuleName`, counted while each one is in flight
+    /// The `CreateSamplingRule` requests BEING SERVED for each `RuleName`, and
+    /// when they arrived, held while each one is in flight
     /// ([`ComAmazonawsXrayAwsxrayState::sampling_rule_create_arrived`]).
     ///
     /// A create that arrives while another create of its name is still being
     /// served was sent before any answer could have told its caller the name was
     /// taken, so it is one of a RACE for that name — which is what decides which
     /// of the two refusals a duplicate name is answered with
-    /// ([`SamplingRuleNameOnArrival`]). A name with no create in flight carries
+    /// ([`SamplingRuleNameOnArrival`]), and the arrival instants are what the
+    /// span between a create's read of the name and its write runs from
+    /// ([`SAMPLING_RULE_CREATE_SPAN`]). A name with no create in flight carries
     /// no entry, so a settled store holds nothing here.
-    pub sampling_rule_creates_in_flight: BTreeMap<String, u64>,
+    pub sampling_rule_creates_in_flight: BTreeMap<String, SamplingRuleCreatesInFlight>,
     /// Started trace retrievals, keyed by the `RetrievalToken` that was minted
     /// for them, at most [`MAX_TRACE_RETRIEVALS`] of them.
     pub retrievals: BTreeMap<String, TraceRetrievalRecord>,

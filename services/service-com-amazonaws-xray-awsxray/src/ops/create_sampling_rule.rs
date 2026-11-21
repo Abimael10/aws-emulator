@@ -24,7 +24,17 @@
 //! the insert, was sent before any answer could have told its caller the name
 //! was taken, so the constraint's sentence answers it; a create that arrives
 //! when the name is held by a create already answered, with none of that name in
-//! flight beside it, takes the read's sentence. A store already holding
+//! flight beside it, takes the read's sentence.
+//!
+//! So those two steps are separated in TIME, by the span the service spends
+//! serving one create ([`crate::state::SAMPLING_RULE_CREATE_SPAN`]): a create
+//! that read the name as free spends what is left of that span before it writes,
+//! and every create of the name that arrives meanwhile pushes the span out from
+//! its own arrival. That is what makes the creates a client dispatches together
+//! — none of which could have had an answer about the name — all read the name
+//! before any of them takes it, while a caller that waits for its answer before
+//! asking again is never inside the span and so reads the name as held. A store
+//! already holding
 //! [`crate::state::MAX_SAMPLING_RULES`] rules answers the modelled
 //! `RuleLimitExceededException` instead, which is the one refusal that reports a
 //! limit rather than the request.
@@ -190,7 +200,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let region = crate::state::request_region(ctx.parts());
-        let now = crate::state::now_epoch_seconds();
 
         // The service's OWN read of the name, taken as the request arrives and
         // before any of the work below: a duplicate name is refused by one of
@@ -215,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _in_flight = InFlightCreate {
             state: state.clone(),
-            rule_name: name_in_flight,
+            rule_name: name_in_flight.clone(),
         };
 
         // The same tag restrictions `TagResource` and `CreateGroup` enforce,
@@ -247,17 +256,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Between that read and the write, the runtime is given a point to
-        // serve another request at: a create of the same name that is in flight
-        // beside this one then reads the name while it is still free, as it
-        // would against a service whose read and write are two steps, instead of
-        // being starved until this request has finished writing.
-        ::tokio::task::yield_now().await;
+        // Between that read and the write the service spends its own span
+        // serving the request ([`crate::state::SAMPLING_RULE_CREATE_SPAN`]),
+        // which is the window every create of this name that its caller sent
+        // without an answer arrives in: each of them takes its read of the name
+        // while the name is still free, as against a service whose read and its
+        // write are two steps separated in time, instead of a write landing
+        // before another caller's request can be taken in at all. Spent only by
+        // a create that may still take the name — a create whose name the read
+        // found held and settled is refused below without waiting — and never
+        // while holding the store's lock, so the creates racing for one name are
+        // served beside one another rather than one after another.
+        if let (crate::state::SamplingRuleNameOnArrival::Free, Some(name)) =
+            (on_arrival, name_in_flight.as_deref())
+        {
+            spend_the_read_to_write_span(&state, name).await;
+        }
 
         // One lock, so the uniqueness check and the insert cannot interleave
         // with another call for the same name: whichever of the racers reaches
-        // it first is the one winner.
+        // it first is the one winner. The clock is read under that same lock, so
+        // the rule is stamped with the instant it was stored at rather than one
+        // read before the span above.
         let mut store = state.lock();
+        let now = crate::state::now_epoch_seconds();
         match store.insert_sampling_rule(&region, input.sampling_rule, tags, now, on_arrival) {
             Ok(stored) => Ok(CreateSamplingRuleOutput {
                 sampling_rule_record: Some(stored.to_record()),
@@ -272,6 +294,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             Err(rejection) => Err(invalid(rejection.message().to_string())),
         }
+    }
+}
+
+/// Hold this create for what is left of the service's span between its read of
+/// `rule_name` and its write of the rule under that name
+/// ([`crate::state::ComAmazonawsXrayAwsxrayState::sampling_rule_create_commit_due`]).
+///
+/// Looked up again after each wait rather than waited out once: a create of the
+/// same name arriving meanwhile pushes the instant out, so the write cannot land
+/// before every create a caller sent without an answer has read the name. What
+/// those arrivals can push it to is bounded HERE as well as in the store: the
+/// ceiling is taken once, from this create's own entry into the span
+/// ([`crate::state::MAX_SAMPLING_RULE_CREATE_SPAN`]), so however many creates of
+/// the name keep arriving, this request is held no longer than that and returns.
+async fn spend_the_read_to_write_span(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsXrayAwsxrayState>,
+    rule_name: &str,
+) {
+    let ceiling = ::tokio::time::Instant::now() + crate::state::MAX_SAMPLING_RULE_CREATE_SPAN;
+    loop {
+        // The lock is taken and released around the read, never held across the
+        // wait below.
+        let due = { state.lock().sampling_rule_create_commit_due(rule_name) };
+        let Some(due) = due else { return };
+        let due = due.min(ceiling);
+        if due <= ::tokio::time::Instant::now() {
+            return;
+        }
+        ::tokio::time::sleep_until(due).await;
     }
 }
 

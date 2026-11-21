@@ -34,9 +34,17 @@
 //! the losing create states differently (and along stating none of them
 //! differently, i.e. restating the stored rule exactly), along how many callers
 //! ask for one name, and along whether those callers are sequential or in flight
-//! together.
+//! together — joined by one task, and DISPATCHED TOGETHER from separate tasks,
+//! which is the shape a client with a thread per caller sends them in.
+//!
+//! Nothing here asserts on elapsed time, and no case is decided by how fast the
+//! host runs: a row either awaits the answers it is about, asks again only once
+//! they have come back, or runs on a paused clock, where virtual time carries
+//! the span a create spends between its read of the name and its write.
 //! `graphs_rules_retrievals_and_insights` grades the in-flight case once more,
 //! over the five joined creates it fires for one name.
+
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 
@@ -459,3 +467,405 @@ async fn in_flight(xray: &Xray, body: &Value, callers: usize) -> Vec<Answer> {
 // `graphs_rules_retrievals_and_insights::concurrent_creates_of_one_rule_name_have_exactly_one_winner`,
 // which fires five joined creates for one name and reads each loser's refusal for the one internal
 // id the winner is stored under: the one-winner rule stands there, in one place.
+
+// =============================================================================
+// 3. Callers DISPATCHED TOGETHER, each on its own task: what they race in is the
+//    span between the service's read of the name and its write
+// =============================================================================
+
+/// How many callers race for one name, per row: a pair, a handful, the five of
+/// the recorded burst, and more than that.
+const RACER_COUNTS: &[usize] = &[2, 3, 5, 9];
+
+/// The one answer of `answers` that stored the rule.
+fn the_winner<'a>(case: &str, answers: &'a [Answer]) -> &'a Answer {
+    answers
+        .iter()
+        .find(|answer| answer.status == 200)
+        .unwrap_or_else(|| panic!("case {case:?}: one create must have won, got {answers:?}"))
+}
+
+/// The `Priority` the rule named `name` is stored with, as `GetSamplingRules`
+/// reports it.
+async fn stored_priority(xray: &Xray, name: &str) -> Option<i64> {
+    let listed = xray
+        .call_in_region(DEFAULT_REGION, "/GetSamplingRules", &json!({}))
+        .await;
+    array(&listed.body, "SamplingRuleRecords")
+        .iter()
+        .filter_map(|record| record.get("SamplingRule"))
+        .find(|rule| rule.get("RuleName").and_then(Value::as_str) == Some(name))
+        .and_then(|rule| rule.get("Priority").and_then(Value::as_i64))
+}
+
+/// Every `RuleName` the account holds, walked across the pages
+/// `GetSamplingRules` serves them in — so a case holding more rules than one
+/// page carries still sees all of them.
+async fn held_names(xray: &Xray) -> Vec<String> {
+    /// More pages than any case here fills, so a walk that does not terminate
+    /// fails the case instead of hanging.
+    const MAX_PAGES: usize = 50;
+
+    let mut names: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..MAX_PAGES {
+        let mut body = json!({});
+        if let Some(token) = token.as_deref() {
+            body["NextToken"] = json!(token);
+        }
+        let page = xray
+            .call_in_region(DEFAULT_REGION, "/GetSamplingRules", &body)
+            .await;
+        assert_eq!(
+            page.status, 200,
+            "the stored rules must be listable, got {page:?}"
+        );
+        names.extend(
+            array(&page.body, "SamplingRuleRecords")
+                .iter()
+                .filter_map(|record| record.get("SamplingRule"))
+                .filter_map(|rule| rule.get("RuleName").and_then(Value::as_str))
+                .map(str::to_string),
+        );
+        token = page.get("NextToken").as_str().map(str::to_string);
+        if token.is_none() {
+            return names;
+        }
+    }
+    panic!("the walk of the sampling-rule pages must terminate, got {names:?}")
+}
+
+/// `racers` creates of `name`, every one of them sent before any answer about
+/// the name could have come back.
+///
+/// Each call is SPAWNED on its own task, so the calls contend for the service
+/// the way callers with a thread each do, rather than being polled one after
+/// another by a single task: every one of them is in flight before any of them
+/// can take the name. `identical` states one rule for every racer; otherwise
+/// each racer carries a priority of its own, which the rule under test reads
+/// nothing from.
+async fn dispatched_together(
+    xray: &Arc<Xray>,
+    name: &str,
+    racers: usize,
+    identical: bool,
+) -> Vec<Answer> {
+    let mut calls = Vec::with_capacity(racers);
+    for racer in 0..racers {
+        let xray = Arc::clone(xray);
+        let priority = if identical {
+            300
+        } else {
+            300 + i64::try_from(racer).unwrap_or_default()
+        };
+        let body = rule_body(name, priority);
+        calls.push(::tokio::spawn(async move {
+            xray.call("/CreateSamplingRule", &body).await
+        }));
+    }
+    let mut answers = Vec::with_capacity(racers);
+    for call in calls {
+        answers.push(call.await.expect("each racing create is answered"));
+    }
+    answers
+}
+
+/// RULE: which of the two refusals a duplicate `RuleName` is answered with turns
+/// on whether the caller could have been TOLD the name was taken before it sent
+/// the request — so every create a client dispatched before any answer about the
+/// name existed takes its read while the name is free and is refused by the
+/// store's uniqueness constraint, naming the one resource that won it, while a
+/// caller that waits for an answer and only then asks again reads the name as
+/// held.
+///
+/// The rows differ along how many callers race, along whether the racers state
+/// one rule or each its own, and along whether the name they race for was ever
+/// held before — and each row goes on to the caller that asks AFTER the burst
+/// was answered, which is the other side of the same rule.
+///
+/// The clock is PAUSED: the span a create spends between its read of the name
+/// and its write runs on the runtime's clock, so virtual time carries it while
+/// nothing sleeps, and which answer each racer gets follows from the order the
+/// runtime serves them in rather than from how fast or how loaded the host is.
+#[tokio::test(start_paused = true)]
+async fn creates_dispatched_together_are_refused_for_the_resource_that_won() {
+    for racers in RACER_COUNTS.iter().copied() {
+        for identical in [true, false] {
+            let xray = Arc::new(Xray::new());
+            let name = format!("burst-{racers}-{identical}");
+            let case = format!(
+                "{racers} creates of one name dispatched together, {}",
+                if identical {
+                    "all stating one rule"
+                } else {
+                    "each stating its own"
+                }
+            );
+
+            let answers = dispatched_together(&xray, &name, racers, identical).await;
+            let stored_by_the_winner = the_winner(&case, &answers)
+                .get("SamplingRuleRecord")
+                .get("SamplingRule")
+                .and_then(|rule| rule.get("Priority"))
+                .and_then(Value::as_i64);
+            let named: Vec<String> = one_winner(&case, &answers)
+                .into_iter()
+                .map(|loser| refused_for_the_resource_that_won(&case, loser))
+                .collect();
+            let won = named.first().cloned().unwrap_or_default();
+            assert!(
+                named.iter().all(|id| *id == won),
+                "case {case:?}: every loser lost to the one winner, so every refusal names one \
+                 id, got {named:?}"
+            );
+            assert_eq!(
+                times_held(&xray, &name).await,
+                1,
+                "case {case:?}: the name must be held exactly once afterwards"
+            );
+            // The rule the winner answered with is the rule the store holds: the
+            // losers wrote nothing over it.
+            assert_eq!(
+                stored_priority(&xray, &name).await,
+                stored_by_the_winner,
+                "case {case:?}: the stored rule must be the one the winner answered with, got \
+                 {stored_by_the_winner:?}"
+            );
+
+            // Every answer of the burst is in, so a caller asking now could have
+            // been told the name was taken: the service's own read of the name
+            // is what refuses it, in that step's fixed sentence.
+            let afterwards = xray
+                .call("/CreateSamplingRule", &rule_body(&name, 900))
+                .await;
+            refused_as_already_existing(&format!("{case}, then one more caller"), &afterwards);
+
+            // The same race on the freed name: the resource holding it is a new
+            // one, so its losers are refused for a different internal id.
+            let deleted = xray
+                .call("/DeleteSamplingRule", &json!({ "RuleName": name }))
+                .await;
+            assert_eq!(
+                deleted.status, 200,
+                "case {case:?}: the winner's rule must be deletable, got {deleted:?}"
+            );
+            let again = dispatched_together(&xray, &name, racers, identical).await;
+            let case = format!("{case}, on the freed name");
+            let renamed: Vec<String> = one_winner(&case, &again)
+                .into_iter()
+                .map(|loser| refused_for_the_resource_that_won(&case, loser))
+                .collect();
+            assert!(
+                renamed.iter().all(|id| *id != won),
+                "case {case:?}: the name holds a different resource now, so its losers must name \
+                 a different internal id, got {renamed:?} beside {won:?}"
+            );
+            assert_eq!(
+                times_held(&xray, &name).await,
+                1,
+                "case {case:?}: the name must be held exactly once afterwards"
+            );
+        }
+    }
+}
+
+/// RULE, from the other side: creates of DIFFERENT names dispatched together are
+/// not racing one another at all — each one takes the name it asks for, and no
+/// caller is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creates_of_different_names_dispatched_together_each_take_their_own() {
+    for callers in RACER_COUNTS.iter().copied() {
+        let xray = Arc::new(Xray::new());
+        let mut calls = Vec::with_capacity(callers);
+        for caller in 0..callers {
+            let xray = Arc::clone(&xray);
+            let name = format!("own-{callers}-{caller}");
+            let body = rule_body(&name, 300 + i64::try_from(caller).unwrap_or_default());
+            calls.push(::tokio::spawn(async move {
+                xray.call("/CreateSamplingRule", &body).await
+            }));
+        }
+        let case = format!("{callers} creates of {callers} names dispatched together");
+        for call in calls {
+            let answer = call.await.expect("each create is answered");
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: a create of a name of its own must succeed, got {answer:?}"
+            );
+        }
+        let held = held_names(&xray).await;
+        for caller in 0..callers {
+            let name = format!("own-{callers}-{caller}");
+            assert_eq!(
+                held.iter().filter(|stored| **stored == name).count(),
+                1,
+                "case {case:?}: {name} must be held exactly once, got {held:?}"
+            );
+        }
+    }
+}
+
+/// RULE (the two steps, in TIME): a create's read of the name and its write of
+/// the rule under it are separated by the span the service spends serving it, so
+/// a create that read a free name has not stored it yet while it is still being
+/// served — which is exactly what lets a caller dispatched beside it read the
+/// same name as free and be refused by the store's uniqueness constraint rather
+/// than by the read.
+///
+/// On a PAUSED clock, so that span is carried by virtual time: the create being
+/// served cannot reach its write while anything else has work to do, which makes
+/// each step below observable instead of raced, and nothing here waits. The
+/// separation itself is read off the store in ONE look, so no case turns on when
+/// the runtime next goes idle; the two refusals are then asserted over the wire.
+#[tokio::test(start_paused = true)]
+async fn the_name_is_not_written_while_the_create_that_read_it_is_being_served() {
+    use service_com_amazonaws_xray_awsxray::state::ComAmazonawsXrayAwsxrayState;
+
+    /// More yields than the runtime needs to serve the spawned create up to its
+    /// own waiting point, so a create that is never served fails the case
+    /// instead of hanging.
+    const YIELDS: usize = 100;
+
+    let (xray, engine) = Xray::with_engine();
+    let xray = Arc::new(xray);
+    let store = engine.state::<ComAmazonawsXrayAwsxrayState>();
+    let name = "obsidian-sampler";
+
+    // One create of a free name, in flight on its own task.
+    let create = |priority: i64| {
+        let xray = Arc::clone(&xray);
+        let body = rule_body(name, priority);
+        ::tokio::spawn(async move { xray.call("/CreateSamplingRule", &body).await })
+    };
+    let first = create(500);
+
+    // Hand the runtime back until that create has taken its read of the name:
+    // it then counts as in flight for the name, and has not yet written.
+    for _ in 0..YIELDS {
+        if store
+            .lock()
+            .sampling_rule_creates_in_flight
+            .contains_key(name)
+        {
+            break;
+        }
+        ::tokio::task::yield_now().await;
+    }
+    // Both halves read in one go, with nothing awaited in between, so what is
+    // asserted is one state of the store: a create of the name being served,
+    // and no rule written under it yet.
+    let (in_flight, written) = {
+        let store = store.lock();
+        (
+            store.sampling_rule_creates_in_flight.contains_key(name),
+            store.sampling_rules.contains_key(name),
+        )
+    };
+    assert!(
+        in_flight,
+        "the create must still be being served after it read the name, in flight: {:?}",
+        store.lock().sampling_rule_creates_in_flight
+    );
+    assert!(
+        !written,
+        "the create being served must not have written its rule yet, stored: {:?}",
+        store.lock().sampling_rules.keys().collect::<Vec<_>>()
+    );
+
+    // A second caller, dispatched while the first is still being served: it
+    // reads the same free name, so what refuses it is the store's constraint,
+    // naming the resource that won.
+    let second = create(501);
+    let answers = vec![
+        first.await.expect("the first create is answered"),
+        second.await.expect("the second create is answered"),
+    ];
+    let case = "a create dispatched beside one still being served";
+    for loser in one_winner(case, &answers) {
+        let named = refused_for_the_resource_that_won(case, loser);
+        let holder = store
+            .lock()
+            .sampling_rule_internal_id_in_use(name)
+            .unwrap_or_default();
+        assert_eq!(
+            named, holder,
+            "case {case:?}: the refusal must name the resource that won the name, got {named:?} \
+             against {holder:?}"
+        );
+    }
+    assert_eq!(
+        times_held(&xray, name).await,
+        1,
+        "case {case:?}: the name must be held exactly once afterwards"
+    );
+}
+
+/// RULE, read off the store rather than off any clock: WHICH of the two refusals
+/// answers a create of a held name is decided by whether a create of that name
+/// is still BEING SERVED — one is refused by the store's uniqueness constraint,
+/// naming the resource that holds the name by the internal id the store holds it
+/// under, and once that create has been answered the next one is refused by the
+/// service's own read of the name.
+///
+/// The create still in flight is registered through the service's own report of
+/// an arrival, so this case states nothing about timing at all: it holds the one
+/// condition the selection turns on and asks what each answer is. The rows differ
+/// along what holds the name — a rule the account created, and the
+/// service-managed rule that holds its name without being created — and along
+/// the priority the colliding create carries.
+#[tokio::test]
+async fn the_refusal_follows_whether_a_create_of_the_name_is_still_being_served() {
+    use service_com_amazonaws_xray_awsxray::state::ComAmazonawsXrayAwsxrayState;
+
+    let (xray, engine) = Xray::with_engine();
+    let store = engine.state::<ComAmazonawsXrayAwsxrayState>();
+
+    // A rule the account created, and the service-managed rule, which holds its
+    // name without a record ever being stored for it.
+    let created = xray
+        .call("/CreateSamplingRule", &rule_body("marble-sampler", 450))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the rule under test must be created, got {created:?}"
+    );
+    let rows: Vec<(&str, &str, i64)> = vec![
+        ("a rule the account created", "marble-sampler", 451),
+        (
+            "the service-managed rule",
+            DEFAULT_SAMPLING_RULE_NAME,
+            452,
+        ),
+    ];
+
+    for (case, name, priority) in rows {
+        // The internal id the store holds the name under: what the constraint's
+        // refusal has to name, read from the state rather than written out here.
+        let holder = store
+            .lock()
+            .sampling_rule_internal_id_in_use(name)
+            .unwrap_or_else(|| panic!("case {case:?}: the name {name:?} must be held"));
+
+        // One create of that name reported as arrived and not yet answered —
+        // the service's own report, which is what a create being served leaves
+        // behind.
+        store.lock().sampling_rule_create_arrived(name);
+        let raced = xray
+            .call("/CreateSamplingRule", &rule_body(name, priority))
+            .await;
+        let named = refused_for_the_resource_that_won(case, &raced);
+        assert_eq!(
+            named, holder,
+            "case {case:?}: the refusal must name the resource holding the name, got {named:?} \
+             against {holder:?}"
+        );
+
+        // That create answered, nothing of the name is in flight: the next one
+        // is refused by the read of the name instead, in its fixed sentence.
+        store.lock().sampling_rule_create_finished(name);
+        let late = xray
+            .call("/CreateSamplingRule", &rule_body(name, priority + 1))
+            .await;
+        refused_as_already_existing(&format!("{case}, once nothing is in flight"), &late);
+    }
+}
