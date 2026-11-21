@@ -61,56 +61,85 @@ const VERSION_ROWS: [(&str, &str, Option<&str>); 12] = [
 ];
 
 /// One engine-default-parameter row: the parameter, the engine version that
-/// introduced it, the families whose line covers that version, and families
-/// whose line predates it.
+/// introduced it, the families whose line covers that version — each with the
+/// `MinimumEngineVersion` that family reports the parameter under — and
+/// families whose line predates it.
+type ParameterFamilyRow = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static [&'static str],
+);
+
+/// The rows [`a_family_reports_every_published_parameter_of_its_line_and_none_of_a_later_one`]
+/// is driven over, in the shape [`ParameterFamilyRow`] gives them.
 ///
 /// Source: the parameter catalogs this service publishes
-/// (`state::family_default_parameters`, whose rows carry each parameter's
-/// published `MinimumEngineVersion`). The rows span the generations: the
-/// parameters the Redis OSS 4, 5, 6 and 7 lines introduced, and a Memcached one,
-/// so a family reports every parameter its line covers and none of a later one.
-const PARAMETER_ROWS: [(&str, &str, &[&str], &[&str]); 8] = [
-    ("lfu-log-factor", "4.0.9", &["redis4.0", "redis7"], &["redis3.2"]),
+/// (`state::family_default_parameters`) and the family lines they are read for
+/// (`state::FAMILY_LINES`). The rows span the generations: the parameters the
+/// Redis OSS 4, 5, 6 and 7 lines introduced, and a Memcached one, so a family
+/// reports every parameter its line covers and none of a later one.
+///
+/// The reported version is the earliest version of THAT family the parameter
+/// applies to, so it is the introducing version only where the family's own line
+/// introduced it, and the family's line floor for a parameter the engine already
+/// had before that line (`lfu-log-factor` arrived with Redis OSS 4.0.9 and is
+/// reported under 7.0.0 by `redis7`, whose line starts there).
+const PARAMETER_ROWS: [ParameterFamilyRow; 8] = [
+    (
+        "lfu-log-factor",
+        "4.0.9",
+        &[("redis4.0", "4.0.9"), ("redis7", "7.0.0")],
+        &["redis3.2"],
+    ),
     (
         "cluster-allow-reads-when-down",
         "5.0.6",
-        &["redis5.0", "redis6.x", "valkey9"],
+        &[
+            ("redis5.0", "5.0.6"),
+            ("redis6.x", "6.0.5"),
+            ("valkey9", "9.0.0"),
+        ],
         &["redis4.0"],
     ),
     (
         "lazyfree-lazy-user-del",
         "6.0.5",
-        &["redis6.x", "redis7"],
+        &[("redis6.x", "6.0.5"), ("redis7", "7.0.0")],
         &["redis5.0"],
     ),
     (
         "maxmemory-eviction-tenacity",
         "6.0.5",
-        &["redis6.x", "redis7"],
+        &[("redis6.x", "6.0.5"), ("redis7", "7.0.0")],
         &["redis5.0"],
     ),
     (
         "lazyfree-lazy-user-flush",
         "6.2.6",
-        &["redis6.x", "redis7"],
+        &[("redis6.x", "6.2.6"), ("redis7", "7.0.0")],
         &["redis5.0"],
     ),
     (
         "hash-max-listpack-value",
         "7.0.0",
-        &["redis7", "valkey7", "valkey8"],
+        &[
+            ("redis7", "7.0.0"),
+            ("valkey7", "7.2.0"),
+            ("valkey8", "8.0.0"),
+        ],
         &["redis6.x"],
     ),
     (
         "propagation-error-behavior",
         "7.0.0",
-        &["redis7", "valkey9"],
+        &[("redis7", "7.0.0"), ("valkey9", "9.0.0")],
         &["redis6.x", "memcached1.6"],
     ),
     (
         "slab_chunk_max",
         "1.5.10",
-        &["memcached1.5", "memcached1.6"],
+        &[("memcached1.5", "1.5.10"), ("memcached1.6", "1.6.6")],
         &["memcached1.4", "redis7"],
     ),
 ];
@@ -239,7 +268,8 @@ async fn a_family_reports_every_published_parameter_of_its_line_and_none_of_a_la
     let emulator = Emulator::new();
 
     for (parameter, introduced, carried_by, absent_from) in PARAMETER_ROWS {
-        for family in carried_by {
+        for (family, reported_version) in carried_by {
+            let (family, reported_version) = (*family, *reported_version);
             let reply = engine_defaults(&emulator, family).await;
             let names: BTreeSet<String> =
                 reported(&reply).into_iter().map(|row| row.name).collect();
@@ -251,8 +281,9 @@ async fn a_family_reports_every_published_parameter_of_its_line_and_none_of_a_la
             let published = one_parameter(&reply, family, parameter);
             assert_eq!(
                 published.field("MinimumEngineVersion"),
-                Some(introduced),
-                "case {family}/{parameter}: expected MinimumEngineVersion {introduced}, got \
+                Some(reported_version),
+                "case {family}/{parameter}: expected MinimumEngineVersion {reported_version} — \
+                 the earliest version of this family the parameter applies to — got \
                  {published:?}"
             );
         }

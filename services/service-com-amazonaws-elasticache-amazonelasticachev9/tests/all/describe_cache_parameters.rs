@@ -393,8 +393,13 @@ async fn every_group_reports_the_published_catalog_of_its_family() {
 
 /// One term of a numeric `AllowedValues`, in the forms the published catalog
 /// writes them in.
+///
+/// `pub(crate)` for the reason the scanners above are: the
+/// `parameter_catalog_version_and_bounds` suite holds a node-type-specific
+/// value against the range its own member publishes, and a second reading of
+/// `<lo>-<hi>` / `<lo>-` would be a second thing to keep correct.
 #[derive(Debug)]
-enum Term {
+pub(crate) enum Term {
     /// A single permitted value — the `0` of `0,20-`.
     Literal(f64),
     /// A range bounded only at the bottom: `20-`.
@@ -403,9 +408,20 @@ enum Term {
     Closed(f64, f64),
 }
 
+impl Term {
+    /// Whether this term covers `number`.
+    pub(crate) fn covers(&self, number: f64) -> bool {
+        match self {
+            Self::Literal(value) => *value == number,
+            Self::From(low) => number >= *low,
+            Self::Closed(low, high) => number >= *low && number <= *high,
+        }
+    }
+}
+
 /// `allowed` split into its comma-separated terms, or `None` when it is not a
 /// numeric value set at all (an enumeration of words, say).
-fn numeric_terms(allowed: &str) -> Option<Vec<Term>> {
+pub(crate) fn numeric_terms(allowed: &str) -> Option<Vec<Term>> {
     allowed
         .split(',')
         .map(|term| match term.split_once('-') {

@@ -79,41 +79,77 @@ pub(super) const PARAMETER_ENGINE_REDIS: &str = "redis";
 /// introduced belongs to it.
 pub(super) const ANY_MINOR: i32 = i32::MAX;
 
-/// Each published family's parameter catalog and the version its parameters are
-/// selected by.
+/// Each published family's parameter catalog, the version its parameters are
+/// selected by, and the FLOOR of its version line.
 ///
 /// A family's parameters are its ENGINE's, which is why each row names the
-/// catalog the family draws on. The version is the HIGHEST engine version the
-/// family's line covers, because a family carries every parameter any version on
-/// its line introduced: `redis6.x` covers Redis OSS 6.0 through 6.2, and
-/// `redis7` / `valkey7` / `valkey8` / `valkey9` cover every minor of their
-/// major — see [`ANY_MINOR`].
+/// catalog the family draws on. The selecting version is the HIGHEST engine
+/// version the family's line covers, because a family carries every parameter
+/// any version on its line introduced: `redis6.x` covers Redis OSS 6.0 through
+/// 6.2, and `redis7` / `valkey7` / `valkey8` / `valkey9` cover every minor of
+/// their major — see [`ANY_MINOR`].
+///
+/// The floor is the OLDEST engine release of that line the service publishes
+/// parameters for, and it is what a parameter of the family reports as its
+/// `Parameter$MinimumEngineVersion` when the parameter is older than the line
+/// itself: inside one family no version below the floor exists, so the earliest
+/// version of the family a parameter is available at is the floor — see
+/// [`family_minimum_engine_version`]. The floors are the releases each line
+/// starts at (Memcached 1.4.5, 1.5.10 and 1.6.6; Redis OSS 2.6.13, 2.8.6,
+/// 3.2.4, 4.0.9, 5.0.0, 6.0.5 and 7.0.0; Valkey 7.2.0, 8.0.0 and 9.0.0), the
+/// same releases the catalogs below carry as the minimum engine version of the
+/// parameters those lines introduced.
 ///
 /// The family names are [`PARAMETER_GROUP_FAMILIES`], this service's published
 /// set; this table says what each of them MEANS to the parameter catalog.
-pub const FAMILY_LINES: [(&str, &str, (i32, i32)); PARAMETER_GROUP_FAMILIES.len()] = [
-    ("memcached1.4", PARAMETER_ENGINE_MEMCACHED, (1, 4)),
-    ("memcached1.5", PARAMETER_ENGINE_MEMCACHED, (1, 5)),
-    ("memcached1.6", PARAMETER_ENGINE_MEMCACHED, (1, ANY_MINOR)),
-    ("redis2.6", PARAMETER_ENGINE_REDIS, (2, 6)),
-    ("redis2.8", PARAMETER_ENGINE_REDIS, (2, 8)),
-    ("redis3.2", PARAMETER_ENGINE_REDIS, (3, 2)),
-    ("redis4.0", PARAMETER_ENGINE_REDIS, (4, ANY_MINOR)),
-    ("redis5.0", PARAMETER_ENGINE_REDIS, (5, ANY_MINOR)),
-    ("redis6.x", PARAMETER_ENGINE_REDIS, (6, ANY_MINOR)),
-    ("redis7", PARAMETER_ENGINE_REDIS, (7, ANY_MINOR)),
-    ("valkey7", PARAMETER_ENGINE_REDIS, (7, ANY_MINOR)),
-    ("valkey8", PARAMETER_ENGINE_REDIS, (8, ANY_MINOR)),
-    ("valkey9", PARAMETER_ENGINE_REDIS, (9, ANY_MINOR)),
+pub const FAMILY_LINES: [(&str, &str, (i32, i32), &str); PARAMETER_GROUP_FAMILIES.len()] = [
+    ("memcached1.4", PARAMETER_ENGINE_MEMCACHED, (1, 4), "1.4.5"),
+    ("memcached1.5", PARAMETER_ENGINE_MEMCACHED, (1, 5), "1.5.10"),
+    (
+        "memcached1.6",
+        PARAMETER_ENGINE_MEMCACHED,
+        (1, ANY_MINOR),
+        "1.6.6",
+    ),
+    ("redis2.6", PARAMETER_ENGINE_REDIS, (2, 6), "2.6.13"),
+    ("redis2.8", PARAMETER_ENGINE_REDIS, (2, 8), "2.8.6"),
+    ("redis3.2", PARAMETER_ENGINE_REDIS, (3, 2), "3.2.4"),
+    ("redis4.0", PARAMETER_ENGINE_REDIS, (4, ANY_MINOR), "4.0.9"),
+    ("redis5.0", PARAMETER_ENGINE_REDIS, (5, ANY_MINOR), "5.0.0"),
+    ("redis6.x", PARAMETER_ENGINE_REDIS, (6, ANY_MINOR), "6.0.5"),
+    ("redis7", PARAMETER_ENGINE_REDIS, (7, ANY_MINOR), "7.0.0"),
+    ("valkey7", PARAMETER_ENGINE_REDIS, (7, ANY_MINOR), "7.2.0"),
+    ("valkey8", PARAMETER_ENGINE_REDIS, (8, ANY_MINOR), "8.0.0"),
+    ("valkey9", PARAMETER_ENGINE_REDIS, (9, ANY_MINOR), "9.0.0"),
 ];
 
-/// The parameter catalog `family` draws on and the version its parameters are
-/// selected by, or `None` when no published family carries that name.
-pub fn family_line(family: &str) -> Option<(&'static str, (i32, i32))> {
+/// The parameter catalog `family` draws on, the version its parameters are
+/// selected by and the floor of its version line, or `None` when no published
+/// family carries that name.
+pub fn family_line(family: &str) -> Option<(&'static str, (i32, i32), &'static str)> {
     FAMILY_LINES
         .iter()
-        .find(|(name, _, _)| *name == family)
-        .map(|(_, engine, version)| (*engine, *version))
+        .find(|(name, _, _, _)| *name == family)
+        .map(|(_, engine, version, floor)| (*engine, *version, *floor))
+}
+
+/// The `Parameter$MinimumEngineVersion` a family reports for a parameter its
+/// engine introduced at `introduced`, given the family's line `floor`
+/// ([`FAMILY_LINES`]).
+///
+/// "The earliest cache engine version to which the parameter can apply"
+/// (`Parameter$MinimumEngineVersion`) is answered INSIDE the family being read:
+/// the family's line starts at its floor, so a parameter the engine already had
+/// before that line applies to the family from its floor onwards, while one the
+/// line itself introduced applies from the version that introduced it. So the
+/// reported version is the LATER of the two, compared as version numbers rather
+/// than as strings ([`version_sort_key`]).
+pub fn family_minimum_engine_version<'a>(floor: &'a str, introduced: &'a str) -> &'a str {
+    if version_sort_key(introduced) < version_sort_key(floor) {
+        floor
+    } else {
+        introduced
+    }
 }
 
 /// The ENGINE a published parameter group family belongs to.
@@ -163,12 +199,13 @@ pub(super) fn version_rank(version: &str) -> (i32, i32) {
 /// literal values (`yes,no`), a numeric RANGE as `<lo>-<hi>` where the engine
 /// bounds the value at both ends and `<lo>-` where it bounds only the bottom
 /// (optionally with the discrete values that sit outside the range in front of
-/// it, `0,20-`), and the EMPTY string only where a customer cannot set the
-/// parameter at all — a value the engine or the node type fixes
-/// (`IsModifiable: false`), which is the one case there is no set to discover.
-/// So every MODIFIABLE numeric parameter publishes its range: a client that
-/// reads the catalog to decide what it may set finds the bounds to validate
-/// against.
+/// it, `0,20-`), and the EMPTY string only where the engine publishes no set at
+/// all for the parameter — the one case there is nothing to discover. So every
+/// numeric parameter whose bounds the engine publishes carries them, whether or
+/// not a customer may set it: a client that reads the catalog to decide what it
+/// may set finds the bounds to validate against, and one that reads a parameter
+/// the NODE TYPE fixes ([`node_type_specific_value`]) still finds the range the
+/// engine holds that value to.
 pub(super) struct ParameterRow(
     pub(super) &'static str,
     pub(super) &'static str,
@@ -394,7 +431,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         "",
         "The output buffer, in bytes, at which a replica is disconnected.",
         "integer",
-        "",
+        "0-",
         false,
         "5.0.0",
         CHANGE_TYPE_IMMEDIATE,
@@ -407,7 +444,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         "The output buffer, in bytes, a replica is disconnected for holding for longer than \
          the soft seconds.",
         "integer",
-        "",
+        "0-",
         false,
         "5.0.0",
         CHANGE_TYPE_IMMEDIATE,
@@ -666,6 +703,17 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         false,
     ),
     ParameterRow(
+        "list-max-ziplist-value",
+        "64",
+        "The largest list entry, in bytes, kept in the memory-efficient ziplist encoding.",
+        "integer",
+        "0-",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
         "lua-time-limit",
         "5000",
         "How long, in milliseconds, a Lua script may run before the node starts answering \
@@ -693,7 +741,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         "",
         "The memory, in bytes, the client output buffers of all clients together may use.",
         "integer",
-        "",
+        "0-",
         false,
         "7.0.0",
         CHANGE_TYPE_IMMEDIATE,
@@ -816,13 +864,25 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         false,
     ),
     ParameterRow(
+        "reserved-memory",
+        "0",
+        "The memory, in bytes, reserved for non-data use, superseded by \
+         reserved-memory-percent.",
+        "integer",
+        "0-",
+        true,
+        "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
         "reserved-memory-percent",
         "25",
         "The percentage of a node's memory reserved for non-data use.",
         "integer",
         "0-100",
         true,
-        "2.6.13",
+        "3.2.4",
         CHANGE_TYPE_IMMEDIATE,
         false,
     ),
@@ -991,7 +1051,7 @@ pub(super) const REDIS_PARAMETERS: &[ParameterRow] = &[
         "",
         "The memory, in bytes, available to the data stored on a node.",
         "integer",
-        "",
+        "0-",
         false,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1083,6 +1143,28 @@ pub(super) const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         false,
     ),
     ParameterRow(
+        "expirezero_does_not_evict",
+        "0",
+        "Whether an item stored with an expiry of zero is kept out of the eviction scan.",
+        "boolean",
+        "0,1",
+        true,
+        "1.4.24",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "hash_algorithm",
+        "jenkins",
+        "The algorithm the hash table hashes a key with.",
+        "string",
+        "jenkins,murmur3",
+        true,
+        "1.4.24",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
         "hashpower_init",
         "0",
         "The initial size of the hash table, as a power of two.",
@@ -1112,6 +1194,50 @@ pub(super) const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "0,1",
         false,
         "1.4.5",
+        CHANGE_TYPE_REQUIRES_REBOOT,
+        false,
+    ),
+    ParameterRow(
+        "lru_crawler",
+        "0",
+        "Whether the background crawler that reclaims expired items runs.",
+        "boolean",
+        "0,1",
+        true,
+        "1.4.24",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lru_crawler_sleep",
+        "100",
+        "How long, in microseconds, the crawler sleeps between the items it reclaims.",
+        "integer",
+        "0-1000000",
+        true,
+        "1.4.24",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lru_crawler_tocrawl",
+        "0",
+        "How many items of a slab class one crawl visits, or 0 for all of them.",
+        "integer",
+        "0-",
+        true,
+        "1.4.24",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "lru_maintainer",
+        "0",
+        "Whether the background thread that rebalances the LRU segments runs.",
+        "boolean",
+        "0,1",
+        true,
+        "1.4.24",
         CHANGE_TYPE_REQUIRES_REBOOT,
         false,
     ),
@@ -1197,7 +1323,7 @@ pub(super) const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "",
         "The memory, in megabytes, available to the cache on a node.",
         "integer",
-        "",
+        "1-100000",
         false,
         "1.4.5",
         CHANGE_TYPE_REQUIRES_REBOOT,
@@ -1209,7 +1335,7 @@ pub(super) const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "",
         "How many threads a node serves requests with.",
         "integer",
-        "",
+        "1-",
         false,
         "1.4.5",
         CHANGE_TYPE_REQUIRES_REBOOT,
@@ -1599,9 +1725,12 @@ pub const MAX_PARAMETERS_PER_REQUEST: usize = 20;
 ///
 /// A family reports the rows of its engine's catalog whose minimum engine
 /// version its line covers, so two families of one engine differ by exactly the
-/// parameters the later versions introduced.
+/// parameters the later versions introduced. Each row is reported with the
+/// minimum engine version it has INSIDE this family, which is the family's line
+/// floor for a parameter older than the line — see
+/// [`family_minimum_engine_version`].
 pub fn family_default_parameters(family: &str) -> Option<BTreeMap<String, ParameterRecord>> {
-    let (engine, line) = family_line(family)?;
+    let (engine, line, floor) = family_line(family)?;
     let rows = if engine == PARAMETER_ENGINE_MEMCACHED {
         MEMCACHED_PARAMETERS
     } else {
@@ -1660,7 +1789,8 @@ pub fn family_default_parameters(family: &str) -> Option<BTreeMap<String, Parame
             data_type: data_type.to_string(),
             allowed_values: (!allowed_values.is_empty()).then(|| allowed_values.to_string()),
             is_modifiable,
-            minimum_engine_version: minimum_engine_version.to_string(),
+            minimum_engine_version: family_minimum_engine_version(floor, minimum_engine_version)
+                .to_string(),
             change_type: change_type.to_string(),
             node_type_values,
         };
