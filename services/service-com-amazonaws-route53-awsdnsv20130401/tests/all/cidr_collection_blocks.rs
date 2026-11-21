@@ -31,6 +31,14 @@
 //! 6. A collection that still holds a block is not one `DeleteCidrCollection` takes away
 //!    (`CidrCollectionInUseException`, HTTP 400); an emptied one is, and is then gone from the
 //!    listing and from every operation addressed by its id.
+//! 7. A change applies as a SET operation over the blocks each location holds — a `PUT`
+//!    associates, a `DELETE_IF_EXISTS` dissociates "an existing CIDR block" and so asks for
+//!    nothing where the collection holds none — therefore applying the same request a second
+//!    time is served and leaves the collection holding exactly the same blocks, while still
+//!    moving its `Version` by one and minting its own change.
+//! 8. That set is reached independently of the ORDER the request carries its changes in: the
+//!    same changes over distinct blocks, written in any order, leave the collection holding
+//!    the same blocks.
 //!
 //! Every test drives the service through the real router, using the SAME harness the
 //! hosted-zone suites use, so what is asserted is the HTTP/restXml behaviour a Route 53
@@ -812,4 +820,247 @@ async fn a_collection_is_deleted_only_once_it_holds_nothing() {
         gone.error_code(),
         gone.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// A change applies as a set over the blocks each location holds
+// ---------------------------------------------------------------------------
+
+/// One change a request carries: the location it names, its `Action` and the blocks of its
+/// `CidrList`.
+type ChangeSpec = (&'static str, &'static str, &'static [&'static str]);
+
+/// The `<Changes>` content of a request carrying `changes`.
+fn changes_body(changes: &[ChangeSpec]) -> String {
+    changes
+        .iter()
+        .map(|(location, action, blocks)| change(location, action, blocks))
+        .collect()
+}
+
+/// The blocks the collection `id` holds, read back through `ListCidrBlocks`.
+async fn held_pairs(router: &MultiServiceRouter, id: &str) -> Vec<(String, String)> {
+    let (reply, held) = listed_blocks(
+        router,
+        &format!("/2013-04-01/cidrcollection/{id}/cidrblocks"),
+    )
+    .await;
+    assert_eq!(
+        reply.status, 200,
+        "expected 200 from ListCidrBlocks, got {} with body {}",
+        reply.status, reply.body
+    );
+    held
+}
+
+/// A table's expected `(location, block)` pairs, owned for comparison with what was read.
+fn owned_pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(location, block)| ((*location).to_string(), (*block).to_string()))
+        .collect()
+}
+
+/// One row of the set table: the collection is seeded with `seed`, `changes` is then applied
+/// TWICE, and `held` is what the collection must hold after each of the two applications.
+struct SetRow {
+    case: &'static str,
+    seed: &'static [ChangeSpec],
+    changes: &'static [ChangeSpec],
+    held: &'static [(&'static str, &'static str)],
+}
+
+/// The rows span what a change can ask of a location's block set that is already true of it:
+/// a block it holds, a block it does not, the same block named twice in one request, two
+/// changes naming one location, a delete that empties a location, a delete naming the wrong
+/// location, and a put beside a delete over distinct blocks.
+const SET_ROWS: &[SetRow] = &[
+    SetRow {
+        case: "a put of a block the collection already holds",
+        seed: &[("office", PUT, &["10.0.0.0/24"])],
+        changes: &[("office", PUT, &["10.0.0.0/24"])],
+        held: &[("office", "10.0.0.0/24")],
+    },
+    SetRow {
+        case: "a put naming one held and one new block",
+        seed: &[("office", PUT, &["10.0.0.0/24"])],
+        changes: &[("office", PUT, &["10.0.0.0/24", "10.0.1.0/24"])],
+        held: &[("office", "10.0.0.0/24"), ("office", "10.0.1.0/24")],
+    },
+    SetRow {
+        case: "the same block named twice in one request",
+        seed: &[],
+        changes: &[("office", PUT, &["10.0.0.0/24", "10.0.0.0/24"])],
+        held: &[("office", "10.0.0.0/24")],
+    },
+    SetRow {
+        case: "two changes naming the same location",
+        seed: &[],
+        changes: &[
+            ("office", PUT, &["10.0.0.0/24"]),
+            ("office", PUT, &["10.0.1.0/24"]),
+        ],
+        held: &[("office", "10.0.0.0/24"), ("office", "10.0.1.0/24")],
+    },
+    SetRow {
+        case: "a delete of a block the collection does not hold",
+        seed: &[("office", PUT, &["10.0.0.0/24"])],
+        changes: &[("west", DELETE_IF_EXISTS, &["203.0.113.0/24"])],
+        held: &[("office", "10.0.0.0/24")],
+    },
+    SetRow {
+        case: "a delete of every block of a location",
+        seed: &[("office", PUT, &["10.0.0.0/24", "10.0.1.0/24"])],
+        changes: &[("office", DELETE_IF_EXISTS, &["10.0.0.0/24", "10.0.1.0/24"])],
+        held: &[],
+    },
+    SetRow {
+        case: "a delete naming a location that does not hold the block",
+        seed: &[("east", PUT, &["198.51.100.0/24"])],
+        changes: &[("west", DELETE_IF_EXISTS, &["198.51.100.0/24"])],
+        held: &[("east", "198.51.100.0/24")],
+    },
+    SetRow {
+        case: "a put beside a delete, over distinct blocks",
+        seed: &[("office", PUT, &["10.0.0.0/24"])],
+        changes: &[
+            ("global", PUT, &["2001:db8::/32"]),
+            ("office", DELETE_IF_EXISTS, &["10.0.0.0/24"]),
+        ],
+        held: &[("global", "2001:db8::/32")],
+    },
+];
+
+#[tokio::test]
+async fn a_change_applies_as_a_set_so_applying_it_again_holds_the_same_blocks() {
+    for row in SET_ROWS {
+        let case = row.case;
+        let router = router();
+        let id = create_collection(&router, "set-semantics").await;
+        // "A sequential counter that Amazon Route 53 sets to 1 when you create a
+        // collection": every served change below moves it by exactly one.
+        let mut version = 1;
+        if !row.seed.is_empty() {
+            let seeded = change_collection(&router, &id, None, &changes_body(row.seed)).await;
+            assert_eq!(
+                seeded.status, 200,
+                "case {case:?}: expected 200 from the seeding change, got {} with body {}",
+                seeded.status, seeded.body
+            );
+            version += 1;
+        }
+
+        let body = changes_body(row.changes);
+        let expected = owned_pairs(row.held);
+        let mut change_ids: Vec<String> = Vec::new();
+        for pass in ["the first time", "the second time"] {
+            let applied = change_collection(&router, &id, None, &body).await;
+            assert_eq!(
+                applied.status, 200,
+                "case {case:?} applied {pass}: expected 200, got {} with body {}",
+                applied.status, applied.body
+            );
+            let change_id = applied
+                .first("Id")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?} applied {pass}: the change must answer an id; body {}",
+                        applied.body
+                    )
+                })
+                .to_string();
+            change_ids.push(change_id);
+            version += 1;
+
+            let held = held_pairs(&router, &id).await;
+            assert_eq!(
+                held, expected,
+                "case {case:?} applied {pass}: expected the collection to hold {expected:?}, \
+                 got {held:?}"
+            );
+            assert_eq!(
+                listed_version(&router, &id).await,
+                version.to_string(),
+                "case {case:?} applied {pass}: expected the collection at version {version}"
+            );
+        }
+        assert_ne!(
+            change_ids[0], change_ids[1],
+            "case {case:?}: each served change is its own change, got {change_ids:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The order the changes are carried in
+// ---------------------------------------------------------------------------
+
+/// One row of the ordering table: changes over DISTINCT blocks, and what the collection must
+/// hold whichever order the request carries them in. A put and a delete of the SAME block are
+/// left out: that pair is the documented move, which is ordered by the two actions rather
+/// than by the request.
+struct OrderRow {
+    case: &'static str,
+    changes: &'static [ChangeSpec],
+    held: &'static [(&'static str, &'static str)],
+}
+
+const ORDER_ROWS: &[OrderRow] = &[
+    OrderRow {
+        case: "two locations",
+        changes: &[
+            ("east", PUT, &["198.51.100.0/24"]),
+            ("west", PUT, &["203.0.113.0/24"]),
+        ],
+        held: &[("east", "198.51.100.0/24"), ("west", "203.0.113.0/24")],
+    },
+    OrderRow {
+        case: "three puts, two of them in one location",
+        changes: &[
+            ("east", PUT, &["198.51.100.0/24"]),
+            ("east", PUT, &["203.0.113.0/24"]),
+            ("west", PUT, &["192.0.2.0/24"]),
+        ],
+        held: &[
+            ("east", "198.51.100.0/24"),
+            ("east", "203.0.113.0/24"),
+            ("west", "192.0.2.0/24"),
+        ],
+    },
+    OrderRow {
+        case: "a put beside a delete of a block nothing holds",
+        changes: &[
+            ("global", PUT, &["2001:db8::/32"]),
+            ("office", DELETE_IF_EXISTS, &["10.0.0.0/24"]),
+        ],
+        held: &[("global", "2001:db8::/32")],
+    },
+];
+
+#[tokio::test]
+async fn the_order_a_request_carries_its_changes_in_does_not_change_what_is_held() {
+    for row in ORDER_ROWS {
+        let case = row.case;
+        for (order, reversed) in [("as written", false), ("reversed", true)] {
+            let router = router();
+            let id = create_collection(&router, "ordering").await;
+            let mut carried: Vec<ChangeSpec> = row.changes.to_vec();
+            if reversed {
+                carried.reverse();
+            }
+            let applied = change_collection(&router, &id, None, &changes_body(&carried)).await;
+            assert_eq!(
+                applied.status, 200,
+                "case {case:?} carried {order}: expected 200, got {} with body {}",
+                applied.status, applied.body
+            );
+            let held = held_pairs(&router, &id).await;
+            let expected = owned_pairs(row.held);
+            assert_eq!(
+                held, expected,
+                "case {case:?} carried {order}: expected the collection to hold {expected:?}, \
+                 got {held:?}"
+            );
+        }
+    }
 }
