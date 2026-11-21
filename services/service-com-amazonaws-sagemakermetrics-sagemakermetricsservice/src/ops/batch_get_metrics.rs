@@ -59,6 +59,11 @@
 //!
 //! This operation only READS state: polling it changes nothing a later caller sees.
 //!
+//! Ahead of every one of those steps is IAM's decision on the CALLER: a principal whose
+//! identity-based policies do not allow `sagemaker:BatchGetMetrics` on a resource one of
+//! these queries references is refused `AccessDeniedException` and no query is answered at
+//! all ([`crate::service::authorization`]).
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
@@ -490,6 +495,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides first, as AWS decides it in front of the service: the action is this
+        // operation's own name under the `sagemaker` namespace, and the resources are the
+        // references the queries carry — taken as sent, before this service judges whether
+        // one of them is a SageMaker reference at all. A refused call reports nothing.
+        let resources = crate::service::authorization::referenced_resources(
+            input
+                .metric_queries
+                .iter()
+                .map(|query| query.resource_arn.as_str()),
+        );
+        if let Some(denial) =
+            crate::service::authorization::refusal(&*self.engine, ctx, Self::NAME, &resources)
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         // The resource reference is resolved before anything else in the request is read,
         // and a value that is not a SageMaker ARN fails the WHOLE call — whichever query
         // carried it, at whatever position — with one constant sentence.

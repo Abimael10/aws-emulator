@@ -9,6 +9,11 @@
 //! EVERY answer of this operation, as the empty list when every point was ingested, so a
 //! client reads one member whatever happened.
 //!
+//! What happens before any of that is IAM's decision on the CALLER: a principal whose
+//! identity-based policies do not allow `sagemaker:BatchPutMetrics` on the trial component
+//! this batch names is refused `AccessDeniedException` and nothing is ingested
+//! ([`crate::service::authorization`]).
+//!
 //! The modelled constraints of a batch (`MetricName` 1..255 matching `^.+$`, `Step` >= 0,
 //! `TrialComponentName` matching `^[a-z0-9](-*[a-z0-9]){0,119}$`, 1..10 data points) are
 //! NOT refused in front of this handler (`skip_validation` in `super::types`): a
@@ -188,6 +193,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides first, as AWS decides it in front of the service: the action is this
+        // operation's own name under the `sagemaker` namespace, and the resource is the trial
+        // component the request names. A refused call ingests nothing, so a later read of the
+        // point it carried reports an empty series.
+        let resources = [crate::service::authorization::trial_component_addressed(
+            ctx,
+            &input.trial_component_name,
+        )];
+        if let Some(denial) =
+            crate::service::authorization::refusal(&*self.engine, ctx, Self::NAME, &resources)
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(denial));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // No shared store, so nothing could be ingested. The model has no
             // operation-level error for that, but it has a per-datum one.

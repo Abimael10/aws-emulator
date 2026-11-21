@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How this service refuses a SageMaker resource reference it cannot read as an ARN.
+//! How this service refuses a call it will not serve AT ALL — the two faults that fail the
+//! WHOLE request rather than one item of it.
 //!
-//! A value outside the modelled `SageMakerResourceArn` `@pattern` fails the WHOLE call
+//! A value outside the modelled `SageMakerResourceArn` `@pattern` fails the whole call
 //! with `400 ValidationException` and ONE constant sentence — no member path, no
 //! collection position, no submitted value and no expression quoted back — whatever the
 //! offending value is, wherever in `MetricQueries` it sits and however many queries the
 //! batch carries.
+//!
+//! IAM's authorization decision is the other: a caller whose identity-based policies do not
+//! allow `sagemaker:<OperationName>` on a resource the request addresses is refused
+//! `403 AccessDeniedException` with IAM's own sentence, before either operation reads or
+//! writes a metric.
 //!
 //! Every other modelled constraint of either operation is judged by the operation itself,
 //! per item, inside a 200 response — and a reference the expression ACCEPTS but that no
@@ -32,6 +38,14 @@ const T0: i64 = 1_700_000_000;
 /// How the framework opens its own per-member constraint clause: the envelope every
 /// refusal this service does NOT word itself keeps.
 const FRAMEWORK_ENVELOPE_OPENING: &str = "validation error";
+
+/// The access-key id a call presents unless a case varies it: neither STS nor IAM holds a
+/// record for it, so it resolves to the account's own ambient identity, which holds no IAM
+/// policies — the position AWS account root credentials are in.
+const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
+
+/// The Region a call is signed for unless a case varies it.
+const REGION: &str = "us-east-1";
 
 /// One emulator with this service mounted on a single shared engine, exactly as the
 /// router mounts it in production.
@@ -61,19 +75,32 @@ impl Answer {
 }
 
 /// Dispatch one restJson1 request.
+/// Dispatch one restJson1 request, as the account's own published credential.
 async fn call(router: &MultiServiceRouter, method: &str, path: &str, body: &Value) -> Answer {
+    call_as(router, ACCOUNT_KEY, REGION, method, path, body).await
+}
+
+/// Dispatch one restJson1 request signed for `region` with `access_key_id` in its SigV4
+/// credential scope — which is where the caller's identity and the Region of the resource
+/// ARNs a decision is taken against are read from.
+async fn call_as(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: &Value,
+) -> Answer {
     let request = http::Request::builder()
         .method(method)
-        .uri(format!("https://metrics.sagemaker.us-east-1.amazonaws.com{path}"))
-        .header("host", "metrics.sagemaker.us-east-1.amazonaws.com")
+        .uri(format!("https://metrics.sagemaker.{region}.amazonaws.com{path}"))
+        .header("host", format!("metrics.sagemaker.{region}.amazonaws.com"))
         .header("content-type", "application/json")
         // The SigV4 credential scope is how the router picks the service; the signature
         // itself is not verified here (authentication is off above).
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 \
-             Credential=AKIDEXAMPLE/20261029/us-east-1/sagemaker/aws4_request, \
-             SignedHeaders=host, Signature=not-verified",
+            authorization_header(access_key_id, region, "sagemaker"),
         )
         .body(bytes::Bytes::from(
             serde_json::to_vec(body).expect("serialize the request body"),
@@ -601,5 +628,611 @@ async fn a_reference_the_expression_accepts_is_answered_in_band() {
         value,
         Some(4.0),
         "case {stored:?}: expected the stored value 4.0, got {value:?}"
+    );
+}
+
+// The second fault that refuses the whole call: IAM's authorization decision on the CALLER.
+
+/// A second Region, for the cases that vary which Region a call was signed for.
+const OTHER_REGION: &str = "eu-west-3";
+
+/// The namespace SageMaker publishes this service's actions under, which is also its SigV4
+/// signing name and the namespace of the resource ARNs a decision is taken against.
+const ACTION_PREFIX: &str = "sagemaker";
+
+/// The code and the status an authorization refusal carries.
+const ACCESS_DENIED: &str = "AccessDeniedException";
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The `RoleSessionName` every `AssumeRole` below asks for — the last segment of the
+/// assumed-role ARN a refusal names as the principal.
+const SESSION: &str = "probe";
+
+/// A SigV4 `Authorization` header whose credential scope names `access_key_id`, `region` and
+/// `signing_name`. Request authentication is off in these tests, so the signature is not
+/// checked; the scope is what the caller's identity and the ARN Region are read from.
+fn authorization_header(access_key_id: &str, region: &str, signing_name: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/20261029/{region}/{signing_name}/\
+         aws4_request, SignedHeaders=host, Signature=not-verified"
+    )
+}
+
+/// One emulator with this service mounted beside the two services a CALLER's own identity is
+/// made with — IAM, which holds the principals and the documents in force on them, and STS,
+/// which mints the sessions — all on ONE shared engine, as the assembled emulator mounts
+/// them. So the policies the gate reads are the ones those services wrote.
+fn emulator_with_identity_services() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    // Signatures are the framework's business and are not what these tests pin.
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    router.register_service(
+        service_com_amazonaws_sts_awssecuritytokenservicev20110615::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC 3986's
+/// unreserved characters literal — so a policy document's braces and quotes survive the round
+/// trip.
+fn form_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// The text of the first `<name>…</name>` element of an awsQuery response.
+fn xml_element(body: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].to_string())
+}
+
+/// One awsQuery call to IAM or STS, made with the account's own credential, that must be
+/// served.
+async fn aws_query(
+    router: &MultiServiceRouter,
+    signing_name: &str,
+    version: &str,
+    action: &str,
+    params: &[(&str, String)],
+) -> String {
+    let mut body = format!("Action={action}&Version={version}");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://{signing_name}.amazonaws.com/"))
+        .header("host", format!("{signing_name}.amazonaws.com"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            authorization_header(ACCOUNT_KEY, REGION, signing_name),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("build the awsQuery request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let text = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "setup {action}: the call must succeed, got {status} with {text}"
+    );
+    text
+}
+
+/// A caller: the access key id its requests present, and the principal a refusal names.
+struct Principal {
+    access_key_id: String,
+    arn: String,
+}
+
+/// Create an IAM role carrying `policies` as its inline policies, assume it through STS, and
+/// answer the session's access key id with the session ARN.
+async fn assumed_role(
+    router: &MultiServiceRouter,
+    role_name: &str,
+    policies: &[String],
+) -> Principal {
+    let account = engine::emulator_account_id();
+    let trust = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": format!("arn:aws:iam::{account}:root")},
+            "Action": "sts:AssumeRole",
+        }],
+    })
+    .to_string();
+    aws_query(
+        router,
+        "iam",
+        "2010-05-08",
+        "CreateRole",
+        &[
+            ("RoleName", role_name.to_string()),
+            ("AssumeRolePolicyDocument", trust),
+        ],
+    )
+    .await;
+    for (index, policy) in policies.iter().enumerate() {
+        aws_query(
+            router,
+            "iam",
+            "2010-05-08",
+            "PutRolePolicy",
+            &[
+                ("RoleName", role_name.to_string()),
+                ("PolicyName", format!("inline-{index}")),
+                ("PolicyDocument", policy.clone()),
+            ],
+        )
+        .await;
+    }
+    let assumed = aws_query(
+        router,
+        "sts",
+        "2011-06-15",
+        "AssumeRole",
+        &[
+            ("RoleArn", format!("arn:aws:iam::{account}:role/{role_name}")),
+            ("RoleSessionName", SESSION.to_string()),
+        ],
+    )
+    .await;
+    Principal {
+        access_key_id: xml_element(&assumed, "AccessKeyId")
+            .unwrap_or_else(|| panic!("AssumeRole answers an AccessKeyId, got {assumed}")),
+        arn: xml_element(&assumed, "Arn")
+            .unwrap_or_else(|| panic!("AssumeRole answers the session's Arn, got {assumed}")),
+    }
+}
+
+/// One identity-based policy document carrying one statement.
+fn statement(effect: &str, actions: &[&str], resource: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": effect, "Action": actions, "Resource": resource}],
+    })
+    .to_string()
+}
+
+/// The ARN of a trial component of THIS account, spelled here independently of the crate
+/// under test — as SageMaker's Service Authorization Reference spells the
+/// `experiment-trial-component` resource type.
+fn component_arn(region: &str, component: &str) -> String {
+    format!(
+        "arn:aws:{ACTION_PREFIX}:{region}:{}:experiment-trial-component/{component}",
+        engine::emulator_account_id()
+    )
+}
+
+/// The sentence IAM refuses a request with, stated here rather than read off the crate under
+/// test: who was refused, which action, on which resource, and which of IAM's rules refused.
+fn denial(principal: &str, operation: &str, resource: &str, explicit_deny: bool) -> String {
+    let action = format!("{ACTION_PREFIX}:{operation}");
+    let reason = if explicit_deny {
+        "with an explicit deny in an identity-based policy".to_string()
+    } else {
+        format!("because no identity-based policy allows the {action} action")
+    };
+    format!(
+        "User: {principal} is not authorized to perform: {action} on resource: {resource} {reason}"
+    )
+}
+
+/// One operation of this service as a CALLER reaches it: the name that is also the last
+/// segment of the IAM action, the method and path an SDK addresses it at, and the body it
+/// carries for the trial component under test, in the Region whose ARNs it names.
+struct Call {
+    operation: &'static str,
+    method: &'static str,
+    path: &'static str,
+    body: fn(&str, &str) -> Value,
+}
+
+const CALLS: &[Call] = &[
+    Call {
+        operation: "BatchPutMetrics",
+        method: "PUT",
+        path: "/BatchPutMetrics",
+        // The ingest names its trial component by NAME; the Region of the resource the
+        // decision is taken against is the one the caller SIGNED for.
+        body: |component, _region| {
+            json!({
+                "TrialComponentName": component,
+                "MetricData": [{
+                    "MetricName": "loss",
+                    "Timestamp": T0,
+                    "Step": 0,
+                    "Value": 7.5,
+                }],
+            })
+        },
+    },
+    Call {
+        operation: "BatchGetMetrics",
+        method: "POST",
+        path: "/BatchGetMetrics",
+        // The read names its resource by ARN, one per query.
+        body: |component, region| json!({ "MetricQueries": [query(&component_arn(region, component))] }),
+    },
+];
+
+/// One row of the grant table: the documents the caller's role carries — built from the
+/// action the call asks for and the ARN of the trial component it addresses — and whether IAM
+/// allows the call under them.
+struct Grant {
+    case: &'static str,
+    policies: fn(&str, &str) -> Vec<String>,
+    allowed: bool,
+    explicit_deny: bool,
+}
+
+const GRANTS: &[Grant] = &[
+    Grant {
+        case: "a role carrying no policy at all",
+        policies: |_action, _arn| Vec::new(),
+        allowed: false,
+        explicit_deny: false,
+    },
+    Grant {
+        case: "a role granted every SageMaker action",
+        policies: |_action, _arn| vec![statement("Allow", &["sagemaker:*"], "*")],
+        allowed: true,
+        explicit_deny: false,
+    },
+    Grant {
+        case: "a role granted this call's action on this trial component",
+        policies: |action, arn| vec![statement("Allow", &[action], arn)],
+        allowed: true,
+        explicit_deny: false,
+    },
+    Grant {
+        case: "a role granted this call's action on every trial component of the account",
+        policies: |action, _arn| vec![statement("Allow", &[action], &component_arn(REGION, "*"))],
+        allowed: true,
+        explicit_deny: false,
+    },
+    Grant {
+        case: "a role granted every action on ANOTHER trial component",
+        policies: |_action, _arn| {
+            vec![statement(
+                "Allow",
+                &["sagemaker:*"],
+                &component_arn(REGION, "another-component"),
+            )]
+        },
+        allowed: false,
+        explicit_deny: false,
+    },
+    Grant {
+        case: "a role granted another service's actions",
+        policies: |_action, _arn| vec![statement("Allow", &["s3:*"], "*")],
+        allowed: false,
+        explicit_deny: false,
+    },
+    Grant {
+        case: "a role granted every action with this call's action denied",
+        policies: |action, _arn| {
+            vec![
+                statement("Allow", &["sagemaker:*"], "*"),
+                statement("Deny", &[action], "*"),
+            ]
+        },
+        allowed: false,
+        explicit_deny: true,
+    },
+];
+
+/// Assert `answer` is the authorization refusal `principal` is owed for `operation` on
+/// `resource`.
+fn assert_denied(
+    case: &str,
+    answer: &Answer,
+    principal: &str,
+    operation: &str,
+    resource: &str,
+    explicit_deny: bool,
+) {
+    assert_eq!(
+        answer.status, ACCESS_DENIED_STATUS,
+        "case {case:?}: expected HTTP {ACCESS_DENIED_STATUS}, got {} ({:?})",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_type.as_deref(),
+        Some(ACCESS_DENIED),
+        "case {case:?}: expected __type {ACCESS_DENIED}, got {:?}",
+        answer.error_type
+    );
+    assert_eq!(
+        answer.header_error_type.as_deref(),
+        Some(ACCESS_DENIED),
+        "case {case:?}: expected x-amzn-errortype {ACCESS_DENIED}, got {:?}",
+        answer.header_error_type
+    );
+    assert_eq!(
+        answer.message(),
+        denial(principal, operation, resource, explicit_deny),
+        "case {case:?}: expected IAM's own sentence, got {:?}",
+        answer.message()
+    );
+}
+
+/// How many points `component` holds for the metric these calls write, read back with the
+/// account's own credential — so a refused ingest can be shown to have stored nothing.
+async fn stored_points(router: &MultiServiceRouter, component: &str) -> usize {
+    let answer = get_metrics(router, vec![query(&component_arn(REGION, component))]).await;
+    assert_eq!(
+        answer.status, 200,
+        "reading {component} back must answer 200, got {} ({:?})",
+        answer.status, answer.body
+    );
+    let results = answer.body["MetricQueryResults"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected MetricQueryResults, got {:?}", answer.body))
+        .clone();
+    assert_eq!(
+        results[0]["Status"].as_str(),
+        Some("Complete"),
+        "reading {component} back is Complete whether or not anything was stored, got {:?}",
+        results[0]
+    );
+    results[0]["MetricValues"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_else(|| panic!("expected MetricValues, got {:?}", results[0]))
+}
+
+/// RULE: both operations are decided against the CALLING principal's own identity-based
+/// policies, under `sagemaker:<OperationName>` on the trial component the request addresses —
+/// so a caller no readable statement grants, or one an explicit deny refuses, is answered
+/// `403 AccessDeniedException` with IAM's own sentence and ingests nothing, while the same
+/// call is served once the grant is in force.
+#[tokio::test]
+async fn both_operations_are_decided_against_the_callers_identity_policies() {
+    let router = emulator_with_identity_services();
+    for (call_index, call) in CALLS.iter().enumerate() {
+        let action = format!("{ACTION_PREFIX}:{}", call.operation);
+        for (grant_index, grant) in GRANTS.iter().enumerate() {
+            let component = format!("tc-authz-{call_index}-{grant_index}");
+            let resource = component_arn(REGION, &component);
+            let case = format!("{} / {}", call.operation, grant.case);
+            let caller = assumed_role(
+                &router,
+                &format!("smm-authz-{call_index}-{grant_index}"),
+                &(grant.policies)(&action, &resource),
+            )
+            .await;
+            let answer = call_as(
+                &router,
+                &caller.access_key_id,
+                REGION,
+                call.method,
+                call.path,
+                &(call.body)(&component, REGION),
+            )
+            .await;
+            if grant.allowed {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: a permitted caller must be served, got {} ({:?})",
+                    answer.status, answer.body
+                );
+            } else {
+                assert_denied(
+                    &case,
+                    &answer,
+                    &caller.arn,
+                    call.operation,
+                    &resource,
+                    grant.explicit_deny,
+                );
+            }
+            // Whatever the verdict, only a PERMITTED ingest leaves a point behind: a refused
+            // call performs nothing at all.
+            let expected = usize::from(grant.allowed && call.operation == "BatchPutMetrics");
+            let held = stored_points(&router, &component).await;
+            assert_eq!(
+                held, expected,
+                "case {case:?}: expected {expected} stored point(s) for {component}, got {held}"
+            );
+        }
+    }
+}
+
+/// RULE: the account's own published credential holds no IAM policies — the position AWS
+/// account root credentials are in — so it is served, and what it writes is queryable.
+#[tokio::test]
+async fn the_accounts_own_credential_is_served() {
+    let router = emulator_with_identity_services();
+    let component = "tc-authz-account";
+    for call in CALLS {
+        let answer = call_as(
+            &router,
+            ACCOUNT_KEY,
+            REGION,
+            call.method,
+            call.path,
+            &(call.body)(component, REGION),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {}: the account's own credential must be served, got {} ({:?})",
+            call.operation, answer.status, answer.body
+        );
+    }
+    let held = stored_points(&router, component).await;
+    assert_eq!(
+        held, 1,
+        "the account's own ingest must be queryable afterwards, got {held} point(s)"
+    );
+}
+
+/// RULE: the resource a decision is taken against comes from the REQUEST — the trial
+/// component an ingest names, in the Region it was signed for, and the reference a query
+/// carries for a read. So a grant scoped to one Region's component ARN allows the ingest
+/// signed for that Region and refuses the identical one signed for another, naming the ARN of
+/// the Region it was signed for; a read is decided on the reference it carries whatever Region
+/// it was signed for.
+#[tokio::test]
+async fn the_resource_comes_from_the_request_and_the_region_it_was_signed_for() {
+    let router = emulator_with_identity_services();
+    let component = "tc-authz-region";
+    let resource = component_arn(REGION, component);
+    let caller = assumed_role(
+        &router,
+        "smm-authz-region",
+        &[statement(
+            "Allow",
+            &[
+                &format!("{ACTION_PREFIX}:BatchPutMetrics"),
+                &format!("{ACTION_PREFIX}:BatchGetMetrics"),
+            ],
+            &resource,
+        )],
+    )
+    .await;
+
+    // (case, the call, the Region signed for, the status expected, the resource a refusal
+    // must name)
+    let ingest = &CALLS[0];
+    let read = &CALLS[1];
+    let rows: Vec<(&str, &Call, &str, u16, String)> = vec![
+        (
+            "the ingest signed for the granted Region",
+            ingest,
+            REGION,
+            200,
+            resource.clone(),
+        ),
+        (
+            "the same ingest signed for another Region",
+            ingest,
+            OTHER_REGION,
+            ACCESS_DENIED_STATUS,
+            component_arn(OTHER_REGION, component),
+        ),
+        (
+            "the read of the granted reference, signed for another Region",
+            read,
+            OTHER_REGION,
+            200,
+            resource.clone(),
+        ),
+    ];
+    for (case, call, region, expected_status, named) in rows {
+        // The body always names the GRANTED reference; what varies is the credential scope.
+        let answer = call_as(
+            &router,
+            &caller.access_key_id,
+            region,
+            call.method,
+            call.path,
+            &(call.body)(component, REGION),
+        )
+        .await;
+        if expected_status == 200 {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the call to be served, got {} ({:?})",
+                answer.status, answer.body
+            );
+        } else {
+            assert_denied(case, &answer, &caller.arn, call.operation, &named, false);
+        }
+    }
+}
+
+/// RULE: a read is decided against EVERY reference its queries carry, so a caller granted one
+/// of two referenced components is refused the batch naming both — the refusal naming the
+/// component it holds no grant for — and the same batch is served once both are granted.
+#[tokio::test]
+async fn a_read_is_decided_against_every_reference_its_queries_carry() {
+    let router = emulator_with_identity_services();
+    let granted = component_arn(REGION, "tc-authz-granted");
+    let ungranted = component_arn(REGION, "tc-authz-ungranted");
+    let action = format!("{ACTION_PREFIX}:BatchGetMetrics");
+    let batch = vec![query(&granted), query(&ungranted)];
+
+    let partial = assumed_role(
+        &router,
+        "smm-authz-partial",
+        &[statement("Allow", &[action.as_str()], &granted)],
+    )
+    .await;
+    let refused = call_as(
+        &router,
+        &partial.access_key_id,
+        REGION,
+        "POST",
+        "/BatchGetMetrics",
+        &json!({ "MetricQueries": batch.clone() }),
+    )
+    .await;
+    assert_denied(
+        "a batch naming one granted and one ungranted component",
+        &refused,
+        &partial.arn,
+        "BatchGetMetrics",
+        &ungranted,
+        false,
+    );
+    assert!(
+        refused.body.get("MetricQueryResults").is_none(),
+        "a refused read must answer no query at all, got {:?}",
+        refused.body
+    );
+
+    let both = assumed_role(
+        &router,
+        "smm-authz-both",
+        &[statement(
+            "Allow",
+            &[action.as_str()],
+            &component_arn(REGION, "*"),
+        )],
+    )
+    .await;
+    let served = call_as(
+        &router,
+        &both.access_key_id,
+        REGION,
+        "POST",
+        "/BatchGetMetrics",
+        &json!({ "MetricQueries": batch }),
+    )
+    .await;
+    assert_eq!(
+        served.status, 200,
+        "a caller granted both references must be served, got {} ({:?})",
+        served.status, served.body
+    );
+    assert_eq!(
+        served.body["MetricQueryResults"].as_array().map(Vec::len),
+        Some(2),
+        "one result per query, got {:?}",
+        served.body
     );
 }

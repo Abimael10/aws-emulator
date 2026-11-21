@@ -41,11 +41,22 @@
 //! modelled request is read with is the model's own `restJson1`, reading a batch's items
 //! the way this service reads them ([`unset_members`]).
 //!
+//! # The authorization step every operation runs first
+//!
+//! AWS decides authorization at the IAM layer, in front of the service: a caller whose
+//! identity-based policies do not allow the action — or that an explicit `Deny` covers — is
+//! refused `AccessDeniedException` and the call performs nothing, so a refused ingest stores
+//! no point and a refused read reports none. That decision is a property of the request's
+//! identity, the action it names and the resources it addresses rather than of what a handler
+//! goes on to do, so it is stated ONCE in [`authorization`] and taken by each operation
+//! before it reads or writes the metric store.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+pub mod authorization;
 mod envelope;
 mod unset_members;
 
