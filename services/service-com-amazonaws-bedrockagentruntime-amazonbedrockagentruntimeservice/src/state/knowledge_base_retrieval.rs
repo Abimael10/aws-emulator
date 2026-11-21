@@ -349,6 +349,32 @@ pub fn knowledge_base_resource_arn(
     )
 }
 
+/// Whether the Bedrock Agent plane holds the knowledge base `knowledge_base_id` names, for
+/// a read that must answer for the resource BEFORE it interprets the members that only
+/// shape what it reports.
+///
+/// `Ok` for a knowledge base that plane holds live; `Err` is the same refusal
+/// [`nearest_chunks`] answers for the same two conditions, so one knowledge base earns one
+/// refusal wherever it is resolved.
+///
+/// READ-ONLY for everything a later caller can observe; the one write on its path is the
+/// Bedrock Agent plane materialising the status transitions its own clock had already made
+/// due, which is owed whether or not anybody called.
+pub fn resolve_knowledge_base<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    knowledge_base_id: &str,
+) -> Result<(), RetrievalRefusal> {
+    let Some(agent) = agent_state::service_state(engine) else {
+        return Err(RetrievalRefusal::StoreUnavailable);
+    };
+    let mut agent = agent.lock();
+    agent.materialise_due_transitions(SystemTime::now());
+    if agent.live_knowledge_base(knowledge_base_id).is_none() {
+        return Err(RetrievalRefusal::UnknownKnowledgeBase);
+    }
+    Ok(())
+}
+
 /// The chunks of `knowledge_base_id` nearest to `query`, most relevant first, at most
 /// `keep` of them, and only those whose own metadata `filter` admits.
 ///

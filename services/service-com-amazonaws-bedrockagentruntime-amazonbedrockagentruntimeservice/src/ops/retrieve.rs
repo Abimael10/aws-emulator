@@ -49,6 +49,11 @@
 //! count it keeps would answer a success whose ordering is the one the caller asked to
 //! have replaced).
 //!
+//! Each of those legs is read only once the knowledge base the URI names has RESOLVED:
+//! none of them identifies a resource, so none can make a knowledge base exist or hide
+//! that it does not, and a retrieval from a knowledge base this emulator does not hold is
+//! the modelled `ResourceNotFoundException` whatever the request asks of it.
+//!
 //! `overrideSearchType` IS served: `HYBRID` and `SEMANTIC` name the same ordering here,
 //! because the vectors the ingestion wrote are term-frequency vectors and their
 //! nearest-neighbour order already is the lexical one.
@@ -221,9 +226,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The request is read in full BEFORE anything is looked up: a leg this service
-        // cannot compute is refused whatever the stores hold, and that refusal depends on
-        // the request alone, so it says nothing about which knowledge bases exist.
+        // Authorization is decided against the knowledge base the call retrieves from —
+        // the resource an identity-based policy for `bedrock:Retrieve` names — and before
+        // the store is read, so an unauthorized call is answered the same way whether or
+        // not that knowledge base exists.
+        let resource = retrieval::knowledge_base_resource_arn(ctx, &input.knowledge_base_id);
+        if let Err(denied) = crate::state::authorize(&*self.engine, ctx, Self::NAME, &resource) {
+            return Err(RetrieveErrorModeled::AccessDeniedException(denied).into());
+        }
+
+        // The knowledge base the request names answers for itself BEFORE any member that
+        // shapes the retrieval is interpreted: a knowledge base this emulator does not hold
+        // is the modelled not-found whatever else the request asks for, so which of the two
+        // refusals a caller sees never depends on a retrieval-shaping member. An identifier
+        // that names a knowledge base of another account, region or partition names none
+        // this call can read, so it is answered not-found rather than reduced to a bare id
+        // that would resolve in the caller's own place.
+        let knowledge_base_id = retrieval::knowledge_base_id_from_identifier(
+            &input.knowledge_base_id,
+            &crate::state::request_region(ctx),
+        )
+        .ok_or_else(|| {
+            unretrievable(
+                retrieval::RetrievalRefusal::UnknownKnowledgeBase,
+                &input.knowledge_base_id,
+            )
+        })?;
+        retrieval::resolve_knowledge_base(&*self.engine, knowledge_base_id)
+            .map_err(|refusal| unretrievable(refusal, &input.knowledge_base_id))?;
+
+        // Now the request is read in full: a leg this service cannot compute is refused
+        // whatever the store holds, and that refusal depends on the request alone, so it
+        // says nothing about what the knowledge base has ingested.
         let query = query_text(&input.retrieval_query)?;
         if input.guardrail_configuration.is_some() {
             return Err(refuse(
@@ -257,71 +291,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refuse(too_big));
         }
 
-        // Authorization is decided against the knowledge base the call retrieves from —
-        // the resource an identity-based policy for `bedrock:Retrieve` names — and before
-        // the store is read, so an unauthorized call is answered the same way whether or
-        // not that knowledge base exists.
-        let resource = retrieval::knowledge_base_resource_arn(ctx, &input.knowledge_base_id);
-        if let Err(denied) = crate::state::authorize(&*self.engine, ctx, Self::NAME, &resource) {
-            return Err(RetrieveErrorModeled::AccessDeniedException(denied).into());
-        }
-
         // The retrieval itself: the chunks of the knowledge base's bound index nearest to
-        // the query, narrowed by the filter and cut to the page the request asked for. An
-        // identifier that names a knowledge base of another account, region or partition
-        // names none this call can read, so it is answered not-found rather than reduced to
-        // a bare id that would resolve in the caller's own place.
-        let knowledge_base_id = retrieval::knowledge_base_id_from_identifier(
-            &input.knowledge_base_id,
-            &crate::state::request_region(ctx),
-        );
-        let retrieved = match knowledge_base_id {
-            Some(knowledge_base_id) => retrieval::nearest_chunks(
-                &*self.engine,
-                knowledge_base_id,
-                &query,
-                search.results,
-                search.filter,
-            ),
-            None => Err(retrieval::RetrievalRefusal::UnknownKnowledgeBase),
-        };
-        let retrieved = match retrieved {
-            Ok(retrieved) => retrieved,
-            Err(retrieval::RetrievalRefusal::UnknownKnowledgeBase) => {
-                return Err(RetrieveErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(retrieval::knowledge_base_not_found_message(
-                            &input.knowledge_base_id,
-                        )),
-                    },
-                )
-                .into())
-            }
-            Err(retrieval::RetrievalRefusal::StoreUnavailable) => {
-                return Err(RetrieveErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: Some("the knowledge base store is unavailable".to_string()),
-                        reason: None,
-                    },
-                )
-                .into())
-            }
-            // The knowledge base's content does not live anywhere this plane can read it:
-            // it names no vector store, or the index it was bound to cannot be resolved or
-            // is gone. Its DEPENDENCY failed, which is the modelled error
-            // for exactly that ("There was an issue with a dependency. Check the resource
-            // configurations and retry the request."), and never an empty success.
-            Err(retrieval::RetrievalRefusal::UnreachableVectorStore(resource))
-            | Err(retrieval::RetrievalRefusal::MissingVectorIndex(resource)) => {
-                return Err(RetrieveErrorModeled::DependencyFailedException(
-                    DependencyFailedException {
-                        message: Some(retrieval::unreachable_store_message(&resource)),
-                        resource_name: Some(resource),
-                    },
-                )
-                .into())
-            }
-        };
+        // the query, narrowed by the filter and cut to the page the request asked for.
+        let retrieved = retrieval::nearest_chunks(
+            &*self.engine,
+            knowledge_base_id,
+            &query,
+            search.results,
+            search.filter,
+        )
+        .map_err(|refusal| unretrievable(refusal, &input.knowledge_base_id))?;
 
         Ok(RetrieveOutput {
             retrieval_results: retrieved
@@ -358,6 +337,39 @@ fn refuse(message: String) -> RetrieveError {
         message: Some(message),
     })
     .into()
+}
+
+/// The modelled error a knowledge base that cannot be retrieved from earns, worded once for
+/// every point of this operation that resolves one: the knowledge base the request
+/// identified does not exist (not-found, naming the identifier the request carried), a store
+/// this read needs is not on this engine (a server error), or the knowledge base's content
+/// lives nowhere this plane can read it — its DEPENDENCY failed, which is the modelled error
+/// for exactly that ("There was an issue with a dependency. Check the resource
+/// configurations and retry the request."), and never an empty success.
+fn unretrievable(refusal: retrieval::RetrievalRefusal, identifier: &str) -> RetrieveError {
+    match refusal {
+        retrieval::RetrievalRefusal::UnknownKnowledgeBase => {
+            RetrieveErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(retrieval::knowledge_base_not_found_message(identifier)),
+            })
+            .into()
+        }
+        retrieval::RetrievalRefusal::StoreUnavailable => {
+            RetrieveErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the knowledge base store is unavailable".to_string()),
+                reason: None,
+            })
+            .into()
+        }
+        retrieval::RetrievalRefusal::UnreachableVectorStore(resource)
+        | retrieval::RetrievalRefusal::MissingVectorIndex(resource) => {
+            RetrieveErrorModeled::DependencyFailedException(DependencyFailedException {
+                message: Some(retrieval::unreachable_store_message(&resource)),
+                resource_name: Some(resource),
+            })
+            .into()
+        }
+    }
 }
 
 /// The text the query is ranked against.

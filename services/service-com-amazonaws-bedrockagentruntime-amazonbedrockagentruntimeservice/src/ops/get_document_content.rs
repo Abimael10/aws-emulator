@@ -34,7 +34,11 @@
 //!
 //! That is the modelled `ValidationException`, because a plausible-looking success — a URL
 //! that leads nowhere, or content the caller asked to have filtered — is worse than an
-//! error.
+//! error. It is read only once the knowledge base, the data source and the document have
+//! RESOLVED: `outputFormat` selects how a document that exists is rendered, so it can
+//! neither make a document exist nor hide that it does not, and a read of a resource this
+//! emulator does not hold is the modelled `ResourceNotFoundException` whatever rendering
+//! the request asked for.
 //!
 //! `userContext` IS served: it names the identity the read is narrowed to the authorized
 //! documents of, and that narrowing withholds nothing here, because no document of a
@@ -199,30 +203,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::document_content as content;
 
-        // The request is read in full BEFORE anything is looked up: a leg this service
-        // cannot compute is refused whatever the stores hold, and that refusal depends on
-        // the request alone, so it says nothing about which documents exist.
-        match input.output_format.as_deref() {
-            None | Some(content::OUTPUT_FORMAT_RAW) => {}
-            Some(content::OUTPUT_FORMAT_EXTRACTED) => {
-                return Err(refuse(format!(
-                    "outputFormat: {} is not an output format this service holds a \
-                     document in — no document parser runs here, so the parsed text of a \
-                     document does not exist to be handed out; ask for {} to read the \
-                     document as it was ingested",
-                    content::OUTPUT_FORMAT_EXTRACTED,
-                    content::OUTPUT_FORMAT_RAW
-                )));
-            }
-            Some(other) => {
-                return Err(refuse(format!(
-                    "outputFormat: {other:?} is not an output format of a document. \
-                     Supported formats: {}",
-                    content::OUTPUT_FORMAT_RAW
-                )));
-            }
-        }
-
         // Authorization is decided against the knowledge base the call reads — the resource
         // an identity-based policy for `bedrock:GetDocumentContent` names — and before any
         // store is read, so an unauthorized call is answered the same way whether or not
@@ -278,6 +258,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         };
+
+        // Only NOW is the member that selects how the document is rendered read: it names
+        // no resource, so a leg of it this service cannot compute says nothing about which
+        // documents exist, and the resources the path names have already answered for
+        // themselves. A value the model does not define never reaches here — the boundary
+        // validator refuses one against `DocumentOutputFormat`'s value set before a handler
+        // runs — so both refusals below are about a modelled format.
+        match input.output_format.as_deref() {
+            None | Some(content::OUTPUT_FORMAT_RAW) => {}
+            Some(content::OUTPUT_FORMAT_EXTRACTED) => {
+                return Err(refuse(format!(
+                    "outputFormat: {} is not an output format this service holds a \
+                     document in — no document parser runs here, so the parsed text of a \
+                     document does not exist to be handed out; ask for {} to read the \
+                     document as it was ingested",
+                    content::OUTPUT_FORMAT_EXTRACTED,
+                    content::OUTPUT_FORMAT_RAW
+                )));
+            }
+            Some(other) => {
+                return Err(refuse(format!(
+                    "outputFormat: {other:?} is not an output format of a document. \
+                     Supported formats: {}",
+                    content::OUTPUT_FORMAT_RAW
+                )));
+            }
+        }
 
         // The URL leads back to THIS emulator, signed by the framework's own signer, so the
         // client that follows it reads the document's content from the store that holds it:
