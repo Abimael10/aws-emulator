@@ -183,23 +183,37 @@ impl SerializableStruct for ValidationException {
 /// `@httpError 404`).
 const UNKNOWN_MONITOR_EXCEPTION: &str = crate::ops::types::UnknownMonitorException::shape_name();
 
+/// The wire error code of the refusal every operation that resolves an ARN against a
+/// registry answers when the ARN names no resource the account holds, taken from the
+/// generated shape rather than retyped (`smithy_query(query="shape",
+/// shape="ResourceNotFoundException")`: errorKind client, `@httpError 404`).
+const RESOURCE_NOT_FOUND_EXCEPTION: &str =
+    crate::ops::types::ResourceNotFoundException::shape_name();
+
+/// The modelled errors THIS service serves at HTTP 400 rather than at the status their own
+/// `@httpError` declares — the dangling-reference refusals, whose recorded wire status is
+/// 400 for every operation that raises them.
+const SERVED_AT_BAD_REQUEST: [&str; 2] = [UNKNOWN_MONITOR_EXCEPTION, RESOURCE_NOT_FOUND_EXCEPTION];
+
 /// The status THIS service serializes the modelled error `shape_name` at, given the
 /// `modelled` status its own `@httpError` declares.
 ///
-/// Cost Explorer answers a request naming a cost anomaly monitor the account does not
-/// hold with HTTP **400**, not the 404 `UnknownMonitorException` carries: recorded wire
-/// behaviour, with the body's `__type` and message exactly the ones the refusing
-/// operation builds — so the error identity stays the model's and only the status is the
-/// service's. The difference is observable: a 404 from a JSON-protocol endpoint reads to
-/// SDK retry middleware and HTTP proxies as a missing route rather than as a dangling
-/// resource reference the caller must fix.
+/// Cost Explorer answers a request whose reference resolves to no resource the account
+/// holds — a cost anomaly monitor it does not hold, or an ARN naming nothing — with HTTP
+/// **400**, not the 404 those shapes carry: recorded wire behaviour, with the body's
+/// `__type` and message exactly the ones the refusing operation builds — so the error
+/// identity stays the model's and only the status is the service's. The difference is
+/// observable: a 404 from a JSON-protocol endpoint reads to SDK retry middleware and HTTP
+/// proxies as a missing route rather than as a dangling resource reference the caller must
+/// fix, so tooling retries a request that can never succeed.
 ///
-/// It is a per-SERVICE rule, applied here — the one place every operation's error is
-/// serialized through — rather than in each handler, so an operation that raises this
-/// error later cannot answer a different status for the same condition. Every other
-/// modelled error keeps the status its own `@httpError` declares.
+/// It is a per-SERVICE rule, keyed on the ERROR SHAPE and applied here — the one place
+/// every operation's error is serialized through — rather than in each handler, so every
+/// operation that raises one of these errors answers the same status for the same
+/// condition, whichever registry it resolved the reference against. Every other modelled
+/// error keeps the status its own `@httpError` declares.
 fn served_status(shape_name: &str, modelled: u16) -> u16 {
-    if shape_name == UNKNOWN_MONITOR_EXCEPTION {
+    if SERVED_AT_BAD_REQUEST.contains(&shape_name) {
         400
     } else {
         modelled
@@ -314,7 +328,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     /// retryable, so a client would retry an operation that can never succeed.
     ///
     /// A modeled error takes the status THIS SERVICE serves it at ([`served_status`]),
-    /// which is the model's `@httpError` for every error but the unknown-monitor refusal.
+    /// which is the model's `@httpError` for every error but the dangling-reference
+    /// refusals.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,

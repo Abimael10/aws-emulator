@@ -20,6 +20,12 @@ use crate::harness::{error_code, Emulator};
 /// `CostCategoryRuleVersion`).
 const RULE_VERSION: &str = "CostCategoryExpression.v1";
 
+/// The status Cost Explorer serves a `ResourceNotFoundException` at — not the 404 the
+/// shape's `@httpError` declares. It is a per-SERVICE rule keyed on the error shape, so it
+/// holds for every operation that raises it; see [`crate::resource_tagging`], which asserts
+/// it for the tagging operations that resolve an ARN the same way these do.
+const RESOURCE_NOT_FOUND_STATUS: u16 = 400;
+
 /// A `CostCategoryRule` assigning `value` to one linked account.
 fn rule(value: &str) -> Value {
     json!({
@@ -282,8 +288,9 @@ async fn a_definition_round_trips_through_create_describe_list_update_and_delete
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
-        "Describe on a deleted ARN must be 404 ResourceNotFoundException, got {status}: {body}"
+        (RESOURCE_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+        "Describe on a deleted ARN must be a {RESOURCE_NOT_FOUND_STATUS} \
+         ResourceNotFoundException, got {status}: {body}"
     );
     let listed = emulator.ok("ListCostCategoryDefinitions", &json!({})).await;
     assert_eq!(
@@ -670,8 +677,9 @@ async fn reads_are_answered_as_of_the_effective_date() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
-        "case {before:?} (before EffectiveStart): expected 404, got {status}: {body}"
+        (RESOURCE_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+        "case {before:?} (before EffectiveStart): expected {RESOURCE_NOT_FOUND_STATUS}, got \
+         {status}: {body}"
     );
     let listed = emulator
         .ok(
@@ -717,8 +725,9 @@ async fn reads_are_answered_as_of_the_effective_date() {
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
-        "case \"as of now, after the delete\": expected 404, got {status}: {body}"
+        (RESOURCE_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+        "case \"as of now, after the delete\": expected {RESOURCE_NOT_FOUND_STATUS}, got {status}: \
+         {body}"
     );
     let described = emulator
         .ok(
@@ -750,7 +759,8 @@ async fn reads_are_answered_as_of_the_effective_date() {
 }
 
 /// RULE: an operation naming a cost category the service does not hold as of now
-/// answers `ResourceNotFoundException` (404) — whether the ARN was never created or has
+/// answers `ResourceNotFoundException` at the status this service serves that shape at
+/// ([`RESOURCE_NOT_FOUND_STATUS`]) — whether the ARN was never created or has
 /// already been ended.
 #[tokio::test]
 async fn an_unheld_arn_is_a_resource_not_found_everywhere() {
@@ -790,9 +800,9 @@ async fn an_unheld_arn_is_a_resource_not_found_everywhere() {
             let (status, response) = emulator.call(operation, &body).await;
             assert_eq!(
                 (status, error_code(&response).as_str()),
-                (404, "ResourceNotFoundException"),
-                "case {label:?} on {operation}: expected 404 ResourceNotFoundException, got \
-                 {status}: {response}"
+                (RESOURCE_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+                "case {label:?} on {operation}: expected {RESOURCE_NOT_FOUND_STATUS} \
+                 ResourceNotFoundException, got {status}: {response}"
             );
             assert_eq!(
                 response["resourceName"].as_str().or(response["ResourceName"].as_str()),

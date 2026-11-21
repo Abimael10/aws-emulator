@@ -40,10 +40,15 @@ pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
 /// request that tries to write a system tag with.
 const SYSTEM_TAG_REFUSAL: &str = "System tags cannot be added/updated by requester";
 
-/// The sentence a tagging operation refuses an unresolvable `ResourceArn` with, from
-/// `ResourceNotFoundException`'s own documentation: "The specified ARN in the request
-/// doesn't exist."
-const ARN_DOES_NOT_EXIST: &str = "The specified ARN in the request doesn't exist.";
+/// The sentence a tagging operation refuses an unresolvable `ResourceArn` with.
+///
+/// Wholly FIXED text for this refusal class — it names neither the ARN, nor the resource
+/// type, nor the account — and the wording Amazon Web Services' Cost Explorer tagging
+/// surface answers an ARN it resolves to nothing with. It is deliberately NOT
+/// `ResourceNotFoundException`'s documentation sentence ("The specified ARN in the request
+/// doesn't exist."): a shape's doc string describes the error to a reader of the model, it
+/// is not the message the service puts on the wire.
+const RESOURCE_NOT_FOUND: &str = "Resource not found";
 
 /// The sentence a tag set larger than [`MAX_USER_TAGS`] is refused with. The limit is the
 /// rule's own published number, read off the constant rather than written out.
@@ -149,7 +154,7 @@ pub fn tags_without_keys(stored: &[ResourceTag], removed: &[String]) -> Vec<Reso
 /// reported there rather than interpolated into the sentence, which is fixed.
 pub fn unknown_tagged_resource(resource_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(ARN_DOES_NOT_EXIST.to_string()),
+        message: Some(RESOURCE_NOT_FOUND.to_string()),
         resource_name: Some(resource_arn.to_string()),
     }
 }

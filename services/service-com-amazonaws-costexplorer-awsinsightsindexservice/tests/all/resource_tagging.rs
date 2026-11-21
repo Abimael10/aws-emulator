@@ -584,9 +584,11 @@ async fn the_user_tag_maximum_per_resource_is_enforced() {
 }
 
 /// RULE: an ARN this account holds no resource under is refused with
-/// `ResourceNotFoundException` (HTTP 404) by both tagging operations, whether it names a
-/// resource type that cannot be tagged, a resource that was never created, or one that has
-/// been deleted.
+/// `ResourceNotFoundException` at the status this service serves that shape at (HTTP 400,
+/// not the 404 its `@httpError` declares) and the service's own fixed sentence, by every
+/// tagging operation — whether the ARN names a resource type that cannot be tagged, a
+/// resource that was never created, or one that has been deleted. The ARN itself is
+/// reported in the modelled `ResourceName` member, never spliced into `Message`.
 #[tokio::test]
 async fn an_arn_naming_no_resource_is_refused_by_both_tagging_operations() {
     let emulator = Emulator::start();
@@ -644,8 +646,8 @@ async fn an_arn_naming_no_resource_is_refused_by_both_tagging_operations() {
             };
             let (status, answered) = emulator.call(operation, &body).await;
             assert_eq!(
-                status, 404,
-                "case {case:?}: expected 404, got {status}: {answered}"
+                status, 400,
+                "case {case:?}: expected 400, got {status}: {answered}"
             );
             assert_eq!(
                 error_code(&answered),
@@ -654,13 +656,93 @@ async fn an_arn_naming_no_resource_is_refused_by_both_tagging_operations() {
             );
             assert_eq!(
                 error_message(&answered),
-                "The specified ARN in the request doesn't exist.",
+                "Resource not found",
                 "case {case:?}: got {answered}"
             );
             assert_eq!(
                 answered["ResourceName"].as_str(),
                 Some(arn.as_str()),
                 "case {case:?}: the refusal names the ARN the request carried, got {answered}"
+            );
+        }
+    }
+}
+
+/// RULE: the refusal a tagging operation answers an unresolvable `ResourceArn` with is the
+/// SAME answer whatever the ARN was: HTTP 400 — the status this service serves
+/// `ResourceNotFoundException` at, not the 404 the shape's `@httpError` declares —
+/// `ResourceNotFoundException`, and the service's own wholly fixed sentence, with nothing
+/// of the request interpolated into it. The ARN the caller sent is reported in the modelled
+/// `ResourceNotFoundException$ResourceName` member instead.
+///
+/// The table spans what a well-formed ARN can differ along — account, partition, service
+/// namespace, region, resource type, and the length of the whole ARN up to the published
+/// bound (`smithy_query(query="operation", operation="ListTagsForResource")`: `ResourceArn`
+/// targets `Arn`, `@length` 20..2048, pattern
+/// `^arn:aws[-a-z0-9]*:[a-z0-9]+:[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$`) — so an answer
+/// that varied with any of them would show up as a row that differs from the rest.
+#[tokio::test]
+async fn an_unresolvable_arn_is_refused_with_one_fixed_answer_whatever_the_arn_was() {
+    let emulator = Emulator::start();
+    let account = engine::emulator_account_id();
+
+    // The longest ARN the member admits: the published upper bound of `Arn`'s `@length`,
+    // padded in the resource id so the value still matches the modelled pattern.
+    let long_prefix = format!("arn:aws:ce::{account}:anomalymonitor/");
+    let long_arn = format!("{long_prefix}{}", "a".repeat(2048 - long_prefix.len()));
+
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "the shortest resource id the pattern admits",
+            format!("arn:aws:ce::{account}:a"),
+        ),
+        ("an ARN of the published maximum length", long_arn),
+        (
+            "an ARN in another partition",
+            format!("arn:aws-us-gov:ce::{account}:anomalymonitor/gov-monitor"),
+        ),
+        (
+            "an ARN carrying a region",
+            format!("arn:aws:ce:eu-west-1:{account}:anomalysubscription/regional"),
+        ),
+        (
+            "an ARN of another account",
+            "arn:aws:ce::999999999999:costcategory/other-account".to_string(),
+        ),
+        (
+            "an ARN of another service",
+            format!("arn:aws:sns:us-east-1:{account}:cost-anomaly-alerts"),
+        ),
+        (
+            "an ARN whose resource id reads like an id the service mints",
+            format!("arn:aws:ce::{account}:anomalymonitor/00000000-0000-8000-8000-000000000000"),
+        ),
+    ];
+
+    for (label, arn) in &cases {
+        for operation in ["TagResource", "UntagResource", "ListTagsForResource"] {
+            let case = format!("{label}, {operation}");
+            let body = match operation {
+                "TagResource" => {
+                    json!({"ResourceArn": arn, "ResourceTags": tag_list(&[("env", "test")])})
+                }
+                "UntagResource" => json!({"ResourceArn": arn, "ResourceTagKeys": ["env"]}),
+                _ => json!({"ResourceArn": arn}),
+            };
+            let (status, answered) = emulator.call(operation, &body).await;
+            let message = error_message(&answered);
+            assert_eq!(
+                (status, error_code(&answered).as_str(), message.as_str()),
+                (400, "ResourceNotFoundException", "Resource not found"),
+                "case {case:?}: expected one 400 ResourceNotFoundException with the service's \
+                 fixed sentence, got {status}: {answered}"
+            );
+            // The one sentence every row above answers with is what proves it is fixed
+            // text: the ARN it would otherwise carry is reported here instead.
+            assert_eq!(
+                answered["ResourceName"].as_str(),
+                Some(arn.as_str()),
+                "case {case:?}: the ARN belongs in ResourceName, got {answered}"
             );
         }
     }
