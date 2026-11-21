@@ -19,7 +19,9 @@
 //! listing and resolution rules against the service's own catalog constant; this suite
 //! pins the published VALUES independently of that constant, so a re-worded description or
 //! a re-minted id segment fails here even though both copies would still agree with each
-//! other.
+//! other. One catalog stands behind both index keys a reader uses, so the listing is
+//! checked indexed by `name` and indexed by `arn`, and an ARN taken off the listing is
+//! read back through `GetBaseline`.
 //!
 //! The table below is AWS's published baseline catalog: the entries `ListBaselines`
 //! returns in every account, including the ones no issue cites (`BackupAdminBaseline`,
@@ -306,17 +308,34 @@ async fn walked_descriptions(
     region: &str,
     max_results: Option<i64>,
 ) -> BTreeMap<String, String> {
-    let (listed, _) = crate::list_baselines::walk(router, case, region, max_results).await;
-    let mut collected: BTreeMap<String, String> = BTreeMap::new();
-    for entry in listed {
-        let previous = collected.insert(entry.name.clone(), entry.description);
-        assert!(
-            previous.is_none(),
-            "case {case:?}: {:?} must be listed once, got it twice",
-            entry.name
-        );
-    }
-    collected
+    let rows = walked_rows(router, case, region, max_results).await;
+    indexed_by(IndexKey::Name, case, &rows)
+        .into_iter()
+        .map(|(name, row)| (name, row.description))
+        .collect()
+}
+
+/// The whole listing walked with `max_results`, as the [`Reported`] rows a client reads off
+/// the responses.
+///
+/// The walk itself is the sibling listing suite's ([`crate::list_baselines::walk`]), so
+/// there is one token loop in this crate's tests rather than a second copy of it here.
+async fn walked_rows(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    max_results: Option<i64>,
+) -> Vec<Reported> {
+    crate::list_baselines::walk(router, case, region, max_results)
+        .await
+        .0
+        .into_iter()
+        .map(|entry| Reported {
+            arn: entry.arn,
+            name: entry.name,
+            description: entry.description,
+        })
+        .collect()
 }
 
 /// AWS's published text, as a map from name to description.
@@ -440,6 +459,128 @@ async fn a_published_description_carries_no_request_or_state_derived_part() {
         PUBLISHED_CATALOG.len(),
         "every published baseline must have been read at least once, got {first_seen:?}"
     );
+}
+
+/// Which required member of a listed entry a reader builds its index on. Both `arn` and
+/// `name` are required members of `BaselineSummary`, so a client may key the response on
+/// either — and a catalog that is one table answers both keys with the same entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexKey {
+    Arn,
+    Name,
+}
+
+impl IndexKey {
+    /// The member this index is built on, as the response spells it.
+    fn member(self) -> &'static str {
+        match self {
+            IndexKey::Arn => "arn",
+            IndexKey::Name => "name",
+        }
+    }
+
+    /// The key this index reads off a reported entry.
+    fn of(self, entry: &Reported) -> String {
+        match self {
+            IndexKey::Arn => entry.arn.clone(),
+            IndexKey::Name => entry.name.clone(),
+        }
+    }
+}
+
+/// AWS's published catalog as a reader indexing it by `key` sees it in `region`: the whole
+/// published row under each key, so a mis-paired or re-worded entry is named in full when a
+/// case fails.
+fn published_by(key: IndexKey, region: &str) -> BTreeMap<String, Reported> {
+    PUBLISHED_CATALOG
+        .iter()
+        .map(|entry| {
+            let row = Reported {
+                arn: published_arn(region, entry),
+                name: entry.name.to_string(),
+                description: entry.description.to_string(),
+            };
+            (key.of(&row), row)
+        })
+        .collect()
+}
+
+/// `rows` indexed by `key`, refusing a key the listing reported twice — an index a client
+/// builds is only a reading of the catalog if each key leads to one entry.
+fn indexed_by(key: IndexKey, case: &str, rows: &[Reported]) -> BTreeMap<String, Reported> {
+    let mut indexed: BTreeMap<String, Reported> = BTreeMap::new();
+    for row in rows {
+        assert!(
+            indexed.insert(key.of(row), row.clone()).is_none(),
+            "case {case:?}: {:?} must be listed once, got it twice",
+            key.of(row)
+        );
+    }
+    indexed
+}
+
+/// The page cut each region below is walked with: `maxResults` omitted, each published bound
+/// of `ListBaselinesMaxResults` (`@range(min: 4, max: 100)`) and a size between them that
+/// divides the catalog unevenly — a page boundary must move no entry between the keys.
+const INDEX_KEY_PAGE_CUTS: &[Option<i64>] = &[None, Some(4), Some(7), Some(100)];
+
+/// RULE (one catalog behind both index keys): a reader indexes the listing by `name` or by
+/// `arn` — both required members — and either key leads to the SAME published entry, so the
+/// description reached through an ARN is AWS's sentence for the baseline AWS pairs with that
+/// id, not another baseline's and not a re-wording of it; and the ARN so read resolves
+/// through `GetBaseline` to that same entry.
+///
+/// Each region is walked with a different page cut, so the cases span both dimensions the
+/// projection could have varied along without walking the listing once per pair.
+#[tokio::test]
+async fn both_index_keys_of_the_listing_report_the_published_entry() {
+    let router = emulator();
+    assert_eq!(
+        REQUEST_REGIONS.len(),
+        INDEX_KEY_PAGE_CUTS.len(),
+        "every region must be walked with a page cut of its own, got {} regions and {} cuts",
+        REQUEST_REGIONS.len(),
+        INDEX_KEY_PAGE_CUTS.len()
+    );
+
+    for (index, (region, max_results)) in REQUEST_REGIONS
+        .iter()
+        .zip(INDEX_KEY_PAGE_CUTS)
+        .enumerate()
+    {
+        let case = match max_results {
+            Some(max) => format!("the listing in {region} walked with maxResults {max}"),
+            None => format!("the listing in {region} with maxResults omitted"),
+        };
+        let rows = walked_rows(&router, &case, region, *max_results).await;
+
+        for key in [IndexKey::Arn, IndexKey::Name] {
+            let case = format!("{case}, indexed by {}", key.member());
+            assert_eq!(
+                indexed_by(key, &case, &rows),
+                published_by(key, region),
+                "case {case:?}: expected AWS's published entry under every key, got {rows:?}"
+            );
+        }
+
+        // The ARN-keyed path a client walks next: one entry per case, asked for by the ARN
+        // as the response reported it rather than one this suite built, must resolve to the
+        // very entry the listing showed beside it.
+        let row = &rows[index % rows.len()];
+        let case = format!("{} read back through its listed ARN in {region}", row.name);
+        let read = get_baseline(&router, region, &row.arn).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected 200 for {:?}, got {} body {:?}",
+            row.arn, read.status, read.body
+        );
+        assert_eq!(
+            &reported(&read, &read.body),
+            row,
+            "case {case:?}: expected the entry the listing reported, got {:?}",
+            read.body
+        );
+    }
 }
 
 /// RULE (a read changes nothing): reading the catalog — listing it whole, walking it in
