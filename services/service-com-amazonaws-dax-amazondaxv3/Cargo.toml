@@ -36,6 +36,9 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` file, so a new suite is picked up
+# by adding the file and nothing else.
+automod = { workspace = true }
 # The EC2 service, mounted beside this one in the test harness: that a subnet
 # group can be built from the subnets the account HAS can only be driven end to
 # end with the owner of subnets on the same engine. DEV-ONLY: this crate depends

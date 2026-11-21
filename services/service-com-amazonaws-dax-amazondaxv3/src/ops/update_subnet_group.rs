@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies ONLY the members the request carries to the stored subnet group, leaving every
+//! other value of it exactly as it was, and answers the `SubnetGroup` built from what is
+//! now stored. A request naming a group this service does not hold is refused with
+//! `SubnetGroupNotFoundFault` and changes nothing.
+//!
+//! A `SubnetIds` the request carries REPLACES the group's membership, resolved the way
+//! `CreateSubnetGroup` resolves one: every identifier against the subnets the ACCOUNT has,
+//! as the service that owns them reports them (`crate::state::ec2_subnets`), so the VPC and
+//! each subnet's Availability Zone the group reports after the change come from those
+//! records. An identifier Amazon EC2 holds no subnet for is refused with 400
+//! `InvalidParameterValueException`, a list that is empty or longer than the store holds
+//! for one group with `InvalidSubnet`/`SubnetQuotaExceededFault`, and subnets spanning two
+//! VPCs with `InvalidSubnet` — in each case the stored group is left untouched. One subnet
+//! may be named by more than one group, so nothing here refuses a subnet another group
+//! already names.
 //!
 //! ## Shape of an operation
 //!
@@ -91,9 +98,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dax-amazondaxv3.json");
 // here — hence the `UpdateSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.dax#UpdateSubnetGroup")]
+//
+// `InvalidParameterValueException` is widened in through `extra_errors`: the SERVICE
+// models it ("The value for a parameter is invalid", HTTP 400) and it is the error AWS
+// answers a `SubnetIds` naming a subnet that does not exist with, but the model's
+// `errors` list for this operation omits it.
+#[smithy_macros::operation_error(
+    "com.amazonaws.dax#UpdateSubnetGroup",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum UpdateSubnetGroupErrorModeled {
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidSubnet(InvalidSubnet),
     ServiceLinkedRoleNotFoundFault(ServiceLinkedRoleNotFoundFault),
     SubnetGroupNotFoundFault(SubnetGroupNotFoundFault),
@@ -153,18 +169,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSubnetGroup"))
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // `CreateSubnetGroup$SubnetGroupName` documents that the name "is stored as a
+        // lowercase string", so that form is the group's identity on every path.
+        let name = input.subnet_group_name.to_lowercase();
+
+        // The group must exist before anything about the request is applied, and it is
+        // looked up again below: the subnets a replacement names are resolved against
+        // ANOTHER service, which cannot be asked while the store is locked.
+        if !state.lock().subnet_groups.contains_key(&name) {
+            return Err(UpdateSubnetGroupErrorModeled::SubnetGroupNotFoundFault(
+                crate::state::subnet_group_not_found_named(&name),
+            )
+            .into());
+        }
+
+        // A `SubnetIds` the request carries REPLACES the membership, so it is held to
+        // every rule a create's list is held to; a request carrying none leaves the
+        // stored subnets, the VPC and the Region they were resolved in untouched.
+        let replacement = match input.subnet_ids {
+            None => None,
+            Some(subnet_ids) => {
+                // A group must name at least one subnet: the model's list is satisfied by
+                // an empty one, which no VPC subnet group can be built from.
+                if subnet_ids.is_empty() {
+                    return Err(UpdateSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                        message: Some("SubnetIds must name at least one subnet".to_string()),
+                    })
+                    .into());
+                }
+                // A group may not name more subnets than the store will hold for it.
+                if subnet_ids.len() > crate::state::MAX_SUBNETS_PER_GROUP {
+                    return Err(UpdateSubnetGroupErrorModeled::SubnetQuotaExceededFault(
+                        SubnetQuotaExceededFault {
+                            message: Some(format!(
+                                "SubnetIds names {} subnets, more than the {} allowed in a \
+                                 subnet group",
+                                subnet_ids.len(),
+                                crate::state::MAX_SUBNETS_PER_GROUP
+                            )),
+                        },
+                    )
+                    .into());
+                }
+
+                // Every identifier must name a subnet the ACCOUNT has in the Region this
+                // request was signed for, which only the service that owns subnets can
+                // answer. An identifier it reports no subnet for cannot be placed in a VPC
+                // or a zone, so the request is refused and the group is left as it was.
+                let requested: Vec<&str> = subnet_ids.iter().map(String::as_str).collect();
+                let resolved = match crate::state::ec2_subnets::resolve_requested_subnets(
+                    ctx, &region, &requested,
+                )
+                .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(unresolved) => {
+                        return Err(
+                            UpdateSubnetGroupErrorModeled::InvalidParameterValueException(
+                                crate::state::invalid_subnets(&unresolved),
+                            )
+                            .into(),
+                        );
+                    }
+                };
+
+                // "All of the subnets that you specify in a subnet group must exist in the
+                // same VPC" (`CreateCluster$SubnetGroupName`): the group reports ONE
+                // `VpcId`, so a list spanning two VPCs names no VPC it could be placed in.
+                let Some(vpc_id) = crate::state::ec2_subnets::common_vpc(&resolved) else {
+                    return Err(UpdateSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                        message: Some(
+                            "All of the subnets that you specify in a subnet group must exist \
+                             in the same VPC."
+                                .to_string(),
+                        ),
+                    })
+                    .into());
+                };
+                Some((vpc_id.to_string(), resolved))
+            }
+        };
+
+        let mut store = state.lock();
+        // Looked up again: the group could have been removed while the subnets were being
+        // resolved, and a modification of a group that is no longer stored is the same
+        // refusal as one that never existed.
+        let Some(group) = store.subnet_groups.get_mut(&name) else {
+            return Err(UpdateSubnetGroupErrorModeled::SubnetGroupNotFoundFault(
+                crate::state::subnet_group_not_found_named(&name),
+            )
+            .into());
+        };
+
+        // ONLY the supplied members are applied; every other stored value is kept.
+        if input.description.is_some() {
+            group.description = input.description;
+        }
+        if let Some((vpc_id, subnets)) = replacement {
+            group.vpc_id = vpc_id;
+            group.subnets = subnets;
+            group.region = region;
+        }
+        let view = group.view();
+        store.record_event(
+            &name,
+            crate::state::SOURCE_TYPE_SUBNET_GROUP,
+            crate::state::EVENT_SUBNET_GROUP_MODIFIED,
+            now,
+        );
+
+        Ok(UpdateSubnetGroupOutput {
+            subnet_group: Some(view),
+        })
     }
 }

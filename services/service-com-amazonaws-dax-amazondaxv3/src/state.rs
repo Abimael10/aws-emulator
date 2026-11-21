@@ -207,6 +207,8 @@ pub const EVENT_CLUSTER_DELETING: &str = "Deleting cluster.";
 pub const EVENT_CLUSTER_DELETED: &str = "Cluster deleted.";
 /// The event a `CreateSubnetGroup` records against the group it minted.
 pub const EVENT_SUBNET_GROUP_CREATED: &str = "Subnet group created.";
+/// The event an `UpdateSubnetGroup` records against the group it changed.
+pub const EVENT_SUBNET_GROUP_MODIFIED: &str = "Subnet group modified.";
 /// The event a `CreateParameterGroup` records against the group it minted.
 pub const EVENT_PARAMETER_GROUP_CREATED: &str = "Parameter group created.";
 /// The event an `UpdateParameterGroup` records against the group whose parameters it
@@ -1191,8 +1193,9 @@ pub fn subnet_group_not_found() -> SubnetGroupNotFoundFault {
     }
 }
 
-/// `SubnetGroupNotFoundFault` for one element of a requested LIST of subnet group names:
-/// the template NAMES that element, so a caller that asked for several groups can tell
+/// `SubnetGroupNotFoundFault` for a request that NAMES the group it means — one element of
+/// a requested LIST of subnet group names, or the one group a modification addresses:
+/// the template NAMES that group, so a caller that asked for several groups can tell
 /// which of them is missing. `name` is the identifier as this service holds it —
 /// `CreateSubnetGroup$SubnetGroupName` documents that it "is stored as a lowercase
 /// string", so the lower-cased form is the group's identity rather than a rewrite of the
