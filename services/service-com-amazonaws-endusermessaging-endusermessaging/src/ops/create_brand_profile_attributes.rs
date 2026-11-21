@@ -258,36 +258,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             let carries_media = crate::state::carries_media(&requested.attribute_type);
-            // Which member carries an attribute's content follows from its type:
-            // `attributeValue` "applies to attributes of type TEXT. For attributes of
-            // type IMAGE or DOCUMENT, provide the media through the attachment body
-            // instead" — so an entry offering the other type's member asks for
-            // something the attribute cannot hold.
-            if carries_media && requested.attribute_value.is_some() {
-                return Err(member_not_applicable(
-                    index,
-                    "attributeValue",
-                    &requested.attribute_type,
-                    "attachmentBody",
-                ));
+            // An attribute holds ONE content, so the text member and the media member are
+            // alternatives: an entry carrying both asks for two at once, whatever its type.
+            if requested.attribute_value.is_some() && requested.attachment_body.is_some() {
+                return Err(
+                    CreateBrandProfileAttributesErrorModeled::ValidationException(
+                        crate::state::attribute_content_members_are_exclusive(
+                            &format!("/attributes/{index}/attributeValue"),
+                            &requested.attribute_name,
+                        ),
+                    )
+                    .into(),
+                );
             }
-            if !carries_media && requested.attachment_body.is_some() {
-                return Err(member_not_applicable(
-                    index,
-                    "attachmentBody",
-                    &requested.attribute_type,
-                    "attributeValue",
-                ));
+            // Which member carries an attribute's content follows from its type. An
+            // `IMAGE` or `DOCUMENT` attribute holds media, so its text member carries the
+            // LOCATION that media is taken from — an `s3://<bucket>/<key>` object — and a
+            // text value that is no such location asks the attribute to hold text it
+            // cannot hold. A `TEXT` attribute holds no media at all, so an entry offering
+            // one media bytes asks for something that attribute cannot hold either.
+            if carries_media {
+                if let Some(value) = requested.attribute_value.as_deref() {
+                    if crate::state::media_location_key(value).is_none() {
+                        return Err(
+                            CreateBrandProfileAttributesErrorModeled::ValidationException(
+                                crate::state::attribute_value_not_a_media_location(
+                                    &format!("/attributes/{index}/attributeValue"),
+                                    &requested.attribute_type,
+                                    &requested.attribute_name,
+                                ),
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            } else if requested.attachment_body.is_some() {
+                return Err(member_not_applicable(index, "attachmentBody", requested));
             }
-            // `attributeName` "is unique within a brand profile", so a name the
-            // profile already holds — and a name this one request asks for twice —
-            // conflicts with the state the profile would have to be in for both
-            // attributes to exist under it.
-            if profile.attributes.contains_key(&requested.attribute_name)
-                || pending
-                    .iter()
-                    .any(|held| held.name == requested.attribute_name)
+            // `attributeName` "is unique within a brand profile", so a request that lists
+            // one name twice asks for a state no profile can be in: that is a fault of the
+            // request itself, refused as a validation failure against the repeated entry,
+            // whatever the profile happens to hold.
+            if pending
+                .iter()
+                .any(|held| held.name == requested.attribute_name)
             {
+                return Err(
+                    CreateBrandProfileAttributesErrorModeled::ValidationException(
+                        crate::state::duplicate_attribute_name(
+                            &format!("/attributes/{index}/attributeName"),
+                            &requested.attribute_name,
+                        ),
+                    )
+                    .into(),
+                );
+            }
+            // A name the profile ALREADY holds is the other half: the request is
+            // well-formed and the state it met is what refuses it, so it conflicts with
+            // the state the profile would have to be in for both attributes to exist
+            // under it.
+            if profile.attributes.contains_key(&requested.attribute_name) {
                 return Err(CreateBrandProfileAttributesErrorModeled::ConflictException(
                     crate::state::brand_profile_attribute_exists_conflict(
                         &requested.attribute_name,
@@ -299,6 +329,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .attachment_body
                 .clone()
                 .map(crate::state::BrandProfileAttributeMedia::new);
+            // The media this API serves back is served under the file type its own content
+            // announces, so an attribute holds only the types it serves: content of any
+            // other type is refused against the member that carried it rather than stored.
+            if media.as_ref().is_some_and(|media| {
+                !crate::state::is_supported_media_file_type(&media.content_type)
+            }) {
+                return Err(
+                    CreateBrandProfileAttributesErrorModeled::ValidationException(
+                        crate::state::unsupported_media_file_type(
+                            &format!("/attributes/{index}/attachmentBody"),
+                            &requested.attribute_name,
+                        ),
+                    )
+                    .into(),
+                );
+            }
             pending_media_bytes += media.as_ref().map_or(0, |media| media.bytes.len());
             pending.push(crate::state::BrandProfileAttribute {
                 name: requested.attribute_name.clone(),
@@ -401,37 +447,27 @@ fn output_for(
 }
 
 /// `ValidationException` for an entry of `attributes` that carries content its own
-/// `attributeType` does not take: `index` is that entry's 0-based position in the list,
-/// `member` the member at fault and `instead` the one that type takes.
+/// `attributeType` does not take: `index` is that entry's 0-based position in the list and
+/// `member` the member at fault.
 ///
-/// The member is reported at its path WITHIN the request — the element and then the
-/// member — so a caller sending ten attributes is told which of them to change: a list
-/// element contributes a ONE-based `<index>.member` segment, as the validating
-/// framework's own constraint reports spell it.
-///
-/// This is a requirement the MODEL does not declare, stated by the handler, so it keeps
-/// the framework's clause form rather than the envelope
-/// [`crate::service`]'s boundary renderer states a modelled constraint in — which is the
-/// form this API's recordings show for a modelled constraint alone. Nothing recorded
-/// shows this API's words for this rule.
+/// The member is reported at its JSONPointer WITHIN the request — the entry's position and
+/// then the member — and the sentence names the entry's own `attributeName`, so a caller
+/// sending ten attributes is told which of them to change both ways. The sentence itself is
+/// the one this API states wherever a member is offered for a type that does not take it
+/// ([`crate::state::member_not_for_named_attribute_type`]), so the create and the update
+/// cannot word one rule two ways.
 fn member_not_applicable(
     index: usize,
     member: &str,
-    attribute_type: &str,
-    instead: &str,
+    requested: &BrandProfileAttributeInput,
 ) -> CreateBrandProfileAttributesError {
-    let path = format!("attributes.{}.member.{member}", index + 1);
-    let requirement =
-        format!("Member must not be specified for an attribute of type {attribute_type}; supply {instead} instead");
-    CreateBrandProfileAttributesErrorModeled::ValidationException(ValidationException {
-        message: format!(
-            "1 validation error detected: Value at '{path}' failed to satisfy constraint: \
-             {requirement}"
+    CreateBrandProfileAttributesErrorModeled::ValidationException(
+        crate::state::member_not_for_named_attribute_type(
+            &format!("/attributes/{index}/{member}"),
+            member,
+            &requested.attribute_type,
+            &requested.attribute_name,
         ),
-        field_list: Some(vec![ValidationExceptionField {
-            path,
-            message: requirement,
-        }]),
-    })
+    )
     .into()
 }

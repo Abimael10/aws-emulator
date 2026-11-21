@@ -207,7 +207,10 @@ fn envelope(clauses: &[String]) -> String {
 /// A `@length` violation states the LENGTH of that value in front of the member
 /// (`Value with length <n> at '<pointer>' …`), which is the number the check counted and
 /// the only part of the value the clause carries; every other class names the member and
-/// the requirement alone.
+/// the requirement alone. That number is read by
+/// [`service_common::validation_message::stated_length`], which owns the one reading of the
+/// walk's own renderings for every service, and is `None` where nothing at hand measures the
+/// value — a clause then names the member and the requirement alone.
 ///
 /// `None` for a constraint class this service has no wording for — [`ViolationKind`] is
 /// `#[non_exhaustive]`, so a class added upstream keeps the framework's own wording
@@ -219,7 +222,7 @@ fn clause_for(
 ) -> Option<String> {
     let declared = input_schema.and_then(|schema| member_traits(schema, &violation.path));
     let requirement = requirement_for(violation, declared)?;
-    let subject = match stated_length(violation, echo) {
+    let subject = match ::service_common::validation_message::stated_length(violation, echo) {
         Some(length) => format!("Value with length {length} "),
         None => "Value ".to_string(),
     };
@@ -227,51 +230,6 @@ fn clause_for(
         "{subject}at '{}' failed to satisfy constraint: {requirement}",
         pointer(&violation.path)
     ))
-}
-
-/// The length the violated `@length` check COUNTED, as the clause states it, or `None` for
-/// every other constraint class and for a value this layer cannot measure.
-///
-/// `@length` counts a string's characters, a collection's elements and a blob's bytes, so
-/// the number comes from the value itself rather than from the violation, which carries
-/// only the bound that was broken:
-///
-/// * a COLLECTION is length-checked on the member, before the walk descends into its
-///   elements, and the walk's own rendering of it states the size it counted — a list as
-///   `<n> items`, a map as `<n> entries` — which
-///   [`service_common::validation_message`] reads for every service;
-/// * a STRING is measured on the value the caller submitted, which the collecting walk
-///   re-read from the request ([`SubmittedEcho::Rendered`]).
-///
-/// `None` where neither is at hand — a value past the bounds that walk states, or a seam
-/// holding no request — and the clause then names the member and the requirement alone,
-/// rather than a length nothing measured.
-fn stated_length(violation: &Violation, echo: &SubmittedEcho) -> Option<usize> {
-    if !matches!(
-        violation.kind,
-        ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
-    ) {
-        return None;
-    }
-    if let Some(stored) = violation.value.as_deref() {
-        let size = ::service_common::validation_message::list_item_count(stored)
-            .or_else(|| ::service_common::validation_message::map_entry_count(stored));
-        if size.is_some() {
-            return size;
-        }
-    }
-    match echo {
-        SubmittedEcho::Rendered(value) => Some(value.chars().count()),
-        // The walk stored its own rendering of the value, which is the value itself up to
-        // a ceiling of its own: measurable only while it IS the value, never once it has
-        // been elided into a prefix plus the marker naming the whole value's byte count
-        // ([`service_common::validation::named_byte_count`] reads that marker).
-        _ => violation
-            .value
-            .as_deref()
-            .filter(|stored| ::service_common::validation::named_byte_count(stored).is_none())
-            .map(|stored| stored.chars().count()),
-    }
 }
 
 /// The requirement `violation` failed, as this service words it — the half of a clause

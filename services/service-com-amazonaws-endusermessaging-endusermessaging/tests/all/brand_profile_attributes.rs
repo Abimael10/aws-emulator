@@ -440,7 +440,7 @@ fn batches() -> Vec<(&'static str, Vec<Attribute>)> {
                 .map(|(index, name)| match index % 3 {
                     0 => Attribute::text(name, Some("inline")),
                     1 => Attribute::media(name, "IMAGE", Some(JPEG)),
-                    _ => Attribute::media(name, "DOCUMENT", Some(UNKNOWN_MEDIA)),
+                    _ => Attribute::media(name, "DOCUMENT", Some(PDF)),
                 })
                 .collect(),
         ),
@@ -583,29 +583,22 @@ async fn media_is_served_from_the_url_the_service_reports() {
     let em = Emulator::new();
 
     // The rows differ in the format the bytes announce, in their size, and in the
-    // attribute type carrying them: one byte is `AttachmentBody`'s modelled minimum.
+    // attribute type carrying them — over the file types an attribute's media may be, since
+    // any other is refused (`an_unsupported_media_file_type_is_refused`). A payload of many
+    // kilobytes opens with a format's signature and carries filler behind it, so what the
+    // size varies is the body and not its type.
     let payloads: Vec<(&str, &'static str, Vec<u8>, &'static str)> = vec![
         ("a PNG image", "IMAGE", PNG.to_vec(), "image/png"),
         ("a JPEG image", "IMAGE", JPEG.to_vec(), "image/jpeg"),
-        ("a GIF image", "IMAGE", GIF.to_vec(), "image/gif"),
         ("a PDF document", "DOCUMENT", PDF.to_vec(), "application/pdf"),
         (
-            "bytes of no published format",
+            "a PDF of many kilobytes",
             "DOCUMENT",
-            UNKNOWN_MEDIA.to_vec(),
-            GENERIC_MEDIA_TYPE,
-        ),
-        (
-            "the smallest body the model admits",
-            "IMAGE",
-            vec![0x42],
-            GENERIC_MEDIA_TYPE,
-        ),
-        (
-            "a body of many kilobytes",
-            "DOCUMENT",
-            (0..64 * 1024).map(|index| (index % 251) as u8).collect(),
-            GENERIC_MEDIA_TYPE,
+            PDF.iter()
+                .copied()
+                .chain((0..64 * 1024).map(|index| (index % 251) as u8))
+                .collect(),
+            "application/pdf",
         ),
     ];
 
@@ -668,6 +661,115 @@ async fn media_is_served_from_the_url_the_service_reports() {
 }
 
 #[tokio::test]
+async fn an_unsupported_media_file_type_is_refused() {
+    // An attribute's media is content this API serves back under its own file type, so it
+    // holds only the types it serves: content of any other type is refused, named by the
+    // attribute it was offered for, and nothing is created.
+    let em = Emulator::new();
+    let profile = em.profile("Media type owner").await;
+
+    // The rows span what the rule generalises over: a published format outside the set, a
+    // body announcing no format at all, the smallest body the model admits, and the
+    // attribute types that hold media.
+    let payloads: Vec<(&str, &str, Vec<u8>)> = vec![
+        ("a GIF image", "IMAGE", GIF.to_vec()),
+        ("bytes of no published format", "DOCUMENT", UNKNOWN_MEDIA.to_vec()),
+        ("the smallest body the model admits", "IMAGE", vec![0x42]),
+        (
+            "kilobytes announcing no format",
+            "DOCUMENT",
+            (0..64 * 1024).map(|index| (index % 251) as u8).collect(),
+        ),
+    ];
+
+    for (case, attribute_type, bytes) in payloads {
+        let before = em.listed_names(&profile).await;
+        let refused = em
+            .create_attributes(
+                &profile,
+                json!({ "attributes": [{
+                    "attributeName": "Asset",
+                    "attributeType": attribute_type,
+                    "attachmentBody": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                }] }),
+            )
+            .await;
+        assert_eq!(
+            (refused.status, refused.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case}: expected 400 ValidationException, got {} / {:?}",
+            refused.status,
+            refused.body
+        );
+        let stated = "Unsupported file type for attribute 'Asset'. Allowed: PDF, JPEG, PNG";
+        assert_eq!(
+            refused.string("message"),
+            stated,
+            "case {case}: unexpected refusal message"
+        );
+        assert_eq!(
+            refused.body["fieldList"],
+            json!([{ "path": "/attributes/0/attachmentBody", "message": stated }]),
+            "case {case}: the refusal must name the member at fault, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            em.listed_names(&profile).await,
+            before,
+            "case {case}: a refused batch must create nothing"
+        );
+    }
+
+    // The same rule on the update: a replacement of an unsupported type is refused and the
+    // media the attribute held stands.
+    let created = em
+        .create_attributes(
+            &profile,
+            batch(&[Attribute::media("Logo", "IMAGE", Some(PNG))]),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the create must succeed, got {} / {:?}",
+        created.status, created.body
+    );
+    let refused = em
+        .update_attribute(
+            &profile,
+            "Logo",
+            json!({ "attachmentBody": base64::engine::general_purpose::STANDARD.encode(GIF) }),
+        )
+        .await;
+    let stated = "Unsupported file type for attribute 'Logo'. Allowed: PDF, JPEG, PNG";
+    assert_eq!(
+        (refused.status, refused.error.as_deref()),
+        (400, Some("ValidationException")),
+        "an update of an unsupported type must be refused, got {} / {:?}",
+        refused.status,
+        refused.body
+    );
+    assert_eq!(
+        refused.string("message"),
+        stated,
+        "unexpected refusal message, got {:?}",
+        refused.body
+    );
+    assert_eq!(
+        refused.body["fieldList"],
+        json!([{ "path": "/attachmentBody", "message": stated }]),
+        "the refusal must name the member at fault, got {:?}",
+        refused.body
+    );
+    assert_eq!(
+        em.get_attribute(&profile, "Logo")
+            .await
+            .member("mediaContentType"),
+        &json!("image/png"),
+        "a refused update must leave the stored media alone"
+    );
+}
+
+#[tokio::test]
 async fn a_media_address_with_nothing_behind_it_serves_nothing() {
     let em = Emulator::new();
     let profile = em.profile("Media owner").await;
@@ -711,9 +813,11 @@ async fn a_name_that_is_already_taken_is_refused_as_a_conflict() {
     let em = Emulator::new();
 
     // The rows span where the duplicate comes from: a name an earlier create stored, a
-    // name the seeded default template holds, and a name one request asks for twice —
-    // with the duplicate first and last in the batch, so the atomicity below is tested
-    // on a batch whose earlier entries are all acceptable.
+    // name the seeded default template holds, and a stored name reached from the LAST entry
+    // of a batch whose earlier entries are all acceptable, so the atomicity below is tested
+    // on a batch that got past them. A name ONE REQUEST asks for twice is a fault of that
+    // request rather than of the state it met, and is refused as such
+    // ([`a_batch_that_asks_for_one_name_twice_is_refused_as_a_malformed_request`]).
     let profile = em.profile("Conflict owner").await;
     let seeded = em
         .listed_names(&profile)
@@ -734,13 +838,6 @@ async fn a_name_that_is_already_taken_is_refused_as_a_conflict() {
         (
             "a name of the seeded default template".to_string(),
             json!({ "attributes": [{ "attributeName": seeded, "attributeType": "TEXT" }] }),
-        ),
-        (
-            "a name the request asks for twice".to_string(),
-            batch(&[
-                Attribute::text("Twice", Some("a")),
-                Attribute::text("Twice", Some("b")),
-            ]),
         ),
         (
             "a batch whose LAST entry duplicates a stored name".to_string(),
@@ -784,48 +881,62 @@ async fn a_name_that_is_already_taken_is_refused_as_a_conflict() {
 }
 
 #[tokio::test]
-async fn content_the_attribute_type_does_not_take_is_refused() {
+async fn a_batch_that_asks_for_one_name_twice_is_refused_as_a_malformed_request() {
+    // A name repeated inside ONE request asks for a state no profile can be in — an
+    // attribute name "is unique within a brand profile" — so the request itself is at
+    // fault: 400 `ValidationException` naming the repeated name, with the entry that
+    // repeated it in `fieldList`, and nothing created.
     let em = Emulator::new();
-    let profile = em.profile("Validation owner").await;
+    let profile = em.profile("Duplicate owner").await;
 
-    // `attributeValue` applies to TEXT, and media to IMAGE and DOCUMENT; each type admits
-    // exactly one of the two members, in a batch of one and in a batch whose later entry
-    // is the one at fault. Each row states the path the refusal must name: the member at
-    // fault under the ONE-based position of its entry, which is how a list element's path
-    // is spelled, so the index base and the member named are both pinned.
+    // The rows span what the rule generalises over: how many entries the batch carries,
+    // where the repeat sits in it, how many times the name appears, the attribute types
+    // involved, and the name itself — so the sentence's variable part is read from the
+    // request rather than fixed.
     let cases: Vec<(&str, Value, &str, &str)> = vec![
         (
-            "media on a TEXT attribute",
-            json!({ "attributes": [{
-                "attributeName": "Inline",
-                "attributeType": "TEXT",
-                "attachmentBody": base64::engine::general_purpose::STANDARD.encode(PNG),
-            }] }),
-            "attributes.1.member.attachmentBody",
-            "TEXT",
+            "a batch of two entries under one name",
+            batch(&[
+                Attribute::text("Twice", Some("a")),
+                Attribute::text("Twice", Some("b")),
+            ]),
+            "/attributes/1/attributeName",
+            "Twice",
         ),
         (
-            "an inline value on an IMAGE attribute",
-            json!({ "attributes": [{
-                "attributeName": "Picture",
-                "attributeType": "IMAGE",
-                "attributeValue": "not a picture",
-            }] }),
-            "attributes.1.member.attributeValue",
-            "IMAGE",
+            "a repeat after an acceptable entry",
+            batch(&[
+                Attribute::text("First", Some("a")),
+                Attribute::text("Repeated Name", Some("b")),
+                Attribute::text("Repeated Name", Some("c")),
+            ]),
+            "/attributes/2/attributeName",
+            "Repeated Name",
         ),
         (
-            "an inline value on a DOCUMENT attribute, after an acceptable entry",
+            "a name repeated three times, reported at its first repeat",
+            batch(&[
+                Attribute::text("Thrice", Some("a")),
+                Attribute::text("Thrice", Some("b")),
+                Attribute::text("Thrice", Some("c")),
+            ]),
+            "/attributes/1/attributeName",
+            "Thrice",
+        ),
+        (
+            "a repeat across attribute types",
             json!({ "attributes": [
-                { "attributeName": "Fine", "attributeType": "TEXT", "attributeValue": "ok" },
-                { "attributeName": "Paper", "attributeType": "DOCUMENT", "attributeValue": "x" },
+                { "attributeName": "Mixed_1", "attributeType": "TEXT", "attributeValue": "v" },
+                { "attributeName": "Logo", "attributeType": "IMAGE",
+                  "attachmentBody": base64::engine::general_purpose::STANDARD.encode(PNG) },
+                { "attributeName": "Logo", "attributeType": "TEXT", "attributeValue": "v" },
             ] }),
-            "attributes.2.member.attributeValue",
-            "DOCUMENT",
+            "/attributes/2/attributeName",
+            "Logo",
         ),
     ];
 
-    for (case, body, expected_path, attribute_type) in cases {
+    for (case, body, pointer, repeated) in cases {
         let before = em.listed_names(&profile).await;
         let refused = em.create_attributes(&profile, body).await;
         assert_eq!(
@@ -835,33 +946,305 @@ async fn content_the_attribute_type_does_not_take_is_refused() {
             refused.status,
             refused.body
         );
-        let requirement = format!(
-            "Member must not be specified for an attribute of type {attribute_type}; supply {} \
-             instead",
-            if attribute_type == "TEXT" {
-                "attributeValue"
-            } else {
-                "attachmentBody"
-            }
+        let stated = format!("Duplicate attribute name: '{repeated}'");
+        assert_eq!(
+            refused.string("message"),
+            stated,
+            "case {case}: expected message {stated:?}, got {:?}",
+            refused.body
         );
         assert_eq!(
             refused.body["fieldList"],
-            json!([{ "path": expected_path, "message": requirement }]),
+            json!([{ "path": pointer, "message": stated }]),
+            "case {case}: the refusal must name the entry that repeated the name, got {:?}",
+            refused.body
+        );
+        // Atomic: nothing of a refused batch is created, not even its acceptable entries.
+        let after = em.listed_names(&profile).await;
+        assert_eq!(
+            after, before,
+            "case {case}: a refused batch must leave the profile's attributes unchanged"
+        );
+    }
+}
+
+#[tokio::test]
+async fn content_the_attribute_type_does_not_take_is_refused() {
+    let em = Emulator::new();
+    let profile = em.profile("Validation owner").await;
+
+    // A `TEXT` attribute holds text and no media; an `IMAGE` or `DOCUMENT` attribute holds
+    // media, so its text member carries the S3 LOCATION that media is taken from. Each row
+    // offers content the entry's own type does not hold, in a batch of one and in a batch
+    // whose later entry is the one at fault, and states what the refusal must say: the
+    // member at fault as the JSONPointer into the request under its entry's 0-based
+    // position, and the sentence — which names the attribute the entry described, since one
+    // request carries several.
+    let cases: Vec<(&str, Value, &str, String)> = vec![
+        (
+            "media on a TEXT attribute",
+            json!({ "attributes": [{
+                "attributeName": "Inline",
+                "attributeType": "TEXT",
+                "attachmentBody": base64::engine::general_purpose::STANDARD.encode(PNG),
+            }] }),
+            "/attributes/0/attachmentBody",
+            "attachmentBody cannot be provided for TEXT attribute 'Inline'".to_string(),
+        ),
+        (
+            "plain text on an IMAGE attribute",
+            json!({ "attributes": [{
+                "attributeName": "Picture",
+                "attributeType": "IMAGE",
+                "attributeValue": "not a picture",
+            }] }),
+            "/attributes/0/attributeValue",
+            media_location_required("IMAGE", "Picture"),
+        ),
+        (
+            "plain text on a DOCUMENT attribute, after an acceptable entry",
+            json!({ "attributes": [
+                { "attributeName": "Fine", "attributeType": "TEXT", "attributeValue": "ok" },
+                { "attributeName": "Paper", "attributeType": "DOCUMENT", "attributeValue": "x" },
+            ] }),
+            "/attributes/1/attributeValue",
+            media_location_required("DOCUMENT", "Paper"),
+        ),
+        (
+            "an S3 URI naming a bucket and no object",
+            json!({ "attributes": [{
+                "attributeName": "Bucket Only",
+                "attributeType": "IMAGE",
+                "attributeValue": "s3://media-bucket",
+            }] }),
+            "/attributes/0/attributeValue",
+            media_location_required("IMAGE", "Bucket Only"),
+        ),
+        (
+            "an https URL of the same object",
+            json!({ "attributes": [{
+                "attributeName": "Https",
+                "attributeType": "DOCUMENT",
+                "attributeValue": "https://media-bucket.s3.us-east-1.amazonaws.com/terms.pdf",
+            }] }),
+            "/attributes/0/attributeValue",
+            media_location_required("DOCUMENT", "Https"),
+        ),
+        (
+            "a bucket name Amazon S3 holds none under",
+            json!({ "attributes": [{
+                "attributeName": "Bad Bucket",
+                "attributeType": "IMAGE",
+                "attributeValue": "s3://Media_Bucket/logo.png",
+            }] }),
+            "/attributes/0/attributeValue",
+            media_location_required("IMAGE", "Bad Bucket"),
+        ),
+    ];
+
+    for (case, body, expected_path, stated) in cases {
+        let before = em.listed_names(&profile).await;
+        let refused = em.create_attributes(&profile, body).await;
+        assert_eq!(
+            (refused.status, refused.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case}: expected 400 ValidationException, got {} / {:?}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.body["fieldList"],
+            json!([{ "path": expected_path, "message": stated }]),
             "case {case}: the refusal must name the entry and member at fault, got {:?}",
             refused.body
         );
         assert_eq!(
             refused.string("message"),
-            format!(
-                "1 validation error detected: Value at '{expected_path}' failed to satisfy \
-                 constraint: {requirement}"
-            ),
+            stated,
             "case {case}: unexpected refusal message"
         );
         assert_eq!(
             em.listed_names(&profile).await,
             before,
             "case {case}: a refused batch must create nothing"
+        );
+    }
+}
+
+/// The sentence this API states when a media attribute's text member is not the S3 location
+/// its content is taken from: fixed text over the attribute's own type and the name the
+/// request named it by.
+fn media_location_required(attribute_type: &str, attribute_name: &str) -> String {
+    format!(
+        "attributeValue must be an S3 URL (s3://bucket/key) for {attribute_type} attribute \
+         '{attribute_name}'"
+    )
+}
+
+/// The sentence this API states when a request offers one attribute both of the members
+/// that carry its content: fixed text over the name the request named it by, with no
+/// attribute type in it — the two members are alternatives whatever the type.
+fn one_content_member_only(attribute_name: &str) -> String {
+    format!(
+        "Only one of attributeValue or attachmentBody can be provided for attribute \
+         '{attribute_name}'"
+    )
+}
+
+#[tokio::test]
+async fn an_attribute_offered_both_of_its_content_members_is_refused() {
+    // An attribute holds ONE content, so its text member and its media member are
+    // alternatives: a request carrying both is refused whatever the type, before anything
+    // is written, and whether or not the text it carries would be acceptable on its own.
+    let em = Emulator::new();
+    let profile = em.profile("Exclusive content owner").await;
+    let media = base64::engine::general_purpose::STANDARD.encode(PNG);
+
+    // The rows span the attribute types, which entry of a batch carries the pair, and
+    // whether the text member alone would have been taken for that type.
+    let cases: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "a media attribute carrying its location and its bytes",
+            json!({ "attributes": [{
+                "attributeName": "Logo",
+                "attributeType": "IMAGE",
+                "attributeValue": "s3://media-bucket/logo.png",
+                "attachmentBody": media.clone(),
+            }] }),
+            "/attributes/0/attributeValue",
+            "Logo",
+        ),
+        (
+            "a media attribute whose text is no location either",
+            json!({ "attributes": [{
+                "attributeName": "Scan",
+                "attributeType": "DOCUMENT",
+                "attributeValue": "not a location",
+                "attachmentBody": media.clone(),
+            }] }),
+            "/attributes/0/attributeValue",
+            "Scan",
+        ),
+        (
+            "a TEXT attribute carrying both, in a later entry",
+            json!({ "attributes": [
+                { "attributeName": "Fine", "attributeType": "TEXT", "attributeValue": "ok" },
+                { "attributeName": "Note", "attributeType": "TEXT", "attributeValue": "v",
+                  "attachmentBody": media.clone() },
+            ] }),
+            "/attributes/1/attributeValue",
+            "Note",
+        ),
+    ];
+
+    for (case, body, pointer, attribute_name) in cases {
+        let before = em.listed_names(&profile).await;
+        let refused = em.create_attributes(&profile, body).await;
+        assert_eq!(
+            (refused.status, refused.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case}: expected 400 ValidationException, got {} / {:?}",
+            refused.status,
+            refused.body
+        );
+        let stated = one_content_member_only(attribute_name);
+        assert_eq!(
+            refused.string("message"),
+            stated,
+            "case {case}: unexpected refusal message"
+        );
+        assert_eq!(
+            refused.body["fieldList"],
+            json!([{ "path": pointer, "message": stated }]),
+            "case {case}: the refusal must name the member at fault, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            em.listed_names(&profile).await,
+            before,
+            "case {case}: a refused batch must create nothing"
+        );
+    }
+
+    // An attribute whose text member is its only content keeps nothing of a refused
+    // request: the exclusivity is checked before anything is written.
+    let created = em
+        .create_attributes(
+            &profile,
+            json!({ "attributes": [{
+                "attributeName": "Both",
+                "attributeType": "IMAGE",
+                "attributeValue": "s3://media-bucket/both.png",
+            }] }),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "an entry carrying one content must be taken, got {} / {:?}",
+        created.status, created.body
+    );
+    assert_eq!(
+        em.get_attribute(&profile, "Both")
+            .await
+            .member("attributeValue"),
+        &json!("s3://media-bucket/both.png"),
+        "the one content it carried must be stored"
+    );
+}
+
+#[tokio::test]
+async fn a_media_attribute_takes_the_s3_location_of_its_content() {
+    // The other side of the rule above: a media attribute's `attributeValue` IS taken when
+    // it names one S3 object, and the location is stored — a later read reports the same
+    // text back, so the value is held rather than merely accepted.
+    let em = Emulator::new();
+    let profile = em.profile("Media location owner").await;
+
+    // The rows span what an `s3://<bucket>/<key>` location generalises over: the attribute
+    // type that holds media, the depth of the key, and the characters a key carries.
+    let cases: Vec<(&str, &str, &str, &str)> = vec![
+        ("an image at a top-level key", "Logo", "IMAGE", "s3://media-bucket/logo.png"),
+        (
+            "a document under a prefix",
+            "Terms",
+            "DOCUMENT",
+            "s3://media-bucket/legal/2026/terms.pdf",
+        ),
+        (
+            "a key carrying spaces and symbols",
+            "Scan",
+            "DOCUMENT",
+            "s3://media.bucket-1/scans/front page (1).pdf",
+        ),
+    ];
+
+    for (case, name, attribute_type, location) in cases {
+        let created = em
+            .create_attributes(
+                &profile,
+                json!({ "attributes": [{
+                    "attributeName": name,
+                    "attributeType": attribute_type,
+                    "attributeValue": location,
+                }] }),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: a media location must be taken, got {} / {:?}",
+            created.status, created.body
+        );
+        let read = em.get_attribute(&profile, name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: the created attribute must read back, got {} / {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.member("attributeValue"),
+            &json!(location),
+            "case {case}: the stored location must read back, got {:?}",
+            read.body
         );
     }
 }
@@ -1111,7 +1494,7 @@ async fn deleting_an_attribute_removes_it_and_the_media_it_held() {
                 batch(&[
                     target.clone(),
                     Attribute::text(NEIGHBOUR_TEXT, Some("stays")),
-                    Attribute::media(NEIGHBOUR_MEDIA, "IMAGE", Some(GIF)),
+                    Attribute::media(NEIGHBOUR_MEDIA, "IMAGE", Some(JPEG)),
                 ]),
             )
             .await;
@@ -2043,34 +2426,42 @@ async fn an_update_carrying_content_the_attribute_type_does_not_take_is_refused(
     let em = Emulator::new();
     let profile = em.profile("Update validation owner").await;
 
-    // `attributeValue` applies to TEXT and media to IMAGE and DOCUMENT, so each stored
-    // type takes exactly one of the two members — asserted for every type, and for a
-    // media attribute both with and without media already held.
-    let cases: Vec<(&str, Attribute, Value, &str, &str)> = vec![
+    // A `TEXT` attribute holds no media and a media attribute's content is replaced through
+    // its media member, so each stored type refuses the other member — asserted for every
+    // type, and for a media attribute both with and without media already held. Each row
+    // states the member at fault and the sentence the refusal words.
+    let cases: Vec<(&str, Attribute, Value, &str, String)> = vec![
         (
             "media on a TEXT attribute",
             Attribute::text("Inline", Some("v")),
             json!({ "attachmentBody": base64::engine::general_purpose::STANDARD.encode(PNG) }),
             "attachmentBody",
-            "TEXT",
+            "attachmentBody cannot be provided for TEXT attribute".to_string(),
         ),
         (
             "an inline value on an IMAGE attribute holding media",
             Attribute::media("Picture", "IMAGE", Some(PNG)),
             json!({ "attributeValue": "not a picture" }),
             "attributeValue",
-            "IMAGE",
+            "attributeValue cannot be provided for IMAGE attribute".to_string(),
         ),
         (
             "an inline value on a DOCUMENT attribute holding no media",
             Attribute::media("Paper", "DOCUMENT", None),
             json!({ "attributeValue": "x" }),
             "attributeValue",
-            "DOCUMENT",
+            "attributeValue cannot be provided for DOCUMENT attribute".to_string(),
+        ),
+        (
+            "an S3 location on a media attribute, which an update does not import",
+            Attribute::media("Imported", "IMAGE", None),
+            json!({ "attributeValue": "s3://media-bucket/logo.png" }),
+            "attributeValue",
+            "attributeValue cannot be provided for IMAGE attribute".to_string(),
         ),
     ];
 
-    for (case, attribute, change, member, attribute_type) in cases {
+    for (case, attribute, change, member, expected) in cases {
         let created = em
             .create_attributes(&profile, batch(std::slice::from_ref(&attribute)))
             .await;
@@ -2091,7 +2482,6 @@ async fn an_update_carrying_content_the_attribute_type_does_not_take_is_refused(
             refused.status,
             refused.body
         );
-        let expected = format!("{member} cannot be provided for {attribute_type} attribute");
         assert_eq!(
             refused.string("message"),
             expected,

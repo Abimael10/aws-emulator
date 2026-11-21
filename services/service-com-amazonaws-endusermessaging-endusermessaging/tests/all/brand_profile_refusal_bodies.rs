@@ -32,6 +32,10 @@
 //!   `Value at '<JSON pointer>' failed to satisfy constraint: <requirement>`, with no
 //!   value of the caller's in it — and whose `fieldList` carries that same clause under
 //!   the pointer naming its member;
+//! * a clause about a `@length` states one measurement of the value besides: the LENGTH
+//!   that check counted — `Value with length <n> at '<JSON pointer>' …` — whatever shape
+//!   kind carried it (a string's characters, a list's elements) and whichever bound it
+//!   broke, while every other constraint class names the member and the requirement alone;
 //! * a refusal this service words ITSELF names the member at fault in `fieldList` by the
 //!   member's own name, and the identifier-format gate states there the one sentence it
 //!   states in `message`.
@@ -39,7 +43,7 @@
 //! The constraint rows reach operations beyond the brand profiles, because the envelope is
 //! the service's rather than one operation's: `call` addresses any of them.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -738,6 +742,12 @@ async fn an_update_carrying_nothing_is_refused_before_the_identifier_is_resolved
             refused.status, refused.body
         );
         assert_eq!(
+            refused.error.as_deref(),
+            Some("ValidationException"),
+            "case {case}: the refusal must name its error class on the wire, got {:?}",
+            refused.error
+        );
+        assert_eq!(
             refused.string("message"),
             "At least one field must be provided for update",
             "case {case}: unexpected message, got {:?}",
@@ -746,20 +756,50 @@ async fn an_update_carrying_nothing_is_refused_before_the_identifier_is_resolved
     }
 }
 
-/// The clause this service states about one failing member: the member as the JSON
-/// pointer that names it in the request body, and the requirement it failed.
-fn constraint_clause(pointer: &str, requirement: &str) -> String {
-    format!("Value at '{pointer}' failed to satisfy constraint: {requirement}")
+/// The clause this service states about one failing member: the value — with the LENGTH a
+/// `@length` check counted, where it counted one — the member as the JSON pointer that names
+/// it in the request body, and the requirement it failed.
+fn constraint_clause(length: Option<usize>, pointer: &str, requirement: &str) -> String {
+    let subject = match length {
+        Some(counted) => format!("Value with length {counted} "),
+        None => "Value ".to_string(),
+    };
+    format!("{subject}at '{pointer}' failed to satisfy constraint: {requirement}")
 }
 
+/// `count` well-formed entries for a `CreateBrandProfileAttributes` batch: each satisfies
+/// every constraint `BrandProfileAttributeInput` declares, so the only thing a request
+/// carrying them can break is the `@length` on the LIST that holds them
+/// (`smithy_query(query="shape", shape="BrandProfileAttributeInput")`).
+fn attribute_entries(count: usize) -> Vec<Value> {
+    (0..count)
+        .map(|index| {
+            json!({
+                "attributeName": format!("Entry_{index}"),
+                "attributeType": "TEXT",
+                "attributeValue": "v",
+            })
+        })
+        .collect()
+}
+
+/// A `ListBrandProfiles` request whose query-bound `nextToken` is one character past the
+/// `@length` maximum of 2048 the member declares
+/// (`smithy_query(query="operation", operation="ListBrandProfiles")`), built once because a
+/// row of the table below names a `&'static str` path.
+static NEXT_TOKEN_PAST_ITS_MAXIMUM: LazyLock<String> =
+    LazyLock::new(|| format!("/v1/brand-profiles?nextToken={}", "t".repeat(2049)));
+
 /// One row of the constraint table below: the case it names, the request that breaks one
-/// modelled constraint (method, path, body), and the clause the refusal must state about it
-/// (the member's JSON pointer and the requirement it failed).
+/// modelled constraint (method, path, body), the length the refusal must state about the
+/// value (`None` where the class states none), and the clause's member pointer and
+/// requirement.
 type ConstraintRow = (
     &'static str,
     &'static str,
     &'static str,
     Option<Value>,
+    Option<usize>,
     &'static str,
     String,
 );
@@ -772,7 +812,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
     // this service declares them at rather than over the one request a report cited.
     // Sources for the bounds and value sets: `smithy_query(query="shape",
     // shape="RegistrationIdOrArn,BrandProfileName,CodeConfigurationParameters,CodeType,\
-    // MaxResults,Tag")`.
+    // MaxResults,Tag,CreateBrandProfileAttributesInput,ClientToken")`.
     let rows: Vec<ConstraintRow> = vec![
         (
             "a body member outside its @pattern",
@@ -782,6 +822,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
                 "registrationId": "not a valid registration id!!",
                 "brandProfileName": "from-registration",
             })),
+            None,
             "/registrationId",
             "Member must satisfy regular expression pattern: ^[A-Za-z0-9_:/-]+$".to_string(),
         ),
@@ -790,6 +831,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
             "POST",
             "/v1/brand-profiles",
             Some(json!({})),
+            None,
             "/brandProfileName",
             "Member must not be null".to_string(),
         ),
@@ -798,8 +840,45 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
             "POST",
             "/v1/brand-profiles",
             Some(json!({ "brandProfileName": "n".repeat(65) })),
+            Some(65),
             "/brandProfileName",
             "Member must have length between 1 and 64, inclusive".to_string(),
+        ),
+        (
+            "a body member below its @length minimum",
+            "PUT",
+            "/v1/brand-profiles/bp-00000000000000000/attributes/CompanyName",
+            Some(json!({ "category": "" })),
+            Some(0),
+            "/category",
+            "Member must have length between 1 and 64, inclusive".to_string(),
+        ),
+        (
+            "a @sensitive body member past its @length maximum",
+            "POST",
+            "/v1/brand-profiles",
+            Some(json!({ "brandProfileName": "tokened", "clientToken": "t".repeat(129) })),
+            Some(129),
+            "/clientToken",
+            "Member must have length between 1 and 128, inclusive".to_string(),
+        ),
+        (
+            "a LIST member past its @length maximum: its elements are counted",
+            "POST",
+            "/v1/brand-profiles/bp-00000000000000000/attributes",
+            Some(json!({ "attributes": attribute_entries(11) })),
+            Some(11),
+            "/attributes",
+            "Member must have length between 1 and 10, inclusive".to_string(),
+        ),
+        (
+            "an empty LIST member, below the same @length minimum",
+            "POST",
+            "/v1/brand-profiles/bp-00000000000000000/attributes",
+            Some(json!({ "attributes": attribute_entries(0) })),
+            Some(0),
+            "/attributes",
+            "Member must have length between 1 and 10, inclusive".to_string(),
         ),
         (
             "a nested member above its @range",
@@ -809,6 +888,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
                 "notifyCodeConfigurationName": "policy",
                 "codeConfigurationParameters": { "codeLength": 9 },
             })),
+            None,
             "/codeConfigurationParameters/codeLength",
             "Member must be between 4 and 8, inclusive".to_string(),
         ),
@@ -820,6 +900,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
                 "notifyCodeConfigurationName": "policy",
                 "codeConfigurationParameters": { "codeLength": 3 },
             })),
+            None,
             "/codeConfigurationParameters/codeLength",
             "Member must be between 4 and 8, inclusive".to_string(),
         ),
@@ -831,8 +912,21 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
                 "notifyCodeConfigurationName": "policy",
                 "codeConfigurationParameters": { "validityPeriodMinutes": 61 },
             })),
+            None,
             "/codeConfigurationParameters/validityPeriodMinutes",
             "Member must be between 1 and 60, inclusive".to_string(),
+        ),
+        (
+            "a nested member past its own @length maximum",
+            "POST",
+            "/v1/notify-code-configurations",
+            Some(json!({
+                "notifyCodeConfigurationName": "policy",
+                "channelParameters": { "text": { "inlineTemplateBody": "b".repeat(6001) } },
+            })),
+            Some(6001),
+            "/channelParameters/text/inlineTemplateBody",
+            "Member must have length between 1 and 6000, inclusive".to_string(),
         ),
         (
             "a nested member outside its enumerated value set",
@@ -842,6 +936,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
                 "notifyCodeConfigurationName": "policy",
                 "codeConfigurationParameters": { "codeType": "ROMAN" },
             })),
+            None,
             "/codeConfigurationParameters/codeType",
             "Member must satisfy enum value set: [NUMERIC, ALPHA, ALPHANUMERIC]".to_string(),
         ),
@@ -853,6 +948,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
                 "brandProfileName": "tagged",
                 "tags": [{ "key": "k".repeat(129), "value": "v" }],
             })),
+            Some(129),
             "/tags/0/key",
             "Member must have length between 1 and 128, inclusive".to_string(),
         ),
@@ -867,6 +963,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
                     { "key": "k".repeat(129), "value": "v" },
                 ],
             })),
+            Some(129),
             "/tags/1/key",
             "Member must have length between 1 and 128, inclusive".to_string(),
         ),
@@ -874,6 +971,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
             "a query-bound member below its @range",
             "GET",
             "/v1/brand-profiles?maxResults=0",
+            None,
             None,
             "/maxResults",
             "Member must be between 1 and 100, inclusive".to_string(),
@@ -883,12 +981,22 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
             "GET",
             "/v1/brand-profiles?maxResults=101",
             None,
+            None,
             "/maxResults",
             "Member must be between 1 and 100, inclusive".to_string(),
         ),
+        (
+            "a query-bound member past its @length maximum",
+            "GET",
+            NEXT_TOKEN_PAST_ITS_MAXIMUM.as_str(),
+            None,
+            Some(2049),
+            "/nextToken",
+            "Member must have length between 1 and 2048, inclusive".to_string(),
+        ),
     ];
 
-    for (case, method, path, body, pointer, requirement) in rows {
+    for (case, method, path, body, length, pointer, requirement) in rows {
         let refused = em.call(method, path, body).await;
         assert_eq!(
             refused.status, 400,
@@ -901,7 +1009,7 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
             "case {case:?}: unexpected error code, got {:?}",
             refused.error
         );
-        let clause = constraint_clause(pointer, &requirement);
+        let clause = constraint_clause(length, pointer, &requirement);
         let expected = format!("1 validation error detected. {clause}");
         assert_eq!(
             refused.string("message"),
@@ -913,6 +1021,95 @@ async fn a_modelled_constraint_refusal_is_the_counted_pointer_envelope_with_a_fi
             refused.body["fieldList"],
             json!([{ "path": pointer, "message": clause }]),
             "case {case:?}: the refusal must list the member at fault, got {:?}",
+            refused.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_length_clause_states_the_size_the_request_itself_carried() {
+    // The number in a `@length` clause is a MEASUREMENT of the request, so it moves with
+    // the value: the rows send the same member at several sizes, in characters for a string
+    // and in elements for a list, so a clause stating a fixed number — the bound, or the
+    // size one recorded request happened to send — fails here.
+    let em = Emulator::new();
+
+    // (case, method, path, body, the member's pointer, its declared window, the length the
+    //  clause must state)
+    let rows: Vec<(String, &str, String, Value, &str, &str, usize)> = [65usize, 100, 1000]
+        .into_iter()
+        .map(|characters| {
+            (
+                format!("a name of {characters} characters"),
+                "POST",
+                "/v1/brand-profiles".to_string(),
+                json!({ "brandProfileName": "n".repeat(characters) }),
+                "/brandProfileName",
+                "Member must have length between 1 and 64, inclusive",
+                characters,
+            )
+        })
+        .chain(std::iter::once((
+            // `BrandProfileAttributeCategory` is bounded 1..64 and declares no `@pattern`
+            // (`smithy_query(query="shape", shape="BrandProfileAttributeCategory")`), so an
+            // empty value breaks its minimum alone.
+            "an empty category".to_string(),
+            "PUT",
+            "/v1/brand-profiles/bp-00000000000000000/attributes/CompanyName".to_string(),
+            json!({ "category": "" }),
+            "/category",
+            "Member must have length between 1 and 64, inclusive",
+            0,
+        )))
+        .chain(std::iter::once((
+            // `InlineTemplateBody`'s `@pattern` is `^[\s\S]*\S[\s\S]*$`, which admits any
+            // character, so a multi-byte value breaks its length alone — and `@length`
+            // counts CHARACTERS, not the bytes they take on the wire.
+            "a template body of 6001 multi-byte characters".to_string(),
+            "POST",
+            "/v1/notify-code-configurations".to_string(),
+            json!({
+                "notifyCodeConfigurationName": "policy",
+                "channelParameters": { "text": { "inlineTemplateBody": "\u{e9}".repeat(6001) } },
+            }),
+            "/channelParameters/text/inlineTemplateBody",
+            "Member must have length between 1 and 6000, inclusive",
+            6001,
+        )))
+        .chain([11usize, 12, 20].into_iter().map(|entries| {
+            (
+                format!("a batch of {entries} attributes"),
+                "POST",
+                "/v1/brand-profiles/bp-00000000000000000/attributes".to_string(),
+                json!({ "attributes": attribute_entries(entries) }),
+                "/attributes",
+                "Member must have length between 1 and 10, inclusive",
+                entries,
+            )
+        }))
+        .collect();
+
+    for (case, method, path, body, pointer, requirement, length) in rows {
+        let refused = em.call(method, &path, Some(body)).await;
+        assert_eq!(
+            (refused.status, refused.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case:?}: expected 400 ValidationException, got {} / {:?}",
+            refused.status,
+            refused.body
+        );
+        let clause = constraint_clause(Some(length), pointer, requirement);
+        let expected = format!("1 validation error detected. {clause}");
+        assert_eq!(
+            refused.string("message"),
+            expected,
+            "case {case:?}: expected message {expected:?}, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body["fieldList"],
+            json!([{ "path": pointer, "message": clause }]),
+            "case {case:?}: the entry must state the same clause, got {:?}",
             refused.body
         );
     }

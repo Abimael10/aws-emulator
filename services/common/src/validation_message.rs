@@ -78,6 +78,12 @@
 //! value it submitted. There is no scalar rendering of a list or a map, so none is
 //! invented.
 //!
+//! A service whose recordings state a `@length` violation's LENGTH in place of its value
+//! (`Value with length <n> at '<member path>' …`) reads that number here as well
+//! ([`stated_length`]): `@length` counts a string's characters, a collection's elements and
+//! a blob's bytes, none of which the violation carries, so it comes off the walk's own
+//! renderings and the value re-read from the request.
+//!
 //! The same half is dropped for a member whose value the refusal WITHHOLDS: a member
 //! modelled `@sensitive` is one the service never discloses, so its clause names the
 //! member and the requirement and states no value — neither the submitted bytes nor the
@@ -158,7 +164,7 @@ use aws_smithy_schema_server::constraints::{
 use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use smithy_server_runtime::{Refusal, Refused};
 
-use crate::validation::{list_of_element, unanchored};
+use crate::validation::{list_of_element, unanchored, SubmittedEcho};
 
 /// The two suffixes the validating walk renders a COLLECTION's size with when it
 /// length-checks one: a list as `<n> items`, a map as `<n> entries`
@@ -444,6 +450,89 @@ pub fn valueless_clause(violation: &Violation) -> Option<String> {
     };
     let requirement_half = violation.message().strip_prefix(&value_half)?.to_string();
     Some(format!("Value {requirement_half}"))
+}
+
+/// The length the violated `@length` check COUNTED, for a clause that states it, and `None`
+/// for every other constraint class and for a value nothing at hand measures.
+///
+/// A service whose refusals name that number states it in front of the member (`Value with
+/// length <n> at '<member path>' …`), and the number is not on the violation, which carries
+/// the BOUND that was broken and not the size that broke it. `@length` counts a string's
+/// characters, a collection's elements and a blob's bytes, so it is read off the value, from
+/// the two places a value reaches a clause:
+///
+/// * the validating walk's own rendering of a value it has no text for, which states the
+///   size it counted — a list as `<n> items`, a map as `<n> entries`
+///   ([`list_item_count`], [`map_entry_count`]), a blob as the bytes it held
+///   ([`blob_byte_count`]);
+/// * the value the caller submitted, re-read from the request
+///   ([`SubmittedEcho::Rendered`]) and measured in CHARACTERS, which is what `@length`
+///   counts on a string.
+///
+/// `None` rather than a number nothing measured, which is the fail-safe direction — a clause
+/// then names the member and the requirement alone: a seam that holds no request, a value
+/// elided past the bounds the collecting walk states
+/// ([`crate::validation::named_byte_count`] reads that marker), and a COLLECTION reached
+/// with no size beside it (a `@sensitive` collection member, whose summary the walk
+/// withholds), whose rendering is its elements rather than how many there were.
+///
+/// `pub` because this is one reading of the walk's own renderings, shared for the reason
+/// [`list_item_count`] is: two services must not state two different lengths for one value.
+#[must_use]
+pub fn stated_length(violation: &Violation, echo: &SubmittedEcho) -> Option<usize> {
+    if !matches!(
+        violation.kind,
+        ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
+    ) {
+        return None;
+    }
+    if let Some(summarised) = violation.value.as_deref().and_then(summarised_size) {
+        return Some(summarised);
+    }
+    match echo {
+        SubmittedEcho::Rendered(submitted) => measured_value(submitted),
+        // The walk's own rendering of the value is all there is: measurable only while it IS
+        // the value, never once it has been elided into a prefix plus the marker naming the
+        // whole value's byte count.
+        _ => violation
+            .value
+            .as_deref()
+            .filter(|stored| crate::validation::named_byte_count(stored).is_none())
+            .and_then(measured_value),
+    }
+}
+
+/// The size the walk's own summary of a value it has no text for states — a list's items, a
+/// map's entries, a blob's bytes — and `None` for a caller's own text.
+fn summarised_size(stored: &str) -> Option<usize> {
+    list_item_count(stored)
+        .or_else(|| map_entry_count(stored))
+        .or_else(|| blob_byte_count(stored))
+}
+
+/// `rendering` measured the way `@length` counts the value it renders: the characters of
+/// the value's own text.
+///
+/// `None` for a rendering that is not that text and whose characters would therefore state a
+/// length no check counted: the rendering of a COLLECTION, which states the elements it held
+/// rather than how many of them there were, and the buffer a BLOB was read into
+/// ([`crate::validation::rendered_blob`]), whose own byte count is the length instead.
+fn measured_value(rendering: &str) -> Option<usize> {
+    if let Some(bytes) = crate::validation::rendered_blob_bytes(rendering) {
+        return Some(bytes);
+    }
+    (!renders_a_collection(rendering)).then(|| rendering.chars().count())
+}
+
+/// Whether `rendering` is how a LIST or a MAP renders inside a clause
+/// ([`crate::validation::rendered_list`], [`crate::validation::rendered_map`]): bracketed
+/// elements, or a braced set of entries.
+fn renders_a_collection(rendering: &str) -> bool {
+    let bounded = |open: char, close: char| {
+        let mut characters = rendering.chars();
+        characters.next() == Some(open) && characters.next_back() == Some(close)
+    };
+    bounded('[', ']') || bounded('{', '}')
 }
 
 /// The sentence a JSON-schema layer states for an object carrying more properties than
@@ -2307,9 +2396,11 @@ mod tests {
         parameter_value_mismatch, parameters_value_mismatch, pattern_constraint_report,
         pattern_mismatch, pattern_requirement_unstated, property_count_refusal,
         quoting_the_submitted_collection, quoting_the_whole_submitted_value, requirement,
-        stated_enum_value_set, string_too_long, string_too_short, StatedEnumValueSets,
+        stated_enum_value_set, stated_length, string_too_long, string_too_short,
+        StatedEnumValueSets,
     };
-    use crate::validation::unanchored_grouping_alternation;
+    use crate::validation::{rendered_blob, rendered_list, unanchored_grouping_alternation,
+        SubmittedEcho};
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
     use aws_smithy_schema_server::constraints::{
         ElementConstraintsTrait, LengthTrait, PatternTrait,
@@ -2325,6 +2416,146 @@ mod tests {
             kind,
             value: Some(value.to_owned()),
             sensitive: false,
+        }
+    }
+
+    /// RULE: the length a `@length` clause states is the size the check counted — a
+    /// string's characters, a collection's elements, a blob's bytes — read off the walk's
+    /// own rendering of the value or off the value re-read from the request; no other
+    /// constraint class states one, and neither does a value nothing at hand measures.
+    ///
+    /// The rows span what that generalises over: the kind of shape the length was counted
+    /// on, which bound was broken, where the number is read from, and the values no length
+    /// can be stated for.
+    #[test]
+    fn a_length_clause_states_the_size_the_check_counted() {
+        /// One row: the case it names, the constraint it broke, the value the walk holds,
+        /// how a clause can state that value, and the length stated for it.
+        type LengthRow = (
+            &'static str,
+            ViolationKind,
+            Option<String>,
+            SubmittedEcho,
+            Option<usize>,
+        );
+
+        // (case, kind, the value the walk holds, the echo, the length stated)
+        let rows: Vec<LengthRow> = vec![
+            (
+                "a string over its maximum, re-read from the request",
+                ViolationKind::MaxLength(64),
+                Some("n".repeat(65)),
+                SubmittedEcho::Rendered("n".repeat(65)),
+                Some(65),
+            ),
+            (
+                "a string under its minimum",
+                ViolationKind::MinLength(1),
+                Some(String::new()),
+                SubmittedEcho::Rendered(String::new()),
+                Some(0),
+            ),
+            (
+                "a string of multi-byte characters, counted in characters",
+                ViolationKind::MaxLength(3),
+                Some("\u{e9}\u{e9}\u{e9}\u{e9}".to_owned()),
+                SubmittedEcho::Rendered("\u{e9}\u{e9}\u{e9}\u{e9}".to_owned()),
+                Some(4),
+            ),
+            (
+                "a sensitive string, whose summary the walk withheld",
+                ViolationKind::MaxLength(128),
+                None,
+                SubmittedEcho::Rendered("t".repeat(129)),
+                Some(129),
+            ),
+            (
+                "a list over its element maximum",
+                ViolationKind::MaxLength(10),
+                Some("11 items".to_owned()),
+                SubmittedEcho::Rendered(rendered_list(&["a", "b"])),
+                Some(11),
+            ),
+            (
+                "an empty list under its minimum",
+                ViolationKind::MinLength(1),
+                Some("0 items".to_owned()),
+                SubmittedEcho::Rendered("[]".to_owned()),
+                Some(0),
+            ),
+            (
+                "a map over its entry maximum",
+                ViolationKind::MaxLength(50),
+                Some("51 entries".to_owned()),
+                SubmittedEcho::Unrendered,
+                Some(51),
+            ),
+            (
+                "a blob rendering: its own byte count, not the width of the summary",
+                ViolationKind::MinLength(1),
+                None,
+                SubmittedEcho::Rendered(rendered_blob(0)),
+                Some(0),
+            ),
+            (
+                "a large blob, whose summary the walk kept",
+                ViolationKind::MaxLength(1024),
+                Some("1048576 bytes".to_owned()),
+                SubmittedEcho::Unrendered,
+                Some(1_048_576),
+            ),
+            (
+                "a value elided past the ceiling the collecting walk states",
+                ViolationKind::MaxLength(64),
+                Some("nnn... [20000 bytes]".to_owned()),
+                SubmittedEcho::Unrendered,
+                None,
+            ),
+            (
+                "a collection reached with no size beside it",
+                ViolationKind::MaxLength(10),
+                None,
+                SubmittedEcho::Rendered(rendered_list(&["a", "b"])),
+                None,
+            ),
+            (
+                "a member that was absent altogether",
+                ViolationKind::MinLength(1),
+                None,
+                SubmittedEcho::Absent,
+                None,
+            ),
+        ];
+
+        for (case, kind, stored, echo, expected) in rows {
+            let held = Violation {
+                path: "member".to_owned(),
+                kind,
+                value: stored,
+                sensitive: false,
+            };
+            let actual = stated_length(&held, &echo);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        // Every OTHER constraint class states no length, whatever value is at hand.
+        for kind in [
+            ViolationKind::MissingRequiredMember,
+            ViolationKind::MaxValue("100".to_owned()),
+            ViolationKind::MinValue("1".to_owned()),
+            ViolationKind::Pattern("^[a-z]+$".to_owned()),
+            ViolationKind::EnumValue(vec!["NUMERIC".to_owned()]),
+            ViolationKind::UniqueItems,
+        ] {
+            let held = violation("member", kind.clone(), "abcdef");
+            let actual = stated_length(&held, &SubmittedEcho::Rendered("abcdef".to_owned()));
+            assert_eq!(
+                actual, None,
+                "case {kind:?}: only a length clause states a length, got {actual:?}"
+            );
         }
     }
 

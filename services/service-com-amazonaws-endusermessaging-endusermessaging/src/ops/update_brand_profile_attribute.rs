@@ -267,7 +267,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which member carries an attribute's content follows from the type the STORED
         // attribute has — an update cannot change that type — so a request offering the
         // other type's member asks for something this attribute cannot hold, and is
-        // refused before any member is applied.
+        // refused before any member is applied. An update replaces an attribute's content
+        // with what the request carries, so a media attribute's content comes from its
+        // media member alone here; naming a LOCATION for it is a create-time import
+        // ([`crate::ops::create_brand_profile_attributes`]), not an update.
         let carries_media = crate::state::carries_media(&attribute.attribute_type);
         if !carries_media && input.attachment_body.is_some() {
             return Err(
@@ -301,6 +304,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .attachment_body
             .clone()
             .map(crate::state::BrandProfileAttributeMedia::new);
+        // A replacement is held to the same file types a create is: the type the content's
+        // own signature announces is the type a download would be served under.
+        if replacement_media.as_ref().is_some_and(|media| {
+            !crate::state::is_supported_media_file_type(&media.content_type)
+        }) {
+            return Err(
+                UpdateBrandProfileAttributeErrorModeled::ValidationException(
+                    crate::state::unsupported_media_file_type(
+                        "/attachmentBody",
+                        &input.attribute_name,
+                    ),
+                )
+                .into(),
+            );
+        }
         if let Some(media) = replacement_media.as_ref() {
             let held_elsewhere = media_held
                 .saturating_sub(attribute.media.as_ref().map_or(0, |held| held.bytes.len()));

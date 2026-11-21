@@ -35,6 +35,21 @@
 //! caller's input never comes back inside a summary message. The same clause, without the
 //! envelope, is what each `fieldList` entry states about its own member.
 //!
+//! A clause about a `@length` states one number of the value besides: the LENGTH the check
+//! counted, in front of the member —
+//!
+//! ```text
+//! 1 validation error detected. Value with length 11 at '/attributes' failed to satisfy constraint: Member must have length between 1 and 10, inclusive
+//! ```
+//!
+//! — which is the one part of its own input a caller cannot read off the request without
+//! re-measuring it, and the one number that says by how much the value overran. `@length`
+//! counts a string's characters, a collection's elements and a blob's bytes, and a
+//! [`Violation`] carries the BOUND rather than the size that broke it, so the number is read
+//! off the value ([`::service_common::validation_message::stated_length`], which owns that
+//! reading for every service). Every other constraint class names the member and the
+//! requirement alone.
+//!
 //! Every requirement sentence is the framework's own
 //! ([`::service_common::validation_message::requirement`]) except one: a `@range` or
 //! `@length` the model bounds on BOTH sides is stated as that whole interval — `Member must
@@ -46,6 +61,7 @@ use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::sync::LazyLock;
 
+use ::service_common::validation::SubmittedEcho;
 use aws_smithy_schema::{Schema, ShapeId, TraitMap};
 use aws_smithy_schema_server::constraints::{
     self, ElementConstraintsTrait, LengthTrait, RangeTrait,
@@ -85,17 +101,34 @@ fn pointer(path: &str) -> String {
     ::service_common::json_pointer::json_pointer(path)
 }
 
-/// The clause one violation states: the member's pointer and the requirement it failed.
+/// The clause one violation states: the member's pointer, the requirement it failed, and —
+/// for a `@length` — the length the check counted ([`subject`]).
 ///
 /// It names the member and the rule, and never the value that broke it: the value is the
 /// caller's own input — some of this service's members are `@sensitive` — and this service's
 /// clause carries no echo of it.
-fn clause(operation: &Operated<'_>, violation: &Violation) -> String {
+fn clause(operation: &Operated<'_>, violation: &Violation, echo: &SubmittedEcho) -> String {
     format!(
-        "Value at '{}' {CLAUSE_MARKER}{}",
+        "{}at '{}' {CLAUSE_MARKER}{}",
+        subject(violation, echo),
         pointer(&violation.path),
         requirement(operation, violation)
     )
+}
+
+/// What a clause names before the member: the value, and for a `@length` violation the
+/// LENGTH that check counted.
+///
+/// The number is a measurement of the caller's value and not the value itself, so it is the
+/// one thing of the input a clause here states; it is read by
+/// [`::service_common::validation_message::stated_length`], the one reading of the
+/// validating walk's own renderings, and a value nothing at hand measures states no length
+/// rather than a number nothing counted.
+fn subject(violation: &Violation, echo: &SubmittedEcho) -> String {
+    match ::service_common::validation_message::stated_length(violation, echo) {
+        Some(length) => format!("Value with length {length} "),
+        None => "Value ".to_string(),
+    }
 }
 
 /// The requirement half of one violation's clause.
@@ -201,14 +234,14 @@ fn render_bound(bound: f64) -> String {
 /// `None` when there is nothing to state, i.e. no violation.
 fn boundary_exception(
     operation: &Operated<'_>,
-    violations: &[Violation],
+    violations: &[(Violation, SubmittedEcho)],
 ) -> Option<ValidationException> {
     if violations.is_empty() {
         return None;
     }
     let clauses: Vec<String> = violations
         .iter()
-        .map(|violation| clause(operation, violation))
+        .map(|(violation, echo)| clause(operation, violation, echo))
         .collect();
     let message = match clauses.len() {
         1 => format!("1 validation error detected. {}", clauses[0]),
@@ -217,7 +250,7 @@ fn boundary_exception(
     let field_list = violations
         .iter()
         .zip(clauses)
-        .map(|(violation, clause)| ValidationExceptionField {
+        .map(|((violation, _), clause)| ValidationExceptionField {
             path: pointer(&violation.path),
             message: clause,
         })
@@ -640,9 +673,13 @@ impl<Op: Operation> ErasedOperation for ModelledValidation<Op> {
                 // The framework's own two steps, in its order: read the request into the
                 // operation's input shape, then walk the constraint traits over what was
                 // read. A failure that is not a refusal — a body the codec cannot read at
-                // all — yields no violation and keeps the framework's own rendering.
+                // all — yields no violation and keeps the framework's own rendering. Each
+                // violation comes paired with how a clause can state the value it is about,
+                // which is where a `@length` clause reads the length it states from.
                 let violations =
-                    ::service_common::validation::refusing_violations::<Op>(protocol, req);
+                    ::service_common::validation::refusing_violations_with_echoes::<Op>(
+                        protocol, req,
+                    );
                 let operated = Operated {
                     name: Op::NAME,
                     input_schema: Op::INPUT_SCHEMA,
@@ -762,16 +799,19 @@ mod tests {
     }
 
     /// A clause names the member as the JSON pointer into the request body, states the
-    /// requirement, and carries no value of the caller's.
+    /// requirement, and carries no value of the caller's — only, for a `@length`, the length
+    /// that check counted.
     #[test]
     fn a_clause_addresses_the_member_as_a_pointer_and_echoes_no_value() {
         // The rows differ along what the rule generalises over: the depth of the member, the
-        // kind of step into it, and the class of constraint it broke.
-        let rows: [(&str, &str, ViolationKind, &str); 4] = [
+        // kind of step into it, the class of constraint it broke, and — for the length class
+        // — which rendering the length is read from.
+        let rows: [(&str, &str, ViolationKind, SubmittedEcho, &str); 7] = [
             (
                 "a top-level member outside its pattern",
                 "registrationId",
                 ViolationKind::Pattern("^[A-Za-z0-9_:/-]+$".to_string()),
+                SubmittedEcho::Rendered("a value the caller sent".to_string()),
                 "Value at '/registrationId' failed to satisfy constraint: Member must satisfy \
                  regular expression pattern: ^[A-Za-z0-9_:/-]+$",
             ),
@@ -779,6 +819,7 @@ mod tests {
                 "an absent required member",
                 "brandProfileName",
                 ViolationKind::MissingRequiredMember,
+                SubmittedEcho::Absent,
                 "Value at '/brandProfileName' failed to satisfy constraint: Member must not be \
                  null",
             ),
@@ -786,6 +827,7 @@ mod tests {
                 "a member of a nested structure",
                 "codeConfigurationParameters.codeLength",
                 ViolationKind::MaxValue("8".to_string()),
+                SubmittedEcho::Rendered("9".to_string()),
                 "Value at '/codeConfigurationParameters/codeLength' failed to satisfy \
                  constraint: Member must be between 4 and 8, inclusive",
             ),
@@ -793,20 +835,45 @@ mod tests {
                 "a member of a list element",
                 "tags.2.member.key",
                 ViolationKind::MissingRequiredMember,
+                SubmittedEcho::Absent,
                 "Value at '/tags/1/key' failed to satisfy constraint: Member must not be null",
+            ),
+            (
+                "a string past its length maximum: the length it was measured at",
+                "notifyCodeConfigurationName",
+                ViolationKind::MaxLength(64),
+                SubmittedEcho::Rendered("n".repeat(65)),
+                "Value with length 65 at '/notifyCodeConfigurationName' failed to satisfy \
+                 constraint: Member must have length between 1 and 64, inclusive",
+            ),
+            (
+                "a nested string below its length minimum",
+                "channelParameters.text.inlineTemplateBody",
+                ViolationKind::MinLength(1),
+                SubmittedEcho::Rendered(String::new()),
+                "Value with length 0 at '/channelParameters/text/inlineTemplateBody' failed to \
+                 satisfy constraint: Member must have length between 1 and 6000, inclusive",
+            ),
+            (
+                "a value no rendering at hand measures: no length is stated",
+                "notifyCodeConfigurationName",
+                ViolationKind::MaxLength(64),
+                SubmittedEcho::Unrendered,
+                "Value at '/notifyCodeConfigurationName' failed to satisfy constraint: Member \
+                 must have length between 1 and 64, inclusive",
             ),
         ];
 
-        for (case, path, kind, expected) in rows {
+        for (case, path, kind, echo, expected) in rows {
             let violation = Violation {
                 path: path.to_string(),
                 kind,
-                // A value the walk recorded is never stated: the clause is about the member
-                // and the rule.
-                value: Some("a value the caller sent".to_string()),
+                // A value the walk recorded is never stated: the clause is about the member,
+                // the rule, and at most how long the value was.
+                value: None,
                 sensitive: false,
             };
-            let actual = clause(&notify_create(), &violation);
+            let actual = clause(&notify_create(), &violation, &echo);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
@@ -897,15 +964,21 @@ mod tests {
             boundary_exception(&notify_create(), &[]).is_none(),
             "case \"no violation\": there is nothing to state"
         );
-        let violations: Vec<Violation> = ["notifyCodeConfigurationName", "clientToken"]
-            .into_iter()
-            .map(|path| Violation {
-                path: path.to_string(),
-                kind: ViolationKind::MissingRequiredMember,
-                value: None,
-                sensitive: false,
-            })
-            .collect();
+        let violations: Vec<(Violation, SubmittedEcho)> =
+            ["notifyCodeConfigurationName", "clientToken"]
+                .into_iter()
+                .map(|path| {
+                    (
+                        Violation {
+                            path: path.to_string(),
+                            kind: ViolationKind::MissingRequiredMember,
+                            value: None,
+                            sensitive: false,
+                        },
+                        SubmittedEcho::Absent,
+                    )
+                })
+                .collect();
 
         let one = boundary_exception(&notify_create(), &violations[..1])
             .expect("one violation words a refusal");

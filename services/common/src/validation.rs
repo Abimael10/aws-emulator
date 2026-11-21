@@ -2652,7 +2652,32 @@ pub const UNSET_MEMBER: &str = "null";
 /// `pub` for the same reason [`UNSET_MEMBER`] is.
 #[must_use]
 pub fn rendered_blob(bytes: usize) -> String {
-    format!("java.nio.HeapByteBuffer[pos=0 lim={bytes} cap={bytes}]")
+    format!("{BLOB_RENDERING_OPENING}{bytes} cap={bytes}]")
+}
+
+/// The opening of [`rendered_blob`]'s one form, up to the byte count it states first — the
+/// one place that form is written, so the renderer and [`rendered_blob_bytes`] cannot drift
+/// into two spellings of it.
+const BLOB_RENDERING_OPENING: &str = "java.nio.HeapByteBuffer[pos=0 lim=";
+
+/// The byte count a BLOB's rendering states, or `None` for text that is not one.
+///
+/// The inverse of [`rendered_blob`], which is the only rendering a blob has: a clause that
+/// states the LENGTH of the value it is about — what `@length` counts on a blob is its bytes
+/// — reads that count back out of the rendering, rather than measuring the rendering itself
+/// and stating the width of a summary in place of the size of a value.
+///
+/// `pub` for the same reason [`rendered_blob`] is: the one form has one reader, so no two
+/// services can disagree about which text is this walk's own rendering and which is a
+/// caller's.
+#[must_use]
+pub fn rendered_blob_bytes(rendering: &str) -> Option<usize> {
+    let (limit, capacity) = rendering
+        .strip_prefix(BLOB_RENDERING_OPENING)?
+        .strip_suffix(']')?
+        .split_once(" cap=")?;
+    let bytes = limit.parse::<usize>().ok()?;
+    (capacity.parse::<usize>().ok()? == bytes).then_some(bytes)
 }
 
 /// `entries` as a map renders, with the entries put in KEY order first — the form a clause

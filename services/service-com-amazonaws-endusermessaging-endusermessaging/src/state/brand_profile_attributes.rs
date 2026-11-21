@@ -170,6 +170,30 @@ pub fn brand_profile_attribute_exists_conflict(
     )
 }
 
+/// `ValidationException` for a create batch that asks for one `attributeName` more than
+/// once, reported against the repeated entry's own member at `pointer`.
+///
+/// `attributeName` "is unique within a brand profile", so a request listing the same name
+/// twice contradicts itself whatever the profile holds: it asks for a state no profile can
+/// be in, which is a fault of the REQUEST rather than of the state it met — unlike a name
+/// the profile already holds, which is the conflict
+/// [`brand_profile_attribute_exists_conflict`] states.
+///
+/// The fixed text is the `Duplicate attribute name: '…'` sentence; its one variable part is
+/// the repeated name, taken from the request. The `fieldList` entry states the same sentence
+/// about the member it names, so a caller sending a list of attributes is told which entry
+/// to change.
+#[must_use]
+pub fn duplicate_attribute_name(
+    pointer: &str,
+    attribute_name: &str,
+) -> crate::ops::types::ValidationException {
+    stated_about_member(
+        pointer,
+        format!("Duplicate attribute name: '{attribute_name}'"),
+    )
+}
+
 /// The `category` values this service supports.
 ///
 /// `BrandProfileAttributeCategory` is modelled as a plain 1..64 string and documented
@@ -211,35 +235,177 @@ pub fn is_supported_attribute_category(category: &str) -> bool {
 /// caller sending a list of attributes is told which entry to change.
 #[must_use]
 pub fn invalid_category(pointer: &str, category: &str) -> crate::ops::types::ValidationException {
-    let message = format!(
-        "Invalid category '{category}'. Supported values: {}",
-        SUPPORTED_ATTRIBUTE_CATEGORIES.join(", ")
-    );
-    crate::ops::types::ValidationException {
-        message: message.clone(),
-        field_list: Some(vec![crate::ops::types::ValidationExceptionField {
-            path: pointer.to_string(),
-            message,
-        }]),
-    }
+    stated_about_member(
+        pointer,
+        format!(
+            "Invalid category '{category}'. Supported values: {}",
+            SUPPORTED_ATTRIBUTE_CATEGORIES.join(", ")
+        ),
+    )
+}
+
+/// The file types the media an attribute holds may be, as this API names them in the
+/// refusal of anything else, each with the MIME type that format's own signature announces
+/// ([`media_content_type`]).
+///
+/// An `IMAGE` or `DOCUMENT` attribute's media is content this API serves back to a caller
+/// (`mediaDownloadUrl`), so it holds only the formats it serves; the set is this service's
+/// own, as its refusal lists it.
+const SUPPORTED_MEDIA_FILE_TYPES: [(&str, &str); 3] = [
+    ("PDF", "application/pdf"),
+    ("JPEG", "image/jpeg"),
+    ("PNG", "image/png"),
+];
+
+/// Whether media announcing `content_type` is one of [`SUPPORTED_MEDIA_FILE_TYPES`].
+///
+/// The type is the one the content's own signature announces ([`media_content_type`]) rather
+/// than anything a request declared about it — the input declares nothing — so what decides
+/// this is the type a download of that media would be served under. Bytes announcing no
+/// known format at all are not one of them: an attribute's media is served back under a
+/// type, so content naming none is content this API cannot serve.
+#[must_use]
+pub fn is_supported_media_file_type(content_type: &str) -> bool {
+    SUPPORTED_MEDIA_FILE_TYPES
+        .iter()
+        .any(|(_, mime)| *mime == content_type)
+}
+
+/// `ValidationException` for media whose file type is not one this API holds, reported
+/// against the member that named it at `pointer`.
+///
+/// The fixed text is the `Unsupported file type for attribute '…'. Allowed: …` sentence over
+/// [`SUPPORTED_MEDIA_FILE_TYPES`]; its one variable part is the name the request names the
+/// attribute by.
+#[must_use]
+pub fn unsupported_media_file_type(
+    pointer: &str,
+    attribute_name: &str,
+) -> crate::ops::types::ValidationException {
+    let allowed: Vec<&str> = SUPPORTED_MEDIA_FILE_TYPES
+        .iter()
+        .map(|(label, _)| *label)
+        .collect();
+    stated_about_member(
+        pointer,
+        format!(
+            "Unsupported file type for attribute '{attribute_name}'. Allowed: {}",
+            allowed.join(", ")
+        ),
+    )
+}
+
+/// `ValidationException` for a request offering an attribute BOTH of the two members that
+/// carry its content, reported against the text member at `pointer`.
+///
+/// An attribute holds one content: the text member and the media member are alternatives, so
+/// a request supplying both asks for two contents at once and names no single one — which is
+/// a fault of the request whatever the attribute's type is, and is therefore stated without
+/// one. The fixed text is the `Only one of … can be provided for attribute '…'` sentence;
+/// its one variable part is the name the request names the attribute by.
+#[must_use]
+pub fn attribute_content_members_are_exclusive(
+    pointer: &str,
+    attribute_name: &str,
+) -> crate::ops::types::ValidationException {
+    stated_about_member(
+        pointer,
+        format!(
+            "Only one of attributeValue or attachmentBody can be provided for attribute \
+             '{attribute_name}'"
+        ),
+    )
+}
+
+/// The object KEY a media attribute's `attributeValue` names, or `None` when that value
+/// names no object: the key of the `s3://<bucket>/<key>` URI it has to be
+/// ([`::service_common::s3_uri::object_address`], the one reading of that spelling for every
+/// service).
+///
+/// An `IMAGE` or `DOCUMENT` attribute holds media rather than text, so the text member of
+/// one carries where that media lives instead of the content itself; a value that is no such
+/// location asks the attribute to hold text it cannot hold
+/// ([`attribute_value_not_a_media_location`]). A `TEXT` attribute's value is free text and is
+/// held to nothing here.
+#[must_use]
+pub fn media_location_key(attribute_value: &str) -> Option<String> {
+    ::service_common::s3_uri::object_address(attribute_value).map(|(_bucket, key)| key)
+}
+
+/// `ValidationException` for a media attribute whose `attributeValue` is not an S3 object
+/// location, reported against that member at `pointer`.
+///
+/// The fixed text is the `attributeValue must be an S3 URL (s3://bucket/key) for …` sentence;
+/// its variable parts are the attribute's own type and the name the request names it by.
+#[must_use]
+pub fn attribute_value_not_a_media_location(
+    pointer: &str,
+    attribute_type: &str,
+    attribute_name: &str,
+) -> crate::ops::types::ValidationException {
+    stated_about_member(
+        pointer,
+        format!(
+            "attributeValue must be an S3 URL (s3://bucket/key) for {attribute_type} attribute \
+             '{attribute_name}'"
+        ),
+    )
 }
 
 /// `ValidationException` for a request supplying `member` for an attribute whose
 /// `attribute_type` does not take it, reported against the member at `pointer`.
 ///
 /// Which member carries an attribute's content follows from its type: `attachmentBody`
-/// is "The binary content for an attribute of type IMAGE or DOCUMENT" and
-/// `attributeValue` "applies to attributes of type TEXT. For attributes of type IMAGE or
-/// DOCUMENT, provide the media through the attachment body instead". The fixed text is
-/// the `… cannot be provided for … attribute` sentence; its variable parts are the
-/// member the request supplied and the stored attribute's own type.
+/// is "The binary content for an attribute of type IMAGE or DOCUMENT", so a `TEXT`
+/// attribute takes none, and an update of a media attribute takes no inline value. The
+/// fixed text is the `… cannot be provided for … attribute` sentence; its variable parts are
+/// the member the request supplied and the attribute's own type.
 #[must_use]
 pub fn member_not_for_attribute_type(
     pointer: &str,
     member: &str,
     attribute_type: &str,
 ) -> crate::ops::types::ValidationException {
-    let message = format!("{member} cannot be provided for {attribute_type} attribute");
+    stated_about_member(pointer, member_not_taken(member, attribute_type, None))
+}
+
+/// [`member_not_for_attribute_type`] for a request that DESCRIBES the attribute at fault
+/// rather than only addressing it: the sentence closes with the name that request gave it,
+/// so a caller whose one request carries several attributes is told which of them it is
+/// about.
+///
+/// The name is the value the request supplied for that entry, quoted back to the caller that
+/// sent it — unlike a refusal about an attribute the request only ADDRESSES
+/// ([`brand_profile_attribute_not_found`]), whose name stays in the member modelled for it.
+#[must_use]
+pub fn member_not_for_named_attribute_type(
+    pointer: &str,
+    member: &str,
+    attribute_type: &str,
+    attribute_name: &str,
+) -> crate::ops::types::ValidationException {
+    stated_about_member(
+        pointer,
+        member_not_taken(member, attribute_type, Some(attribute_name)),
+    )
+}
+
+/// The sentence both of the two above state: the member the request supplied, the type that
+/// does not take it, and — where the request describes the attribute itself — its name.
+fn member_not_taken(member: &str, attribute_type: &str, attribute_name: Option<&str>) -> String {
+    match attribute_name {
+        Some(name) => {
+            format!("{member} cannot be provided for {attribute_type} attribute '{name}'")
+        }
+        None => format!("{member} cannot be provided for {attribute_type} attribute"),
+    }
+}
+
+/// `message` as this API states a refusal it words ITSELF about one member: the sentence as
+/// the summary, and the same sentence as the `fieldList` entry of the member at `pointer` —
+/// the JSONPointer of that member in the request document, which is what
+/// `ValidationExceptionField$path` documents.
+fn stated_about_member(pointer: &str, message: String) -> crate::ops::types::ValidationException {
     crate::ops::types::ValidationException {
         message: message.clone(),
         field_list: Some(vec![crate::ops::types::ValidationExceptionField {
