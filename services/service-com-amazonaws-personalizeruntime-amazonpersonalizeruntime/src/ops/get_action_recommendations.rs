@@ -89,7 +89,7 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::{self as registry, scoring, Action, Denied, Entity, RecipeType, RequiredInput};
+use crate::state::{self as registry, scoring, Denied, Entity, RecipeType, RequiredInput};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -259,33 +259,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //    same shared helper the sibling operations score through, without the
         //    `context` member this operation's model does not carry.
         let seed = scoring::Seed::without_context(&campaign.arn, user_id);
-        let mut ranked: Vec<(&Action, f64)> = catalog
-            .iter()
-            .map(|action| {
-                let score = seed.relevance(action.base_score, &action.action_id);
-                (action, score)
-            })
-            .collect();
         // The reported score of an action is the model's certainty for the (campaign,
         // userId, action) triple, so the denominator is the WHOLE scored catalog and is
         // settled before any member that only selects which actions come back — the
-        // request's filter and `numResults`. A response that reports fewer actions
-        // reports each of them with the same score a larger one would, and sums to at
-        // most 1.0.
-        scoring::normalize_by(&mut ranked, |(_, score)| score);
-        // "the filter to apply to the returned recommendations" — it decides WHICH
-        // actions come back, never what one of them scores.
-        ranked.retain(|(action, _)| {
-            request_filter.as_ref().is_none_or(|filter| {
-                filter.retains(recorded.facts(&action.action_id, &action.attributes))
-            })
-        });
-        ranked.sort_by(|(left, left_score), (right, right_score)| {
-            scoring::by_score_desc(
-                (left.action_id.as_str(), *left_score),
-                (right.action_id.as_str(), *right_score),
-            )
-        });
+        // request's filter ("the filter to apply to the returned recommendations", which
+        // decides WHICH actions come back, never what one of them scores) and
+        // `numResults`. That ORDER is the rule the sibling operations report their own
+        // catalogs under, so it is applied through the one shared pipeline
+        // (`scoring::ranked`) rather than restated here: a response that reports fewer
+        // actions reports each of them with the same score a larger one would, and sums
+        // to at most 1.0.
+        let mut ranked = scoring::ranked(
+            catalog.iter(),
+            &seed,
+            request_filter.as_ref(),
+            &recorded,
+        );
         ranked.truncate(num_results);
 
         let action_list: Vec<PredictedAction> = ranked

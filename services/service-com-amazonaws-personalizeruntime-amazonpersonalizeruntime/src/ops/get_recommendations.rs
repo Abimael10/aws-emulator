@@ -350,35 +350,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             personalization,
             input.context.as_ref(),
         );
-        let mut candidates: Vec<(usize, f64)> = catalog
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| {
-                !(resolved.required_input == RequiredInput::Item && item.item_id == item_id)
-            })
-            .map(|(index, item)| (index, seed.relevance(item.base_score, &item.item_id)))
-            .collect();
         // The reported score of an item is the model's certainty for the resolved
         // resource, the request's personalization inputs and that item, so the
-        // denominator is the WHOLE scored catalog and is settled before any member
-        // that only selects which items come back — the request's filter, `numResults`
-        // and a promotion. A response that reports fewer items reports each of them
-        // with the same score a larger one would, and sums to at most 1.0.
-        scoring::normalize_by(&mut candidates, |(_, score)| score);
-        // "a filter you created to include items or exclude items from recommendations"
-        // — it decides WHICH candidates come back, never what one of them scores.
-        candidates.retain(|(index, _)| {
-            request_filter.as_ref().is_none_or(|filter| {
-                let item = &catalog[*index];
-                filter.retains(recorded.facts(&item.item_id, &item.attributes))
-            })
-        });
-        candidates.sort_by(|(left, left_score), (right, right_score)| {
-            scoring::by_score_desc(
-                (&catalog[*left].item_id, *left_score),
-                (&catalog[*right].item_id, *right_score),
-            )
-        });
+        // denominator is the WHOLE scored catalog and is settled before any member that
+        // only selects which items come back — the request's filter ("a filter you
+        // created to include items or exclude items from recommendations", which decides
+        // WHICH candidates come back, never what one of them scores), `numResults` and a
+        // promotion. That ORDER is the rule the sibling operations report their own
+        // catalogs under, so it is applied through the one shared pipeline
+        // (`scoring::ranked`) rather than restated here: a response that reports fewer
+        // items reports each of them with the same score a larger one would, and sums to
+        // at most 1.0.
+        let candidates = scoring::ranked(
+            catalog.iter().filter(|item| {
+                !(resolved.required_input == RequiredInput::Item && item.item_id == item_id)
+            }),
+            &seed,
+            request_filter.as_ref(),
+            &recorded,
+        );
 
         // 8. Fill the returned slots: the promotion's share first, then the rest of
         //    the ranking. Both are drawn in descending-score order, and the chosen
@@ -394,11 +384,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut chosen: Vec<(usize, bool)> = Vec::new();
         if let Some(promotion) = promotion.as_ref() {
             let slots = promoted_slots(reported, promotion.percent);
-            for (position, (index, _)) in candidates.iter().enumerate() {
+            for (position, (item, _)) in candidates.iter().enumerate() {
                 if chosen.len() >= slots {
                     break;
                 }
-                let item = &catalog[*index];
                 if promotion
                     .filter
                     .retains(recorded.facts(&item.item_id, &item.attributes))
@@ -421,8 +410,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let item_list: Vec<PredictedItem> = chosen
             .iter()
             .map(|(position, promoted)| {
-                let (index, score) = candidates[*position];
-                let item = &catalog[index];
+                let (item, score) = candidates[*position];
                 PredictedItem {
                     item_id: Some(item.item_id.clone()),
                     score: Some(score),

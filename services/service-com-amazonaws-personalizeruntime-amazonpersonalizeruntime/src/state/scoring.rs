@@ -2,6 +2,12 @@
 
 //! The deterministic scoring the three runtime operations share.
 //!
+//! Each stored catalog entry's prediction score is composed here ([`Seed`]), each
+//! entry's share of the reported certainty is settled here ([`normalize`]), and the
+//! order in which those two and the request's filter are applied to a whole catalog is
+//! stated once here as well ([`ranked`]), so the operations that report a catalog of
+//! their own choosing cannot drift apart on it.
+//!
 //! # Why a hash, and why no clock or randomness
 //!
 //! All three operations are `@idempotent` in the model, and their documented output
@@ -32,9 +38,13 @@
 //! of a personalization model. It is NOT a model, and nothing here claims to be one;
 //! the scores are derived from stored state rather than canned.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use sha2::{Digest, Sha256};
+
+use super::filter::BoundFilter;
+use super::ingested::RecordedInteractions;
+use super::{Action, Item};
 
 /// `parts` written as ONE string that can be read back as exactly that sequence of
 /// parts: each part prefixed by its BYTE LENGTH and a colon.
@@ -250,3 +260,96 @@ pub fn by_score_desc<Key: Ord>(left: (Key, f64), right: (Key, f64)) -> std::cmp:
         .unwrap_or(std::cmp::Ordering::Equal)
         .then_with(|| left.0.cmp(&right.0))
 }
+
+/// One entry of a resource's stored catalog, as [`ranked`] reads it: the id a score is
+/// seeded with and reported under, the stored popularity the score is derived from, and
+/// the entity-dataset columns a filter clause reads.
+///
+/// Implemented for every catalog element type an operation recommends from, so the
+/// pipeline below is stated once over all of them rather than once per element type.
+pub trait CatalogEntry {
+    /// The entry's own id — `itemId` or `actionId`.
+    fn entry_id(&self) -> &str;
+
+    /// The entry's popularity in the stored catalog.
+    fn base_score(&self) -> f64;
+
+    /// The entry's entity-dataset columns, keyed by column name.
+    fn attributes(&self) -> &BTreeMap<String, String>;
+}
+
+impl CatalogEntry for Item {
+    fn entry_id(&self) -> &str {
+        &self.item_id
+    }
+
+    fn base_score(&self) -> f64 {
+        self.base_score
+    }
+
+    fn attributes(&self) -> &BTreeMap<String, String> {
+        &self.attributes
+    }
+}
+
+impl CatalogEntry for Action {
+    fn entry_id(&self) -> &str {
+        &self.action_id
+    }
+
+    fn base_score(&self) -> f64 {
+        self.base_score
+    }
+
+    fn attributes(&self) -> &BTreeMap<String, String> {
+        &self.attributes
+    }
+}
+
+/// `catalog` scored for `seed`, each entry's share settled over the WHOLE scored
+/// catalog, then the request's `filter` applied, then ordered by score descending —
+/// the ORDER in which an operation that chooses its own list applies the three rules
+/// above, stated once.
+///
+/// The order is the rule, not an implementation detail of one operation: the
+/// denominator behind a reported score is the whole scored catalog, so normalization
+/// is settled BEFORE any member of the request that merely selects which entries come
+/// back ([`normalize_by`]), and the list is then reported through the one comparator
+/// all these operations share ([`by_score_desc`]), tie-broken by the entry's own id.
+/// A caller selects the entries it reports from the returned list — how many
+/// (`numResults`), and which of them a promotion takes — which can no longer move the
+/// score of any of them.
+///
+/// `catalog` is the candidate set: an entry a personalization input excludes from
+/// being recommended at all (never a selection member) is left out by the caller
+/// before scoring, because such an entry is no candidate and therefore no part of the
+/// denominator either. `filter` is the request's bound filter, applied to the facts
+/// each entry carries for the user this request personalizes for (`recorded`).
+pub fn ranked<'a, Entry: CatalogEntry + 'a>(
+    catalog: impl IntoIterator<Item = &'a Entry>,
+    seed: &Seed<'_>,
+    filter: Option<&BoundFilter>,
+    recorded: &RecordedInteractions,
+) -> Vec<(&'a Entry, f64)> {
+    let mut ranked: Vec<(&'a Entry, f64)> = catalog
+        .into_iter()
+        .map(|entry| {
+            let score = seed.relevance(entry.base_score(), entry.entry_id());
+            (entry, score)
+        })
+        .collect();
+    normalize_by(&mut ranked, |(_, score)| score);
+    ranked.retain(|(entry, _)| {
+        filter.is_none_or(|filter| {
+            filter.retains(recorded.facts(entry.entry_id(), entry.attributes()))
+        })
+    });
+    ranked.sort_by(|(left, left_score), (right, right_score)| {
+        by_score_desc(
+            (left.entry_id(), *left_score),
+            (right.entry_id(), *right_score),
+        )
+    });
+    ranked
+}
+
