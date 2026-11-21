@@ -311,6 +311,12 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
+        // Either Directory Service directory publishes the `Alias` that service answers its
+        // access URL under — the directory id itself until an alias is assigned — and a
+        // Simple AD the `DirectoryId` it minted beside it. Their `DnsIpAddresses` is a LIST,
+        // so no attribute carries it ([`DIRECTORY_SERVICE_MICROSOFT_AD_ATTRIBUTES`]).
+        DIRECTORY_SERVICE_MICROSOFT_AD => DIRECTORY_SERVICE_MICROSOFT_AD_ATTRIBUTES,
+        DIRECTORY_SERVICE_SIMPLE_AD => DIRECTORY_SERVICE_SIMPLE_AD_ATTRIBUTES,
         // An Application Signals service level objective publishes the ARN these naming rules
         // compute from its name beside the four read-only values that service decides; a
         // GROUPING CONFIGURATION publishes the one instant its put recorded; and an
@@ -922,6 +928,16 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // The two DIRECTORY SERVICE directory types are two more: neither `CreateMicrosoftAD`
+        // nor `CreateDirectory` takes an identifier — a declaration states the directory's
+        // fully qualified name, its administrator password and the subnets its servers go in —
+        // and each answers the `DirectoryId` that service minted (`^d-[0-9a-f]{10}$`), which
+        // is what "Ref returns the directory ID" publishes and the handle every operation on
+        // a directory takes. The `Name` a declaration states is the DNS name the directory
+        // answers for, which no call of that service accepts as a directory id, so the
+        // identity in force is the one that service answered.
+        || resource_type == DIRECTORY_SERVICE_MICROSOFT_AD
+        || resource_type == DIRECTORY_SERVICE_SIMPLE_AD
         // The two Billing and Cost Management Dashboards types are two more: neither
         // `CreateDashboard` nor `CreateScheduledReport` takes an identifier — a template
         // declares a dashboard's widgets and a report's schedule — and each answers the
@@ -2031,6 +2047,16 @@ pub(super) const DETECTOR_ID_SALT: &str = "guardduty/detector-id";
 /// detector of the same name. The WIDTH is [`DETECTOR_ID_HEX_DIGITS`]: GuardDuty mints an
 /// `IpSetId` with the same `mint_id` it mints a detector id with.
 pub(super) const IP_SET_ID_SALT: &str = "guardduty/ip-set-id";
+
+/// The form of the identifier Directory Service mints for a directory, from that model's own
+/// `DirectoryId` (`^d-[0-9a-f]{10}$`): the prefix, and the ten lowercase hexadecimal
+/// characters after it.
+pub(super) const DIRECTORY_ID_PREFIX: &str = "d-";
+pub(super) const DIRECTORY_ID_HEX_DIGITS: usize = 10;
+
+/// The salt the stand-in directory id is derived under (see [`derived_digits`]), so it cannot
+/// collide with another identifier derived for the same resource.
+pub(super) const DIRECTORY_ID_SALT: &str = "directoryservice/directory-id";
 
 /// The prefix of an experiment-template id, as FIS mints one (`EXT` + a base-36 suffix;
 /// FIS's own `TEMPLATE_ID_PREFIX`).

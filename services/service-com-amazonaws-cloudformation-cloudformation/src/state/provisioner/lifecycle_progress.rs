@@ -187,6 +187,14 @@ impl Provisioner {
             Self::MwaaEnvironment => {
                 mwaa_environment_readiness(ctx, region, physical_resource_id).await
             }
+            // A created directory is `Requested` and then `Creating` — its domain controllers
+            // are still being built, and it serves no directory traffic in either stage — so
+            // the resource is held open until Directory Service reports it `Active`, which is
+            // also when the alias and the single sign-on flag the declaration asks for are
+            // applied: that service takes either only on a directory that is serving.
+            Self::DirectoryServiceDirectory(_) => {
+                ds_directory_readiness(ctx, region, physical_resource_id, declared).await
+            }
             // `CreateCluster` answers a cluster `creating`, in which it serves no connection
             // and publishes no endpoint at all, so the resource's creation is finished once
             // Amazon Redshift reports it `available`.
@@ -363,6 +371,13 @@ impl Provisioner {
             Self::MwaaEnvironment => {
                 mwaa_environment_ready_attributes(ctx, region, physical_resource_id).await
             }
+            // A directory's `Alias` is the directory id itself until an alias is assigned, and
+            // its DNS servers hold no address until its controllers are up, so the type's
+            // attributes are read off the directory again once that service reports it
+            // `Active`.
+            Self::DirectoryServiceDirectory(kind) => {
+                ds_directory_ready_attributes(ctx, region, kind, physical_resource_id).await
+            }
             // A graph has no endpoint while it is `CREATING`: the address a client reaches it
             // at is one Neptune Analytics publishes once the graph is serving, so the type's
             // attributes are read off the graph again once it reports it `AVAILABLE`. (A
@@ -469,6 +484,13 @@ impl Provisioner {
             // and the deletion is finished once Amazon MWAA no longer holds it.
             Self::MwaaEnvironment => {
                 mwaa_environment_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteDirectory` leaves the directory `Deleting` — the modelled stage it is
+            // reported in while its servers are decommissioned — so it is still there when the
+            // delete answers and the deletion is finished once Directory Service no longer
+            // holds it.
+            Self::DirectoryServiceDirectory(_) => {
+                ds_directory_removal(ctx, region, physical_resource_id).await
             }
             // "The `DeleteCacheCluster` operation deletes a previously provisioned cluster"
             // and leaves it `deleting` while it does, so the cluster is still there when the

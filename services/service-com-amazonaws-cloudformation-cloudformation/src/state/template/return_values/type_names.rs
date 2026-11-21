@@ -276,6 +276,30 @@ pub const BRAKET_ARN_NAMESPACE: &str = "braket";
 /// for it, from that same pattern.
 pub(super) const BRAKET_SPENDING_LIMIT_PATH: &str = "spending-limit";
 
+/// The `AWS::<cloudFormationName>::<Resource>` types of the two Directory Service directories
+/// a template declares: the AWS Managed Microsoft AD directory `CreateMicrosoftAD` makes, and
+/// the Simple AD directory `CreateDirectory` makes. The middle segment is that model's own
+/// `awsService.cloudFormationName` (`DirectoryService`).
+///
+/// "Ref returns the directory ID" for either — the `^d-[0-9a-f]{10}$` identifier that service
+/// MINTS, which no naming rule could compute and which every operation on a directory takes,
+/// so [`identity_is_service_assigned`] names both types. `Fn::GetAtt` reads the directory's
+/// `Alias` ("if no alias exists, the alias is the directory identifier") and its
+/// `DnsIpAddresses`, a LIST this catalogue therefore stands in for no value of; a Simple AD
+/// publishes its `DirectoryId` beside them.
+pub const DIRECTORY_SERVICE_MICROSOFT_AD: &str = "AWS::DirectoryService::MicrosoftAD";
+pub const DIRECTORY_SERVICE_SIMPLE_AD: &str = "AWS::DirectoryService::SimpleAD";
+
+/// Every `Fn::GetAtt` attribute either directory type publishes that these naming rules
+/// compute a stand-in for, in the sorted order a resource's own attribute map holds them in.
+///
+/// The `DnsIpAddresses` both types publish is not among them: it is a LIST, and the attribute
+/// map is string-valued, so it reaches the resource one element per indexed key off that
+/// service's own description of the directory — the position a hosted zone's `NameServers` is
+/// in.
+pub(super) const DIRECTORY_SERVICE_MICROSOFT_AD_ATTRIBUTES: &[&str] = &["Alias"];
+pub(super) const DIRECTORY_SERVICE_SIMPLE_AD_ATTRIBUTES: &[&str] = &["Alias", "DirectoryId"];
+
 /// The `AWS::<cloudFormationName>::<Resource>` types of the three CloudWatch Application
 /// Signals resources a template declares. The middle segment is that model's own
 /// `awsService.sdkId` (`Application Signals`) with its space closed up, as the resource-type

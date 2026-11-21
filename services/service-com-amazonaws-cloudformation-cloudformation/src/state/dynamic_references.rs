@@ -350,8 +350,8 @@ async fn resolve(
 /// stand at, with `/` between the members ([`property_path`] builds the same spelling for
 /// the reference being judged).
 const SSM_SECURE_PROPERTIES: &[(&str, &[&str])] = &[
-    ("AWS::DirectoryService::MicrosoftAD", &["Password"]),
-    ("AWS::DirectoryService::SimpleAD", &["Password"]),
+    (super::template::DIRECTORY_SERVICE_MICROSOFT_AD, &["Password"]),
+    (super::template::DIRECTORY_SERVICE_SIMPLE_AD, &["Password"]),
     ("AWS::ElastiCache::ReplicationGroup", &["AuthToken"]),
     ("AWS::IAM::User", &["LoginProfile/Password"]),
     (

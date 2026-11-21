@@ -104,6 +104,32 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // Everything about a Directory Service directory but its single sign-on flag is fixed
+        // when that service makes it: the fully qualified name, the NetBIOS short name, the
+        // administrator password, the placement and the edition or size are all members of
+        // `CreateMicrosoftAD`/`CreateDirectory`, and that service publishes no call that
+        // changes any of them on a directory that exists — so a declaration restating one asks
+        // for a DIFFERENT directory, which CloudFormation replaces. `CreateAlias` is here for
+        // the same reason: an alias "cannot be deleted or reused", so asking for one on a
+        // directory that already carries its own is asking for another directory. (The `Name`
+        // is in this position through [`name_is_create_only`] as well. `EnableSso` is
+        // deliberately absent: `EnableSso`/`DisableSso` turn the flag over in place, which is
+        // what [`crate::state::provisioner`] applies for a changed declaration of it.)
+        DIRECTORY_SERVICE_MICROSOFT_AD => &[
+            "CreateAlias",
+            "Edition",
+            "Password",
+            "ShortName",
+            "VpcSettings",
+        ],
+        DIRECTORY_SERVICE_SIMPLE_AD => &[
+            "CreateAlias",
+            "Description",
+            "Password",
+            "ShortName",
+            "Size",
+            "VpcSettings",
+        ],
         // An Application Signals instrumentation configuration keeps everything it was created
         // with: "configurations are immutable after creation"
         // (`CreateInstrumentationConfiguration`), and that service publishes no call that

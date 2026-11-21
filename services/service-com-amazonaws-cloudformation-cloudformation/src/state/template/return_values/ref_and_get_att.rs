@@ -2582,6 +2582,34 @@ pub(crate) fn return_values(
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the directory ID"; Fn::GetAtt: Alias and DnsIpAddresses, with a Simple
+        // AD publishing DirectoryId beside them. Directory Service ASSIGNS that id — neither
+        // `CreateMicrosoftAD` nor `CreateDirectory` takes an identifier, and the `Name` a
+        // declaration states is the DNS name the directory answers for — so a declaration
+        // reports an identifier of that service's own shape (`d-` and ten lowercase
+        // hexadecimal characters) rather than that name, which no call of that service would
+        // accept as a directory id. The ALIAS stands in as the id itself, which is what that
+        // service reports for a directory no alias has been assigned to ("if no alias exists,
+        // the alias is the directory identifier"). These are the types
+        // `super::provisioning` creates in Directory Service itself, which reports the id IT
+        // minted and the alias and DNS addresses it holds back over these attributes — and
+        // THOSE, not these, are what the stack reports for a directory that service created.
+        DIRECTORY_SERVICE_MICROSOFT_AD | DIRECTORY_SERVICE_SIMPLE_AD => {
+            let id = format!(
+                "{DIRECTORY_ID_PREFIX}{}",
+                derived_digits(
+                    DIRECTORY_ID_SALT,
+                    name,
+                    DIRECTORY_ID_HEX_DIGITS,
+                    Alphabet::Lower,
+                )
+            );
+            attributes.insert("Alias".to_string(), id.clone());
+            if resource_type == DIRECTORY_SERVICE_SIMPLE_AD {
+                attributes.insert("DirectoryId".to_string(), id.clone());
+            }
+            (id, attributes)
+        }
         // "Ref returns the hosted zone ID"; Fn::GetAtt: Id, NameServers. Route 53 ASSIGNS
         // that id — `CreateHostedZone` takes no identifier, and the zone's `Name` is only
         // the DNS name it answers for — so a declaration reports an identifier of Route 53's

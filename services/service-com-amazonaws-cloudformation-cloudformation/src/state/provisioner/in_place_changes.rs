@@ -487,6 +487,14 @@ impl Provisioner {
             // when an environment is made — which replace the resource instead — so a changed
             // declaration is applied to that environment rather than replacing it.
             Self::MwaaEnvironment => update_mwaa_environment(ctx, region, resource, declared).await,
+            // The single sign-on flag is the one property of either Directory Service
+            // directory type a call of that service changes in place (`EnableSso` /
+            // `DisableSso`); every other property is create-only, so a changed declaration of
+            // one replaces the directory instead of reaching here.
+            Self::DirectoryServiceDirectory(kind) => {
+                update_ds_directory(ctx, region, kind, resource, declared).await
+            }
+
             // `UpdateApi` ("updates an Api resource") is the one call that changes an api API
             // Gateway v2 already holds, and every property of
             // `AWS::ApiGatewayV2::Api` but its protocol, its definition and its tags is a

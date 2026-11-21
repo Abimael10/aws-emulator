@@ -674,6 +674,12 @@ impl Provisioner {
             Self::MwaaEnvironment => {
                 describe_mwaa_environment(ctx, region, physical_resource_id).await
             }
+            // Directory Service's own description of the directory, by the id it minted for
+            // it.
+            Self::DirectoryServiceDirectory(_) => {
+                describe_ds_directory(ctx, region, physical_resource_id).await
+            }
+
             // X-Ray publishes no read of ONE sampling rule, so the rule is read out of the
             // account's own listing, by the identity that service minted for it.
             Self::XraySamplingRule => describe_sampling_rule(ctx, region, resource).await,

@@ -151,6 +151,12 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // `snapshotIdentifier` every call on one takes.
         NEPTUNE_GRAPH_GRAPH => "GraphId",
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => "Id",
+        // A Simple AD directory, identified by the `DirectoryId` Directory Service minted for
+        // it ("Ref returns the directory ID") — the handle every operation on a directory
+        // takes, which this type publishes as a return value of its own. (An
+        // `AWS::DirectoryService::MicrosoftAD` needs no row: it publishes no return value
+        // carrying that id, and this answer can only name one the type publishes.)
+        DIRECTORY_SERVICE_SIMPLE_AD => "DirectoryId",
         // An AWS Amplify app, identified by the ARN that service built around the id it minted
         // ("Ref returns the ARN of the app"), which is the type's primary identifier. (The
         // three Amplify UI Builder entities need no row: each is identified by the app, the

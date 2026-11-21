@@ -523,6 +523,7 @@ use super::template::{
     MSK_CONFIGURATION_REVISION_CREATION_TIME, MSK_CONFIGURATION_REVISION_DESCRIPTION,
     MSK_CONFIGURATION_REVISION_NUMBER,
     MSK_SERVERLESS_CLUSTER, MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH, NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
+    DIRECTORY_SERVICE_MICROSOFT_AD, DIRECTORY_SERVICE_SIMPLE_AD,
     NETWORK_SECURITY_MANAGER_POLICY, NETWORK_SECURITY_MANAGER_RULE,
     NETWORK_SECURITY_MANAGER_SCOPE, NETWORK_SECURITY_MANAGER_TEMPLATE,
     OPENSEARCH_DOMAIN, PIPES_PIPE, RBIN_RULE,
@@ -1311,6 +1312,16 @@ pub(super) enum Provisioner {
     /// resource's creation and its deletion are each held open on that service's own report
     /// of the environment.
     MwaaEnvironment,
+    /// `AWS::DirectoryService::MicrosoftAD` and `AWS::DirectoryService::SimpleAD`: the two
+    /// directories of Directory Service's own control plane, which `CreateMicrosoftAD` and
+    /// `CreateDirectory` make in the caller's VPC, `EnableSso`/`DisableSso` turn single sign-on
+    /// over on and `DeleteDirectory` removes. That service MINTS the `DirectoryId` either type
+    /// publishes — the handle every operation on a directory takes — so it is read off that
+    /// create's own answer and is the identity a `Ref` resolves to. Both lifecycle changes are
+    /// asynchronous, so the resource's creation and its deletion are each held open on that
+    /// service's own description of the directory. Which of the two types it is travels with
+    /// the variant ([`directory_service_directories::DirectoryKind`]).
+    DirectoryServiceDirectory(directory_service_directories::DirectoryKind),
     /// `AWS::XRay::SamplingRule`: a sampling rule of AWS X-Ray, which
     /// `CreateSamplingRule` creates under the rule name its declaration states and
     /// `DeleteSamplingRule` deletes. X-Ray mints the `RuleARN` that type's `Ref`
@@ -1643,6 +1654,13 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         AMPLIFY_APP => Some(Provisioner::AmplifyApp),
         AMPLIFY_BRANCH => Some(Provisioner::AmplifyBranch),
         MWAA_ENVIRONMENT => Some(Provisioner::MwaaEnvironment),
+        DIRECTORY_SERVICE_MICROSOFT_AD => Some(Provisioner::DirectoryServiceDirectory(
+            directory_service_directories::DirectoryKind::MicrosoftAd,
+        )),
+        DIRECTORY_SERVICE_SIMPLE_AD => Some(Provisioner::DirectoryServiceDirectory(
+            directory_service_directories::DirectoryKind::SimpleAd,
+        )),
+
         XRAY_SAMPLING_RULE => Some(Provisioner::XraySamplingRule),
         XRAY_GROUP => Some(Provisioner::XrayGroup),
         CONFIG_CONFIGURATION_RECORDER => Some(Provisioner::ConfigConfigurationRecorder),
@@ -2542,6 +2560,13 @@ impl Provisioner {
             Self::MwaaEnvironment => {
                 create_mwaa_environment(ctx, region, resource, propagated).await
             }
+            // Neither `AWS::DirectoryService::*` type publishes a `Tags` property — Directory
+            // Service holds a directory's tags through its own `AddTagsToResource` and takes
+            // none on either create — so no tags are propagated to a directory.
+            Self::DirectoryServiceDirectory(kind) => {
+                create_ds_directory(ctx, region, kind, resource).await
+            }
+
             // None of the three `AWS::Config::*` types publishes a `Tags` property — AWS
             // Config holds tags on a recorder and on a rule through its own tagging call
             // and takes none on either put — so no tags are propagated to one.
@@ -3571,6 +3596,12 @@ impl Provisioner {
             Self::MwaaEnvironment => {
                 delete_mwaa_environment(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the directory by the id Directory Service minted for it,
+            // which is this resource's physical id.
+            Self::DirectoryServiceDirectory(_) => {
+                delete_ds_directory(ctx, region, physical_resource_id).await
+            }
+
             // A rule is addressed by its name or by the ARN X-Ray minted — "either name
             // or ARN, but not both" — and the ARN is this resource's physical id.
             Self::XraySamplingRule => delete_sampling_rule(ctx, region, resource).await,
@@ -3927,6 +3958,11 @@ use amplify_ui_builder::*;
 use amplify_apps::*;
 use amplify_branches::*;
 use mwaa_environments::*;
+/// The two Directory Service directory arms, whose own `DirectoryKind` says which type an arm
+/// is working on. Visible to the rest of this service's state because that kind travels on the
+/// `Provisioner` variant the catalogue above decides.
+pub(in crate::state) mod directory_service_directories;
+use directory_service_directories::*;
 use customer_profiles_domains::*;
 use rbin_rules::*;
 use network_security_manager::*;

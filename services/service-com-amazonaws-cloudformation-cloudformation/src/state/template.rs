@@ -3056,6 +3056,11 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // The Recycle Bin retention rule, publishing the ARN and the identifier that service
     // mints for it and the lock state it keeps.
     RBIN_RULE,
+    // The two Directory Service directory types, each publishing the alias that service
+    // answers the directory's access URL under — the directory id itself until an alias is
+    // assigned — with a Simple AD publishing the id beside it.
+    DIRECTORY_SERVICE_MICROSOFT_AD,
+    DIRECTORY_SERVICE_SIMPLE_AD,
     // The four AWS Network Security Manager entities, each publishing the ARN that service
     // mints for it and the id inside that ARN.
     NETWORK_SECURITY_MANAGER_RULE,

@@ -97,7 +97,8 @@ use super::template::{
     CLEANROOMSML_TRAINING_DATASET,
     CLOUDFRONT_CONNECTION_FUNCTION, CLOUDFRONT_CONNECTION_GROUP, CLOUDFRONT_FUNCTION,
     CLOUDFRONT_KEY_VALUE_STORE, CLOUDFRONT_MONITORING_SUBSCRIPTION,
-    CUSTOMER_PROFILES_DOMAIN, GLUE_TABLE_OPTIMIZER,
+    CUSTOMER_PROFILES_DOMAIN, DIRECTORY_SERVICE_MICROSOFT_AD, DIRECTORY_SERVICE_SIMPLE_AD,
+    GLUE_TABLE_OPTIMIZER,
     IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION, MEDIACONVERT_CERTIFICATE_ASSOCIATION,
     MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
     NEPTUNE_GRAPH_GRAPH_SNAPSHOT,
@@ -491,6 +492,11 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // Amazon Detective
     "AWS::Detective::Graph",
     "AWS::Detective::MemberInvitation",
+    // AWS Directory Service. Both directory types are created in the owning service
+    // (`super::provisioner`): `CreateMicrosoftAD` makes an AWS Managed Microsoft AD directory
+    // and `CreateDirectory` a Simple AD one.
+    DIRECTORY_SERVICE_MICROSOFT_AD,
+    DIRECTORY_SERVICE_SIMPLE_AD,
     // AWS Database Migration Service
     "AWS::DMS::Certificate",
     "AWS::DMS::Endpoint",
