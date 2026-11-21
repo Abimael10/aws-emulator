@@ -9,10 +9,13 @@
 //!
 //! * [`url_event`] maps a request onto the event document the handler is given: `version`,
 //!   `routeKey`, `rawPath`, `rawQueryString`, the request's headers LOWER-CASED (duplicates
-//!   joined, which is how one header name carrying several values travels in a JSON object),
-//!   the `cookies` array the `Cookie` header is split into, `queryStringParameters`, the
-//!   `requestContext` describing the call, the `body`, and `isBase64Encoded`, which says
-//!   whether that body is the bytes themselves or their base64.
+//!   joined, which is how one header name carrying several values travels in a JSON object,
+//!   beside the `x-forwarded-for`, `x-forwarded-proto` and `x-forwarded-port` the front door
+//!   states for the hop it terminated where the client sent none of them, and the
+//!   `x-amzn-trace-id` of the chain the invocation runs under), the `cookies` array
+//!   the `Cookie` header is split into, `queryStringParameters`, the `requestContext`
+//!   describing the call, the `body`, and `isBase64Encoded`, which says whether that body is
+//!   the bytes themselves or their base64.
 //! * [`mapped_result`] maps what the handler RETURNED onto the HTTP response: a result that
 //!   names any of `statusCode`, `headers`, `cookies`, `body` or `isBase64Encoded` is the
 //!   response it describes, and any other value is the response Lambda INFERS — "If your
@@ -86,8 +89,13 @@ pub struct UrlRequest<'r> {
     pub account_id: &'r str,
     /// This request's id, which is also the invocation's.
     pub request_id: &'r str,
-    /// The address the request came from.
+    /// The address the request came from: the address of the CONNECTION it arrived on, which
+    /// the plane reads off that connection and never off a header the client wrote (see
+    /// [`event_headers`]).
     pub source_ip: &'r str,
+    /// The X-Ray tracing header this invocation RUNS under, which the handler is told about
+    /// both in its environment and among the request's headers (see [`event_headers`]).
+    pub trace_header: &'r str,
     /// When the request arrived.
     pub received: ::std::time::SystemTime,
     /// The caller, for a URL that authorizes callers by IAM.
@@ -106,7 +114,14 @@ pub fn url_event(request: &UrlRequest<'_>) -> Vec<u8> {
     if !cookies.is_empty() {
         event.insert("cookies".to_string(), json!(cookies));
     }
-    event.insert("headers".to_string(), json!(event_headers(request.headers)));
+    event.insert(
+        "headers".to_string(),
+        json!(event_headers(
+            request.headers,
+            request.source_ip,
+            request.trace_header
+        )),
+    );
     let query = query_parameters(request.raw_query);
     if !query.is_empty() {
         event.insert("queryStringParameters".to_string(), json!(query));
@@ -130,7 +145,27 @@ pub fn url_event(request: &UrlRequest<'_>) -> Vec<u8> {
 /// array it is also split into ([`cookies_of`]): a function URL reports the request's headers
 /// whole, so a handler that reads the one header and a handler that reads the array both see
 /// the cookies the request carried.
-fn event_headers(headers: &[(String, String)]) -> BTreeMap<String, String> {
+///
+/// The `X-Forwarded-*` family is what the FRONT DOOR states about the hop it terminated, and
+/// each name is written only when the client sent NONE of it, so nothing a client wrote is
+/// replaced: `x-forwarded-for` names `source_ip` — the address the CONNECTION came from —
+/// alone, `x-forwarded-proto` the scheme a function URL is reached over
+/// ([`FORWARDED_PROTO`]) and `x-forwarded-port` that scheme's own port
+/// ([`FORWARDED_PORT`]). A client that did send one of them has its own value reported
+/// VERBATIM, because it is the client's claim about the hops AHEAD of this one and the format
+/// reports the request's headers as they arrived; none of them decides what the call itself is
+/// attributed to ([`UrlRequest::source_ip`]).
+///
+/// The tracing header is the one name the front door STATES rather than fills: `trace_header`
+/// is the chain this invocation runs under, which continues the one the client named where it
+/// named one ([`UrlRequest::trace_header`]), so the header the handler reads and the
+/// `_X_AMZN_TRACE_ID` its environment reports are one value and a client cannot have its
+/// handler file work under a chain the invocation is not in.
+fn event_headers(
+    headers: &[(String, String)],
+    source_ip: &str,
+    trace_header: &str,
+) -> BTreeMap<String, String> {
     let mut mapped: BTreeMap<String, String> = BTreeMap::new();
     for (name, value) in headers {
         let name = name.to_ascii_lowercase();
@@ -143,7 +178,46 @@ fn event_headers(headers: &[(String, String)]) -> BTreeMap<String, String> {
             .or_insert_with(|| value.clone());
     }
     mapped
+        .entry(FORWARDED_FOR_HEADER.to_string())
+        .or_insert_with(|| source_ip.to_string());
+    mapped
+        .entry(FORWARDED_PROTO_HEADER.to_string())
+        .or_insert_with(|| FORWARDED_PROTO.to_string());
+    mapped
+        .entry(FORWARDED_PORT_HEADER.to_string())
+        .or_insert_with(|| FORWARDED_PORT.to_string());
+    // Stated rather than filled: every invocation runs under a chain
+    // (`crate::state::execution::trace_context::invocation_trace_context` mints one for a
+    // caller that named none), so a value a client wrote under this name is replaced by it.
+    mapped.insert(TRACE_HEADER.to_string(), trace_header.to_string());
+    mapped
 }
+
+/// The header the X-Ray tracing context travels in, as this crate spells it everywhere
+/// (`crate::state::execution::trace_context::TRACE_HEADER`).
+const TRACE_HEADER: &str = crate::state::execution::trace_context::TRACE_HEADER;
+
+/// The header carrying the hops a request travelled, the client's own entries first.
+const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+
+/// The header carrying the scheme of the hop a front door terminated.
+const FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
+
+/// The header carrying the port of that hop.
+const FORWARDED_PORT_HEADER: &str = "x-forwarded-port";
+
+/// The scheme a function URL is reached over: a function URL IS an HTTPS endpoint — the
+/// address `CreateFunctionUrlConfig` hands out is announced under this scheme whatever address
+/// it is served at (`crate::state::function_url::announced_function_url`) — so the scheme the
+/// front door states for the hop it terminated is the resource's own.
+const FORWARDED_PROTO: &str = "https";
+
+/// The port of that hop, which is [`FORWARDED_PROTO`]'s own: a function URL endpoint is
+/// published under that scheme and under no port of its own, and this is the port such an
+/// address is reached at. A fact of the RESOURCE, like the scheme, rather than of the socket
+/// this process happens to be able to bind — the authority a client reached is what the event
+/// reports as `requestContext.domainName`.
+const FORWARDED_PORT: &str = "443";
 
 /// The header a client sends its cookies in.
 const COOKIE_HEADER: &str = "cookie";
@@ -190,6 +264,11 @@ fn percent_decoded(component: &str) -> String {
 
 /// The event's `requestContext`: what the format reports about the call itself, every field
 /// of it read off this request or off the resource it addressed.
+///
+/// `http.sourceIp` is the address of the TCP connection the request arrived on
+/// ([`UrlRequest::source_ip`]), so no header the client wrote can change which address the
+/// call is attributed to, while `http.userAgent` is the client's own declaration and is
+/// reported as sent.
 fn request_context(request: &UrlRequest<'_>) -> Value {
     let mut http = Map::new();
     http.insert("method".to_string(), json!(request.method));
@@ -637,11 +716,21 @@ mod tests {
             domain_name: "0123456789abcdef0123456789abcdef.lambda-url.us-east-1.on.aws",
             account_id: "000000000000",
             request_id: "9b1e0d4e-0000-4000-8000-0000000000ff",
-            source_ip: "127.0.0.1",
+            source_ip: CONNECTION_ADDRESS,
+            trace_header: TRACE_CONTEXT,
             received: ::std::time::UNIX_EPOCH + ::std::time::Duration::from_secs(1_793_979_043),
             iam: None,
         }
     }
+
+    /// The chain the invocation these requests become runs under, in the form X-Ray writes one.
+    const TRACE_CONTEXT: &str =
+        "Root=1-67c0a1b2-0123456789abcdef01234567;Parent=89abcdef01234567;Sampled=0";
+
+    /// The address the connection these requests arrived on was opened from. Deliberately NOT
+    /// the loopback address this emulator falls back to, so a reading that took the address off
+    /// a header — or off nothing at all — is visible in these rows.
+    const CONNECTION_ADDRESS: &str = "198.51.100.23";
 
     /// One header pair, as the plane reads them off the wire.
     fn header(name: &str, value: &str) -> (String, String) {
@@ -675,6 +764,15 @@ mod tests {
                     "host": "example.lambda-url.us-east-1.on.aws",
                     "x-trace": "one,two",
                     "cookie": "a=1; b=2",
+                    // The three names the front door wrote itself, because this request
+                    // carried none of them: the address its connection came from, and the
+                    // scheme and port of the endpoint it addressed.
+                    "x-forwarded-for": CONNECTION_ADDRESS,
+                    "x-forwarded-proto": "https",
+                    "x-forwarded-port": "443",
+                    // And the chain the invocation runs under, which the front door states
+                    // rather than fills.
+                    "x-amzn-trace-id": TRACE_CONTEXT,
                 }),
             ),
             (
@@ -704,6 +802,184 @@ mod tests {
             Some(&json!("06/Nov/2026:15:30:43 +0000")),
             "case the request context: expected the CLF time, got {context}"
         );
+    }
+
+    /// The address the event attributes the call to is the one the CONNECTION came from,
+    /// whatever `X-Forwarded-For` the client wrote, and the header itself is reported as the
+    /// client sent it — the front door writing one, naming that address alone, only for a
+    /// request that carried none.
+    ///
+    /// The rows span the forms the client's own header takes: none at all, one address, a
+    /// chain, the header sent twice, a value that is no address, and an empty field.
+    #[test]
+    fn the_source_address_is_the_connections_and_the_forwarded_list_is_the_clients() {
+        // (case, the client's own `X-Forwarded-For` fields, the list the event reports)
+        let rows: &[(&str, &[&str], &str)] = &[
+            ("no forwarded list at all", &[], CONNECTION_ADDRESS),
+            ("one claimed address", &["203.0.113.9"], "203.0.113.9"),
+            (
+                "a chain of claimed hops",
+                &["198.51.100.7, 203.0.113.9"],
+                "198.51.100.7, 203.0.113.9",
+            ),
+            (
+                "the header sent twice",
+                &["203.0.113.9", "198.51.100.7"],
+                "203.0.113.9,198.51.100.7",
+            ),
+            ("a value that is no address", &["not-an-address"], "not-an-address"),
+            ("an empty field", &[""], ""),
+            ("an address of the other family", &["2001:db8::1"], "2001:db8::1"),
+            (
+                "the connection's own address claimed as well",
+                &[CONNECTION_ADDRESS],
+                CONNECTION_ADDRESS,
+            ),
+        ];
+
+        for (case, claimed, expected_list) in rows {
+            let headers: Vec<(String, String)> = claimed
+                .iter()
+                .map(|value| header("X-Forwarded-For", value))
+                .collect();
+            let event: Value =
+                ::serde_json::from_slice(&url_event(&request("/probe", "", &headers)))
+                    .expect("the event is JSON");
+            // The address the request helper states its connection came from, which is the
+            // one every row must report however its header reads.
+            let expected_source = json!(CONNECTION_ADDRESS);
+            assert_eq!(
+                event.pointer("/requestContext/http/sourceIp"),
+                Some(&expected_source),
+                "case {case:?}: expected sourceIp {expected_source}, got {event}"
+            );
+            assert_eq!(
+                event.pointer("/headers/x-forwarded-for"),
+                Some(&json!(expected_list)),
+                "case {case:?}: expected the forwarded list {expected_list:?}, got {event}"
+            );
+        }
+    }
+
+    /// One row of the forwarded scheme-and-port table.
+    struct HopRow {
+        case: &'static str,
+        /// The endpoint the URL publishes, which the event reports as its `domainName`.
+        endpoint: &'static str,
+        /// The headers the client wrote itself.
+        claimed: &'static [(&'static str, &'static str)],
+        /// The scheme and the port the event must report.
+        proto: &'static str,
+        port: &'static str,
+    }
+
+    /// The scheme and the port the front door states for the hop it terminated: the scheme a
+    /// function URL is reached over and that scheme's own port, each written only for a request
+    /// that carried none of that name — and neither of them moved by the endpoint the URL
+    /// happens to be served at.
+    ///
+    /// The rows span what the rule generalises over: an endpoint naming no port, one served on
+    /// a port, an IPv6-literal authority, and a client that wrote the two headers itself.
+    #[test]
+    fn the_forwarded_scheme_and_port_are_the_endpoints_until_the_client_states_them() {
+        let rows: &[HopRow] = &[
+            HopRow {
+                case: "an endpoint naming no port",
+                endpoint: "abc.lambda-url.us-east-1.on.aws",
+                claimed: &[],
+                proto: "https",
+                port: "443",
+            },
+            HopRow {
+                case: "an endpoint served on a port",
+                endpoint: "127.0.0.1:34567",
+                claimed: &[],
+                proto: "https",
+                port: "443",
+            },
+            HopRow {
+                case: "an IPv6 authority served on a port",
+                endpoint: "[::1]:8443",
+                claimed: &[],
+                proto: "https",
+                port: "443",
+            },
+            HopRow {
+                case: "a client that wrote both headers itself",
+                endpoint: "127.0.0.1:34567",
+                claimed: &[("X-Forwarded-Proto", "http"), ("X-Forwarded-Port", "80")],
+                proto: "http",
+                port: "80",
+            },
+        ];
+
+        for row in rows {
+            let case = row.case;
+            let headers: Vec<(String, String)> = row
+                .claimed
+                .iter()
+                .map(|(name, value)| header(name, value))
+                .collect();
+            let mut built = request("/probe", "", &headers);
+            built.domain_name = row.endpoint;
+            let event: Value =
+                ::serde_json::from_slice(&url_event(&built)).expect("the event is JSON");
+            assert_eq!(
+                event.pointer("/headers/x-forwarded-proto"),
+                Some(&json!(row.proto)),
+                "case {case:?}: expected the forwarded scheme {:?}, got {event}",
+                row.proto
+            );
+            assert_eq!(
+                event.pointer("/headers/x-forwarded-port"),
+                Some(&json!(row.port)),
+                "case {case:?}: expected the forwarded port {:?}, got {event}",
+                row.port
+            );
+        }
+    }
+
+    /// The chain the handler is told it runs under is the INVOCATION's, whatever the client
+    /// wrote in that header: the value the event reports and the one the environment reports
+    /// are one, and a client naming a chain of its own does not move the handler's work into
+    /// it (the invocation's own context CONTINUES the client's where it named one, which is
+    /// `crate::state::execution::trace_context`'s to decide, not this format's).
+    ///
+    /// The rows span what the client carried: nothing, one chain of its own, and the header
+    /// sent twice.
+    #[test]
+    fn the_tracing_header_is_the_invocations_whatever_the_client_wrote() {
+        // (case, the client's own `X-Amzn-Trace-Id` fields)
+        let rows: &[(&str, &[&str])] = &[
+            ("no tracing header at all", &[]),
+            (
+                "a chain of the client's own",
+                &["Root=1-5759e988-bd862e3fe1be46a994272793"],
+            ),
+            (
+                "the header sent twice",
+                &[
+                    "Root=1-5759e988-bd862e3fe1be46a994272793",
+                    "Root=1-5759e988-aaaaaaaaaaaaaaaaaaaaaaaa",
+                ],
+            ),
+        ];
+
+        for (case, claimed) in rows {
+            let headers: Vec<(String, String)> = claimed
+                .iter()
+                .map(|value| header("X-Amzn-Trace-Id", value))
+                .collect();
+            let event: Value =
+                ::serde_json::from_slice(&url_event(&request("/probe", "", &headers)))
+                    .expect("the event is JSON");
+            assert_eq!(
+                event.pointer("/headers/x-amzn-trace-id"),
+                Some(&json!(TRACE_CONTEXT)),
+                "case {case:?}: expected the invocation's own chain {TRACE_CONTEXT:?}, \
+                 got {event}"
+            );
+        }
     }
 
     /// A body travels verbatim under a textual media type and base64 under every other one.

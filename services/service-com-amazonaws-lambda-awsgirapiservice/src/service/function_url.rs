@@ -131,13 +131,26 @@ const UNREADABLE_BODY_MESSAGE: &str =
 /// The header a function URL response reports its request id in.
 const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
 
-/// The address a request that names none came from: this emulator is reached in-process or
-/// over the loopback interface, which is where a request with no forwarded address came
-/// from.
+/// The address a request whose connection this emulator observed none for came from: the
+/// core hands a handler nothing about the peer of a connection it accepted, and every
+/// connection to a loopback listener comes from loopback, so that is the address such a
+/// request arrived from — the same reading every other plane of this emulator that reports
+/// the address a request came from uses.
 const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
 
-/// The header a proxy records the client's own address in, whose FIRST hop is the client.
-const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
+/// The address the CONNECTION this request arrived on was opened from, as the end that
+/// accepted it knows it.
+///
+/// Read off the CONNECTION and never off the request: a client of this emulator states where
+/// it opens a connection from when it opens one
+/// ([`::service_common::dialable_data_planes`]), and [`LOOPBACK_SOURCE_IP`] is the address of
+/// a connection nothing stated one for. That is what makes the address a function URL
+/// attributes a call to unspoofable — a header the client wrote is the client's claim about
+/// the hops ahead of this one, not a statement about where this one came from.
+fn connection_address() -> String {
+    ::service_common::dialable_data_planes::connected_from()
+        .map_or_else(|| LOOPBACK_SOURCE_IP.to_string(), |from| from.ip().to_string())
+}
 
 /// The function URL `addressed` names, out of the one shared store.
 ///
@@ -633,6 +646,16 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
         // What every series about this invocation is reported for: the function, the resource
         // the URL addressed and the version that served it (`crate::state::metrics`).
         let metered = crate::state::InvokedTarget::new(&function_name, &version, &executed_version);
+        // The X-Ray trace context this invocation runs with: the chain the client named on its
+        // own request, under the rule the function's `TracingConfig` mode gives
+        // (`crate::state::execution::trace_context`). Resolved BEFORE the event is built,
+        // because the handler is told about that chain among the request's headers as well as
+        // in its environment, and the two are one value.
+        let trace = crate::state::invocation_trace_context(
+            crate::state::supplied_trace_header(ctx).as_deref(),
+            &resolved_config.tracing_mode,
+            ::std::time::SystemTime::now(),
+        );
         let invocation = crate::state::Invocation {
             function_name: function_name.clone(),
             executed_version: executed_version.clone(),
@@ -656,20 +679,13 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                 .zip_bytes
                 .clone(),
             layer_zips: crate::state::layer_archives(&resolved_config.layers),
-            payload: self.event_for(target, incoming, ctx),
+            payload: self.event_for(target, incoming, ctx, &trace.header),
             // A function URL request carries no `ClientContext` and no `TenantId`: both are
             // members of the `Invoke` API, which this plane is not.
             client_context: None,
             tenant_id: None,
             request_id: request_id.to_string(),
-            // The X-Ray trace context this invocation runs with: the chain the client
-            // named on its own request, under the rule the function's `TracingConfig` mode
-            // gives (`crate::state::execution::trace_context`).
-            trace: Some(crate::state::invocation_trace_context(
-                crate::state::supplied_trace_header(ctx).as_deref(),
-                &resolved_config.tracing_mode,
-                ::std::time::SystemTime::now(),
-            )),
+            trace: Some(trace),
             // Which kind of environment serves it is the admission's to decide, once this
             // store guard is released (`crate::state::execution_slot`).
             initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
@@ -706,12 +722,14 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
         })
     }
 
-    /// The payload-format-2.0 event this request becomes.
+    /// The payload-format-2.0 event this request becomes, for an invocation running under the
+    /// trace context `trace_header` names.
     fn event_for(
         &self,
         target: &crate::state::FunctionUrlTarget,
         incoming: &Incoming<'_>,
         ctx: &OperationContext<'_>,
+        trace_header: &str,
     ) -> Vec<u8> {
         let req = incoming.req;
         // The host the handler is told about is the function URL's OWN — the host of the
@@ -732,14 +750,10 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             })
             .collect();
         let content_type = req.headers().get("content-type").map(str::to_string);
-        let source_ip = req
-            .headers()
-            .get(FORWARDED_FOR_HEADER)
-            .and_then(|forwarded| forwarded.split(',').next())
-            .map(str::trim)
-            .filter(|hop| !hop.is_empty())
-            .unwrap_or(LOOPBACK_SOURCE_IP)
-            .to_string();
+        // The address the call is attributed to is the one its CONNECTION came from: a
+        // client's own `X-Forwarded-For` travels on to the handler verbatim among the
+        // headers, and decides nothing here.
+        let source_ip = connection_address();
         let request = UrlRequest {
             method: req.method(),
             raw_path: &target.request_path,
@@ -752,6 +766,7 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             account_id: ::engine::emulator_account_id(),
             request_id: incoming.request_id,
             source_ip: &source_ip,
+            trace_header,
             received: incoming.received,
             iam: self.caller(ctx),
         };
