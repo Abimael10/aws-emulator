@@ -1,0 +1,46 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: ecs.delete-daemon-with-active-deployment-succeeds ecs.daemon-update-after-delete-rejected
+Issue-Shape-Id: com.amazonaws.ecs#AmazonEC2ContainerServiceV20141113
+Issue-Key: ecs|UpdateDaemon|InvalidParameterException
+Issue-Key: ecs.daemon-update-after-delete-rejected|run#23|KeyError|daemonRevisionArns=[still_deployment["targetDaemonRevision"]["arn"]]
+Issue-Commit: ef5208a2316f6e603f33dcb5e1ac1bc1a8b9d2da
+
+# ecs: 2 net-new causes — UpdateDaemon still refuses a fully-deleted daemon with the "deletion is in progress" message instead of "Daemon service not found", and DescribeDaemonDeployments omits the modeled targetDaemonRevision
+
+> _Note: this issue was identified against the code base at commit `ef5208a2316f6e603f33dcb5e1ac1bc1a8b9d2da`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+UpdateDaemon
+
+## Description
+REOPENS 20261114T200408Z-ecs-4-net-new-causes-the-ssm-read.md: its fix left the call refused. That issue's Cause 2 ("UpdateDaemon on a deleted daemon is mis-classified") is closed only as far as the error CODE: UpdateDaemon on a deleted daemon now answers InvalidParameterException, but the refusal it serves for a daemon that is already GONE is still the wrong one (Cause 1 below). Cause 2 below is a net-new representation gap that the repaired refusal path uncovered behind it. Both causes are in service ecs; each must be closed before this issue is submitted.
+
+Cause 1 of 2: UpdateDaemon on a daemon DeleteDaemon has already finished removing is refused with the in-flight deletion message instead of the not-found message.
+AWS: AWS distinguishes two states of a deleted daemon and gives each its own InvalidParameterException message (HTTP 400). While the delete is still being carried out the message is the daemon's ARN followed by the fixed text " deletion is in progress" (the ARN is the variable part, taken from the request's daemonArn; the emulator already serves this one correctly, and the sibling check asserts exactly that template). Once the daemon is gone — DescribeDaemon on the same ARN answers DaemonNotFoundException — UpdateDaemon's message is the fixed text "Daemon service not found" with no variable part at all. Smithy: UpdateDaemon (daemonArn, daemonTaskDefinitionArn, capacityProviderArns all @required) models InvalidParameterException, DaemonNotFoundException and DaemonNotActiveException, every one at httpError 400, so the code alone does not identify the state and the message is the distinguishing requirement. The "Daemon service not found" wording is recorded behavior for this request class.
+Emulator: after DeleteDaemon has completed (the check's own poll already saw DescribeDaemon answer DaemonNotFoundException), UpdateDaemon on that ARN is refused InvalidParameterException with the message '<daemonArn> deletion is in progress' — the in-flight wording, carrying an ARN the store no longer holds. The handler collapses both states deliberately: ops/update_daemon.rs takes the state::daemon_delete_was_asked_for branch ("whether the delete is still being carried out or has taken the record away already, which is ONE request class and one refusal") before it ever consults daemon_from_arn, so the gone case can never reach a not-found message.
+Why: a client that reads the message to decide whether to keep polling (deletion still running) or to stop and recreate (daemon gone) is told forever that a deletion is in progress for a daemon that no longer exists, so cleanup/recreate loops never terminate; the same emulator answers DescribeDaemon with DaemonNotFoundException for that ARN, so the two reads contradict each other.
+Fix: the refusal path of the UpdateDaemon handler (the ECS crate's ops/update_daemon.rs, the daemon_delete_was_asked_for branch and the message helper state::daemon_deletion_in_progress_message) must separate "delete in flight" from "record already removed" and serve the not-found wording for the latter. DeleteDaemon's own lifecycle bookkeeping in state is the shared component.
+Traces: ecs.delete-daemon-with-active-deployment-succeeds.
+
+Cause 2 of 2: DescribeDaemonDeployments serves a daemon deployment with no targetDaemonRevision member, so the revision a rollout is deploying is unreadable.
+AWS: Smithy DaemonDeployment$targetDaemonRevision -> DaemonDeploymentRevisionDetail, documented "The daemon revision being deployed", whose members are arn ("The Amazon Resource Name (ARN) of the daemon revision"), capacityProviders, totalRunningInstanceCount, totalWithoutDaemonInstanceCount and totalDrainingInstanceCount; the sibling member sourceDaemonRevisions carries "the currently deployed daemon revisions that are being replaced". DescribeDaemonDeployments is readonly and answers HTTP 200 with daemonDeployments populated, so a client reads targetDaemonRevision.arn and feeds it to DescribeDaemonRevisions.
+Emulator: the deployment object returned for a daemon whose UpdateDaemon rollout was accepted contains no targetDaemonRevision key at all — botocore raises KeyError: 'targetDaemonRevision' on still_deployment["targetDaemonRevision"]["arn"]. The response is otherwise a 200, so the member is simply never populated by the view the handler serves (ops/describe_daemon_deployments.rs builds each entry from state::daemon_deployment_view).
+Why: the rollout is opaque — a client cannot tell which revision a deployment is rolling out or which ones it is replacing, cannot chain to DescribeDaemonRevisions, and any code that reads the modeled member crashes instead of getting a value; a verification that a rejected UpdateDaemon left the daemon's target task definition unchanged is impossible.
+Fix: the DaemonDeployment view in the ECS crate's state (state::daemon_deployment_view, consumed by ops/describe_daemon_deployments.rs and the ListDaemonDeployments/DescribeDaemonRevisions reads that share it) must populate targetDaemonRevision — the revision the rollout was started for, with its arn and instance counts — and sourceDaemonRevisions for the revisions being replaced.
+Traces: ecs.daemon-update-after-delete-rejected.
+
+Related open issues, named for context, that do NOT carry these replay keys: 20261117T054412Z-ecs-daemon-read-operations-skip-request-validation-and.md and 20261029T220901Z-ecs-express-gateway-and-daemon-operations-skip-validation.md (daemon read validation / not-found classification), 20261104T062603Z-ecs-describedaemondeployments-stub.md (filed when the operation was still a 501 stub; it now answers 200).
+
+## Evidence
+Cause 1 — expected, from UpdateDaemon on a daemon whose DeleteDaemon has completed: HTTP 400, Error.Code InvalidParameterException, Error.Message exactly "Daemon service not found" (all fixed text). Actual: HTTP 400 InvalidParameterException with Error.Message '<daemonArn> deletion is in progress' — reported by the check as `AssertionError: expected the exact InvalidParameterException message AWS returns, got 'arn:aws:ecs:<region>:<account>:daemon/<cluster>/<daemon> deletion is in progress'` (the ARN, region, account and generated names in that string are per-run values filling the emulator's in-flight template; the divergence is the template itself). The same check first observed DescribeDaemon answer DaemonNotFoundException for that ARN, so the daemon was already gone when UpdateDaemon claimed a deletion was in progress. Check: ecs.delete-daemon-with-active-deployment-succeeds.
+
+Cause 2 — expected, from DescribeDaemonDeployments on the deployment DescribeDaemon reports for the daemon: HTTP 200 with daemonDeployments[0].targetDaemonRevision present and its arn resolvable by DescribeDaemonRevisions. Actual: the entry has no targetDaemonRevision member — `KeyError: 'targetDaemonRevision'` at `daemonRevisionArns=[still_deployment["targetDaemonRevision"]["arn"]]`. Check: ecs.daemon-update-after-delete-rejected (which had already passed the InvalidParameterException code and '<arn> deletion is in progress' message assertions for the still-deleting state, confirming Cause 1 is specifically about the already-gone state).
+
+## Steps to Reproduce
+Shared setup: create a cluster, an ECS Managed Instances capacity provider (infrastructure role + instance profile + instanceLaunchTemplate), RegisterDaemonTaskDefinition, then CreateDaemon naming that capacity provider.
+
+Cause 1: DeleteDaemon the daemon and poll DescribeDaemon until it answers DaemonNotFoundException (the daemon is fully gone), then call UpdateDaemon with the same daemonArn and read Error.Code and Error.Message — expect InvalidParameterException / "Daemon service not found", observe InvalidParameterException / "<arn> deletion is in progress". Replay ecs.delete-daemon-with-active-deployment-succeeds.
+
+Cause 2: UpdateDaemon the ACTIVE daemon onto a second daemon task definition revision, read DescribeDaemon for its deploymentArn, then call DescribeDaemonDeployments with that ARN and read daemonDeployments[0].targetDaemonRevision.arn — the member is absent. Replay ecs.daemon-update-after-delete-rejected.
