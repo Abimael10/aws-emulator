@@ -373,6 +373,10 @@ impl Prepared {
             }
         };
         let contained = Arc::new(AtomicBool::new(false));
+        // From here until the environment stands, what is in flight is this emulator's own
+        // work and none of the function's, so it is bounded by the span that work is allowed
+        // rather than by either of the run's own spans.
+        bounds.begin_provisioning();
         let interpreter = interpreter(&contained);
         // A run only happens when the native surface really was narrowed to the allow-list. If
         // it could not be, nothing is run at all: an uncontained interpreter is never handed
@@ -849,9 +853,10 @@ fn initialize(
     let prepared = scope.globals.get_item("__lambda_prepare", vm)?;
     install_trace_hook(vm, session, held)?;
     // The interpreter is standing and nothing of the RUN's own code has been read yet, so
-    // this is where the memory the run itself takes is measured from. The host takes this
-    // baseline, never the guest.
+    // this is where the memory the run itself takes is measured from, and where the span its
+    // initialization is allowed starts running. The host takes both, never the guest.
     bounds.measure_memory_from_here();
+    bounds.begin_initialization();
     // The INIT phase, under the span an initialization is allowed rather than the
     // function's `Timeout`. It answers nothing when the environment is ready, and the
     // document of a failure that belongs to no invocation when it is not.
@@ -2368,6 +2373,11 @@ impl Bounds {
     /// what an initialization is given up on after is the two spans together. The handler's
     /// own deadline is taken by [`Self::start`], when the invoke phase begins.
     ///
+    /// A run for which this emulator still has to BUILD an execution environment says so
+    /// ([`Self::begin_provisioning`]) and has the initialization's own deadline read from the
+    /// instant that environment is standing ([`Self::begin_initialization`]): the span this
+    /// process spends on its own interpreter is a span of neither phase of the run.
+    ///
     /// The MEMORY baselines are taken by [`Self::measure_memory_from_here`], once the
     /// interpreter this emulator builds is standing and before any of the run's own code is
     /// read — by the host, because a baseline a guest could re-take is no ceiling at all.
@@ -2407,6 +2417,39 @@ impl Bounds {
     /// could hold the ceiling's worth of memory again after every call.
     fn measure_memory_from_here(&self) {
         self.held.measure_from_here();
+    }
+
+    /// Begin STANDING THE ENVIRONMENT UP: from here the deadline is the span this emulator
+    /// may spend on that work ([`super::ENVIRONMENT_BUILD_SPAN`]) and not a span of the run's
+    /// own, because none of the function's code has been read yet — building the interpreter,
+    /// narrowing its native surface and evaluating this emulator's own runtime is this
+    /// process's work on whatever host it is running on, and the function's `Timeout` and the
+    /// span an initialization is allowed bound the GUEST's doing instead.
+    ///
+    /// Called by the HOST, before the interpreter is built ([`Prepared::start`]), and
+    /// reachable from no guest code: a run served in an environment that is already standing
+    /// never reaches it, because there is nothing to build for it.
+    fn begin_provisioning(&self) {
+        *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
+            self.clock.now() + super::ENVIRONMENT_BUILD_SPAN;
+    }
+
+    /// Begin the INIT phase: the span an initialization is allowed runs from HERE — the
+    /// instant the environment is standing and nothing of the run's own code has been read —
+    /// so what the deadline measures is the module-level code of the deployment package
+    /// rather than the environment this emulator built to read it in.
+    ///
+    /// The same instant the run's memory baseline is taken at
+    /// ([`Self::measure_memory_from_here`]), and for the same reason: a span this process
+    /// spent on its own interpreter is no more the run's doing than a page that interpreter
+    /// faulted in. What the deadline then allows is the two spans [`Self::new`] states — the
+    /// initialization's own and the function's `Timeout` it is retried under.
+    ///
+    /// Called by the HOST, from the one place that knows the environment is standing
+    /// ([`initialize`]), and reachable from no guest code.
+    fn begin_initialization(&self) {
+        *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
+            self.clock.now() + super::INIT_PHASE_LIMIT.saturating_add(self.host_span());
     }
 
     /// Begin the INVOKE phase: the handler's deadline runs from HERE, so what the deadline
@@ -3259,6 +3302,65 @@ mod tests {
                 watched.stopped(),
                 *expected,
                 "case {case}: expected the watch over the run to latch {expected:?}"
+            );
+        }
+    }
+
+    /// The span this emulator spends STANDING AN ENVIRONMENT UP is charged to neither phase
+    /// of the run: the deadline the initialization is judged against is read from the instant
+    /// the environment is standing — the same instant the memory baseline is taken at — so a
+    /// host slow enough to spend a whole `Timeout` on building an interpreter does not have
+    /// the run answered by its deadline.
+    ///
+    /// Judged against a clock the run's own READINGS drive, so what a row "spends" standing
+    /// the environment up is a number of readings rather than a span of this host's time, the
+    /// same on an idle host and on a loaded one. The rows differ along how much of that span
+    /// went by before the environment stood: none of it, more of it than the function's own
+    /// `Timeout`, and more of it than both of the run's spans together.
+    #[test]
+    fn the_span_spent_standing_an_environment_up_is_charged_to_neither_phase() {
+        // How far ONE reading drives the clock a row is judged against, so a row spends a
+        // stated span of it by taking a stated number of readings.
+        const TICK: Duration = Duration::from_secs(1);
+        /// The `Timeout` every row's function carries, in those same seconds.
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        // (case, readings taken while the environment was being stood up)
+        let cases: &[(&str, u32)] = &[
+            ("an environment that stood at once", 0),
+            ("a build longer than the function's own Timeout", 8),
+            ("a build longer than both of the run's spans together", 40),
+        ];
+        for (case, readings) in cases {
+            let mut whole = budget();
+            // Far more steps than the readings below spend, so no row is answered by the
+            // step budget instead.
+            whole.steps = 2_000_000_000;
+            whole.wall_clock = TIMEOUT;
+            let clock = Clock::driven(TICK);
+            let bounds = Bounds::new(&whole, clock.clone());
+            bounds.begin_provisioning();
+            for _ in 0..*readings {
+                let _ = clock.now();
+            }
+            // The environment is standing: the initialization's own span starts here, and
+            // what standing it up spent is owed by nobody.
+            bounds.begin_initialization();
+            bounds.watch();
+            assert_eq!(
+                bounds.stopped(),
+                None,
+                "case {case}: expected the run to be left alone after {readings} readings \
+                 spent standing its environment up"
+            );
+            // And what it has left is the span an initialization is allowed beside the
+            // function's `Timeout` — the two spans of the RUN and nothing of the build's,
+            // less only the handful of readings the checks above took.
+            let left = bounds.remaining();
+            let allowed = crate::state::execution::INIT_PHASE_LIMIT.saturating_add(TIMEOUT);
+            assert!(
+                left > TIMEOUT && left <= allowed,
+                "case {case}: expected between the function's own {TIMEOUT:?} and {allowed:?} \
+                 left once the environment stood, got {left:?}"
             );
         }
     }

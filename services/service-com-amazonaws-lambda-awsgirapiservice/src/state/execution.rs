@@ -347,15 +347,17 @@ const PER_RUN_MEMORY_CEILING_MB: u32 = (MAX_RUN_MEMORY_BYTES / BYTES_PER_MB) as 
 
 /// How long an invocation waits for its share of that envelope before it is throttled.
 ///
-/// As long as a run AHEAD of it is being answered: such a run holds its share for the
-/// initialization of the execution environment it happens in ([`INIT_PHASE_LIMIT`]) and for
+/// As long as a run AHEAD of it is being answered: such a run holds its share while the
+/// execution environment it happens in is stood up ([`ENVIRONMENT_BUILD_SPAN`]), for the
+/// initialization that then runs in it ([`INIT_PHASE_LIMIT`]) and for
 /// the handler's own run, whose wait is bounded by [`HOST_WAIT_CEILING`], plus the
 /// [`ABANDON_GRACE`] its caller then gives it. So a caller that arrives while the memory is
 /// held is served as soon as a handler ahead of it ends, and only an envelope still full
 /// after that span is answered the modelled throttle. A run that outlived its own caller
 /// keeps its share until its thread ends, because the engine still holding that memory is
 /// that thread's, and it counts against [`MAX_ABANDONED_RUNS`] for just as long.
-pub const PERMIT_WAIT: Duration = INIT_PHASE_LIMIT
+pub const PERMIT_WAIT: Duration = ENVIRONMENT_BUILD_SPAN
+    .saturating_add(INIT_PHASE_LIMIT)
     .saturating_add(HOST_WAIT_CEILING)
     .saturating_add(ABANDON_GRACE);
 
@@ -464,6 +466,24 @@ pub const GUEST_WAIT_HOST_SPAN: Duration = Duration::from_secs(20);
 /// node engine every invocation initializes an environment of its own and so is bounded by
 /// this span as well as by its `Timeout`.
 pub const INIT_PHASE_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long this emulator may spend STANDING UP the execution environment an invocation runs
+/// in, before a line of the function's own code is read: building the interpreter or the
+/// engine, narrowing its native surface and evaluating this emulator's own runtime.
+///
+/// EMULATOR-CHOSEN, and a span of neither the function's configuration nor of either phase of
+/// a run: the two spans a run is judged against measure the RUN's own doing — the
+/// `Timeout` bounds the handler's own phase and [`INIT_PHASE_LIMIT`] the code outside the
+/// handler — so the work of creating the sandbox those phases happen in is charged to neither,
+/// and a function whose handler and initialization code did nothing slow is never reported to
+/// have run past its `Timeout` because this emulator was slow to build its interpreter.
+/// It is not unbounded either: this is what an environment this process cannot stand up is
+/// given up on after, and what the caller's own wait allows for beside the two phases.
+///
+/// Generous, because what it bounds is this process's own work on whatever host it is running
+/// on: building an interpreter takes a fraction of it on an idle host and far more of it on one
+/// running every other suite of a build beside it.
+pub const ENVIRONMENT_BUILD_SPAN: Duration = Duration::from_secs(60);
 
 /// How long after its budget is spent a run is still waited for before it is abandoned.
 pub const ABANDON_GRACE: Duration = Duration::from_secs(2);
@@ -1092,7 +1112,12 @@ pub async fn run_invocation(
             HOST_WAIT_CEILING
                 .saturating_add(INIT_PHASE_LIMIT)
                 .saturating_add(ABANDON_GRACE),
-        );
+        )
+        // And beside both phases, the span this emulator may spend STANDING THE ENVIRONMENT
+        // UP ([`ENVIRONMENT_BUILD_SPAN`]): that work is charged to neither phase, so a wait
+        // that did not allow for it would give up on a run whose own bounds had not been
+        // reached — the very failure the function's configuration never asked for.
+        .saturating_add(ENVIRONMENT_BUILD_SPAN);
     // The accounting of a run that outlives the caller is a GUARD rather than a branch, so
     // it happens however this invocation ends: the wait running out, the caller's request
     // being cancelled while it is suspended (which drops this future at the await below),
