@@ -13,9 +13,13 @@
 //! `routeKey`, and the one `connectionId` the handshake minted, with the handshake's query
 //! string on the connection request), while the handshake itself completes only on a `2xx`
 //! from the connection request and a `REQUEST` authorizer in front of it decides it first:
-//! `401` when an identity source is absent (the authorizer not invoked at all), `403` when
-//! its function denies, and otherwise the context it returned reaches every later call's
-//! event. Every one of those invocations is made by the gateway as its OWN service principal
+//! `401` when an identity source is absent (the authorizer not invoked at all), `403` whenever
+//! the decision its function STATED does not authorize the connection request — read as
+//! `execute-api:Invoke` on that route's own ARN, so an explicit deny, a deny beside an allow and
+//! an allow about another resource or another action all refuse it there, while the gateway's own
+//! `500` is kept for a reply stating no decision at all — and otherwise the context it returned
+//! reaches every later call's event. Every one of those invocations is made by the gateway as
+//! its OWN service principal
 //! (`apigateway.amazonaws.com`), so it is made only where the FUNCTION's resource-based policy
 //! allows that principal `lambda:InvokeFunction` with the route's own `execute-api` ARN
 //! (`{api-id}/{stage}/{route-key}`) as the `aws:SourceArn` such a grant may be narrowed by: an
@@ -2503,6 +2507,198 @@ async fn a_frame_its_routes_model_refuses_is_answered_by_the_gateway() {
              message on, got {answered}",
             row.case
         );
+    }
+}
+
+/// The `$connect` route's own function for the table below: it admits every connection request
+/// it is given, so what each row's handshake is answered with is the AUTHORIZER's decision and
+/// nothing else.
+const ADMITTING_CONNECT_HANDLER: &str = "def lambda_handler(event, context):\n\
+                                         \x20   return {\"statusCode\": 200}\n";
+
+/// A `REQUEST` authorizer whose function states a DIFFERENT KIND of decision for each token the
+/// handshake may carry: the policy shapes an IAM evaluation reaches each of its outcomes
+/// through, the boolean of a simple response, and an answer that states no decision at all.
+///
+/// Every policy it returns names the route ARN its own event carried (`methodArn`), so what
+/// tells the rows apart is the EFFECT, the ACTION and the RESOURCE a statement names — never a
+/// value written into this test.
+const DECIDING_AUTHORIZER_HANDLER: &str = concat!(
+    "def statement(effect, action, resource):\n",
+    "\x20   return {\"Action\": action, \"Effect\": effect, \"Resource\": resource}\n",
+    "\n",
+    "\n",
+    "def lambda_handler(event, context):\n",
+    "\x20   arn = event[\"methodArn\"]\n",
+    "\x20   token = (event.get(\"queryStringParameters\") or {}).get(\"token\", \"\")\n",
+    "\x20   invoke = \"execute-api:Invoke\"\n",
+    "\x20   if token == \"allow\":\n",
+    "\x20       statements = [statement(\"Allow\", invoke, arn)]\n",
+    "\x20   elif token == \"deny\":\n",
+    "\x20       statements = [statement(\"Deny\", invoke, arn)]\n",
+    "\x20   elif token == \"deny-beside-allow\":\n",
+    "\x20       statements = [statement(\"Allow\", invoke, arn),\n",
+    "\x20                     statement(\"Deny\", invoke, arn)]\n",
+    "\x20   elif token == \"another-route\":\n",
+    "\x20       other = arn.rsplit(\"/\", 1)[0] + \"/$disconnect\"\n",
+    "\x20       statements = [statement(\"Allow\", invoke, other)]\n",
+    "\x20   elif token == \"another-action\":\n",
+    "\x20       statements = [statement(\"Allow\", \"execute-api:ManageConnections\", arn)]\n",
+    "\x20   elif token == \"simple-no\":\n",
+    "\x20       return {\"isAuthorized\": False}\n",
+    "\x20   else:\n",
+    "\x20       return {\"context\": {\"token\": token}}\n",
+    "\x20   return {\"principalId\": \"connection-principal\",\n",
+    "\x20           \"policyDocument\": {\"Version\": \"2012-10-17\",\n",
+    "\x20                              \"Statement\": statements}}\n",
+);
+
+/// One row of [`CONNECT_DECISION_STATUSES`]: the decision the authorizer's function states for
+/// this token, and the status the opening handshake owes for it.
+struct DecisionStatus {
+    case: &'static str,
+    /// The value the handshake's `token` query parameter carries — the authorizer's one
+    /// identity source, present and non-empty in every row, so the function is invoked for
+    /// each — which is what [`DECIDING_AUTHORIZER_HANDLER`] answers by.
+    token: &'static str,
+    /// The status the handshake is refused with, or `None` when it is completed.
+    refused: Option<u16>,
+}
+
+/// The rows span what the decision generalises over: each outcome an IAM evaluation of the
+/// policy the function returned can reach for `execute-api:Invoke` on the `$connect` route's own
+/// ARN — allowed, explicitly denied, denied beside an allow, and stated about another resource
+/// or another action — plus the same refusal in the OTHER format a Lambda authorizer answers in,
+/// and, last, an answer that states no decision this authorizer can read at all.
+///
+/// The ALLOWED row is first: it is the one that starts the two functions' runtimes, so the rows
+/// after it are decided by a warm authorizer and the `500` the last row owes is the gateway's
+/// own answer to a decisionless reply rather than a runtime still starting.
+const CONNECT_DECISION_STATUSES: &[DecisionStatus] = &[
+    DecisionStatus {
+        case: "an Allow for the invoke action on the route's own ARN",
+        token: "allow",
+        refused: None,
+    },
+    DecisionStatus {
+        // The recorded case.
+        case: "an explicit Deny on the route's own ARN",
+        token: "deny",
+        refused: Some(FORBIDDEN),
+    },
+    DecisionStatus {
+        case: "an explicit Deny beside an Allow for the same ARN",
+        token: "deny-beside-allow",
+        refused: Some(FORBIDDEN),
+    },
+    DecisionStatus {
+        case: "an Allow naming another route of the same stage",
+        token: "another-route",
+        refused: Some(FORBIDDEN),
+    },
+    DecisionStatus {
+        case: "an Allow naming another execute-api action on this route",
+        token: "another-action",
+        refused: Some(FORBIDDEN),
+    },
+    DecisionStatus {
+        case: "the boolean of a simple response stating no",
+        token: "simple-no",
+        refused: Some(FORBIDDEN),
+    },
+    DecisionStatus {
+        case: "an answer carrying neither a policy nor a boolean",
+        token: "no-decision",
+        refused: Some(INTERNAL_SERVER_ERROR),
+    },
+];
+
+/// A decision the `$connect` authorizer's function STATED and that does not authorize the
+/// connection request is the client's refusal, `403`, and never the gateway's own fault.
+///
+/// RULE: the authorization of the route that serves the connection request is decided by
+/// evaluating the answer its `REQUEST` authorizer's function returned against
+/// `execute-api:Invoke` on that route's own ARN — the `methodArn` the authorizer event names —
+/// so every readable answer that is not an allow REFUSES THE HANDSHAKE `403`, whichever of the
+/// two formats stated it and whichever way the evaluation reached it (an explicit deny, a deny
+/// beside an allow, nothing said about this resource or this action), while the gateway's own
+/// `500` is kept for a reply that states no decision this authorizer can read at all. A client
+/// can therefore tell "you are not allowed to connect" — which no retry changes — from "the
+/// gateway broke".
+#[tokio::test]
+async fn a_stated_refusal_of_the_connect_authorizer_is_a_403_and_only_no_decision_is_a_500() {
+    let case = "one api whose $connect route is guarded by a REQUEST authorizer that states a \
+                different kind of decision per token";
+    let (emulator, engine) = emulator();
+    let authorizer_function = given_function(
+        &emulator,
+        &engine,
+        case,
+        "deciding-authorizer",
+        DECIDING_AUTHORIZER_HANDLER,
+    )
+    .await;
+    let connect = given_function(
+        &emulator,
+        &engine,
+        case,
+        "admitting-connect-route",
+        ADMITTING_CONNECT_HANDLER,
+    )
+    .await;
+
+    let api = given_api(&emulator, case).await;
+    let authorizer_id = given_authorizer(&emulator, case, &api.api_id, &authorizer_function).await;
+    given_route(
+        &emulator,
+        case,
+        &api.api_id,
+        "$connect",
+        &connect,
+        false,
+        Some(&authorizer_id),
+    )
+    .await;
+    given_stage(&emulator, case, &api.api_id).await;
+
+    // Each row's own handshake. A socket a row completed is kept open until the case ends, as a
+    // client's would be.
+    let mut _upgraded: Vec<ClientSocket> = Vec::new();
+    for row in CONNECT_DECISION_STATUSES {
+        let label = row.case;
+        // A row that owes anything but the gateway's own `500` offers the handshake again while
+        // it is being answered one: that is what a loaded host produces transiently while the
+        // authorizer's runtime is starting. The wait is for a DECISION — a condition — and
+        // nothing here asserts on the clock.
+        let deadline = std::time::Instant::now() + DECISION_WAIT;
+        let answered = loop {
+            let answered = handshake_at(
+                label,
+                &api.authority,
+                &format!("/{STAGE}?token={}", row.token),
+            )
+            .await;
+            let transient = matches!(answered, Err(status)
+                if status == INTERNAL_SERVER_ERROR && row.refused != Some(INTERNAL_SERVER_ERROR));
+            if !transient || std::time::Instant::now() >= deadline {
+                break answered;
+            }
+            tokio::time::sleep(LOOK_INTERVAL).await;
+        };
+        match (row.refused, answered) {
+            (None, Ok(socket)) => _upgraded.push(socket),
+            (None, Err(status)) => panic!(
+                "case {case:?} / {label}: a decision that authorizes the connection request \
+                 must complete the handshake, got {status}"
+            ),
+            (Some(expected), Err(status)) => assert_eq!(
+                status, expected,
+                "case {case:?} / {label}: expected the handshake refused {expected}, got {status}"
+            ),
+            (Some(expected), Ok(_socket)) => panic!(
+                "case {case:?} / {label}: expected the handshake refused {expected}, got 101"
+            ),
+        }
     }
 }
 
