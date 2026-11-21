@@ -31,6 +31,11 @@
 //!   request rather than of the principal.
 //! * [`a_rule_that_submits_no_pattern_carries_no_value_for_the_event_content_keys`] writes a
 //!   rule that fires on a schedule alone, which constrains no event field at all.
+//! * [`a_source_conditioned_grant_admits_the_pattern_it_covers_and_refuses_the_rest`] varies the
+//!   condition FORM and drives BOTH legs of each one under the same grant: the covered call is
+//!   served on its first attempt — a conditioned `Allow` has no window in which it admits
+//!   nothing — and reads back with its pattern verbatim, while the uncovered call is refused and
+//!   the name it named holds no rule afterwards.
 //!
 //! The principal is an assumed ROLE, because that is the identity a least-privilege policy
 //! ('this tenant may only subscribe to its own events') is attached to. Nothing is ever
@@ -809,5 +814,231 @@ async fn a_rule_that_submits_no_pattern_carries_no_value_for_the_event_content_k
                 );
             }
         }
+    }
+}
+
+/// The rule the COVERED call of a row below writes, and the one its uncovered call names. Two
+/// names, so the refused call is never the same record as the served one.
+const COVERED_RULE: &str = "covered-subscription";
+const UNCOVERED_RULE: &str = "uncovered-subscription";
+
+/// `DescribeRule` for the rule `name` on [`BUS`], as its status and body. It is read with the
+/// account's own credential, so the read is never itself the call being decided.
+async fn described_rule(emulator: &Emulator, name: &str) -> (u16, Value) {
+    events_as(
+        emulator,
+        ACCOUNT_KEY,
+        "DescribeRule",
+        &json!({ "Name": name, "EventBusName": BUS }),
+    )
+    .await
+}
+
+/// What a reader reports for a name [`BUS`] holds no rule under: this service names the rule
+/// and the bus it was sought on, because a rule name is unique only within its bus.
+fn no_such_rule(name: &str) -> String {
+    format!("Rule {name} does not exist on EventBus {BUS}.")
+}
+
+/// One row: the `Condition` the caller's only `Allow` carries, one pattern that condition
+/// COVERS and one it does not.
+struct AdmissionRow {
+    case: &'static str,
+    /// The `Condition` element of the single `Allow` in force on the caller.
+    condition: Value,
+    /// The `EventPattern` whose published key values satisfy that condition.
+    covered: &'static str,
+    /// An `EventPattern` whose values it does not cover.
+    uncovered: &'static str,
+}
+
+/// The rows. Each one holds ONE conditioned grant and differs along the form that grant is
+/// written in — which event-content key it is scoped by (the event's `source`, its
+/// `detail-type`), the condition operator (string equality, a string wildcard, the existence
+/// operator in both its spellings), the set qualifier (none, `ForAllValues:`, `ForAnyValue:`)
+/// and how many literals the covered pattern lists — so the pair of calls under it is the
+/// same differential in every row: the pattern the grant covers against one it does not.
+fn admission_rows() -> Vec<AdmissionRow> {
+    vec![
+        AdmissionRow {
+            // "`Null` — check if a condition key is present at the time of authorization":
+            // asking for its PRESENCE grants every call that fixes the field to literals, and
+            // no call that leaves it free.
+            case: "Null asserting the source key is present",
+            condition: on_key("Null", SOURCE_KEY, "false"),
+            covered: r#"{"source":["com.demo.orders"]}"#,
+            uncovered: r#"{"detail-type":["Order Created"]}"#,
+        },
+        AdmissionRow {
+            case: "Null asserting the source key is absent",
+            condition: on_key("Null", SOURCE_KEY, "true"),
+            covered: r#"{"detail-type":["Order Created"]}"#,
+            uncovered: r#"{"source":["com.demo.orders"]}"#,
+        },
+        AdmissionRow {
+            case: "ForAllValues:StringEquals over the one source the grant names",
+            condition: on_key_values("ForAllValues:StringEquals", SOURCE_KEY, &[ALLOWED_SOURCE]),
+            covered: r#"{"source":["com.demo.orders"]}"#,
+            uncovered: r#"{"source":["com.other.orders"]}"#,
+        },
+        AdmissionRow {
+            case: "ForAllValues:StringEquals over two sources the grant names",
+            condition: on_key_values(
+                "ForAllValues:StringEquals",
+                SOURCE_KEY,
+                &[ALLOWED_SOURCE, OTHER_SOURCE],
+            ),
+            covered: r#"{"source":["com.demo.orders","com.other.orders"]}"#,
+            uncovered: r#"{"source":["com.demo.orders","com.third.orders"]}"#,
+        },
+        AdmissionRow {
+            case: "ForAnyValue:StringEquals over the one source the grant names",
+            condition: on_key_values("ForAnyValue:StringEquals", SOURCE_KEY, &[ALLOWED_SOURCE]),
+            covered: r#"{"source":["com.other.orders","com.demo.orders"]}"#,
+            uncovered: r#"{"source":["com.other.orders"]}"#,
+        },
+        AdmissionRow {
+            case: "StringEquals on the one source the grant names",
+            condition: on_key("StringEquals", SOURCE_KEY, ALLOWED_SOURCE),
+            covered: r#"{"source":["com.demo.orders"]}"#,
+            uncovered: r#"{"source":["com.other.orders"]}"#,
+        },
+        AdmissionRow {
+            case: "StringLike over the source prefix the grant names",
+            condition: on_key("StringLike", SOURCE_KEY, "com.demo.*"),
+            covered: r#"{"source":["com.demo.orders"]}"#,
+            uncovered: r#"{"source":["com.other.orders"]}"#,
+        },
+        AdmissionRow {
+            case: "StringEquals on the detail-type the grant names",
+            condition: on_key("StringEquals", DETAIL_TYPE_KEY, ALLOWED_DETAIL_TYPE),
+            covered: r#"{"source":["com.demo.orders"],"detail-type":["Order Created"]}"#,
+            uncovered: r#"{"source":["com.demo.orders"],"detail-type":["Order Cancelled"]}"#,
+        },
+    ]
+}
+
+/// RULE — a statement scoped by an event-content condition key is a GRANT for the calls whose
+/// submitted pattern satisfies it, not merely a refusal for the others: such a call is served
+/// 200 on its FIRST attempt, so there is no window in which a conditioned `Allow` admits
+/// nothing, and the rule it wrote reads back carrying that pattern verbatim. Only the call
+/// whose pattern the condition does not cover is refused `AccessDeniedException` with AWS's
+/// implicit-deny sentence, and the name that call named holds no rule afterwards — which a
+/// later read reports as the missing rule it is.
+#[tokio::test]
+async fn a_source_conditioned_grant_admits_the_pattern_it_covers_and_refuses_the_rest() {
+    for row in admission_rows() {
+        let case = row.case;
+        let emulator = emulator();
+        given_bus(&emulator, case).await;
+        let (key, principal) =
+            assumed_role(&emulator, case, &scoped_allow(Some(row.condition))).await;
+
+        // The ADMITTED leg: the first call under the conditioned grant, with no retry around
+        // it, because a grant that holds holds at once.
+        let covered_arn = rule_arn(BUS, COVERED_RULE);
+        let (status, answered) = events_as(
+            &emulator,
+            &key,
+            "PutRule",
+            &json!({
+                "Name": COVERED_RULE,
+                "EventBusName": BUS,
+                "EventPattern": row.covered,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the covered pattern to be admitted on the first call, got \
+             {status} {answered}"
+        );
+        assert_eq!(
+            answered["RuleArn"],
+            json!(covered_arn),
+            "case {case:?}: expected the rule ARN {covered_arn:?}, got {answered}"
+        );
+        let (status, described) = described_rule(&emulator, COVERED_RULE).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the admitted rule to be readable, got {status} {described}"
+        );
+        assert_eq!(
+            described["EventPattern"],
+            json!(row.covered),
+            "case {case:?}: expected the pattern {:?} read back verbatim, got {described}",
+            row.covered
+        );
+        assert_eq!(
+            described["Arn"],
+            json!(covered_arn),
+            "case {case:?}: expected the stored ARN {covered_arn:?}, got {described}"
+        );
+        assert_eq!(
+            described["EventBusName"],
+            json!(BUS),
+            "case {case:?}: expected the rule on the bus {BUS:?}, got {described}"
+        );
+
+        // The REFUSED leg, under the very same grant: the same principal, the same action and
+        // the same bus, differing only in the pattern this call submits.
+        let uncovered_arn = rule_arn(BUS, UNCOVERED_RULE);
+        let (status, answered) = events_as(
+            &emulator,
+            &key,
+            "PutRule",
+            &json!({
+                "Name": UNCOVERED_RULE,
+                "EventBusName": BUS,
+                "EventPattern": row.uncovered,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the uncovered pattern to be refused, got {status} {answered}"
+        );
+        let code = error_code(&answered);
+        assert_eq!(
+            code, "AccessDeniedException",
+            "case {case:?}: expected the code AccessDeniedException, got {code:?} in {answered}"
+        );
+        let expected = Refusal::NoGrant.message(&principal, &uncovered_arn);
+        let reported = message(&answered);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the refusal {expected:?}, got {reported:?}"
+        );
+        let (status, described) = described_rule(&emulator, UNCOVERED_RULE).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a refused call must leave no rule behind, got {status} {described}"
+        );
+        let code = error_code(&described);
+        assert_eq!(
+            code, "ResourceNotFoundException",
+            "case {case:?}: expected the code ResourceNotFoundException, got {code:?} in \
+             {described}"
+        );
+        let expected = no_such_rule(UNCOVERED_RULE);
+        let reported = message(&described);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the missing-rule sentence {expected:?}, got {reported:?}"
+        );
+
+        // The served call's own rule is untouched by the refusal beside it.
+        let (status, described) = described_rule(&emulator, COVERED_RULE).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the admitted rule must survive the refused call, got {status} \
+             {described}"
+        );
+        assert_eq!(
+            described["EventPattern"],
+            json!(row.covered),
+            "case {case:?}: expected the admitted pattern {:?} unchanged, got {described}",
+            row.covered
+        );
     }
 }
