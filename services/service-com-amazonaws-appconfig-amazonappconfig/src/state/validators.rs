@@ -182,14 +182,16 @@ pub struct Candidate<'a> {
 /// The validators are run in the order the profile carries them and the first verdict is
 /// answered, so a call is refused for the first check it failed rather than for the last.
 pub async fn first_rejection(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     validators: &[Validator],
     candidate: &Candidate<'_>,
     request_region: &str,
 ) -> Option<String> {
     for validator in validators {
         let rejection = match validator.r#type.as_str() {
-            LAMBDA => lambda_rejection(ctx, &validator.content, candidate, request_region).await,
+            LAMBDA => {
+                lambda_rejection(callback, &validator.content, candidate, request_region).await
+            }
             JSON_SCHEMA => json_schema_rejection(&validator.content, candidate).await,
             // A `Type` outside the model's `ValidatorType` enum is refused by the boundary
             // validator before any handler stores it, so there is no check to run for one.
@@ -205,7 +207,7 @@ pub async fn first_rejection(
 /// The verdict a `LAMBDA` validator gives: whether the function the validator's `Content`
 /// names, invoked with the candidate configuration, reports an error.
 async fn lambda_rejection(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     function: &str,
     candidate: &Candidate<'_>,
     request_region: &str,
@@ -217,7 +219,7 @@ async fn lambda_rejection(
     let event = validator_event(candidate).to_string();
     match ::tokio::time::timeout(
         LAMBDA_CHECK_BUDGET,
-        invoke_function(ctx, function, region, event),
+        invoke_function(callback, function, region, event),
     )
     .await
     {

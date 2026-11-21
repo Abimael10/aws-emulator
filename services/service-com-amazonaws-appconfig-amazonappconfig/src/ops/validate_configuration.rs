@@ -266,7 +266,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             content: &content,
         };
         if let Some(rejection) =
-            crate::state::validators::first_rejection(ctx, &validators, &candidate, &region).await
+            crate::state::validators::first_rejection(
+                ctx.callback(),
+                &validators,
+                &candidate,
+                &region,
+            )
+            .await
         {
             return Err(ValidateConfigurationErrorModeled::BadRequestException(
                 BadRequestException {

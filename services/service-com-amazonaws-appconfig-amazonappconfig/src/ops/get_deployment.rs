@@ -271,12 +271,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // asked for this report.
         crate::state::extension_actions::drive_deployment(
             &*self.engine,
-            ctx,
+            ctx.callback(),
+            &crate::state::request_region(ctx.parts()),
             &application_id,
             &environment_id,
             input.deployment_number,
         )
         .await;
+
+        // The clock that owes those points keeps running while this deployment is in
+        // flight, so the next one falls due without a further read: starting it here is
+        // what picks the work up again if the store's clock had already stood down.
+        crate::state::deployment_clock::drive(
+            &self.engine,
+            ctx.callback(),
+            &crate::state::request_region(ctx.parts()),
+        );
 
         let store = state.lock();
         let Some(deployment) = store

@@ -44,6 +44,9 @@ pub mod alarm_monitors;
 /// Where a configuration profile's configuration LIVES, and the content a deployed
 /// version of it has when that location is not AppConfig's own hosted store.
 pub mod configuration_sources;
+/// The one in-process task that carries a started deployment through the stages, and the
+/// extension action points, AppConfig's own schedule owes it — without a further call.
+pub mod deployment_clock;
 pub mod extension_actions;
 /// The extension and extension-association records an account holds, with the store
 /// methods every operation reaches them through.
@@ -4219,6 +4222,19 @@ pub struct ComAmazonawsAppconfigAmazonappconfigState {
     /// [`Self::reserve_hosted_configuration_bytes`] and bounded by
     /// [`MAX_TOTAL_HOSTED_CONFIGURATION_BYTES`].
     hosted_configuration_bytes: usize,
+    /// Whether the one clock that carries this store's deployments through the stages
+    /// AppConfig's schedule owes them is running ([`deployment_clock`]).
+    ///
+    /// PRIVATE, like the claim's other two fields: the clock module is the only thing
+    /// that reads or writes them, and a second clock started beside the running one
+    /// would dispatch a deployment's action points twice.
+    deployment_clock_running: bool,
+    /// Which claim on that clock is the current one, so a clock that has stood down
+    /// cannot release a claim a clock started since is holding.
+    deployment_clock_generation: u64,
+    /// The running clock's task, kept so a claim taken over from a clock that ended
+    /// without releasing it drops the task with it.
+    deployment_clock: Option<::tokio::task::JoinHandle<()>>,
 }
 
 impl ComAmazonawsAppconfigAmazonappconfigState {

@@ -464,7 +464,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut replaced: Option<Vec<u8>> = None;
         for target in &targets {
             match crate::state::extension_actions::invoke(
-                ctx,
+                ctx.callback(),
                 target,
                 &event.document(target),
                 &region,

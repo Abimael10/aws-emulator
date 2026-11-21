@@ -37,8 +37,9 @@
 //!
 //! A target is reached through [`TargetKind`], which admits ONLY an ARN naming one of
 //! those four resources, and the invocation is made with a client bound to that service's
-//! endpoint over `OperationContext::callback` — the transport back into this same
-//! emulator. So the destination of an action's invocation is always a service this
+//! endpoint over the in-process callback handle a request carries
+//! (`OperationContext::callback`) — the transport back into this same emulator. So the
+//! destination of an action's invocation is always a service this
 //! emulator itself serves: a `Uri` carrying a URL, a host name or an ARN of any other
 //! resource reaches nothing, and no socket leaves the machine. How many invocations one
 //! call can make is bounded by the association store's own cap
@@ -612,7 +613,7 @@ pub fn directive(answer: &Value) -> Option<(String, Option<String>)> {
 /// request was signed for, over the in-process callback into this same emulator — so the
 /// service that owns the target is the one that serves the invocation.
 pub async fn invoke(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     target: &ActionTarget,
     event: &Value,
     request_region: &str,
@@ -633,7 +634,7 @@ pub async fn invoke(
         .unwrap_or(request_region);
     let body = event.to_string();
     match kind {
-        TargetKind::Function => invoke_function(ctx, &target.uri, region, body).await,
+        TargetKind::Function => invoke_function(callback, &target.uri, region, body).await,
         TargetKind::Queue => {
             let Some(queue_url) = queue_url(&target.uri) else {
                 return Err(Failure {
@@ -644,7 +645,7 @@ pub async fn invoke(
                 });
             };
             answered_nothing(
-                sqs_client(ctx, region)
+                sqs_client(callback, region)
                     .send_message()
                     .queue_url(queue_url)
                     .message_body(body)
@@ -653,7 +654,7 @@ pub async fn invoke(
             )
         }
         TargetKind::Topic => answered_nothing(
-            sns_client(ctx, region)
+            sns_client(callback, region)
                 .publish()
                 .topic_arn(&target.uri)
                 .message(body)
@@ -661,7 +662,7 @@ pub async fn invoke(
                 .await,
         ),
         TargetKind::EventBus => answered_nothing(
-            eventbridge_client(ctx, region)
+            eventbridge_client(callback, region)
                 .put_events()
                 .entries(
                     ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
@@ -687,12 +688,12 @@ pub async fn invoke(
 /// document to a function and reads the verdict back: a configuration profile's `LAMBDA`
 /// validator does too ([`super::validators`]), and both go through this one invocation.
 pub(crate) async fn invoke_function(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
     function_name: &str,
     region: &str,
     body: String,
 ) -> Answer {
-    let answer = lambda_client(ctx, region)
+    let answer = lambda_client(callback, region)
         .invoke()
         .function_name(function_name)
         .invocation_type(::aws_sdk_lambda::types::InvocationType::RequestResponse)
@@ -877,13 +878,13 @@ fn queue_url(uri: &str) -> Option<String> {
 macro_rules! callback_client {
     ($name:ident, $sdk:ident, $endpoint:literal) => {
         fn $name(
-            ctx: &smithy_server_runtime::OperationContext<'_>,
+            callback: &smithy_server_runtime::EmbeddedEmulator,
             region: &str,
         ) -> ::$sdk::Client {
             let config = ::$sdk::Config::builder()
                 .behavior_version(::$sdk::config::BehaviorVersion::latest())
-                .http_client(ctx.callback().http_client())
-                .credentials_provider(ctx.callback().aws_credentials_provider())
+                .http_client(callback.http_client())
+                .credentials_provider(callback.aws_credentials_provider())
                 .region(::$sdk::config::Region::new(region.to_string()))
                 .endpoint_url(format!("https://{}.{region}.amazonaws.com", $endpoint))
                 .retry_config(::$sdk::config::retry::RetryConfig::disabled())
@@ -914,26 +915,28 @@ struct OwedPoint {
 }
 
 /// Invoke the action points this deployment's own lifecycle owes, and apply what the
-/// targets answer.
+/// targets answer. Answers how many invocations it made.
 ///
 /// Every point it dispatches was owed by the CLOCK: each `ON_DEPLOYMENT_*` point is owed
 /// by a deployment event the strategy's own durations already made due, and a tick by the
 /// interval that has elapsed since the previous one — so a reporting operation may call
-/// this. It cannot make a later caller see anything the clock had not already made true,
-/// with the one exception the extension itself asks for: a target that answers
-/// [`DIRECTIVE_ROLL_BACK`] rolls the deployment back, which is the point of the action
-/// point.
+/// this, and so may the service's own clock ([`super::deployment_clock`]), which is what
+/// dispatches them for a client that never reads the deployment again. It cannot make a
+/// later caller see anything the clock had not already made true, with the one exception
+/// the extension itself asks for: a target that answers [`DIRECTIVE_ROLL_BACK`] rolls the
+/// deployment back, which is the point of the action point.
 pub async fn drive_deployment<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
     application_id: &str,
     environment_id: &str,
     deployment_number: i32,
-) {
+) -> usize {
     let Some(state) = super::service_state(engine) else {
-        return;
+        return 0;
     };
-    let region = super::request_region(ctx.parts());
+    let mut invoked = 0;
     for _ in 0..MAX_DRIVE_ROUNDS {
         let now = SystemTime::now();
         let owed = {
@@ -943,17 +946,17 @@ pub async fn drive_deployment<Eng: Send + Sync + 'static>(
                 application_id,
                 environment_id,
                 deployment_number,
-                &region,
+                region,
                 now,
             )
         };
         let Some(owed) = owed else {
-            return;
+            return invoked;
         };
         let mut records: Vec<ActionInvocation> = Vec::new();
         let mut rollback: Option<Option<String>> = None;
         for target in &owed.targets {
-            let answer = invoke(ctx, target, &owed.event.document(target), &region).await;
+            let answer = invoke(callback, target, &owed.event.document(target), region).await;
             match answer {
                 Ok(answered) => {
                     records.push(target.invocation_record(None));
@@ -977,13 +980,14 @@ pub async fn drive_deployment<Eng: Send + Sync + 'static>(
         if records.is_empty() && rollback.is_none() {
             continue;
         }
+        invoked += records.len();
         let mut store = state.lock();
         let Some(deployment) = store
             .application_mut(application_id)
             .and_then(|application| application.environments.get_mut(environment_id))
             .and_then(|environment| environment.deployments.get_mut(&deployment_number))
         else {
-            return;
+            return invoked;
         };
         if let Some(index) = owed.event_index {
             if let Some(event) = deployment.event_log.get_mut(index) {
@@ -996,6 +1000,7 @@ pub async fn drive_deployment<Eng: Send + Sync + 'static>(
             apply_roll_back(deployment, description, records, now);
         }
     }
+    invoked
 }
 
 /// Apply an `AT_DEPLOYMENT_TICK` target's [`DIRECTIVE_ROLL_BACK`] to the deployment it
@@ -1122,6 +1127,17 @@ fn owed_point_of(deployment: &Deployment, now: SystemTime) -> Option<(&'static s
         return Some((AT_DEPLOYMENT_TICK, None));
     }
     None
+}
+
+/// Whether `deployment` owes the invocation of an action point at `now`.
+///
+/// The same question [`owed_point_of`] answers, without the index: what the service's own
+/// clock asks of a deployment it is deciding whether to keep carrying
+/// ([`super::deployment_clock`]), because a deployment the service has finished with can
+/// still owe the `ON_DEPLOYMENT_COMPLETE` or `ON_DEPLOYMENT_ROLLED_BACK` point of the
+/// stage that finished it.
+pub fn owes_an_action_point(deployment: &Deployment, now: SystemTime) -> bool {
+    owed_point_of(deployment, now).is_some()
 }
 
 /// The event every action point of a deployment's own workflow is handed: the resources

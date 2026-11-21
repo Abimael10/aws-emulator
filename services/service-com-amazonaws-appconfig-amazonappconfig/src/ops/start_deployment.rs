@@ -625,7 +625,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 content,
             };
             if let Some(rejection) = crate::state::validators::first_rejection(
-                ctx,
+                ctx.callback(),
                 &prepared.validators,
                 &candidate,
                 &region,
@@ -642,7 +642,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut pre_start_invocations: Vec<ActionInvocation> = Vec::new();
         for target in &prepared.targets {
             match crate::state::extension_actions::invoke(
-                ctx,
+                ctx.callback(),
                 target,
                 &prepared.event.document(target),
                 &region,
@@ -729,12 +729,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with nothing left to wait for, the completion the clock already made due.
         crate::state::extension_actions::drive_deployment(
             &*self.engine,
-            ctx,
+            ctx.callback(),
+            &region,
             &prepared.application_id,
             &prepared.environment_id,
             deployment_number,
         )
         .await;
+
+        // Every stage AFTER this call, and every action point those stages owe, falls due
+        // on AppConfig's own schedule rather than on anybody calling again — so the one
+        // in-process clock of this store is started here to wait for those instants. A
+        // client that watches what the deployment's extensions do, and never reads the
+        // deployment itself, is the one for which nothing else would.
+        crate::state::deployment_clock::drive(&self.engine, ctx.callback(), &region);
 
         let store = state.lock();
         let Some(stored) = store
