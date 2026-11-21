@@ -185,6 +185,16 @@ fn invalid_argument(message: String) -> UpdateChannelError {
     .into()
 }
 
+/// Refuse the request with the error this operation models for an input the service validates
+/// before it applies anything — the data-freshness window a destination is moved to, worded
+/// exactly as the create words it for the same window.
+fn validation(message: String) -> UpdateChannelError {
+    UpdateChannelErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// Refuse the request because the channel it names is "not available for this operation": a
 /// channel whose create or whose previous change is still due is one no further change may
 /// be applied to, since "For successful operation, the resource must be in the ACTIVE state"
@@ -263,6 +273,20 @@ fn update_channel(
         ));
     }
 
+    // Still what the request says on its own: a streaming table destination delivers on the
+    // data-freshness window the service documents for it, so an update moving that window
+    // outside it is refused before the store is read, with the same sentence the create
+    // refuses such a window with ([`crate::state::streaming_table_freshness_refusal`]).
+    if let Some(refusal) = input
+        .s3_tables_destination_configuration
+        .as_ref()
+        .and_then(|update| {
+            crate::state::streaming_table_freshness_refusal(update.data_freshness_in_seconds)
+        })
+    {
+        return Err(validation(refusal));
+    }
+
     // `ChannelARN` is the only identifier this operation takes (`@required`), and a channel
     // "is unique within your Amazon Web Services account and Amazon Web Services Region", so
     // the region the request was signed for is the one whose channels it addresses.
@@ -299,8 +323,9 @@ fn update_channel(
     }
 
     // Only the members the update names change. `DataFreshnessInSeconds` is modelled required
-    // on both update inputs and carries no `@range`, so any value the boundary validator
-    // admits is stored as submitted.
+    // on both update inputs and carries no `@range`, so a general purpose bucket destination's
+    // window is stored as submitted, and a streaming table destination's is the one the check
+    // above already admitted.
     if let (Some(update), Some(destination)) = (
         input.s3_destination_configuration.as_ref(),
         channel.s3_destination.as_mut(),

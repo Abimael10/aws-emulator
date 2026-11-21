@@ -23,7 +23,10 @@
 //! `PartitionSpec`), so a streaming table configuration naming no partitioning specification
 //! describes no table this service can create and is refused with the modelled
 //! `ValidationException` ([`crate::state::PARTITION_SPEC_REQUIRED_MESSAGE`]), before any
-//! channel is stored and any table provisioned.
+//! channel is stored and any table provisioned. Such a destination also delivers on a
+//! data-freshness window the service documents a range for, so a window outside it is refused
+//! the same way, with the sentence naming that range's bounds
+//! ([`crate::state::streaming_table_freshness_refusal`]).
 //!
 //! The `ServiceExecutionRoleARN` is resolved against this account's IAM records
 //! SYNCHRONOUSLY, before any channel state is written and before anything the request says
@@ -371,6 +374,18 @@ fn destination(input: &CreateChannelInput) -> Result<Destination, CreateChannelE
             })
         }
         (None, Some(tables)) => {
+            // A streaming table destination delivers on the data-freshness window the service
+            // documents for it, so a window outside that one is refused here — before any
+            // channel is stored and before any table is provisioned — with the sentence that
+            // names the window's own bounds
+            // ([`crate::state::streaming_table_freshness_message`]). A create naming no window
+            // takes the documented default, which is inside it.
+            if let Some(refusal) = tables
+                .data_freshness_in_seconds
+                .and_then(crate::state::streaming_table_freshness_refusal)
+            {
+                return Err(validation(refusal));
+            }
             // A streaming table destination is a table this service CREATES, partitioned the
             // way the configuration asks for ("Specifies how the destination table is
             // partitioned", `PartitionSpec`), so a configuration naming no partitioning

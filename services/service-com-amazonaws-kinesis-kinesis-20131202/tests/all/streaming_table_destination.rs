@@ -25,6 +25,14 @@
 //! configuration that does name one is accepted whatever that specification holds, reaches
 //! `ACTIVE`, and reports the partitioning it was created with.
 //!
+//! RULE 3: that destination delivers on the data-freshness window the service documents a
+//! range for — 300 to 900 seconds, both ends served — so a `CreateChannel` or an
+//! `UpdateChannel` naming a window outside that range is refused — HTTP 400,
+//! `ValidationException`, "DataFreshnessInSeconds must be between 300 and 900." — before any
+//! channel is stored and before any table is provisioned, while a window inside it, and a
+//! create that names none and takes the documented default, is served and reported back by
+//! every later read.
+//!
 //! The recorded flow this was derived from creates ONE channel with ONE streaming table
 //! configuration and then reads that table back, which is one row of the table below. The
 //! rows differ along what the rule generalises over: the form and length of the destination
@@ -994,6 +1002,406 @@ async fn a_configuration_with_a_partition_spec_is_accepted_whatever_its_fields()
             status, 200,
             "case {case}: expected the accepted create to have provisioned its table, got \
              {status} with body {table}"
+        );
+    }
+}
+
+/// The shortest data-freshness window a streaming table destination delivers on. The model
+/// states no bound — `smithy_query(query="shape",shape="S3TablesDestinationConfiguration")` ->
+/// `DataFreshnessInSeconds` targets a plain integer whose documentation names only the default
+/// — so this is the lower end of the delivery range the service documents for a streaming table
+/// destination.
+const MIN_FRESHNESS_SECONDS: i64 = 300;
+
+/// The longest window it delivers on: the upper end of that same documented range.
+const MAX_FRESHNESS_SECONDS: i64 = 900;
+
+/// The window a destination that names none gets: "The default value is 300 seconds" (same
+/// member).
+const DEFAULT_FRESHNESS_SECONDS: i64 = 300;
+
+/// The sentence the service refuses a window outside that range with. FIXED text around the
+/// member's own two bounds, written out here rather than borrowed from the crate, so a drift
+/// away from the wording fails rather than comparing the handler against itself.
+const FRESHNESS_OUT_OF_RANGE: &str = "DataFreshnessInSeconds must be between 300 and 900.";
+
+/// One streaming table destination delivering to one table, naming `freshness` as its
+/// data-freshness window only where a case states one.
+fn tables_destination_with_freshness(
+    bucket_arn: &str,
+    namespace: &str,
+    table: &str,
+    freshness: Option<i64>,
+) -> Value {
+    let mut destination = tables_destination(bucket_arn, namespace, table, "ZSTD");
+    if let (Some(members), Some(freshness)) = (destination.as_object_mut(), freshness) {
+        members.insert("DataFreshnessInSeconds".to_string(), json!(freshness));
+    }
+    destination
+}
+
+/// The window the stored channel `arn` reports for its streaming table destination.
+async fn reported_freshness(emulator: &Emulator, case: &str, arn: &str) -> Option<i64> {
+    let read = emulator
+        .ok(case, "DescribeChannel", &json!({ "ChannelARN": arn }))
+        .await;
+    read["ChannelDescription"]["S3TablesDestinationConfiguration"]["DataFreshnessInSeconds"]
+        .as_i64()
+}
+
+/// Look at the channel `arn` until it reports the `ACTIVE` its create or its last accepted
+/// change owes it, through the crate's one poll loop ([`crate::stream_tags::poll_until`]).
+///
+/// The sibling `crate::channel_lifecycle::poll_until_channel_active` keeps the same loop for
+/// the Kinesis-only harness, and takes THAT suite's `Emulator`; the cases here drive the
+/// Kinesis-and-S3-Tables router this file mounts, so the wait is written once for this
+/// `Emulator` rather than threaded through a second harness.
+async fn poll_until_active(emulator: &Emulator, case: &str, arn: &str) {
+    poll_until(
+        case,
+        &format!("the channel {arn} reports {CHANNEL_ACTIVE}"),
+        || async {
+            let (status, response) = emulator
+                .call("DescribeChannel", &json!({ "ChannelARN": arn }))
+                .await;
+            status == 200
+                && response["ChannelDescription"]["ChannelStatus"].as_str() == Some(CHANNEL_ACTIVE)
+        },
+    )
+    .await;
+}
+
+/// One row of the freshness table: the window a create names (absent where `None`) and the
+/// window the channel must report, or `None` where the create must be refused.
+struct Freshness {
+    case: &'static str,
+    freshness: Option<i64>,
+    served: Option<i64>,
+}
+
+/// A create takes a streaming table destination's data-freshness window only inside the range
+/// the destination delivers on, and a refused one leaves behind neither a channel, nor a table,
+/// nor an entry on the source stream's listing.
+#[tokio::test]
+async fn a_streaming_table_window_is_served_only_inside_the_documented_range() {
+    let emulator = Emulator::new();
+    let bucket_arn = emulator.table_bucket("freshness", "ch-tables-freshness").await;
+    emulator.namespace("freshness", &bucket_arn, "events").await;
+    let source = emulator
+        .on_demand_stream("freshness", "freshness-source")
+        .await;
+
+    // The rows differ along where the window sits relative to the range: under its lower end,
+    // on each published bound, inside, over its upper end, and absent altogether.
+    let rows = [
+        Freshness {
+            case: "one second under the minimum",
+            freshness: Some(MIN_FRESHNESS_SECONDS - 1),
+            served: None,
+        },
+        Freshness {
+            case: "a zero window",
+            freshness: Some(0),
+            served: None,
+        },
+        Freshness {
+            case: "a negative window",
+            freshness: Some(-1),
+            served: None,
+        },
+        Freshness {
+            case: "one second over the maximum",
+            freshness: Some(MAX_FRESHNESS_SECONDS + 1),
+            served: None,
+        },
+        Freshness {
+            case: "a day-long window",
+            freshness: Some(86_400),
+            served: None,
+        },
+        Freshness {
+            case: "the minimum itself",
+            freshness: Some(MIN_FRESHNESS_SECONDS),
+            served: Some(MIN_FRESHNESS_SECONDS),
+        },
+        Freshness {
+            case: "inside the range",
+            freshness: Some(451),
+            served: Some(451),
+        },
+        Freshness {
+            case: "the maximum itself",
+            freshness: Some(MAX_FRESHNESS_SECONDS),
+            served: Some(MAX_FRESHNESS_SECONDS),
+        },
+        Freshness {
+            case: "no window named, so the documented default",
+            freshness: None,
+            served: Some(DEFAULT_FRESHNESS_SECONDS),
+        },
+    ];
+
+    let mut channels_served: Vec<String> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let name = format!("freshness-channel-{index}");
+        let table = format!("freshness_records_{index}");
+        let (status, response) = emulator
+            .call(
+                "CreateChannel",
+                &create_channel_body(
+                    &name,
+                    &source,
+                    "GSR_JSON",
+                    tables_destination_with_freshness(&bucket_arn, "events", &table, row.freshness),
+                ),
+            )
+            .await;
+
+        let Some(expected) = row.served else {
+            assert_eq!(
+                status, 400,
+                "case {case}: expected a client error, got {status} with body {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                VALIDATION,
+                "case {case}: expected {VALIDATION}, got {response}"
+            );
+            let message = error_message(&response);
+            assert_eq!(
+                message, FRESHNESS_OUT_OF_RANGE,
+                "case {case}: expected the message {FRESHNESS_OUT_OF_RANGE:?}, got {message:?}"
+            );
+
+            // The refusal is taken before anything is persisted, so the name it asked for
+            // holds no channel ...
+            let (read_status, described) = emulator
+                .call(
+                    "DescribeChannel",
+                    &json!({ "ChannelARN": channel_arn(REGION, &name) }),
+                )
+                .await;
+            assert_eq!(
+                read_status, 400,
+                "case {case}: expected the refused create to have stored no channel, got \
+                 {read_status} with body {described}"
+            );
+            assert_eq!(
+                error_code(&described),
+                "ResourceNotFoundException",
+                "case {case}: expected the refused create to have stored no channel, got \
+                 {described}"
+            );
+
+            // ... and S3 Tables holds no table for the destination it named.
+            let (table_status, body) = emulator.get_table(&bucket_arn, "events", &table).await;
+            assert_eq!(
+                table_status, 404,
+                "case {case}: expected the refused create to have provisioned no table {table}, \
+                 got {table_status} with body {body}"
+            );
+            continue;
+        };
+
+        assert_eq!(
+            status, 200,
+            "case {case}: expected the window inside the range to be served, got {status} with \
+             body {response}"
+        );
+        let reported = response["ChannelDescription"]["S3TablesDestinationConfiguration"]
+            ["DataFreshnessInSeconds"]
+            .as_i64();
+        assert_eq!(
+            reported,
+            Some(expected),
+            "case {case}: expected the create to report the window {expected}, got {response}"
+        );
+
+        // What the create accepted is what the STORED channel reports, and its table is there.
+        let arn = channel_arn(REGION, &name);
+        poll_until_active(&emulator, case, &arn).await;
+        assert_eq!(
+            reported_freshness(&emulator, case, &arn).await,
+            Some(expected),
+            "case {case}: expected the stored window {expected} to be read back"
+        );
+        let (table_status, body) = emulator.get_table(&bucket_arn, "events", &table).await;
+        assert_eq!(
+            table_status, 200,
+            "case {case}: expected the served create to have provisioned its table {table}, got \
+             {table_status} with body {body}"
+        );
+        channels_served.push(name);
+    }
+
+    // Exactly the served creates left a channel on the source stream: a refused one leaves no
+    // residue on the listing either.
+    let case = "the source stream's listing";
+    let listed = emulator
+        .ok(
+            case,
+            "ListChannels",
+            &json!({ "StreamFilter": [{ "StreamARN": source }] }),
+        )
+        .await;
+    let mut listed_names: Vec<String> = listed["ChannelSummaries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: ListChannels answers ChannelSummaries, got {listed}"))
+        .iter()
+        .map(|summary| summary["ChannelName"].as_str().unwrap_or_default().to_string())
+        .collect();
+    listed_names.sort();
+    let mut expected_names = channels_served.clone();
+    expected_names.sort();
+    assert_eq!(
+        listed_names, expected_names,
+        "case {case}: expected only the served channels on the source stream, got {listed_names:?}"
+    );
+}
+
+/// One row of the update table: the window the update names and whether it must be served.
+struct FreshnessUpdate {
+    case: &'static str,
+    freshness: i64,
+    served: bool,
+}
+
+/// An update moves a streaming table destination's window only inside that same range, and a
+/// refused one leaves the stored window as it was and arms no transition.
+#[tokio::test]
+async fn an_update_moves_a_streaming_table_window_only_inside_the_documented_range() {
+    let emulator = Emulator::new();
+    let bucket_arn = emulator
+        .table_bucket("update-freshness", "ch-tables-update-freshness")
+        .await;
+    emulator
+        .namespace("update-freshness", &bucket_arn, "events")
+        .await;
+    let source = emulator
+        .on_demand_stream("update-freshness", "update-freshness-source")
+        .await;
+
+    let case = "the channel every update is sent against";
+    let name = "update-freshness-channel";
+    let arn = channel_arn(REGION, name);
+    emulator
+        .ok(
+            case,
+            "CreateChannel",
+            &create_channel_body(
+                name,
+                &source,
+                "GSR_JSON",
+                tables_destination_with_freshness(
+                    &bucket_arn,
+                    "events",
+                    "update_freshness_records",
+                    Some(600),
+                ),
+            ),
+        )
+        .await;
+    poll_until_active(&emulator, case, &arn).await;
+
+    let rows = [
+        FreshnessUpdate {
+            case: "an update one second under the minimum",
+            freshness: MIN_FRESHNESS_SECONDS - 1,
+            served: false,
+        },
+        FreshnessUpdate {
+            case: "an update one second over the maximum",
+            freshness: MAX_FRESHNESS_SECONDS + 1,
+            served: false,
+        },
+        FreshnessUpdate {
+            case: "an update to a zero window",
+            freshness: 0,
+            served: false,
+        },
+        FreshnessUpdate {
+            case: "an update to the minimum",
+            freshness: MIN_FRESHNESS_SECONDS,
+            served: true,
+        },
+        FreshnessUpdate {
+            case: "an update to the maximum",
+            freshness: MAX_FRESHNESS_SECONDS,
+            served: true,
+        },
+        FreshnessUpdate {
+            case: "an update inside the range",
+            freshness: 777,
+            served: true,
+        },
+    ];
+
+    let mut held = reported_freshness(&emulator, case, &arn).await;
+    for row in &rows {
+        let case = row.case;
+        let (status, response) = emulator
+            .call(
+                "UpdateChannel",
+                &json!({
+                    "ChannelARN": arn,
+                    "S3TablesDestinationConfiguration": {
+                        "DataFreshnessInSeconds": row.freshness,
+                    },
+                }),
+            )
+            .await;
+
+        if row.served {
+            assert_eq!(
+                status, 200,
+                "case {case}: expected the window inside the range to be served, got {status} \
+                 with body {response}"
+            );
+            poll_until_active(&emulator, case, &arn).await;
+            held = Some(row.freshness);
+            assert_eq!(
+                reported_freshness(&emulator, case, &arn).await,
+                held,
+                "case {case}: expected the stored window to be {held:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case}: expected a client error, got {status} with body {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            VALIDATION,
+            "case {case}: expected {VALIDATION}, got {response}"
+        );
+        let message = error_message(&response);
+        assert_eq!(
+            message, FRESHNESS_OUT_OF_RANGE,
+            "case {case}: expected the message {FRESHNESS_OUT_OF_RANGE:?}, got {message:?}"
+        );
+
+        // A refused update writes nothing and arms no transition, so the channel is still
+        // ACTIVE on the window it already carried.
+        let described = emulator
+            .ok(case, "DescribeChannel", &json!({ "ChannelARN": arn }))
+            .await;
+        let status_reported = described["ChannelDescription"]["ChannelStatus"].as_str();
+        assert_eq!(
+            status_reported,
+            Some(CHANNEL_ACTIVE),
+            "case {case}: expected a refused update to leave the channel {CHANNEL_ACTIVE}, got \
+             {described}"
+        );
+        assert_eq!(
+            described["ChannelDescription"]["S3TablesDestinationConfiguration"]
+                ["DataFreshnessInSeconds"]
+                .as_i64(),
+            held,
+            "case {case}: expected the stored window {held:?} to be left as it was, got \
+             {described}"
         );
     }
 }
