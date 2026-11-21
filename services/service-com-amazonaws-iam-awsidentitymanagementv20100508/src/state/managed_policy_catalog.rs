@@ -1305,6 +1305,32 @@ pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
         is_attachable: true,
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["kinesis:DescribeStream","kinesis:DescribeStreamSummary","kinesis:GetRecords","kinesis:GetShardIterator","kinesis:ListShards","kinesis:ListStreams","kinesis:SubscribeToShard","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
     },
+    // The same, for an Amazon MSK cluster: the cluster reads Lambda makes to find the
+    // brokers it consumes through, the interface calls it makes to reach them inside the
+    // cluster's VPC, and the log writes every execution role carries.
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSLambdaMSKExecutionRole",
+        policy_id: "ANPAWKPTVSZGKJDPVNHLA",
+        default_version_id: "v3",
+        published: "2020-08-11T20:05:31Z",
+        revised: "2022-03-15T18:31:06Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["kafka:DescribeCluster","kafka:DescribeClusterV2","kafka:GetBootstrapBrokers","kafka:ListScramSecrets","ec2:CreateNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeVpcs","ec2:DeleteNetworkInterface","ec2:DescribeSubnets","ec2:DescribeSecurityGroups","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
+    },
+    // The same, for an Amazon SQS queue: the three calls Lambda makes to consume a queue on
+    // the function's behalf — receive a batch, delete the batch it processed, read the
+    // queue's own attributes — beside those log writes.
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSLambdaSQSQueueExecutionRole",
+        policy_id: "ANPAJHQBV6TNDQGZXUQ7G",
+        default_version_id: "v1",
+        published: "2018-06-14T22:44:49Z",
+        revised: "2018-06-14T22:44:49Z",
+        is_attachable: true,
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:ReceiveMessage","sqs:DeleteMessage","sqs:GetQueueAttributes","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
+    },
     // The same, for a function configured to run inside a VPC: the interface calls Lambda
     // makes on the function's behalf to attach it to each subnet and to clean up after it.
     AwsManagedPolicy {

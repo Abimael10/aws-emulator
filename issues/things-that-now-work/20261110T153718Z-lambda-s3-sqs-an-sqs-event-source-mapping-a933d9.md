@@ -37,3 +37,41 @@ Expected: the enabled mapping invokes the function for the first queued message 
 3. UpdateEventSourceMapping(UUID=..., Enabled=False), wait for State "Disabled", SendMessage again and confirm no invocation for a window sized from step 2's latency, with the message still in the queue.
 4. UpdateEventSourceMapping(Enabled=True) and confirm the withheld message is delivered.
 5. The emulator never completes step 2. Re-replay lambda__s3__sqs.sqs-esm-disabled-mapping-no-invocation-negative to confirm the fix.
+
+## Resolution
+
+The reported behaviour — an `Enabled` queue mapping that never invokes its function — is served
+by the current tree, and the whole contract this check measures completes in about ten seconds
+on the emulator a client STARTS (the built binary, its own port, request authentication on,
+every call SigV4-signed over TLS): the mapping settles into `Enabled`, the message sent to its
+queue reaches the running handler, which writes its report object into Amazon S3; the mapping
+moved to `Disabled` takes nothing out of the queue, so the message sent then stays waiting
+there (`ApproximateNumberOfMessages` 1, none in flight) with nothing reported for it over a
+quiet window, and a direct `ReceiveMessage` is still handed it; enabled again, the mapping
+delivers exactly that withheld message. Pinned end to end by
+core/router/tests/all/lambda_sqs_mapping_enabled_gate_on_a_started_emulator.rs, beside the
+owning crate's tests/all/event_source_mapping_pause_and_resume_delivery.rs (the same gate on a
+router assembled in the test process) and tests/all/event_source_mapping_sqs_delivery.rs. The
+poller itself lives in
+services/service-com-amazonaws-lambda-awsgirapiservice/src/state/sqs_poller.rs, armed by
+src/ops/create_event_source_mapping.rs and src/ops/update_event_source_mapping.rs.
+
+What WAS broken in that path is the execution role's published grant: AWS's own
+`arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole` — the policy a client
+attaches to the role an SQS-triggered function polls as, and the policy this emulator's own
+CloudFormation SAM transform puts on the roles it creates
+(services/service-com-amazonaws-cloudformation-cloudformation/src/state/sam.rs) — was not in
+the IAM emulator's catalog of AWS-managed policies, so `GetPolicy`, `GetPolicyVersion` and
+`ListPolicies(Scope=AWS)` reported it absent and a role granted the queue's three reads only
+through it was judged on no document at all: Lambda then accepted that role for a mapping on
+ANY event source, where AWS refuses a Kinesis or DynamoDB stream mapping for a role carrying
+only the queue policy. The same held for `AWSLambdaMSKExecutionRole`. Both are now carried in
+services/service-com-amazonaws-iam-awsidentitymanagementv20100508/src/state/managed_policy_catalog.rs,
+pinned by that crate's tests/all/published_lambda_event_source_policies.rs and by
+services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/event_source_mapping_published_grant.rs,
+whose table drives each published policy against each source and consumes a queue through a
+role granted by nothing else.
+
+The replay key `|run#18|Timeout|time.sleep(5)` is the harness's own 60 s per-check cap, reached
+inside the check's own sleep; no step of the contract stalls in the emulator, which serves all
+of it in about ten seconds.
