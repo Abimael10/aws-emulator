@@ -7,6 +7,24 @@ Issue-Commit: 99cd58a9732d3abbd4ae376bbbd8ca320e363114
 
 # autoscaling__ecs__elbv2: an ALB answers 502 for an ECS awsvpc ip target, because nothing in the emulator runs the container behind it (cause 1 of the two-cause report)
 
+> _RESOLVED, and every paragraph below that says otherwise is SUPERSEDED — including the
+> platform-blocker paragraph, which was written when nothing of the emulator ran the container and
+> no published name resolved. Both gaps it names are closed on the current code base: Amazon ECS
+> runs the container's own program and records the server it started at the task's address
+> (`services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/src/state/container_servers.rs`,
+> `container_runtime.rs`, publishing into `services/common/src/served_http_addresses.rs`), Elastic
+> Load Balancing v2 reads that one record for both the health check and the `forward`
+> (`.../src/state/target_servers.rs`, `.../src/service/instance_target.rs`), and a load balancer
+> that serves traffic opens a socket of the emulator's own and publishes the address it answers on
+> as its `DNSName` (`.../src/state/load_balancer_endpoint.rs`,
+> `.../src/service/listener_socket.rs`), so the check's `GET` to the published address reaches it.
+> The recorded unit replays green, and the rule is pinned by
+> `core/router/tests/all/alb_published_address_reaches_its_ecs_task.rs` beside the suites that
+> already pin its neighbours (`ecs_alb_serves_its_awsvpc_tasks_container.rs`,
+> `image_shipped_page_behind_a_load_balancer.rs`,
+> `alb_fails_open_to_its_unhealthy_ecs_target.rs`). The 502 remains what a target with no server
+> behind it earns._
+
 > _Split out of
 > `issues/things-that-now-work/20261108T200221Z-autoscaling-ecs-elbv2-2-net-new-causes-an-b49c9b.md`,
 > whose cause 2 (a health check pointed at a port nothing listens on reporting `healthy`) is

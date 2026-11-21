@@ -646,20 +646,43 @@ pub(crate) async fn health(router: &MultiServiceRouter, group: &str) -> Vec<(Str
 /// Wait until `group` reports exactly one registration and that registration is `healthy`,
 /// answering the address it is registered at.
 ///
-/// Polls the CONDITION — the task's start, the registration that start owes and the health its
-/// checks determine are all clock-owed — rather than waiting a fixed time.
+/// One target is the shape most rows want; a service whose desired count places several is waited
+/// for through [`healthy_targets`], which this delegates to so there is ONE poll of this condition.
 pub(crate) async fn healthy_target(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,
     service_name: &str,
 ) -> String {
+    healthy_targets(router, case, group, service_name, 1)
+        .await
+        .into_iter()
+        .next()
+        .expect("a settled poll answers one address per expected registration")
+}
+
+/// Wait until `group` reports `expected` registrations and every one of them is `healthy`,
+/// answering the addresses they name, in order.
+///
+/// Polls the CONDITION — the tasks' start, the registrations that start owes and the health their
+/// checks determine are all clock-owed — rather than waiting a fixed time.
+pub(crate) async fn healthy_targets(
+    router: &MultiServiceRouter,
+    case: &str,
+    group: &str,
+    service_name: &str,
+    expected: usize,
+) -> Vec<String> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let reported = health(router, group).await;
-        let settled = reported.len() == 1 && reported[0].1 == HEALTHY;
+        let settled =
+            reported.len() == expected && reported.iter().all(|(_, state)| state == HEALTHY);
         if settled {
-            return reported[0].0.clone();
+            let mut addresses: Vec<String> =
+                reported.into_iter().map(|(address, _)| address).collect();
+            addresses.sort();
+            return addresses;
         }
         if Instant::now() >= deadline {
             // What the service itself says about the tasks it placed, so a row that never
@@ -671,12 +694,22 @@ pub(crate) async fn healthy_target(
             )
             .await;
             panic!(
-                "case {case:?}: expected one registration reported {HEALTHY}, got {reported:?}; \
-                 the service reports {described}"
+                "case {case:?}: expected {expected} registration(s) reported {HEALTHY}, got \
+                 {reported:?}; the service reports {described}"
             );
         }
         ::tokio::time::sleep(POLL).await;
     }
+}
+
+/// The hostname the container of the task registered at `address` carries, which is the private
+/// DNS hostname of that very address — so a body carrying it is a body that task's own container
+/// wrote.
+///
+/// `pub(crate)` for the reason [`emulator`] gives: the rule belongs once, beside the fixtures every
+/// suite of this topology reads it with.
+pub(crate) fn container_hostname(address: &str) -> String {
+    format!("ip-{}", address.replace('.', "-"))
 }
 
 /// One answered data-plane request: the status and the body, as the wire carries them.
@@ -699,6 +732,63 @@ pub(crate) async fn get(router: &MultiServiceRouter, dns_name: &str, path: &str)
         status: response.status().as_u16(),
         body: String::from_utf8_lossy(response.body()).to_string(),
     }
+}
+
+/// How long one exchange on the published address waits to connect, to send and to be answered.
+/// Generous on purpose, for the same reason [`DEADLINE`] is.
+const EXCHANGE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// DIAL the address the load balancer published and exchange one request on it, as the client
+/// handed that address does: a connection in the clear, HTTP/1.1, with the authority it dialled as
+/// `Host`.
+///
+/// What [`get`] asserts of the PLANE, this asserts of the ADDRESS. Only the port is taken from the
+/// published authority, because the core binds the socket it opens for a load balancer on
+/// loopback.
+///
+/// `pub(crate)` for the reason [`emulator`] gives, and because there is ONE hand-written raw HTTP/1.1
+/// exchange for this topology rather than one per suite: every suite that dials a load balancer's
+/// own address calls this.
+pub(crate) async fn dialled(case: &str, dns_name: &str, path: &str) -> Answered {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let port = dns_name
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the published address {dns_name:?} carries no port to dial")
+        });
+    let mut stream = tokio::time::timeout(
+        EXCHANGE_DEADLINE,
+        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("case {case:?}: {dns_name} did not accept a connection"))
+    .unwrap_or_else(|error| panic!("case {case:?}: {dns_name} refused a connection: {error}"));
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {dns_name}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: the request was not sent: {error}"));
+    let mut answer = Vec::new();
+    tokio::time::timeout(EXCHANGE_DEADLINE, stream.read_to_end(&mut answer))
+        .await
+        .unwrap_or_else(|_| panic!("case {case:?}: {dns_name} did not answer in time"))
+        .unwrap_or_else(|error| panic!("case {case:?}: the answer was not read: {error}"));
+    let raw = String::from_utf8_lossy(&answer).to_string();
+    let status = raw
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("case {case:?}: no status line in {raw:?}"));
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    Answered { status, body }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -747,10 +837,7 @@ async fn a_load_balancer_answers_with_the_ecs_containers_own_server() {
             // the hostname the runtime gave that container, which is the private DNS hostname
             // of the very address the registration names.
             let wanted = if row.hostname_in_body {
-                vec![
-                    row.body.to_string(),
-                    format!("ip-{}", registered.replace('.', "-")),
-                ]
+                vec![row.body.to_string(), container_hostname(&registered)]
             } else {
                 vec![row.body.to_string()]
             };

@@ -36,6 +36,10 @@ use smithy_server_runtime::MultiServiceRouter;
 // The ONE percent-encoder and element readers this test crate keeps for awsQuery suites
 // (`all/query_wire.rs`: "Nothing new should write another one — call this module").
 use crate::query_wire::{element, elements, form_encode, members_of, opt_element};
+// The ONE hand-written raw HTTP/1.1 exchange on a load balancer's own published address and the
+// in-process request beside it, from the sibling suite that owns the fixtures for this topology —
+// nothing here keeps a second copy of them.
+use crate::ecs_alb_serves_its_awsvpc_tasks_container::{dialled, get};
 
 /// The region every request below is signed for.
 const REGION: &str = "us-east-1";
@@ -520,80 +524,6 @@ async fn reaching(
     }
 }
 
-/// How long a dial of the published address waits to connect, to send and to be answered.
-/// Generous on purpose, for the same reason [`DEADLINE`] is.
-const EXCHANGE_DEADLINE: Duration = Duration::from_secs(30);
-
-/// One answered data-plane request: the status and the body, as the wire carries them.
-struct Answered {
-    status: u16,
-    body: String,
-}
-
-/// Send one request to the address the load balancer published, carrying no AWS credential —
-/// exactly as a client handed that name sends it.
-async fn get(router: &MultiServiceRouter, dns_name: &str, path: &str) -> Answered {
-    let request = http::Request::builder()
-        .method("GET")
-        .uri(format!("http://{dns_name}{path}"))
-        .header("host", dns_name)
-        .body(Bytes::new())
-        .expect("a well-formed data-plane request");
-    let response = router.dispatch(request).await;
-    Answered {
-        status: response.status().as_u16(),
-        body: String::from_utf8_lossy(response.body()).to_string(),
-    }
-}
-
-/// DIAL the address the load balancer published and exchange one request on it, as a client
-/// handed that name does: a connection in the clear, HTTP/1.1, with the authority it dialled as
-/// `Host`.
-///
-/// What [`get`] asserts of the plane, this asserts of the ADDRESS. Only the port is taken from
-/// the published authority, because the core binds its listeners on loopback.
-async fn dialed(case: &str, dns_name: &str, path: &str) -> Answered {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-    let port = dns_name
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse::<u16>().ok())
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: the published address {dns_name:?} carries no port to dial")
-        });
-    let mut stream = tokio::time::timeout(
-        EXCHANGE_DEADLINE,
-        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
-    )
-    .await
-    .unwrap_or_else(|_| panic!("case {case:?}: {dns_name} did not accept a connection"))
-    .unwrap_or_else(|error| panic!("case {case:?}: {dns_name} refused a connection: {error}"));
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {dns_name}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-    );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .unwrap_or_else(|error| panic!("case {case:?}: the request was not sent: {error}"));
-    let mut answer = Vec::new();
-    tokio::time::timeout(EXCHANGE_DEADLINE, stream.read_to_end(&mut answer))
-        .await
-        .unwrap_or_else(|_| panic!("case {case:?}: {dns_name} did not answer in time"))
-        .unwrap_or_else(|error| panic!("case {case:?}: the answer was not read: {error}"));
-    let raw = String::from_utf8_lossy(&answer).to_string();
-    let status = raw
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .unwrap_or_else(|| panic!("case {case:?}: no status line in {raw:?}"));
-    let body = raw
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or_default();
-    Answered { status, body }
-}
-
 /// Look at the load balancer until it reports `State.Code` `active`, which is when its listener
 /// serves traffic on the name it published.
 async fn active(router: &MultiServiceRouter, dns_name: &str) {
@@ -667,7 +597,7 @@ async fn an_alb_fails_open_to_its_unhealthy_ecs_target_and_503s_with_no_target()
     );
     // And over a REAL connection to the address the load balancer published, which is what a
     // client handed that name dials: the same fail-open answer, off the socket.
-    let off_the_socket = dialed(case, &dns_name, SERVED_PATH).await;
+    let off_the_socket = dialled(case, &dns_name, SERVED_PATH).await;
     assert_eq!(
         off_the_socket.status, SERVED_STATUS,
         "case {case:?}: expected the unhealthy target's own {SERVED_STATUS} on the published \
@@ -735,7 +665,7 @@ async fn an_alb_fails_open_to_its_unhealthy_ecs_target_and_503s_with_no_target()
          {:?}",
         answered.body
     );
-    let off_the_socket = dialed(drained, &dns_name, SERVED_PATH).await;
+    let off_the_socket = dialled(drained, &dns_name, SERVED_PATH).await;
     assert_eq!(
         off_the_socket.status, NO_TARGET_STATUS,
         "case {drained:?}: expected the load balancer's own {NO_TARGET_STATUS} on the published \
