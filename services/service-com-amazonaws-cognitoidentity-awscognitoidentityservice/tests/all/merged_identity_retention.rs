@@ -119,8 +119,10 @@ async fn listed(
 }
 
 /// Merge the developer user `merged_away_identifier` into `survivor_identifier` and answer the
-/// `IdentityId` the call reports — which is the surviving identity.
-async fn merge(
+/// `IdentityId` the call reports — which is the surviving identity. `pub(crate)` so a sibling
+/// suite in this test target merges two developer users through the same call rather than
+/// keeping a second copy of this.
+pub(crate) async fn merge(
     emulator: &Emulator,
     case: &str,
     pool_id: &str,

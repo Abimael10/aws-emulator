@@ -435,13 +435,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> MergeDeveloperIde
         // written with this lock released, so two of them are never held at once.
         drop(store);
 
-        // Nothing reaches the merged-away user any more — its logins are the survivor's —
-        // so the tokens issued for it name a user only the survivor's id now stands for. A
-        // role session a vend already handed out keeps working: it is a session of the IAM
-        // role the pool resolved, held by the token service's registry until its own expiry,
-        // and a merge of two identities is not its revocation.
-        crate::state::forget_issued_web_identities_of_identity(&*self.engine, &destination);
-
         Ok(MergeDeveloperIdentitiesOutput {
             identity_id: Some(source),
         })

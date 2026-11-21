@@ -378,6 +378,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
                         // one is linked to nothing WITHOUT being a disabled one.
                         disabled: false,
                         merged_away: false,
+                        merged_into: None,
                         creation_date: now,
                         last_modified_date: now,
                     },

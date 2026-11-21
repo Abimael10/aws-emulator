@@ -2007,6 +2007,12 @@ pub struct Identity {
     /// [`Identity::projected_logins`]). It is the LAST such call that counts: an unlink that
     /// disables an identity a merge had merged away records itself here.
     pub merged_away: bool,
+    /// The identity a MERGE gave this one's logins to, when a merge is what took them off
+    /// it: the side of the join that is left STANDING for the account the two identities
+    /// became ([`ComAmazonawsCognitoidentityAwscognitoidentityserviceState::canonical_identity`]).
+    /// `None` for an identity no merge ever merged away, and for one an unlink has since
+    /// left linked to nothing — that identity stands for itself again.
+    pub merged_into: Option<String>,
     pub creation_date: SystemTime,
     pub last_modified_date: SystemTime,
 }
@@ -2560,12 +2566,15 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// two provider lists APPENDED (a name it already carries is kept, so the merged record
     /// holds one entry per user it now stands for) and stamped with `now` as the instant it
     /// changed. The
-    /// two users are one user afterwards, so nothing reaches `merged_away` any more: this
-    /// service's record of the session outstanding for it and the OpenID Connect tokens
-    /// issued for it spoke for a user that is now reached through `survivor` alone, so they
-    /// are given up. A role session already vended for it is not: that credential is a
-    /// session of the IAM role, held by the token service's registry until its own expiry,
-    /// and a merge of two identities is not its revocation.
+    /// two users are one user afterwards, so nothing reaches `merged_away` through a LOGIN any
+    /// more. What a merge takes is those logins: a token this service already ISSUED for
+    /// `merged_away` keeps naming it, since the record it was minted from is still stored, so
+    /// the issuances stand and the identity they name keeps being the one they were minted
+    /// for. A role session already vended for it keeps working too: that credential is a
+    /// session of the IAM role, held by the token service's registry until its own expiry, and
+    /// a merge of two identities is not its revocation; what this service gives up is only its
+    /// own record of the session outstanding for an identity no login reaches, so a later vend
+    /// is a fresh one.
     ///
     /// The RECORD of `merged_away` nevertheless stays stored, in `identities` and in the
     /// pool's listing order, with its logins emptied and `disabled` set: a merge takes the
@@ -2574,7 +2583,10 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
     /// still reported by a listing that hides no disabled identity, and hidden from one that
     /// hides them, projecting the sentinel a merge leaves behind
     /// ([`Identity::projected_logins`]). Removing the record is
-    /// [`Self::delete_identity`]'s own effect, which no other transition borrows.
+    /// [`Self::delete_identity`]'s own effect, which no other transition borrows. That record
+    /// also keeps WHICH identity it was merged into, so the two ids name one account from
+    /// here on and a call naming the merged-away one can be served as the call on the
+    /// identity still standing for it that it is ([`Self::canonical_identity`]).
     ///
     /// Both identities have to be the named pool's own, which is what the caller resolved
     /// them through: an identity belongs to the pool that minted it and never moves, so a
@@ -2611,6 +2623,10 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
                 // where an unlink's projects the marker alone
                 // ([`Identity::projected_logins`]).
                 identity.merged_away = true;
+                // WHICH identity the account is reached through from here on, so a later
+                // call naming the merged-away id can be served as the call on that identity
+                // it is ([`Self::canonical_identity`]).
+                identity.merged_into = Some(survivor.to_string());
                 identity.last_modified_date = now;
                 absorbed
             }
@@ -2627,8 +2643,6 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
             identity.logins.sort();
             identity.last_modified_date = now;
         }
-        self.open_id_tokens
-            .retain(|_, issued| issued.identity_id != merged_away);
         self.credentials.remove(merged_away);
         true
     }
@@ -2895,6 +2909,34 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         self.identities_proven_by(identity_pool_id, logins, now)
             .iter()
             .any(|proven| proven == identity_id)
+    }
+
+    /// The identity that stands for `identity_id` today: itself, unless a MERGE merged it
+    /// away, in which case the identity that merge left its logins with — and, through a
+    /// chain of merges, the one identity at the end of it.
+    ///
+    /// A merge makes two identities ONE account ([`Self::merge_identity_into`]): every login
+    /// of the merged-away side resolves to the survivor afterwards, so the merged-away id is
+    /// another name for the same account rather than an account of its own. The redirect
+    /// holds only while that record is still reached by no login of its own
+    /// ([`Identity::is_disabled`]) — an identity a later call linked a login to is reached
+    /// through that login again, so it stands for itself. Bounded by the number of stored
+    /// identities, so no chain of records can spin here.
+    pub fn canonical_identity(&self, identity_id: &str) -> String {
+        let mut standing_for = identity_id.to_string();
+        for _ in 0..self.identities.len() {
+            let next = self
+                .identities
+                .get(&standing_for)
+                .filter(|identity| identity.is_disabled())
+                .and_then(|identity| identity.merged_into.clone())
+                .filter(|next| *next != standing_for && self.identities.contains_key(next));
+            match next {
+                Some(next) => standing_for = next,
+                None => break,
+            }
+        }
+        standing_for
     }
 
     /// The identity a POOL-SCOPED request names, or why it is not one that request may
@@ -4260,7 +4302,7 @@ pub fn forget_issued_web_identities<Eng: Send + Sync + 'static>(
 /// the redeemer of one reads.
 ///
 /// The same judgement [`forget_issued_web_identities`] makes, one identity rather than a
-/// whole pool: a merge leaves the identity it merged away existing no longer, so a token
+/// whole pool: a DELETE leaves the identity it removes existing no longer, so a token
 /// naming it names nobody and must stop resolving to a role.
 pub fn forget_issued_web_identities_of_identity<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -4311,6 +4353,7 @@ mod tests {
                     logins: Vec::new(),
                     disabled: false,
                     merged_away: false,
+                    merged_into: None,
                     creation_date: now,
                     last_modified_date: now,
                 },

@@ -225,6 +225,11 @@ async fn a_developer_login_links_into_the_identity_the_call_names_or_proves() {
         .identity(&pool_id, Some(json!({PUBLIC_PROVIDER: facebook_login})))
         .await;
     let guest = emulator.identity(&pool_id, None).await;
+    // A SECOND guest, for the row that links a new developer login onto an unauthenticated
+    // identity: an earlier row resolves AWAY from the first guest, which absorbs it into the
+    // identity that answered, so a row whose rule is about an identity no login has been
+    // linked to needs one no earlier row has joined into another account.
+    let unjoined_guest = emulator.identity(&pool_id, None).await;
 
     // (case, the IdentityId sent, the logins presented, the identity owed, the providers that
     // identity must be linked to afterwards)
@@ -279,9 +284,9 @@ async fn a_developer_login_links_into_the_identity_the_call_names_or_proves() {
         ),
         (
             "a new developer login onto a guest identity no login has been linked to",
-            Some(guest.as_str()),
+            Some(unjoined_guest.as_str()),
             vec![(DEVELOPER_PROVIDER, "the-guests-backend-id")],
-            guest.as_str(),
+            unjoined_guest.as_str(),
             vec![DEVELOPER_PROVIDER],
         ),
     ];

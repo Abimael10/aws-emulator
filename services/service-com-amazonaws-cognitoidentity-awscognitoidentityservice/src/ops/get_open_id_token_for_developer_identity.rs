@@ -41,6 +41,18 @@
 //! one account from there on, so the absorbed id is left in the state a join leaves the side
 //! it absorbed in and no later call reaches it as the guest it was.
 //!
+//! A MERGE makes the two identities it joins ONE account: the merged-away side's logins all
+//! resolve to the identity that survives it, so a login of that survivor is a login of the
+//! merged-away identity's own account
+//! ([`crate::state::ComAmazonawsCognitoidentityAwscognitoidentityserviceState::canonical_identity`]).
+//! An `IdentityId` naming such an identity, presented with a login of that account, is
+//! therefore a call the caller has PROVEN, and it is served on the identity still standing for
+//! the account — answering that identity's id, which is what the ordinary re-login of a merged
+//! developer user is, the caller replaying the id it was answered before the merge. What is
+//! NOT served is a call naming an identity no login of its own reaches and presenting no login
+//! of its account at all: an identity an unlink or a merge left linked to nothing is
+//! inaccessible, so there is nothing for such a call to link its logins into.
+//!
 //! The `Logins` map names ONE developer provider — "you can only specify one developer
 //! provider as part of the `Logins` map, which is linked to the identity pool" — and WHICH of
 //! its entries name one is the classification every reading of a presented map makes
@@ -450,8 +462,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // holds it is settled FIRST ([`crate::state::ScopedIdentityRefusal`]), so an identity
         // of another pool is one this request may not reach rather than a resource this
         // service does not hold.
+        //
+        // WHICH identity the id it carries names is a second question: a MERGE makes the two
+        // identities it joins ONE account, giving the merged-away side's logins to the
+        // identity that survives it, so from then on the merged-away id is another name for
+        // that one account and not an account of its own
+        // ([`crate::state::ComAmazonawsCognitoidentityAwscognitoidentityserviceState::canonical_identity`]).
+        // A developer user of a merged account keeps replaying the id it was answered before
+        // the merge, and the identity that id names is the one still standing for that
+        // account, so the call is served as the call on that identity it is — the id the
+        // request carried is what the call RESOLVES through, not a second account the
+        // presented login fails to prove.
         let mut named_identity_is_idp_proven = false;
         let mut named_identity_has_been_linked = false;
+        let mut named_identity_is_inaccessible = false;
+        let mut named_identity = input.identity_id.clone();
         if let Some(identity_id) = &input.identity_id {
             match store.scoped_identity(&input.identity_pool_id, identity_id) {
                 Err(crate::state::ScopedIdentityRefusal::NotStored) => {
@@ -479,14 +504,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                     );
                 }
                 Ok(identity) => {
-                    // Whether the identity the request names is one an IDENTITY PROVIDER's
-                    // login already proves: a provider it is linked to that is not the
-                    // pool's own developer provider is a provider whose own user it is.
-                    named_identity_is_idp_proven = identity
-                        .logins
-                        .iter()
-                        .any(|provider| *provider != developer_provider);
-                    named_identity_has_been_linked = identity.has_been_linked();
+                    // Whether the identity the request NAMED is one no login of its own
+                    // reaches: an identity an unlink or a merge left linked to nothing
+                    // ([`crate::state::Identity::is_disabled`]).
+                    named_identity_is_inaccessible = identity.is_disabled();
+                    // The identity still standing for the account that id names, which every
+                    // question below is asked of.
+                    let standing_for = store.canonical_identity(identity_id);
+                    if let Some(identity) = store.identities.get(&standing_for) {
+                        // Whether that identity is one an IDENTITY PROVIDER's login already
+                        // proves: a provider it is linked to that is not the pool's own
+                        // developer provider is a provider whose own user it is.
+                        named_identity_is_idp_proven = identity
+                            .logins
+                            .iter()
+                            .any(|provider| *provider != developer_provider);
+                        named_identity_has_been_linked = identity.has_been_linked();
+                    }
+                    named_identity = Some(standing_for);
                 }
             }
         }
@@ -508,10 +543,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // no part in it and is left untouched. An identity logins HAVE been linked to is a
         // federated user's, so it stays the identity the call is about and a presented login
         // proving another one is the conflict decided below.
-        let ignores_named_identity = input.identity_id.is_some()
+        let ignores_named_identity = named_identity.is_some()
             && !named_identity_has_been_linked
             && registered_to.is_some()
-            && registered_to != input.identity_id;
+            && registered_to != named_identity;
 
         // The identity this call is about: the one the request names, else the one the
         // developer user identifier is already registered under (which is what makes the
@@ -519,7 +554,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         let resolved = if ignores_named_identity {
             registered_to.clone()
         } else {
-            input.identity_id.clone().or_else(|| registered_to.clone())
+            named_identity.clone().or_else(|| registered_to.clone())
         };
 
         // Every login the call presents belongs to the ONE account this call is about, and
@@ -549,15 +584,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // Whether one of the presented logins is a login OF the identity the request names —
         // the same question every login-authorized call of this service is authorized by
         // (`logins_name_identity`), answered from the identities just resolved.
-        let proves_the_named_identity = input
-            .identity_id
+        let proves_the_named_identity = named_identity
             .as_ref()
             .is_some_and(|named| proven.contains(named));
-        let would_join_a_proven_identity = input.identity_id.as_deref().is_some_and(|named| {
+        let would_join_a_proven_identity = named_identity.as_deref().is_some_and(|named| {
             named_identity_is_idp_proven
                 && !proves_the_named_identity
                 && registered_to.as_deref() != Some(named)
         });
+
+        // An identity reached through NO login of its own — a DISABLED one, which an unlink
+        // or a merge left linked to nothing ("removing the last linked login will make this
+        // identity inaccessible", `UnlinkIdentity`,
+        // `smithy_query(query="doc",shape="UnlinkIdentity")`) — is an identity no caller can
+        // show a login of, and linking the logins presented INTO the identity named is the
+        // one thing this operation does with an identity a call has not proven. So a call
+        // naming such an identity is served only where a presented login DOES prove the
+        // account it belongs to: for one a merge merged away, a login of the surviving
+        // identity, the two being one account from the merge on. Presented anything else, the
+        // call has shown no authority over the identity it named, which is the authorization
+        // failure every login-authorized call of this service answers in one sentence
+        // ([`crate::state::UNMATCHED_LOGINS_MESSAGE`]) — fixed text, so it tells a caller
+        // nothing about what the pool holds for that identity.
+        if named_identity_is_inaccessible && !proves_the_named_identity {
+            return Err(
+                GetOpenIdTokenForDeveloperIdentityErrorModeled::NotAuthorizedException(
+                    NotAuthorizedException {
+                        message: Some(crate::state::UNMATCHED_LOGINS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
         if proves_another_account || would_join_a_proven_identity {
             // Which refusal this is follows WHOSE ownership the request got wrong, and how
             // many of the link's two sides are identities the pool already HOLDS.
@@ -603,7 +661,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                     .into(),
                 );
             }
-            if input.identity_id.is_some() && registered_to.is_some() {
+            if named_identity.is_some() && registered_to.is_some() {
                 return Err(
                     GetOpenIdTokenForDeveloperIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
@@ -690,6 +748,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                         // disabled one.
                         disabled: false,
                         merged_away: false,
+                        merged_into: None,
                         creation_date: now,
                         last_modified_date: now,
                     },
@@ -738,7 +797,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // unauthenticated identity it was: what names an identity a login has been linked to
         // is a login OF it, and the absorbed one has none.
         if ignores_named_identity {
-            if let Some(absorbed) = &input.identity_id {
+            if let Some(absorbed) = &named_identity {
                 store.merge_identity_into(
                     &input.identity_pool_id,
                     absorbed,

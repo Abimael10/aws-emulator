@@ -410,8 +410,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
                 // this is that call: a read of an identity an UNLINK left linked to nothing
                 // projects the disabled marker alone, where a merge's own end state projects
                 // the marker and the pool's region
-                // ([`crate::state::Identity::projected_logins`]).
+                // ([`crate::state::Identity::projected_logins`]). An identity THIS call left
+                // linked to nothing stands for itself, whatever merge once gave its logins
+                // away, so the redirect a merge recorded goes with them
+                // ([`crate::state::ComAmazonawsCognitoidentityAwscognitoidentityserviceState::canonical_identity`]).
                 identity.merged_away = false;
+                identity.merged_into = None;
             }
         }
 
