@@ -411,9 +411,18 @@ pub fn deliver(
         .log_groups
         .get(&delivery.log_group)
         .and_then(|group| group.kms_key_id.clone());
+    // The transformer in force for the destination group transforms what that group takes in
+    // — by whichever path the records arrive — so a delivered record is stored with the
+    // fields that pipeline produced from it, like any other ingested event.
+    let transformer = store
+        .log_groups
+        .get(&delivery.log_group)
+        .map(|group| logs::active_transformer::pipeline(&store, group))
+        .unwrap_or_default();
     let stored = logs::StoredEvent {
         timestamp: unix_millis(entry.at),
         masked_message: logs::data_protection::masked(&message, &data_identifiers),
+        transformed_message: transformer.transform(&message),
         message,
         ingestion_time: ingested_at,
         ingestion_seq: store.take_ingestion_seq(),

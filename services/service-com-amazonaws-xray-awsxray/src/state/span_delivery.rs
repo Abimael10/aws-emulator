@@ -152,6 +152,14 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, spans: &[
         .log_groups
         .get(SPANS_LOG_GROUP)
         .and_then(|group| group.kms_key_id.clone());
+    // The transformer in force for the destination group transforms what that group takes in
+    // — by whichever path the events arrive — so a delivered span document is stored with the
+    // fields that pipeline produced from it, like any other ingested event.
+    let transformer = store
+        .log_groups
+        .get(SPANS_LOG_GROUP)
+        .map(|group| logs::active_transformer::pipeline(&store, group))
+        .unwrap_or_default();
     let events: Vec<logs::StoredEvent> = spans
         .iter()
         // An event larger than the largest one CloudWatch Logs holds is not
@@ -176,6 +184,7 @@ pub fn deliver<Eng: Send + Sync + 'static>(engine: &Eng, region: &str, spans: &[
         .map(|span| logs::StoredEvent {
             timestamp: span.timestamp_ms(),
             masked_message: logs::data_protection::masked(&span.document, &data_identifiers),
+            transformed_message: transformer.transform(&span.document),
             message: span.document.clone(),
             ingestion_time: now_ms,
             ingestion_seq: store.take_ingestion_seq(),

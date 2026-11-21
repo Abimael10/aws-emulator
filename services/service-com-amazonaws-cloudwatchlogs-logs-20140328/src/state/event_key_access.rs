@@ -95,6 +95,7 @@ mod tests {
             timestamp: 1_767_225_600_000,
             message: "one".to_string(),
             masked_message: None,
+            transformed_message: None,
             ingestion_time: 1_767_225_600_000,
             ingestion_seq: 1,
             ingest_kms_key_id: key.map(str::to_string),

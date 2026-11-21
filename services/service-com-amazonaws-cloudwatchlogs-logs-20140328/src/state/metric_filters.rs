@@ -42,12 +42,6 @@ pub struct CompiledFilters {
     /// One entry per filter whose pattern this module could parse, in the group's own filter
     /// order, so the datapoints one event publishes are in the same order on every run.
     filters: Vec<CompiledFilter>,
-    /// The log group's own transformer, prepared for this batch, which is what the
-    /// TRANSFORMED version of an event is produced by ([`super::transformer`]). Empty for a
-    /// group that carries no transformer, and then no filter has a transformed version to run
-    /// against: `applyOnTransformedLogs` "is valid only for log groups that have an active log
-    /// transformer".
-    pipeline: super::transformer::Pipeline,
 }
 
 /// One metric filter, ready to run.
@@ -63,8 +57,7 @@ struct CompiledFilter {
 }
 
 impl CompiledFilters {
-    /// Every metric filter `group` holds, compiled, beside the transformer that group
-    /// transforms its ingested events with.
+    /// Every metric filter `group` holds, compiled.
     ///
     /// A pattern that does not parse is left out rather than failing the ingest: the batch
     /// was accepted, and a filter the emulator cannot run extracts nothing. Every pattern a
@@ -83,14 +76,7 @@ impl CompiledFilters {
                     })
             })
             .collect();
-        let pipeline = super::transformer::Pipeline::of(
-            group
-                .transformer
-                .as_ref()
-                .map(|transformer| transformer.processors.as_slice())
-                .unwrap_or_default(),
-        );
-        Self { filters, pipeline }
+        Self { filters }
     }
 
     /// The datapoints ONE ingested log event publishes through these filters.
@@ -105,11 +91,14 @@ impl CompiledFilters {
     ///
     /// A filter that declares `applyOnTransformedLogs` is run against the TRANSFORMED version
     /// of the event — both its pattern and the selectors its transformation resolves — and
-    /// every other filter against the message as ingested. The transformation is performed at
-    /// most once per event, and only where some filter asks for it.
+    /// every other filter against the message as ingested. `transformed_message` is the
+    /// version the event was STORED with ([`crate::state::StoredEvent::transformed_message`]),
+    /// which is what the transformer in force at ingestion produced, so the transformation is
+    /// performed once per event however many filters read it.
     pub fn datapoints(
         &self,
         message: &str,
+        transformed_message: Option<&str>,
         event_timestamp_ms: i64,
         budget: usize,
     ) -> Vec<ExtractedDatapoint> {
@@ -120,13 +109,7 @@ impl CompiledFilters {
         // the whole event however many filters and selectors ask for it — and not at all when
         // none does.
         let event = Event::of(message);
-        let transformed_message = self
-            .filters
-            .iter()
-            .any(|filter| filter.apply_on_transformed_logs)
-            .then(|| self.pipeline.transform(message))
-            .flatten();
-        let transformed = transformed_message.as_deref().map(Event::of);
+        let transformed = transformed_message.map(Event::of);
         let mut datapoints: Vec<ExtractedDatapoint> = Vec::new();
         for filter in &self.filters {
             if datapoints.len() >= budget {

@@ -457,6 +457,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             .get(&input.log_group_name)
             .map(crate::state::metric_filters::CompiledFilters::of)
             .unwrap_or_default();
+        // The TRANSFORMER in force for this group, prepared for the batch on the same rule:
+        // "CloudWatch Logs performs the transformations at the time of log ingestion", so the
+        // pipeline each event of this batch is transformed through is the one the group (or the
+        // account policy selecting it) carried when the batch arrived
+        // ([`crate::state::active_transformer`]), and a put, reconfiguration or
+        // `DeleteTransformer` after this instant changes only what LATER batches are stored as.
+        let ingest_transformer = store
+            .log_groups
+            .get(&input.log_group_name)
+            .map(|group| crate::state::active_transformer::pipeline(&store, group))
+            .unwrap_or_default();
         // The DATA IDENTIFIERS the data protection policies in force for the group name are
         // read here for the same reason, and because masking is decided as the event is
         // stored: "sensitive data is detected and masked when it is ingested into the log
@@ -609,6 +620,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
                     &event.message,
                     &found,
                 ),
+                // The TRANSFORMED version this event is stored with, produced as it is
+                // ingested: "CloudWatch Logs performs the transformations at the time of log
+                // ingestion", and the ingested message stands beside it as `@message`.
+                transformed_message: ingest_transformer.transform(&event.message),
                 message: event.message.clone(),
                 ingestion_time,
                 ingestion_seq,
@@ -622,6 +637,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
         let stored_messages: Vec<(i64, String)> = batch
             .iter()
             .map(|event| (event.timestamp, event.message.clone()))
+            .collect();
+        // The TRANSFORMED version each of those events was stored with, in the same order:
+        // the version a metric filter configured with `applyOnTransformedLogs` extracts from,
+        // taken from the event itself rather than transformed a second time here.
+        let stored_transformed: Vec<Option<String>> = batch
+            .iter()
+            .map(|event| event.transformed_message.clone())
             .collect();
         // A fresh token on every accepted batch, minted from the same counter so it is
         // unique for the life of the store, and persisted on the stream below.
@@ -732,7 +754,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
         // per-event ceiling bounds what the two publish BETWEEN them.
         let mut extracted: Vec<crate::state::emf::ExtractedDatapoint> =
             Vec::with_capacity(stored_messages.len());
-        for (timestamp, message) in &stored_messages {
+        for ((timestamp, message), transformed) in stored_messages.iter().zip(&stored_transformed) {
             let declared = if extract_emf_metrics {
                 crate::state::emf::extracted_datapoints(message, *timestamp)
             } else {
@@ -741,7 +763,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutLogEvents<Eng>
             let remaining = crate::state::emf::MAX_DATAPOINTS_PER_EVENT
                 .saturating_sub(declared.len());
             extracted.extend(declared);
-            extracted.extend(metric_filters.datapoints(message, *timestamp, remaining));
+            extracted.extend(metric_filters.datapoints(
+                message,
+                transformed.as_deref(),
+                *timestamp,
+                remaining,
+            ));
             // An event that WAS such a document and could not be read as one publishes no
             // metric of its own, so the count of the failure is the only trace it leaves —
             // which is what tells a client its producer is emitting documents the service

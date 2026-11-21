@@ -831,11 +831,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 taken.sort_by_key(|(key, _)| ::std::cmp::Reverse(*key));
                 selected.push(SelectedGroup {
                     messages: taken.into_iter().map(|(_, message)| message).collect(),
-                    processors: group
-                        .transformer
-                        .as_ref()
-                        .map(|transformer| transformer.processors.clone())
-                        .unwrap_or_default(),
+                    // The transformer in force for the group, log-group level or account
+                    // level, since either transforms what it ingests
+                    // ([`crate::state::active_transformer`]).
+                    processors: crate::state::active_transformer::processors(&store, group),
                 });
             }
             selected

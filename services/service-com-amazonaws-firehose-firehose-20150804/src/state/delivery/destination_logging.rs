@@ -247,9 +247,18 @@ pub fn report_events<Eng: Send + Sync + 'static>(
             .log_groups
             .get(&report.logging.log_group)
             .and_then(|group| group.kms_key_id.clone());
+        // The transformer in force for the destination group transforms what that group takes
+        // in — by whichever path the events arrive — so a reported event is stored with the
+        // fields that pipeline produced from it, like any other ingested event.
+        let transformer = store
+            .log_groups
+            .get(&report.logging.log_group)
+            .map(|group| logs::active_transformer::pipeline(&store, group))
+            .unwrap_or_default();
         let event = logs::StoredEvent {
             timestamp,
             masked_message: logs::data_protection::masked(&message, &data_identifiers),
+            transformed_message: transformer.transform(&message),
             message,
             ingestion_time: now_ms,
             ingestion_seq: store.take_ingestion_seq(),

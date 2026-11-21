@@ -415,7 +415,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         break;
                     }
                     taken_bytes = taken_bytes.saturating_add(event.message.len());
-                    taken.push(event.message.clone());
+                    // The fields of an event are the fields of the version a QUERY reads: the
+                    // transformed one for an event a transformer structured as it was
+                    // ingested, and the ingested message otherwise
+                    // ([`crate::state::StoredEvent::queried_message`]).
+                    taken.push(event.queried_message().to_string());
                 }
             }
             taken

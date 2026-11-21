@@ -187,12 +187,22 @@ pub fn deliver(
         // The sequence numbers come from the store's one monotonic counter, so a finding is
         // ordered against every other event the store holds; they are taken before the
         // destination group is borrowed to write them.
+        //
+        // A finding is an ordinary log event of the destination group, so the transformer in
+        // force for THAT group transforms it as it is stored, exactly as it transforms
+        // anything else ingested there ([`super::active_transformer`]).
+        let pipeline = store
+            .log_groups
+            .get(destination)
+            .map(|group| super::active_transformer::pipeline(store, group))
+            .unwrap_or_default();
         let events: Vec<super::StoredEvent> = findings
             .iter()
             .map(|document| super::StoredEvent {
                 timestamp: audit_time_ms,
                 message: document.clone(),
                 masked_message: None,
+                transformed_message: pipeline.transform(document),
                 ingestion_time: audit_time_ms,
                 ingestion_seq: store.take_ingestion_seq(),
                 ingest_kms_key_id: destination_kms_key_id.clone(),

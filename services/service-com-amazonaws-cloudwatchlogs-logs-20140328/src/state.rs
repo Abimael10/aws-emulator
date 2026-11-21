@@ -250,6 +250,10 @@ pub mod log_transformer;
 /// The transformation a log group's transformer applies to an ingested log event.
 pub mod transformer;
 
+/// WHICH transformer is in force for a log group — the one created on the group itself, or the
+/// account-level transformer policy that selects it.
+pub mod active_transformer;
+
 /// Reading and writing a datetime under the patterns a `dateTimeConverter` processor states.
 pub mod date_time_patterns;
 
@@ -2888,6 +2892,16 @@ pub struct StoredEvent {
     /// stored — "it does not affect any of the data that was already encrypted" — so a group
     /// that has been associated with one key and then another holds events bound to each.
     pub ingest_kms_key_id: Option<String>,
+    /// The TRANSFORMED version of this event: what the transformer in force for its log group
+    /// when it ARRIVED produced from its message ([`active_transformer`],
+    /// [`transformer::Pipeline::transform`]), since "CloudWatch Logs performs the
+    /// transformations at the time of log ingestion". `None` for an event ingested while no
+    /// transformer was in force for the group, and for one whose pipeline structured nothing —
+    /// and then the ingested message is the only version there is.
+    ///
+    /// Per EVENT, like the key it was ingested under: a transformer put, reconfigured or
+    /// deleted changes what LATER events are stored as and rewrites nothing already stored.
+    pub transformed_message: Option<String>,
 }
 
 impl StoredEvent {
@@ -2909,6 +2923,18 @@ impl StoredEvent {
             Some(masked) if !unmask => masked,
             _ => &self.message,
         }
+    }
+
+    /// The version of this event a QUERY reads: the transformed one where the event has one,
+    /// and the ingested message otherwise.
+    ///
+    /// `GetLogEvents` and `FilterLogEvents` "return only the original versions of log events,
+    /// before they were transformed. To view the transformed versions, you must use a
+    /// CloudWatch Logs query" — so this is the version the query-side reads structure an event
+    /// from (its fields), while the event READ operations report
+    /// [`Self::message_as_read`].
+    pub fn queried_message(&self) -> &str {
+        self.transformed_message.as_deref().unwrap_or(&self.message)
     }
 
     /// What this event adds to the volume its log group HOLDS: the UTF-8 message plus

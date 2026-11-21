@@ -434,7 +434,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         events.push(ScannedEvent {
                             timestamp: event.timestamp,
                             ingestion_time: event.ingestion_time,
-                            message: event.message.clone(),
+                            // An index matches the FIELDS of an event, which are the fields of
+                            // the version a query reads
+                            // ([`crate::state::StoredEvent::queried_message`]): the
+                            // transformed one for an event a transformer structured as it was
+                            // ingested, and the ingested message otherwise.
+                            message: event.queried_message().to_string(),
                         });
                     }
                 }

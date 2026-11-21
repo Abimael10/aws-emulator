@@ -364,9 +364,18 @@ fn forward<Eng: Send + Sync + 'static>(engine: &Eng, event: &ForwardedEvent) {
         .log_groups
         .get(&event.log_group_name)
         .and_then(|group| group.kms_key_id.clone());
+    // The transformer in force for the destination group transforms what that group takes in
+    // — by whichever path the events arrive — so a forwarded event is stored with the fields
+    // that pipeline produced from it, like any other ingested event.
+    let transformer = store
+        .log_groups
+        .get(&event.log_group_name)
+        .map(|group| logs::active_transformer::pipeline(&store, group))
+        .unwrap_or_default();
     let stored = logs::StoredEvent {
         timestamp: epoch_millis(event.at),
         masked_message: logs::data_protection::masked(&event.message, &data_identifiers),
+        transformed_message: transformer.transform(&event.message),
         message: event.message.clone(),
         ingestion_time: ingested_at,
         ingestion_seq: store.take_ingestion_seq(),

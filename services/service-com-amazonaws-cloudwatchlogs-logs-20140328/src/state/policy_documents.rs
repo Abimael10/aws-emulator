@@ -373,26 +373,39 @@ pub fn check_index_policy_quotas(fields: &[IndexedField]) -> Result<(), IndexPol
     Ok(())
 }
 
+/// The PROCESSOR BLOCKS a `TRANSFORMER_POLICY` document carries: "a transformer policy must
+/// include one JSON block with the array of processors and their configurations", written either
+/// as that array itself or as an object holding it. `None` for a document that is not JSON, or
+/// that carries no such array at all.
+///
+/// ONE reading of that shape, shared by the check below — which judges the blocks it answers —
+/// and by the ingest path that RUNS them
+/// ([`super::active_transformer`]), so the two cannot drift apart.
+pub(super) fn transformer_policy_processor_blocks(
+    document: &str,
+) -> Option<Vec<serde_json::Value>> {
+    match serde_json::from_str::<serde_json::Value>(document).ok()? {
+        serde_json::Value::Array(processors) => Some(processors),
+        serde_json::Value::Object(members) => members
+            .values()
+            .find_map(|value| value.as_array().cloned()),
+        _ => None,
+    }
+}
+
 /// Judge a `TRANSFORMER_POLICY` document: "A transformer policy must include one JSON
 /// block with the array of processors and their configurations." Which processors exist,
 /// and how each is configured, is the catalogue `PutTransformer` owns, so what is judged
-/// here is that the document carries a non-empty array of processor blocks — written
-/// either as that array itself or as an object holding it — whose FIRST block names a
+/// here is that the document carries a non-empty array of processor blocks
+/// ([`transformer_policy_processor_blocks`]) whose FIRST block names a
 /// parse-type processor, and in which a parser for an AWS-vended log format appears nowhere
 /// but first: the two rules a transformer's pipeline has to satisfy wherever it is configured
 /// ([`PARSE_TYPE_PROCESSORS`], [`LEADING_ONLY_PROCESSORS`]).
 pub(super) fn check_transformer_policy_document(document: &str) -> Result<(), String> {
     let expected =
         "policyDocument for a transformer policy must include an array of processors".to_string();
-    let parsed = serde_json::from_str::<serde_json::Value>(document).map_err(|_| expected.clone())?;
-    let processors = match &parsed {
-        serde_json::Value::Array(processors) => processors.clone(),
-        serde_json::Value::Object(members) => members
-            .values()
-            .find_map(|value| value.as_array().cloned())
-            .ok_or_else(|| expected.clone())?,
-        _ => return Err(expected),
-    };
+    let processors =
+        transformer_policy_processor_blocks(document).ok_or_else(|| expected.clone())?;
     if processors.is_empty() || !processors.iter().all(serde_json::Value::is_object) {
         return Err(expected);
     }

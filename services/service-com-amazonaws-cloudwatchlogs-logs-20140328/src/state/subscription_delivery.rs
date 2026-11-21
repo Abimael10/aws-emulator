@@ -438,28 +438,26 @@ pub fn deliveries(
     // The TRANSFORMED version of this batch, materialised once and only where some filter
     // asks for it: a filter put with `applyOnTransformedLogs` "will be applied on the
     // transformed version of the log events instead of the original ingested log events", and
-    // a group with no active transformer has no transformed version at all.
-    let transformed: Option<Vec<StoredEvent>> = group
-        .transformer
-        .as_ref()
-        .filter(|_| {
-            filters
-                .iter()
-                .any(|filter| filter.apply_on_transformed_logs && !filter.destination_unhealthy)
-        })
-        .map(|transformer| {
-            let pipeline = super::transformer::Pipeline::of(&transformer.processors);
-            events
-                .iter()
-                .map(|event| match pipeline.transform(&event.message) {
-                    Some(message) => StoredEvent {
-                        message,
-                        ..event.clone()
-                    },
-                    None => event.clone(),
-                })
-                .collect()
-        });
+    // an event ingested while no transformer was in force has no transformed version at all
+    // ([`StoredEvent::transformed_message`]).
+    let transformed: Option<Vec<StoredEvent>> = (events
+        .iter()
+        .any(|event| event.transformed_message.is_some())
+        && filters
+            .iter()
+            .any(|filter| filter.apply_on_transformed_logs && !filter.destination_unhealthy))
+    .then(|| {
+        events
+            .iter()
+            .map(|event| match &event.transformed_message {
+                Some(message) => StoredEvent {
+                    message: message.clone(),
+                    ..event.clone()
+                },
+                None => event.clone(),
+            })
+            .collect()
+    });
     let mut deliveries = Vec::new();
     for filter in filters {
         if filter.destination_unhealthy {
@@ -1088,6 +1086,7 @@ mod tests {
             timestamp: 1_700_000_000_000,
             message: message.to_string(),
             masked_message: None,
+            transformed_message: None,
             ingestion_time: 1_700_000_000_123,
             ingestion_seq,
             ingest_kms_key_id: None,
