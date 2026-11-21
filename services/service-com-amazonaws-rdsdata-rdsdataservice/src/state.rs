@@ -111,6 +111,7 @@
 //!   of this file pins that.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::config::DbConfig;
@@ -232,6 +233,31 @@ const MAX_LIKE_PATTERN_BYTES: i32 = 1_024;
 /// [`Database::open`].
 const MAX_DATABASE_PAGES: i64 = 16_384;
 
+/// How many pages one step of [`copy_pages`] moves.
+///
+/// The copy is driven a step at a time rather than in one call so its deadline is checked
+/// between steps, which is the cancellation point a bounded request needs — and so a
+/// backing another surface of the cluster is writing at this instant is asked again rather
+/// than copied without end.
+const COPY_PAGES_PER_STEP: ::std::os::raw::c_int = 256;
+
+/// How many CHANGED ROWS the statements of one unit of work in a transaction take row locks
+/// over.
+///
+/// Work over more rows than this is run with NO row locks rather than with a lock table the
+/// size of the table it wrote: the same ceiling the cluster's engine endpoints hold their own
+/// locks to. It is a bound on this emulator's own bookkeeping and never a refusal — the
+/// statement runs either way.
+const MAX_LOCKED_ROWS: usize = 10_000;
+
+/// The longest a database NAME can be: the model's own `DbName` is `len ..64`, which the
+/// request walk already holds the `database` member of every call to.
+///
+/// What a name taken out of caller SQL (`CREATE DATABASE`) is held to as well, where it is
+/// used to address the cluster's own storage ([`Cluster::volume_database`]): a longer name is
+/// a name no database of the cluster could answer to.
+const MAX_DATABASE_NAME_BYTES: usize = 64;
+
 /// `PRAGMA hard_heap_limit`: the ceiling on what the SQL ENGINE's own allocator may
 /// hold. The page caps above bound each schema of each database, and the request
 /// budget bounds steps, time and output; this bounds MEMORY itself, which is a
@@ -306,13 +332,16 @@ pub(crate) const MAX_DECLARED_ARGUMENT: i32 = 65_535;
 
 /// The only pragmas caller SQL — and this module's own schema introspection — may
 /// run: `table_info`/`table_xinfo` report the columns a table declares, which is
-/// where `columnMetadata`'s types and nullability come from. They read this
-/// database's own schema and nothing else; every other pragma (temp-file paths,
-/// journal and schema-writing switches) is refused. The same two names, prefixed
-/// `pragma_`, are the ONLY virtual-table modules the authorizer admits, so one
-/// rule governs both the statement form (`PRAGMA table_info(t)`) and the
-/// table-valued form (`pragma_table_info(t)`) this module itself queries.
-const SCHEMA_INTROSPECTION_PRAGMAS: &[&str] = &["table_info", "table_xinfo"];
+/// where `columnMetadata`'s types and nullability come from, and `data_version`
+/// reports only whether ANOTHER connection has committed to this database since
+/// this one last looked ([`Database::committed_elsewhere`]). They read this
+/// database's own schema and its own commit mark and nothing else; every other
+/// pragma (temp-file paths, journal and schema-writing switches) is refused. The
+/// first two names, prefixed `pragma_`, are the only virtual-table modules a
+/// statement reaches, so one rule governs both the statement form (`PRAGMA
+/// table_info(t)`) and the table-valued form (`pragma_table_info(t)`) this module
+/// itself queries.
+const SCHEMA_INTROSPECTION_PRAGMAS: &[&str] = &["table_info", "table_xinfo", "data_version"];
 
 /// Every SQL function caller SQL may call — an ALLOW-LIST, so a function a future
 /// SQLite or `rusqlite` build defines is refused until it is reviewed and named
@@ -657,6 +686,21 @@ pub struct Cluster {
     /// it ([`preconditions::Admitted`]): what decides the words, the vendor error code and
     /// the SQLSTATE an error the database raises reaches the caller in.
     engine: EngineFamily,
+    /// WHERE this cluster's databases live: the cluster's own VOLUME, as the control plane
+    /// that owns the cluster named it ([`preconditions::Admitted`]).
+    ///
+    /// A DB cluster is ONE database behind several doors — this HTTP front door and the
+    /// cluster's own engine endpoints — so a database of the cluster is held in ONE backing
+    /// that every surface of it opens a connection onto
+    /// ([`::service_common::cluster_sql_volumes`]): a table a statement here creates is a
+    /// table of the cluster, which a session on its writer endpoint then selects, and the
+    /// other way round. `None` for a cluster no control plane answered about, whose
+    /// databases are this service's alone — there is no cluster to share them with.
+    volume: Option<::service_common::cluster_sql_volumes::ClusterVolume>,
+    /// The cluster's own `DatabaseName`, as that control plane answered it: the database a
+    /// call that NAMES none addresses, which is the name those rows belong to on the
+    /// cluster ([`Self::backing_for`]).
+    default_database: Option<String>,
 }
 
 /// Which database engine a DB cluster runs, as far as this data plane is concerned.
@@ -721,10 +765,29 @@ impl Cluster {
         }
     }
 
+    /// Record everything the precondition chain RESOLVED about this cluster from the control
+    /// plane that owns it: the engine it runs ([`Self::runs_engine`]) and the volume its
+    /// databases live in ([`Self::serves_volume`]).
+    ///
+    /// Called by every operation that reaches the data plane, before it runs: the cluster is
+    /// another service's resource, so what this service holds for it follows what that
+    /// service answers.
+    pub fn resolved(&mut self, admitted: &preconditions::Admitted) {
+        self.runs_engine(admitted.engine);
+        self.serves_volume(
+            admitted.volume.clone(),
+            admitted.default_database.clone(),
+        );
+    }
+
     /// The committed database `name` holds, created empty on first use — up to
     /// [`MAX_DATABASES_PER_CLUSTER`], past which a request for a NEW database is
     /// refused. Admitting a new one first forgets the databases that naming alone
     /// brought into being, for the reason [`Database::is_empty`] gives.
+    ///
+    /// A database CREATED here is opened on the cluster's own volume where the cluster has
+    /// one ([`Self::backing_for`]), so it is the same database the cluster's engine
+    /// endpoints serve under that name.
     pub fn database_mut(&mut self, name: &str) -> Result<&mut Database, SqlError> {
         if !self.databases.contains_key(name) {
             self.forget_empty_databases();
@@ -734,14 +797,208 @@ impl Cluster {
                 )));
             }
             // A database of this cluster runs the cluster's engine, which is what its
-            // diagnostics are worded as.
-            self.databases
-                .insert(name.to_string(), Database::open(name, self.engine)?);
+            // diagnostics are worded as, and lives in the cluster's own storage, which is
+            // what every surface of the cluster addresses.
+            let backing = self.backing_for(name);
+            self.databases.insert(
+                name.to_string(),
+                Database::open(name, self.engine, backing.as_deref())?,
+            );
         }
         Ok(self
             .databases
             .get_mut(name)
             .expect("the database was just inserted"))
+    }
+
+    /// Record the VOLUME this cluster's databases live in, and the database the cluster was
+    /// created with, as the call that was just admitted resolved them from the control plane
+    /// that owns the cluster.
+    ///
+    /// Each is kept only when the control plane ANSWERED it: a call that reached no control
+    /// plane leaves what a previous one resolved exactly as it was, because an owner that was
+    /// not asked says nothing about where the cluster's data lives.
+    pub fn serves_volume(
+        &mut self,
+        volume: Option<::service_common::cluster_sql_volumes::ClusterVolume>,
+        default_database: Option<String>,
+    ) {
+        if volume.is_some() {
+            self.volume = volume;
+        }
+        if default_database.is_some() {
+            self.default_database = default_database;
+        }
+    }
+
+    /// The backing the database `name` of this cluster is held in, and `None` for a database
+    /// that is this service's alone.
+    fn backing_for(&self, name: &str) -> Option<String> {
+        let volume = self.volume.as_ref()?;
+        Some(volume.backing(&self.volume_database(name)?))
+    }
+
+    /// The name the database `name` of a call has ON THE CLUSTER, and `None` for a cluster
+    /// whose storage this service does not share.
+    ///
+    /// A NAMED database is that name on the cluster. A call that names NONE addresses "the
+    /// connection's default database", which on the cluster is the database it was created
+    /// with — so those rows belong to that name, which is where a session on the cluster's
+    /// own endpoint reads them. A cluster created with no database has no such name, so a
+    /// call that names none keeps a database of this service's own rather than one given a
+    /// name this emulator invented.
+    ///
+    /// Lowercased, because that is the one spelling every surface of the cluster addresses a
+    /// database by: the engines behind those endpoints resolve a database name without regard
+    /// to case.
+    ///
+    /// A name that could be no database of the cluster at all — one carrying a NUL, which
+    /// neither engine admits in an identifier, or one longer than the modelled `DbName`
+    /// ([`MAX_DATABASE_NAME_BYTES`], which the request walk already holds the `database`
+    /// member to, so only a name taken out of caller SQL can reach it) — names nothing on the
+    /// cluster, so no storage of the cluster is addressed for it and the database stays this
+    /// service's own. The caller's text decides nothing about WHAT is opened in any case:
+    /// `ClusterVolume::backing` encodes the name rather than interpolating it, and
+    /// `cluster_sql_volumes::open_backing` opens nothing but a name that function composed.
+    fn volume_database(&self, name: &str) -> Option<String> {
+        self.volume.as_ref()?;
+        let database = match name.is_empty() {
+            true => self
+                .default_database
+                .as_deref()
+                .filter(|default| !default.is_empty())?,
+            false => name,
+        };
+        if database.len() > MAX_DATABASE_NAME_BYTES || database.contains('\0') {
+            return None;
+        }
+        Some(database.to_ascii_lowercase())
+    }
+
+    /// Hold, for the transaction `transaction_id`, the rows its statements have just WRITTEN:
+    /// a row a transaction writes is held against every other transaction until it ends,
+    /// whichever surface of the cluster that other transaction is on.
+    ///
+    /// The rows are the ones the ENGINE reported ([`Database::rows_it_changed`]), taken in
+    /// the cluster's ONE lock table ([`::service_common::sql_row_locks`]) — the table the
+    /// cluster's engine endpoints hold their own transactions' rows in — so a `SELECT … FOR
+    /// UPDATE NOWAIT` on a native session is refused for a row this transaction holds, and a
+    /// statement here waits for a row a native transaction holds.
+    ///
+    /// Nothing is held for a cluster whose storage this service does not share: there is no
+    /// other surface of it to hold a row against.
+    ///
+    /// A row another transaction holds is WAITED for, until the request's own deadline — what
+    /// a statement that names no locking clause does on both engines — and the three ways
+    /// that can end are the conditions those engines report: the wait ran out, waiting would
+    /// close a cycle, or this emulator holds as many rows as it serves.
+    fn hold_what_it_wrote(
+        &mut self,
+        transaction_id: &str,
+        budget: &RequestBudget,
+    ) -> Result<(), SqlError> {
+        let Some(volume) = self.volume.clone() else {
+            return Ok(());
+        };
+        let transaction = self.open_transaction_mut(transaction_id)?;
+        let holder = transaction.holder;
+        let named = transaction.database.clone();
+        let Some(changed) = transaction.open_database()?.rows_it_changed() else {
+            return Ok(());
+        };
+        let Some(database) = self.volume_database(&database_key(named.as_ref())) else {
+            return Ok(());
+        };
+        let rows: Vec<::service_common::sql_row_locks::RowKey> = changed
+            .into_iter()
+            .map(|(table, rowid)| (database.clone(), table, rowid))
+            .collect();
+        let held = volume.locks().acquire(
+            holder,
+            &rows,
+            ::service_common::sql_row_locks::LockMode::Exclusive,
+            ::service_common::sql_row_locks::WaitPolicy::Wait,
+            budget.deadline(),
+        );
+        match held {
+            ::service_common::sql_row_locks::LockOutcome::Granted(_) => Ok(()),
+            // A statement of this API names no locking clause, so a row it cannot have is
+            // one it WAITED for: the condition is the wait running out, which is what each
+            // engine words here.
+            ::service_common::sql_row_locks::LockOutcome::TimedOut => {
+                Err(SqlError::Engine(self.lock_wait_ran_out()))
+            }
+            // A row simply unavailable is the condition a statement that asked not to wait
+            // earns, which this API's own statements do not ask for — so it is worded as the
+            // lock that could not be obtained rather than as a wait nobody made.
+            ::service_common::sql_row_locks::LockOutcome::Unavailable => {
+                Err(SqlError::Engine(self.lock_unavailable(&rows)))
+            }
+            ::service_common::sql_row_locks::LockOutcome::Deadlocked => {
+                Err(SqlError::Engine(self.deadlock_broken()))
+            }
+            ::service_common::sql_row_locks::LockOutcome::TooMany => Err(SqlError::Capacity(
+                format!(
+                    "this emulator holds at most {} locked rows at once",
+                    ::service_common::sql_row_locks::MAX_HELD_ROWS
+                ),
+            )),
+        }
+    }
+
+    /// What the engine THIS CLUSTER RUNS tells a client whose statement waited for a row
+    /// another transaction holds until the wait ran out.
+    fn lock_wait_ran_out(&self) -> String {
+        match self.engine {
+            EngineFamily::PostgreSql => postgres::lock_timeout(),
+            EngineFamily::MySql => mysql::lock_wait_timeout(),
+        }
+    }
+
+    /// And what it tells a statement that could not have a row of `rows` at all: the
+    /// condition each engine words for a lock it did not obtain, naming the relation the
+    /// first such row belongs to.
+    fn lock_unavailable(&self, rows: &[::service_common::sql_row_locks::RowKey]) -> String {
+        match self.engine {
+            EngineFamily::PostgreSql => postgres::could_not_obtain_lock(
+                rows.first().map_or("", |(_, table, _)| table.as_str()),
+            ),
+            EngineFamily::MySql => mysql::lock_wait_timeout(),
+        }
+    }
+
+    /// And what it tells the one transaction of a waiting CYCLE it breaks.
+    fn deadlock_broken(&self) -> String {
+        match self.engine {
+            EngineFamily::PostgreSql => postgres::deadlock_detected(),
+            EngineFamily::MySql => mysql::deadlock_detected(),
+        }
+    }
+
+    /// Let go of every row the holder `holder` was holding — what a commit, a rollback and
+    /// the clock's own rollback do — and wake whatever was waiting for one of them.
+    fn release_the_rows_of(&self, holder: u32) {
+        if let Some(volume) = &self.volume {
+            volume.locks().release(holder);
+        }
+    }
+
+    /// Install `pending` as the committed database `name` of this cluster: what applying a
+    /// transaction's writes does.
+    ///
+    /// A database of this service's own is REPLACED by the copy the transaction wrote into,
+    /// which is the cheapest way to install it. A database held in the cluster's own volume
+    /// is written INTO instead ([`Database::absorb`]): the backing is the storage every
+    /// surface of the cluster addresses, so a commit has to leave the data in it rather than
+    /// move this service onto a copy of its own that no other surface can see.
+    pub fn install_committed(&mut self, name: &str, pending: Database) -> Result<(), SqlError> {
+        if let Some(committed) = self.databases.get_mut(name) {
+            if committed.is_backed() {
+                return committed.absorb(&pending);
+            }
+        }
+        self.databases.insert(name.to_string(), pending);
+        Ok(())
     }
 
     /// Drop every committed database that holds no schema of its own — one a
@@ -776,13 +1033,20 @@ impl Cluster {
         // database it was opened for: read while its copy is still here, carried over
         // once the loop has let go of it.
         let mut carried: Vec<(String, Vec<(String, i64)>)> = Vec::new();
+        let mut let_go: Vec<u32> = Vec::new();
         for transaction in self.transactions.values_mut() {
             if let Some(pending) = transaction.end_if_the_clock_has() {
                 carried.push((
                     database_key(transaction.database.as_ref()),
                     pending.sequence_marks(),
                 ));
+                let_go.push(transaction.holder);
             }
+        }
+        // The rows a transaction the CLOCK ended held go with it, exactly as they go with one
+        // a caller ended.
+        for holder in let_go {
+            self.release_the_rows_of(holder);
         }
         for (database, marks) in carried {
             // Only into a database this cluster still has: the clock's rollback creates
@@ -851,11 +1115,19 @@ impl Cluster {
 
     /// End the transaction `transaction_id` names and hand back the database it was
     /// writing into. The id stays with the cluster, now terminal.
+    ///
+    /// The rows that transaction held go with it: a transaction that has ended holds
+    /// nothing, so whatever was waiting for one of its rows can have it
+    /// ([`Self::release_the_rows_of`]).
     pub fn end_transaction(&mut self, transaction_id: &str) -> Result<Database, SqlError> {
-        self.transactions
+        let transaction = self
+            .transactions
             .get_mut(transaction_id)
-            .ok_or(SqlError::TransactionNotFound(TransactionEnd::Terminated))?
-            .end()
+            .ok_or(SqlError::TransactionNotFound(TransactionEnd::Terminated))?;
+        let holder = transaction.holder;
+        let ended = transaction.end()?;
+        self.release_the_rows_of(holder);
+        Ok(ended)
     }
 
     /// Record that a statement of the transaction `transaction_id` names FAILED, so the
@@ -891,10 +1163,16 @@ impl Cluster {
         let transaction = self.open_transaction_mut(transaction_id)?;
         transaction.touch();
         transaction.require_room_for(1)?;
-        let outcome = transaction
-            .open_database()?
-            .run_within(budget, sql, parameters)?;
+        let database = transaction.open_database()?;
+        // The rows THIS statement writes are the rows it goes on to hold, so what an earlier
+        // statement of the transaction wrote is not counted again.
+        database.forget_what_changed();
+        let outcome = database.run_within(budget, sql, parameters)?;
+        let transaction = self.open_transaction_mut(transaction_id)?;
         transaction.record(sql, parameters, &outcome);
+        // And the rows it wrote are held against every other transaction of this cluster,
+        // whichever of its surfaces that transaction is on, until this one ends.
+        self.hold_what_it_wrote(transaction_id, budget)?;
         if commits {
             self.commit_in_place(transaction_id, budget)?;
         }
@@ -924,12 +1202,15 @@ impl Cluster {
         let transaction = self.open_transaction_mut(transaction_id)?;
         transaction.touch();
         transaction.require_room_for(parameter_sets.len())?;
-        let outcomes = transaction
-            .open_database()?
-            .run_batch_within(budget, sql, parameter_sets)?;
+        let database = transaction.open_database()?;
+        // As for a single statement: the rows THIS batch writes are the rows it holds.
+        database.forget_what_changed();
+        let outcomes = database.run_batch_within(budget, sql, parameter_sets)?;
+        let transaction = self.open_transaction_mut(transaction_id)?;
         for (parameters, outcome) in parameter_sets.iter().zip(&outcomes) {
             transaction.record(sql, parameters, outcome);
         }
+        self.hold_what_it_wrote(transaction_id, budget)?;
         if commits {
             self.commit_in_place(transaction_id, budget)?;
         }
@@ -999,8 +1280,12 @@ impl Cluster {
         let database = self.prepare_to_install_writes(transaction_id, budget)?;
         let transaction = self.open_transaction_mut(transaction_id)?;
         transaction.touch();
+        let holder = transaction.holder;
         let installed = transaction.commit_in_place()?;
-        self.databases.insert(database, installed);
+        self.install_committed(&database, installed)?;
+        // What it had written is COMMITTED now, so it holds none of those rows any more:
+        // there is nothing left for another transaction to wait for.
+        self.release_the_rows_of(holder);
         Ok(())
     }
 
@@ -1449,6 +1734,25 @@ pub struct Database {
     /// The ENGINE the cluster holding this database runs, which is what an error the
     /// database raises is worded as ([`Self::in_the_engines_words`]).
     engine: EngineFamily,
+    /// Whether this database is held in the BACKING of the cluster's own volume — the
+    /// storage every surface of that cluster addresses
+    /// ([`::service_common::cluster_sql_volumes`]) — as opposed to a database of this
+    /// service's own: a copy taken for a transaction, or one of a cluster no control plane
+    /// answered about.
+    ///
+    /// What decides how a transaction's writes are installed ([`Cluster::install_committed`]):
+    /// a backed database is WRITTEN INTO, because moving this service onto a copy of its own
+    /// would take the data out of the storage the cluster's other surfaces read.
+    backed: bool,
+    /// The rows the statement running now has CHANGED in this database, as the engine's own
+    /// update hook reports them: the table (lowercased, as a row's key names it) and the
+    /// engine's row id.
+    ///
+    /// What the ROWS a transaction holds are taken from ([`Cluster::hold_what_it_wrote`]):
+    /// the engine reports each row it writes, so nothing here reads a statement's text to
+    /// decide which rows it touched. Cleared before each statement, so it holds one
+    /// statement's rows and never grows across requests.
+    changed: Arc<Mutex<Vec<(String, i64)>>>,
 }
 
 /// What a table's declaration said about a column whose values the ENGINE assigns.
@@ -1470,6 +1774,36 @@ struct DeclaredSequence {
 fn next_version() -> u64 {
     static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Copy `source` over `destination` with the ENGINE's own page-level copy, bounded in time.
+///
+/// `sqlite3_backup_*` between two OPEN connections, so no path is named and no file is
+/// opened; it also runs beneath SQL, so it copies every table, index, view and trigger of the
+/// source exactly, with no dialect or quoting of its own to get wrong.
+///
+/// Driven one step at a time rather than in one call, so [`STATEMENT_TIME_BUDGET`] is checked
+/// BETWEEN steps — the cancellation point every other unit of engine work here has. That
+/// matters because either end may be a backing another surface of the cluster is writing
+/// (`service_common::cluster_sql_volumes`): the engine then answers a step `BUSY` or
+/// `LOCKED`, which is asked again until the deadline, and a copy that could not be made in
+/// that time is reported as the timeout it is rather than retried without end.
+fn copy_pages(source: &Connection, destination: &mut Connection) -> Result<(), SqlError> {
+    let deadline = Instant::now() + STATEMENT_TIME_BUDGET;
+    let backup =
+        ::rusqlite::backup::Backup::new(source, destination).map_err(SqlError::unavailable)?;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(SqlError::Timeout);
+        }
+        if backup
+            .step(COPY_PAGES_PER_STEP)
+            .map_err(SqlError::from_engine)?
+            == ::rusqlite::backup::StepResult::Done
+        {
+            return Ok(());
+        }
+    }
 }
 
 impl Database {
@@ -1509,8 +1843,21 @@ impl Database {
     /// the catalog relations that describe this database reports as its catalog, and
     /// `engine` the engine the cluster that holds it runs, which its diagnostics are
     /// worded as.
-    pub fn open(name: &str, engine: EngineFamily) -> Result<Self, SqlError> {
-        let mut conn = Connection::open_in_memory().map_err(SqlError::unavailable)?;
+    ///
+    /// `backing` is WHERE its pages live: the backing of this database in the cluster's own
+    /// volume ([`Cluster::backing_for`]), which every surface of that cluster opens a
+    /// connection onto, so a statement here and a session on the cluster's engine endpoint
+    /// read and write one database. `None` opens a database nothing else addresses — the
+    /// private copy a transaction writes into, and the databases of a cluster no control
+    /// plane answered about. Either way the confinement, the bounds and the functions below
+    /// are this connection's own.
+    pub fn open(
+        name: &str,
+        engine: EngineFamily,
+        backing: Option<&str>,
+    ) -> Result<Self, SqlError> {
+        let mut conn = ::service_common::cluster_sql_volumes::open_backing(backing)
+            .map_err(SqlError::unavailable)?;
 
         // Memory, value size, statement size and complexity. Set first, so they
         // hold for every statement the connection ever prepares.
@@ -1661,22 +2008,107 @@ impl Database {
             version: next_version(),
             declared: false,
             engine,
+            backed: backing.is_some(),
+            changed: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Have the engine report every row this database's statements CHANGE
+    /// ([`Self::changed`]).
+    ///
+    /// Installed on the copy a TRANSACTION writes into and on nothing else: the rows a
+    /// transaction holds are the rows its own statements wrote, and a database no transaction
+    /// is writing into records nothing and costs nothing.
+    fn record_what_changes(&mut self) -> Result<(), SqlError> {
+        let recorded = Arc::clone(&self.changed);
+        self.conn
+            .update_hook(Some(
+                move |_action: ::rusqlite::hooks::Action,
+                      _schema: &str,
+                      table: &str,
+                      rowid: i64| {
+                    let mut held = recorded
+                        .lock()
+                        .unwrap_or_else(::std::sync::PoisonError::into_inner);
+                    // One past the ceiling is kept, which is what says the statements changed
+                    // MORE rows than locks are taken over ([`Self::rows_it_changed`]).
+                    if held.len() <= MAX_LOCKED_ROWS {
+                        held.push((table.to_ascii_lowercase(), rowid));
+                    }
+                },
+            ))
+            .map_err(SqlError::unavailable)
+    }
+
+    /// The rows the statements that have run since [`Self::forget_what_changed`] CHANGED, as
+    /// the engine reported them, and `None` when they changed MORE than [`MAX_LOCKED_ROWS`]
+    /// of them.
+    ///
+    /// Work over more rows than that is run with NO row locks rather than with a lock table
+    /// the size of the table it wrote — the same ceiling the cluster's engine endpoints hold
+    /// their own locks to — which is a bound on this emulator's bookkeeping and never a
+    /// refusal: the statement itself ran.
+    fn rows_it_changed(&self) -> Option<Vec<(String, i64)>> {
+        let held = self
+            .changed
+            .lock()
+            .unwrap_or_else(::std::sync::PoisonError::into_inner);
+        if held.len() > MAX_LOCKED_ROWS {
+            return None;
+        }
+        Some(held.clone())
+    }
+
+    /// Forget the rows recorded so far, before the next unit of work runs.
+    fn forget_what_changed(&self) {
+        self.changed
+            .lock()
+            .unwrap_or_else(::std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    /// Whether this database is held in the backing of the cluster's own volume; see
+    /// [`Self::backed`].
+    #[must_use]
+    pub fn is_backed(&self) -> bool {
+        self.backed
+    }
+
+    /// Make this database hold exactly what `from` holds, by copying its pages into this
+    /// one's own storage.
+    ///
+    /// What installs a transaction's writes into a database the cluster's other surfaces
+    /// also read ([`Cluster::install_committed`]): the pages are copied by SQLite's own
+    /// backup API, so this database holds the same schema and the same rows as `from` while
+    /// STAYING the storage it is — every connection other surfaces of the cluster hold onto
+    /// this backing reads the installed data on its next statement.
+    ///
+    /// Bounded like every other unit of engine work here: the copy is driven a step at a
+    /// time under [`STATEMENT_TIME_BUDGET`], so a backing another surface is reading at this
+    /// instant is asked again until the deadline rather than failing the commit, and a copy
+    /// that cannot be made in that time is reported as the timeout it is.
+    pub fn absorb(&mut self, from: &Database) -> Result<(), SqlError> {
+        copy_pages(&from.conn, &mut self.conn)?;
+        // The installed pages carry the same schema, so they carry the same declarations;
+        // and the CONTENT has moved, so this database is at a version of its own, which is
+        // what every open transaction on it compares against.
+        self.sequence_columns = from.sequence_columns.clone();
+        self.version = next_version();
+        Ok(())
     }
 
     /// A private copy of this database — the same schema and the same rows — for a
     /// transaction to write into. Copied by SQLite's own backup API, so the copy is
-    /// byte-identical to the source database, and bounded by the same
-    /// `max_page_count` as every other database here.
+    /// byte-identical to the source database, bounded in SIZE by the same `max_page_count`
+    /// as every other database here and in TIME by [`copy_pages`].
     pub fn snapshot(&self) -> Result<Self, SqlError> {
-        let mut copy = Self::open(&self.name, self.engine)?;
-        {
-            let backup = rusqlite::backup::Backup::new(&self.conn, &mut copy.conn)
-                .map_err(SqlError::unavailable)?;
-            backup
-                .run_to_completion(1024, Duration::ZERO, None)
-                .map_err(SqlError::from_engine)?;
-        }
+        // A PRIVATE copy: the transaction writes into a database of its own, which no other
+        // reader and no other surface of the cluster can see until it is installed.
+        let mut copy = Self::open(&self.name, self.engine, None)?;
+        // And the engine reports every row it writes into that copy, which is what the rows
+        // the transaction HOLDS are taken from.
+        copy.record_what_changes()?;
+        copy_pages(&self.conn, &mut copy.conn)?;
         // The copy carries the same schema, so it carries the same declarations —
         // and the same CONTENT, so it is at the same version as the database it was
         // taken from.
@@ -1687,8 +2119,34 @@ impl Database {
 
     /// The version this database's content is at: what a transaction compares to tell
     /// whether the committed database it reads has moved since it last ran.
+    ///
+    /// Both ways it can move are in it: a statement THIS service ran (the counter below) and
+    /// a commit ANOTHER SURFACE of the cluster made on the same backing
+    /// ([`Self::committed_elsewhere`]). Each part only ever grows, so the version a
+    /// transaction was built from differs from this one exactly when the database has moved
+    /// since — which is what makes a transaction read, and install over, what every surface
+    /// of the cluster has committed rather than only what this one has.
     pub fn version(&self) -> u64 {
-        self.version
+        self.version.saturating_add(self.committed_elsewhere())
+    }
+
+    /// How many times ANOTHER connection on this database's backing has committed, as the
+    /// ENGINE's own account of it: `PRAGMA data_version` "is unchanged for commits made on
+    /// the same database connection" and moves when another connection commits to the same
+    /// database.
+    ///
+    /// Zero for a database nothing else addresses — a private copy, and the databases of a
+    /// cluster whose storage this service does not share — which only this connection writes,
+    /// and zero when the engine will not answer, which leaves the version to this service's
+    /// own counter rather than to a reading nobody made.
+    fn committed_elsewhere(&self) -> u64 {
+        if !self.backed {
+            return 0;
+        }
+        self.conn
+            .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+            .map(|committed| u64::try_from(committed).unwrap_or_default())
+            .unwrap_or_default()
     }
 
     /// The engine connection this database's pages live in, for a reader that carries its
@@ -2432,6 +2890,14 @@ pub struct Transaction {
     aborted: bool,
     /// When the transaction ended and WHY, and `None` while it is open or aborted.
     ended: Option<Ended>,
+    /// WHO this transaction is in the cluster's lock table
+    /// ([`::service_common::sql_row_locks`]): the holder of every row it has written, told
+    /// apart there from every transaction of every other surface of the cluster.
+    ///
+    /// Drawn from that table itself, where it cannot be the connection id of a session on one
+    /// of the cluster's engine endpoints; zero for a cluster whose storage this service does
+    /// not share, which holds no rows against anything.
+    holder: u32,
 }
 
 /// When a transaction stopped running, and why — what a refusal of its id is answered
@@ -2447,254 +2913,6 @@ struct Ended {
 struct RecordedWrite {
     sql: String,
     parameters: Vec<SqlParameter>,
-}
-
-impl Transaction {
-    /// Open a transaction on `cluster`'s `database`, minting its id and taking its
-    /// snapshot. The id is opaque, unique and BOUND to the resource it was opened on
-    /// ([`mint_transaction_id`]), well inside the modelled 192-character limit. A cluster
-    /// holds at most [`MAX_OPEN_TRANSACTIONS`] open transactions — each is a whole copy of
-    /// a database — past which opening another is refused. A transaction that ENDED holds
-    /// no database, so it is not one of them.
-    pub fn open(
-        cluster: &mut Cluster,
-        resource_arn: &str,
-        secret_arn: &str,
-        database: Option<&String>,
-        schema: Option<&String>,
-    ) -> Result<String, SqlError> {
-        if cluster.open_transaction_count() >= MAX_OPEN_TRANSACTIONS {
-            return Err(SqlError::Capacity(format!(
-                "this emulator holds at most {MAX_OPEN_TRANSACTIONS} open transactions per cluster"
-            )));
-        }
-        let committed = cluster.database_mut(&database_key(database))?;
-        let based_on = committed.version();
-        let pending = committed.snapshot()?;
-        let id = mint_transaction_id(resource_arn);
-        let now = SystemTime::now();
-        cluster.transactions.insert(
-            id.clone(),
-            Self {
-                id: id.clone(),
-                resource_arn: resource_arn.to_string(),
-                secret_arn: secret_arn.to_string(),
-                database: database.cloned(),
-                schema: schema.cloned(),
-                created_at: now,
-                last_used_at: now,
-                pending: Some(pending),
-                writes: Vec::new(),
-                based_on,
-                aborted: false,
-                ended: None,
-            },
-        );
-        Ok(id)
-    }
-
-    /// Record that a call used this transaction, restarting its idle timeout.
-    pub fn touch(&mut self) {
-        self.last_used_at = SystemTime::now();
-    }
-
-    /// Whether this transaction has ENDED — a commit installed its writes, a rollback
-    /// discarded them, or the clock rolled it back.
-    pub fn is_terminal(&self) -> bool {
-        self.ended.is_some()
-    }
-
-    /// Why this transaction is no longer running, and `None` while it still is.
-    pub fn end_cause(&self) -> Option<TransactionEnd> {
-        self.ended.map(|ended| ended.cause)
-    }
-
-    /// When this transaction stopped running, and `None` while it still is.
-    fn ended_at(&self) -> Option<SystemTime> {
-        self.ended.map(|ended| ended.at)
-    }
-
-    /// Whether a statement of this transaction FAILED, so the database ignores every
-    /// further command of it until the transaction block ends.
-    pub fn is_aborted(&self) -> bool {
-        self.aborted
-    }
-
-    /// The database this transaction's statements write into.
-    ///
-    /// `Err` once a statement of this transaction has failed: the database "ignores
-    /// commands until end of transaction block", which is an error the DATABASE raises
-    /// for every further statement rather than the transaction being gone.
-    pub fn open_database(&mut self) -> Result<&mut Database, SqlError> {
-        if self.aborted {
-            return Err(SqlError::Engine(postgres::transaction_aborted()));
-        }
-        self.pending
-            .as_mut()
-            .ok_or(SqlError::TransactionNotFound(TransactionEnd::Terminated))
-    }
-
-    /// Whether this transaction's copy was built from the committed database as it is
-    /// at `version`, so its next statement already reads everything committed.
-    fn reads_version(&self, version: u64) -> bool {
-        self.based_on == version
-    }
-
-    /// Rebuild the copy this transaction runs against from the COMMITTED database as it
-    /// is now, with this transaction's own writes replayed onto it.
-    ///
-    /// What READ COMMITTED means here: a statement of this transaction reads every row
-    /// another transaction committed before it ran, alongside the rows this transaction
-    /// has written itself and nobody else can see yet. The rows another writer committed
-    /// come from the fresh copy and this transaction's own from the replay, so both are
-    /// there.
-    ///
-    /// What the replay does NOT reproduce: a statement that read the database as it was
-    /// (`UPDATE t SET n = n + 1`, `INSERT … SELECT`) is applied again to the newer rows,
-    /// and one that read a clock or a random value gets another reading. A replayed
-    /// statement the newer rows REFUSE (a key another transaction has since committed)
-    /// fails as that statement's own failure, which terminates this transaction the way
-    /// any failed statement in it does.
-    fn rebase_onto(
-        &mut self,
-        committed: &Database,
-        budget: &mut RequestBudget,
-    ) -> Result<(), SqlError> {
-        let mut rebuilt = committed.snapshot()?;
-        for write in &self.writes {
-            rebuilt.run_within(budget, &write.sql, &write.parameters)?;
-        }
-        self.pending = Some(rebuilt);
-        self.based_on = committed.version();
-        Ok(())
-    }
-
-    /// Remember a statement of this transaction that CHANGED its database, so a later
-    /// rebase puts it back.
-    fn record(&mut self, sql: &str, parameters: &[SqlParameter], outcome: &StatementOutcome) {
-        if !outcome.changed_it() {
-            return;
-        }
-        self.writes.push(RecordedWrite {
-            sql: sql.to_string(),
-            parameters: parameters.to_vec(),
-        });
-    }
-
-    /// Refuse a transaction that is already holding [`MAX_TRANSACTION_WRITES`]
-    /// statements one more, BEFORE it runs: the statements a transaction has written are
-    /// kept until it ends (that is what a rebase replays and a commit installs), so their
-    /// number is a store one caller can grow and is capped like every other store here.
-    fn require_room_for(&self, statements: usize) -> Result<(), SqlError> {
-        if self.writes.len() + statements > MAX_TRANSACTION_WRITES {
-            return Err(SqlError::Capacity(format!(
-                "this emulator holds at most {MAX_TRANSACTION_WRITES} statements per open \
-                 transaction"
-            )));
-        }
-        Ok(())
-    }
-
-    /// End this transaction and hand back the database it was writing into, so the caller
-    /// can install it (a commit) or read the sequence marks out of it and drop it (a
-    /// rollback). The id stays in the cluster, now ended.
-    ///
-    /// `Err` for one that has already ended, which is what refuses a second commit or
-    /// rollback of the same id.
-    pub fn end(&mut self) -> Result<Database, SqlError> {
-        let pending = self.pending.take().ok_or_else(|| {
-            SqlError::TransactionNotFound(self.end_cause().unwrap_or(TransactionEnd::Terminated))
-        })?;
-        self.ended = Some(Ended {
-            at: SystemTime::now(),
-            cause: TransactionEnd::Terminated,
-        });
-        Ok(pending)
-    }
-
-    /// Hand back the copy this transaction has been writing into, for a caller that
-    /// installs it as the committed database while the transaction GOES ON — the
-    /// implicit commit a statement of a class the engine does not run inside a
-    /// transaction earns ([`Cluster::commits_the_transaction`]).
-    ///
-    /// Unlike [`Self::end`] this does not end the transaction: it is left reading a fresh
-    /// copy of the database that is about to be committed, with the statements it had
-    /// written forgotten — they are committed now, so nothing can replay them and nothing
-    /// is left for a rollback to discard. The copy it carries on with is taken BEFORE the
-    /// installed one is handed over, so a transaction whose copy could not be taken keeps
-    /// the one it had.
-    fn commit_in_place(&mut self) -> Result<Database, SqlError> {
-        let pending = self.pending.as_ref().ok_or_else(|| {
-            SqlError::TransactionNotFound(self.end_cause().unwrap_or(TransactionEnd::Terminated))
-        })?;
-        let carried_on = pending.snapshot()?;
-        self.based_on = carried_on.version();
-        let installed = self
-            .pending
-            .replace(carried_on)
-            .expect("the copy was just read");
-        self.writes.clear();
-        Ok(installed)
-    }
-
-    /// Record that a statement of this transaction FAILED, which is what terminates it:
-    /// "a transaction is terminated when a statement in it fails"
-    /// (`BeginTransaction`'s own documentation). Nothing it wrote can reach the committed
-    /// database any more — a commit of it discards its writes exactly as a rollback does —
-    /// and the copy it was writing into is kept until one of them ends it, because that is
-    /// what they discard.
-    pub fn abort(&mut self) {
-        self.aborted = true;
-    }
-
-    /// End this transaction if the CLOCK has already ended it, and hand back the copy of
-    /// the database it was writing into so its sequence marks can be carried over before
-    /// it is dropped. `None` for one the clock does not owe a rollback, and for one that
-    /// has already stopped running.
-    ///
-    /// Two windows end a transaction nobody ended:
-    ///
-    /// * it sat IDLE for [`TRANSACTION_IDLE_TIMEOUT`] — "a transaction times out if no
-    ///   calls use its transaction ID in three minutes", and a transaction that timed out
-    ///   "is rolled back automatically" — so its id is answered from then on as one the
-    ///   service abandoned for inactivity ([`TransactionEnd::Idle`]);
-    /// * it has been open for [`TRANSACTION_MAX_LIFETIME`] — "a transaction is terminated
-    ///   and rolled back automatically after 24 hours" — which the service words as a
-    ///   termination like any other ([`TransactionEnd::Terminated`]).
-    ///
-    /// Each is dated at the instant it FELL DUE and not at the call that noticed, so how
-    /// long a terminal record is then kept does not depend on when anybody looked.
-    fn end_if_the_clock_has(&mut self) -> Option<Database> {
-        if self.is_terminal() {
-            return None;
-        }
-        let idle_since = self.last_used_at + TRANSACTION_IDLE_TIMEOUT;
-        let lifetime_since = self.created_at + TRANSACTION_MAX_LIFETIME;
-        let now = SystemTime::now();
-        let (at, cause) = if idle_since <= now {
-            (idle_since, TransactionEnd::Idle)
-        } else if lifetime_since <= now {
-            (lifetime_since, TransactionEnd::Terminated)
-        } else {
-            return None;
-        };
-        let pending = self.pending.take();
-        // The statements it wrote go with the copy they wrote into: nothing can replay
-        // them any more.
-        self.writes.clear();
-        self.ended = Some(Ended { at, cause });
-        pending
-    }
-
-    /// Whether this transaction can be FORGOTTEN: an ended one past the window a terminal
-    /// id is kept for. Its id is then answered as one of a transaction that ended all the
-    /// same, which is what a forgotten record and a remembered one have in common.
-    fn is_forgotten(&self) -> bool {
-        self.ended_at().is_some_and(|at| {
-            at.elapsed()
-                .is_ok_and(|since| since >= TERMINAL_TRANSACTION_MEMORY)
-        })
-    }
 }
 
 /// The id a `BeginTransaction` on `resource_arn` mints for the transaction it opens: an
@@ -3026,6 +3244,13 @@ impl RequestBudget {
             deadline: Instant::now() + STATEMENT_TIME_BUDGET,
             response_bytes_left: MAX_RESPONSE_BYTES,
         }
+    }
+
+    /// When this request's engine work must be over, which is also how long it waits for a
+    /// row another transaction holds.
+    #[must_use]
+    pub fn deadline(&self) -> Instant {
+        self.deadline
     }
 
     /// Charge `bytes` of result to this request, or refuse it: the first value
@@ -4494,91 +4719,6 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A heap ceiling low enough that a statement writing a few megabytes of pages
-    /// runs into it, and high enough that the engine can still prepare statements
-    /// (so the ceiling can be put back afterwards).
-    const PROBE_HEAP_BYTES: i64 = 16 * 1024 * 1024;
-
-    /// Half a megabyte per row, under [`MAX_VALUE_BYTES`], so what the statements
-    /// below run into is the HEAP ceiling and not the per-value limit.
-    const PROBE_VALUE_BYTES: i64 = 512 * 1024;
-
-    /// Enough rows to need four times [`PROBE_HEAP_BYTES`] of pages.
-    const PROBE_ROWS: usize = 128;
-
-    /// Set SQLite's process-wide heap ceiling, through a connection of this test's
-    /// own: a confined [`Database`] refuses `PRAGMA` to anything, including this
-    /// crate, once its authorizer is installed.
-    fn set_process_heap_ceiling(bytes: i64) {
-        let probe = Connection::open_in_memory().expect("a connection for the pragma");
-        probe
-            .pragma_update(None, "hard_heap_limit", bytes)
-            .expect("the engine takes a heap ceiling");
-    }
-
-    /// `PRAGMA hard_heap_limit` bounds the ENGINE's allocator, so a statement whose
-    /// pages would take the engine past the ceiling is REFUSED by the engine
-    /// instead of growing this process — the memory axis the page, step, time and
-    /// output bounds do not cover.
-    ///
-    /// SQLite's heap limit is process-wide, which is why this lives beside the code
-    /// rather than in `tests/all/`: lowering it is visible to every database in the
-    /// process, so the window is held open for one statement and closed again,
-    /// where the wire suite's databases (which deliberately fill tens of megabytes)
-    /// cannot see it.
-    #[test]
-    fn the_engine_heap_ceiling_refuses_an_allocation_heavy_statement() {
-        let mut database =
-            Database::open("probe", EngineFamily::default()).expect("a confined database opens");
-        database
-            .run_within(
-                &mut RequestBudget::new(),
-                "CREATE TABLE blobs (payload BLOB)",
-                &[],
-            )
-            .expect("the table is created under the configured ceiling");
-
-        // The ceiling is the only thing that changes for the length of this loop.
-        set_process_heap_ceiling(PROBE_HEAP_BYTES);
-        let mut refused = None;
-        let mut rows_written = 0_usize;
-        for _ in 0..PROBE_ROWS {
-            match database.run_within(
-                &mut RequestBudget::new(),
-                &format!("INSERT INTO blobs (payload) VALUES (zeroblob({PROBE_VALUE_BYTES}))"),
-                &[],
-            ) {
-                Ok(_) => rows_written += 1,
-                Err(error) => {
-                    refused = Some(error);
-                    break;
-                }
-            }
-        }
-        set_process_heap_ceiling(MAX_ENGINE_HEAP_BYTES);
-
-        let refused = refused.unwrap_or_else(|| {
-            panic!(
-                "case \"rows past the heap ceiling\": the engine accepted {rows_written} rows of \
-                 {PROBE_VALUE_BYTES} bytes under a {PROBE_HEAP_BYTES}-byte ceiling, so memory is \
-                 not bounded"
-            )
-        });
-        let message = refused.message();
-        assert!(
-            matches!(refused, SqlError::Capacity(_)) && message.contains("memory ceiling"),
-            "case \"rows past the heap ceiling\": expected the engine's out-of-memory refusal, \
-             reported as this emulator's capacity, after {rows_written} rows, got \
-             {refused:?} ({message})"
-        );
-
-        // The ceiling is back, so the engine serves statements again: the bound
-        // refuses work, it does not break the database it was applied to.
-        database
-            .run_within(&mut RequestBudget::new(), "SELECT count(*) FROM blobs", &[])
-            .expect("the database still answers once the ceiling is restored");
-    }
-}
+mod tests;
+/// ONE TRANSACTION of a cluster: the copy of a database it writes into and the ways it ends.
+mod transactions;

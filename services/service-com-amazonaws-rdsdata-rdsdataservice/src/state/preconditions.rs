@@ -203,17 +203,40 @@ pub async fn admit<Eng: Send + Sync + 'static>(
         engine: super::EngineFamily::of_engine(
             cluster.as_ref().and_then(|cluster| cluster.engine.as_deref()),
         ),
+        // WHERE the databases of this cluster live: the cluster's own volume, which every
+        // surface of that cluster addresses. Named by the resource id the control plane
+        // answered with, so the Data API and the cluster's engine endpoints resolve the
+        // same storage — and `None` where no control plane answered, which leaves this
+        // service's own databases where they were opened rather than moving them on the
+        // strength of a peer that said nothing.
+        volume: cluster
+            .as_ref()
+            .and_then(|cluster| cluster.resource_id.as_deref())
+            .zip(::service_common::cluster_sql_volumes::ClusterVolumes::of(engine))
+            .map(|(resource_id, volumes)| volumes.cluster(resource_id)),
+        default_database: cluster
+            .as_ref()
+            .and_then(|cluster| cluster.database_name.clone()),
     })
 }
 
 /// What admitting a call RESOLVED about the cluster it addressed, which the statement then
 /// runs under.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Admitted {
     /// The engine the cluster runs, which is what decides the words an error the DATABASE
     /// raises reaches the caller in. A cluster no control plane answered about carries the
     /// default family, because nothing says otherwise.
     pub engine: super::EngineFamily,
+    /// The VOLUME the cluster's databases live in — the one backing each of them is held
+    /// in, which the cluster's engine endpoints open the same connections onto
+    /// ([`::service_common::cluster_sql_volumes`]). `None` for a cluster no control plane
+    /// answered about and for an emulator whose engine vends no such naming.
+    pub volume: Option<::service_common::cluster_sql_volumes::ClusterVolume>,
+    /// `DatabaseName`: the database the cluster was created with, which is the database a
+    /// call that names none addresses — so it is the name that call's rows belong to on the
+    /// cluster.
+    pub default_database: Option<String>,
 }
 
 /// Refuse a `transactionId` that cannot be a transaction id of the resource the call
@@ -343,6 +366,10 @@ struct ClusterFacts {
     /// `Engine`: which database engine the cluster runs, so the databases that engine
     /// ships with are known to be there too.
     engine: Option<String>,
+    /// `DbClusterResourceId`: the cluster's own immutable id, which is what its storage is
+    /// named by — "Region-unique [and] immutable", so it follows the cluster through a
+    /// rename. `None` for a cluster whose record names none.
+    resource_id: Option<String>,
 }
 
 impl ClusterFacts {
@@ -354,6 +381,7 @@ impl ClusterFacts {
             master_username: None,
             database_name: None,
             engine: None,
+            resource_id: None,
         }
     }
 
@@ -465,6 +493,7 @@ async fn describe_cluster(
         master_username: record.master_username().map(str::to_string),
         database_name: record.database_name().map(str::to_string),
         engine: record.engine().map(str::to_string),
+        resource_id: record.db_cluster_resource_id().map(str::to_string),
     })
 }
 
@@ -878,6 +907,7 @@ mod tests {
             master_username: Some("admin".to_string()),
             database_name: Some("demo".to_string()),
             engine: Some("aurora-postgresql".to_string()),
+            resource_id: Some("cluster-DEMO".to_string()),
         };
         // (case, the secret's user, whether it carries a password, the refusal expected)
         let rows: &[(&str, Option<&str>, bool, Option<&str>)] = &[
@@ -967,6 +997,7 @@ mod tests {
             master_username: Some("admin".to_string()),
             database_name: Some("created_with".to_string()),
             engine: Some("aurora-postgresql".to_string()),
+            resource_id: Some("cluster-CREATED".to_string()),
         };
         let held: BTreeSet<String> = ["already_held"].into_iter().map(str::to_string).collect();
         // (case, the database the call names, the refusal expected)

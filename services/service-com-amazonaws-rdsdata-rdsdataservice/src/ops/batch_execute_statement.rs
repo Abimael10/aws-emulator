@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine work is synchronous and CPU-bound, and it holds the state
         // lock, so it runs on the blocking pool under one wall clock rather than on
         // an async worker.
-        crate::state::in_data_plane(move || execute_batch(&store, &input, admitted.engine))
+        crate::state::in_data_plane(move || execute_batch(&store, &input, &admitted))
             .await
             .map_err(statement_failed)
     }
@@ -295,12 +295,13 @@ fn refused(refusal: crate::state::preconditions::Refusal) -> BatchExecuteStateme
 /// Run the statement once per parameter set and build the response, inside the
 /// data plane.
 ///
-/// `engine` is the engine the addressed cluster runs, for the reason
+/// `admitted` is what the precondition chain resolved about the addressed cluster — the
+/// engine it runs and the volume its databases live in — for the reason
 /// `ExecuteStatement`'s own handler gives.
 fn execute_batch(
     store: &crate::state::Store,
     input: &BatchExecuteStatementInput,
-    engine: crate::state::EngineFamily,
+    admitted: &crate::state::preconditions::Admitted,
 ) -> Result<BatchExecuteStatementOutput, crate::state::SqlError> {
     let parameter_sets = input.parameter_sets.clone().unwrap_or_default();
     if parameter_sets.len() > crate::state::MAX_PARAMETER_SETS {
@@ -328,7 +329,7 @@ fn execute_batch(
     };
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
-    cluster.runs_engine(engine);
+    cluster.resolved(admitted);
     cluster.expire_timed_out_transactions();
 
     // Exactly one `UpdateResult` per execution, in the order the sets arrived:

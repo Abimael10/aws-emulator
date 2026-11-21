@@ -1052,6 +1052,73 @@ fn role_missing(name: &str) -> EngineError {
     )
 }
 
+/// How the embedded engine introduces a relation the database does not hold, and the two
+/// spellings it introduces a column nothing declares with — the sentences read here, and
+/// nothing else of a statement or of its text.
+const ENGINE_UNDEFINED_TABLE: &str = "no such table: ";
+const ENGINE_UNDEFINED_COLUMN: &str = "no such column: ";
+const ENGINE_UNDEFINED_COLUMN_OF: &str = "table ";
+const ENGINE_UNDEFINED_COLUMN_OF_MIDDLE: &str = " has no column named ";
+
+/// `undefined_column`: the SQLSTATE PostgreSQL carries a column nothing declares under,
+/// from the condition names in its "Error Codes" appendix. The missing RELATION keeps the
+/// class its kind already carries ([`EngineErrorKind::UndefinedObject`]).
+const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
+
+/// The refusal `error`, worded as a PostgreSQL server words an object the statement names
+/// that the database does not hold.
+///
+/// The embedded engine says `no such table: <name>`, which is its own sentence; PostgreSQL's
+/// is `relation "<name>" does not exist`, and a column nothing declares is `column "<name>"
+/// does not exist` — the form a client's own parser reads the object out of, and the only
+/// form in which the SQLSTATE a client branches on and the sentence beside it agree. The
+/// name is the one the ENGINE named, taken from its diagnostic and from nowhere else. Every
+/// other refusal keeps the sentence it already had.
+#[must_use]
+pub fn as_postgres_words_it(wire: super::EngineWire, error: EngineError) -> EngineError {
+    if wire != super::EngineWire::Postgres {
+        return error;
+    }
+    if let Some(table) = error.message.strip_prefix(ENGINE_UNDEFINED_TABLE) {
+        return EngineError::new(
+            error.kind,
+            format!("relation \"{}\" does not exist", named_in(table)),
+        );
+    }
+    if let Some(column) = error.message.strip_prefix(ENGINE_UNDEFINED_COLUMN) {
+        return EngineError::new(
+            error.kind,
+            format!("column \"{}\" does not exist", named_in(column)),
+        )
+        .with_sqlstate(SQLSTATE_UNDEFINED_COLUMN);
+    }
+    if let Some((table, column)) = error
+        .message
+        .strip_prefix(ENGINE_UNDEFINED_COLUMN_OF)
+        .and_then(|rest| rest.split_once(ENGINE_UNDEFINED_COLUMN_OF_MIDDLE))
+    {
+        return EngineError::new(
+            error.kind,
+            format!(
+                "column \"{}\" of relation \"{}\" does not exist",
+                named_in(column),
+                named_in(table)
+            ),
+        )
+        .with_sqlstate(SQLSTATE_UNDEFINED_COLUMN);
+    }
+    error
+}
+
+/// The NAME the engine's diagnostic is about, read out of the text that follows its prefix:
+/// the engine appends a hint and the statement it was reading to some of its messages, where
+/// a server's own sentence carries the name alone.
+fn named_in(rest: &str) -> String {
+    let head = rest.split(" - ").next().unwrap_or(rest).trim();
+    let head = head.split_whitespace().next().unwrap_or(head);
+    head.trim_matches('"').to_string()
+}
+
 /// The role a role statement names: the first identifier after the object word that is not
 /// part of an `IF [NOT] EXISTS` clause, quoted or not. A role name is case-SENSITIVE when it
 /// is quoted and folded to lower case when it is not, exactly as PostgreSQL folds an

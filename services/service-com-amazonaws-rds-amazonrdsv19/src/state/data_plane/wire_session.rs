@@ -1913,6 +1913,11 @@ pub(super) fn run_statement_at(
         )
         .map_err(|error| {
             let error = server_statements::as_the_engine_words_it(facts.wire, &prepared, error);
+            // The sentence an error the ENGINE raised reaches the client in is the sentence
+            // the engine the client is talking to words that condition with: PostgreSQL's
+            // for a PostgreSQL session and MySQL's for a MySQL one, each naming the object
+            // the engine named.
+            let error = super::pg_server::as_postgres_words_it(facts.wire, error);
             let error = super::mysql_server::as_mysql_words_it(facts.wire, &target, error);
             super::constraint_names::as_the_engine_names_it(
                 database, facts, &target, &prepared, params, error,
@@ -2081,9 +2086,13 @@ fn take_the_rows_it_locks(
         });
     };
     let table = plan.table.to_ascii_lowercase();
+    // The row's key names the DATABASE too, lowercased as the table is: the engines resolve
+    // both names without regard to case, and the key has to be the same key every surface of
+    // this storage builds for that row.
+    let in_database = target.to_ascii_lowercase();
     let rows: Vec<row_locks::RowKey> = ids
         .into_iter()
-        .map(|rowid| (target.to_string(), table.clone(), rowid))
+        .map(|rowid| (in_database.clone(), table.clone(), rowid))
         .collect();
     let deadline = super::sql_engine::statement_deadline(&server_view(facts)).0;
     // Taking the rows is where a statement WAITS: the time spent here is the time the

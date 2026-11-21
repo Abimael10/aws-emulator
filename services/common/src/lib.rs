@@ -796,6 +796,13 @@ pub mod submitted_collections;
 /// The ONE list of SQL functions caller SQL may call, for every data plane that runs it on
 /// the in-process SQLite engine.
 pub mod sqlite_confinement;
+/// The ONE backing database each database of a DB cluster is held in, for every surface of
+/// that cluster — the engine endpoints its clients dial and the HTTP front door its Data API
+/// calls arrive at, which address one cluster and therefore one database.
+pub mod cluster_sql_volumes;
+/// The ROW LOCKS the transactions open on one database hold, for every surface that opens one
+/// on it.
+pub mod sql_row_locks;
 /// The ONE home for a service whose DATA plane is a SQL-wire database endpoint: the
 /// listener a client dials, the server half of the MySQL or PostgreSQL protocol, and the
 /// confined in-process SQL engine its statements run against.

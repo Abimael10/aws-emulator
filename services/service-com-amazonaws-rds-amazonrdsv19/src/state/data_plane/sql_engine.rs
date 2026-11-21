@@ -452,7 +452,25 @@ pub struct InstanceDatabase {
     /// [`super::session_transactions`].
     transactions: Arc<OpenTransactions>,
     /// The rows those transactions hold; see [`super::row_locks`].
-    locks: LockTable,
+    ///
+    /// The ONE table of the storage this engine serves: for a DB CLUSTER's volume it is the
+    /// cluster's own, shared with every other surface of that cluster, so a row a transaction
+    /// on one door holds is a row a transaction on another waits for.
+    locks: Arc<LockTable>,
+    /// The VOLUME this engine's databases are held in, for an engine that serves a DB
+    /// CLUSTER's storage ([`InstanceDatabase::open_on_volume`]).
+    ///
+    /// A DB cluster is ONE database behind SEVERAL doors: its engine endpoints, and — for an
+    /// Aurora cluster whose HTTP endpoint is on — the RDS Data API, whose `ExecuteStatement`
+    /// "runs a SQL statement against a database" of that same cluster. So each database of
+    /// such a cluster is held in one backing that every surface of the cluster opens a
+    /// connection onto ([`::service_common::cluster_sql_volumes`]), and a table a client
+    /// created through one door is a table a session on another selects.
+    ///
+    /// `None` for an engine whose databases are its own: a DB INSTANCE's engine, and every
+    /// COPY of a database (a snapshot's, a transaction's working set), which nothing else
+    /// addresses.
+    volume: Option<::service_common::cluster_sql_volumes::ClusterVolume>,
 }
 
 /// The databases one instance holds.
@@ -490,14 +508,39 @@ impl InstanceDatabase {
     /// the caller answers the create with a failure rather than publishing an endpoint
     /// nothing serves — and each database is opened empty when it is first named.
     pub fn open() -> Result<Self, EngineError> {
+        Self::open_on_volume(None)
+    }
+
+    /// The same, for an engine that serves the storage of a DB CLUSTER: its databases are
+    /// held in that cluster's own volume ([`InstanceDatabase::volume`]), so every surface of
+    /// the cluster — this endpoint, the cluster's other endpoints and its Data API HTTP
+    /// endpoint — reads and writes one database per name.
+    ///
+    /// `None` is [`Self::open`]: an engine whose databases are its own.
+    pub fn open_on_volume(
+        volume: Option<::service_common::cluster_sql_volumes::ClusterVolume>,
+    ) -> Result<Self, EngineError> {
         let view = Arc::new(Mutex::new(ServerView::default()));
         probe_the_engine_starts(&view)?;
         Ok(Self {
             databases: Mutex::new(Databases::default()),
             view,
             transactions: Arc::new(OpenTransactions::default()),
-            locks: LockTable::default(),
+            // The lock table of the storage: a cluster volume's own, which every surface of
+            // that cluster holds rows in, and a table of this engine's own where the storage
+            // is.
+            locks: volume.as_ref().map_or_else(
+                || Arc::new(LockTable::default()),
+                |volume| Arc::clone(volume.locks()),
+            ),
+            volume,
         })
+    }
+
+    /// The backing the database `name` of this engine is held in, and `None` for a database
+    /// of an engine whose storage is its own; see [`InstanceDatabase::volume`].
+    fn backing(&self, name: &str) -> Option<String> {
+        self.volume.as_ref().map(|volume| volume.backing(name))
     }
 
     /// The rows the transactions on this engine hold, which is what decides whether one
@@ -556,7 +599,12 @@ impl InstanceDatabase {
             if admit_another_database(&databases).is_err() {
                 return;
             }
-            match open_recorded_database(&self.view, &self.transactions, name) {
+            match open_recorded_database(
+                &self.view,
+                &self.transactions,
+                name,
+                self.backing(name).as_deref(),
+            ) {
                 Ok(conn) => {
                     databases.open.insert(name.clone(), conn);
                 }
@@ -662,6 +710,7 @@ impl InstanceDatabase {
             &mut databases,
             &self.view,
             &self.transactions,
+            self.volume.as_ref(),
             session,
             database,
         )?;
@@ -730,11 +779,18 @@ impl InstanceDatabase {
         let deadline = Instant::now() + COPY_DEADLINE;
         // The copy records the rows it changes against the transactions of this endpoint,
         // exactly as the shared database does: the rows the transaction writes in its own
-        // copy are the rows its commit carries over.
-        let mut copy = open_confined_database(&self.view)?;
+        // copy are the rows its commit carries over. PRIVATE: a session's working set is
+        // nobody else's to read, so it is never opened on the cluster's volume.
+        let mut copy = open_confined_database(&self.view, None)?;
         session_transactions::record_changes_of(&mut copy, &key, &self.transactions)
             .map_err(unavailable)?;
-        let conn = connection(databases, &self.view, &self.transactions, &key)?;
+        let conn = connection(
+            databases,
+            &self.view,
+            &self.transactions,
+            self.volume.as_ref(),
+            &key,
+        )?;
         let pages = copy_database(conn, &mut copy, deadline)?;
         // The SCHEMA the copy declares right now, which is what its commit carries its own
         // changes over against ([`session_transactions::apply_schema`]).
@@ -925,7 +981,13 @@ impl InstanceDatabase {
             }
             let empty = std::collections::BTreeSet::new();
             let rows = closed.changed.get(name).unwrap_or(&empty);
-            let live = connection(&mut databases, &self.view, &self.transactions, name)?;
+            let live = connection(
+                &mut databases,
+                &self.view,
+                &self.transactions,
+                self.volume.as_ref(),
+                name,
+            )?;
             carried = {
                 let mut unconfined = Unconfined::of(live);
                 let live = unconfined.connection();
@@ -1008,6 +1070,7 @@ impl InstanceDatabase {
             &mut databases,
             &self.view,
             &self.transactions,
+            self.volume.as_ref(),
             Some(session),
             database,
         )
@@ -1047,6 +1110,7 @@ impl InstanceDatabase {
             &mut databases,
             &self.view,
             &self.transactions,
+            self.volume.as_ref(),
             Some(session),
             database,
         )?;
@@ -1117,7 +1181,12 @@ impl InstanceDatabase {
         // instance that has already been handed a database must not seed another over it.
         destination.seeded = source.seeded;
         for (name, held) in &source.open {
-            let mut copy = open_recorded_database(&self.view, &self.transactions, name)?;
+            let mut copy = open_recorded_database(
+                &self.view,
+                &self.transactions,
+                name,
+                self.backing(name).as_deref(),
+            )?;
             let _pages = copy_database(held, &mut copy, deadline)?;
             destination.open.insert(name.clone(), copy);
         }
@@ -1155,7 +1224,12 @@ impl InstanceDatabase {
             return Ok(false);
         }
         admit_another_database(&databases)?;
-        let opened = open_recorded_database(&self.view, &self.transactions, name)?;
+        let opened = open_recorded_database(
+            &self.view,
+            &self.transactions,
+            name,
+            self.backing(name).as_deref(),
+        )?;
         databases.open.insert(name.to_string(), opened);
         Ok(true)
     }
@@ -1205,7 +1279,12 @@ impl InstanceDatabase {
             },
             None => {
                 admit_another_database(&databases)?;
-                let opened = open_recorded_database(&self.view, &self.transactions, name)?;
+                let opened = open_recorded_database(
+                    &self.view,
+                    &self.transactions,
+                    name,
+                    self.backing(name).as_deref(),
+                )?;
                 databases.open.entry(name.to_string()).or_insert(opened)
             }
         };
@@ -1267,12 +1346,15 @@ fn connection<'a>(
     databases: &'a mut Databases,
     view: &Arc<Mutex<ServerView>>,
     transactions: &Arc<OpenTransactions>,
+    volume: Option<&::service_common::cluster_sql_volumes::ClusterVolume>,
     name: &str,
 ) -> Result<&'a mut Connection, EngineError> {
     let key = resolve(&databases.open, name).unwrap_or_else(|| name.to_string());
     if !databases.open.contains_key(&key) {
         admit_another_database(databases)?;
-        let opened = open_recorded_database(view, transactions, &key)?;
+        let backing = volume.map(|volume| volume.backing(&key));
+        let opened =
+            open_recorded_database(view, transactions, &key, backing.as_deref())?;
         databases.open.insert(key.clone(), opened);
     }
     databases
@@ -1293,6 +1375,7 @@ fn connection_for<'a>(
     databases: &'a mut Databases,
     view: &Arc<Mutex<ServerView>>,
     transactions: &Arc<OpenTransactions>,
+    volume: Option<&::service_common::cluster_sql_volumes::ClusterVolume>,
     session: Option<u32>,
     name: &str,
 ) -> Result<&'a mut Connection, EngineError> {
@@ -1307,18 +1390,22 @@ fn connection_for<'a>(
                 });
         }
     }
-    connection(databases, view, transactions, &key)
+    connection(databases, view, transactions, volume, &key)
 }
 
 /// One database of the instance, with the rows its connection changes reported to
 /// `transactions` — which is what makes a session's `ROLLBACK` able to put its own rows
 /// back.
+/// `backing` is where its pages live: the backing of this database in the DB cluster's own
+/// volume for an engine that serves a cluster's storage ([`InstanceDatabase::volume`]), and
+/// `None` for a database of this engine's own.
 fn open_recorded_database(
     view: &Arc<Mutex<ServerView>>,
     transactions: &Arc<OpenTransactions>,
     name: &str,
+    backing: Option<&str>,
 ) -> Result<Connection, EngineError> {
-    let mut conn = open_confined_database(view)?;
+    let mut conn = open_confined_database(view, backing)?;
     session_transactions::record_changes_of(&mut conn, name, transactions).map_err(unavailable)?;
     Ok(conn)
 }
@@ -1327,7 +1414,7 @@ fn open_recorded_database(
 /// the bounds above and closed again, so a DB instance whose engine cannot run is refused
 /// at create time rather than publishing an endpoint nothing serves.
 fn probe_the_engine_starts(view: &Arc<Mutex<ServerView>>) -> Result<(), EngineError> {
-    drop(open_confined_database(view)?);
+    drop(open_confined_database(view, None)?);
     Ok(())
 }
 
@@ -1427,8 +1514,17 @@ impl Drop for Unconfined<'_> {
 /// One empty in-memory database, with every bound above in force — and with the server
 /// functions this endpoint defines registered on it ([`register_server_functions`]) —
 /// before any client statement can reach it.
-fn open_confined_database(view: &Arc<Mutex<ServerView>>) -> Result<Connection, EngineError> {
-    let mut conn = Connection::open_in_memory().map_err(unavailable)?;
+/// `backing` says WHERE its pages live, and nothing else: the backing of one database of a
+/// DB cluster's volume, which every surface of that cluster opens its own connection onto
+/// ([`::service_common::cluster_sql_volumes::open_backing`]), or `None` for a database of
+/// this engine's own. Either way the bounds, the confinement and the functions below are
+/// this connection's.
+fn open_confined_database(
+    view: &Arc<Mutex<ServerView>>,
+    backing: Option<&str>,
+) -> Result<Connection, EngineError> {
+    let mut conn =
+        ::service_common::cluster_sql_volumes::open_backing(backing).map_err(unavailable)?;
     // Temp database in memory FIRST, so naming `temp` below opens it in memory and
     // not as a host file; then the page ceiling on both schemas.
     conn.pragma_update(None, "temp_store", TEMP_STORE_MEMORY)

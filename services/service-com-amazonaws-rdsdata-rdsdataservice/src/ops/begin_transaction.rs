@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // transaction is opened on a cluster that serves the Data API, with credentials
         // that log in to it, or it is not opened at all — a returned transaction id for a
         // cluster AWS would have refused is a handle on nothing.
-        crate::state::preconditions::admit(
+        let admitted = crate::state::preconditions::admit(
             &*self.engine,
             ctx,
             &crate::state::preconditions::Call {
@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(refused)?;
         // Taking the transaction's snapshot is engine work, so it runs on the
         // blocking pool under one wall clock rather than on an async worker.
-        crate::state::in_data_plane(move || begin(&store, &input))
+        crate::state::in_data_plane(move || begin(&store, &input, &admitted))
             .await
             .map_err(request_failed)
     }
@@ -246,12 +246,18 @@ fn refused(refusal: crate::state::preconditions::Refusal) -> BeginTransactionErr
 }
 
 /// Open the transaction, inside the data plane.
+///
+/// `admitted` is what the precondition chain resolved about the addressed cluster, which the
+/// database this transaction is opened on follows: the engine the cluster runs and the
+/// volume its databases live in.
 fn begin(
     store: &crate::state::Store,
     input: &BeginTransactionInput,
+    admitted: &crate::state::preconditions::Admitted,
 ) -> Result<BeginTransactionOutput, crate::state::SqlError> {
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
+    cluster.resolved(admitted);
     cluster.expire_timed_out_transactions();
     // The id is stored with the cluster, secret, database and schema it was opened
     // for, together with the copy of the database the transaction writes into — a

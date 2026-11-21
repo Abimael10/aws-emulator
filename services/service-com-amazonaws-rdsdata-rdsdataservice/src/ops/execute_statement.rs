@@ -291,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine work is synchronous and CPU-bound, and it holds the state
         // lock, so it runs on the blocking pool under one wall clock rather than on
         // an async worker.
-        crate::state::in_data_plane(move || execute(&store, &input, admitted.engine))
+        crate::state::in_data_plane(move || execute(&store, &input, &admitted))
             .await
             .map_err(statement_failed)
     }
@@ -328,13 +328,14 @@ fn refused(refusal: crate::state::preconditions::Refusal) -> ExecuteStatementErr
 
 /// Run the statement and build the response, inside the data plane.
 ///
-/// `engine` is the engine the addressed cluster RUNS, as the precondition chain resolved it
-/// from the control plane that owns the cluster: what decides the words, the vendor error
-/// code and the SQLSTATE an error the database raises reaches the caller in.
+/// `admitted` is what the precondition chain resolved from the control plane that owns the
+/// cluster: the engine the cluster RUNS — what decides the words, the vendor error code and
+/// the SQLSTATE an error the database raises reaches the caller in — and the volume its
+/// databases live in, the storage every surface of that cluster addresses.
 fn execute(
     store: &crate::state::Store,
     input: &ExecuteStatementInput,
-    engine: crate::state::EngineFamily,
+    admitted: &crate::state::preconditions::Admitted,
 ) -> Result<ExecuteStatementOutput, crate::state::SqlError> {
     let parameters = input.parameters.clone().unwrap_or_default();
     // The faults of the request's own `parameters` are decided before the statement is
@@ -348,7 +349,7 @@ fn execute(
     let as_json = format_as_json(input.format_records_as.as_deref());
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
-    cluster.runs_engine(engine);
+    cluster.resolved(admitted);
     cluster.expire_timed_out_transactions();
 
     // ONE budget for this request: the deadline its statement runs under and the

@@ -284,6 +284,31 @@ pub(super) fn transaction_aborted() -> String {
     )
 }
 
+/// How PostgreSQL states that a statement could not have a row of `table` that another
+/// transaction holds: its own sentence for the condition, under the SQLSTATE of
+/// `lock_not_available`.
+pub(super) fn could_not_obtain_lock(table: &str) -> String {
+    postgresql_error(
+        &format!("could not obtain lock on row in relation \"{table}\""),
+        SQLSTATE_LOCK_NOT_AVAILABLE,
+    )
+}
+
+/// And how it states the one transaction of a waiting CYCLE the server breaks:
+/// "deadlock detected", under the SQLSTATE of `deadlock_detected`.
+pub(super) fn deadlock_detected() -> String {
+    postgresql_error("deadlock detected", SQLSTATE_DEADLOCK_DETECTED)
+}
+
+/// And how it states a statement whose WAIT for such a row ran out: PostgreSQL's own
+/// sentence for the cancellation, under the same `lock_not_available` SQLSTATE.
+pub(super) fn lock_timeout() -> String {
+    postgresql_error(
+        "canceling statement due to lock timeout",
+        SQLSTATE_LOCK_NOT_AVAILABLE,
+    )
+}
+
 /// How PostgreSQL states a statement it cannot parse: "syntax error at or near" the token
 /// it stopped on, the POSITION of that token in the statement, and the SQLSTATE of a
 /// syntax error.
@@ -373,6 +398,11 @@ const SQLSTATE_INVALID_CATALOG_NAME: &str = "3D000";
 /// And the one a value of the wrong type for its column is refused under (class 42,
 /// datatype mismatch).
 const SQLSTATE_DATATYPE_MISMATCH: &str = "42804";
+/// And the two a row another transaction HOLDS carries: `lock_not_available` for a row a
+/// statement could not have, and `deadlock_detected` for the one transaction of a waiting
+/// cycle the server breaks.
+const SQLSTATE_LOCK_NOT_AVAILABLE: &str = "55P03";
+const SQLSTATE_DEADLOCK_DETECTED: &str = "40P01";
 /// And the one text that is no value of the type it was written as is refused under
 /// (class 22, invalid textual representation).
 const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";

@@ -701,9 +701,29 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
         .listeners();
     let database = match storage {
         Some(shared) => shared,
-        None => Arc::new(sql_engine::InstanceDatabase::open().map_err(|error| {
-            format!("the SQL engine could not be started: {}", error.message)
-        })?),
+        None => {
+            // WHERE this endpoint's databases live. A DB CLUSTER's are held in the
+            // cluster's own VOLUME — the storage every surface of that cluster addresses,
+            // its Data API HTTP endpoint among them
+            // (`service_common::cluster_sql_volumes`) — so a table a client created
+            // through one door is a table a session here selects, and the other way round.
+            // A DB instance's engine and a DB proxy's endpoint serve storage of their own:
+            // a proxy is handed the database its target group holds, and an instance runs
+            // its own engine.
+            let volume = match &target {
+                wire_session::SessionTarget::DbCluster { resource_id, .. } => {
+                    ::service_common::cluster_sql_volumes::ClusterVolumes::of(engine)
+                        .map(|volumes| volumes.cluster(resource_id))
+                }
+                wire_session::SessionTarget::DbInstance { .. }
+                | wire_session::SessionTarget::DbProxy { .. } => None,
+            };
+            Arc::new(
+                sql_engine::InstanceDatabase::open_on_volume(volume).map_err(|error| {
+                    format!("the SQL engine could not be started: {}", error.message)
+                })?,
+            )
+        }
     };
     let (generation, generation_rx) = watch::channel(0u64);
     let sessions = pg_sessions::SessionRegistry::default();

@@ -34,6 +34,10 @@ const ER_DUP_KEY: u16 = 1022;
 const ER_BAD_NULL_ERROR: u16 = 1048;
 const ER_NO_SUCH_TABLE: u16 = 1146;
 const ER_BAD_FIELD_ERROR: u16 = 1054;
+/// ... and the two a row another transaction holds raises: the wait for it ran out, and
+/// waiting for it would have closed a cycle.
+const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
+const ER_LOCK_DEADLOCK: u16 = 1213;
 
 /// And their SQLSTATEs, as MySQL's own reference lists them for each error number:
 /// class 23 for an integrity-constraint violation, `42S02` for a base table that is not
@@ -41,6 +45,30 @@ const ER_BAD_FIELD_ERROR: u16 = 1054;
 const SQLSTATE_INTEGRITY_CONSTRAINT: &str = "23000";
 const SQLSTATE_BASE_TABLE_NOT_FOUND: &str = "42S02";
 const SQLSTATE_COLUMN_NOT_FOUND: &str = "42S22";
+/// And the two the lock conditions carry: `HY000` for the wait that ran out and `40001`
+/// (serialization failure) for the deadlock the server broke.
+const SQLSTATE_GENERAL_ERROR: &str = "HY000";
+const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
+
+/// What a MySQL server tells a client whose statement waited for a row another transaction
+/// holds until its wait ran out: `ER_LOCK_WAIT_TIMEOUT`'s own sentence.
+pub(super) fn lock_wait_timeout() -> String {
+    mysql_error(
+        "Lock wait timeout exceeded; try restarting transaction",
+        ER_LOCK_WAIT_TIMEOUT,
+        SQLSTATE_GENERAL_ERROR,
+    )
+}
+
+/// What it tells the one transaction of a waiting CYCLE it breaks: `ER_LOCK_DEADLOCK`'s own
+/// sentence.
+pub(super) fn deadlock_detected() -> String {
+    mysql_error(
+        "Deadlock found when trying to get lock; try restarting transaction",
+        ER_LOCK_DEADLOCK,
+        SQLSTATE_SERIALIZATION_FAILURE,
+    )
+}
 
 /// What MySQL calls the index that enforces a table's PRIMARY KEY: every table has at most
 /// one, and it is named `PRIMARY` whatever its columns are called.

@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // commit is a call on the cluster too, so it is refused for a cluster that does
         // not serve the Data API and for credentials that do not log in to it. This
         // operation carries no statement and selects no database.
-        crate::state::preconditions::admit(
+        let admitted = crate::state::preconditions::admit(
             &*self.engine,
             ctx,
             &crate::state::preconditions::Call {
@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(refused)?;
         // Installing the transaction's database is engine-owned state under the
         // service lock, so it runs on the blocking pool under one wall clock.
-        crate::state::in_data_plane(move || commit(&store, &input))
+        crate::state::in_data_plane(move || commit(&store, &input, &admitted))
             .await
             .map_err(request_failed)
     }
@@ -239,12 +239,18 @@ fn refused(refusal: crate::state::preconditions::Refusal) -> CommitTransactionEr
 }
 
 /// Apply the transaction's writes, inside the data plane.
+///
+/// `admitted` is what the precondition chain resolved about the addressed cluster, which the
+/// database the writes are installed into follows: the engine the cluster runs and the
+/// volume its databases live in.
 fn commit(
     store: &crate::state::Store,
     input: &CommitTransactionInput,
+    admitted: &crate::state::preconditions::Admitted,
 ) -> Result<CommitTransactionOutput, crate::state::SqlError> {
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
+    cluster.resolved(admitted);
     cluster.expire_timed_out_transactions();
     // The name the transaction's writes belong to, and the database ready to take them — the
     // one preparation every installation of a transaction's writes makes
@@ -284,7 +290,9 @@ fn commit(
     }
     // Applying the transaction's writes: the database it wrote into becomes the
     // cluster's committed database for that name, which is what makes those writes
-    // visible to a later non-transactional statement.
+    // visible to a later non-transactional statement — and, for a database held in the
+    // cluster's own volume, to a session on any other endpoint of that cluster
+    // (`Cluster::install_committed`).
     //
     // ISOLATION, stated here because it is observable: the database being installed was
     // rebuilt from what is committed NOW with this transaction's own writes replayed
@@ -295,7 +303,7 @@ fn commit(
     // `two_transactions_on_one_database_both_keep_their_writes` in
     // `tests/all/read_committed_transactions.rs` pins the semantics rather than leaving
     // them to this comment.
-    cluster.databases.insert(database, pending);
+    cluster.install_committed(&database, pending)?;
     Ok(CommitTransactionOutput {
         transaction_status: Some(crate::state::TRANSACTION_COMMITTED_STATUS.to_string()),
     })
