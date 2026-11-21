@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The AS2 agreement lifecycle: `CreateAgreement` mints and persists, `DescribeAgreement`
-//! reports what was persisted.
+//! reports what was persisted, and `ListAgreements` reports a server's stored agreements.
 //!
 //! RULE: `CreateAgreement` resolves the server and the two AS2 profiles the agreement
 //! combines, mints a fresh system-assigned `AgreementId` of the modelled shape for EVERY
@@ -11,16 +11,24 @@
 //! answers that record unchanged, and a `(ServerId, AgreementId)` pair the store does not
 //! hold is answered with the modelled not-found error rather than an agreement.
 //!
+//! RULE (the listing): `ListAgreements` reports the agreements the store holds for the
+//! server the request names — and only those — each projected into the member set
+//! `ListedAgreement` declares, in `AgreementId` order, bounded by `MaxResults` with a
+//! `NextToken` handed back only while further records remain; a `ServerId` the store
+//! holds no server for is refused as not found, a token the service never issued with
+//! `InvalidNextTokenException`, and nothing a later caller sees is changed by a listing.
+//!
 //! The rows differ along what the rule generalises over: whether each optional member is
 //! sent at all, each enum member's whole modelled value set, the form and the length of
 //! `BaseDirectory` (including both published bounds), `CustomDirectories` as the
-//! alternative to it, and the COUNT of `Tags`.
+//! alternative to it, the COUNT of `Tags`, how many agreements a server holds, which
+//! server is addressed, and the page bound.
 
 use serde_json::{json, Value};
 
 use crate::harness::{
-    assert_members, custom_directories, is_modelled_agreement_id, member_of, Emulator, ACCOUNT,
-    REGION, ROLE,
+    assert_members, custom_directories, drain_pages, is_modelled_agreement_id, member_of, Emulator,
+    ACCOUNT, REGION, ROLE, UNMINTED_SERVER_ID,
 };
 
 /// `AgreementStatusType`'s whole modelled value set
@@ -1041,4 +1049,436 @@ async fn the_agreement_store_is_bounded_per_server_and_in_total() {
         "case \"one release below the total bound\": expected 200, got {} with body {}",
         answer.status, answer.body
     );
+}
+
+/// The `ListedAgreement` the record `case` created projects to.
+///
+/// `ListedAgreement` declares `Arn`, `AgreementId`, `Description`, `Status`, `ServerId`,
+/// `LocalProfileId` and `PartnerProfileId`
+/// (`smithy_query(query="shape",shape="ListedAgreement")`), so every other member of the
+/// stored record is expected ABSENT from a listed item: a listing is the projection of
+/// the record, not the whole record `DescribeAgreement` reports. `Description` is absent
+/// for an agreement created without one, as that reader reports it too.
+fn expected_listed(case: &Case, partnership: &Partnership, agreement_id: &str) -> Value {
+    json!({
+        "Arn": format!(
+            "arn:aws:transfer:{REGION}:{ACCOUNT}:agreement/{}/{agreement_id}",
+            partnership.server_id
+        ),
+        "AgreementId": agreement_id,
+        "Description": match &case.description {
+            Some(description) => json!(description),
+            None => Value::Null,
+        },
+        "Status": case.status.unwrap_or(DEFAULT_STATUS),
+        "ServerId": &partnership.server_id,
+        "LocalProfileId": &partnership.local_profile,
+        "PartnerProfileId": &partnership.partner_profile,
+        "BaseDirectory": Value::Null,
+        "CustomDirectories": Value::Null,
+        "AccessRole": Value::Null,
+        "PreserveFilename": Value::Null,
+        "EnforceMessageSigning": Value::Null,
+        "Tags": Value::Null,
+    })
+}
+
+/// `ListAgreements` for one server, asserted to have been served, with the `Agreements`
+/// list and the `NextToken` it reported.
+async fn list_agreements(emulator: &Emulator, case: &str, request: Value) -> (Vec<Value>, Value) {
+    let answer = emulator.call("ListAgreements", request).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected ListAgreements 200, got {} with body {}",
+        answer.status, answer.body
+    );
+    let agreements = answer
+        .get("Agreements")
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected an Agreements list, got {}",
+                answer.body
+            )
+        });
+    (agreements, answer.get("NextToken").clone())
+}
+
+/// The `AgreementId` of one listed item.
+fn listed_id(item: &Value) -> String {
+    member_of(item, "AgreementId")
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Create every row of [`cases`] on `partnership`'s server, in table order.
+async fn create_table(emulator: &Emulator, partnership: &Partnership) -> Vec<(Case, String)> {
+    let mut created = Vec::new();
+    for case in cases() {
+        let agreement_id = create_agreement(emulator, partnership, &case).await;
+        created.push((case, agreement_id));
+    }
+    created
+}
+
+/// RULE (the listing): every agreement a create persisted on a server is reported by
+/// `ListAgreements` exactly once, projected into `ListedAgreement`'s member set, in
+/// `AgreementId` order — and the same record reads back member by member through
+/// `DescribeAgreement`.
+///
+/// The rows are [`cases`]: an absent and a present `Description`, every
+/// `AgreementStatusType` value plus the default, and either directory configuration —
+/// none of which a listed item reports beyond the projection.
+#[tokio::test]
+async fn list_agreements_reports_every_stored_agreement_of_the_server_it_names() {
+    let emulator = Emulator::new();
+    let partnership = Partnership::create(&emulator).await;
+    let created = create_table(&emulator, &partnership).await;
+
+    let (listed, next_token) = list_agreements(
+        &emulator,
+        "every created agreement",
+        json!({"ServerId": &partnership.server_id}),
+    )
+    .await;
+    assert_eq!(
+        listed.len(),
+        created.len(),
+        "case \"every created agreement\": expected {} agreements, got {listed:?}",
+        created.len()
+    );
+    assert!(
+        next_token.is_null(),
+        "case \"every created agreement\": expected no NextToken on a complete listing, got \
+         {next_token:?}"
+    );
+
+    // `AgreementId` order: the listing is resumable, so it is ordered by the key a
+    // `NextToken` names.
+    let mut want_ids: Vec<String> = created.iter().map(|(_, id)| id.clone()).collect();
+    want_ids.sort();
+    let got_ids: Vec<String> = listed.iter().map(listed_id).collect();
+    assert_eq!(
+        got_ids, want_ids,
+        "case \"every created agreement\": expected every id once in AgreementId order, got \
+         {got_ids:?}"
+    );
+
+    for (case, agreement_id) in &created {
+        let found = listed
+            .iter()
+            .find(|item| listed_id(item) == *agreement_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: expected {agreement_id} listed in {listed:?}",
+                    case.name
+                )
+            });
+        assert_members(
+            case.name,
+            found,
+            &expected_listed(case, &partnership, agreement_id),
+        );
+
+        // Round trip: the listed projection and the full read answer the same record.
+        let described = describe(&emulator, &partnership.server_id, agreement_id).await;
+        assert_eq!(
+            described.status, 200,
+            "case {:?}: expected DescribeAgreement 200, got {} with body {}",
+            case.name, described.status, described.body
+        );
+        let agreement = described.get("Agreement");
+        for member in [
+            "Arn",
+            "AgreementId",
+            "Description",
+            "Status",
+            "ServerId",
+            "LocalProfileId",
+            "PartnerProfileId",
+        ] {
+            assert_eq!(
+                member_of(found, member),
+                member_of(agreement, member),
+                "case {:?}: expected the listed {member} to be the described one, got {} and {}",
+                case.name,
+                member_of(found, member),
+                member_of(agreement, member)
+            );
+        }
+    }
+}
+
+/// RULE (the listing is scoped to one server): a listing reports the agreements of the
+/// `ServerId` it names and no other's; a server holding none reports the empty list; and
+/// a `ServerId` the store holds no server for — never created, or deleted since — is
+/// refused with the modelled not-found rather than an empty listing.
+#[tokio::test]
+async fn list_agreements_reports_only_the_named_servers_agreements() {
+    let emulator = Emulator::new();
+    let first = Partnership::create(&emulator).await;
+    let second = Partnership::create(&emulator).await;
+    let empty_server = emulator.create_server(json!({})).await;
+
+    // Rows: a server holding several agreements, a server holding exactly one, and a
+    // server holding none.
+    let mut first_ids: Vec<String> = Vec::new();
+    for name in [PLAIN_CASE, CUSTOM_DIRECTORIES_CASE, "three tags, order preserved"] {
+        let case = case_named(name);
+        first_ids.push(create_agreement(&emulator, &first, &case).await);
+    }
+    first_ids.sort();
+    let second_id = create_agreement(&emulator, &second, &case_named(PLAIN_CASE)).await;
+
+    for (case, server_id, want) in [
+        ("the server holding three", &first.server_id, first_ids.clone()),
+        ("the server holding one", &second.server_id, vec![second_id.clone()]),
+        ("a server holding none", &empty_server, Vec::new()),
+    ] {
+        let (listed, next_token) =
+            list_agreements(&emulator, case, json!({"ServerId": server_id})).await;
+        let got: Vec<String> = listed.iter().map(listed_id).collect();
+        assert_eq!(
+            got, want,
+            "case {case:?}: expected exactly that server's ids, got {got:?}"
+        );
+        assert!(
+            next_token.is_null(),
+            "case {case:?}: expected no NextToken on a complete listing, got {next_token:?}"
+        );
+        for item in &listed {
+            assert_eq!(
+                member_of(item, "ServerId").as_str(),
+                Some(server_id.as_str()),
+                "case {case:?}: expected every item to name the server listed, got {item}"
+            );
+        }
+    }
+
+    // Rows: a `ServerId` of the modelled shape that was never minted, and one whose
+    // server was deleted — which takes its agreements with it, so the listing is refused
+    // for the server rather than answered as a server that holds none.
+    let deleted = emulator
+        .call("DeleteServer", json!({"ServerId": &second.server_id}))
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "expected DeleteServer 200, got {} with body {}",
+        deleted.status, deleted.body
+    );
+    for (case, server_id) in [
+        ("a server never created", UNMINTED_SERVER_ID.to_string()),
+        ("a server deleted since", second.server_id.clone()),
+    ] {
+        let answer = emulator
+            .call("ListAgreements", json!({"ServerId": &server_id}))
+            .await;
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {} with body {}",
+            answer.status,
+            answer.body
+        );
+        assert!(
+            answer.body.get("Agreements").is_none(),
+            "case {case:?}: a refused listing must report no agreements, got {}",
+            answer.body
+        );
+    }
+
+    // The other server's agreements are untouched by the delete beside them.
+    let (listed, _) = list_agreements(
+        &emulator,
+        "after another server was deleted",
+        json!({"ServerId": &first.server_id}),
+    )
+    .await;
+    let got: Vec<String> = listed.iter().map(listed_id).collect();
+    assert_eq!(
+        got, first_ids,
+        "case \"after another server was deleted\": expected the surviving server's ids, got \
+         {got:?}"
+    );
+}
+
+/// RULE (paging): a page carries at most `MaxResults` agreements and a `NextToken` ONLY
+/// while further ones remain, resuming from that token walks the server's agreements
+/// exactly once in `AgreementId` order, a token the service never issued is refused with
+/// `InvalidNextTokenException` (400), and a `MaxResults` outside the modelled
+/// `range 1..1000` is refused at the boundary while both bounds themselves are accepted.
+#[tokio::test]
+async fn list_agreements_honours_every_page_bound_and_resumes_from_its_token() {
+    let emulator = Emulator::new();
+    let partnership = Partnership::create(&emulator).await;
+    let created = create_table(&emulator, &partnership).await;
+    let mut want: Vec<String> = created.iter().map(|(_, id)| id.clone()).collect();
+    want.sort();
+    let stored = want.len();
+    let base = json!({"ServerId": &partnership.server_id});
+
+    // Rows: page sizes below, exactly at and above the stored count (so the exact-fit
+    // page must NOT hand back a token), both published bounds of the modelled
+    // `range 1..1000`, and no bound at all.
+    let bounds: Vec<Option<i64>> = vec![
+        Some(1),
+        Some(2),
+        Some(5),
+        Some(i64::try_from(stored - 1).expect("the table is small")),
+        Some(i64::try_from(stored).expect("the table is small")),
+        Some(i64::try_from(stored + 1).expect("the table is small")),
+        Some(1000),
+        None,
+    ];
+    for limit in bounds {
+        let case = format!("MaxResults={limit:?}");
+        let (page_sizes, ids) =
+            drain_pages(&emulator, "ListAgreements", &base, "Agreements", "AgreementId", limit)
+                .await;
+        assert_eq!(
+            ids, want,
+            "case {case:?}: expected every id once in AgreementId order, got {ids:?}"
+        );
+        match limit {
+            Some(limit) => {
+                let limit = usize::try_from(limit).expect("a positive page bound");
+                for size in &page_sizes {
+                    assert!(
+                        *size <= limit,
+                        "case {case:?}: a page carried {size} agreements, above the bound {limit}"
+                    );
+                }
+                let want_pages = stored.div_ceil(limit).max(1);
+                assert_eq!(
+                    page_sizes.len(),
+                    want_pages,
+                    "case {case:?}: expected {want_pages} page(s), got {page_sizes:?}"
+                );
+            }
+            None => assert_eq!(
+                page_sizes,
+                vec![stored],
+                "case {case:?}: expected a single unbounded page, got {page_sizes:?}"
+            ),
+        }
+    }
+
+    // Rows: a token that is not the codec's hex at all, one with an odd number of hex
+    // digits, one that is hex of bytes that are not UTF-8, and one at `NextToken`'s
+    // modelled minimum length (`len 1..6144`).
+    for token in ["not-a-token", "abc", "ff", "+"] {
+        let answer = emulator
+            .call(
+                "ListAgreements",
+                json!({"ServerId": &partnership.server_id, "NextToken": token}),
+            )
+            .await;
+        assert_eq!(
+            (answer.status, answer.error_code().as_str()),
+            (400, "InvalidNextTokenException"),
+            "case {token:?}: expected 400 InvalidNextTokenException, got {} with body {}",
+            answer.status,
+            answer.body
+        );
+    }
+
+    // The named server is resolved FIRST: the same unissued token on a server that does
+    // not exist is a not-found, not an invalid-token.
+    let answer = emulator
+        .call(
+            "ListAgreements",
+            json!({"ServerId": UNMINTED_SERVER_ID, "NextToken": "not-a-token"}),
+        )
+        .await;
+    assert_eq!(
+        answer.error_code(),
+        "ResourceNotFoundException",
+        "case \"an unissued token on a server never created\": expected the unknown server to \
+         be refused first, got {}",
+        answer.body
+    );
+
+    // One PAST each published bound of `MaxResults`' modelled range 1..1000, then both
+    // bounds themselves.
+    for bad in [0, 1001] {
+        let answer = emulator
+            .call(
+                "ListAgreements",
+                json!({"ServerId": &partnership.server_id, "MaxResults": bad}),
+            )
+            .await;
+        assert_eq!(
+            answer.status, 400,
+            "case \"MaxResults={bad}\": expected HTTP 400, got {} with body {}",
+            answer.status, answer.body
+        );
+    }
+    for good in [1, 1000] {
+        let answer = emulator
+            .call(
+                "ListAgreements",
+                json!({"ServerId": &partnership.server_id, "MaxResults": good}),
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case \"MaxResults={good}\": expected HTTP 200, got {} with body {}",
+            answer.status, answer.body
+        );
+    }
+}
+
+/// RULE (a listing reports, it does not change): paging through a server's agreements
+/// consumes nothing — the same listing answers the same body afterwards, every record is
+/// still readable member by member, and the store still holds exactly what the creates
+/// wrote.
+#[tokio::test]
+async fn list_agreements_leaves_the_store_unchanged() {
+    let emulator = Emulator::new();
+    let partnership = Partnership::create(&emulator).await;
+    let created = create_table(&emulator, &partnership).await;
+    let base = json!({"ServerId": &partnership.server_id});
+
+    let first = emulator.call("ListAgreements", base.clone()).await;
+    // Rows: the unbounded listing, then the whole set walked one agreement at a time.
+    let (_, paged) = drain_pages(
+        &emulator,
+        "ListAgreements",
+        &base,
+        "Agreements",
+        "AgreementId",
+        Some(1),
+    )
+    .await;
+    let mut want: Vec<String> = created.iter().map(|(_, id)| id.clone()).collect();
+    want.sort();
+    assert_eq!(
+        paged, want,
+        "case \"paged walk\": expected every id once, got {paged:?}"
+    );
+
+    let again = emulator.call("ListAgreements", base).await;
+    assert_eq!(
+        again.body, first.body,
+        "case \"re-read after paging\": expected the same listing as {}, got {}",
+        first.body, again.body
+    );
+    assert_eq!(
+        emulator.store().lock().agreements.len(),
+        created.len(),
+        "case \"re-read after paging\": expected the store to still hold {} agreements, got {}",
+        created.len(),
+        emulator.store().lock().agreements.len()
+    );
+
+    for (case, agreement_id) in &created {
+        let described = describe(&emulator, &partnership.server_id, agreement_id).await;
+        assert_eq!(
+            described.status, 200,
+            "case {:?}: expected the agreement still readable, got {} with body {}",
+            case.name, described.status, described.body
+        );
+    }
 }
