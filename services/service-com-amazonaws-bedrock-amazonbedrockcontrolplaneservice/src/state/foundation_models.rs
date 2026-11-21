@@ -828,6 +828,12 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         BATCH_ONLY,
         "2024-12-06T00:00:00Z",
     ),
+    // The Llama 3 generation is offered ON DEMAND ONLY: AWS sells no reserved capacity for
+    // either of its models, so neither backs a Provisioned Throughput — a purchase over one
+    // is refused as a model no such throughput is offered over
+    // ([`supports_provisioned_throughput`]) rather than classified against the account's
+    // model units. The Llama 3.1 and 3.3 rows above are the Meta rows AWS does sell reserved
+    // capacity for, and they carry it.
     FoundationModel {
         model_id: "meta.llama3-70b-instruct-v1:0",
         model_name: "Llama 3 70B Instruct",
@@ -837,13 +843,13 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
         customizations_supported: NO_CUSTOMIZATION,
-        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        inference_types_supported: ON_DEMAND,
         features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2024-04-18T00:00:00Z",
         legacy_window: None,
     },
-    also_provisioned(text_model(
+    text_model(
         "meta.llama3-8b-instruct-v1:0",
         "Llama 3 8B Instruct",
         "Meta",
@@ -851,7 +857,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         IN_TEXT,
         BATCH_ONLY,
         "2024-04-18T00:00:00Z",
-    )),
+    ),
     text_model(
         "meta.llama4-maverick-17b-instruct-v1:0",
         "Llama 4 Maverick",

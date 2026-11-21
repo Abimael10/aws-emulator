@@ -57,7 +57,7 @@ const TAG_PUNCTUATION: &str = " ._:/=+@-";
 /// A base model this account's catalog offers WITH Provisioned Throughput
 /// (`service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::FOUNDATION_MODELS`,
 /// which `ListFoundationModels` reports).
-const PROVISIONABLE_MODEL: &str = "meta.llama3-70b-instruct-v1:0";
+const PROVISIONABLE_MODEL: &str = "meta.llama3-1-70b-instruct-v1:0";
 
 /// A `RoleArn` the model admits (pattern `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`).
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/bedrock-tagging";

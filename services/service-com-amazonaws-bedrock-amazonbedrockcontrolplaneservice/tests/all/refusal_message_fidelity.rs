@@ -304,7 +304,7 @@ async fn a_stale_concurrency_token_on_a_policy_test_is_refused_in_the_services_o
 /// commitment (the quota a no-commitment create draws on is not granted):
 /// `service_...::state::FOUNDATION_MODELS` carries `PROVISIONED` for it, and
 /// `CommitmentDuration` is `[OneMonth, SixMonths]`.
-const PROVISIONABLE_MODEL: &str = "meta.llama3-70b-instruct-v1:0";
+const PROVISIONABLE_MODEL: &str = "meta.llama3-1-70b-instruct-v1:0";
 const COMMITMENT: &str = "OneMonth";
 
 /// The `ProvisionedModelArn` of `resource`:

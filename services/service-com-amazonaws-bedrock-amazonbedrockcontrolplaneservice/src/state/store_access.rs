@@ -588,25 +588,32 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         }
     }
 
-    /// The runs the evaluation jobs of `region` still owe, taken ONCE
-    /// ([`EvaluationJobRecord::due_run`]) and at most
+    /// The runs the evaluation jobs of `region` owe that the clock has already left behind,
+    /// taken ONCE ([`EvaluationJobRecord::overdue_run`]) and at most
     /// [`evaluation_run::MAX_RUNS_PER_REQUEST`] of them per call.
     ///
     /// A listing reports the status every job it carries holds, and a terminal status is the
-    /// status the job's RUN ended in — so a listing takes the runs its jobs are owed exactly
-    /// as a read of one job takes that job's, and the two cannot report different statuses
-    /// for one job. Jobs of another region are another account-region's resources and are
-    /// not listed, so their runs are not taken here either.
+    /// status the job's RUN ended in — so a listing takes the runs its jobs are still owed
+    /// exactly as a read of one job takes that job's, and the two cannot report different
+    /// statuses for one job. The run of an accepted job belongs to the create that accepted
+    /// it ([`evaluation_run::run_when_accepted`]), so what is taken here is only a run that
+    /// established nothing and gave itself back. Jobs of another region are another
+    /// account-region's resources and are not listed, so their runs are not taken here
+    /// either.
     ///
     /// The number taken per call is BOUNDED, for the reason
     /// [`Self::due_model_invocation_runs`] bounds its own: a job whose run this call does not
     /// take still owes it, so a later call takes it — and the iteration is lazy, so a run
     /// that is not taken is not marked as taken either.
-    pub fn due_evaluation_runs(&mut self, region: &str) -> Vec<evaluation_run::DueRun> {
+    pub fn overdue_evaluation_runs(
+        &mut self,
+        region: &str,
+        now: SystemTime,
+    ) -> Vec<evaluation_run::DueRun> {
         self.evaluation_jobs
             .values_mut()
             .filter(|record| record.region == region)
-            .filter_map(EvaluationJobRecord::due_run)
+            .filter_map(|record| record.overdue_run(now))
             .take(evaluation_run::MAX_RUNS_PER_REQUEST)
             .collect()
     }

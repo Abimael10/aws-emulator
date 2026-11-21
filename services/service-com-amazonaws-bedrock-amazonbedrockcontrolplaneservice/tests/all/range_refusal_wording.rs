@@ -264,7 +264,7 @@ async fn a_range_violation_states_the_member_and_the_bound_with_the_subject_its_
             path: "/provisioned-model-throughput".to_string(),
             body: Some(json!({
                 "provisionedModelName": "rangewording",
-                "modelId": "meta.llama3-70b-instruct-v1:0",
+                "modelId": "meta.llama3-1-70b-instruct-v1:0",
                 "modelUnits": MODEL_UNITS_MIN - 1,
             })),
             member: "modelUnits",
@@ -277,7 +277,7 @@ async fn a_range_violation_states_the_member_and_the_bound_with_the_subject_its_
             path: "/provisioned-model-throughput".to_string(),
             body: Some(json!({
                 "provisionedModelName": "rangewording",
-                "modelId": "meta.llama3-70b-instruct-v1:0",
+                "modelId": "meta.llama3-1-70b-instruct-v1:0",
                 "modelUnits": -4096,
             })),
             member: "modelUnits",
@@ -355,7 +355,7 @@ async fn each_published_bound_of_a_range_is_accepted() {
             "/provisioned-model-throughput".to_string(),
             Some(json!({
                 "provisionedModelName": "boundwording",
-                "modelId": "meta.llama3-70b-instruct-v1:0",
+                "modelId": "meta.llama3-1-70b-instruct-v1:0",
                 // A commitment, so the create is answered on its own terms rather than by
                 // the no-commitment capacity quota: what this row pins is that the value
                 // AT the bound is not refused for its range.

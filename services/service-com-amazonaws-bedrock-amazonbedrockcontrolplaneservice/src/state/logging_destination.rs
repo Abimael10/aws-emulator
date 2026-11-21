@@ -239,7 +239,7 @@ async fn bucket_region(
     region: &str,
     bucket: &str,
 ) -> Option<String> {
-    match s3_client(ctx, region)
+    match s3_client(ctx.callback(), region)
         .get_bucket_location()
         .bucket(bucket)
         .send()

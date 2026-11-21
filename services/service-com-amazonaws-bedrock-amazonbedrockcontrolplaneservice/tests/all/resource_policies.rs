@@ -148,7 +148,7 @@ pub(crate) async fn provisioned_model_arn(emu: &Emulator, name: &str) -> String 
             "/provisioned-model-throughput",
             Some(json!({
                 "provisionedModelName": name,
-                "modelId": "meta.llama3-70b-instruct-v1:0",
+                "modelId": "meta.llama3-1-70b-instruct-v1:0",
                 "modelUnits": 1,
                 "commitmentDuration": "OneMonth",
             })),

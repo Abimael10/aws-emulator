@@ -8,10 +8,12 @@
 //! `EvaluationSummary` apiece, filtered by the members the request carried and paged with
 //! the cursor every paginated listing of this service pages with. A reporting operation: the
 //! only writes it makes are the ones the CLOCK had already made due — each job's status
-//! transition, and the RUN the create made due
-//! ([`crate::state::evaluation_run::run_evaluation`]) — so the status this listing reports
+//! transition, and a RUN its own create left established nothing of
+//! ([`crate::state::EvaluationJobRecord::overdue_run`]) — so the status this listing reports
 //! for a job is the status a read of that one job reports at the same instant, and a job it
-//! reports in a terminal status has its results under its output prefix.
+//! reports in a terminal status has its results under its output prefix. The run of an
+//! accepted job itself belongs to the create that accepted it
+//! ([`crate::state::evaluation_run::run_when_accepted`]).
 //!
 //! ## Shape of an operation
 //!
@@ -236,21 +238,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The status each job holds NOW is what this listing reports and what `statusEquals`
         // filters on, so the transitions the clock has already made due are materialised
-        // before either happens — and with them the work the create made due: a job carried
-        // into a terminal status has evaluated the records of its datasets and saved the
-        // results under its output prefix
-        // (`crate::state::evaluation_run::run_evaluation`). The runs are collected while the
-        // store is locked and performed after the guard is dropped, so no lock is held across
-        // the in-process calls they make, and each is taken ONCE per job, so a listing reports
-        // what the run established without changing it.
+        // before either happens. The RUN of an accepted job belongs to the create that
+        // accepted it (`crate::state::evaluation_run::run_when_accepted`), so what a listing
+        // takes is only a run that established nothing and gave itself back, and only once
+        // the instant the job's completion was owed has passed
+        // (`crate::state::EvaluationJobRecord::overdue_run`) — a listing reports what such a
+        // run established without changing it. The runs are collected while the store is
+        // locked and performed after the guard is dropped, so no lock is held across the
+        // in-process calls they make.
         let dues = {
             let mut store = state.lock();
             store.settle_evaluation_jobs(now);
-            store.due_evaluation_runs(&region)
+            store.overdue_evaluation_runs(&region, now)
         };
         for due in dues {
             let outcome =
-                crate::state::evaluation_run::run_evaluation(&*self.engine, ctx, &due).await;
+                crate::state::evaluation_run::run_evaluation(&*self.engine, ctx.callback(), &due)
+                    .await;
             if let Some(job) = state.lock().evaluation_jobs.get_mut(&due.arn) {
                 job.record_run(outcome);
             }

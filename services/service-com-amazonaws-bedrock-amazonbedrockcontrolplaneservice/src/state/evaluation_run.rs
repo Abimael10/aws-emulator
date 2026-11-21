@@ -70,6 +70,15 @@ use crate::ops::types::{
 /// the batch inference family, and the same size for the same reason.
 pub const MAX_RUNS_PER_REQUEST: usize = 4;
 
+/// How many acceptance-time evaluation runs this service may have in flight at once.
+///
+/// CHOSEN, and a bound on WORK rather than on jobs: every accepted job starts its run
+/// ([`run_when_accepted`]), so without it a burst of creates would leave an unbounded number
+/// of runs outstanding. A create that finds no slot free starts nothing and leaves the run
+/// owed, so a later call takes it through the same claim — beside
+/// [`MAX_RUNS_PER_REQUEST`], which bounds what ONE such call performs.
+pub const MAX_RUNS_IN_FLIGHT: usize = 8;
+
 /// The content type the result objects are stored with: their records are JSON objects, one
 /// per line.
 const OUTPUT_CONTENT_TYPE: &str = "application/json";
@@ -280,23 +289,101 @@ pub fn due_model_ids(config: &EvaluationInferenceConfig) -> Vec<String> {
         .collect()
 }
 
+/// Perform the run an accepted evaluation job owes, in a task of its own, and write back
+/// what it established.
+///
+/// An accepted job RUNS whether or not anybody calls: `CreateEvaluationJob` answers the
+/// modelled 202 and the evaluation is performed after that answer, so the work belongs to the
+/// call that ACCEPTED the job rather than to a call that reads it. A read is a report: it
+/// materialises the transition the clock already owed and answers the stored record, so it
+/// answers at once instead of carrying the dataset reads, the inference over every record and
+/// the result writes — which is what a client polling a fresh job for its terminal status
+/// waits on.
+///
+/// The run is taken ONCE off the record ([`crate::state::EvaluationJobRecord::due_run`])
+/// before this is called, so this task performs work no other caller can also perform, and a
+/// run that established nothing gives itself back ([`RunOutcome::Deferred`]) for a later call
+/// to take. One task is started per accepted job and its work is bounded by that job's own
+/// configuration ([`run_evaluation`]), so what is in flight at once is bounded by the
+/// account's own evaluation-job cap.
+pub fn run_when_accepted<Eng: Send + Sync + 'static>(
+    engine: ::std::sync::Arc<Eng>,
+    callback: ::smithy_server_runtime::EmbeddedEmulator,
+    due: DueRun,
+) {
+    let Some(state) = crate::state::service_state(&*engine) else {
+        return;
+    };
+    // The slot is taken BEFORE the task starts and given back however it ends, so the work
+    // this service has outstanding at once is bounded whatever a caller submits. A run that
+    // finds no slot free is given back under the same guard, so a later call takes it.
+    let started = {
+        let mut store = state.lock();
+        let started = store.begin_evaluation_run();
+        if !started {
+            if let Some(job) = store.evaluation_jobs.get_mut(&due.arn) {
+                job.defer_run();
+            }
+        }
+        started
+    };
+    if !started {
+        ::tracing::warn!(
+            job = ?due.arn,
+            "{MAX_RUNS_IN_FLIGHT} evaluation runs are already in flight; this job's run is \
+             performed by the next call that finds it still owed"
+        );
+        return;
+    }
+    ::tokio::spawn(async move {
+        let outcome = run_evaluation(&*engine, &callback, &due).await;
+        // The guard is taken only to write back what the run established, so this service's
+        // store is never held across the in-process calls the run makes.
+        if let Some(state) = crate::state::service_state(&*engine) {
+            let mut store = state.lock();
+            if let Some(job) = store.evaluation_jobs.get_mut(&due.arn) {
+                job.record_run(outcome);
+            }
+            store.finish_evaluation_run();
+        }
+    });
+}
+
+impl crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
+    /// Take one of the [`MAX_RUNS_IN_FLIGHT`] slots, or answer `false` when they are all
+    /// taken.
+    fn begin_evaluation_run(&mut self) -> bool {
+        if self.evaluation_runs_in_flight >= MAX_RUNS_IN_FLIGHT {
+            return false;
+        }
+        self.evaluation_runs_in_flight += 1;
+        true
+    }
+
+    /// Give one slot back, however the run that held it ended.
+    fn finish_evaluation_run(&mut self) {
+        self.evaluation_runs_in_flight = self.evaluation_runs_in_flight.saturating_sub(1);
+    }
+}
+
 /// Run one evaluation job: read the records of every dataset it names, invoke each model it
 /// evaluates over each record under the account's enforced guardrail, score the configured
 /// metrics, and store the result records under its output prefix.
 ///
-/// It is the work the job's own clock made due with the status that says the job is running,
-/// so it is performed once per job ([`crate::state::EvaluationJobRecord::due_run`]) and no
-/// later call performs it again: what a client fetched out of the output location once stays
-/// what it fetched.
+/// It is the work the job was ACCEPTED for, owed from the create that accepted it and taken
+/// ONCE ([`crate::state::EvaluationJobRecord::due_run`]), so it is performed from a task of
+/// its own ([`run_when_accepted`]) rather than from a call that reads the job, and no later
+/// call performs it again: what a client fetched out of the output location stays what it
+/// fetched.
 ///
-/// HOW MUCH work one call does is bounded by the job's own configuration — at most five
+/// HOW MUCH work one run does is bounded by the job's own configuration — at most five
 /// `datasetMetricConfigs` (the member's modelled `@length(1..5)`) of at most
 /// [`super::evaluation_datasets::MAX_DATASET_RECORDS`] records each, over at most two models
 /// (`EvaluationModelConfigs`' modelled `@length(1..2)`) — and by nothing a later request
 /// sends.
 pub async fn run_evaluation<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
     due: &DueRun,
 ) -> RunOutcome {
     // The models are resolved through the very index the Amazon Bedrock Runtime emulator's
@@ -332,7 +419,7 @@ pub async fn run_evaluation<Eng: Send + Sync + 'static>(
         )]);
     };
 
-    let client = s3_client(ctx, &due.region);
+    let client = s3_client(callback, &due.region);
     let mut evaluated = 0i64;
     let mut errors = 0i64;
     let mut interventions = 0i64;
@@ -347,8 +434,13 @@ pub async fn run_evaluation<Eng: Send + Sync + 'static>(
         };
         for dataset in &due.datasets {
             let prompts =
-                match dataset_records(ctx, &due.region, &dataset.name, dataset.location.as_deref())
-                    .await
+                match dataset_records(
+                    callback,
+                    &due.region,
+                    &dataset.name,
+                    dataset.location.as_deref(),
+                )
+                .await
                 {
                     DatasetVerdict::Records(records) => records,
                     DatasetVerdict::Rejected(message) => return RunOutcome::Failed(vec![message]),

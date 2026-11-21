@@ -63,7 +63,7 @@ const PROVISIONABLE_MODELS: &[&str] = &[
     "amazon.nova-pro-v1:0",
     "amazon.titan-embed-text-v2:0",
     "cohere.command-text-v14",
-    "meta.llama3-70b-instruct-v1:0",
+    "meta.llama3-1-70b-instruct-v1:0",
 ];
 
 /// Base models the same catalog offers with Provisioned Throughput, used by the rows that

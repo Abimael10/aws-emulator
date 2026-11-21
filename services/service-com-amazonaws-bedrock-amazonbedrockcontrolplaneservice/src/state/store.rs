@@ -261,6 +261,14 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many evaluation job ids this store has minted; the uniqueness half of a minted
     /// id.
     pub minted_evaluation_jobs: u64,
+    /// How many acceptance-time evaluation runs are in flight right now, which is what
+    /// bounds the work the creates of this service have outstanding at once
+    /// ([`evaluation_run::MAX_RUNS_IN_FLIGHT`]). PRIVATE, and taken and given back through
+    /// [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::begin_evaluation_run`]
+    /// and
+    /// [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::finish_evaluation_run`],
+    /// so no caller can leave the count standing.
+    pub(super) evaluation_runs_in_flight: usize,
     /// Every stored advanced prompt optimization job, keyed by its
     /// `AdvancedPromptOptimizationJobArn` — one of the two spellings an
     /// `AdvancedPromptOptimizationJobIdentifier` carries, the other being the minted job

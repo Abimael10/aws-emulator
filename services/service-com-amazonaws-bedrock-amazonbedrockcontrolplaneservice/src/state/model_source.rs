@@ -106,7 +106,7 @@ async fn holder_of(
     region: &str,
     bucket: &str,
 ) -> Holder {
-    let client = s3_client(ctx, region);
+    let client = s3_client(ctx.callback(), region);
     if let Err(error) = client.head_bucket().bucket(bucket).send().await {
         if names_nothing(&error) {
             // S3 says it holds no bucket of that name: the verdict is grounded.

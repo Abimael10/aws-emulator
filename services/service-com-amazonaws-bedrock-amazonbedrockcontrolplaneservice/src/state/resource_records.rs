@@ -297,9 +297,10 @@ impl EvaluationJobRecord {
     /// The run this job still owes, taken ONCE — or `None` when it owes none.
     ///
     /// The work was made due by the create that accepted the job: an accepted job RUNS,
-    /// whether or not anybody calls, so the first operation that reads the job takes the run
-    /// ([`evaluation_run::run_evaluation`]) and no later call takes it again — which is what
-    /// leaves what a client fetched out of the output location as it fetched it.
+    /// whether or not anybody calls, so the create takes the run and performs it in a task
+    /// of its own ([`evaluation_run::run_when_accepted`]) and no later call takes it again —
+    /// which is what leaves what a client fetched out of the output location as it fetched
+    /// it.
     ///
     /// A job whose configuration names nothing this service runs owes nothing: there is no
     /// dataset to evaluate, or no model to invoke ([`evaluation_run::due_datasets`],
@@ -322,6 +323,29 @@ impl EvaluationJobRecord {
             datasets,
             output_uri: evaluation_run::output_s3_uri(&self.output_data_config).to_string(),
         })
+    }
+
+    /// The run this job owes that the clock has ALREADY left behind: the one a REPORTING
+    /// operation takes.
+    ///
+    /// A read reports — the run belongs to the call that accepted the job ([`Self::due_run`])
+    /// — so what is left for a read to take is a run that established nothing and gave itself
+    /// back ([`evaluation_run::RunOutcome::Deferred`]): a job still owing its results after
+    /// the instant its completion was owed. The run is therefore claimed only once that
+    /// instant has passed, and a read inside the span the job is still running in takes none
+    /// and answers the stored record.
+    pub fn overdue_run(&mut self, now: SystemTime) -> Option<evaluation_run::DueRun> {
+        if self.completed_due_at.is_some_and(|due| now < due) {
+            return None;
+        }
+        self.due_run()
+    }
+
+    /// Give a claimed run back, so a later call takes it again: what a run that could not be
+    /// STARTED leaves behind ([`evaluation_run::run_when_accepted`]), exactly as
+    /// [`evaluation_run::RunOutcome::Deferred`] is what one that established nothing leaves.
+    pub fn defer_run(&mut self) {
+        self.run_owed = true;
     }
 
     /// Whether the job is RUNNING or has run: the statuses a job whose run was started

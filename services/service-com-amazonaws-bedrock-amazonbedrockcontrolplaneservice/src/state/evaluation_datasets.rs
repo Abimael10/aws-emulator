@@ -264,13 +264,13 @@ pub fn unknown_dataset_message(name: &str) -> String {
 /// Amazon S3 over the same in-process client every cross-service call of this service uses;
 /// one without is addressed by name alone, which is what a built-in dataset is.
 pub async fn dataset_records(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     name: &str,
     location: Option<&str>,
 ) -> DatasetVerdict {
     match location {
-        Some(uri) => custom_dataset_records(ctx, region, uri).await,
+        Some(uri) => custom_dataset_records(callback, region, uri).await,
         None => match builtin_dataset(name) {
             Some(dataset) => DatasetVerdict::Records(builtin_records(dataset)),
             None => DatasetVerdict::Rejected(unknown_dataset_message(name)),
@@ -280,7 +280,7 @@ pub async fn dataset_records(
 
 /// The records of the custom prompt dataset the object `uri` names.
 async fn custom_dataset_records(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     uri: &str,
 ) -> DatasetVerdict {
@@ -291,7 +291,7 @@ async fn custom_dataset_records(
              again."
         ));
     };
-    let answer = s3_client(ctx, region)
+    let answer = s3_client(callback, region)
         .get_object()
         .bucket(&bucket)
         .key(&key)

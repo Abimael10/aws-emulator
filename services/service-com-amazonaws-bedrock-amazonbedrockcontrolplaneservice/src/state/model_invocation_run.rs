@@ -107,43 +107,31 @@ const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchBucket", "NoSuchKey", "NoSuchVersi
 ///
 /// The ONE client this service reaches object storage with: the read of a job's input
 /// records ([`read_input_records`]), the write of its result records
-/// ([`run_batch_inference`]) and the question whose bucket a model source names
-/// ([`super::model_source`]) all go through it, so none of them can reach the object store
-/// in a way another would not.
+/// ([`run_batch_inference`]), the records and results of an evaluation job
+/// ([`super::evaluation_run`], [`super::evaluation_datasets`]) and the question whose bucket
+/// a model source names ([`super::model_source`]) all go through it, so none of them can
+/// reach the object store in a way another would not.
 ///
-/// The callback is the framework's documented seam for calling another emulated service:
-/// it routes in process, so no network client is configured here and this crate names no
-/// other service's crate for it. The `endpoint_url` below is therefore an ADDRESS the
-/// in-process router reads, never a host any resolver looks up, and `region` is the
-/// request's own signing region as [`crate::state::request_region`] narrowed it — so a
-/// job's records are read and written where the caller's own Amazon S3 requests go.
+/// It is the SHARED construction of that hop — the one every emulated service that writes an
+/// object uses ([`service_common::s3_client::s3_client`]) — rather than a second
+/// configuration of the same client beside it: the transport, the credentials, the
+/// addressing and what an upload is allowed to declare about the object are decided in one
+/// place, so a write of this service and a write of any other reach Amazon S3 alike.
 ///
-/// The credentials are the emulator's own: they only sign this operation's in-process
-/// calls and are never put in a response or a log.
+/// The callback is the framework's documented seam for calling another emulated service: it
+/// routes in process, so nothing here opens a socket or resolves a name. It is taken as the
+/// TRANSPORT itself rather than read off a request's context, so the work an accepted job
+/// owes can be performed from a task of its own once the call that accepted it has answered;
+/// `region` is the request's own signing region as [`crate::state::request_region`] narrowed
+/// it, so a job's records are read and written where the caller's own Amazon S3 requests go.
+///
+/// The credentials are the emulator's own: they only sign this service's in-process calls
+/// and are never put in a response or a log.
 pub(crate) fn s3_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_s3::Client {
-    let config = ::aws_sdk_s3::Config::builder()
-        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
-        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
-        // The in-process transport routes on the request's own path, and a virtual-host
-        // bucket name is not a host this emulator resolves, so the request addresses its
-        // bucket in the path.
-        .force_path_style(true)
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
-        // The transport is in-process: there is nothing to retry, time out or watch for a
-        // stalled stream, and each of those would need a sleep implementation this client
-        // is not given. The same goes for caching the identity: the credentials are handed
-        // over directly.
-        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
-        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
-        .build();
-    ::aws_sdk_s3::Client::from_conf(config)
+    ::service_common::s3_client::s3_client(callback, region)
 }
 
 /// Whether S3's answer is S3 ITSELF saying it holds nothing at the address a request
@@ -258,7 +246,7 @@ pub async fn read_input_records(
              again."
         ));
     };
-    let answer = s3_client(ctx, region)
+    let answer = s3_client(ctx.callback(), region)
         .get_object()
         .bucket(&bucket)
         .key(&key)
@@ -526,7 +514,7 @@ pub async fn run_batch_inference<Eng: Send + Sync + 'static>(
     // WHERE the results go: a folder named for the job under the prefix the submission
     // named, holding one output file per input file it read, named for that file.
     let key = output_key(&prefix, due.job_id(), &due.input_uri);
-    let client = s3_client(ctx, &due.region);
+    let client = s3_client(ctx.callback(), &due.region);
     if let Err(error) = client
         .put_object()
         .bucket(&bucket)

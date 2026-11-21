@@ -8,13 +8,17 @@
 //! A reporting operation: the only writes it makes are the ones the CLOCK had already made
 //! due — the status transition a running job's move to its terminal status is, or a stopping
 //! job's move to `Stopped`, owed at its due instant even if nobody had called, so two reads
-//! inside one span answer alike — and the job's own RUN, which the create made due and this
-//! read performs once ([`crate::state::evaluation_run::run_evaluation`]): the records of
-//! every dataset the job names, evaluated on the model its `inferenceConfig` names under the
-//! guardrail this account enforces, and saved under `outputDataConfig.s3Uri`. So a client
-//! that reads this job and then lists that prefix finds the results there, and a job whose
-//! configuration could not be run reports the modelled `Failed` with its `failureMessages`
-//! rather than `Completed` with nothing saved.
+//! inside one span answer alike. The job's own RUN belongs to the create that accepted it
+//! and is performed in a task of its own
+//! ([`crate::state::evaluation_run::run_when_accepted`]): the records of every dataset the
+//! job names, evaluated on the model its `inferenceConfig` names under the guardrail this
+//! account enforces, and saved under `outputDataConfig.s3Uri`. So this read answers the
+//! stored record at once, a client that reads a job in a terminal status finds the results
+//! under that prefix, and a job whose configuration could not be run reports the modelled
+//! `Failed` with its `failureMessages` rather than `Completed` with nothing saved. A run
+//! that established nothing and gave itself back is taken here once the instant the job's
+//! completion was owed has passed ([`crate::state::EvaluationJobRecord::overdue_run`]), so
+//! no job is left owing its results for ever.
 //!
 //! ## Shape of an operation
 //!
@@ -207,25 +211,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         };
 
-        // The work the create made due, taken here and performed before this read answers: an
-        // accepted evaluation job evaluates its configured datasets on the model it names and
-        // saves the results under its output prefix, so a client that lists that prefix
-        // straight after reading the job finds them
-        // (`crate::state::evaluation_run::run_evaluation`). It is collected while the store is
-        // locked and performed after the guard is dropped, so no lock is held across the
-        // in-process calls into the object store and the inference surface, and it is taken
-        // ONCE per job, so this read reports what the run established without changing it for
-        // the next caller.
+        // A read REPORTS: it materialises the status transition the clock has already made
+        // due and answers the stored record, so it answers at once. The run an accepted job
+        // owes — evaluating its configured datasets on the model its `inferenceConfig` names
+        // and saving the results under its output prefix — belongs to the create that
+        // accepted the job and is performed in a task of its own
+        // (`crate::state::evaluation_run::run_when_accepted`). What is left for this read to
+        // take is a run that established nothing and gave itself back, and only once the
+        // instant the job's completion was owed has passed
+        // (`crate::state::EvaluationJobRecord::overdue_run`); it is collected while the store
+        // is locked and performed after the guard is dropped, so no lock is held across the
+        // in-process calls into the object store and the inference surface.
         let due = {
             let mut store = state.lock();
             let Some(job) = store.evaluation_job(&input.job_identifier, now) else {
                 return Err(not_found().into());
             };
-            job.due_run()
+            job.overdue_run(now)
         };
         if let Some(due) = due {
             let outcome =
-                crate::state::evaluation_run::run_evaluation(&*self.engine, ctx, &due).await;
+                crate::state::evaluation_run::run_evaluation(&*self.engine, ctx.callback(), &due)
+                    .await;
             if let Some(job) = state.lock().evaluation_jobs.get_mut(&due.arn) {
                 job.record_run(outcome);
             }

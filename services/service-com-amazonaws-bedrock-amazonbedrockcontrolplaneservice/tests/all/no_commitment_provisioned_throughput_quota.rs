@@ -22,6 +22,13 @@
 //! `ValidationException`, which is how a client tells "fix the request" from "ask for model
 //! units".
 //!
+//! The offering itself is ONE catalogue fact read by two surfaces: the models
+//! `ListFoundationModels` reports under `byInferenceType=PROVISIONED` are exactly the models
+//! a purchase is admitted over, and the model verdict is reached BEFORE the account's granted
+//! model units are read — so a model published for on-demand inference only is refused the
+//! fixed not-supported sentence whichever term the purchase names and however many model
+//! units it asks for.
+//!
 //! # What the tables generalise over
 //!
 //! The candidates are READ OUT of the emulator's own
@@ -455,4 +462,242 @@ async fn a_model_unit_count_below_the_published_minimum_stays_an_input_fault() {
             quota_gated.body
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// 3. The catalogue's Provisioned-Throughput offering is ONE fact, read by both surfaces.
+// ---------------------------------------------------------------------------------------
+
+/// The `modelFamily` of a generation this catalogue publishes for on-demand inference ONLY,
+/// taken by family so every row of it is walked rather than one model id.
+const ON_DEMAND_ONLY_FAMILY: &str = "Llama 3";
+
+/// `inferenceTypesSupported` — the member whose values decide whether a Provisioned
+/// Throughput is offered over a listed model (`InferenceType` is `[ON_DEMAND, PROVISIONED]`).
+const PROVISIONED_INFERENCE: &str = "PROVISIONED";
+
+/// The model-unit counts the eligibility rows ask for: `PositiveInteger`'s published minimum,
+/// the most this account is granted for a purchase WITH a term, and a count far past it. A
+/// model no Provisioned Throughput is offered over is refused the same way for every one of
+/// them, which is what says the model is judged before the account's units are read.
+const ELIGIBILITY_UNIT_COUNTS: &[i32] = &[1, bedrock::state::MAX_COMMITTED_MODEL_UNITS, i32::MAX];
+
+/// Every term a purchase may name, and no term at all: the model decides the same way for
+/// each, because the term chooses a quota rather than a property of the model.
+const COMMITMENT_FORMS: &[Option<&str>] = &[None, Some("OneMonth"), Some("SixMonths")];
+
+/// The whole published catalogue, as `ListFoundationModels` serves it: one row per model with
+/// the `inferenceTypesSupported` that row publishes.
+async fn catalogue(emu: &Emulator) -> Vec<(String, bool)> {
+    let reply = emu.call("GET", "/foundation-models", None).await;
+    assert_eq!(
+        reply.status, 200,
+        "case \"the whole catalogue\": the listing must be served, got {} {:?}",
+        reply.status, reply.body
+    );
+    let rows: Vec<(String, bool)> = reply
+        .get("modelSummaries")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|summary| {
+            let offered = summary
+                .get("inferenceTypesSupported")
+                .and_then(Value::as_array)
+                .is_some_and(|types| {
+                    types
+                        .iter()
+                        .any(|kind| kind.as_str() == Some(PROVISIONED_INFERENCE))
+                });
+            (text(summary, "modelId"), offered)
+        })
+        .collect();
+    assert!(
+        rows.len() > 1 && rows.iter().any(|(_, offered)| *offered),
+        "case \"the whole catalogue\": the listing must report models offered under both \
+         inference types, or this table asserts nothing, got {:?}",
+        reply.body
+    );
+    rows
+}
+
+/// RULE: the Provisioned-Throughput offering of a base model is ONE catalogue fact, so the
+/// listing and the purchase gate agree about every model: a model whose row publishes
+/// `PROVISIONED` inference reaches the granted-model-unit classification, and a model whose
+/// row publishes on-demand inference only is refused as a purchase no model can back — the
+/// fixed not-supported sentence. Asserted over EVERY row the catalogue serves, so neither
+/// surface can advertise what the other refuses.
+#[tokio::test]
+async fn the_purchase_gate_and_the_published_offering_agree_about_every_model() {
+    let emu = emulator();
+    let rows = catalogue(&emu).await;
+    let advertised: Vec<String> = provisioned_candidates(&emu)
+        .await
+        .into_iter()
+        .map(|candidate| candidate.model_id)
+        .collect();
+
+    for (index, (model_id, offered)) in rows.iter().enumerate() {
+        let case = format!("{model_id} (PROVISIONED published: {offered})");
+        // The two readings of the one fact: what the row publishes, and what the filtered
+        // listing narrows to.
+        assert_eq!(
+            *offered,
+            advertised.contains(model_id),
+            "case {case}: the filtered listing must report exactly the models whose row \
+             publishes {PROVISIONED_INFERENCE}, got advertised {:?}",
+            advertised.contains(model_id)
+        );
+        let reply = buy(
+            &emu,
+            REGION,
+            purchase(&name("agree", index), model_id, 1, None),
+        )
+        .await;
+        let (expected_code, expected_message) = if *offered {
+            (
+                "ServiceQuotaExceededException",
+                bedrock::state::no_commitment_model_units_message(model_id, REGION),
+            )
+        } else {
+            (
+                "ValidationException",
+                bedrock::state::MODEL_NOT_SUPPORTED_FOR_PROVISIONED_THROUGHPUT.to_string(),
+            )
+        };
+        assert_eq!(
+            (reply.status, code(&reply)),
+            (400, expected_code),
+            "case {case}: the purchase must be classified as the published offering says, \
+             got {} {} {:?}",
+            reply.status,
+            code(&reply),
+            reply.body
+        );
+        let stated = message(&case, &reply);
+        assert_eq!(
+            stated, expected_message,
+            "case {case}: expected the refusal {expected_message:?}, got {stated:?}"
+        );
+    }
+}
+
+/// RULE: a model the catalogue publishes for on-demand inference only backs no Provisioned
+/// Throughput at all, and that verdict is reached BEFORE the account's granted model units
+/// are read — so the refusal is the fixed not-supported sentence whichever term the purchase
+/// names, however many model units it asks for and whichever spelling named the model. The
+/// Llama 3 generation is such a family, and a model the catalogue does publish `PROVISIONED`
+/// inference for is bought under a term for the same count, which is what makes the verdict
+/// about the model rather than about the request.
+#[tokio::test]
+async fn an_on_demand_only_model_is_refused_before_the_granted_model_units_are_read() {
+    let emu = emulator();
+    let family: Vec<&bedrock::state::FoundationModel> = CATALOG
+        .iter()
+        .filter(|model| model.model_family == ON_DEMAND_ONLY_FAMILY)
+        .collect();
+    assert!(
+        !family.is_empty(),
+        "case {ON_DEMAND_ONLY_FAMILY:?}: the catalogue must publish this generation, or this \
+         table asserts nothing"
+    );
+    for model in &family {
+        assert!(
+            !bedrock::state::supports_provisioned_throughput(model),
+            "case {}: the catalogue must publish this generation for on-demand inference \
+             only, got {:?}",
+            model.model_id,
+            model.inference_types_supported
+        );
+    }
+
+    let mut index = 0;
+    for model in &family {
+        for (spelling, identifier) in [
+            ("its bare model id", model.model_id.to_string()),
+            (
+                "its foundation-model ARN",
+                foundation_model_arn(REGION, model.model_id),
+            ),
+        ] {
+            for commitment in COMMITMENT_FORMS {
+                for units in ELIGIBILITY_UNIT_COUNTS {
+                    let case = format!(
+                        "{} by {spelling}, commitment {commitment:?}, {units} model unit(s)",
+                        model.model_id
+                    );
+                    let reply = buy(
+                        &emu,
+                        REGION,
+                        purchase(&name("eligibility", index), &identifier, *units, *commitment),
+                    )
+                    .await;
+                    index += 1;
+                    assert_eq!(
+                        (reply.status, code(&reply)),
+                        (400, "ValidationException"),
+                        "case {case}: a model no Provisioned Throughput is offered over must \
+                         be refused as not supported, got {} {} {:?}",
+                        reply.status,
+                        code(&reply),
+                        reply.body
+                    );
+                    let stated = message(&case, &reply);
+                    assert_eq!(
+                        stated,
+                        bedrock::state::MODEL_NOT_SUPPORTED_FOR_PROVISIONED_THROUGHPUT,
+                        "case {case}: the refusal must be the not-supported sentence; the \
+                         account's model units are not consulted, got {stated:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The contrast the rule rests on, over the same Region and the same count: an advertised
+    // model under a term is bought and reads back.
+    let candidates = provisioned_candidates(&emu).await;
+    let candidate = candidates
+        .first()
+        .expect("the catalogue must advertise a model with Provisioned Throughput");
+    let case = format!("{} under a term", candidate.model_id);
+    let bought = buy(
+        &emu,
+        REGION,
+        purchase(
+            &name("offered", index),
+            &candidate.model_id,
+            1,
+            Some(COMMITMENT),
+        ),
+    )
+    .await;
+    assert_eq!(
+        bought.status, 201,
+        "case {case}: an advertised model under a term must be bought, got {} {:?}",
+        bought.status, bought.body
+    );
+    let arn = bought.text("provisionedModelArn");
+    let read = emu
+        .call(
+            "GET",
+            &format!("/provisioned-model-throughput/{}", label(&arn)),
+            None,
+        )
+        .await;
+    assert_eq!(
+        read.status, 200,
+        "case {case}: the bought Provisioned Throughput must read back, got {} {:?}",
+        read.status, read.body
+    );
+
+    // And the refused rows bought nothing: the listing holds the one purchase above alone.
+    let summaries = listed(&emu, REGION, "after the refused purchases").await;
+    assert_eq!(
+        summaries.len(),
+        1,
+        "case \"after the refused purchases\": only the admitted purchase may be listed, got \
+         {summaries:?}"
+    );
 }

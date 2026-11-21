@@ -20,9 +20,11 @@
 //! [`crate::state::EVALUATION_JOB_COMPLETE_AFTER`], materialised by the next call that
 //! reads the record. The accepted job also OWES ITS RUN from here — the records of every
 //! dataset its `evaluationConfig` names, evaluated on the model its `inferenceConfig` names
-//! and saved under `outputDataConfig.s3Uri` ([`crate::state::evaluation_run`]) — which the
-//! first call that reads the job performs, so the terminal status it reaches is the one its
-//! run ended in. `GetEvaluationJob` reads the job back.
+//! and saved under `outputDataConfig.s3Uri` ([`crate::state::evaluation_run`]) — which this
+//! call starts in a task of its own ([`crate::state::evaluation_run::run_when_accepted`]),
+//! not a later read of the job, so the terminal status the job reaches is the one its run
+//! ended in and the results are saved while it is still running. `GetEvaluationJob` reads
+//! the job back.
 //!
 //! ## Shape of an operation
 //!
@@ -363,10 +365,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::EVALUATION_JOB_STATUS_IN_PROGRESS,
             // The RUN itself is owed from here too: an accepted job evaluates its configured
             // datasets on the model its `inferenceConfig` names and saves the results under
-            // `outputDataConfig.s3Uri`, which the first call that reads the job performs
-            // (`crate::state::evaluation_run`). Until it has been performed the job ends in
-            // the status a run that was performed leads to; a run that cannot be performed
-            // replaces that with the modelled failure.
+            // `outputDataConfig.s3Uri`, which this create starts in a task of its own
+            // (`crate::state::evaluation_run::run_when_accepted`). Until it has been
+            // performed the job ends in the status a run that was performed leads to; a run
+            // that cannot be performed replaces that with the modelled failure.
             run_owed: true,
             terminal_status: crate::state::EVALUATION_JOB_STATUS_COMPLETED,
             failure_messages: Vec::new(),
@@ -392,8 +394,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = store
             .evaluation_job(&arn, now)
             .expect("the evaluation job just inserted under this ARN");
-        Ok(CreateEvaluationJobOutput {
-            job_arn: stored.arn.clone(),
-        })
+        let job_arn = stored.arn.clone();
+        // The RUN this create accepted, taken off the record here and performed in a task of
+        // its own: an accepted job evaluates the records of every dataset its configuration
+        // names on the model its `inferenceConfig` names and saves the results under
+        // `outputDataConfig.s3Uri`, which happens after this call answers its 202 rather
+        // than inside a later read of the job
+        // (`crate::state::evaluation_run::run_when_accepted`). Taken ONCE, so no other call
+        // performs the same run; a run that establishes nothing gives itself back for a
+        // later call to take.
+        let due = store
+            .evaluation_jobs
+            .get_mut(&arn)
+            .and_then(crate::state::EvaluationJobRecord::due_run);
+        // Given up before the run is started: the task takes the same lock to write back
+        // what it established.
+        drop(store);
+        if let Some(due) = due {
+            crate::state::evaluation_run::run_when_accepted(
+                ::std::sync::Arc::clone(&self.engine),
+                ctx.callback().clone(),
+                due,
+            );
+        }
+
+        Ok(CreateEvaluationJobOutput { job_arn })
     }
 }

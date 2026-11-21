@@ -39,51 +39,51 @@ use crate::cloudfront_key_value_store_handshake::segment as form_encode;
 /// The Region every call here is signed for. It is NOT `us-east-1`, so the bucket is created
 /// with the location constraint a bucket outside that Region carries — the shape the recorded
 /// case stages its output bucket in.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The account id every emulated ARN carries (`engine::emulator_account_id`).
-const ACCOUNT: &str = "000000000000";
+pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// The bucket the results are saved in, and one no create ever makes.
-const BUCKET: &str = "example-evaluation-results";
+pub(crate) const BUCKET: &str = "example-evaluation-results";
 const ABSENT_BUCKET: &str = "example-evaluation-results-missing";
 
 /// The service role the submission passes, created in IAM below with a trust policy Amazon
 /// Bedrock's pass-role step admits.
-const ROLE_NAME: &str = "bedrock-evaluation-role";
+pub(crate) const ROLE_NAME: &str = "bedrock-evaluation-role";
 
 /// The model the jobs evaluate, named the way the recorded case names it: a
 /// `foundation-model` ARN of this Region.
-const EVALUATED_MODEL_ARN: &str =
+pub(crate) const EVALUATED_MODEL_ARN: &str =
     "arn:aws:bedrock:us-west-2::foundation-model/amazon.nova-lite-v1:0";
 
 /// The model id that ARN resolves to, which is what a result file is named for.
-const EVALUATED_MODEL: &str = "amazon.nova-lite-v1:0";
+pub(crate) const EVALUATED_MODEL: &str = "amazon.nova-lite-v1:0";
 
 /// The two built-in metrics of an automated job this emulator computes a value for: accuracy,
 /// from the response and the record's own reference response, and toxicity, from the response.
-const METRIC_ACCURACY: &str =
+pub(crate) const METRIC_ACCURACY: &str =
     service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::evaluation_run::METRIC_ACCURACY;
-const METRIC_TOXICITY: &str =
+pub(crate) const METRIC_TOXICITY: &str =
     service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::evaluation_run::METRIC_TOXICITY;
 
 /// How long after the create the job's status is owed its move to the terminal status its run
 /// ended in, read off the service's own constant.
-const COMPLETE_AFTER: Duration =
+pub(crate) const COMPLETE_AFTER: Duration =
     service_com_amazonaws_bedrock_amazonbedrockcontrolplaneservice::state::EVALUATION_JOB_COMPLETE_AFTER;
 
 /// How long a case polls a job before it concludes the lifecycle is stuck: generous next to
 /// the span above, room for a slow machine rather than for another order of magnitude.
-const POLL_BUDGET: Duration = Duration::from_secs(45);
+pub(crate) const POLL_BUDGET: Duration = Duration::from_secs(45);
 
 /// How long a case waits between two reads of a job while it polls it.
-const POLL_STEP: Duration = Duration::from_millis(100);
+pub(crate) const POLL_STEP: Duration = Duration::from_millis(100);
 
 /// The Bedrock control plane, the Bedrock Runtime inference plane, IAM, STS and Amazon S3 over
 /// ONE shared engine, as `router/src/lib.rs` mounts them — so the control plane's in-process
 /// callback reaches this very object store and this very inference plane, and its pass-role
 /// step this very IAM.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -124,7 +124,12 @@ fn authorization(service: &str) -> String {
 
 /// One raw request to the emulator's Amazon S3 front door: path-style, so the bucket and key
 /// live in the URI and the body is the object's own bytes.
-async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) -> (u16, String) {
+pub(crate) async fn s3(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> (u16, String) {
     let request = http::Request::builder()
         .method(method)
         .uri(path)
@@ -142,7 +147,11 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &[u8]) 
 }
 
 /// One awsQuery call to IAM: `POST /` with the parameters in the form body.
-async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+pub(crate) async fn iam(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
     let mut body = format!("Action={action}&Version=2010-05-08");
     for (name, value) in params {
         body.push('&');
@@ -167,7 +176,7 @@ async fn iam(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// One restJson1 call to the Bedrock control plane: the status and the answered document.
-async fn bedrock(
+pub(crate) async fn bedrock(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -197,7 +206,7 @@ async fn bedrock(
 
 /// `PUT /<bucket>` with the location constraint of a bucket outside `us-east-1`, which is the
 /// Region every call here is signed for.
-async fn given_bucket(router: &MultiServiceRouter) {
+pub(crate) async fn given_bucket(router: &MultiServiceRouter) {
     let configuration = format!(
         "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"
@@ -233,7 +242,7 @@ async fn given_bucket(router: &MultiServiceRouter) {
 /// The service role the submissions pass: a role Amazon Bedrock may assume, narrowed to this
 /// account as the one it would act for, with a policy granting it the object writes an
 /// evaluation job's output needs.
-async fn given_role(router: &MultiServiceRouter) -> String {
+pub(crate) async fn given_role(router: &MultiServiceRouter) -> String {
     let trust = format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Principal\":{{\"Service\":\"bedrock.amazonaws.com\"}},\"Action\":\"sts:AssumeRole\",\
@@ -292,7 +301,11 @@ async fn given_role(router: &MultiServiceRouter) -> String {
 
 /// Poll `GetEvaluationJob` the way a client does until the job reports a terminal status, and
 /// hand back the document that first reported it.
-async fn poll_until_terminal(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
+pub(crate) async fn poll_until_terminal(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) -> Value {
     let started = ::std::time::Instant::now();
     let mut seen: Vec<String> = Vec::new();
     loop {
@@ -330,7 +343,11 @@ async fn poll_until_terminal(router: &MultiServiceRouter, case: &str, arn: &str)
 
 /// Every key the output bucket holds under `prefix`, as `ListObjectsV2` reports them — the
 /// call a client makes to find a finished job's results.
-async fn listed_keys(router: &MultiServiceRouter, case: &str, prefix: &str) -> Vec<String> {
+pub(crate) async fn listed_keys(
+    router: &MultiServiceRouter,
+    case: &str,
+    prefix: &str,
+) -> Vec<String> {
     let (status, body) = s3(
         router,
         "GET",
