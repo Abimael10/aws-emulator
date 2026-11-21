@@ -502,8 +502,9 @@ async fn a_stage_refuses_a_pointer_it_has_no_member_for_as_a_method_setting_path
     //
     // A two-token method path whose resource half simply LEAVES its leading separator to the
     // pointer (`/pets/GET/…`) is not one of them: that is the spelling
-    // `MethodSetting$ResourcePath` states a path in, so it names the method `pets/GET` and
-    // is applied — see `a_method_settings_key_is_the_method_path_its_pointer_names`.
+    // `MethodSetting$ResourcePath` states a path in, so it names a method and is applied —
+    // keyed `pets/GET`, the method path that pointer spelled, see
+    // `a_method_settings_key_is_the_method_path_its_pointer_names`.
     let paths = [
         "/sim2realNoSuchField",
         "/stageName",

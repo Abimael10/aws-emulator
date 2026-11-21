@@ -28,11 +28,22 @@
 //!
 //! Every case drives the real wire path through [`Gateway`], this crate's one wire-test
 //! harness, and reuses the stage and patch helpers of the suites beside it.
+//!
+//! The other half of the same rule — what the entry under a key CARRIES, and who reports it —
+//! is pinned at the end of this file:
+//!
+//! > the value under a `methodSettings` key is the `MethodSetting` the patches applied to that
+//! > method wrote, and EVERY reader of the stage reports it: the `UpdateStage` answer,
+//! > `GetStage` and the `GetStages` collection entry all render one stage record. The
+//! > whole-stage `*/*` key is an entry of its own, so writing either scope neither creates nor
+//! > changes the other.
 
 use serde_json::{json, Value};
 
+use crate::account_settings::{patch_account, role_arn};
 use crate::patch_updates::{op, patch_ok, replace};
-use crate::rest_api_lifecycle::{create_api, Gateway};
+use crate::rest_api_lifecycle::{create_api, page_items, Gateway};
+use crate::stage_collection::get_stages;
 use crate::stage_lifecycle::{create_deployed_stage, get_stage};
 
 /// One row: a method, and the patch paths that address a setting of it — each paired with the
@@ -317,4 +328,372 @@ async fn a_key_is_the_method_path_its_pointer_spelled() {
             read.body["methodSettings"], body["methodSettings"]
         );
     }
+}
+
+/// One setting of a method: the tail a patch path addresses it by (its published group and
+/// name), the `MethodSetting` member it writes, the value the patch sends and the JSON a
+/// reader must then report.
+///
+/// Source: the `MethodSetting` shape (`smithy_query(query="shape", shape="MethodSetting")`)
+/// for the member names and their types, its `unauthorizedCacheControlHeaderStrategy` value
+/// set for the strategy, and `MethodSetting$loggingLevel` ("valid values are OFF, ERROR, and
+/// INFO") for the level. Every value differs from the one an entry carries for a setting
+/// nobody configured, so no row can pass on a default.
+type Setting = (&'static str, &'static str, &'static str, Value);
+
+fn applied_settings() -> Vec<Setting> {
+    vec![
+        ("metrics/enabled", "metricsEnabled", "true", json!(true)),
+        ("logging/loglevel", "loggingLevel", "ERROR", json!("ERROR")),
+        ("logging/dataTrace", "dataTraceEnabled", "true", json!(true)),
+        (
+            "throttling/burstLimit",
+            "throttlingBurstLimit",
+            "77",
+            json!(77),
+        ),
+        (
+            "throttling/rateLimit",
+            "throttlingRateLimit",
+            "12.5",
+            json!(12.5),
+        ),
+        ("caching/enabled", "cachingEnabled", "true", json!(true)),
+        (
+            "caching/ttlInSeconds",
+            "cacheTtlInSeconds",
+            "45",
+            json!(45),
+        ),
+        (
+            "caching/dataEncrypted",
+            "cacheDataEncrypted",
+            "true",
+            json!(true),
+        ),
+        (
+            "caching/requireAuthorizationForCacheControl",
+            "requireAuthorizationForCacheControl",
+            "false",
+            json!(false),
+        ),
+        (
+            "caching/unauthorizedCacheControlHeaderStrategy",
+            "unauthorizedCacheControlHeaderStrategy",
+            "FAIL_WITH_403",
+            json!("FAIL_WITH_403"),
+        ),
+    ]
+}
+
+/// The resource half of a method path as a patch pointer SPELLS it, which is the resource half
+/// of the KEY the stage then reports: the resource path as ONE reference token, every separator
+/// in it — its leading one included — escaped `~1` the way `PatchOperation$path` requires of a
+/// path name. The wildcard names no resource path, so it is carried over as it stands.
+fn resource_token(resource_path: &str) -> String {
+    if resource_path.trim_start_matches('/') == "*" {
+        return "*".to_string();
+    }
+    let path = resource_path.strip_prefix('/').unwrap_or(resource_path);
+    format!("/{path}").replace('/', "~1")
+}
+
+/// The patch pointer that addresses `setting` of the method `verb` of `resource_path`: the
+/// resource half as [`resource_token`] spells it, then the verb in its own reference token,
+/// then the setting.
+fn setting_pointer(resource_path: &str, verb: &str, setting: &str) -> String {
+    format!("/{}/{verb}/{setting}", resource_token(resource_path))
+}
+
+/// The `methodSettings` key a [`setting_pointer`] of that method writes: the pointer's
+/// reference tokens before the setting, as written — derived here from the method rather than
+/// remembered.
+fn method_key(resource_path: &str, verb: &str) -> String {
+    format!("{}/{verb}", resource_token(resource_path))
+}
+
+/// The `methodSettings` the `GetStages` collection reports for `stage_name` of `api` — the
+/// collection's own entry for that stage, so the map is asserted at the COLLECTION reader
+/// too and not only at the single-stage one.
+async fn listed_method_settings(
+    gateway: &Gateway,
+    api: &str,
+    stage_name: &str,
+    case: &str,
+) -> Value {
+    let listed = get_stages(gateway, api, "").await;
+    assert_eq!(
+        listed.status, 200,
+        "case {case}: expected 200 from GetStages, got {} with {:?}",
+        listed.status, listed.body
+    );
+    let entry = page_items(&listed.body, case)
+        .into_iter()
+        .find(|item| item["stageName"] == json!(stage_name));
+    let entry = entry.unwrap_or_else(|| {
+        panic!(
+            "case {case}: expected GetStages to report the stage {stage_name:?}, got {:?}",
+            listed.body
+        )
+    });
+    entry["methodSettings"].clone()
+}
+
+/// The `cacheTtlInSeconds` under one `methodSettings` key, as a reader reports it.
+fn reported_ttl(settings: &Value, key: &str) -> Value {
+    settings[key]["cacheTtlInSeconds"].clone()
+}
+
+/// RULE: the value under a `methodSettings` key is the `MethodSetting` the patches applied to
+/// that method wrote, and every reader of the stage reports it — the `UpdateStage` answer,
+/// `GetStage` and the `GetStages` collection entry render the one stage record.
+#[tokio::test]
+async fn every_reader_reports_a_per_method_entry_carrying_the_settings_applied_to_it() {
+    // Rows differ along what the rule generalises over: the DEPTH of the resource path (the
+    // root, a child, a nested one, a deeper one), a part that is a path parameter, and the
+    // HTTP verb — the verbs are the ones `PutMethod$httpMethod` takes.
+    let methods: [(&str, &str, &str); 4] = [
+        ("the root resource", "/", "GET"),
+        ("a child resource", "/short", "GET"),
+        ("a nested resource", "/items/{id}", "DELETE"),
+        ("a deeply nested resource", "/a/b/c", "PUT"),
+    ];
+
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "method-settings-readback").await;
+    create_deployed_stage(&gateway, &api, "prod").await;
+    // Two of the settings turn a method's EXECUTION logging on, which API Gateway writes
+    // under the ACCOUNT's CloudWatch Logs role, so the account carries one before the table
+    // runs — the precondition the sibling `stage_execution_logging_account_role` suite covers.
+    patch_account(
+        &gateway,
+        "replace",
+        "/cloudwatchRoleArn",
+        Some(&role_arn("method-settings-readback")),
+    )
+    .await;
+    let uri = format!("/restapis/{api}/stages/prod");
+
+    // The members a reader must report for a method every setting was applied to: the whole
+    // `MethodSetting` shape, so a reader reports the structure rather than a subset of it.
+    let mut expected_members: Vec<String> = applied_settings()
+        .iter()
+        .map(|(_, member, _, _)| (*member).to_string())
+        .collect();
+    expected_members.sort();
+
+    for (depth, resource_path, verb) in methods {
+        let key = method_key(resource_path, verb);
+        // Every setting of the one method in ONE request, the way a client configures a
+        // method's caching and logging in a single call.
+        let operations: Vec<Value> = applied_settings()
+            .iter()
+            .map(|(published, _, value, _)| {
+                replace(&setting_pointer(resource_path, verb, published), value)
+            })
+            .collect();
+        let case = format!("{depth} as {key:?}");
+        let answered = patch_ok(&gateway, &case, &uri, operations).await;
+        let read = get_stage(&gateway, &api, "prod").await.body;
+        let listed = listed_method_settings(&gateway, &api, "prod", &case).await;
+
+        for (source, settings) in [
+            ("the UpdateStage answer", &answered["methodSettings"]),
+            ("GetStage", &read["methodSettings"]),
+            ("GetStages", &listed),
+        ] {
+            for (published, member, _, expected) in applied_settings() {
+                let actual = &settings[key.as_str()][member];
+                assert_eq!(
+                    actual, &expected,
+                    "case {case}: expected {source} to report {member} (written as \
+                     {published:?}) as {expected:?}, got {:?}",
+                    settings[key.as_str()]
+                );
+            }
+            let mut reported: Vec<String> = settings[key.as_str()]
+                .as_object()
+                .map(|map| map.keys().cloned().collect())
+                .unwrap_or_default();
+            reported.sort();
+            assert_eq!(
+                reported, expected_members,
+                "case {case}: expected {source} to report the members {expected_members:?} \
+                 under {key:?}, got {reported:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the whole-stage `*/*` key is an entry of its own, so writing either scope neither
+/// creates nor changes the other — a per-method override and the stage-wide settings stand
+/// side by side, each carrying its own values.
+#[tokio::test]
+async fn the_whole_stage_entry_and_a_per_method_entry_are_independent() {
+    // The TTL the stage-wide entry carries, and the strategy with it: both differ from every
+    // row's own values below, so an entry that was overwritten by the other scope fails the
+    // assertion rather than passing on a shared value. Inside `caching/ttlInSeconds`'
+    // published range.
+    const STAGE_WIDE_TTL: &str = "600";
+    const STAGE_WIDE_STRATEGY: &str = "SUCCEED_WITHOUT_RESPONSE_HEADER";
+    // The TTL the stage-wide entry is moved to after every per-method entry is written, which
+    // is the other direction of the same independence.
+    const STAGE_WIDE_RETTL: &str = "1200";
+
+    // Rows differ along what the rule generalises over: the depth of the method's resource
+    // path, the verb, and each row's OWN TTL — so the entries are told apart by value as well
+    // as by key. `3600` is the published upper bound of `caching/ttlInSeconds`, `0` its lower
+    // one.
+    let methods: [(&str, &str, &str, &str); 4] = [
+        ("a child resource", "/short", "GET", "7"),
+        ("the root resource", "/", "POST", "45"),
+        ("a nested resource", "/count/{id}", "GET", "3600"),
+        ("a deeply nested resource", "/a/b/c", "DELETE", "0"),
+    ];
+
+    let gateway = Gateway::new();
+    let (api, _root) = create_api(&gateway, "method-settings-scopes").await;
+    create_deployed_stage(&gateway, &api, "prod").await;
+    let uri = format!("/restapis/{api}/stages/prod");
+
+    // The stage-wide entry first, so each per-method write below lands on a stage that
+    // already carries one.
+    patch_ok(
+        &gateway,
+        "the stage-wide entry",
+        &uri,
+        vec![
+            replace("/*/*/caching/enabled", "true"),
+            replace("/*/*/caching/ttlInSeconds", STAGE_WIDE_TTL),
+            replace(
+                "/*/*/caching/unauthorizedCacheControlHeaderStrategy",
+                STAGE_WIDE_STRATEGY,
+            ),
+        ],
+    )
+    .await;
+
+    let mut written: Vec<(String, String, Value)> = Vec::new();
+    for (depth, resource_path, verb, ttl) in methods {
+        let key = method_key(resource_path, verb);
+        let case = format!("{depth} as {key:?}");
+        patch_ok(
+            &gateway,
+            &case,
+            &uri,
+            vec![
+                replace(&setting_pointer(resource_path, verb, "caching/enabled"), "true"),
+                replace(
+                    &setting_pointer(resource_path, verb, "caching/ttlInSeconds"),
+                    ttl,
+                ),
+                replace(
+                    &setting_pointer(
+                        resource_path,
+                        verb,
+                        "caching/unauthorizedCacheControlHeaderStrategy",
+                    ),
+                    "FAIL_WITH_403",
+                ),
+            ],
+        )
+        .await;
+        written.push((case.clone(), key.clone(), json!(ttl.parse::<i64>().unwrap())));
+
+        let settings = get_stage(&gateway, &api, "prod").await.body["methodSettings"].clone();
+        // The method's own entry carries the row's values.
+        assert_eq!(
+            settings[key.as_str()]["unauthorizedCacheControlHeaderStrategy"],
+            json!("FAIL_WITH_403"),
+            "case {case}: expected the method's own strategy, got {:?}",
+            settings[key.as_str()]
+        );
+        // The stage-wide entry is a separate entry, untouched by the per-method write.
+        assert_eq!(
+            reported_ttl(&settings, "*/*"),
+            json!(STAGE_WIDE_TTL.parse::<i64>().unwrap()),
+            "case {case}: expected the stage-wide entry to keep its own TTL, got {:?}",
+            settings["*/*"]
+        );
+        assert_eq!(
+            settings["*/*"]["unauthorizedCacheControlHeaderStrategy"],
+            json!(STAGE_WIDE_STRATEGY),
+            "case {case}: expected the stage-wide entry to keep its own strategy, got {:?}",
+            settings["*/*"]
+        );
+        // And every method written before this one still carries its own TTL: one method's
+        // entry is not the next method's.
+        for (earlier, earlier_key, earlier_ttl) in &written {
+            assert_eq!(
+                &reported_ttl(&settings, earlier_key),
+                earlier_ttl,
+                "case {case}: expected {earlier} to keep its own TTL, got {:?}",
+                settings[earlier_key.as_str()]
+            );
+        }
+    }
+
+    // The other direction: moving the stage-wide entry leaves every per-method entry as it
+    // was.
+    let settings = patch_ok(
+        &gateway,
+        "the stage-wide entry moved",
+        &uri,
+        vec![replace("/*/*/caching/ttlInSeconds", STAGE_WIDE_RETTL)],
+    )
+    .await["methodSettings"]
+        .clone();
+    assert_eq!(
+        reported_ttl(&settings, "*/*"),
+        json!(STAGE_WIDE_RETTL.parse::<i64>().unwrap()),
+        "case the stage-wide entry moved: expected the new TTL, got {:?}",
+        settings["*/*"]
+    );
+    for (case, key, ttl) in &written {
+        assert_eq!(
+            &reported_ttl(&settings, key),
+            ttl,
+            "case the stage-wide entry moved: expected {case} to keep its own TTL, got {:?}",
+            settings[key.as_str()]
+        );
+    }
+
+    // Taking one method's entry away takes that entry and no other: the stage-wide entry and
+    // every other method's are still there, with their own values.
+    let (removed_case, removed_key, _) = written.remove(0);
+    let settings = patch_ok(
+        &gateway,
+        &format!("{removed_case} removed"),
+        &uri,
+        vec![op("remove", &format!("/{removed_key}"), None)],
+    )
+    .await["methodSettings"]
+        .clone();
+    assert_eq!(
+        settings[removed_key.as_str()],
+        Value::Null,
+        "case {removed_case} removed: expected the entry gone, got {:?}",
+        settings[removed_key.as_str()]
+    );
+    assert_eq!(
+        reported_ttl(&settings, "*/*"),
+        json!(STAGE_WIDE_RETTL.parse::<i64>().unwrap()),
+        "case {removed_case} removed: expected the stage-wide entry untouched, got {:?}",
+        settings["*/*"]
+    );
+    for (case, key, ttl) in &written {
+        assert_eq!(
+            &reported_ttl(&settings, key),
+            ttl,
+            "case {removed_case} removed: expected {case} to keep its own TTL, got {:?}",
+            settings[key.as_str()]
+        );
+    }
+    let read = get_stage(&gateway, &api, "prod").await.body;
+    assert_eq!(
+        read["methodSettings"], settings,
+        "case {removed_case} removed: GetStage must report what UpdateStage answered, got {:?} \
+         after {:?}",
+        read["methodSettings"], settings
+    );
 }
