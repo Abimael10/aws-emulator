@@ -28,9 +28,12 @@
 //! The script is the one the DOCUMENT declares for the node's platform: the step whose
 //! plugin runs on it ([`super::document_platforms::step_runs_on`]), with the document's
 //! `commands` input resolved from the parameters the send supplied and the defaults the
-//! document declares. A document that declares no step this node runs — a Windows document
-//! sent to a Linux node — is not something the node's agent performs, and the send's own
-//! `UnsupportedPlatformType` refusal is what a client is told about that.
+//! document declares. Those resolved lines are ONE script, which is what the agent performs
+//! with the guest's shell (`ComAmazonawsEc2Amazonec2State::run_in_instance_guest_with`), so a
+//! construct spanning them is the script's own and what the invocation reports is that
+//! script's exit status and its two streams. A document that declares no step this node runs
+//! — a Windows document sent to a Linux node — is not something the node's agent performs,
+//! and the send's own `UnsupportedPlatformType` refusal is what a client is told about that.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;

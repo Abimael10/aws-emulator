@@ -348,11 +348,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ran.map(|ran| ran.standard_output()).unwrap_or_default(),
             ),
             standard_output_url: Some(String::new()),
-            // The guest's session reports ONE stream — what the program wrote to its
-            // standard output — so there is no second stream to report here, and a
-            // diagnostic invented for a command that failed would be text nothing wrote.
+            // "The first 8,000 characters written by the plugin to `stderr`. If the command
+            // hasn't finished running, then this string is empty" (`StandardErrorContent`):
+            // the guest's session reports the two streams apart, so what the script reported
+            // it could not do is this member — the shell's own diagnostic for a command the
+            // guest has no program for, and whatever the script itself wrote there. Nothing
+            // is invented for a command that wrote none.
+            standard_error_content: Some(
+                ran.map(|ran| ran.standard_error()).unwrap_or_default(),
+            ),
             // The URLs name the files a plugin wrote to Amazon S3, of which there are none.
-            standard_error_content: Some(String::new()),
             standard_error_url: Some(String::new()),
             cloud_watch_output_config: command.cloud_watch_output_config.clone(),
         })

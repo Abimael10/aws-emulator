@@ -4,10 +4,11 @@
 //! end with Systems Manager, Amazon EC2 and IAM on one engine.
 //!
 //! RULE under test: AN INVOCATION IS THE DOCUMENT'S SCRIPT PERFORMED IN THE NODE'S GUEST —
-//! so what a client reads back is what that guest wrote and the exit code its shell ended
-//! on, the invocation reaches a terminal status on the clock without anything asking it to,
-//! and a command the guest has no program for runs nothing and answers the status a shell
-//! answers for a utility it could not find.
+//! so what a client reads back is what that guest wrote on each of its two streams and the
+//! exit code its shell ended on, the invocation reaches a terminal status on the clock
+//! without anything asking it to, and a command the guest has no program for runs nothing and
+//! answers the status a shell answers for a utility it could not find, with the shell's own
+//! diagnostic on standard error.
 //!
 //! Every case goes through the front door: `AmazonSSM.SendCommand` and
 //! `AmazonSSM.GetCommandInvocation` over `awsJson1_1`, with the instance launched over
@@ -55,13 +56,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const TERMINAL: &[&str] = &["Success", "Cancelled", "Failed", "TimedOut"];
 
 /// One row: the script sent, the status the invocation ends in, the exit code the guest's
-/// shell answers, and the output it wrote.
+/// shell answers, and what it wrote on each of its two streams.
 struct ScriptCase {
     case: &'static str,
     commands: Vec<&'static str>,
     status: &'static str,
     response_code: i64,
     output: &'static str,
+    errors: &'static str,
 }
 
 /// Launch an instance that becomes a managed node and answer its id.
@@ -191,6 +193,7 @@ async fn an_invocation_reports_what_the_guest_ran() {
             status: "Success",
             response_code: 0,
             output: "hello\n",
+            errors: "",
         },
         ScriptCase {
             case: "a script of several lines",
@@ -198,6 +201,7 @@ async fn an_invocation_reports_what_the_guest_ran() {
             status: "Success",
             response_code: 0,
             output: "first\nsecond\n",
+            errors: "",
         },
         ScriptCase {
             case: "a script that answers failure",
@@ -205,16 +209,18 @@ async fn an_invocation_reports_what_the_guest_ran() {
             status: "Failed",
             response_code: 1,
             output: "",
+            errors: "",
         },
         // A program the guest does not have is where the shell's own command search ends with
-        // nothing, and a shell says so: the diagnostic naming that command reaches the
-        // guest's console, which is the one stream this invocation reports.
+        // nothing, and a shell says so: the diagnostic naming that command goes to standard
+        // error, which the invocation reports apart from what the script wrote.
         ScriptCase {
             case: "a script naming a program the guest does not have",
             commands: vec!["/usr/bin/definitely-not-installed --now"],
             status: "Failed",
             response_code: COULD_NOT_RUN,
-            output: "sh: /usr/bin/definitely-not-installed: command not found\n",
+            output: "",
+            errors: "sh: /usr/bin/definitely-not-installed: command not found\n",
         },
         ScriptCase {
             case: "a script that writes the machine's storage and reads it back",
@@ -222,6 +228,7 @@ async fn an_invocation_reports_what_the_guest_ran() {
             status: "Success",
             response_code: 0,
             output: "kept\n",
+            errors: "",
         },
         // The file utilities a script written against a machine's storage names: `touch`
         // makes the file and `ls` writes the path back, which is how such a script checks
@@ -232,6 +239,7 @@ async fn an_invocation_reports_what_the_guest_ran() {
             status: "Success",
             response_code: 0,
             output: "/tmp/made\n",
+            errors: "",
         },
         ScriptCase {
             case: "a script that lists a directory of the machine's storage",
@@ -244,17 +252,17 @@ async fn an_invocation_reports_what_the_guest_ran() {
             status: "Success",
             response_code: 0,
             output: "alpha\nbeta\n",
+            errors: "",
         },
         // A path the machine does not hold is the utility's own failure, reported in its own
-        // wording. The guest's session reports ONE stream, so that diagnostic is what the
-        // invocation carries as its output — the same way the file utilities beside `ls`
-        // report a path they could not read.
+        // wording on standard error — the same stream the shell's own diagnostics reach.
         ScriptCase {
             case: "a script that names a path the machine does not hold",
             commands: vec!["ls /tmp/not-there"],
             status: "Failed",
             response_code: 1,
-            output: "ls: cannot access '/tmp/not-there': No such file or directory\n",
+            output: "",
+            errors: "ls: cannot access '/tmp/not-there': No such file or directory\n",
         },
     ];
 
@@ -285,6 +293,12 @@ async fn an_invocation_reports_what_the_guest_ran() {
             answered["StandardOutputContent"].as_str(),
             Some(row.output),
             "case {:?}: expected the guest's output, got {answered}",
+            row.case
+        );
+        assert_eq!(
+            answered["StandardErrorContent"].as_str(),
+            Some(row.errors),
+            "case {:?}: expected what the guest reported it could not do, got {answered}",
             row.case
         );
         assert_eq!(

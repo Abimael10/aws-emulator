@@ -694,6 +694,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 invocation.delivered(crate::state::commands::InvocationOutcome {
                     plugin_name: step.name,
                     output: run.output,
+                    errors: run.errors,
                     response_code: run.status,
                     due_at,
                     delivered: true,
@@ -709,6 +710,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // No step ran, so there is no step to name and no exit code to report.
                 plugin_name: String::new(),
                 output: Vec::new(),
+                errors: Vec::new(),
                 response_code: crate::state::commands::NO_RESPONSE_CODE,
                 due_at: undelivered_at,
                 delivered: false,
@@ -757,6 +759,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // report the patch reads project, not through a shell's output, so
                     // nothing is reported as having been written on the node.
                     output: Vec::new(),
+                    errors: Vec::new(),
                     response_code: crate::state::commands::SUCCESSFUL_RESPONSE_CODE,
                     due_at,
                     delivered: true,

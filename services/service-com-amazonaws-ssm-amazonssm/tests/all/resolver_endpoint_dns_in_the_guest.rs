@@ -801,17 +801,27 @@ async fn the_guests_lookup_client_reads_the_same_dns() {
         "case \"a text record the lookup names\": expected exit 0, got {code}"
     );
 
-    let (written, code) = output(
+    let answered = ran(
         &estate,
         "a setting the lookup client has no reading for",
         &format!("nslookup -norecurse app.{ZONE} {LINK_LOCAL_RESOLVER}"),
     )
     .await;
+    // The agent reports the two streams apart, so a command this guest could not run writes
+    // nothing and the shell's own diagnostic for it is the invocation's standard error.
     assert_eq!(
-        (written.as_str(), code),
-        ("sh: nslookup: command not found\n", COULD_NOT_RUN),
+        (
+            answered["StandardOutputContent"].as_str(),
+            answered["StandardErrorContent"].as_str(),
+            answered["ResponseCode"].as_i64(),
+        ),
+        (
+            Some(""),
+            Some("sh: nslookup: command not found\n"),
+            Some(COULD_NOT_RUN),
+        ),
         "case \"a setting the lookup client has no reading for\": expected the status a shell \
          answers for a command it could not run, and the diagnostic it writes for one, got \
-         {written:?} with {code}"
+         {answered}"
     );
 }

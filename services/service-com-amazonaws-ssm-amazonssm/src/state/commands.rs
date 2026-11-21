@@ -183,6 +183,10 @@ pub struct InvocationOutcome {
     pub plugin_name: String,
     /// The lines the guest wrote to its standard output, in the order it wrote them.
     pub output: Vec<String>,
+    /// The lines the guest wrote to its standard ERROR, in the order it wrote them — what the
+    /// script reported it could not do, which is what `StandardErrorContent` carries beside
+    /// the exit code below.
+    pub errors: Vec<String>,
     /// "The exit code of the plugin script" (`GetCommandInvocationResult$ResponseCode`):
     /// the status the guest's own shell answered with.
     pub response_code: i32,
@@ -223,12 +227,51 @@ impl InvocationOutcome {
 
     /// The whole of what the guest wrote, as `StandardOutputContent` carries it: the lines
     /// in order, each ended by a newline the way a terminal writes them.
+    ///
+    /// "The first 24,000 characters written by the plugin to `stdout`"
+    /// (`GetCommandInvocationResult$StandardOutputContent`, whose modelled length is
+    /// `0..24000`), so a script that wrote more is reported by its first characters.
     pub fn standard_output(&self) -> String {
-        self.output
+        cut_to(&self.lines(&self.output), MAX_STANDARD_OUTPUT_BYTES)
+    }
+
+    /// The whole of what the guest reported it could not do, as `StandardErrorContent`
+    /// carries it: "the first 8,000 characters written by the plugin to `stderr`"
+    /// (`GetCommandInvocationResult$StandardErrorContent`, whose modelled length is
+    /// `0..8000`).
+    pub fn standard_error(&self) -> String {
+        cut_to(&self.lines(&self.errors), MAX_STANDARD_ERROR_BYTES)
+    }
+
+    /// One of the two streams as the member carrying it reads: the lines in order, each ended
+    /// by a newline the way a terminal writes them.
+    fn lines(&self, stream: &[String]) -> String {
+        stream
             .iter()
             .map(|line| format!("{line}\n"))
             .collect()
     }
+}
+
+/// The modelled lengths of the two members a finished invocation reports its streams in:
+/// `GetCommandInvocationResult$StandardOutputContent` (`len 0..24000`) and
+/// `$StandardErrorContent` (`len 0..8000`).
+const MAX_STANDARD_OUTPUT_BYTES: usize = 24_000;
+
+/// See [`MAX_STANDARD_OUTPUT_BYTES`].
+const MAX_STANDARD_ERROR_BYTES: usize = 8_000;
+
+/// `written` cut to `ceiling` bytes, on a character boundary so what is reported is still
+/// text — the "first N characters" each of those members carries.
+fn cut_to(written: &str, ceiling: usize) -> String {
+    if written.len() <= ceiling {
+        return written.to_string();
+    }
+    let mut cut = ceiling;
+    while cut > 0 && !written.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    written[..cut].to_string()
 }
 
 /// `at` as the ISO-8601 instant a command invocation's execution times are written in:
@@ -900,14 +943,7 @@ const MAX_PLUGIN_OUTPUT_BYTES: usize = 2_500;
 /// `output` cut to [`MAX_PLUGIN_OUTPUT_BYTES`], on a character boundary so the member still
 /// carries text.
 fn truncated_plugin_output(output: &str) -> String {
-    if output.len() <= MAX_PLUGIN_OUTPUT_BYTES {
-        return output.to_string();
-    }
-    let mut cut = MAX_PLUGIN_OUTPUT_BYTES;
-    while cut > 0 && !output.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    output[..cut].to_string()
+    cut_to(output, MAX_PLUGIN_OUTPUT_BYTES)
 }
 
 /// The ids of the nodes `region` holds that one target selects, or `Err(key)` when the

@@ -240,8 +240,8 @@ async fn an_invocation_reads_back_what_the_instances_user_data_wrote() {
                 );
             }
             None => {
-                // The guest's session reports ONE stream, so the reader's diagnostic is what
-                // the invocation carries as its output rather than a separate error stream
+                // The agent reports the two streams apart, so the reader's own diagnostic is
+                // what the invocation carries as its standard ERROR and its output is empty
                 // (the sibling in-guest suite's `ls` rows take the same reading).
                 assert_eq!(
                     answered["Status"].as_str(),
@@ -257,6 +257,11 @@ async fn an_invocation_reads_back_what_the_instances_user_data_wrote() {
                 );
                 assert_eq!(
                     answered["StandardOutputContent"].as_str(),
+                    Some(""),
+                    "case {case:?}: a reader that read nothing wrote nothing, got {answered}"
+                );
+                assert_eq!(
+                    answered["StandardErrorContent"].as_str(),
                     Some(
                         format!("cat: {}: No such file or directory\n", row.path).as_str()
                     ),

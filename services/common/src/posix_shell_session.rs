@@ -227,15 +227,21 @@ use super::posix_shell_volume::ShellVolume;
 ///
 /// Each one's whole effect is inside the session, which is why it can be performed in
 /// process: `echo` writes a line of the program's output, `cat` writes a file this session
-/// holds, `true`, `false` and `:` answer a status, `exit` ends the session, and
-/// `export`/`unset` change its variables. A command that is not one of these is either a
+/// holds, `true`, `false` and `:` answer a status, `exit` ends the session,
+/// `export`/`unset` change its variables, and `set` changes the OPTIONS the commands after
+/// it are performed under ([`ShellOption`]) — which is what a script's own first line does.
+/// A command that is not one of these is either a
 /// TEXT FILTER ([`TEXT_FILTER_COMMANDS`]) or a file utility ([`VOLUME_COMMANDS`]) this
 /// session performs, or it needs a program, which is the environment's to provide
 /// ([`EnvironmentPrograms`]) and not the shell's, and is answered as a command that could not
 /// be run when the environment provides none of that name.
 pub const BUILT_IN_COMMANDS: &[&str] = &[
-    "echo", "cat", "true", "false", ":", "exit", "export", "unset",
+    "echo", "cat", "true", "false", ":", "exit", "export", "unset", SET_COMMAND,
 ];
+
+/// The built-in utility that changes the OPTIONS the shell performs the rest of the program
+/// under ([`ShellOption`]), which is what a script's own first line does.
+const SET_COMMAND: &str = "set";
 
 /// What one program of the environment a session runs in answered: the status it exited
 /// with and the lines it wrote.
@@ -466,7 +472,71 @@ const COMMAND_WRAPPERS: &[&str] = &["nohup", "setsid"];
 /// special built-in utilities, for which "variable assignments specified with special
 /// built-in utilities remain in effect after the built-in completes". For every other command
 /// an assignment before it is that command's environment alone.
-const PERSISTING_COMMANDS: &[&str] = &[":", ".", "exit", "export", "unset"];
+const PERSISTING_COMMANDS: &[&str] = &[":", ".", "exit", "export", "unset", SET_COMMAND];
+
+/// One OPTION of the shell a program's `set` command turns on or off, out of the options
+/// whose effect this session performs.
+///
+/// Each is an option POSIX gives `set`, and each changes how the commands AFTER it are
+/// performed rather than doing anything itself — which is why a session holds them
+/// ([`ShellOptions`]) instead of the command answering out of them. An option whose effect
+/// this session does not perform is not here, and `set` fails closed for it like every other
+/// form no session performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellOption {
+    /// `-e`, `-o errexit`: "when this option is on, when any command fails … the shell
+    /// immediately shall exit".
+    ErrExit,
+    /// `-u`, `-o nounset`: "the shell shall write a message to standard error when it tries
+    /// to expand a variable that is not set and immediately exit".
+    NoUnset,
+    /// `-o pipefail`: the status of a pipeline is the last command in it that failed, and
+    /// zero for one in which none did.
+    PipeFail,
+}
+
+/// The letter `set` names an option by, for the options that have one: `-e` and `-u`.
+/// `pipefail` is named only by `-o`, which is how the shell spells it.
+fn option_lettered(letter: char) -> Option<ShellOption> {
+    match letter {
+        'e' => Some(ShellOption::ErrExit),
+        'u' => Some(ShellOption::NoUnset),
+        _ => None,
+    }
+}
+
+/// The option `set -o NAME` names, for the options this session performs.
+fn option_named(name: &str) -> Option<ShellOption> {
+    match name {
+        "errexit" => Some(ShellOption::ErrExit),
+        "nounset" => Some(ShellOption::NoUnset),
+        "pipefail" => Some(ShellOption::PipeFail),
+        _ => None,
+    }
+}
+
+/// The letter that names an option by its long NAME instead ([`option_named`]): the word
+/// after the one carrying it, wherever in a group of letters it stands — `set -o pipefail`
+/// and `set -uo pipefail` are the same option.
+const LONG_OPTION_LETTER: char = 'o';
+
+/// Which of those options are ON in a session right now — all of them off for a session
+/// whose program has not turned one on, which is how a shell starts.
+#[derive(Debug, Clone, Copy, Default)]
+struct ShellOptions {
+    /// See [`ShellOption::ErrExit`].
+    errexit: bool,
+    /// See [`ShellOption::NoUnset`].
+    nounset: bool,
+    /// See [`ShellOption::PipeFail`].
+    pipefail: bool,
+}
+
+/// What the shell writes for the expansion of a variable it holds none of while
+/// [`ShellOption::NoUnset`] is on, beside ending the program on a non-zero status:
+/// `<name>: parameter not set`, under the name the shell writes its diagnostics with
+/// ([`SHELL_NAME`]).
+const PARAMETER_NOT_SET: &str = "parameter not set";
 
 /// What a shell writes about a command NAME its search resolved nothing for, and the name it
 /// writes its own diagnostics under ([`ShellSession::command_not_found`]): a shell prefixes
@@ -641,7 +711,10 @@ fn file_path(named: &str) -> Option<String> {
 /// commands it opens — through a grouping character or a reserved word.
 ///
 /// Checked WITHOUT parsing, which is the point: the parser is what the nesting bound
-/// protects.
+/// protects. The count can only be higher than the depth a parse descends to, never lower,
+/// so it refuses a program and never admits one; a caller that hands this session a whole
+/// SCRIPT therefore states the bound for a script's worth of groups, and sizes the stack its
+/// run is performed on for that bound (`…ec2…::state::guest_commands`).
 fn within_parse_bounds(line: &str, bounds: &Bounds) -> bool {
     if line.len() > bounds.command_bytes {
         return false;
@@ -747,6 +820,26 @@ pub struct ShellSession {
     /// nothing has changed it in, and never read for a session whose tree is its own: such a
     /// tree keys a file by the path a program named.
     working_directory: String,
+    /// The shell OPTIONS this session performs the program under, which its own `set`
+    /// commands turn on and off ([`Self::run_set`]).
+    options: ShellOptions,
+    /// How many enclosing commands are TESTING the status of what they run right now — the
+    /// condition of an `if`, a `while` or an `until` — which is where [`ShellOption::ErrExit`]
+    /// does not end the program: "the shell shall not exit if the command that fails is part
+    /// of the … condition of a while, until or if statement".
+    tested_status: usize,
+    /// Whether the pipeline whose status the and-or list being performed answers with was
+    /// written with `!`, which is the other place that option does not end the program: the
+    /// status of such a pipeline is one the program itself is reading.
+    negated_pipeline: bool,
+    /// Set for a caller that reports standard output and standard ERROR as members of its own,
+    /// which keeps a diagnostic off the console this session keeps
+    /// ([`Self::reporting_both_streams`]).
+    separate_errors: bool,
+    /// How many COMPOUND commands are being performed inside one another right now, which is
+    /// what bounds this module's own recursion over the grammar's control flow
+    /// ([`Self::run_compound`]).
+    compound_depth: usize,
 }
 
 /// The FILES of the tree this session works over, handed to the ENVIRONMENT's programs
@@ -883,6 +976,11 @@ impl ShellSession {
             piped_input: None,
             slept: ::std::time::Duration::ZERO,
             working_directory: super::posix_shell_volume::ROOT.to_string(),
+            options: ShellOptions::default(),
+            tested_status: 0,
+            negated_pipeline: false,
+            separate_errors: false,
+            compound_depth: 0,
             config,
         };
         for (name, value) in variables {
@@ -960,6 +1058,21 @@ impl ShellSession {
     #[must_use]
     pub fn with_environment_programs(mut self, programs: Box<dyn EnvironmentPrograms>) -> Self {
         self.programs = Some(programs);
+        self
+    }
+
+    /// This session for a caller whose API reports the two streams SEPARATELY — one member
+    /// for what the program wrote and one for what it reported it could not do.
+    ///
+    /// A session given a MACHINE's tree keeps a diagnostic on the console as well as in
+    /// [`Self::errors`], because a console is where a machine's own diagnostics are read and
+    /// the one stream a console carries is both of them. A caller that reports the two as
+    /// members of its own reads them apart ([`Self::output`], [`Self::errors`]), so for it a
+    /// diagnostic is NOT part of what the program wrote: this keeps it off the console, the
+    /// way the two descriptors of a program are separate streams.
+    #[must_use]
+    pub fn reporting_both_streams(mut self) -> Self {
+        self.separate_errors = true;
         self
     }
 
@@ -1096,25 +1209,66 @@ impl ShellSession {
     /// Perform an and-or list: its first pipeline, then each later pipeline only when the
     /// operator before it says so — `&&` runs the next on a zero status, `||` on a non-zero
     /// one — and answer the status of the last pipeline that ran.
+    ///
+    /// The status of the WHOLE list is what [`ShellOption::ErrExit`] reads: a pipeline the
+    /// operator after it tests is one "part of an AND-OR list other than the last", which that
+    /// option passes over, so the check belongs here rather than at each pipeline.
     fn run_and_or_list(&mut self, list: &::brush_parser::ast::AndOrList) -> i32 {
         let mut status = self.run_pipeline(&list.first);
-        for next in &list.additional {
+        // Whether the status is the one the LAST pipeline of the list answered. A pipeline the
+        // operator after it short-circuited is a status the list itself tested — "part of an
+        // AND-OR list other than the last" — which [`ShellOption::ErrExit`] passes over.
+        let mut from_last = list.additional.is_empty();
+        let count = list.additional.len();
+        for (index, next) in list.additional.iter().enumerate() {
             if self.exit_status.is_some() {
                 break;
             }
-            match next {
+            let (pipeline, runs) = match next {
                 ::brush_parser::ast::AndOr::And(pipeline) => {
-                    if status == self.config.statuses.success {
-                        status = self.run_pipeline(pipeline);
-                    }
+                    (pipeline, status == self.config.statuses.success)
                 }
                 ::brush_parser::ast::AndOr::Or(pipeline) => {
-                    if status != self.config.statuses.success {
-                        status = self.run_pipeline(pipeline);
-                    }
+                    (pipeline, status != self.config.statuses.success)
                 }
+            };
+            if runs {
+                status = self.run_pipeline(pipeline);
             }
+            from_last = runs && index.saturating_add(1) == count;
         }
+        if from_last {
+            self.exit_on_failure(status);
+        }
+        status
+    }
+
+    /// End the program on `status` when [`ShellOption::ErrExit`] is on and this list's status
+    /// is not one the program itself is reading: "when any command fails … the shell
+    /// immediately shall exit", other than inside the condition of an `if`, a `while` or an
+    /// `until` ([`Self::tested_status`]) and other than a pipeline written with `!`
+    /// ([`Self::negated_pipeline`]).
+    ///
+    /// A program that has already ended keeps the status it ended with.
+    fn exit_on_failure(&mut self, status: i32) {
+        if !self.options.errexit
+            || self.tested_status > 0
+            || self.negated_pipeline
+            || self.exit_status.is_some()
+            || status == self.config.statuses.success
+        {
+            return;
+        }
+        self.exit_status = Some(status);
+    }
+
+    /// Perform `list` as a status this program is READING rather than acting on — the
+    /// condition of an `if`, a `while` or an `until` — so a command that fails inside it does
+    /// not end the program under [`ShellOption::ErrExit`].
+    fn run_tested_list(&mut self, list: &::brush_parser::ast::CompoundList) -> i32 {
+        self.tested_status = self.tested_status.saturating_add(1);
+        let status = self.run_compound_list(list);
+        self.tested_status = self.tested_status.saturating_sub(1);
         status
     }
 
@@ -1133,8 +1287,15 @@ impl ShellSession {
     /// answers the failure of the write that did not happen rather than running the rest of it
     /// over an empty stream — a stage past the bound must not be able to make a later stage
     /// answer for input nothing produced.
+    ///
+    /// Under [`ShellOption::PipeFail`] the status is "the value of the last (rightmost)
+    /// command to exit with a non-zero status, or zero if all commands exit successfully"
+    /// instead — read before a `!` negates it, the way the shell reads it.
     fn run_pipeline(&mut self, pipeline: &::brush_parser::ast::Pipeline) -> i32 {
         let mut status = self.config.statuses.success;
+        // The rightmost stage that failed, which is the pipeline's status under
+        // [`ShellOption::PipeFail`].
+        let mut failed: Option<i32> = None;
         let last = pipeline.seq.len().saturating_sub(1);
         // What the stage before the one being performed wrote.
         let mut upstream: Option<String> = None;
@@ -1153,10 +1314,14 @@ impl ShellSession {
             let held_input = ::std::mem::replace(&mut self.piped_input, upstream.take());
             status = self.run_command(command);
             self.piped_input = held_input;
+            if status != self.config.statuses.success {
+                failed = Some(status);
+            }
             if connected {
                 let captured = self.captures.pop().unwrap_or_default();
                 if captured.overflowed {
                     // Not a pipeline that ran, so not one a `!` negates either.
+                    self.negated_pipeline = false;
                     return self.config.statuses.failure;
                 }
                 upstream = Some(captured.text);
@@ -1165,6 +1330,9 @@ impl ShellSession {
                 break;
             }
         }
+        if self.options.pipefail {
+            status = failed.unwrap_or(self.config.statuses.success);
+        }
         if pipeline.bang {
             status = if status == self.config.statuses.success {
                 self.config.statuses.failure
@@ -1172,6 +1340,9 @@ impl ShellSession {
                 self.config.statuses.success
             };
         }
+        // Which the and-or list around it reads, because the status of a pipeline the program
+        // itself negated is not one [`ShellOption::ErrExit`] ends the program for.
+        self.negated_pipeline = pipeline.bang;
         status
     }
 
@@ -1282,16 +1453,38 @@ impl ShellSession {
     /// Every other compound form is one this session does not perform: a subshell and a
     /// `case` clause need an environment of their own or a pattern evaluation this session
     /// has none of, so they answer as a command that could not be run.
+    ///
+    /// How deeply they may NEST is bounded here, by the same bound a parse of the program is
+    /// given ([`Bounds::nesting`]): performing one costs this module a chain of calls per
+    /// level — the compound command, its list, its and-or lists, its pipelines and the
+    /// commands inside them — so a program nesting one inside another without end would spend
+    /// the stack of the thread performing it rather than a budget. A compound command past
+    /// that depth is one this session does not perform, which is the same closed failure
+    /// every other form it cannot perform answers with.
+    ///
+    /// It is the BELT under the parse bound rather than the first thing a program meets: that
+    /// bound counts every grouping character and reserved word of the program
+    /// ([`within_parse_bounds`]), and a compound command carries several of each per level, so
+    /// a program that would nest this deep is refused before it is read at all. What this
+    /// bound answers for is a session whose caller states the parse bound for a whole SCRIPT's
+    /// worth of groups, where the count a flat script spends says nothing about the depth any
+    /// one line of it reaches.
     fn run_compound(&mut self, compound: &::brush_parser::ast::CompoundCommand) -> i32 {
         use ::brush_parser::ast::CompoundCommand as Compound;
-        match compound {
+        if self.compound_depth >= self.config.bounds.nesting {
+            return self.config.statuses.could_not_run;
+        }
+        self.compound_depth = self.compound_depth.saturating_add(1);
+        let status = match compound {
             Compound::BraceGroup(group) => self.run_compound_list(&group.list),
             Compound::IfClause(clause) => self.run_if_clause(clause),
             Compound::WhileClause(clause) => self.run_while_clause(clause, true),
             Compound::UntilClause(clause) => self.run_while_clause(clause, false),
             Compound::ForClause(clause) => self.run_for_clause(clause),
             _ => self.config.statuses.could_not_run,
-        }
+        };
+        self.compound_depth = self.compound_depth.saturating_sub(1);
+        status
     }
 
     /// Perform a list of and-or lists — the body of a compound command — and answer the
@@ -1311,7 +1504,7 @@ impl ShellSession {
     /// condition answered success, and success for an `if` no branch of which ran, which is
     /// the status POSIX gives it ("exit status of zero if no condition is true").
     fn run_if_clause(&mut self, clause: &::brush_parser::ast::IfClauseCommand) -> i32 {
-        let condition = self.run_compound_list(&clause.condition);
+        let condition = self.run_tested_list(&clause.condition);
         if self.exit_status.is_some() {
             return condition;
         }
@@ -1322,7 +1515,7 @@ impl ShellSession {
             match otherwise.condition.as_ref() {
                 // An `elif`, which is its own condition and its own branch.
                 Some(condition) => {
-                    let answered = self.run_compound_list(condition);
+                    let answered = self.run_tested_list(condition);
                     if self.exit_status.is_some() {
                         return answered;
                     }
@@ -1353,7 +1546,7 @@ impl ShellSession {
             if self.commands_left == 0 {
                 return self.config.statuses.could_not_run;
             }
-            let condition = self.run_compound_list(&clause.0);
+            let condition = self.run_tested_list(&clause.0);
             if self.exit_status.is_some() {
                 return condition;
             }
@@ -2037,9 +2230,10 @@ impl ShellSession {
         }
         // Kept for the caller that reports the two streams separately ([`Self::errors`]),
         // and ALSO on the console of a session given a machine's tree, which is where a
-        // guest's diagnostics are read.
+        // guest's diagnostics are read — unless the caller reports the two as members of its
+        // own ([`Self::reporting_both_streams`]), for which they are separate streams.
         self.keep_error(text);
-        if self.volume.is_some() {
+        if self.volume.is_some() && !self.separate_errors {
             self.keep_output(text);
         }
         true
@@ -2235,8 +2429,73 @@ impl ShellSession {
                 }
                 self.config.statuses.success
             }
+            SET_COMMAND => self.run_set(arguments, redirections),
             _ => self.config.statuses.could_not_run,
         }
+    }
+
+    /// Perform `set`: turn the shell OPTIONS its words name on (`-`) or off (`+`), for the
+    /// options whose effect this session performs ([`ShellOption`]).
+    ///
+    /// `set` with no word at all writes "the names and values of all shell variables", which
+    /// is what the utility does when it is given none. Every other FORM is one no session
+    /// performs — an option whose effect it does not perform, a positional-parameter
+    /// assignment, `set --` — and fails closed as a command that could not be run, with no
+    /// option changed: the words are read first and applied only once every one of them is an
+    /// option this session performs, so a program is never left half-way between two sets of
+    /// options.
+    fn run_set(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
+        if arguments.is_empty() {
+            let written: String = self
+                .variables
+                .iter()
+                .map(|(name, value)| format!("{name}={value}\n"))
+                .collect();
+            return if self.write_stdout(&written, redirections) {
+                self.config.statuses.success
+            } else {
+                self.config.statuses.failure
+            };
+        }
+        let mut changes: Vec<(ShellOption, bool)> = Vec::new();
+        let mut words = arguments.iter();
+        while let Some(word) = words.next() {
+            // `-` turns the options its letters name on and `+` turns them off, which is the
+            // way round the utility is specified.
+            let (on, letters) = match (word.strip_prefix('-'), word.strip_prefix('+')) {
+                (Some(letters), _) => (true, letters),
+                (_, Some(letters)) => (false, letters),
+                _ => return self.config.statuses.could_not_run,
+            };
+            if letters.is_empty() {
+                return self.config.statuses.could_not_run;
+            }
+            for letter in letters.chars() {
+                // `o` names the option by its long NAME, which is the word after this one —
+                // wherever in the group the letter stands, so `-uo pipefail` sets both the
+                // option its letter names and the one its name does. It is the only spelling
+                // some options have.
+                if letter == LONG_OPTION_LETTER {
+                    let Some(option) = words.next().and_then(|named| option_named(named)) else {
+                        return self.config.statuses.could_not_run;
+                    };
+                    changes.push((option, on));
+                    continue;
+                }
+                let Some(option) = option_lettered(letter) else {
+                    return self.config.statuses.could_not_run;
+                };
+                changes.push((option, on));
+            }
+        }
+        for (option, on) in changes {
+            match option {
+                ShellOption::ErrExit => self.options.errexit = on,
+                ShellOption::NoUnset => self.options.nounset = on,
+                ShellOption::PipeFail => self.options.pipefail = on,
+            }
+        }
+        self.config.statuses.success
     }
 
     /// Perform one of the commands a session working over a TREE provides
@@ -2823,9 +3082,13 @@ impl ShellSession {
         });
         self.substitution_undo.push(BTreeMap::new());
         let held_exit = self.exit_status.take();
+        let held_negated = self.negated_pipeline;
         let held_bytes = self.held_bytes;
         let status = self.run_program(program);
         self.exit_status = held_exit;
+        // What the commands INSIDE the substitution were written with is no part of how the
+        // command around it is read: the status this substitution answers is the word's.
+        self.negated_pipeline = held_negated;
         for (name, held) in self.substitution_undo.pop().unwrap_or_default() {
             match held {
                 Some(value) => self.variables.insert(name, value),
@@ -2884,12 +3147,29 @@ impl ShellSession {
     /// the expansion names. Every other form — a substring, a replacement, a length, an
     /// indirection, a positional or special parameter — is one this session does not
     /// resolve.
-    fn expand_parameter(&self, parameter: &::brush_parser::word::ParameterExpr) -> Option<String> {
+    ///
+    /// While [`ShellOption::NoUnset`] is on, the plain form of a variable this session holds
+    /// NONE of is an error instead: "the shell shall write a message to standard error …
+    /// and … exit", which is the diagnostic ([`PARAMETER_NOT_SET`]) and the non-zero status
+    /// the program then ends on. The default-value form names what to use for an unset
+    /// variable, so it is not one.
+    fn expand_parameter(
+        &mut self,
+        parameter: &::brush_parser::word::ParameterExpr,
+    ) -> Option<String> {
         match parameter {
             ::brush_parser::word::ParameterExpr::Parameter {
                 parameter: ::brush_parser::word::Parameter::Named(name),
                 indirect: false,
-            } => Some(self.variable(name).unwrap_or_default().to_string()),
+            } => match self.variable(name) {
+                Some(value) => Some(value.to_string()),
+                None if self.options.nounset => {
+                    let name = name.clone();
+                    self.refuse_unset_parameter(&name);
+                    None
+                }
+                None => Some(String::new()),
+            },
             ::brush_parser::word::ParameterExpr::UseDefaultValues {
                 parameter: ::brush_parser::word::Parameter::Named(name),
                 indirect: false,
@@ -2904,6 +3184,22 @@ impl ShellSession {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// Report the expansion of the unset variable `name` and END the program, which is what a
+    /// non-interactive shell does for one while [`ShellOption::NoUnset`] is on.
+    ///
+    /// The diagnostic goes to standard error — where this session keeps it for the caller
+    /// that reports that stream — and the status the program ends on is the failure a shell
+    /// exits with for it.
+    fn refuse_unset_parameter(&mut self, name: &str) {
+        let _ = self.write_stderr(
+            &format!("{SHELL_NAME}: {name}: {PARAMETER_NOT_SET}\n"),
+            &Redirections::default(),
+        );
+        if self.exit_status.is_none() {
+            self.exit_status = Some(self.config.statuses.failure);
         }
     }
 }

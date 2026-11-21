@@ -139,8 +139,8 @@ fn only_the_catalog_is_performed() {
     }
     assert_eq!(
         BUILT_IN_COMMANDS.len(),
-        8,
-        "case the catalog: expected the eight session-local utilities, got {BUILT_IN_COMMANDS:?}"
+        9,
+        "case the catalog: expected the nine session-local utilities, got {BUILT_IN_COMMANDS:?}"
     );
 }
 
@@ -2102,5 +2102,245 @@ fn a_command_nothing_resolved_says_so_on_standard_error() {
         performed.errors().is_empty(),
         "case \"a command that ran\": expected nothing on the error stream, got {:?}",
         performed.errors()
+    );
+}
+
+/// RULE: `set` turns the shell OPTIONS its words name on and off, and the options hold for
+/// the commands AFTER it — `-e` ends the program at the first command that fails other than
+/// one whose status the program itself reads, `-u` makes the expansion of a variable the
+/// session holds none of an error, and `-o pipefail` makes a pipeline worth its rightmost
+/// failing stage.
+///
+/// The rows differ along what the rule generalises over: which option the program sets and in
+/// which spelling (a letter, several letters in one word, the long `-o` name, the `+` form),
+/// where the failing command stands (alone, inside a tested condition, behind `!`, inside a
+/// pipeline), and whether the program ends early.
+#[test]
+fn the_options_a_program_sets_hold_for_the_commands_after_it() {
+    let statuses = Statuses::default();
+    // (case, the program, the status it ended on, the lines it wrote)
+    let rows: [(&str, &str, i32, &[&str]); 13] = [
+        (
+            "errexit ends the program at the failing command",
+            "set -e\necho before\nfalse\necho after",
+            statuses.failure,
+            &["before"],
+        ),
+        (
+            // "part of an AND-OR list other than the last" is a status the program itself is
+            // reading, which this option passes over.
+            "errexit passes over a command another tests with &&",
+            "set -e\nfalse && echo taken\necho after",
+            statuses.success,
+            &["after"],
+        ),
+        (
+            "errexit passes over a negated pipeline",
+            "set -e\n! false\necho after",
+            statuses.success,
+            &["after"],
+        ),
+        (
+            "errexit passes over a command another tests with ||",
+            "set -e\nfalse || echo recovered\necho after",
+            statuses.success,
+            &["recovered", "after"],
+        ),
+        (
+            "errexit turned off again",
+            "set -e\nset +e\nfalse\necho after",
+            statuses.success,
+            &["after"],
+        ),
+        (
+            "nounset refuses the expansion of a variable nothing set",
+            "set -u\necho ${NOTHING_AT_ALL}\necho after",
+            statuses.failure,
+            &[],
+        ),
+        (
+            "nounset leaves a variable the session holds alone",
+            "set -u\nHELD=value\necho ${HELD}",
+            statuses.success,
+            &["value"],
+        ),
+        (
+            "nounset leaves the default-value form alone",
+            "set -u\necho ${NOTHING_AT_ALL:-fallback}",
+            statuses.success,
+            &["fallback"],
+        ),
+        (
+            "pipefail answers the stage that failed",
+            "set -o pipefail\nfalse | cat",
+            statuses.failure,
+            &[],
+        ),
+        (
+            "a pipeline without pipefail answers its last stage",
+            "false | cat",
+            statuses.success,
+            &[],
+        ),
+        (
+            // Several letters in one word, which is how a script's own first line is written.
+            "both options in one word",
+            "set -eu\necho before\nfalse\necho after",
+            statuses.failure,
+            &["before"],
+        ),
+        (
+            // The long option's NAME is the word after the group, wherever in the group its
+            // letter stands: `set -uo pipefail` is the line a real script opens with.
+            "a letter group ending in the long option",
+            "set -uo pipefail\nfalse | cat\necho ${NOTHING_AT_ALL}",
+            statuses.failure,
+            &[],
+        ),
+        (
+            "every option in one word",
+            "set -euo pipefail\necho before\nfalse | cat\necho after",
+            statuses.failure,
+            &["before"],
+        ),
+    ];
+    for (case, program, expected_status, expected_output) in rows {
+        let mut held = session();
+        let mut status = statuses.success;
+        for line in program.lines() {
+            status = held.run(line);
+            if let Some(exited) = held.exit_status() {
+                status = exited;
+                break;
+            }
+        }
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected status {expected_status}, got {status}"
+        );
+        assert_eq!(
+            held.output(),
+            expected_output,
+            "case {case:?}: expected {expected_output:?}, got {:?}",
+            held.output()
+        );
+    }
+
+    // The diagnostic `set -u` writes for the expansion it refused, which is the shell's own.
+    let mut held = session();
+    held.run("set -u");
+    held.run("echo ${NOTHING_AT_ALL}");
+    assert_eq!(
+        held.errors(),
+        ["sh: NOTHING_AT_ALL: parameter not set"],
+        "case \"the nounset diagnostic\": expected the shell's own wording, got {:?}",
+        held.errors()
+    );
+
+    // An option whose effect this session performs nothing of fails closed, with nothing
+    // changed: the command after it still runs, and the failing command before it did not end
+    // the program.
+    let mut held = session();
+    assert_eq!(
+        held.run("set -o noclobber"),
+        statuses.could_not_run,
+        "case \"an option no session performs\": expected the status of a form it does not \
+         perform"
+    );
+    assert_eq!(
+        held.run("false"),
+        statuses.failure,
+        "case \"an option no session performs\": expected the next command to run"
+    );
+    assert!(
+        held.exit_status().is_none(),
+        "case \"an option no session performs\": expected no option to have been turned on, \
+         got {:?}",
+        held.exit_status()
+    );
+
+    // `set` with no word at all writes the names and values of the variables the session
+    // holds, which is what the utility does when it is given none.
+    let mut held = ShellSession::new(
+        BTreeMap::from([("ONE".to_string(), "1".to_string())]),
+        SessionConfig {
+            output: Some(OutputLimits {
+                lines: 8,
+                line_bytes: 64,
+            }),
+            ..SessionConfig::default()
+        },
+    );
+    assert_eq!(
+        held.run("set"),
+        statuses.success,
+        "case \"set with no word\": expected it to write the variables"
+    );
+    assert_eq!(
+        held.output(),
+        ["ONE=1"],
+        "case \"set with no word\": expected the session's own variables, got {:?}",
+        held.output()
+    );
+}
+
+/// RULE: a caller that reports the two streams as members of its own reads them apart, so a
+/// diagnostic is not part of what the program wrote — while the console of a machine's
+/// session, which carries one stream, keeps both.
+#[test]
+fn a_caller_reporting_both_streams_keeps_a_diagnostic_off_the_console() {
+    let statuses = Statuses::default();
+    // The condition of an `if` is a status the program itself reads, which `set -e` passes
+    // over: a compound command is a form a session working over a TREE performs, so the case
+    // is driven on one of those.
+    let mut machine = in_volume().reporting_both_streams();
+    machine.run("set -e");
+    let status = machine.run("if false; then echo taken; fi\necho after");
+    assert_eq!(
+        status, statuses.success,
+        "case \"a status a condition reads\": expected the program to go on, got {status}"
+    );
+    assert_eq!(
+        machine.output(),
+        ["after"],
+        "case \"a status a condition reads\": expected the line after the `if`, got {:?}",
+        machine.output()
+    );
+    assert!(
+        machine.exit_status().is_none(),
+        "case \"a status a condition reads\": expected the program not to have ended, got {:?}",
+        machine.exit_status()
+    );
+
+    let mut console = in_volume();
+    assert_eq!(
+        console.run("definitely-not-a-program"),
+        statuses.could_not_run,
+        "case \"a machine's console\": expected the status of a command nothing resolved"
+    );
+    assert_eq!(
+        console.output(),
+        ["sh: definitely-not-a-program: command not found"],
+        "case \"a machine's console\": expected the diagnostic on the console too, got {:?}",
+        console.output()
+    );
+
+    let mut apart = in_volume().reporting_both_streams();
+    assert_eq!(
+        apart.run("echo written\ndefinitely-not-a-program"),
+        statuses.could_not_run,
+        "case \"the two streams apart\": expected the status of a command nothing resolved"
+    );
+    assert_eq!(
+        apart.output(),
+        ["written"],
+        "case \"the two streams apart\": expected only what the program wrote, got {:?}",
+        apart.output()
+    );
+    assert_eq!(
+        apart.errors(),
+        ["sh: definitely-not-a-program: command not found"],
+        "case \"the two streams apart\": expected the diagnostic on the error stream, got {:?}",
+        apart.errors()
     );
 }

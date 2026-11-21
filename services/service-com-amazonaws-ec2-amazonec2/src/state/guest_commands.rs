@@ -15,15 +15,20 @@
 //!
 //! # What a run is, and what it is not
 //!
-//! The commands are performed by that session, in a tree holding exactly this machine's
-//! storage and its devices: a command whose whole effect is inside the guest (writing a file,
-//! reading one back, writing a line of output) really happens, and the file is still there on
-//! the next run and on the next boot, because the tree IS the instance's storage. Every
-//! command the session provides no program for — anything needing a process, a socket or a
-//! host path — runs nothing and answers the status a shell answers for a utility it could not
-//! find ([`::service_common::posix_shell_session::Statuses::could_not_run`]), exactly as it
-//! does on a machine whose shell has no such program. Nothing here starts a process, opens a
-//! host file or reaches a socket, and nothing is written for a command that did not run.
+//! The commands are ONE SCRIPT, performed by one session, in a tree holding exactly this
+//! machine's storage and its devices: an agent in the guest writes the lines it was delivered
+//! into a script file and runs that file with the guest's shell, so a construct that spans
+//! lines is the script's own — a here-document opened on one line carries the lines under it,
+//! a compound command is read to its end — and a variable one line sets and a file one line
+//! writes are there for the lines after it, and still there on the next run and on the next
+//! boot, because the tree IS the instance's storage. What the run ANSWERS is that script's
+//! own exit status and its two streams. Every command the session provides no program for —
+//! anything needing a process, a socket or a host path — runs nothing and answers the status
+//! a shell answers for a utility it could not find
+//! ([`::service_common::posix_shell_session::Statuses::could_not_run`]), with the diagnostic a
+//! shell writes for it on standard error, exactly as it does on a machine whose shell has no
+//! such program. Nothing here starts a process, opens a host file or reaches a socket, and
+//! nothing is written for a command that did not run.
 //!
 //! # A guest has to be up
 //!
@@ -54,9 +59,44 @@ use super::{ComAmazonawsEc2Amazonec2State, InstanceStateName};
 ///
 /// The bound on the work one run costs, and it matters where this runs: a run is performed
 /// with this store's guard held, so what a caller-supplied program can make one cost is what
-/// every other caller of the store waits for. Well above any command document's own script,
-/// and far below what would cost this process anything noticeable.
-pub const MAX_GUEST_RUN_COMMANDS: usize = 64;
+/// every other caller of the store waits for. The delivered lines are ONE script, so this is
+/// the budget the whole script spends — every line of it, every command substitution one of
+/// them opens and every iteration of a loop inside it — rather than a budget per line, which
+/// is why it is the budget ONE PROGRAM is given everywhere else in this workspace
+/// ([`Bounds::default`]) rather than a number of its own. Every one of those commands is
+/// performed in process over this machine's in-memory tree, and what one of them may expand,
+/// write and keep is bounded beside this ([`Bounds`], [`MAX_GUEST_RUN_OUTPUT_LINES`]).
+pub const MAX_GUEST_RUN_COMMANDS: usize = 1_000;
+
+/// How long ONE script delivered to a guest may be, and how many nested groups it may carry.
+///
+/// The script is read by the grammar in one piece ([`::service_common::posix_shell_session`],
+/// whose own bounds are written for a single line), so both are stated for a whole script
+/// here: a document's lines, the here-documents they carry and the words inside them come to
+/// far more of each than one line does, and the shared nesting bound is a COUNT of the groups
+/// a program carries rather than the depth it nests to. Both are the emulator's numbers — the
+/// script is caller-supplied text — and what reaches them is bounded upstream by the lines
+/// Systems Manager resolves for a step.
+///
+/// The nesting bound is what the grammar's own recursion is kept in range by, so the run is
+/// performed on a stack sized for it ([`MAX_GUEST_SCRIPT_STACK_BYTES`]) and the walk over what
+/// was parsed is bounded by the same number
+/// ([`::service_common::posix_shell_session::Bounds::nesting`], which the session spends per
+/// nested compound command).
+pub const MAX_GUEST_SCRIPT_BYTES: usize = 256 * 1024;
+
+/// See [`MAX_GUEST_SCRIPT_BYTES`].
+pub const MAX_GUEST_SCRIPT_NESTING: usize = 512;
+
+/// The stack the thread ONE script is performed on is given: far above what a program nesting
+/// [`MAX_GUEST_SCRIPT_NESTING`] groups costs the grammar's recursive descent and this module's
+/// own walk over what it parsed (a few kilobytes per level between them), so a script inside
+/// that bound is answered by the bound rather than by the stack it ran on — a stack a thread
+/// runs out of is not a refusal, it is the process gone.
+///
+/// It is the same size the other caller-supplied work of this workspace is given a thread for
+/// (the Systems Manager automation script runner's `SCRIPT_STACK_BYTES`).
+pub const MAX_GUEST_SCRIPT_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// How many lines of output ONE run keeps, and how many bytes one of those lines carries.
 ///
@@ -68,27 +108,78 @@ pub const MAX_GUEST_RUN_OUTPUT_LINES: usize = 256;
 /// See [`MAX_GUEST_RUN_OUTPUT_LINES`].
 pub const MAX_GUEST_RUN_OUTPUT_LINE_BYTES: usize = 2_048;
 
-/// What one program run in a guest answered: the lines it wrote and the status it exited
-/// with.
+/// What one program run in a guest answered: the lines it wrote, the lines it reported it
+/// could not do and the status it exited with.
 #[derive(Debug, Clone, Default)]
 pub struct GuestRun {
     /// The lines the program wrote to its standard output, in the order it wrote them.
     pub output: Vec<String>,
+    /// The lines the program wrote to its standard ERROR, in the order it wrote them: what a
+    /// command reported it could not do, which for a command naming a program the guest does
+    /// not have is the shell's own diagnostic. Kept apart from the output above, because the
+    /// agent that delivered the script reports the two streams separately.
+    pub errors: Vec<String>,
     /// The status the program exited with — the shell's own: zero for a program that ran to
     /// success, and the status a shell answers for a utility it could not find for a command
     /// this guest has no program for.
     pub status: i32,
 }
 
+/// Perform `script` in `session` and answer what it wrote on each stream, the status it ended
+/// on, and the tree it left behind — `None` for a run this process could not perform at all.
+///
+/// The run happens on a THREAD OF ITS OWN, given a stack sized for the nesting bound the
+/// session was constructed with ([`MAX_GUEST_SCRIPT_STACK_BYTES`]): reading a script costs the
+/// grammar's recursive descent, and performing one costs the session's own walk, a level of
+/// each per group the script nests — so a program inside that bound is answered by the bound
+/// and never by the stack of whichever thread served the request. The thread is joined before
+/// this answers, so nothing of the run outlives the call and no work goes on behind it; a
+/// thread this process could not start, or one that ended without answering, is `None` — a run
+/// that performed nothing, which leaves the machine's storage exactly as it was rather than
+/// reporting an outcome nothing produced.
+fn performed(
+    mut session: ShellSession,
+    script: &str,
+) -> Option<(
+    Vec<String>,
+    Vec<String>,
+    i32,
+    ::service_common::posix_shell_volume::ShellVolume,
+)> {
+    let run = move || {
+        let mut status = session.run(script);
+        if let Some(exited) = session.exit_status() {
+            // The script ended the session itself: that status is the run's.
+            status = exited;
+        }
+        let output = session.output().to_vec();
+        let errors = session.errors().to_vec();
+        (
+            output,
+            errors,
+            status,
+            session.into_volume().unwrap_or_default(),
+        )
+    };
+    ::std::thread::scope(|scope| {
+        ::std::thread::Builder::new()
+            .stack_size(MAX_GUEST_SCRIPT_STACK_BYTES)
+            .spawn_scoped(scope, run)
+            .ok()
+            .and_then(|thread| thread.join().ok())
+    })
+}
+
 impl ComAmazonawsEc2Amazonec2State {
-    /// Perform `commands` in the guest of the instance `instance_id` names, in order,
-    /// answering what the guest wrote and the status it ended on — or `None` when there is no
-    /// running, booted guest to perform them in.
+    /// Perform `commands` in the guest of the instance `instance_id` names, as ONE script,
+    /// answering what the guest wrote on each of its two streams and the status it ended on
+    /// — or `None` when there is no running, booted guest to perform them in.
     ///
-    /// The commands run in ONE session, so a variable one sets and a file one writes are
-    /// there for the next; the files the session leaves behind become the instance's own
-    /// storage, the way the boot's program's do. The run stops early when a command ends the
-    /// session (`exit`), which is what a script's own `exit` does.
+    /// The lines are one script in one session, so a construct spanning lines is the script's
+    /// own and a variable one line sets and a file one line writes are there for the next; the
+    /// files the session leaves behind become the instance's own storage, the way the boot's
+    /// program's do. The run stops early when the script ends the session (`exit`), which is
+    /// what a script's own `exit` does.
     pub fn run_in_instance_guest(
         &mut self,
         instance_id: &str,
@@ -135,11 +226,13 @@ impl ComAmazonawsEc2Amazonec2State {
         let services =
             super::guest_services::GuestServices::starting_from(&instance.guest_runtime);
         let volume = guest_volume(&machine, &boot_id, &files);
-        let mut session = ShellSession::in_volume(
+        let session = ShellSession::in_volume(
             guest_environment(&machine, number),
             SessionConfig {
                 bounds: Bounds {
                     commands: MAX_GUEST_RUN_COMMANDS,
+                    command_bytes: MAX_GUEST_SCRIPT_BYTES,
+                    nesting: MAX_GUEST_SCRIPT_NESTING,
                     ..Bounds::default()
                 },
                 output: Some(OutputLimits {
@@ -150,6 +243,10 @@ impl ComAmazonawsEc2Amazonec2State {
             },
             volume,
         )
+        // The agent that delivered the script reports the two streams as members of its own,
+        // so a diagnostic is not part of what the script wrote
+        // ([`::service_common::posix_shell_session::ShellSession::reporting_both_streams`]).
+        .reporting_both_streams()
         // The programs this machine has installed in it, which an agent's command reads the
         // instance's own facts with ([`super::guest_metadata`]) and installs and starts its
         // services with ([`super::guest_services`]) — the same programs the boot's own
@@ -161,17 +258,14 @@ impl ComAmazonawsEc2Amazonec2State {
                 None => own,
             }
         });
-        let mut status = 0;
-        for command in commands {
-            status = session.run(command);
-            if let Some(exited) = session.exit_status() {
-                // The program ended the session itself: that status is the run's.
-                status = exited;
-                break;
-            }
-        }
-        let output = session.output().to_vec();
-        let volume = session.into_volume().unwrap_or_default();
+        // The lines are ONE script, read by the grammar in one piece: that is what makes a
+        // here-document opened on one line carry the lines under it, and what makes the
+        // script's own exit status the status of its LAST command rather than of whichever
+        // line happened to be last in the list.
+        let script = commands.join("\n");
+        // A run nothing performed at all leaves the machine exactly as it was: there is no
+        // outcome to report and nothing to write back.
+        let (output, errors, status, volume) = performed(session, &script)?;
         let written: ::std::collections::BTreeMap<String, String> = volume
             .stored_files()
             .map(|(path, contents)| (path.to_string(), contents.to_string()))
@@ -182,7 +276,11 @@ impl ComAmazonawsEc2Amazonec2State {
             instance.guest_files = written;
             instance.guest_runtime = services.taken();
         }
-        Some(GuestRun { output, status })
+        Some(GuestRun {
+            output,
+            errors,
+            status,
+        })
     }
 
     /// What the guest of the instance `instance_id` names holds at `path`, or `None` when it
