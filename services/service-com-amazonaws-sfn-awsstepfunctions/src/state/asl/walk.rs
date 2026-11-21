@@ -289,12 +289,8 @@ impl Interpreter<'_> {
     /// in flight, and exclusive for entering one.
     fn stopped_by_a_sibling(&self, at: Duration, inclusive: bool) -> Option<Failure> {
         let when = self.cancel_after?;
-        (at > when || (inclusive && at == when)).then(|| {
-            runtime(
-                "a branch of the enclosing 'Parallel' state failed, so this branch was stopped"
-                    .to_string(),
-            )
-        })
+        (at > when || (inclusive && at == when))
+            .then(|| runtime(super::SIBLING_STOP_CAUSE.to_string()))
     }
 
     /// Walk `states` from `start_at`, with `input` as the first state's input and

@@ -669,16 +669,16 @@ async fn an_asynchronous_run_records_its_trace_once_the_clock_has_ended_it() {
 // The outcome the segment reports
 // ---------------------------------------------------------------------------
 
-/// A recorded run reports the outcome it reached: a run the service ended is a FAULT of the
-/// work the segment covers, a run the client stopped is the ERROR of the request that
-/// stopped it, and a run that succeeded carries neither.
+/// A recorded run reports the outcome it reached: a run that did not do the work it was
+/// started for — one that failed, and one the client stopped — is a FAULT of the work the
+/// segment covers, and a run that succeeded carries no flag at all.
 #[tokio::test]
 async fn the_recorded_segment_reports_the_outcome_the_run_reached() {
     // (case, definition, whether the client stops the run, the status, fault, error)
     let rows: Vec<(&str, &str, bool, &str, bool, bool)> = vec![
         ("a run that succeeded", TWO_STATES, false, "SUCCEEDED", false, false),
         ("a run the service failed", FAILS, false, "FAILED", true, false),
-        ("a run the client stopped", WAITS, true, "ABORTED", false, true),
+        ("a run the client stopped", WAITS, true, "ABORTED", true, false),
     ];
     for (case, definition, stopped, status, fault, error) in rows {
         let emulator = Emulator::new();

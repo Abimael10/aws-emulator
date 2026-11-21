@@ -42,3 +42,10 @@ Actual (emulator):
 4. StartExecution each and wait for the terminal status; read the Root trace id from DescribeExecution's traceHeader.
 5. Poll BatchGetTraces for that Root id.
 6. Expected: a root segment with origin AWS::StepFunctions::StateMachine and the per-state subsegment tree described above. Observed: no segments at all (segment origins [], 'root segment absent', no Lambda subsegments).
+
+## Resolution
+The segment tree is published: a recorded execution's segment now carries one subsegment per state the run entered, nested the way the definition nests those states (a `Parallel` branch per `Branches` entry, a `Map` iteration per index), one subsegment per attempt each state's work made at the service it called, and the mark, cause, response status and function error each outcome implies — read off the execution's own history and the definition it ran, and asserted end to end through `BatchGetTraces` in `services/service-com-amazonaws-sfn-awsstepfunctions/tests/all/execution_trace_segment_tree.rs`. The run's own segment is a fault whenever the run did not do the work it was started for (failed, timed out, or stopped), and a run stopped straight after its start now really is stopped, because the outcome the clock owes is owed from the instant the work that reached it was done.
+
+One residual, recorded here rather than left implied: the check
+`lambda__stepfunctions__xray.xray-segment-tree-marks-map-and-parallel-cancellation-and-a-stopped-executions-fault`
+also asserts that the subsegment of a task still RUNNING when `StopExecution` lands is reported canceled. This emulator interprets a run inside the call that starts it, so by the time a client can send that stop the task's work has been performed and the execution's own history says so; the trace mirrors that history. Reporting work in flight after the start has answered needs the interpretation deferred past that answer — a change to the execution runtime's walk and its shared logical clock (the branches of a `Parallel` share it, so no call may move it) — rather than anything further in the trace path.

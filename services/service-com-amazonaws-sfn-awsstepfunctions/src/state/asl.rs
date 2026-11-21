@@ -1812,6 +1812,18 @@ struct Unit {
 const STATE_ENTERED: &str = "StateEntered";
 const STATE_EXITED: &str = "StateExited";
 
+/// What the failure of a state whose concurrent work a SIBLING's failure STOPPED states.
+///
+/// "If any branch fails, the entire Parallel state is considered to have failed and all
+/// the branches are stopped": the state's own outcome is the failure of the unit that
+/// failed, so this is never what a caller reads — what it says is that the work of THIS
+/// state was stopped rather than done, which is also how the trace of the run reports it
+/// ([`super::xray_tracing`]). Stated once here because two readers depend on the same
+/// text: the walk that writes it ([`Interpreter::stopped_by_a_sibling`]) and the trace
+/// that marks the work it stopped as canceled.
+pub const SIBLING_STOP_CAUSE: &str =
+    "a branch of the enclosing 'Parallel' state failed, so this branch was stopped";
+
 /// The event a state of a given type records when the work around it was aborted,
 /// where the service models one.
 ///

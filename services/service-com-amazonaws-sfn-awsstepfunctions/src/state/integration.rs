@@ -3362,6 +3362,39 @@ fn operation_of(action: &str) -> String {
     }
 }
 
+/// The SERVICE and OPERATION a call this service made OUT is reported by, for work named
+/// the way a `Task` state's own history events name it ([`named_work`]).
+///
+/// A call out of an instrumented service is reported by the name the AWS SDKs give the
+/// service it addressed — that service's model's `sdkId` — and by the API operation the
+/// call made, which is what a reader of the call sees beside the resource it addressed.
+/// Both are read off the one table of wire facts the call itself was built from
+/// ([`APIS`], [`AWS_SDK_APIS`]), so what names a called service in a trace of the run is
+/// what names it in that task's own refusals and diagnoses.
+///
+/// `None` for work no call was made for: an action of a service this crate holds no wire
+/// facts of.
+#[must_use]
+pub fn called_work(resource_type: &str, action: &str) -> Option<(&'static str, String)> {
+    let (aws_sdk, service) = match resource_type.split_once(':') {
+        Some((AWS_SDK_SEGMENT, service)) => (true, service),
+        _ => (false, resource_type),
+    };
+    let api = sdk_or_optimized_api(aws_sdk, service, action, resource_type).ok()?;
+    Some((api.sdk_id, operation_of(action)))
+}
+
+/// The same two names for the INVOCATION a `Resource` that is a Lambda function's ARN
+/// makes: the task's unit of work is one `Invoke` of that function
+/// ([`direct_invocation`]), so the call out it records is AWS Lambda's own.
+#[must_use]
+pub fn invoked_function_work() -> Option<(&'static str, String)> {
+    let api = APIS
+        .iter()
+        .find(|api| api.namespace == LAMBDA_NAMESPACE)?;
+    Some((api.sdk_id, LAMBDA_INVOKE_OPERATION.to_string()))
+}
+
 /// How a `Task` state's own history events name the work its `Resource` asked for:
 /// "the service name of the resource in a task state" and "the action of the resource
 /// called by a task state"
@@ -4146,6 +4179,32 @@ pub async fn call_api_as(
 /// response reports them: the status the call answered, and its headers under both
 /// spellings the SDK exposes them in.
 const SDK_HTTP_METADATA: &str = "SdkHttpMetadata";
+
+/// The member of that envelope that carries the status the invoked service answered.
+const SDK_HTTP_STATUS: &str = "HttpStatusCode";
+
+/// The HTTP status the answer to one `Task` state's call came back with, read off the
+/// RESULT that call answered.
+///
+/// The envelope the SDK puts the response's HTTP facts in ([`with_sdk_envelope`]) carries
+/// it, and every value in that envelope is the answer's own — so this is the status the
+/// invoked service really answered, which is what a trace of the call reports.
+///
+/// `None` for a result that keeps none of the answer's HTTP facts: the function payload a
+/// `Resource` that is a function's ARN reports, the document a callback answered, or text
+/// that is no document at all.
+#[must_use]
+pub fn answered_status(result: &str) -> Option<u16> {
+    let document: Value = ::serde_json::from_str(result).ok()?;
+    u16::try_from(
+        document
+            .get(SDK_HTTP_METADATA)?
+            .get(SDK_HTTP_STATUS)?
+            .as_u64()?,
+    )
+    .ok()
+}
+
 /// What a task whose `Resource` named a Lambda FUNCTION reports out of the
 /// invocation's answer: the function's own response payload, the member that operation
 /// binds its body to.
@@ -4328,7 +4387,7 @@ fn with_sdk_envelope(document: Value, answered: &Answered, rest: Option<&Rest>) 
         http.insert("HttpHeaders".to_string(), Value::Object(single));
     }
     http.insert(
-        "HttpStatusCode".to_string(),
+        SDK_HTTP_STATUS.to_string(),
         Value::Number(answered.status.into()),
     );
     members.insert(SDK_HTTP_METADATA.to_string(), Value::Object(http));
@@ -4558,12 +4617,38 @@ pub fn sdk_exception_message(
         Family::Optimized => {
             let request = request_id.map_or_else(String::new, |id| format!("Request ID: {id}; "));
             format!(
-                "{message} (Service: {}; Status Code: {status}; Error Code: {code}; \
-                 {request}Proxy: null)",
+                "{message}{SDK_SERVICE_FIELD}{}{SDK_FIELD_SEPARATOR}{SDK_STATUS_FIELD}{status}\
+                 {SDK_FIELD_SEPARATOR}Error Code: {code}{SDK_FIELD_SEPARATOR}{request}Proxy: null)",
                 api.sdk_client
             )
         }
     }
+}
+
+/// The field an SDK exception's own metadata names the status the answer carried by.
+const SDK_STATUS_FIELD: &str = "Status Code: ";
+
+/// The HTTP status a REFUSAL this service reported came back with, read off the cause it
+/// states.
+///
+/// Both renderings of an SDK exception put the answer's own status in the exception's
+/// metadata under [`SDK_STATUS_FIELD`] — which is why "a `Catch` path reading the cause
+/// finds the status and the service in it" — so the status of a refused call is read back
+/// from the one place the cause states it, and the reading is stated here beside the two
+/// renderings that write it.
+///
+/// `None` for a cause that states no status: a failure no answer came back for (work this
+/// emulator did not run, a call that timed out), and a task whose work ANSWERED and
+/// reported a failure of its own, like a function that raised.
+#[must_use]
+pub fn refused_status(cause: &str) -> Option<u16> {
+    let (_, metadata) = cause.rsplit_once(SDK_STATUS_FIELD)?;
+    metadata
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 /// How many attempts the client made for the call a refusal came back from, which the
@@ -4573,6 +4658,59 @@ pub fn sdk_exception_message(
 /// again, so a refusal is the first attempt's. A `Retry` in the state's own definition
 /// does not add to it — each retry is a fresh call, made by a client of its own.
 const SDK_ATTEMPTS: u32 = 1;
+
+/// The field the OPTIMIZED family's rendering opens its metadata with, and the separator
+/// between its fields.
+const SDK_SERVICE_FIELD: &str = " (Service: ";
+/// See [`SDK_SERVICE_FIELD`].
+const SDK_FIELD_SEPARATOR: &str = "; ";
+/// The field that rendering names the refused request by.
+const SDK_REQUEST_FIELD: &str = "Request ID: ";
+
+/// The refusal `cause` as the CURRENT AWS SDK renders it, for a cause the EARLIER
+/// generation of clients rendered.
+///
+/// One answer, two renderings ([`sdk_exception_message`]): the client an optimized
+/// integration is served through states the metadata as semicolon-separated fields and
+/// names the service by its own client's name, while the current SDK states them
+/// comma-separated with the attempt count and names the service as that SDK does. What a
+/// TRACE of the call reports is the current SDK's rendering, because the segments a
+/// service records about its own calls are written through that SDK — so a cause the
+/// earlier client rendered is re-rendered here, out of the fields it states and the table
+/// those names come from, rather than reported in the other client's words.
+///
+/// `None` for a cause that is not that rendering: one the current SDK already rendered,
+/// a failure no service answered at all, and a refusal naming a service this crate holds
+/// no wire facts of.
+#[must_use]
+pub fn current_sdk_rendering(cause: &str) -> Option<String> {
+    let (message, metadata) = cause.rsplit_once(SDK_SERVICE_FIELD)?;
+    let mut fields = metadata.strip_suffix(')')?.split(SDK_FIELD_SEPARATOR);
+    // The first field is the service as the serving client names it; the rendering of the
+    // current SDK separates its own fields with commas, so a cause it rendered carries
+    // its whole metadata in this one field and names no service of this form.
+    let client = fields.next().filter(|client| !client.contains(','))?;
+    let api = APIS
+        .iter()
+        .chain(AWS_SDK_APIS.iter().copied())
+        .find(|api| api.sdk_client == client)?;
+    let mut status = None;
+    let mut request_id = None;
+    for field in fields {
+        if let Some(digits) = field.strip_prefix(SDK_STATUS_FIELD) {
+            status = digits.parse::<u16>().ok();
+        }
+        if let Some(named) = field.strip_prefix(SDK_REQUEST_FIELD) {
+            request_id = Some(named);
+        }
+    }
+    Some(sdk_attempt_metadata(
+        api.sdk_error_prefix,
+        message,
+        status?,
+        request_id,
+    ))
+}
 
 /// A refusal as the CURRENT AWS SDK renders it: `service`'s own sentence, the metadata
 /// the answer carried, and how many attempts the call took ([`SDK_ATTEMPTS`]).
@@ -4588,7 +4726,7 @@ pub(super) fn sdk_attempt_metadata(
 ) -> String {
     let request = request_id.map_or_else(String::new, |id| format!(", Request ID: {id}"));
     format!(
-        "{message} (Service: {service}, Status Code: {status}{request}) \
+        "{message} (Service: {service}, {SDK_STATUS_FIELD}{status}{request}) \
          (SDK Attempt Count: {SDK_ATTEMPTS})"
     )
 }

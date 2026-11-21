@@ -36,6 +36,13 @@
 //! is the snapshot the start recorded ([`super::RanConfiguration::tracing_configuration`])
 //! and not what the state machine holds by the time the run ends.
 //!
+//! # What the segment reports
+//!
+//! A run's segment names the state machine that ran it and the outcome it reached
+//! ([`outcome_flags`]), and it CARRIES the work the run did: one subsegment per state the
+//! run entered, nested the way the definition nests those states, with one subsegment per
+//! attempt each state's work made — the whole of which is [`segment_tree`].
+//!
 //! # When it is published
 //!
 //! A segment reports work that HAPPENED, so a run's own segment is recorded once that run
@@ -56,11 +63,12 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use ::serde_json::{json, Value};
 
 use super::ComAmazonawsSfnAwsstepfunctionsState;
+
+mod segment_tree;
 
 /// The `origin` the segment of an execution carries: the resource type of the state
 /// machine that ran it, as X-Ray names a Step Functions state machine.
@@ -217,7 +225,7 @@ fn execution_segment(execution: &super::Execution) -> Option<Segment> {
     {
         insert(&mut document, "parent_id", json!(parent));
     }
-    let subsegments = state_subsegments(execution);
+    let subsegments = segment_tree::state_subsegments(execution);
     if !subsegments.is_empty() {
         insert(&mut document, "subsegments", Value::Array(subsegments));
     }
@@ -227,64 +235,17 @@ fn execution_segment(execution: &super::Execution) -> Option<Segment> {
     })
 }
 
-/// One subsegment per STATE the run entered, in the order its history entered them: the
-/// span each state's own work occupied, which is what tells a reader which states
-/// contributed to the trace.
-///
-/// A state's span is the instant its `<Type>StateEntered` event was written to the instant
-/// its `<Type>StateExited` one was; a state the run never left — the state a failed walk
-/// stopped at — ran until the execution itself ended.
-fn state_subsegments(execution: &super::Execution) -> Vec<Value> {
-    let ended = execution.stop_date.unwrap_or(execution.start_date);
-    let mut entered: Vec<(String, SystemTime, Option<SystemTime>)> = Vec::new();
-    for event in &execution.history {
-        let Some(name) = event.state_name.as_deref() else {
-            continue;
-        };
-        if event.event_type.ends_with(super::STATE_ENTERED_SUFFIX) {
-            // Past the cap the entry is not reported, and the walk CONTINUES: the states
-            // that are reported keep the spans their own exits give them rather than
-            // falling back to the instant the run ended.
-            if entered.len() < MAX_REPORTED_STATES {
-                entered.push((name.to_string(), event.timestamp, None));
-            }
-            continue;
-        }
-        if event.event_type.ends_with(super::STATE_EXITED_SUFFIX) {
-            // The exit belongs to the LAST entry of that state still open, so a state a
-            // loop re-entered reports one span per pass rather than one span widened.
-            if let Some(open) = entered
-                .iter_mut()
-                .rev()
-                .find(|(state, _, exited)| state == name && exited.is_none())
-            {
-                open.2 = Some(event.timestamp);
-            }
-        }
-    }
-    entered
-        .into_iter()
-        .map(|(name, from, to)| {
-            json!({
-                "id": ::service_common::xray_trace::mint_span_id(),
-                "name": name,
-                "start_time": ::service_common::xray_segments::epoch_seconds(from),
-                "end_time": ::service_common::xray_segments::epoch_seconds(to.unwrap_or(ended)),
-            })
-        })
-        .collect()
-}
-
 /// The three OUTCOME flags a segment document carries, as X-Ray documents each: "`error` —
 /// boolean indicating that a client error occurred", "`throttle` — boolean indicating that
 /// a request was throttled" and "`fault` — boolean indicating that a server error
 /// occurred".
 ///
-/// A workflow's outcome is a status rather than an HTTP status, and the two kinds of
-/// unsuccessful run differ in WHOSE fault they are: a run the service ended — one that
-/// failed or ran out of time — is a fault of the work the segment covers, while a run the
-/// CLIENT stopped is the client's own doing and so the error of the request rather than a
-/// fault of the service. A run that succeeded carries none of the three.
+/// A workflow's outcome is a status rather than an HTTP status, and what decides the flag
+/// is whether the run DID the work it was started for: a run that failed, one that ran out
+/// of time and one the client stopped all ended without doing it, and the segment covers
+/// that work, so each is a FAULT of the work reported. None of them is the error of a
+/// request: the call that stopped a run is answered, and the run's own segment reports the
+/// run. A run that succeeded carries none of the three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Outcome {
     error: bool,
@@ -295,12 +256,14 @@ struct Outcome {
 /// The flags `status` gives, per the documentation on [`Outcome`].
 fn outcome_flags(status: &str) -> Outcome {
     Outcome {
-        error: status == super::EXECUTION_STATUS_ABORTED,
-        // Nothing a workflow reaches is a throttle: the statuses are the terminal outcomes
-        // of the run, and a request this service refused for capacity never started one.
+        // Nothing a workflow reaches is the error of a request, or a throttle: the
+        // statuses are the terminal outcomes of the RUN, and a request this service
+        // refused for capacity never started one.
+        error: false,
         throttle: false,
         fault: status == super::EXECUTION_STATUS_FAILED
-            || status == super::EXECUTION_STATUS_TIMED_OUT,
+            || status == super::EXECUTION_STATUS_TIMED_OUT
+            || status == super::EXECUTION_STATUS_ABORTED,
     }
 }
 
@@ -377,10 +340,10 @@ mod tests {
     use super::{outcome_flags, state_machine_name, Outcome};
 
     /// The outcome flags a terminal status gives — over the whole set of statuses an
-    /// execution reaches, because the rule is about which party an unsuccessful run is
-    /// down to and not about one of them.
+    /// execution reaches, because the rule is about whether the run did the work it was
+    /// started for and not about one way of not doing it.
     #[test]
-    fn the_outcome_flags_follow_whose_doing_the_status_is() {
+    fn the_outcome_flags_follow_whether_the_run_did_its_work() {
         for (case, status, expected) in [
             (
                 "a run that succeeded",
@@ -413,9 +376,9 @@ mod tests {
                 "a run the client stopped",
                 super::super::EXECUTION_STATUS_ABORTED,
                 Outcome {
-                    error: true,
+                    error: false,
                     throttle: false,
-                    fault: false,
+                    fault: true,
                 },
             ),
             (

@@ -641,8 +641,8 @@ fn first_walked_event_id(previous_event_id: i64, opening: bool) -> i64 {
 }
 
 /// What one walk left for the store to record: its events numbered after
-/// `previous_event_id`, its outcome owed `settle` after `start`, and the activity task
-/// or Map Runs it produced.
+/// `previous_event_id`, its outcome owed `settle` after the work that produced it was
+/// done, and the activity task or Map Runs it produced.
 ///
 /// `opening` is the event the attempt OPENS with, for a walk that is an attempt of its
 /// own (`ExecutionStarted`, `ExecutionRedriven`); a walk that CONTINUES an attempt — a
@@ -686,7 +686,29 @@ fn plan_from_run(
     // definition, so every instant is computed with checked arithmetic: an
     // offset no instant can represent is held at the furthest instant this clock
     // carries, rather than reached through the panicking `Add`.
-    let due_at = after(start, settle.saturating_add(run.elapsed));
+    //
+    // The outcome is owed `settle` after the WORK that reached it was done, and the work
+    // of a run performed in the call that starts it is done when this walk is — which is
+    // later than the walk's own offsets say whenever its states' calls really took time,
+    // because those offsets are the logical clock the definition's `Wait` states advance
+    // and no call may move ([`asl::Interpreter::perform_call`]). Measuring the span from
+    // the run's START instead would owe the outcome of a run whose work took longer than
+    // `settle` at an instant already past, so the caller that started it would be
+    // answered and find the run already over — and a `StopExecution` it sends straight
+    // after would have nothing running to stop.
+    //
+    // What it does NOT change is WHEN the work happened: a run is interpreted inside the
+    // call that starts it, so every event of the walk is stamped at an instant already
+    // past by the time that call answers, and the only thing the clock still owes is the
+    // outcome. A caller that stops such a run therefore stops a run whose states have
+    // all been performed — the history says so, and a trace of it says so too
+    // ([`super::xray_tracing`]) — where the real service would have had work in flight.
+    // Reporting work in flight after the start has answered is a property of the
+    // INTERPRETATION, not of this span: it needs the walk to be performed past that
+    // answer, which is a change to [`asl::run`] and its shared logical clock (the
+    // branches of a `Parallel` share it, so no call may move it) rather than a further
+    // clamp here.
+    let due_at = after(start, settle.saturating_add(run.elapsed)).max(after(super::now(), settle));
     // What this attempt ENDED with, which is what the event it ends on reports: a
     // later attempt of the same execution computes its own outcome, and the event
     // this one wrote stays in the history.
