@@ -57,12 +57,12 @@ fn encode_label(value: &str) -> String {
 
 /// The ARN of one resource of this service: the account every emulator ARN carries, the
 /// region the caller signed for, and the resource's own URI path.
-fn arn(resource_path: &str) -> String {
+pub(crate) fn arn(resource_path: &str) -> String {
     engine::emulator_arn(ARN_SERVICE, REGION, resource_path)
 }
 
 /// `TagResource` over the wire: `POST /tags/{resourceArn}`.
-async fn tag(emulator: &Emulator, resource_arn: &str, tags: Value) -> (u16, Value) {
+pub(crate) async fn tag(emulator: &Emulator, resource_arn: &str, tags: Value) -> (u16, Value) {
     emulator
         .post(
             &format!("/tags/{}", encode_label(resource_arn)),
@@ -80,7 +80,11 @@ async fn list_tags(emulator: &Emulator, resource_arn: &str) -> (u16, Value) {
 
 /// `UntagResource` over the wire: `DELETE /tags/{resourceArn}?tagKeys=…` — `tagKeys` is an
 /// `@httpQuery` list.
-async fn untag(emulator: &Emulator, resource_arn: &str, tag_keys: &[&str]) -> (u16, Value) {
+pub(crate) async fn untag(
+    emulator: &Emulator,
+    resource_arn: &str,
+    tag_keys: &[&str],
+) -> (u16, Value) {
     let query: Vec<String> = tag_keys
         .iter()
         .map(|key| format!("tagKeys={}", encode_label(key)))
@@ -104,7 +108,7 @@ const NO_CONTENT: u16 = 204;
 /// Assert one tagging write answered its no-content success: the status that says a response
 /// carries nothing, and a body that carries nothing — the harness reads an empty body as
 /// `Value::Null`, so an empty JSON object would be seen here as the object it is.
-fn assert_no_content(case: &str, operation: &str, status: u16, body: &Value) {
+pub(crate) fn assert_no_content(case: &str, operation: &str, status: u16, body: &Value) {
     assert_eq!(
         (status, body),
         (NO_CONTENT, &Value::Null),
@@ -113,7 +117,7 @@ fn assert_no_content(case: &str, operation: &str, status: u16, body: &Value) {
 }
 
 /// A tag map as a comparison reads it, whichever order the response rendered it in.
-fn tags_of(body: &Value, member: &str) -> BTreeMap<String, String> {
+pub(crate) fn tags_of(body: &Value, member: &str) -> BTreeMap<String, String> {
     body.get(member)
         .and_then(Value::as_object)
         .map(|map| {
@@ -130,7 +134,7 @@ fn tags_of(body: &Value, member: &str) -> BTreeMap<String, String> {
 }
 
 /// The tags `ListTagsForResource` reports, asserting the call succeeded.
-async fn reported(
+pub(crate) async fn reported(
     emulator: &Emulator,
     case: &str,
     resource_arn: &str,
@@ -148,7 +152,7 @@ async fn reported(
 }
 
 /// One expected tag map, from pairs.
-fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn expected(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
