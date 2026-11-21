@@ -12,6 +12,8 @@
 //! * The JOBS and COMMANDS planes word it `<Family> <id> cannot be found.`
 //!   ([`plane_not_found`]).
 //! * The AUTHORIZER family words it `Authorizer <name> not found`.
+//! * The BILLING GROUP family words it `Billing group <name> does not exist`
+//!   ([`missing_billing_group_message`]).
 //! * The DEVICE DEFENDER family words it `Audit task <id> does not exist.`
 //!   ([`missing_audit_task_message`]).
 //! * The BULK THING REGISTRATION task family words it with a sentence that carries no
@@ -96,6 +98,18 @@ pub fn missing_fleet_metric_message(metric_name: &str) -> String {
 /// other half of [`missing_fleet_metric_message`].
 pub fn fleet_metric_write_not_found_message(metric_name: &str) -> String {
     format!("FleetMetric {metric_name} doesn't exist")
+}
+
+/// How this service states that a `billingGroupName` names no billing group this account
+/// holds — for a reader of one, a writer of one, and for a thing whose `billingGroupName`
+/// named it.
+///
+/// The family states the group the request named and this family's clause for a record that
+/// is not there, with the account NOT named — the form the fleet-metric family's write half
+/// takes ([`fleet_metric_write_not_found_message`]) rather than the thing-group family's
+/// account-qualified sentence.
+pub fn missing_billing_group_message(billing_group_name: &str) -> String {
+    format!("Billing group {billing_group_name} does not exist")
 }
 
 /// How this service states that a `thingTypeName` names no thing type this account holds

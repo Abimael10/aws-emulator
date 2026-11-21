@@ -200,7 +200,8 @@ fn arn_in_input(operation: &str, vendor: &str, body: &[u8], uri: &str) -> Option
 /// (`smithy_query(query="operation", operation="DescribeThing,DescribeThingGroup,
 /// DescribeThingType,GetPolicy,GetTopicRule,DescribeJob,DescribeAuthorizer,GetCommand,
 /// GetPackage,GetOTAUpdate,DescribeCertificate,DescribeStream,DescribeRoleAlias,
-/// DescribeFleetMetric,DescribeProvisioningTemplate,DescribeDomainConfiguration")`) — paired
+/// DescribeFleetMetric,DescribeProvisioningTemplate,DescribeDomainConfiguration,
+/// DescribeBillingGroup")`) — paired
 /// with the builder this crate ALREADY has for that resource type's ARN, so no ARN is spelled
 /// twice and the resource a decision is taken against is the one the service reports.
 ///
@@ -220,6 +221,7 @@ fn path_addressed_arn(region: &str, operation: &str, path: &str) -> Option<Strin
     Some(match collection {
         "things" => crate::state::thing_arn(region, &identifier),
         "thing-groups" => crate::state::thing_group_arn(region, &identifier),
+        "billing-groups" => crate::state::billing_group_arn(region, &identifier),
         "thing-types" => crate::state::thing_type_arn(region, &identifier),
         "policies" => crate::state::policy_arn(region, &identifier),
         "rules" => crate::state::topic_rule_arn(region, &identifier),
@@ -807,6 +809,12 @@ mod tests {
                 "AddThingToBillingGroup",
                 "/billing-groups/addThingToBillingGroup",
                 ANY_RESOURCE.to_string(),
+            ),
+            (
+                "a billing group, whose collection binds its name as the identifier",
+                "DescribeBillingGroup",
+                "/billing-groups/metered-fleet",
+                arn("billinggroup/metered-fleet"),
             ),
             (
                 "a collection this service mints no ARN for",

@@ -46,6 +46,14 @@ mod dependent_resource_deletion;
 #[path = "thing_registry_lifecycle/principal_refusal_wording.rs"]
 mod principal_refusal_wording;
 
+/// The BILLING GROUP store this registry resolves a thing's `billingGroupName` against:
+/// `CreateBillingGroup`, the `DescribeBillingGroup` reader that proves what it persisted,
+/// and what a thing naming a group does. A child of THIS suite for the reason the
+/// deletions are — the registry write under test here is the one this suite's creates go
+/// through — and the `#[path]` is what keeps it one.
+#[path = "thing_registry_lifecycle/billing_group_registry.rs"]
+mod billing_group_registry;
+
 /// HOW an `expectedVersion` that does not match a thing's record is WORDED, and that both
 /// operations taking one state the same sentence and leave the record untouched. A child of
 /// THIS suite for the reason the deletions are: it is coverage of the same registry

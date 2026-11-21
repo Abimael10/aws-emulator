@@ -20,7 +20,9 @@
 //! * The THING family names the dimension that conflicts and the account the collision is
 //!   scoped to: `Thing <name> already exists in account with different attributes`.
 //! * The THING GROUP and THING TYPE families name theirs as `properties`, scoped to the
-//!   `current account`, with the family noun in TWO capitalised words.
+//!   `current account`, with the family noun in TWO capitalised words; the BILLING GROUP
+//!   family states its collision the same way
+//!   ([`existing_billing_group_message`]).
 //! * The TOPIC RULE family single-quotes the name and scopes the collision to the
 //!   account: `Topic Rule '<name>' already exists for account`.
 //! * The CERTIFICATE PROVIDER family BRACKETS the name and scopes the collision to the
@@ -114,6 +116,23 @@ pub fn existing_thing_message(thing_name: &str) -> String {
 pub fn existing_thing_group_message(thing_group_name: &str) -> String {
     format!(
         "Thing Group {thing_group_name} already exists in current account with different \
+         properties"
+    )
+}
+
+/// How this service refuses a `CreateBillingGroup` whose name a group with different
+/// PROPERTIES holds.
+///
+/// The dimension a billing group's create conflicts on is its PROPERTIES — the operation
+/// documents "If this call is made multiple times using the same billing group name and
+/// configuration, the call will succeed. If this call is made with the same billing group
+/// name but different configuration a ResourceAlreadyExistsException is thrown" — which is
+/// the thing-group family's dimension, so the collision is stated in that family's sentence
+/// with this family's noun, exactly as the thing-type family's is
+/// ([`existing_thing_type_message`]).
+pub fn existing_billing_group_message(billing_group_name: &str) -> String {
+    format!(
+        "Billing Group {billing_group_name} already exists in current account with different \
          properties"
     )
 }

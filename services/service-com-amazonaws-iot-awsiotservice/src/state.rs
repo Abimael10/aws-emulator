@@ -40,6 +40,13 @@
 //! member-for-member, and `CreateThing` resolves its `thingTypeName` against the
 //! same records.
 //!
+//! It also holds the account's BILLING GROUPS, keyed by `billingGroupName` for the
+//! same reason: the name is the group's identity and the `@httpLabel` of
+//! `/billing-groups/{billingGroupName}`. One record carries everything a reader hands
+//! back, so `DescribeBillingGroup` after `CreateBillingGroup` returns the created
+//! group member-for-member, and `CreateThing` resolves its `billingGroupName` against
+//! the same records (see [`billing_groups`]).
+//!
 //! It also holds the account's TOPIC RULES, keyed by `ruleName` for the same reason
 //! the thing registry is keyed by `thingName`: the name is the rule's identity and
 //! the `@httpLabel` of `/rules/{ruleName}`. One record carries everything a reader
@@ -323,7 +330,7 @@ impl ThingRegistrationRefusal {
                 deprecated_thing_type_creation_message(thing_type_name)
             }
             Self::MissingBillingGroup(billing_group_name) => {
-                format!("Billing group {billing_group_name} does not exist")
+                not_found::missing_billing_group_message(billing_group_name)
             }
             Self::AlreadyRegistered(thing_name) => existing_thing_message(thing_name),
         }
@@ -814,10 +821,20 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_THING_TYPES`] is the
     /// ceiling `CreateThingType` refuses past.
     pub thing_types: BTreeMap<String, RegisteredThingType>,
-    /// The names of the billing groups that exist, read by `CreateThing` for the
-    /// same reason as [`ComAmazonawsIotAwsiotserviceState::thing_types`];
-    /// `CreateBillingGroup` is still a scaffold and will populate it.
-    pub billing_groups: BTreeSet<String>,
+    /// Every billing group that exists, keyed by `billingGroupName`.
+    ///
+    /// The name is the group's identity — the model binds it as the `@httpLabel` of
+    /// `/billing-groups/{billingGroupName}` on every single-group operation — so a
+    /// `BTreeMap` keyed by name is the registry itself. `BTreeMap` (not `HashMap`)
+    /// because `ListBillingGroups` is `@paginated` and a page boundary is only
+    /// meaningful over a stable order.
+    ///
+    /// `CreateThing` resolves its `billingGroupName` against this registry, for the
+    /// same reason as [`ComAmazonawsIotAwsiotserviceState::thing_types`], so a thing
+    /// may only name a group that was created here. A caller grows this store, so it is
+    /// bounded: [`MAX_BILLING_GROUPS`] is the ceiling `CreateBillingGroup` refuses past
+    /// ([`billing_groups`]).
+    pub billing_groups: BTreeMap<String, RegisteredBillingGroup>,
     /// The endpoint identifier created for each region this account has called
     /// `DescribeEndpoint` in. The call that finds no record creates one; every later
     /// call in that region answers from the record, which is what makes all of an
@@ -1193,7 +1210,7 @@ impl ComAmazonawsIotAwsiotserviceState {
             self.resolve_associable_thing_type(thing_type_name)?;
         }
         if let Some(billing_group_name) = &configuration.billing_group_name {
-            if !self.billing_groups.contains(billing_group_name) {
+            if !self.billing_groups.contains_key(billing_group_name) {
                 return Err(ThingRegistrationRefusal::MissingBillingGroup(
                     billing_group_name.clone(),
                 ));
@@ -3426,18 +3443,28 @@ pub use scheduled_audits::{
     AUDIT_FREQUENCY_WEEKLY, MAX_SCHEDULED_AUDITS, MAX_SCHEDULED_AUDIT_TAGS,
 };
 
+// What a BILLING GROUP is — the record one holds, the ARN it is named by, the id a create
+// mints for it and what a reader of one reports — lives in `state/billing_groups.rs`,
+// beside the store accessor for the same reason the thing-group hierarchy does. Its names
+// are re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod billing_groups;
+pub use billing_groups::{
+    billing_group_arn, BillingGroupConfiguration, RegisteredBillingGroup,
+    FIRST_BILLING_GROUP_VERSION, MAX_BILLING_GROUPS, MAX_BILLING_GROUP_TAGS,
+};
+
 // How a request that named a resource this service does not hold is REFUSED — the fixed
 // sentence each resource family states such a miss with — lives in `state/not_found.rs`,
 // beside the store accessor for the same reason the rules engine does. Its names are
 // re-exported here so a handler reaches them as `crate::state::<name>`.
 pub mod not_found;
 pub use not_found::{
-    missing_audit_task_message, missing_authorizer_message, missing_command_message,
-    missing_fleet_metric_message, missing_job_execution_job_message, missing_job_execution_message,
-    missing_job_message, missing_job_template_message, missing_thing_group_message,
-    missing_thing_message, missing_thing_type_message, tagged_thing_group_not_found_message,
-    unauthorized_topic_rule_message, unrecognized_index_name_message,
-    MISSING_THING_REGISTRATION_TASK_MESSAGE,
+    missing_audit_task_message, missing_authorizer_message, missing_billing_group_message,
+    missing_command_message, missing_fleet_metric_message, missing_job_execution_job_message,
+    missing_job_execution_message, missing_job_message, missing_job_template_message,
+    missing_thing_group_message, missing_thing_message, missing_thing_type_message,
+    tagged_thing_group_not_found_message, unauthorized_topic_rule_message,
+    unrecognized_index_name_message, MISSING_THING_REGISTRATION_TASK_MESSAGE,
 };
 
 // How a create whose name is already taken is REFUSED — the fixed sentence each resource
@@ -3446,11 +3473,12 @@ pub use not_found::{
 // reaches them as `crate::state::<name>`.
 pub mod already_exists;
 pub use already_exists::{
-    existing_certificate_message, existing_certificate_provider_message, existing_command_message,
-    existing_job_message, existing_job_template_message, existing_mitigation_action_message,
-    existing_package_message, existing_policy_message, existing_role_alias_message,
-    existing_scheduled_audit_message, existing_thing_group_message, existing_thing_message,
-    existing_thing_type_message, existing_topic_rule_message,
+    existing_billing_group_message, existing_certificate_message,
+    existing_certificate_provider_message, existing_command_message, existing_job_message,
+    existing_job_template_message, existing_mitigation_action_message, existing_package_message,
+    existing_policy_message, existing_role_alias_message, existing_scheduled_audit_message,
+    existing_thing_group_message, existing_thing_message, existing_thing_type_message,
+    existing_topic_rule_message,
 };
 
 // What an AWS-MANAGED JOB TEMPLATE is — the published catalog `ListManagedJobTemplates`

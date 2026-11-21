@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateBillingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateBillingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateBillingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a BILLING GROUP under the name the URI label carries
+//! ([`crate::state::RegisteredBillingGroup`]): the configuration the request describes,
+//! the tags it supplied, and the identity this service mints for it — a `billingGroupId`
+//! and an `arn:aws:iot:<region>:<account>:billinggroup/<billingGroupName>`. The response
+//! is built from the record that is persisted, so `DescribeBillingGroup` reports the
+//! created group member for member.
+//!
+//! A repeat create of the same name and configuration writes nothing and answers the
+//! stored record, which is the idempotence the operation documents; the same name with a
+//! different configuration is the modelled `ResourceAlreadyExistsException` (409) in this
+//! family's wording ([`crate::state::existing_billing_group_message`]).
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +153,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateBillingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateBillingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateBillingGroupErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // Everything about the group that is NOT its name, in the form the registry keeps
+        // it and compares it: absent properties (or properties carrying no description)
+        // are the configuration of a group that has none, which is what the group then
+        // has ([`crate::state::BillingGroupConfiguration`]).
+        let requested =
+            crate::state::BillingGroupConfiguration::from(input.billing_group_properties);
+        // `Tag$Key` is `@required` and keys a resource's tag set, so the last value given
+        // for a key is the one the resource carries. How MANY tags one request may carry
+        // is bounded, because `TagList` has no modelled maximum and the record keeps what
+        // the writer sent, so without a ceiling one request would choose how large a
+        // single record is.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateBillingGroup"))
+        // Tags are NOT part of the configuration a repeat create is compared on
+        // ("Metadata which can be used to manage the billing group"), so a repeat create
+        // of an existing group keeps the tags that group already carries, whatever this
+        // request sent: changing a resource's tags is what `TagResource` / `UntagResource`
+        // are for.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_BILLING_GROUP_TAGS {
+            return Err(CreateBillingGroupErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "a billing group may carry at most {} tags; this request carries {}",
+                        crate::state::MAX_BILLING_GROUP_TAGS,
+                        requested_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, Option<String>> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let mut store = state.lock();
+
+        // What is already registered under this name decides the call, per the operation's
+        // own documentation: "If this call is made multiple times using the same billing
+        // group name and configuration, the call will succeed. If this call is made with
+        // the same billing group name but different configuration a
+        // ResourceAlreadyExistsException is thrown."
+        if let Some(existing) = store.billing_groups.get(&input.billing_group_name) {
+            if existing.configuration != requested {
+                // The 409 carries this family's sentence alone — the group families'
+                // wording with this family's noun — and no identity of the group that
+                // already exists, the way every registry family's conflict is shaped
+                // (`crate::state::already_exists`).
+                return Err(CreateBillingGroupErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::existing_billing_group_message(
+                            &existing.billing_group_name,
+                        )),
+                        resource_id: None,
+                        resource_arn: None,
+                    },
+                )
+                .into());
+            }
+            // The repeat create names the SAME group: it mints no new identity and writes
+            // nothing, and answers from the stored record — so a client that retried a
+            // create keeps the id and ARN it was handed the first time.
+            return Ok(CreateBillingGroupOutput {
+                billing_group_name: Some(existing.billing_group_name.clone()),
+                billing_group_arn: Some(existing.billing_group_arn.clone()),
+                billing_group_id: Some(existing.billing_group_id.clone()),
+            });
+        }
+
+        // The store is one a CALLER grows, a billing group at a time, so the number of
+        // groups an account can hold is bounded. The ceiling is read AFTER the conflict
+        // check, because a name already taken adds no record. `CreateBillingGroup` models
+        // no `LimitExceededException`, so the refusal past the ceiling is the modelled
+        // `InvalidRequestException` (HTTP 400) naming the limit, never a 200 that records
+        // nothing.
+        if store.billing_groups.len() >= crate::state::MAX_BILLING_GROUPS {
+            return Err(CreateBillingGroupErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "the maximum of {} billing groups is already reached",
+                        crate::state::MAX_BILLING_GROUPS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let group = crate::state::RegisteredBillingGroup::new(
+            &region,
+            input.billing_group_name,
+            store.mint_billing_group_id(),
+            requested,
+            tags,
+            ::std::time::SystemTime::now(),
+        );
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `DescribeBillingGroup` reads are one value,
+        // not two that could drift.
+        let output = CreateBillingGroupOutput {
+            billing_group_name: Some(group.billing_group_name.clone()),
+            billing_group_arn: Some(group.billing_group_arn.clone()),
+            billing_group_id: Some(group.billing_group_id.clone()),
+        };
+        store
+            .billing_groups
+            .insert(group.billing_group_name.clone(), group);
+        Ok(output)
     }
 }

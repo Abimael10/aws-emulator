@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBillingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBillingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBillingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A PURE READ of the billing group the URI label names
+//! ([`crate::state::RegisteredBillingGroup`]): the record `CreateBillingGroup` persisted is
+//! reported as the response — its name, id and ARN, the `billingGroupProperties` the
+//! create stored, the `billingGroupMetadata` of the record and the version it carries — and
+//! a name the account holds no group under is the modelled `ResourceNotFoundException`
+//! (404) in this family's wording ([`crate::state::missing_billing_group_message`]), never
+//! a hollow 200. The read writes nothing, so a later caller sees what this one saw.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBillingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBillingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBillingGroup"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeBillingGroupErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // A pure read of the billing-group registry: the record is cloned out and
+        // reported, and a name the registry does not hold is a 404 worded by the
+        // billing-group family (`crate::state::not_found`), never a hollow 200.
+        let store = state.lock();
+        let group = store
+            .billing_groups
+            .get(&input.billing_group_name)
+            .ok_or_else(|| {
+                DescribeBillingGroupErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_billing_group_message(
+                            &input.billing_group_name,
+                        )),
+                    },
+                )
+            })?;
+
+        // Every member is read off the one record the create persisted, so this reader and
+        // that writer cannot drift: the properties the create stored
+        // ([`crate::state::RegisteredBillingGroup::properties`]), the metadata of the
+        // record ([`crate::state::RegisteredBillingGroup::metadata`]) and the version the
+        // record carries.
+        Ok(DescribeBillingGroupOutput {
+            billing_group_name: Some(group.billing_group_name.clone()),
+            billing_group_id: Some(group.billing_group_id.clone()),
+            billing_group_arn: Some(group.billing_group_arn.clone()),
+            version: group.version,
+            billing_group_properties: Some(group.properties()),
+            billing_group_metadata: Some(group.metadata()),
+        })
     }
 }

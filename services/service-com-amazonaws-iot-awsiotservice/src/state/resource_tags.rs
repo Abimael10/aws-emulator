@@ -47,6 +47,9 @@ pub const MAX_RESOURCE_TAGS: usize = super::MAX_POLICY_TAGS;
 
 /// The resource-type token of a thing group's ARN, as [`super::thing_group_arn`] mints it.
 const THING_GROUP_TYPE: &str = "thinggroup";
+/// The resource-type token of a billing group's ARN, as [`super::billing_group_arn`] mints
+/// it.
+const BILLING_GROUP_TYPE: &str = "billinggroup";
 /// The resource-type token of a thing type's ARN, as [`super::thing_type_arn`] mints it.
 const THING_TYPE_TYPE: &str = "thingtype";
 /// The resource-type token of a policy's ARN, as [`super::policy_arn`] mints it.
@@ -98,6 +101,8 @@ const SCHEDULED_AUDIT_TYPE: &str = "scheduledaudit";
 pub enum TaggedResource {
     /// `thinggroup/<thingGroupName>`: a thing group, static or dynamic.
     ThingGroup(String),
+    /// `billinggroup/<billingGroupName>`: a billing group.
+    BillingGroup(String),
     /// `thingtype/<thingTypeName>`: a thing type.
     ThingType(String),
     /// `policy/<policyName>`: an IoT policy.
@@ -158,6 +163,7 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Result<TaggedResource, Strin
         .ok_or_else(|| untaggable_resource_message(resource_arn))?;
     match resource_type {
         THING_GROUP_TYPE => Ok(TaggedResource::ThingGroup(identifier.to_string())),
+        BILLING_GROUP_TYPE => Ok(TaggedResource::BillingGroup(identifier.to_string())),
         THING_TYPE_TYPE => Ok(TaggedResource::ThingType(identifier.to_string())),
         POLICY_TYPE => Ok(TaggedResource::Policy(identifier.to_string())),
         AUTHORIZER_TYPE => Ok(TaggedResource::Authorizer(identifier.to_string())),
@@ -227,6 +233,10 @@ impl TaggedResource {
         match self {
             Self::ThingGroup(name) => store
                 .thing_groups
+                .get_mut(name)
+                .map(|group| ResourceTagSet::Optional(&mut group.tags)),
+            Self::BillingGroup(name) => store
+                .billing_groups
                 .get_mut(name)
                 .map(|group| ResourceTagSet::Optional(&mut group.tags)),
             Self::ThingType(name) => store
@@ -304,6 +314,7 @@ impl TaggedResource {
             // addressing a group by ARN is told this plane's sentence and not the one a
             // reader or writer of the group itself is told.
             Self::ThingGroup(name) => super::tagged_thing_group_not_found_message(name),
+            Self::BillingGroup(name) => super::missing_billing_group_message(name),
             Self::ThingType(name) => super::missing_thing_type_message(name),
             Self::Policy(name) => super::missing_policy_message(name),
             Self::Authorizer(name) => super::missing_authorizer_message(name),
@@ -447,6 +458,10 @@ mod tests {
             (
                 crate::state::thing_group_arn(region, "fleet"),
                 TaggedResource::ThingGroup("fleet".to_string()),
+            ),
+            (
+                crate::state::billing_group_arn(region, "metered"),
+                TaggedResource::BillingGroup("metered".to_string()),
             ),
             (
                 crate::state::thing_type_arn(region, "sensor"),
