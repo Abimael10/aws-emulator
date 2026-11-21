@@ -153,6 +153,21 @@ pub fn not_found() -> RtResponse {
     json_response(NOT_FOUND_STATUS, NOT_FOUND_MESSAGE, None)
 }
 
+/// The status an `execute-api` endpoint refuses the REQUEST ITSELF with: what arrived is not
+/// a request this endpoint can resolve anything of, so nothing of the api is read for it.
+pub const BAD_REQUEST_STATUS: u16 = 400;
+
+/// The sentence that status carries — the status's own reason phrase (RFC 9110 §15.5.1), the
+/// convention every other sentence this endpoint answers follows ([`NOT_FOUND_MESSAGE`],
+/// [`FORBIDDEN_MESSAGE`], [`UNAUTHORIZED_MESSAGE`]).
+pub const BAD_REQUEST_MESSAGE: &str = "Bad Request";
+
+/// `400` `{"message":"Bad Request"}` — the envelope the gateway answers a request it cannot
+/// read as one, before anything of the api it addressed is resolved.
+pub fn bad_request() -> RtResponse {
+    json_response(BAD_REQUEST_STATUS, BAD_REQUEST_MESSAGE, None)
+}
+
 /// Whether this api's DEFAULT `execute-api` endpoint serves anything at all.
 ///
 /// "Specifies whether clients can invoke your API by using the default execute-api endpoint.

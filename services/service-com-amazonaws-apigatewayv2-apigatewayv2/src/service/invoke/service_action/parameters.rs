@@ -463,6 +463,7 @@ mod tests {
             method: "POST".to_string(),
             raw_path: "/live/orders/7".to_string(),
             route_path: "/orders/7".to_string(),
+            route_segments: vec!["orders".to_string(), "7".to_string()],
             raw_query_string: "kind=retail&tag=a&tag=b".to_string(),
             headers: [
                 (

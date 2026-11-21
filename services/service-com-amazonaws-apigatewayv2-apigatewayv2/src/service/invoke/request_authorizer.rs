@@ -687,6 +687,7 @@ mod tests {
             method: "GET".to_string(),
             raw_path: "/prod/orders".to_string(),
             route_path: "/orders".to_string(),
+            route_segments: vec!["orders".to_string()],
             raw_query_string: String::new(),
             headers: BTreeMap::new(),
             query_parameters: BTreeMap::new(),

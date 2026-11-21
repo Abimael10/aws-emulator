@@ -57,6 +57,14 @@ pub const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
 /// access-log record reads it.
 pub const FORWARDED_FOR_HEADER: &str = "x-forwarded-for";
 
+/// The request headers the GATEWAY itself states about the hop it took: the protocol and the
+/// port of the endpoint the request reached
+/// (`crate::service::invoke::backend_headers` states both from the api's own published
+/// endpoint). `pub` for the same reason as the chain above — this module owns the names of the
+/// forwarded headers this data plane writes.
+pub const FORWARDED_PROTO_HEADER: &str = "x-forwarded-proto";
+pub const FORWARDED_PORT_HEADER: &str = "x-forwarded-port";
+
 /// The greedy suffix of a path-variable route-key segment (`{proxy+}`), which stands for
 /// "the remainder of the path" and so names one parameter holding every remaining segment.
 const GREEDY_VARIABLE_SUFFIX: char = '+';
@@ -86,6 +94,12 @@ pub struct ProxyRequest {
     pub raw_path: String,
     /// The path within the STAGE, which is what the route key matched.
     pub route_path: String,
+    /// That same path as the SEGMENTS route selection read it
+    /// (`crate::service::invoke::Target`): one entry per `/`-separated segment of the request
+    /// target, decoded, the empty ones included. The segments rather than the path are what a
+    /// route key's variables are captured from ([`ProxyRequest::path_parameters`]), because a
+    /// segment can carry a decoded `/` of its own, which separates nothing.
+    pub route_segments: Vec<String>,
     /// The query string as it arrived, with no leading `?`; empty for a request carrying
     /// none.
     pub raw_query_string: String,
@@ -144,14 +158,17 @@ impl ProxyRequest {
     }
 
     /// The caller's address, as the event reports it.
+    ///
+    /// `requestContext.http.sourceIp` is the address of the CONNECTION the gateway read the
+    /// request from, which for this emulator's front door is the loopback address
+    /// ([`LOOPBACK_SOURCE_IP`]) — never a value the request CLAIMED in a forwarded header. A
+    /// client can write any chain it likes into `X-Forwarded-For`, which is precisely why the
+    /// gateway appends its OWN view of the peer to that chain
+    /// (`crate::service::invoke::backend_headers`) instead of trusting it; reporting the claim
+    /// here would make the identity the event states disagree with the chain the backend reads
+    /// and let a caller choose the address it is logged under.
     fn source_ip(&self) -> String {
-        self.header(FORWARDED_FOR_HEADER)
-            .as_deref()
-            .and_then(|value| value.split(',').next())
-            .map(str::trim)
-            .filter(|address| !address.is_empty())
-            .unwrap_or(LOOPBACK_SOURCE_IP)
-            .to_string()
+        LOOPBACK_SOURCE_IP.to_string()
     }
 
     /// The `userAgent` the event reports, or `None` for a request naming none.
@@ -187,7 +204,7 @@ impl ProxyRequest {
     /// `{proxy+}`.
     pub fn path_parameters(&self) -> BTreeMap<String, String> {
         let mut parameters = BTreeMap::new();
-        let requested = path_segments(&self.route_path);
+        let requested: Vec<&str> = self.route_segments.iter().map(String::as_str).collect();
         let Some((_, key_path)) = self.route_key.split_once(' ') else {
             return parameters;
         };
@@ -698,6 +715,7 @@ mod tests {
             method: "GET".to_string(),
             raw_path: "/prod/orders/7".to_string(),
             route_path: "/orders/7".to_string(),
+            route_segments: vec!["orders".to_string(), "7".to_string()],
             raw_query_string: "a=1&a=2&b=3".to_string(),
             headers: BTreeMap::from([
                 ("cookie".to_string(), vec!["one=1; two=2".to_string()]),
@@ -881,33 +899,51 @@ mod tests {
     #[test]
     fn a_route_keys_variables_name_the_path_parameters_of_the_request() {
         // Rows differ along the KIND of variable the key holds: none, one, two, and the
-        // greedy remainder, which holds every segment left.
-        let cases: [(&str, &str, &str, Value); 5] = [
-            ("a key naming no variable", "GET /orders", "/orders", json!({})),
-            ("one variable", "GET /orders/{id}", "/orders/7", json!({"id": "7"})),
+        // greedy remainder, which holds every segment left — and along the kind of SEGMENT it
+        // captures, since the segments route selection read are what a variable is captured
+        // from (`crate::service::invoke::Target`): an ordinary one, one carrying a separator
+        // its own escape decoded to, and the empty one a trailing slash makes.
+        let cases: [(&str, &str, &[&str], Value); 7] = [
+            ("a key naming no variable", "GET /orders", &["orders"], json!({})),
+            ("one variable", "GET /orders/{id}", &["orders", "7"], json!({"id": "7"})),
             (
                 "two variables",
                 "GET /orders/{id}/items/{item}",
-                "/orders/7/items/3",
+                &["orders", "7", "items", "3"],
                 json!({"id": "7", "item": "3"}),
             ),
             (
                 "the greedy remainder over several segments",
                 "ANY /{proxy+}",
-                "/a/b/c",
+                &["a", "b", "c"],
                 json!({"proxy": "a/b/c"}),
             ),
             (
                 "the greedy remainder under a literal prefix",
                 "GET /files/{path+}",
-                "/files/a/b",
+                &["files", "a", "b"],
                 json!({"path": "a/b"}),
             ),
+            (
+                "a variable over a segment whose own escape decoded to a separator",
+                "GET /orders/{id}",
+                &["orders", "a/b"],
+                json!({"id": "a/b"}),
+            ),
+            (
+                "a variable over the empty segment a trailing slash makes",
+                "GET /orders/{id}",
+                &["orders", ""],
+                json!({"id": ""}),
+            ),
         ];
-        for (case, route_key, route_path, expected) in cases {
+        for (case, route_key, segments, expected) in cases {
+            let route_segments: Vec<String> =
+                segments.iter().map(|segment| (*segment).to_string()).collect();
             let actual = json!(ProxyRequest {
                 route_key: route_key.to_string(),
-                route_path: route_path.to_string(),
+                route_path: format!("/{}", route_segments.join("/")),
+                route_segments,
                 ..request()
             }
             .path_parameters());

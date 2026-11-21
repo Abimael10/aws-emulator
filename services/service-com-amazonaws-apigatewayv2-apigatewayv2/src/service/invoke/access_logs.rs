@@ -45,15 +45,10 @@ pub(crate) const FIRST_ERROR_STATUS: u16 = 400;
 /// reports.
 const USER_AGENT_HEADER: &str = "user-agent";
 
-/// The request header the address the request came from is recorded in where it reached the
-/// emulator through a forwarder — the one owner of that header's name
-/// ([`super::proxy_event::FORWARDED_FOR_HEADER`]).
-use super::proxy_event::FORWARDED_FOR_HEADER;
-
-/// The address a request that no forwarder recorded an address for came from: this emulator
-/// is reached in process or over the loopback interface, so that is where such a request
-/// arrived from.
-const LOOPBACK_SOURCE_IP: &str = "127.0.0.1";
+/// The address a request reached this emulator from — the ONE owner of that reading for this
+/// data plane ([`super::proxy_event::LOOPBACK_SOURCE_IP`], which the invocation's own event
+/// reports), so a stage's record and the event it served cannot drift apart.
+use super::proxy_event::LOOPBACK_SOURCE_IP;
 
 /// Deliver the access-log record the stage this request reached asks for.
 ///
@@ -114,7 +109,7 @@ fn planned<Eng: Send + Sync + 'static>(
     let store = state.lock();
     let resolved = super::resolve(&store, &super::Addressed::of_request(req))?;
     let api = resolved.api;
-    let (stage, route_path) = super::stage_of(api, resolved.invoke_path)?;
+    let (stage, route) = super::routed_target(api, resolved.invoke_path)?;
     let settings = stage.access_log_settings.as_ref()?;
     let destination = settings.destination_arn.as_deref()?;
     let format = settings.format.as_deref()?;
@@ -130,7 +125,7 @@ fn planned<Eng: Send + Sync + 'static>(
             super::matching_route(
                 &deployment.configuration.routes,
                 req.method(),
-                &route_path,
+                &route,
             )
         })
         .map(|route| route.route_key.clone())?;
@@ -143,7 +138,7 @@ fn planned<Eng: Send + Sync + 'static>(
         // client that cannot resolve the api's endpoint carries the api id or the local
         // marker in the path instead ([`super::resolve`]), and none of that is part of the
         // path the api was addressed at.
-        &super::endpoint_path(stage, &route_path),
+        &super::endpoint_path(stage, &route),
         &route_key,
         req,
         request_id,
@@ -220,7 +215,7 @@ fn context_of(
         ("status", status.to_string()),
         ("responseLength", body.len().to_string()),
         ("responseLatency", latency.as_millis().to_string()),
-        ("identity.sourceIp", source_ip(req)),
+        ("identity.sourceIp", source_ip()),
     ]
     .into_iter()
     .map(|(member, value)| (member.to_string(), value))
@@ -249,17 +244,13 @@ fn context_of(
     context
 }
 
-/// The address this call came from, as `$context.identity.sourceIp` reports it: the FIRST
-/// hop a forwarder recorded where the request reached the emulator through one, and the
-/// loopback address otherwise — the same reading an invocation's own event takes.
-fn source_ip(req: &RtRequest) -> String {
-    req.headers()
-        .get(FORWARDED_FOR_HEADER)
-        .and_then(|value| value.split(',').next())
-        .map(str::trim)
-        .filter(|address| !address.is_empty())
-        .unwrap_or(LOOPBACK_SOURCE_IP)
-        .to_string()
+/// The address this call came from, as `$context.identity.sourceIp` reports it: the address
+/// of the CONNECTION the request was read from, which for this emulator's front door is the
+/// loopback address — the same reading an invocation's own event takes
+/// ([`super::proxy_event::ProxyRequest::source_ip`]), and never a value the request claimed in
+/// a forwarded header, so a caller cannot choose the address its call is logged under.
+fn source_ip() -> String {
+    LOOPBACK_SOURCE_IP.to_string()
 }
 
 /// `at` in milliseconds since the epoch, which is the unit `requestTimeEpoch` reports.

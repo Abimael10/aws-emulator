@@ -315,7 +315,11 @@ struct Row {
     path_parameters: &'static [(&'static str, &'static str)],
     /// `cookies`, likewise.
     cookies: &'static [&'static str],
-    /// The address `requestContext.http.sourceIp` must report.
+    /// The address `requestContext.http.sourceIp` must report: the CONNECTION the gateway
+    /// read the request from, which for this emulator's front door is the loopback address
+    /// — never an address the request CLAIMED in a forwarded header, which is a value any
+    /// client can write and which the gateway therefore only APPENDS its own view of the peer
+    /// to.
     source_ip: &'static str,
 }
 
@@ -392,7 +396,10 @@ const ROWS: &[Row] = &[
         query_parameters: &[("note", "gift")],
         path_parameters: &[("id", "42")],
         cookies: &[],
-        source_ip: "203.0.113.9",
+        // The claimed chain is relayed and the gateway's own view of the peer is appended to
+        // it, but the address the envelope REPORTS is that peer: the connection this request
+        // was read from.
+        source_ip: LOOPBACK,
     },
     Row {
         case: "an ANY route whose path ends in a greedy segment the request fills with two, \

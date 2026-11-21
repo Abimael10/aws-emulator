@@ -233,6 +233,7 @@ mod tests {
             method: "GET".to_string(),
             raw_path: "/prod/orders".to_string(),
             route_path: "/orders".to_string(),
+            route_segments: vec!["orders".to_string()],
             raw_query_string: "page=2".to_string(),
             headers: BTreeMap::from([(
                 "x-sent".to_string(),

@@ -214,7 +214,7 @@ fn planned<Eng: Send + Sync + 'static>(
 /// with `method`, or `None` for a request no route of the api served.
 ///
 /// Which route matched is what attributes a request to a stage's series, so it is read the
-/// way the serving itself reads it ([`super::stage_of`], the deployment released to that
+/// way the serving itself reads it ([`super::routed_target`], the deployment released to that
 /// stage, and [`super::matching_route`] over the routes that deployment froze) — a stage
 /// pinned to an older deployment therefore meters the routes that deployment holds. Every
 /// answer the gateway produced WITHOUT a route — an endpoint the api turned off
@@ -229,13 +229,13 @@ fn routed<'s>(
     if !crate::service::data_plane::serves_default_endpoint(api) {
         return None;
     }
-    let (stage, route_path) = super::stage_of(api, invoke_path)?;
+    let (stage, route) = super::routed_target(api, invoke_path)?;
     let route = stage
         .deployment_id
         .as_deref()
         .and_then(|deployment_id| api.deployments.get(deployment_id))
         .and_then(|deployment| {
-            super::matching_route(&deployment.configuration.routes, method, &route_path)
+            super::matching_route(&deployment.configuration.routes, method, &route)
         })?;
     Some((stage, route))
 }

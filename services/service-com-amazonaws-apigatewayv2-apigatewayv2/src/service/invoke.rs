@@ -47,6 +47,11 @@
 //!    `{"message":"Not Found"}` ([`not_found`]) — before a stage is even looked for, and it
 //!    serves again as soon as the member is cleared
 //!    ([`super::data_plane::serves_default_endpoint`]);
+//! 1c. the request TARGET is percent-decoded, [`TARGET_DECODE_PASSES`] passes and no more
+//!    ([`Target::of`]), BEFORE anything of the api's is matched against it — so the stage
+//!    segment, the route key, the `pathParameters` captured off the path and the `rawPath` the
+//!    event reports are all the decoded path. A target a pass cannot read (a `%` beginning no
+//!    complete escape) is refused `400` `{"message":"Bad Request"}` ([`bad_request`]);
 //! 2. the path within that api names a `Stage` of it: its first segment, or the
 //!    [`crate::state::DEFAULT_STAGE_NAME`] stage, which is "the stage that serves an api's
 //!    root" and so is reached with no stage segment in the path at all — that is the
@@ -73,6 +78,12 @@
 //!    stage throttles is refused `429` ([`crate::state::route_throttle`]) and its
 //!    integration is not reached, while a twin route of the same stage is served;
 //! 7. the route's integration decides the response.
+//!
+//! Whatever is answered NAMES the request it answered ([`naming_the_request`]): every response
+//! this endpoint returns — the gateway's own envelopes as much as a relayed integration
+//! response — carries [`GATEWAY_REQUEST_ID_HEADER`] stating the id the invoke was minted with,
+//! the same id the proxy payload's `requestContext.requestId` and the stage's access-log
+//! record carry, so a client can join the answer it holds to the record of it.
 //!
 //! On top of those, the api's own `CorsConfiguration` OWNS the `Access-Control-*` headers of
 //! whatever is answered for it ([`cors_decoration`]): `Cors` is a member of the API rather
@@ -197,7 +208,7 @@ use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{http, OperationContext};
 
 use super::data_plane::{
-    addresses_connections, api_id_of_host, first_segment, forbidden, header_of,
+    addresses_connections, api_id_of_host, bad_request, first_segment, forbidden, header_of,
     identity_source_value, json_response, not_found, path_of, path_segments,
     presents_identity_source, query_of, query_parameter_values, query_parameters,
     service_named_by_host, split_first_segment, FieldValues, EXECUTE_API_LABEL,
@@ -271,6 +282,18 @@ const PAYLOAD_TOO_LARGE_MESSAGE: &str = "Request Entity Too Large";
 /// The request header that states how many bytes the payload has (RFC 9110 §8.6), read
 /// only when the body itself is not in memory to be measured.
 const CONTENT_LENGTH_HEADER: &str = "content-length";
+
+/// The response header an HTTP api's `execute-api` endpoint NAMES the request it answered in.
+///
+/// The data plane is modelled nowhere in this service's model — it binds the control-plane
+/// operations alone — so what this endpoint answers is recorded behaviour: every response an
+/// HTTP api returns carries the gateway's own request-id header, and its value is the same id
+/// that invoke reports in the proxy payload's `requestContext.requestId` and in the stage's
+/// access-log `$context.requestId`. It is the gateway's OWN name for the request, beside the
+/// protocol-independent `x-amzn-requestid` every answer of this emulator reports
+/// (`service_common::query_error_envelope`), and it is what a client correlating a refusal it
+/// holds with the record of it reads.
+const GATEWAY_REQUEST_ID_HEADER: &str = "apigw-requestid";
 
 /// The request header that carries the chain of addresses a request was forwarded through,
 /// the leftmost being the client's, which this gateway's own hop appends to
@@ -703,10 +726,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
             )
         }
     };
-    let served = ::service_common::query_error_envelope::with_stated_request_id_header(
-        answered,
-        &request_id,
-    );
+    let served = naming_the_request(answered, &request_id);
     let latency = started.elapsed();
     // What the STAGE publishes about the request it just answered ([`request_metrics`]), and
     // what it LOGS about it ([`access_logs`]), delivered to the destination the stage names.
@@ -755,8 +775,7 @@ pub fn serve_without_transport<Eng: Send + Sync + 'static>(
     // No access-log record is delivered from here: the delivery is a CALL into the
     // CloudWatch Logs this emulator mounts, and this seam has no request of its own to
     // measure or to carry one over. The response still names the request it answered.
-    let served =
-        ::service_common::query_error_envelope::with_stated_request_id_header(answered, &request_id);
+    let served = naming_the_request(answered, &request_id);
     // The metric publication IS made from here: it is a write into the metric store this
     // emulator's CloudWatch holds on the same engine rather than a call over a transport, so
     // a request served from this seam is counted like any other.
@@ -768,6 +787,37 @@ pub fn serve_without_transport<Eng: Send + Sync + 'static>(
         integration_latency,
     );
     served
+}
+
+/// `answered` with the request it answers NAMED, which is what every response an HTTP api's
+/// `execute-api` endpoint returns carries: the gateway's own header
+/// ([`GATEWAY_REQUEST_ID_HEADER`]) and the protocol-independent one every other answer of this
+/// emulator reports, both stating the id THIS invoke was minted with — so the header a client
+/// correlates by, the `requestContext.requestId` the integration's event carried and the
+/// stage's access-log record name one request.
+///
+/// Applied to whatever the endpoint answered, because the id is a property of the RESPONSE and
+/// not of what produced it: the gateway's own envelopes (the `404` for an address it serves
+/// nothing at, the `400` for a target it cannot read, the refusals an authorizer and the
+/// payload quota earn) and a relayed integration response alike. The gateway's header is
+/// STATED rather than kept, since the id is the gateway's: a value a route's backend answered
+/// with cannot be passed off as it.
+fn naming_the_request(answered: RtResponse, request_id: &str) -> RtResponse {
+    let mut response =
+        ::service_common::query_error_envelope::with_stated_request_id_header(answered, request_id);
+    if let Err(error) = response
+        .headers_mut()
+        .try_insert(GATEWAY_REQUEST_ID_HEADER, request_id.to_string())
+    {
+        // Unreachable for a minted id, which is lowercase hex: the header value is always one
+        // the HTTP layer carries. Traced rather than dropped silently, because an answer that
+        // does not name its request is the defect this states the rule against.
+        ::tracing::debug!(
+            %error,
+            "this answer could not be named with the request id the invoke was minted with"
+        );
+    }
+    response
 }
 
 /// Perform `dispatch` over the transport this service remembered, and answer what the route's
@@ -1041,15 +1091,28 @@ fn resolve_answer(
     gateway_answers_preflight: bool,
 ) -> Answer {
     let api = resolved.api;
-    // The stage: the path's first segment when it names one, and otherwise the stage that
+    // The request TARGET first: an HTTP api DECODES it ([`decoded_target`]) before it matches
+    // anything of the api's against it, so every step below — the stage segment, the route
+    // key, the path parameters captured off it and the path the event reports — reads the
+    // decoded path. A target no decoding pass could read is refused with the gateway's own
+    // envelope instead, since there is nothing to match a route key against.
+    let Ok(target) = Target::of(resolved.invoke_path) else {
+        tracing::debug!(
+            api_id = %api.api_id,
+            path = %resolved.invoke_path,
+            "the request target carries an escape no decoding pass can read"
+        );
+        return Answer::Now(Box::new(bad_request()));
+    };
+    // The stage: the target's first segment when it names one, and otherwise the stage that
     // serves the api's root. A path that names neither names a resource of this endpoint
     // that is not there — the same thing a path no route matches names — so it is the
     // endpoint's `404`: that is what makes a DELETED stage stop serving, rather than keep
     // answering for an api whose records no longer hold it.
-    let Some((stage, route_path)) = stage_of(api, resolved.invoke_path) else {
+    let Some((stage, route)) = stage_of(api, &target) else {
         tracing::debug!(
             api_id = %api.api_id,
-            path = %resolved.invoke_path,
+            path = %target.path(),
             "the request names no stage of this api"
         );
         return Answer::Now(Box::new(not_found()));
@@ -1081,8 +1144,8 @@ fn resolve_answer(
     // answers the preflight itself only for a request no route of the served deployment
     // matches — which is what makes a preflight answerable for an api whose routes match no
     // `OPTIONS` request.
-    let matched = matching_route(&deployment.configuration.routes, addressed.method, &route_path);
-    let Some(route) = matched else {
+    let matched = matching_route(&deployment.configuration.routes, addressed.method, &route);
+    let Some(route_record) = matched else {
         if gateway_answers_preflight {
             tracing::debug!(
                 api_id = %api.api_id,
@@ -1096,7 +1159,7 @@ fn resolve_answer(
             api_id = %api.api_id,
             stage = %stage.stage_name,
             method = %addressed.method,
-            path = %route_path,
+            path = %route.path(),
             "no route of this api matches the request"
         );
         return Answer::Now(Box::new(not_found()));
@@ -1105,7 +1168,7 @@ fn resolve_answer(
     // refused here never reaches the integration below, which is what makes an authorizer's
     // gate observable. A Lambda authorizer's own decision is the one part of it that needs
     // the backend, so it travels with the dispatch below.
-    let (authorizer, admitted_jwt) = match authorization(api, stage, route, req) {
+    let (authorizer, admitted_jwt) = match authorization(api, stage, route_record, req) {
         Authorization::Refused(refusal) => return Answer::Now(Box::new(refusal)),
         Authorization::Admitted(admitted_jwt) => (None, admitted_jwt),
         Authorization::DecidedByFunction(authorizer, identity) => {
@@ -1114,15 +1177,15 @@ fn resolve_answer(
     };
     // And the payload quota, ahead of the dispatch below: a body past it is the gateway's
     // own refusal, so the integration is never reached for it.
-    if let Some(refusal) = payload_refusal(api, stage, route, req) {
+    if let Some(refusal) = payload_refusal(api, stage, route_record, req) {
         return Answer::Now(Box::new(refusal));
     }
     Answer::Dispatch(Box::new(dispatch(
         api,
         stage,
         &deployment.configuration,
-        route,
-        &route_path,
+        route_record,
+        &route,
         req,
         request_id,
         authorizer,
@@ -1381,28 +1444,24 @@ fn decorated(mut response: RtResponse, decoration: &CorsDecoration) -> RtRespons
     response
 }
 
-/// The stage of `api` that `invoke_path` names, and the path WITHIN that stage.
+/// The stage of `api` that `target` names, and the target WITHIN that stage.
 ///
 /// Two spellings reach a stage, and `Api$ApiEndpoint` carries both in one word: "the stage
-/// name is TYPICALLY appended to this URI". The first path segment names the stage when the
-/// api holds one of that name; otherwise the stage is the one that serves the api's root,
+/// name is TYPICALLY appended to this URI". The first segment names the stage when the api
+/// holds one of that name; otherwise the stage is the one that serves the api's root,
 /// [`crate::state::DEFAULT_STAGE_NAME`] — "the stage that serves an api's root" — and the
-/// whole path is the route path. A named stage therefore wins over the root stage for a
-/// path that begins with its name, which is the only reading under which both remain
+/// whole target is the route path. A named stage therefore wins over the root stage for a
+/// target that begins with its name, which is the only reading under which both remain
 /// reachable.
-fn stage_of<'s>(api: &'s Api, invoke_path: &str) -> Option<(&'s Stage, String)> {
-    if let Some(first) = first_segment(invoke_path) {
+fn stage_of<'s>(api: &'s Api, target: &Target) -> Option<(&'s Stage, Target)> {
+    if let Some(first) = target.first() {
         if let Some(stage) = api.stages.get(first) {
-            let rest = invoke_path
-                .trim_start_matches('/')
-                .strip_prefix(first)
-                .unwrap_or_default();
-            return Some((stage, normalised_path(rest)));
+            return Some((stage, target.beyond_first()));
         }
     }
     api.stages
         .get(crate::state::DEFAULT_STAGE_NAME)
-        .map(|stage| (stage, normalised_path(invoke_path)))
+        .map(|stage| (stage, target.clone()))
 }
 
 /// The path the api's OWN endpoint was addressed at for this invoke, which is what a proxy
@@ -1420,24 +1479,203 @@ fn stage_of<'s>(api: &'s Api, invoke_path: &str) -> Option<(&'s Stage, String)> 
 /// this machine cannot resolve the api's endpoint, so it carries the api id, the local
 /// marker or the root stage's own name in the PATH instead ([`resolve`]), and none of those
 /// is part of the path the api was addressed at.
-fn endpoint_path(stage: &Stage, route_path: &str) -> String {
+fn endpoint_path(stage: &Stage, route: &Target) -> String {
     if stage.stage_name == crate::state::DEFAULT_STAGE_NAME {
-        return normalised_path(route_path);
+        return route.path();
     }
-    normalised_path(&format!("{}/{route_path}", stage.stage_name))
+    if route.segments.is_empty() {
+        return format!("/{}", stage.stage_name);
+    }
+    format!("/{}{}", stage.stage_name, route.path())
 }
 
-/// `path` with exactly one leading `/` and no trailing one (except for the root itself), so
-/// that the same route path is compared however a client spelled it.
-fn normalised_path(path: &str) -> String {
-    let segments = path_segments(path);
-    if segments.is_empty() {
-        return "/".to_string();
-    }
-    format!("/{}", segments.join("/"))
+/// How many times an HTTP api PERCENT-DECODES each segment of the request target before it
+/// selects a route: twice, and no more.
+///
+/// Recorded behaviour, the contract for a data plane this model binds no operation of: a
+/// target spelling one escaped layer reaches the route key, the event's `rawPath` and the
+/// `pathParameters` fully decoded, a target spelling two layers decodes to the same thing on
+/// the second pass, and a target spelling three keeps its innermost escape as literal text —
+/// which is what fixes the depth at exactly this many.
+const TARGET_DECODE_PASSES: usize = 2;
+
+/// The escape introducer of a percent-encoded octet (RFC 3986 §2.1).
+const PERCENT: u8 = b'%';
+
+/// The dot segments RFC 3986 §5.2.4 removes from a path: "." stands for the path it is in and
+/// ".." for the one above it, so neither is a segment a route key is matched against.
+const SELF_SEGMENT: &str = ".";
+const PARENT_SEGMENT: &str = "..";
+
+/// What no decoding pass can read a request target as: a `%` that begins no complete escape,
+/// or a decoded octet sequence that is not text.
+#[derive(Debug, Clone, Copy)]
+struct MalformedTarget;
+
+/// What a request addressed WITHIN an api, as route selection reads it: the target's segments,
+/// each decoded.
+///
+/// The segments are the unit, not the path string, and three rules follow from that — all of
+/// them recorded behaviour, since the data plane is modelled nowhere in this service's model:
+///
+/// * the target is split on the `/` characters it ARRIVED with, so a `/` that an escape
+///   spells belongs to the segment it decoded in and separates nothing;
+/// * every `/`-separated segment counts, the EMPTY ones included, so a target ending in `/`
+///   carries one empty last segment and is therefore not the same path as the one without it;
+/// * the dot segments RFC 3986 §5.2.4 removes are removed, before anything is decoded: they
+///   are part of the target's syntax rather than text a segment carries.
+///
+/// Each remaining segment is then decoded [`TARGET_DECODE_PASSES`] times, so every reader of
+/// what the request addressed — the route key it is matched against ([`matching_route`]), the
+/// `rawPath` and `requestContext.http.path` the event reports ([`endpoint_path`]), the
+/// `pathParameters` captured off it, and the stage's own record and metrics of the request
+/// ([`routed_target`]) — reads the decoded path AWS had already decoded for a handler rather
+/// than the escaped bytes.
+#[derive(Debug, Clone, Default)]
+struct Target {
+    /// One entry per segment, in order, decoded.
+    segments: Vec<String>,
 }
 
-/// The route of `routes` that serves `method path`, or `None` when none of them does.
+impl Target {
+    /// The target `invoke_path` carries, or [`MalformedTarget`] for one a decoding pass could
+    /// not read — which the gateway refuses with its own [`bad_request`] envelope rather than
+    /// matching a route key against something it could not decode. That is what makes the
+    /// second pass observable even where it changes nothing: a target that decodes once to a
+    /// malformed escape is refused, while one that decodes twice to the same text is served.
+    fn of(invoke_path: &str) -> Result<Self, MalformedTarget> {
+        let mut segments = Vec::new();
+        for segment in without_dot_segments(arriving_segments(invoke_path)) {
+            segments.push(decoded_segment(segment)?);
+        }
+        Ok(Self { segments })
+    }
+
+    /// The first segment, or `None` for a target that names none — the api's own root.
+    fn first(&self) -> Option<&str> {
+        self.segments.first().map(String::as_str)
+    }
+
+    /// This target with its first segment removed: the path within a NAMED stage, whose name
+    /// that segment is.
+    fn beyond_first(&self) -> Self {
+        Self {
+            segments: self.segments.iter().skip(1).cloned().collect(),
+        }
+    }
+
+    /// The path these segments spell: one leading `/` and the segments as they decoded — so a
+    /// target whose last segment is empty keeps its trailing `/`, and a target of no segments
+    /// at all is the root.
+    fn path(&self) -> String {
+        format!("/{}", self.segments.join("/"))
+    }
+}
+
+/// The segments of `path` as the request carried them: split on the `/` characters that
+/// ARRIVED, with every empty segment kept except the one the leading `/` makes, and nothing
+/// decoded yet.
+fn arriving_segments(path: &str) -> Vec<&str> {
+    let within = path.strip_prefix('/').unwrap_or(path);
+    if within.is_empty() {
+        return Vec::new();
+    }
+    within.split('/').collect()
+}
+
+/// `segments` with the dot segments RFC 3986 §5.2.4 removes taken out: a "." segment stands
+/// for the path it is in and is dropped, and a ".." segment stands for the path above it and
+/// takes the preceding segment with it.
+///
+/// A dot segment in LAST position leaves the path it resolved to ending in `/`, which is one
+/// empty segment — `/a/b/.` is `/a/b/` and `/a/b/..` is `/a/` — and a ".." with nothing above
+/// it removes nothing, since a path cannot climb past its own root.
+fn without_dot_segments(segments: Vec<&str>) -> Vec<&str> {
+    let last = segments.len().saturating_sub(1);
+    let mut kept: Vec<&str> = Vec::with_capacity(segments.len());
+    for (position, segment) in segments.into_iter().enumerate() {
+        match segment {
+            SELF_SEGMENT => {}
+            PARENT_SEGMENT => {
+                kept.pop();
+            }
+            other => {
+                kept.push(other);
+                continue;
+            }
+        }
+        // The dot segment resolved to the path it stood in, and in last position that path is
+        // written with a trailing `/`.
+        if position == last {
+            kept.push("");
+        }
+    }
+    kept
+}
+
+/// One SEGMENT of the target, decoded [`TARGET_DECODE_PASSES`] times, or [`MalformedTarget`]
+/// for a segment a pass could not read.
+fn decoded_segment(segment: &str) -> Result<String, MalformedTarget> {
+    let mut decoded = segment.to_string();
+    for _ in 0..TARGET_DECODE_PASSES {
+        decoded = decoded_once(&decoded)?;
+    }
+    Ok(decoded)
+}
+
+/// ONE decoding pass over `segment`: every `%HH` becomes the octet its two digits spell and
+/// every other character is carried through, or [`MalformedTarget`] for a `%` that begins no
+/// complete escape and for a result that is not text.
+///
+/// The decoding itself is `percent_encoding`'s, the maintained decoder for the grammar
+/// (RFC 3986 §2.1). What is stated here is the one rule that decoder does not state: it is
+/// LENIENT by design — a `%` beginning no complete escape is carried through as itself — and
+/// that case is exactly what the gateway refuses a target for, so it is checked BEFORE the
+/// decode rather than inferred from its output.
+fn decoded_once(segment: &str) -> Result<String, MalformedTarget> {
+    every_escape_complete(segment)?;
+    ::percent_encoding::percent_decode_str(segment)
+        .decode_utf8()
+        // The octets an escape spells are the UTF-8 of the text the path carries, and a path
+        // is text: it is compared against route keys, captured into path parameters and
+        // reported in a JSON event, none of which holds anything else.
+        .map(|decoded| decoded.into_owned())
+        .map_err(|_| MalformedTarget)
+}
+
+/// `Ok` when every `%` of `segment` begins a complete escape — two hexadecimal digits — and
+/// [`MalformedTarget`] otherwise.
+///
+/// Every `%` is read as an escape introducer, because a path that carries one as DATA spells
+/// it `%25`: so a `%` the segment does not complete is a target this gateway cannot read,
+/// whichever pass meets it.
+fn every_escape_complete(segment: &str) -> Result<(), MalformedTarget> {
+    let bytes = segment.as_bytes();
+    for (at, byte) in bytes.iter().enumerate() {
+        if *byte != PERCENT {
+            continue;
+        }
+        let escape = bytes.get(at + 1..at + 3).ok_or(MalformedTarget)?;
+        if !escape.iter().all(u8::is_ascii_hexdigit) {
+            return Err(MalformedTarget);
+        }
+    }
+    Ok(())
+}
+
+/// [`stage_of`] over the request target as route selection read it ([`Target::of`]), for the
+/// two readers that RE-RESOLVE a request the endpoint already answered: the stage's
+/// access-log record ([`access_logs`]) and its metrics ([`request_metrics`]).
+///
+/// Both have to read the stage and the route the SERVING read, so both read the target the
+/// same way — a request served through a route whose path carried an escape leaves a record
+/// and a datapoint for that same route. A target no pass could read reached no route at all,
+/// so there is nothing for either to report about it.
+fn routed_target<'s>(api: &'s Api, invoke_path: &str) -> Option<(&'s Stage, Target)> {
+    stage_of(api, &Target::of(invoke_path).ok()?)
+}
+
+/// The route of `routes` that serves `method` at `target`, or `None` when none of them does.
 ///
 /// `routes` are the routes of the DEPLOYMENT the stage serves (frozen when it was
 /// released), not the api's current ones: that is what makes a stage pinned to an older
@@ -1451,15 +1689,18 @@ fn normalised_path(path: &str) -> String {
 /// for the same request, and a key naming the request's verb beats the `ANY` catch-all for
 /// the same path.
 ///
+/// The segments compared are the TARGET's ([`Target`]), so a key is matched against the
+/// decoded segments the request arrived with, one for one.
+///
 /// The work is bounded: one scan of the deployed routes, capped at
 /// [`crate::state::MAX_ROUTES_PER_API`] by the create that stored them, and each key's
 /// segments are compared once against the request's.
 fn matching_route<'s>(
     routes: &'s BTreeMap<String, Route>,
     method: &str,
-    path: &str,
+    target: &Target,
 ) -> Option<&'s Route> {
-    let requested = path_segments(path);
+    let requested: Vec<&str> = target.segments.iter().map(String::as_str).collect();
     let best = routes
         .values()
         .filter(|route| route.route_key != DEFAULT_ROUTE_KEY)
@@ -1771,7 +2012,7 @@ fn dispatch(
     stage: &Stage,
     deployed: &DeployedConfiguration,
     route: &Route,
-    route_path: &str,
+    target: &Target,
     req: &RtRequest,
     request_id: &str,
     authorizer: Option<(Authorizer, Vec<String>)>,
@@ -1790,10 +2031,11 @@ fn dispatch(
             // The path AWS's own event reports is the one the api's OWN endpoint was
             // addressed at ([`endpoint_path`]), whichever addressing a local client reached
             // this emulator by.
-            raw_path: endpoint_path(stage, route_path),
-            route_path: route_path.to_string(),
+            raw_path: endpoint_path(stage, target),
+            route_path: target.path(),
+            route_segments: target.segments.clone(),
             raw_query_string: query_of(req.uri()).unwrap_or_default().to_string(),
-            headers: backend_headers(req),
+            headers: backend_headers(api, req),
             query_parameters: query_parameter_values(req.uri()),
             body: req
                 .body()
@@ -1852,17 +2094,26 @@ fn request_headers(req: &RtRequest) -> FieldValues {
 }
 
 /// The request as the BACKEND sees it: every header the client sent ([`request_headers`]),
-/// with the one header the gateway's own hop writes onto the message.
+/// with the headers the gateway's own hop writes onto the message.
 ///
-/// A gateway is an intermediary, so the request it relays carries the chain of the hops it
-/// came through: the client's `X-Forwarded-For` is PRESERVED and the address this hop
-/// observed the request FROM is appended to it, which is what makes the backend's last
-/// element the peer the gateway actually read the request from rather than whatever the
-/// client claimed (RFC 7239 §4 states the same ordering for `Forwarded`: "the leftmost node
-/// is the node closest to the client"). A request carrying no chain gets one holding that
-/// address alone. Every other header the client sent — `Via` among them — is relayed exactly
-/// as it arrived.
-fn backend_headers(req: &RtRequest) -> FieldValues {
+/// A gateway is an intermediary, so the request it relays says what hop it came through:
+///
+/// * the client's `X-Forwarded-For` is PRESERVED and the address this hop observed the
+///   request FROM is appended to it, which is what makes the backend's last element the peer
+///   the gateway actually read the request from rather than whatever the client claimed
+///   (RFC 7239 §4 states the same ordering for `Forwarded`: "the leftmost node is the node
+///   closest to the client"). A request carrying no chain gets one holding that address
+///   alone;
+/// * the PROTOCOL and the PORT of the endpoint the request reached are STATED rather than
+///   relayed: they describe the hop this gateway terminated, not one the client took, so a
+///   value the client sent for either is replaced. They are the api's own endpoint's — the
+///   scheme `Api$ApiEndpoint` publishes it under ([`crate::state::execute_api_scheme`], which
+///   for an HTTP api is `https`) and that scheme's default port
+///   ([`ENDPOINT_PORTS`]), since the published endpoint names no port of its own.
+///
+/// Every other header the client sent — `Via` and the `Host` it addressed among them — is
+/// relayed exactly as it arrived.
+fn backend_headers(api: &Api, req: &RtRequest) -> FieldValues {
     let mut headers = request_headers(req);
     let claimed = headers
         .get(FORWARDED_FOR_HEADER)
@@ -1876,8 +2127,41 @@ fn backend_headers(req: &RtRequest) -> FieldValues {
     // The chain is ONE field line, whichever number of them the client sent: the hop
     // appends to the chain rather than beside it.
     headers.insert(FORWARDED_FOR_HEADER.to_string(), vec![chain]);
+    let scheme = crate::state::execute_api_scheme(&api.protocol_type);
+    headers.insert(
+        proxy_event::FORWARDED_PROTO_HEADER.to_string(),
+        vec![scheme.to_string()],
+    );
+    headers.insert(
+        proxy_event::FORWARDED_PORT_HEADER.to_string(),
+        vec![endpoint_port(scheme).to_string()],
+    );
     headers
 }
+
+/// The port a client reaches the api's published endpoint on: the default port of the scheme
+/// that endpoint is published under (RFC 9110 §4.2.1-4.2.2), because `Api$ApiEndpoint`
+/// publishes the endpoint with no port and a client therefore dials the scheme's own.
+fn endpoint_port(scheme: &str) -> u16 {
+    ENDPOINT_PORTS
+        .iter()
+        .find(|(named, _)| *named == scheme)
+        .map_or(HTTPS_PORT, |(_, port)| *port)
+}
+
+/// The default port of each scheme an api's endpoint is published under: `https` and the
+/// `wss` a WebSocket api's endpoint names, both of which are reached on the TLS port, and
+/// their cleartext spellings for completeness. Nothing this emulator publishes is cleartext,
+/// so [`HTTPS_PORT`] is also what an unlisted scheme reports.
+const ENDPOINT_PORTS: [(&str, u16); 4] = [
+    ("https", HTTPS_PORT),
+    ("wss", HTTPS_PORT),
+    ("http", 80),
+    ("ws", 80),
+];
+
+/// The port the TLS schemes above are reached on (RFC 9110 §4.2.2).
+const HTTPS_PORT: u16 = 443;
 
 /// The address this gateway OBSERVED the request from, which is the one it appends to the
 /// forwarded chain: a client reaches this emulator over its own loopback front door, so that
@@ -1945,7 +2229,8 @@ mod tests {
 
     /// The rank of one key against one request, as [`specificity`] reads it.
     fn rank(route_key: &str, method: &str, path: &str) -> Option<(Vec<u8>, u8)> {
-        let segments = path_segments(path);
+        let target = Target::of(path).expect("a target this test spells without an escape");
+        let segments: Vec<&str> = target.segments.iter().map(String::as_str).collect();
         specificity(route_key, method, &segments)
     }
 
@@ -1953,7 +2238,22 @@ mod tests {
     fn a_route_key_matches_only_the_requests_it_names() {
         let cases: &[(&str, &str, &str, &str, bool)] = &[
             ("an exact method and path", "GET /orders", "GET", "/orders", true),
-            ("a trailing slash on the request", "GET /orders", "GET", "/orders/", true),
+            (
+                // A trailing `/` is one empty last segment, so the request carries a segment
+                // the key does not name and the key does not match it.
+                "a trailing slash on the request",
+                "GET /orders",
+                "GET",
+                "/orders/",
+                false,
+            ),
+            (
+                "a single-segment variable over the empty segment a trailing slash makes",
+                "GET /orders/{id}",
+                "GET",
+                "/orders/",
+                true,
+            ),
             ("another method", "GET /orders", "POST", "/orders", false),
             ("another path", "GET /orders", "GET", "/invoices", false),
             ("a deeper path", "GET /orders", "GET", "/orders/1", false),
@@ -2041,12 +2341,63 @@ mod tests {
     }
 
     #[test]
-    fn an_invoke_path_keeps_one_leading_slash_and_no_trailing_one() {
-        assert_eq!(normalised_path(""), "/");
-        assert_eq!(normalised_path("/"), "/");
-        assert_eq!(normalised_path("orders"), "/orders");
-        assert_eq!(normalised_path("/orders/"), "/orders");
-        assert_eq!(normalised_path("//orders//7/"), "/orders/7");
+    fn an_invoke_target_is_split_decoded_and_normalised_before_a_route_is_selected() {
+        // Rows differ along what the target carries: nothing to decode, one escaped layer,
+        // two, three (the pass depth is two, so the third layer stays as text), a separator
+        // an escape spells (which separates nothing), a trailing slash (one empty segment),
+        // and the dot segments RFC 3986 §5.2.4 removes.
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("the api's root", "/", &[]),
+            ("a literal path", "/items/plain", &["items", "plain"]),
+            ("one escaped layer", "/items/a%41b", &["items", "aAb"]),
+            ("two escaped layers", "/items/a%2541b", &["items", "aAb"]),
+            ("three escaped layers", "/items/a%252541b", &["items", "a%41b"]),
+            ("an escaped separator", "/items/a%2Fb", &["items", "a/b"]),
+            ("a trailing slash", "/items/", &["items", ""]),
+            ("a self dot segment", "/a/./b", &["a", "b"]),
+            ("a parent dot segment", "/a/../b", &["b"]),
+            ("a parent dot segment at the root", "/..", &[""]),
+            ("a trailing self dot segment", "/a/b/.", &["a", "b", ""]),
+        ];
+        for (case, path, expected) in cases {
+            let target = Target::of(path)
+                .unwrap_or_else(|_| panic!("case {case:?}: {path:?} must decode"));
+            assert_eq!(
+                target.segments, *expected,
+                "case {case:?}: expected the segments {expected:?} of {path:?}, got {:?}",
+                target.segments
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_an_escape_pass_cannot_read_is_no_target_at_all() {
+        // Rows differ along WHICH pass cannot read the target: the first, for an escape that
+        // is malformed as sent, and the second, for one the first pass decoded into a
+        // malformed escape — which is what makes the second pass observable. A target whose
+        // third layer is only text is read by both passes.
+        let refused: &[(&str, &str)] = &[
+            ("a percent beginning no escape", "/items/a%b"),
+            ("a percent ending the target", "/items/a%"),
+            ("a percent with one digit left", "/items/a%4"),
+            ("an escape whose digits are not hexadecimal", "/items/a%zzb"),
+            ("an escape the FIRST pass decodes into a malformed one", "/items/a%25b"),
+        ];
+        for (case, path) in refused {
+            assert!(
+                Target::of(path).is_err(),
+                "case {case:?}: {path:?} must be refused as a target no pass can read, got {:?}",
+                Target::of(path).map(|target| target.segments)
+            );
+        }
+        let served = Target::of("/items/a%2525b")
+            .expect("two passes read an escape spelling three layers");
+        assert_eq!(
+            served.segments,
+            vec!["items".to_string(), "a%b".to_string()],
+            "case \"three layers, the innermost left as text\": got {:?}",
+            served.segments
+        );
     }
 
     #[test]

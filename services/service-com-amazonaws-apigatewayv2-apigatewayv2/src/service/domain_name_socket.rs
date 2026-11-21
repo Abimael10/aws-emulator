@@ -87,9 +87,11 @@ const FORBIDDEN_MESSAGE: &str = super::data_plane::FORBIDDEN_MESSAGE;
 const MISDIRECTED_REQUEST: u16 = 421;
 const NOT_THIS_DOMAIN_NAME: &str = "Misdirected Request";
 
-/// How long a TLS handshake on this address may take, matching the deadline the core puts on
-/// a handshake its own TLS server runs: a client that completes TCP and then stalls the
-/// handshake cannot hold the connection permit the core issued for it.
+/// How long the whole PRE-REQUEST phase on this address may take — the first byte a client
+/// sends, and the TLS handshake that byte begins — matching the deadline the core puts on a
+/// handshake its own TLS server runs: a client that completes TCP and then sends nothing, or
+/// stalls part way through the handshake, cannot hold the connection permit the core issued
+/// for it.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How many DISTINCT certificates ONE connection loads key material for.
@@ -250,20 +252,23 @@ async fn negotiated(
     key_material: Option<&::engine::ServiceState<CertificateKeyMaterialDirectory>>,
     upgrader: Option<TlsUpgrader>,
 ) -> Option<ListenerConn> {
+    // ONE deadline over the whole pre-request phase, taken before the first read: a client
+    // that completes TCP and then sends nothing — or stalls part way through the handshake —
+    // cannot hold the connection permit the core issued for it for longer than this. The
+    // discriminator read is inside it, because an accepted connection that never sends a byte
+    // is exactly the stall this bound exists for, and the key loading the certificate
+    // selection needs is too (how many certificates it loads at all is capped by
+    // [`MAX_CERTIFICATES_PRESENTED`]).
+    let deadline = ::tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
     let mut first = [0u8; 1];
-    match conn.read(&mut first).await {
-        Ok(1) => {}
+    match ::tokio::time::timeout_at(deadline, conn.read(&mut first)).await {
+        Ok(Ok(1)) => {}
         _ => return None,
     }
     let prefixed: ListenerConn = Box::new(Prefixed::new(first.to_vec(), conn));
     if first[0] != TLS_RECORD_FIRST_BYTE {
         return Some(prefixed);
     }
-    // The whole handshake, the key loading its selection needs included, is bounded by ONE
-    // deadline, taken before that loading starts: a client that completes TCP cannot hold the
-    // core's connection permit for longer than this however many certificates the record
-    // names — and how many it loads at all is capped by [`MAX_CERTIFICATES_PRESENTED`].
-    let deadline = ::tokio::time::Instant::now() + HANDSHAKE_DEADLINE;
     let certificates = presented_certificates(state, domain_name, key_material);
     let Some(config) =
         ::service_common::acm_certificate_termination::server_config(&certificates, &[], None)
@@ -272,10 +277,11 @@ async fn negotiated(
         // own TLS server, under the emulator's own certificate. Nothing is invented for it.
         let upgrader = upgrader?;
         // ALPN `None`: a client of this address offers `http/1.1` or nothing, and what follows
-        // is HTTP/1.1 either way.
-        return match upgrader.accept(prefixed, None).await {
-            Ok((upgraded, _negotiated)) => Some(upgraded),
-            Err(error) => {
+        // is HTTP/1.1 either way. Under the SAME deadline, so a handshake the core's server
+        // drives is bounded exactly like one this address drives itself.
+        return match ::tokio::time::timeout_at(deadline, upgrader.accept(prefixed, None)).await {
+            Ok(Ok((upgraded, _negotiated))) => Some(upgraded),
+            Ok(Err(error)) => {
                 ::tracing::debug!(
                     %error,
                     "a TLS handshake on a custom domain name's own address was not completed \
@@ -283,6 +289,7 @@ async fn negotiated(
                 );
                 None
             }
+            Err(_timed_out) => None,
         };
     };
     let acceptor = ::tokio_rustls::TlsAcceptor::from(config);
@@ -444,7 +451,16 @@ fn addressed_mapping(record: &crate::state::DomainName, target: &::http::Uri) ->
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let uri = format!("https://{SERVICE_ENDPOINT}{prefix}{stage}/{under}{query}");
+    // What the client carried UNDER the base path, with its separator — and nothing at all
+    // where it carried nothing: the api's own endpoint was addressed at the stage's root, and
+    // a `/` written here would be one more segment of the path the api reports than the client
+    // sent (`crate::service::invoke::Target` counts the empty segment a trailing `/` makes).
+    let within = if under.is_empty() {
+        String::new()
+    } else {
+        format!("/{under}")
+    };
+    let uri = format!("https://{SERVICE_ENDPOINT}{prefix}{stage}{within}{query}");
     // READ BACK off the rendered target: the path under the base path is the CLIENT's own, so
     // this is the assertion that nothing it carried moved the request to another api, another
     // plane of this process or another service.
@@ -567,13 +583,13 @@ mod tests {
                 "/shop/eu/items",
                 Some("euapi000000/items"),
             ),
-            ("the key with nothing under it", "/shop", Some("shopapi0000/live/")),
+            ("the key with nothing under it", "/shop", Some("shopapi0000/live")),
             (
                 "a segment that merely starts with a key",
                 "/shopping/items",
                 Some("rootapi0000/prod/shopping/items"),
             ),
-            ("the domain root itself", "/", Some("rootapi0000/prod/")),
+            ("the domain root itself", "/", Some("rootapi0000/prod")),
             (
                 "a query string under a key",
                 "/shop/items?colour=red",

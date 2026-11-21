@@ -24,6 +24,13 @@
 //! stage's own name appended). The recorded case — one HTTP api read off `CreateApi` and
 //! invoked at the endpoint with a trailing slash — is ONE row of each.
 //!
+//! A trailing slash on a ROUTE PATH is the one spelling that addresses something else: an
+//! HTTP api counts every `/`-separated segment of the target, so `…/items/` carries an empty
+//! segment `GET /items` does not name and no route of these apis matches it — the gateway's
+//! own `404`, which is asserted here as part of the same rule (the endpoint is served; this
+//! path of it holds nothing). The endpoint's OWN trailing slash is not that: the stage that
+//! serves the api's root is reached with no segment at all either way.
+//!
 //! `http_api_published_invoke_address` holds the same member's rule for `CreateApi`, `GetApi`,
 //! `GetApis` and `ImportApi` over the endpoint forms; this suite holds the two halves it does
 //! not: the api MUTATORS that report the member back (`UpdateApi`, `ReimportApi`), which must
@@ -45,6 +52,12 @@ const SERVED: u16 = 307;
 /// The front door's envelope for a request no service claimed. The defect this suite pins is
 /// an address nothing serves, so this is never a legitimate answer here.
 const UNKNOWN_SERVICE: &str = "UnknownService";
+
+/// What the GATEWAY answers for a path of a served endpoint that no route key of the api
+/// names: its own `404` `{"message":"Not Found"}`, which is a served endpoint answering, not
+/// an unclaimed address.
+const MATCHED_NO_ROUTE: u16 = 404;
+const MATCHED_NO_ROUTE_MESSAGE: &str = "Not Found";
 
 /// The upstream every row's `HTTP_PROXY` integration fronts.
 const UPSTREAM: &str = "https://upstream.example.com/items";
@@ -289,38 +302,85 @@ async fn assert_served(
     );
 }
 
+/// Send one invoke to `authority` at `path` and assert the GATEWAY answered it: the address is
+/// one this emulator serves, and no route of the api matches that path, which is the
+/// endpoint's own `404` — not the front door's "no service claims this".
+async fn assert_matched_no_route(
+    case: &str,
+    emulator: &MultiServiceRouter,
+    spelling: &str,
+    authority: &str,
+    path: &str,
+) {
+    let answer: Answer = send(emulator, authority, "GET", path, &[]).await;
+    assert_ne!(
+        answer.error_type.as_deref(),
+        Some(UNKNOWN_SERVICE),
+        "case {case:?}: the published address must be one this emulator serves, but \
+         {spelling} ({authority}{path}) is claimed by no service: {}",
+        answer.summary()
+    );
+    assert_eq!(
+        answer.status,
+        MATCHED_NO_ROUTE,
+        "case {case:?}: {spelling} ({authority}{path}) names a segment no route key of the \
+         api names, so the gateway answers it, got {}",
+        answer.summary()
+    );
+    assert_eq!(
+        answer.body,
+        json!({ "message": MATCHED_NO_ROUTE_MESSAGE }),
+        "case {case:?}: {spelling} must be answered the gateway's own envelope, got {}",
+        answer.summary()
+    );
+    assert_eq!(
+        answer.location, None,
+        "case {case:?}: {spelling} reached no integration, so nothing may send the caller to \
+         an upstream, got {}",
+        answer.summary()
+    );
+}
+
 /// Every spelling of the invoke URL a client builds from the published endpoint, as
-/// `(what a failing assertion calls it, the path to send)`.
+/// `(what a failing assertion calls it, the path to send, whether a route of the api names
+/// that path)`.
 ///
 /// `base_path` is what the endpoint carries ahead of the stage — the reserved data-plane path
 /// of the api for a client on the emulator's own endpoint, and empty for the documented
 /// execute-api host; an empty path is the root itself.
-fn spellings(base_path: &str) -> Vec<(String, String)> {
+fn spellings(base_path: &str) -> Vec<(String, String, bool)> {
     let at = |path: String| if path.is_empty() { "/".to_string() } else { path };
     vec![
         (
             "the endpoint on its own, for the stage that serves the api's root".to_string(),
             at(base_path.to_string()),
+            true,
         ),
         (
             "the endpoint with a trailing slash".to_string(),
             at(format!("{base_path}/")),
+            true,
         ),
         (
             format!("the endpoint with {NESTED_ROUTE_PATH:?} appended"),
             at(format!("{base_path}{NESTED_ROUTE_PATH}")),
+            true,
         ),
         (
             format!("the endpoint with {NESTED_ROUTE_PATH:?} appended and a trailing slash"),
             at(format!("{base_path}{NESTED_ROUTE_PATH}/")),
+            // The trailing slash is one empty segment, which no route key of this api names.
+            false,
         ),
         (
             "the endpoint with the root stage's own name appended".to_string(),
             at(format!("{base_path}/{DEFAULT_STAGE}")),
+            true,
         ),
         (
             format!("the endpoint with the root stage's name and {NESTED_ROUTE_PATH:?}"),
             at(format!("{base_path}/{DEFAULT_STAGE}{NESTED_ROUTE_PATH}")),
+            true,
         ),
     ]
 }
@@ -440,8 +500,12 @@ async fn every_invoke_spelling_built_from_the_published_endpoint_reaches_the_rou
         let name = format!("published-spellings-{index}");
         let (api_id, announced) = deploy(&emulator, &row, &name).await;
         let (authority, base_path) = assert_announced(&row, "CreateApi", &api_id, &announced);
-        for (spelling, path) in spellings(&base_path) {
-            assert_served(case, &emulator, &spelling, &authority, &path).await;
+        for (spelling, path, serves) in spellings(&base_path) {
+            if serves {
+                assert_served(case, &emulator, &spelling, &authority, &path).await;
+            } else {
+                assert_matched_no_route(case, &emulator, &spelling, &authority, &path).await;
+            }
         }
         // And the same spellings still reach the route after a reimport PUT the definition
         // over the api: the endpoint it reports is the one it is served on.
@@ -460,15 +524,13 @@ async fn every_invoke_spelling_built_from_the_published_endpoint_reaches_the_rou
         );
         let (authority, base_path) =
             assert_announced(&row, "ReimportApi", &api_id, &as_str(&reimported, "apiEndpoint"));
-        for (spelling, path) in spellings(&base_path) {
-            assert_served(
-                case,
-                &emulator,
-                &format!("{spelling}, after the reimport"),
-                &authority,
-                &path,
-            )
-            .await;
+        for (spelling, path, serves) in spellings(&base_path) {
+            let spelling = format!("{spelling}, after the reimport");
+            if serves {
+                assert_served(case, &emulator, &spelling, &authority, &path).await;
+            } else {
+                assert_matched_no_route(case, &emulator, &spelling, &authority, &path).await;
+            }
         }
     }
 }

@@ -102,6 +102,11 @@ regex = "1"
 # resolves nothing (`service::websocket::request_model`) — so a stored schema cannot name a
 # file, a host or a URL for this emulator to read.
 boon = "0.6"
+# The percent-decoder the HTTP api data plane reads a request target with
+# (`src/service/invoke.rs`): an HTTP api decodes each segment of the target before it selects
+# a route, and the maintained decoder for RFC 3986 escapes is this crate's. Tests use its
+# ENCODER for the same grammar, to spell the label an SDK client would send.
+percent-encoding = "2"
 # The URL reader two caller-supplied values of this control plane are held to: a CORS
 # configuration's allowed ORIGIN (`Cors$AllowOrigins`, the `scheme://host[:port]` RFC 6454
 # serializes) and a JWT authorizer's ISSUER (the https URL an OpenID discovery document is
@@ -196,10 +201,6 @@ service-com-amazonaws-acm-certificatemanager = { workspace = true }
 # Generates the certificate material a case imports into that service, the way a client
 # brings its own: something other than the code under test. DEV-ONLY.
 rcgen = "0.13"
-# Percent-encodes the `ConnectionId` a test addresses a `@connections` operation by, the way
-# an SDK client encodes a path label: a minted id is base64, whose alphabet carries `/` and
-# `+`. DEV-ONLY.
-percent-encoding = "2"
 # The CLIENT half of the in-band TLS upgrade a client of AWS performs before its opening
 # handshake (a WEBSOCKET api announces a `wss://` address, and a custom domain name's own
 # address is dialled with TLS too) is driven by the `rustls`/`tokio-rustls` pair declared
