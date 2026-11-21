@@ -456,11 +456,41 @@ impl Rule {
         }
     }
 
+    /// Whether applying an update would CHANGE the configuration this rule already
+    /// holds — the question that decides whether the update modifies the rule at all.
+    ///
+    /// A rule's configuration is what a caller can set through `UpdateRule`: the
+    /// retention period, the description and the two resource selections. The period
+    /// and the description are the values the REQUEST carried, so an absent one changes
+    /// nothing (an absent member leaves the stored value alone); the two selections are
+    /// the MERGED lists, which fall back to the stored ones. The resource type is not
+    /// part of it: the model says a rule's resource type cannot be updated.
+    ///
+    /// Each half is compared the way the service itself identifies it — a period by its
+    /// value and unit ([`same_retention_period`]), a selection by its pairs
+    /// ([`same_resource_tags`]) — so a request re-sending what the rule already holds
+    /// answers `false`, whichever spelling of a valueless pair it wrote.
+    pub fn update_changes_configuration(
+        &self,
+        retention_period: Option<&RetentionPeriod>,
+        description: Option<&str>,
+        resource_tags: &[ResourceTag],
+        exclude_resource_tags: &[ResourceTag],
+    ) -> bool {
+        retention_period
+            .is_some_and(|requested| !same_retention_period(&self.retention_period, requested))
+            || description.is_some_and(|requested| self.description.as_deref() != Some(requested))
+            || !same_resource_tags(&self.resource_tags, resource_tags)
+            || !same_resource_tags(&self.exclude_resource_tags, exclude_resource_tags)
+    }
+
     /// Enter `pending` now and owe `available` one [`STATUS_TRANSITION`] later.
     ///
     /// Every call that mints or modifies a rule goes through this: "Only retention
     /// rules that are in the `available` state retain resources", and a rule that has
-    /// just been created or changed is not retaining yet.
+    /// just been created or changed is not retaining yet. A call that changes nothing
+    /// has modified no rule, so it does not go through this
+    /// ([`Self::update_changes_configuration`]).
     pub fn begin_pending(&mut self, now: SystemTime) {
         self.status = RULE_STATUS_PENDING.to_string();
         self.available_at = status_transition_end(now);
@@ -514,6 +544,35 @@ impl Rule {
 pub fn same_unlock_delay(held: &UnlockDelay, requested: &UnlockDelay) -> bool {
     held.unlock_delay_value == requested.unlock_delay_value
         && held.unlock_delay_unit == requested.unlock_delay_unit
+}
+
+/// Whether two retention periods are the SAME period: the same value, measured in the
+/// same unit.
+///
+/// `RetentionPeriod` carries exactly those two members, both required
+/// (smithy_query(query="shape", shape="RetentionPeriod")), so they are the whole of a
+/// period and comparing them compares the periods. The unit is compared as it was sent:
+/// the model declares one unit, and the boundary validator refuses any other before a
+/// handler runs, so no two spellings of one period reach here.
+pub fn same_retention_period(held: &RetentionPeriod, requested: &RetentionPeriod) -> bool {
+    held.retention_period_value == requested.retention_period_value
+        && held.retention_period_unit == requested.retention_period_unit
+}
+
+/// Whether two resource-tag selections are the SAME selection: the same pairs in the
+/// same order, a pair being the key together with its value as [`resource_tag_pair`]
+/// identifies one — so a tag carrying no value IS the empty value, on either side, the
+/// way selecting and counting already identify a pair.
+///
+/// The order is part of the comparison because the stored order is the order every
+/// reader of the rule reports the selection in, so a selection listing the same pairs
+/// differently is not the selection the rule currently holds.
+pub fn same_resource_tags(held: &[ResourceTag], requested: &[ResourceTag]) -> bool {
+    held.len() == requested.len()
+        && held
+            .iter()
+            .zip(requested)
+            .all(|(held, requested)| resource_tag_pair(held) == resource_tag_pair(requested))
 }
 
 /// The instant an unlock requested at `now` leaves its unlock delay.

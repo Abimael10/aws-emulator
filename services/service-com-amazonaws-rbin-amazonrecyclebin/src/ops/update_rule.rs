@@ -311,18 +311,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        if let Some(retention_period) = input.retention_period {
-            rule.retention_period = retention_period;
+        // Whether this request MODIFIES the rule at all: a request whose merged
+        // configuration is the one the rule already holds — every optional member
+        // absent, or every one of them re-sending a stored value — changes nothing, and
+        // what it changes is what the status below follows from.
+        let modifies_rule = rule.update_changes_configuration(
+            input.retention_period.as_ref(),
+            input.description.as_deref(),
+            &merged_resource_tags,
+            &merged_exclude_resource_tags,
+        );
+        if modifies_rule {
+            if let Some(retention_period) = input.retention_period {
+                rule.retention_period = retention_period;
+            }
+            if let Some(description) = input.description {
+                rule.description = Some(description);
+            }
+            rule.resource_tags = merged_resource_tags;
+            rule.exclude_resource_tags = merged_exclude_resource_tags;
+            // A rule that has just been modified is not retaining resources under the
+            // new configuration yet: it goes back to `pending` and reaches `available`
+            // once the clock makes the transition due. A request that modified nothing
+            // leaves the rule — its status and the instant its transition falls due
+            // included — exactly as it was, so a settled rule nobody changed goes on
+            // retaining resources.
+            rule.begin_pending(now);
         }
-        if let Some(description) = input.description {
-            rule.description = Some(description);
-        }
-        rule.resource_tags = merged_resource_tags;
-        rule.exclude_resource_tags = merged_exclude_resource_tags;
-        // A rule that has just been modified is not retaining resources under the new
-        // configuration yet: it goes back to `pending` and reaches `available` once the
-        // clock makes the transition due.
-        rule.begin_pending(now);
 
         Ok(UpdateRuleOutput {
             identifier: Some(rule.identifier.clone()),
