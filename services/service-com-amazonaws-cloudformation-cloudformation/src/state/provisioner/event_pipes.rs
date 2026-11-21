@@ -190,8 +190,9 @@ pub(super) async fn describe_pipe(
 /// ([`PIPE_RESTING_STATES`]), which is the state its `DesiredState` asked for.
 ///
 /// A pipe that service reports in one of the FAILED states of that enum is not coming up at
-/// all, so the resource fails with the `StateReason` the pipe carries — why it is in that
-/// state — rather than waiting the window out.
+/// all, so the resource fails with this provider's own account of a pipe that did not
+/// stabilise ([`unstabilised_reason`]), carrying the `StateReason` the pipe reports — why it
+/// is in that state — rather than waiting the window out.
 pub(super) async fn readiness(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -215,17 +216,33 @@ pub(super) async fn readiness(
         return Ok(Readiness::Ready);
     }
     if state.ends_with(PIPE_FAILED_STATE_SUFFIX) {
-        let reason = pipe
-            .get("StateReason")
-            .and_then(Value::as_str)
-            .filter(|reason| !reason.is_empty())
-            .map_or_else(
-                || format!("EventBridge Pipes reports the pipe {state}"),
-                ToString::to_string,
-            );
-        return Ok(Readiness::Failed(reason));
+        return Ok(Readiness::Failed(unstabilised_reason(
+            physical_resource_id,
+            pipe.get("StateReason").and_then(Value::as_str),
+        )));
     }
     Ok(Readiness::Pending(state))
+}
+
+/// Why this provider could not stabilise the pipe, from what EventBridge Pipes reported about
+/// it.
+///
+/// A provider holds a resource open until the service that owns it reports the resource in a
+/// state it serves from, and reports a resource that service settled ELSEWHERE as one that did
+/// not stabilize — naming the type it was asked for and the identifier it was asked about,
+/// which for this type is the pipe's name.
+///
+/// `StateReason` is "the reason the pipe is in its current state" (`Pipe$StateReason`) — the
+/// sentence that says WHY the pipe is not coming up — so a pipe carrying one has it stated
+/// after the join this report makes. A pipe carrying NONE leaves that join nothing to state,
+/// and is given no invented reason.
+fn unstabilised_reason(name: &str, state_reason: Option<&str>) -> String {
+    let did_not_stabilise =
+        format!("Resource of type '{PIPES_PIPE}' with identifier '{name}' did not stabilize.");
+    match state_reason.filter(|reason| !reason.is_empty()) {
+        Some(reason) => format!("{did_not_stabilise} Status Reason is {reason}"),
+        None => did_not_stabilise,
+    }
 }
 
 /// The attributes EventBridge Pipes publishes for the pipe now that it reports it settled:

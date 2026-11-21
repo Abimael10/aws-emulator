@@ -110,6 +110,23 @@ pub fn assume_failure_reason(role_arn: &str) -> String {
     ))
 }
 
+/// The sentence a pipe reports as its `StateReason` when the policies in force on its
+/// execution role do not let it make the call that TAKES THE RECORDS from its source: WHICH
+/// call it may not make, which is the only variable part.
+///
+/// `api_action` is the name of that API action and `service` the service it is called on
+/// ([`super::data_plane::SourceRead`]). The sentence says nothing about WHY the role is
+/// without the grant — an explicit deny, no statement at all, a permissions boundary that
+/// caps what it is granted — because what the pipe reports is the call it cannot make.
+///
+/// Bounded by [`STATE_REASON_LENGTH_MAX`] like every other sentence that member carries.
+pub fn source_read_failure_reason(api_action: &str, service: &str) -> String {
+    within_the_reason_bound(format!(
+        "Input parameter is invalid from the request due to : The provided customer role does \
+         not have permissions to call {api_action} on {service}"
+    ))
+}
+
 /// `reason` cut to [`STATE_REASON_LENGTH_MAX`], so a sentence built from the values a
 /// request named is always a legal value of the member that carries it however long those
 /// values are.

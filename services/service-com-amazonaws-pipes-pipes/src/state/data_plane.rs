@@ -3854,24 +3854,69 @@ fn resolve_target(
     }
 }
 
-/// The IAM action of the call that TAKES THE RECORDS from a source of the kind `source`
-/// names — the one call the source stage cannot poll that source without — or `None` for a
-/// source this data plane takes no records from at all.
+/// What separates an IAM action's service namespace from the name of the API action it
+/// authorizes: `sqs:ReceiveMessage` is `ReceiveMessage` in the `sqs` namespace.
+const ACTION_NAMESPACE_SEPARATOR: char = ':';
+
+/// The names the three services a pipe takes records from publish for THEMSELVES, each from
+/// that service's own model (`awsService$sdkId`).
+///
+/// That is the name a sentence ABOUT one of its calls uses, as against the namespace the IAM
+/// action is written in (`sqs`, `dynamodb`, `kinesis`), so neither reading of the same call
+/// has to spell the other's.
+const SQS_SERVICE_NAME: &str = "SQS";
+const DYNAMODB_SERVICE_NAME: &str = "DynamoDB";
+const KINESIS_SERVICE_NAME: &str = "Kinesis";
+
+/// The call that TAKES THE RECORDS from a pipe's source, in both readings of it: the one IAM
+/// evaluates, and the one a sentence about the pipe names.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SourceRead {
+    /// The IAM action the policies in force on the pipe's execution role are evaluated
+    /// against.
+    pub action: &'static str,
+    /// The name of the API action that IAM action authorizes, which is the part of it after
+    /// its service's namespace.
+    pub api: &'static str,
+    /// The service that API action is called on, as that service names itself.
+    pub service: &'static str,
+}
+
+/// The call that takes the records of a source of the kind `source` names — the one call the
+/// source stage cannot poll that source without — or `None` for a source this data plane takes
+/// no records from at all.
 ///
 /// The source stage makes other calls beside it (it reads a queue's attributes, it lists a
-/// stream's shards), and each is authorized where it is made ([`LiveRecord::refusal`]); this
-/// is the single call whose refusal means the pipe could never poll, which is what the
-/// lifecycle asks about before it reports a pipe up ([`super::bring_up`]).
-pub(super) fn source_record_action(source: &str) -> Option<&'static str> {
+/// stream's shards), and each is authorized where it is made ([`LiveRecord::refusal`]); this is
+/// the single call whose refusal means the pipe could never poll, which is what the lifecycle
+/// asks about before it reports a pipe up ([`super::bring_up`]).
+///
+/// ONE table, answering every reading of that call at once — the action IAM is asked about and
+/// the words a pipe's `StateReason` names it by — so a source kind cannot be half-registered:
+/// a kind this answers for is a kind the permission check refuses under and reports, and a kind
+/// it does not is neither.
+pub(super) fn source_read_call(source: &str) -> Option<SourceRead> {
     let parsed = ::service_common::arn::parse(source)?;
-    match parsed.vendor {
-        SQS_NAMESPACE => Some(RECEIVE_MESSAGE_ACTION),
-        DYNAMODB_NAMESPACE if parsed.resource.contains(STREAM_SEGMENT) => Some(GET_RECORDS_ACTION),
-        KINESIS_NAMESPACE if parsed.resource_type() == KINESIS_STREAM_RESOURCE => {
-            Some(kinesis_source::GET_RECORDS_ACTION)
+    let (action, service) = match parsed.vendor {
+        SQS_NAMESPACE => (RECEIVE_MESSAGE_ACTION, SQS_SERVICE_NAME),
+        DYNAMODB_NAMESPACE if parsed.resource.contains(STREAM_SEGMENT) => {
+            (GET_RECORDS_ACTION, DYNAMODB_SERVICE_NAME)
         }
-        _ => None,
-    }
+        KINESIS_NAMESPACE if parsed.resource_type() == KINESIS_STREAM_RESOURCE => {
+            (kinesis_source::GET_RECORDS_ACTION, KINESIS_SERVICE_NAME)
+        }
+        _ => return None,
+    };
+    // Every action above is written in its own service's namespace, so the API action is the
+    // name after that namespace; an action written without one is its own name.
+    let api = action
+        .split_once(ACTION_NAMESPACE_SEPARATOR)
+        .map_or(action, |(_, api)| api);
+    Some(SourceRead {
+        action,
+        api,
+        service,
+    })
 }
 
 /// Why the dead-letter destination the pipe reading `source` under `parameters` configures is

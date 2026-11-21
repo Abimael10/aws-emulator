@@ -56,10 +56,11 @@ pub(crate) enum Reason {
     /// has processed none of: the poller's own reading rather than the move that put the
     /// pipe there.
     PollerIdle,
-    /// A move that could not be completed: the sentence names the source the pipe could not
-    /// poll and carries `mentions` beside it, saying what stopped it.
+    /// A move that could not be completed: the sentence carries `mentions`, saying what
+    /// stopped it, and names `source_arn` where it is about the source resource rather than
+    /// about the call the pipe's role may not make.
     Failure {
-        source_arn: String,
+        source_arn: Option<String>,
         mentions: &'static [&'static str],
     },
 }
@@ -100,7 +101,7 @@ pub(crate) fn assert_reason(case: &str, read: &str, reported: Option<&str>, expe
             reason_says(
                 &format!("{case} as {read} reports it"),
                 reason,
-                source_arn,
+                source_arn.as_deref(),
                 mentions,
             );
             assert_ne!(
@@ -297,7 +298,7 @@ async fn every_listing_reports_the_reason_each_listed_pipe_reached_its_state_by(
             case: create_failed,
             state: CREATE_FAILED,
             reason: Reason::Failure {
-                source_arn: gone_source,
+                source_arn: Some(gone_source),
                 mentions: &["does not exist"],
             },
         },
@@ -305,8 +306,10 @@ async fn every_listing_reports_the_reason_each_listed_pipe_reached_its_state_by(
             case: start_failed,
             state: START_FAILED,
             reason: Reason::Failure {
-                source_arn: start_failed_source,
-                mentions: &["sqs:ReceiveMessage"],
+                // The sentence a role without the source read leaves names the CALL it may
+                // not make and no resource at all.
+                source_arn: None,
+                mentions: &["ReceiveMessage on SQS"],
             },
         },
     ];

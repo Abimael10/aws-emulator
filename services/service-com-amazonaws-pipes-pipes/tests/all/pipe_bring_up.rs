@@ -22,6 +22,11 @@
 //!
 //! `tests/all/pipe_unassumable_role.rs` is the trust document's own table — the first thing
 //! this rule reads — and carries the rows that generalise over what a trust document says.
+//!
+//! The last table is the TEXT of what a pipe reports when the call that takes its source's
+//! records is the one its role is missing: the two tables above assert where such a move
+//! lands, and that one asserts the sentence, over the source kinds that decide which call is
+//! named.
 
 use std::time::{Duration, Instant};
 
@@ -38,8 +43,10 @@ use service_com_amazonaws_pipes_pipes::state::USER_INITIATED_STATE_REASON;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::pipe_data_plane::{
-    collect_at_least, counted, given_queue, send, sqs, QUIET, VISIBLE_ATTRIBUTE,
+    collect_at_least, collect_during, counted, given_queue, send, sqs, QUIET, VISIBLE_ATTRIBUTE,
 };
+use crate::pipe_dynamodb_stream_source::given_streamed_table;
+use crate::pipe_kinesis_stream_source::given_stream;
 use crate::pipe_lifecycle::{call, describe, Reply, REGION};
 use crate::pipe_metrics::{emulator, given_role_stating, series, withdraw_from_role};
 
@@ -53,6 +60,13 @@ const LOOK_AGAIN: Duration = Duration::from_millis(25);
 /// `TargetParameters.InputTemplate`, so a delivered message carries the record's own body
 /// and a delivery can be attributed: `<$.body>` selects the `body` of the record envelope.
 const BODY_TEMPLATE: &str = "<$.body>";
+
+/// The call a pipe whose role may not take an Amazon SQS source's records reports as the one
+/// it does not have permission to make, as its own `StateReason` names it: the API action and
+/// the service that action is called on. The WHOLE sentence that fragment sits in is pinned
+/// by the sentence table at the end of this file; the two tables above assert only that the
+/// sentence a failed move left names that call.
+const RECEIVE_MESSAGE_ON_SQS: &str = "ReceiveMessage on SQS";
 
 /// The ARN form Amazon SQS gives a queue of this account and Region, for the row whose
 /// source queue is never created at all: there is no `CreateQueue` answer to read one off.
@@ -166,17 +180,20 @@ async fn publishes_nothing(router: &MultiServiceRouter, case: &str, name: &str) 
     }
 }
 
-/// Assert the `StateReason` of a failed move names the source and carries `mentions`, within
-/// the bound the member that reports it has.
+/// Assert the `StateReason` of a failed move carries `mentions` — and names the source, for a
+/// failure whose sentence is about the source RESOURCE (`source_arn`) rather than about the
+/// call the pipe's role may not make — within the bound the member that reports it has.
 ///
 /// `pub(crate)` because `tests/all/pipe_listing_state_reason.rs` reads the failure sentence a
 /// LISTING reports the same way: one reading of what that sentence has to say.
-pub(crate) fn reason_says(case: &str, reason: &str, source_arn: &str, mentions: &[&str]) {
-    assert!(
-        reason.contains(source_arn),
-        "case {case:?}: expected the StateReason to name the source {source_arn}, got \
-         {reason:?}"
-    );
+pub(crate) fn reason_says(case: &str, reason: &str, source_arn: Option<&str>, mentions: &[&str]) {
+    if let Some(source_arn) = source_arn {
+        assert!(
+            reason.contains(source_arn),
+            "case {case:?}: expected the StateReason to name the source {source_arn}, got \
+             {reason:?}"
+        );
+    }
     for mention in mentions {
         assert!(
             reason.contains(mention),
@@ -208,8 +225,11 @@ struct Row {
     desired_state: Option<&'static str>,
     /// The `CurrentState` the pipe has to settle in.
     settles_in: &'static str,
-    /// Text the settled `StateReason` has to carry beside the source ARN.
+    /// Text the settled `StateReason` has to carry.
     reason_mentions: &'static [&'static str],
+    /// Whether that sentence NAMES the source: it is about the source resource rather than
+    /// about the call the pipe's role may not make.
+    names_source: bool,
     /// Whether the pipe, having been brought up, must move its record to its target.
     delivers: bool,
 }
@@ -248,6 +268,7 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: Some(RUNNING),
             settles_in: CREATE_FAILED,
             reason_mentions: &["does not exist"],
+            names_source: true,
             delivers: false,
         },
         Row {
@@ -261,6 +282,7 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: Some(STOPPED),
             settles_in: CREATE_FAILED,
             reason_mentions: &["does not exist"],
+            names_source: true,
             delivers: false,
         },
         Row {
@@ -272,7 +294,8 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             policy: |_source, target| the_target_only(target),
             desired_state: Some(RUNNING),
             settles_in: CREATE_FAILED,
-            reason_mentions: &["sqs:ReceiveMessage"],
+            reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
+            names_source: false,
             delivers: false,
         },
         Row {
@@ -292,7 +315,8 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             },
             desired_state: Some(RUNNING),
             settles_in: CREATE_FAILED,
-            reason_mentions: &["sqs:ReceiveMessage"],
+            reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
+            names_source: false,
             delivers: false,
         },
         Row {
@@ -309,7 +333,8 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             },
             desired_state: None,
             settles_in: CREATE_FAILED,
-            reason_mentions: &["sqs:ReceiveMessage"],
+            reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
+            names_source: false,
             delivers: false,
         },
         Row {
@@ -327,6 +352,7 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: None,
             settles_in: RUNNING,
             reason_mentions: &[],
+            names_source: false,
             delivers: true,
         },
         Row {
@@ -346,6 +372,7 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
             desired_state: Some(RUNNING),
             settles_in: RUNNING,
             reason_mentions: &[],
+            names_source: false,
             delivers: false,
         },
     ];
@@ -420,7 +447,12 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
         );
         let reason = reported.string("StateReason");
         if entry.row.settles_in == CREATE_FAILED {
-            reason_says(case, &reason, &entry.source_arn, entry.row.reason_mentions);
+            reason_says(
+                case,
+                &reason,
+                entry.row.names_source.then_some(entry.source_arn.as_str()),
+                entry.row.reason_mentions,
+            );
         } else {
             // A move that COULD be completed leaves the user-initiated reason its caller
             // drove it with.
@@ -445,14 +477,21 @@ async fn create_pipe_brings_up_only_a_pipe_that_could_poll_its_source() {
         );
     }
 
-    // And what a pipe that was NEVER brought up did: nothing. The quiet window every
-    // "nothing happened" is decided after is waited out once for the whole table.
-    tokio::time::sleep(QUIET).await;
+    // And what a pipe that was NEVER brought up did: nothing. The window a "nothing
+    // happened" is decided over is WATCHED rather than waited out: a pipe that was going to
+    // deliver would have delivered at some point in it, and looking all the way through the
+    // window is what makes that independent of how fast the host got there.
     for entry in prepared
         .iter()
         .filter(|entry| entry.row.settles_in == CREATE_FAILED)
     {
         let case = entry.row.case;
+        let delivered = collect_during(&router, &entry.target_url, QUIET).await;
+        assert!(
+            delivered.is_empty(),
+            "case {case:?}: expected the target of a pipe that never ran to receive nothing \
+             over the whole window, it received {delivered:?}"
+        );
         publishes_nothing(&router, case, case).await;
         let held = counted(&router, &entry.target_url, &[VISIBLE_ATTRIBUTE]).await;
         assert_eq!(
@@ -492,8 +531,10 @@ struct Move {
     /// `RUNNING`.
     starts: bool,
     settles_in: &'static str,
-    /// Text the settled `StateReason` has to carry beside the source ARN.
+    /// Text the settled `StateReason` has to carry.
     reason_mentions: &'static [&'static str],
+    /// Whether that sentence NAMES the source ([`Row::names_source`]).
+    names_source: bool,
 }
 
 /// RULE: the same reading holds for every LATER lifecycle call that puts a pipe on its way to
@@ -512,20 +553,23 @@ async fn a_later_move_fails_when_the_pipe_can_no_longer_poll_its_source() {
             starts: true,
             settles_in: START_FAILED,
             reason_mentions: &["does not exist"],
+            names_source: true,
         },
         Move {
             case: "start-after-the-source-read-was-withdrawn",
             broken: Break::SourceReadWithdrawn,
             starts: true,
             settles_in: START_FAILED,
-            reason_mentions: &["sqs:ReceiveMessage"],
+            reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
+            names_source: false,
         },
         Move {
             case: "update-onto-a-role-that-may-not-read-the-source",
             broken: Break::AnotherRole,
             starts: false,
             settles_in: UPDATE_FAILED,
-            reason_mentions: &["sqs:ReceiveMessage"],
+            reason_mentions: &[RECEIVE_MESSAGE_ON_SQS],
+            names_source: false,
         },
         Move {
             case: "update-after-the-source-was-deleted",
@@ -533,6 +577,7 @@ async fn a_later_move_fails_when_the_pipe_can_no_longer_poll_its_source() {
             starts: false,
             settles_in: UPDATE_FAILED,
             reason_mentions: &["does not exist"],
+            names_source: true,
         },
     ];
 
@@ -626,13 +671,19 @@ async fn a_later_move_fails_when_the_pipe_can_no_longer_poll_its_source() {
         reason_says(
             case,
             &reported.string("StateReason"),
-            &source_arn,
+            row.names_source.then_some(source_arn.as_str()),
             row.reason_mentions,
         );
 
-        // And the pipe ran nothing: its target is empty, and the record it was sent is
-        // still on the source wherever that source is still there.
-        tokio::time::sleep(QUIET).await;
+        // And the pipe ran nothing: its target receives nothing over the whole window — the
+        // invariant is watched through it rather than decided after it — and the record it
+        // was sent is still on the source wherever that source is still there.
+        let moved = collect_during(&router, &target_url, QUIET).await;
+        assert!(
+            moved.is_empty(),
+            "case {case:?}: expected the target of a pipe that never ran to receive nothing \
+             over the whole window, it received {moved:?}"
+        );
         publishes_nothing(&router, case, case).await;
         let delivered = counted(&router, &target_url, &[VISIBLE_ATTRIBUTE]).await;
         assert_eq!(
@@ -648,5 +699,373 @@ async fn a_later_move_fails_when_the_pipe_can_no_longer_poll_its_source() {
                  {source_arn}, which holds {left}"
             );
         }
+    }
+}
+
+/// The services a pipe of ANY source kind reaches, on ONE engine: pipes, the IAM store its
+/// execution role lives in, Amazon SQS, and the two STREAM services a pipe takes records
+/// from.
+///
+/// The harness above (`tests/all/pipe_metrics.rs`) mounts the services a QUEUE-sourced pipe's
+/// stages reach; the table below spans the source KINDS, because the call a pipe's role is
+/// missing is the call for the kind of source it reads, so each kind's source is created the
+/// way a client creates one and the pipe is pointed at the ARN that service answered with.
+fn emulator_over_every_source() -> MultiServiceRouter {
+    let engine: std::sync::Arc<engine::InMemoryEngine> =
+        std::sync::Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(service_com_amazonaws_pipes_pipes::EmulatedService::new(
+        std::sync::Arc::clone(&engine),
+    ));
+    router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+        std::sync::Arc::clone(&engine),
+    ));
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+            std::sync::Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService::new(
+            std::sync::Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::EmulatedService::new(
+            std::sync::Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(
+            std::sync::Arc::clone(&engine),
+        ),
+    );
+    router
+}
+
+/// Which kind of resource a row's pipe reads, which is what decides WHICH call its execution
+/// role has to be granted for the pipe to be brought up.
+#[derive(Clone, Copy)]
+enum SourceKind {
+    /// An Amazon SQS queue.
+    Queue,
+    /// The stream of a DynamoDB table.
+    DynamoDbStream,
+    /// A Kinesis data stream.
+    KinesisStream,
+}
+
+/// The row's source: the resource of its kind, created the way a client creates one, and the
+/// `SourceParameters` a pipe reading a source of that kind carries.
+async fn given_source(
+    router: &MultiServiceRouter,
+    case: &str,
+    kind: SourceKind,
+) -> (String, Value) {
+    let name = format!("{case}-src");
+    match kind {
+        SourceKind::Queue => {
+            let (_url, arn) = given_queue(router, &name).await;
+            (arn, json!({ "SqsQueueParameters": { "BatchSize": 1 } }))
+        }
+        SourceKind::DynamoDbStream => {
+            let arn = given_streamed_table(router, &name, "NEW_IMAGE").await;
+            (
+                arn,
+                json!({ "DynamoDBStreamParameters": { "StartingPosition": "LATEST" } }),
+            )
+        }
+        SourceKind::KinesisStream => {
+            let arn = given_stream(router, &name, 1).await;
+            (
+                arn,
+                json!({ "KinesisStreamParameters": { "StartingPosition": "LATEST" } }),
+            )
+        }
+    }
+}
+
+/// `CreatePipe` reading a source of any kind: the source parameters the kind needs travel
+/// with the ARN, and no target parameters are asked for — no row below delivers anything.
+async fn create_pipe_reading(
+    router: &MultiServiceRouter,
+    name: &str,
+    source_arn: &str,
+    source_parameters: &Value,
+    target_arn: &str,
+    role_arn: &str,
+    desired_state: &str,
+) -> Reply {
+    let body = json!({
+        "Source": source_arn,
+        "Target": target_arn,
+        "RoleArn": role_arn,
+        "SourceParameters": source_parameters,
+        "DesiredState": desired_state,
+    });
+    call(router, "POST", &format!("/v1/pipes/{name}"), Some(body), REGION).await
+}
+
+/// Everything, on everything: the role a row that fails LATER is brought up under, so what
+/// the later move takes away is the only thing missing.
+fn every_resource() -> Value {
+    json!([{ "Effect": "Allow", "Action": "*", "Resource": "*" }])
+}
+
+/// The sentence a pipe reports as its `StateReason` when the policies in force on its
+/// execution role do not let it make the call that takes its source's records: the fixed text
+/// of this failure class, with the API action and the service that call is made to as its
+/// only variable parts.
+///
+/// Written out here rather than read from the crate, so a row asserts the TEXT a client reads
+/// and not merely that it equals whatever the crate happens to build.
+fn withheld_source_read_reason(api_action: &str, service: &str) -> String {
+    format!(
+        "Input parameter is invalid from the request due to : The provided customer role does \
+         not have permissions to call {api_action} on {service}"
+    )
+}
+
+/// When the row's execution role loses the source read, which decides which lifecycle call is
+/// the move that cannot be completed.
+#[derive(Clone, Copy)]
+enum Withheld {
+    /// The role never had it: the CREATION is the move that fails.
+    Creation,
+    /// The pipe was created healthy and is re-roled onto a role that allows everything and
+    /// DENIES the source read: the reconfiguration is the move that fails.
+    Reconfiguration,
+    /// The pipe was created healthy and STOPPED, and the source read is then withdrawn from
+    /// the live role it holds: the start is the move that fails.
+    Start,
+}
+
+/// One row of the sentence table: which kind of source the pipe reads, when its role loses
+/// the call that takes that source's records, and what the pipe then reports.
+struct Sentence {
+    case: &'static str,
+    source: SourceKind,
+    withheld: Withheld,
+    /// The IAM action that call is authorized under, which is what a row that DENIES it
+    /// names in its policy.
+    iam_action: &'static str,
+    /// The name of the API action, and the service it is called on, that the pipe has to
+    /// report as the call it does not have permission to make.
+    api_action: &'static str,
+    service: &'static str,
+    /// The terminal failure state of the move that was in flight.
+    settles_in: &'static str,
+}
+
+/// RULE: a pipe whose execution role is not granted the call that TAKES THE RECORDS from its
+/// source cannot be brought up, and what it reports as the reason is that call and nothing
+/// else — the name of the API action and the service it is made to, for the kind of resource
+/// the pipe's `Source` names — in the fixed wording of that failure class
+/// ([`withheld_source_read_reason`]), whichever lifecycle call was in flight and however the
+/// grant came to be missing.
+///
+/// The rows differ along what the rule generalises over: the KIND of source (an Amazon SQS
+/// queue, a DynamoDB stream, a Kinesis data stream), which decides the call that is named;
+/// WHICH lifecycle call was in flight (a creation, a reconfiguration, a start), which decides
+/// the terminal state; and HOW the grant is missing (policies stating nothing about it, an
+/// explicit deny, a grant withdrawn from a live role), which changes nothing about the
+/// sentence.
+///
+/// The two tables above assert where such a move LANDS and that the pipe then runs nothing;
+/// this one asserts the exact text, which is what a client reading a deployment's failure is
+/// shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reason_a_withheld_source_read_leaves_names_that_call() {
+    let rows = [
+        Sentence {
+            case: "withheld-queue-at-create",
+            source: SourceKind::Queue,
+            withheld: Withheld::Creation,
+            iam_action: "sqs:ReceiveMessage",
+            api_action: "ReceiveMessage",
+            service: "SQS",
+            settles_in: CREATE_FAILED,
+        },
+        Sentence {
+            case: "withheld-queue-at-update",
+            source: SourceKind::Queue,
+            withheld: Withheld::Reconfiguration,
+            iam_action: "sqs:ReceiveMessage",
+            api_action: "ReceiveMessage",
+            service: "SQS",
+            settles_in: UPDATE_FAILED,
+        },
+        Sentence {
+            case: "withheld-queue-at-start",
+            source: SourceKind::Queue,
+            withheld: Withheld::Start,
+            iam_action: "sqs:ReceiveMessage",
+            api_action: "ReceiveMessage",
+            service: "SQS",
+            settles_in: START_FAILED,
+        },
+        Sentence {
+            case: "withheld-dynamodb-stream-at-create",
+            source: SourceKind::DynamoDbStream,
+            withheld: Withheld::Creation,
+            iam_action: "dynamodb:GetRecords",
+            api_action: "GetRecords",
+            service: "DynamoDB",
+            settles_in: CREATE_FAILED,
+        },
+        Sentence {
+            case: "withheld-dynamodb-stream-at-update",
+            source: SourceKind::DynamoDbStream,
+            withheld: Withheld::Reconfiguration,
+            iam_action: "dynamodb:GetRecords",
+            api_action: "GetRecords",
+            service: "DynamoDB",
+            settles_in: UPDATE_FAILED,
+        },
+        Sentence {
+            case: "withheld-kinesis-stream-at-create",
+            source: SourceKind::KinesisStream,
+            withheld: Withheld::Creation,
+            iam_action: "kinesis:GetRecords",
+            api_action: "GetRecords",
+            service: "Kinesis",
+            settles_in: CREATE_FAILED,
+        },
+    ];
+
+    // A CONSTANTS-IN-SYNC guard, not a check on the emulator: the two tables above look for a
+    // FRAGMENT of this failure's sentence, and this is what keeps that fragment the tail of the
+    // whole sentence the rows below assert, so editing one of the two constants and not the
+    // other fails here rather than quietly leaving those tables looking for text no pipe
+    // reports.
+    assert!(
+        withheld_source_read_reason("ReceiveMessage", "SQS").ends_with(RECEIVE_MESSAGE_ON_SQS),
+        "expected the queue rows' sentence to end with the fragment the tables above look \
+         for, {RECEIVE_MESSAGE_ON_SQS:?}, got {:?}",
+        withheld_source_read_reason("ReceiveMessage", "SQS")
+    );
+
+    for row in &rows {
+        let case = row.case;
+        let router = emulator_over_every_source();
+        let (_target_url, target_arn) = given_queue(&router, &format!("{case}-tgt")).await;
+        let (source_arn, source_parameters) = given_source(&router, case, row.source).await;
+        let role_name = format!("{case}-role");
+        // A row whose creation is the failing move is created under a role that may write the
+        // target and nothing else; a row that fails LATER is brought up healthy first.
+        let created_under = match row.withheld {
+            Withheld::Creation => the_target_only(&target_arn),
+            Withheld::Reconfiguration | Withheld::Start => every_resource(),
+        };
+        let role = given_role_stating(&router, &role_name, SERVICE_PRINCIPAL, created_under).await;
+        let created_desired = match row.withheld {
+            Withheld::Start => STOPPED,
+            _ => RUNNING,
+        };
+        let created = create_pipe_reading(
+            &router,
+            case,
+            &source_arn,
+            &source_parameters,
+            &target_arn,
+            &role,
+            created_desired,
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePipe answered {} {}",
+            created.status, created.body
+        );
+        let resting = settled(&router, case, case).await;
+
+        // The healthy pipe really came up, so what the later move reports is that move's own
+        // failure and not a pipe that never ran.
+        match row.withheld {
+            Withheld::Creation => {}
+            Withheld::Reconfiguration => assert_eq!(
+                resting.string("CurrentState"),
+                RUNNING,
+                "case {case:?}: expected the pipe to come up before the move, it reports {} \
+                 reason={:?}",
+                resting.string("CurrentState"),
+                resting.member("StateReason")
+            ),
+            Withheld::Start => assert_eq!(
+                resting.string("CurrentState"),
+                STOPPED,
+                "case {case:?}: expected the healthy pipe to rest {STOPPED} before the move, \
+                 it reports {} reason={:?}",
+                resting.string("CurrentState"),
+                resting.member("StateReason")
+            ),
+        }
+
+        // Take the source read away and make the move it is missing from.
+        match row.withheld {
+            Withheld::Creation => {}
+            Withheld::Reconfiguration => {
+                let denied = given_role_stating(
+                    &router,
+                    &format!("{case}-role-b"),
+                    SERVICE_PRINCIPAL,
+                    json!([
+                        { "Effect": "Allow", "Action": "*", "Resource": "*" },
+                        {
+                            "Effect": "Deny",
+                            "Action": row.iam_action,
+                            "Resource": source_arn.clone(),
+                        },
+                    ]),
+                )
+                .await;
+                let answered = call(
+                    &router,
+                    "PUT",
+                    &format!("/v1/pipes/{case}"),
+                    Some(json!({ "RoleArn": denied, "DesiredState": RUNNING })),
+                    REGION,
+                )
+                .await;
+                assert_eq!(
+                    answered.status, 200,
+                    "case {case:?}: UpdatePipe answered {} {}",
+                    answered.status, answered.body
+                );
+            }
+            Withheld::Start => {
+                withdraw_from_role(&router, case, &role_name, &["sqs:SendMessage"]).await;
+                let answered = call(
+                    &router,
+                    "POST",
+                    &format!("/v1/pipes/{case}/start"),
+                    None,
+                    REGION,
+                )
+                .await;
+                assert_eq!(
+                    answered.status, 200,
+                    "case {case:?}: StartPipe answered {} {}",
+                    answered.status, answered.body
+                );
+            }
+        }
+
+        let reported = settled(&router, case, case).await;
+        let state = reported.string("CurrentState");
+        assert_eq!(
+            state, row.settles_in,
+            "case {case:?}: expected the move to settle in {}, it reports {state} reason={:?}",
+            row.settles_in,
+            reported.member("StateReason")
+        );
+        let expected = withheld_source_read_reason(row.api_action, row.service);
+        assert_eq!(
+            reported.string("StateReason"),
+            expected,
+            "case {case:?}: expected the StateReason {expected:?}, got {:?}",
+            reported.string("StateReason")
+        );
     }
 }

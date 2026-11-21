@@ -96,21 +96,26 @@ pub async fn refusal<Eng: Send + Sync + 'static>(
 /// policies in force on it show nothing of the kind.
 ///
 /// The call asked about is the one that TAKES the records for that kind of source
-/// ([`super::data_plane::source_record_action`]) — a source whose records this emulator
-/// polls through no call of its own is a question that is not asked.
+/// ([`super::data_plane::source_read_call`]) — a source whose records this emulator polls
+/// through no call of its own is a question that is not asked.
+///
+/// What the pipe REPORTS for it is that call and nothing else
+/// ([`super::execution_role::source_read_failure_reason`]): the decision's own sentence says
+/// which document withheld the grant, which is for the poller's log rather than for the state
+/// a pipe rests in.
 fn source_read_refusal<Eng: Send + Sync + 'static>(
     engine: &Eng,
     source: &str,
     role_arn: &str,
 ) -> Option<String> {
-    let action = super::data_plane::source_record_action(source)?;
+    let read = super::data_plane::source_read_call(source)?;
     let iam = super::execution_role::iam_state(engine)?;
     // Held for the length of this one decision, and no call leaves the process while it is.
     let held = iam.lock();
-    let refusal = super::execution_role::call_refusal(role_arn, action, source, &held)?;
-    Some(super::execution_role::within_the_reason_bound(format!(
-        "Pipes cannot poll the source {source}: {refusal}."
-    )))
+    super::execution_role::call_refusal(role_arn, read.action, source, &held)?;
+    Some(super::execution_role::source_read_failure_reason(
+        read.api, read.service,
+    ))
 }
 
 /// Why the source `source` names cannot be polled because it is not there, or `None` when

@@ -112,7 +112,15 @@ async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
 
 /// A stream called `name` with `shards` shards, waited out until it is ACTIVE; answers its
 /// ARN.
-async fn given_stream(router: &MultiServiceRouter, name: &str, shards: usize) -> String {
+///
+/// `pub(crate)` because `tests/all/pipe_bring_up.rs` reads a Kinesis data stream as one of
+/// the source KINDS its sentence table spans, and creates it the same way: through this one
+/// path rather than a copy of it.
+pub(crate) async fn given_stream(
+    router: &MultiServiceRouter,
+    name: &str,
+    shards: usize,
+) -> String {
     let (status, body) = kinesis(
         router,
         "CreateStream",

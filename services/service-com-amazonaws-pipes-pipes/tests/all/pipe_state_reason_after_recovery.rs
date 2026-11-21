@@ -81,7 +81,7 @@ struct Row {
     failed: Failed,
     /// The state the failed move settles in, before the recovery call.
     failed_state: &'static str,
-    /// What the failed move's `StateReason` has to carry beside the source ARN.
+    /// What the failed move's `StateReason` has to carry.
     failure_mentions: &'static [&'static str],
     recovery: Recovery,
     /// The transient state the recovery call reports, or `None` for the control row.
@@ -175,7 +175,7 @@ async fn a_later_lifecycle_call_replaces_the_reason_the_failed_move_left() {
             case: "reason-restarted",
             failed: Failed::StartWithoutSourceRead,
             failed_state: START_FAILED,
-            failure_mentions: &["sqs:ReceiveMessage"],
+            failure_mentions: &["ReceiveMessage on SQS"],
             recovery: Recovery::Start,
             transient: Some(STARTING),
             rests_in: RUNNING,
@@ -185,7 +185,7 @@ async fn a_later_lifecycle_call_replaces_the_reason_the_failed_move_left() {
             case: "reason-stopped-after-start",
             failed: Failed::StartWithoutSourceRead,
             failed_state: START_FAILED,
-            failure_mentions: &["sqs:ReceiveMessage"],
+            failure_mentions: &["ReceiveMessage on SQS"],
             recovery: Recovery::UpdateTo(STOPPED),
             transient: Some(UPDATING),
             rests_in: STOPPED,
@@ -195,7 +195,7 @@ async fn a_later_lifecycle_call_replaces_the_reason_the_failed_move_left() {
             case: "reason-updated",
             failed: Failed::CreateWithoutSourceRead,
             failed_state: CREATE_FAILED,
-            failure_mentions: &["sqs:ReceiveMessage"],
+            failure_mentions: &["ReceiveMessage on SQS"],
             recovery: Recovery::UpdateTo(RUNNING),
             transient: Some(UPDATING),
             rests_in: RUNNING,
@@ -219,7 +219,7 @@ async fn a_later_lifecycle_call_replaces_the_reason_the_failed_move_left() {
             case: "reason-left-failed",
             failed: Failed::CreateWithoutSourceRead,
             failed_state: CREATE_FAILED,
-            failure_mentions: &["sqs:ReceiveMessage"],
+            failure_mentions: &["ReceiveMessage on SQS"],
             recovery: Recovery::None,
             transient: None,
             rests_in: CREATE_FAILED,
@@ -315,7 +315,10 @@ async fn a_later_lifecycle_call_replaces_the_reason_the_failed_move_left() {
             failed.member("StateReason")
         );
         let failure_reason = Reason::Failure {
-            source_arn: source_arn.clone(),
+            // Only the failure the SOURCE RESOURCE caused names the source: the sentence a
+            // role without the source read leaves names the CALL it may not make.
+            source_arn: matches!(row.failed, Failed::CreateWithSourceGone)
+                .then(|| source_arn.clone()),
             mentions: row.failure_mentions,
         };
         assert_reason(

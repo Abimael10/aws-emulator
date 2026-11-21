@@ -105,7 +105,15 @@ async fn sqs(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
 
 /// A table called `name` with a stream of `view_type` turned on, waited out until it is
 /// ACTIVE; answers the stream's ARN.
-async fn given_streamed_table(router: &MultiServiceRouter, name: &str, view_type: &str) -> String {
+///
+/// `pub(crate)` because `tests/all/pipe_bring_up.rs` reads a DynamoDB stream as one of the
+/// source KINDS its sentence table spans, and creates it the same way: through this one path
+/// rather than a copy of it.
+pub(crate) async fn given_streamed_table(
+    router: &MultiServiceRouter,
+    name: &str,
+    view_type: &str,
+) -> String {
     let (status, body) = dynamodb(
         router,
         "CreateTable",
