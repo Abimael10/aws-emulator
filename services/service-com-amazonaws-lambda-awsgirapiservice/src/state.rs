@@ -2474,6 +2474,26 @@ pub const WEIGHTED_ALIAS_ON_UNPUBLISHED_MESSAGE: &str =
 pub const WEIGHTED_ALIAS_ROLE_MISMATCH_MESSAGE: &str =
     "Weighted alias cannot be mapped to versions with different execution roles";
 
+/// The refusal a `RoutingConfig` whose `AdditionalVersionWeights` names the version the
+/// alias itself invokes gets.
+///
+/// Traffic shifting splits invocations between the version the alias invokes and a SECOND
+/// one, so naming the first one again names no second version at all: the value is refused
+/// as an invalid function version, and the sentence states both halves of why — the version
+/// offered as the additional one, and that same version being the one the routing
+/// configuration already covers. `version` is that one value, which both halves name,
+/// taken from the request.
+///
+/// Shared by every operation that takes a `RoutingConfig` (`CreateAlias`, `UpdateAlias`),
+/// so one condition has one wording wherever it is reached.
+#[must_use]
+pub fn routing_includes_invoked_version_message(version: &str) -> String {
+    format!(
+        "Invalid function version {version}. Function version {version} is already included in \
+         routing configuration."
+    )
+}
+
 /// Whether the two versions an alias would split its invocations between run as DIFFERENT
 /// execution roles, and so the sentence refusing that alias — `None` when they run as the
 /// same role, and for a version this store holds no configuration for, which the caller

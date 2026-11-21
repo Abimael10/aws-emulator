@@ -336,10 +336,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                 }
                 if *additional == target_version {
-                    return Err(invalid_parameter(format!(
-                        "RoutingConfig.AdditionalVersionWeights names version {additional}, which \
-                         is the version this alias already invokes"
-                    )));
+                    return Err(invalid_parameter(
+                        crate::state::routing_includes_invoked_version_message(additional),
+                    ));
                 }
                 if record.config_of(additional).is_none() {
                     return Err(not_found(format!(
