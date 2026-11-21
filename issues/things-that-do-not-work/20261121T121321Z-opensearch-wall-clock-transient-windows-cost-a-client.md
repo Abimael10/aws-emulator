@@ -1,0 +1,63 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: opensearch.associate-dissociate-packages-concurrent-race-conflict opensearch.e2e-package-association-search-flow opensearch.package-dissociation-blocks-dependent-index-creation-rejected opensearch.update-index-dependency-failure-on-unavailable-package opensearch.update-vpc-endpoint-out-of-range-subnet-rejected opensearch.visibility-timeout-ttl-service-software-rollback-window-accepted
+Issue-Shape-Id: com.amazonaws.opensearch#AmazonOpenSearchService
+Issue-Key: opensearch.associate-dissociate-packages-concurrent-race-conflict|_wait_association_gone_or_status#26|Timeout|time.sleep(interval_s)
+Issue-Key: opensearch.e2e-package-association-search-flow|_wait_domain_package_status#22|Timeout|time.sleep(interval_s)
+Issue-Key: opensearch.package-dissociation-blocks-dependent-index-creation-rejected|_poll_until#12|Timeout|time.sleep(interval_s)
+Issue-Key: opensearch.update-index-dependency-failure-on-unavailable-package|_wait_domain_package_dissociation_failed#16|Timeout|time.sleep(interval_s)
+Issue-Key: opensearch.update-vpc-endpoint-out-of-range-subnet-rejected|_wait_endpoint_active#24|Timeout|time.sleep(interval_s)
+Issue-Key: opensearch.visibility-timeout-ttl-service-software-rollback-window-accepted|_wait_service_software_settled#6|Timeout|time.sleep(interval_s)
+Issue-Commit: 1332dc451a9c2b4446e90cf355e9a9abe7c79725
+
+# opensearch: wall-clock transient windows cost a client one full poll interval per state change, so six chained-wait checks never reach their assertions (time out)
+
+> _Note: this issue was identified against the code base at commit `1332dc451a9c2b4446e90cf355e9a9abe7c79725`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeDomain
+
+## Description
+Six behavioral checks of the opensearch control plane end with `Check timed out after 60.0s` and never reach a single assertion. All six share ONE root cause, so this issue carries one cause with six grounded examples.
+
+Cause 1 of 1: every transient lifecycle status this service publishes is left in place for a WALL-CLOCK span and only materialised to its terminal value once that span has elapsed, so a client that polls the resource always observes the transient value on its first probe and then sleeps a full poll interval before it can see the terminal one. Four lifecycles are involved, each with its own span in the store: a domain's provisioning/modification (`state::DOMAIN_WORK`, 3 s — `Processing`/`DomainProcessingStatus`), a package's content copy (`state::PROVISIONING`, 500 ms — `PackageStatus` COPYING -> AVAILABLE), a domain/package association (`state::PACKAGE_ASSOCIATION_CHANGE`, 750 ms — `DomainPackageStatus` ASSOCIATING -> ACTIVE and DISSOCIATING -> removal) and a service-managed VPC endpoint (`state::VPC_ENDPOINT_CHANGE`, 3 s — `VpcEndpointStatus` CREATING/UPDATING -> ACTIVE). A check that chains three or more of these waits spends 60 s or more purely in client-side sleeps and is killed by the suite's per-check budget before it can exercise the behavior it is about (a concurrent associate/dissociate race, a dissociated-package index refusal, an UpdateVpcEndpoint cross-VPC refusal, a no-op RollbackServiceSoftwareUpdate).
+
+AWS: Smithy: DomainStatus carries Created/Processing and DomainProcessingStatus (DomainProcessingStatusType: Creating, Active, Modifying, UpgradingEngineVersion, UpdatingServiceSoftware, Isolated, Deleting); PackageDetails$PackageStatus (PackageStatus: COPYING, VALIDATING, AVAILABLE, ...); DomainPackageDetails$DomainPackageStatus (DomainPackageStatus: ASSOCIATING, ACTIVE, DISSOCIATING, DISSOCIATION_FAILED, ASSOCIATION_FAILED); VpcEndpoint$Status (VpcEndpointStatus: CREATING, ACTIVE, UPDATING, ...). AWS does pass through each transient value and reaches the terminal one asynchronously; the model states nothing about how long that takes, so for the duration this is recorded behavior only. What the recorded suite shows is that each of these checks completes against AWS, i.e. the number of successive poll intervals a conforming implementation costs a client is bounded by what the check budgets, not by a fixed wall-clock span per transition.
+
+Emulator: answers every call correctly, but holds each transient status for its wall-clock span and materialises the terminal status lazily on the first read taken after the due instant. A client's first probe (issued immediately after the mutating call) therefore always reads the transient value, and the terminal value only becomes visible one client poll interval later. Measured per check, from the checks' own poll intervals: associate-dissociate-packages-concurrent-race-conflict = 15 s (package AVAILABLE) + 30 s (domain active) + 10 s (association ACTIVE) + 10 s (association gone) = 65 s; package-dissociation-blocks-dependent-index-creation-rejected = 10 + 30 + 10 + 10 + 10 = 70 s; update-vpc-endpoint-out-of-range-subnet-rejected = 30 (domain) + 15 (endpoint ACTIVE) + 15 (endpoint ACTIVE after update) = 60 s; visibility-timeout-ttl-service-software-rollback-window-accepted = 20 (domain) + 20 + 20 (three identical ServiceSoftwareOptions reads) = 60 s; e2e-package-association-search-flow and update-index-dependency-failure-on-unavailable-package chain the same domain + package-copy + association waits. In each case the budget is exhausted by sleeps alone and no assertion is ever evaluated.
+
+Why: a client that provisions a domain, imports a package, associates it and then does work on the result pays one full poll interval per transition no matter how quickly it polls, because the transition is gated on wall-clock time rather than on progress. Any caller whose own deadline is in the tens of seconds (a test harness, a CloudFormation-style orchestrator, an interactive CLI loop) times out on a sequence AWS completes, and in this suite it means four package-plane behaviors, one VPC-endpoint refusal and one service-software no-op are not exercised at all — the emulator's answers for them are unverified.
+
+Fix: the lifecycle state the control plane materialises transient statuses from — `state::DOMAIN_WORK`, `state::PROVISIONING`, `state::PACKAGE_ASSOCIATION_CHANGE` and `state::VPC_ENDPOINT_CHANGE` and the `settle` paths that consume their due instants (`Domain::settle`, `Domain::settle_package_associations`, `Package::settle`, `PackageAssociation::settle`). Hypothesis: gate the transition on OBSERVATION rather than on wall clock — let the first read after the mutating call still report the transient status (which is what the non-zero spans exist for) and let the NEXT read report the terminal one, instead of withholding it until a fixed span has passed. That keeps every transient status observable for the checks that assert it while costing a polling client only one round trip per transition rather than one of its poll intervals.
+
+Traces: opensearch.associate-dissociate-packages-concurrent-race-conflict, opensearch.e2e-package-association-search-flow, opensearch.package-dissociation-blocks-dependent-index-creation-rejected, opensearch.update-index-dependency-failure-on-unavailable-package, opensearch.update-vpc-endpoint-out-of-range-subnet-rejected, opensearch.visibility-timeout-ttl-service-software-rollback-window-accepted. Code: services/service-com-amazonaws-opensearch-amazonopensearchservice/src/state.rs lines 745-800 (PROVISIONING, DOMAIN_WORK, PACKAGE_ASSOCIATION_CHANGE, VPC_ENDPOINT_CHANGE); src/state/domains.rs lines 716-771 (Domain::settle) and 803-815 (Domain::settle_package_associations); src/state/packages.rs lines 204-227 (Package::settle) and 606-624 (PackageAssociation::settle).
+
+Note: no open issue covers this. The nearest package-plane issues are 20261114T093806Z-opensearch-package-catalog-diverges-from-aws-describepackages-serves.md (the CONTENT of the AWS-managed package catalog and GetPackageVersionHistory's status) and 20261029T190009Z-es-package-vpc-endpoint-tagging-and-reserved-instance.md (`es` refusal wording); neither concerns when a transient status becomes terminal.
+
+## Evidence
+Behavioral suite replay against the emulator built from this checkout: 285/364 passed (78.3%), 69 mismatched, 10 errored. Of the 79 failures, 73 are marked OWNED by an already-filed issue; the six below are the only unowned ones and every one of them reports the same thing:
+
+### opensearch
+[mismatch] opensearch.associate-dissociate-packages-concurrent-race-conflict — Error: Check timed out after 60.0s
+[mismatch] opensearch.e2e-package-association-search-flow — Error: Check timed out after 60.0s
+[mismatch] opensearch.package-dissociation-blocks-dependent-index-creation-rejected — Error: Check timed out after 60.0s
+[mismatch] opensearch.update-index-dependency-failure-on-unavailable-package — Error: Check timed out after 60.0s
+[mismatch] opensearch.update-vpc-endpoint-out-of-range-subnet-rejected — Error: Check timed out after 60.0s
+[mismatch] opensearch.visibility-timeout-ttl-service-software-rollback-window-accepted — Error: Check timed out after 60.0s
+
+Expected: each check completes its wait sequence and evaluates its assertions (the ConflictException race, the dissociated-package CreateIndex refusal 'IOException while reading synonyms_path_path: file not readable', the cross-VPC UpdateVpcEndpoint ValidationException, and RollbackServiceSoftwareUpdate answering 200 with RollbackServiceSoftwareOptions.RollbackAvailable=false and CurrentVersion unchanged).
+Actual: the whole 60 s budget is consumed by the checks' own poll sleeps, because every transient status is only replaced by its terminal value after a wall-clock span has elapsed, so the first probe after each mutating call necessarily reads the transient value:
+  - domain provisioning/modification: Processing=true / DomainProcessingStatus != 'Active' for DOMAIN_WORK = 3 s (state.rs:771)
+  - package content copy: PackageStatus = 'COPYING' for PROVISIONING = 500 ms (state.rs:757)
+  - package association/dissociation: DomainPackageStatus = 'ASSOCIATING'/'DISSOCIATING' for PACKAGE_ASSOCIATION_CHANGE = 750 ms (state.rs:785)
+  - service-managed VPC endpoint: Status = 'CREATING'/'UPDATING' for VPC_ENDPOINT_CHANGE = 3 s (state.rs:800)
+Sleep arithmetic from the checks' own intervals (first probe transient, second probe terminal): 15+30+10+10 = 65 s; 10+30+10+10+10 = 70 s; 30+15+15 = 60 s; 20+20+20 = 60 s — each at or over the 60 s cap, with no assertion reached. No wrong status code, error code or message was observed for these operations: the divergence is that the terminal status is withheld for a fixed wall-clock span instead of being reachable by the next poll.
+
+## Steps to Reproduce
+1. git clone the repo and let the behavioral suite build and boot the emulator from it.
+2. Replay opensearch.visibility-timeout-ttl-service-software-rollback-window-accepted (the shortest case). It calls CreateDomain, then polls DescribeDomain every 20 s until Created && !Processing, then requires three consecutive identical ServiceSoftwareOptions reads 20 s apart. The first DescribeDomain (issued immediately after CreateDomain) reports Processing=true because the domain's work window (DOMAIN_WORK = 3 s) has not elapsed, so the client sleeps 20 s; the three settle reads cost another 40 s; the check is killed at 60 s before RollbackServiceSoftwareUpdate is ever called.
+3. Replay opensearch.package-dissociation-blocks-dependent-index-creation-rejected. CreatePackage -> poll DescribePackages every 10 s for AVAILABLE (first read COPYING, +10 s); CreateDomain -> poll every 30 s for Created && !Processing (first read Processing, +30 s); AssociatePackages -> poll ListPackagesForDomain every 10 s for ACTIVE (first read ASSOCIATING, +10 s); DissociatePackages -> poll until gone (+10 s); re-associate (+10 s) = 70 s of sleeps, so the CreateIndex refusal it is about is never asserted.
+4. Replay opensearch.update-vpc-endpoint-out-of-range-subnet-rejected: DescribeDomain poll at 30 s intervals until DomainProcessingStatus == 'Active' (+30 s), DescribeVpcEndpoints poll at 15 s intervals until Status == 'ACTIVE' after CreateVpcEndpoint (+15 s) and again after the valid UpdateVpcEndpoint (+15 s) = 60 s.
+5. Confirm the cause by observation rather than by sleeping: issue the mutating call, then re-read the resource in a tight loop. The terminal status appears only once the span in services/service-com-amazonaws-opensearch-amazonopensearchservice/src/state.rs (lines 757, 771, 785, 800) has elapsed, not on the next read.
+6. After the fix, re-replay exactly the six check ids in trace_ids.
