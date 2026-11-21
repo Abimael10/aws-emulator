@@ -360,6 +360,9 @@ pub struct StoredView {
 /// [`VIEW_QUOTA`]. The quota-bounded creates refuse with the modelled
 /// `ServiceQuotaExceededException` once their bound is reached, and the deletes release
 /// records and their tokens together, so nothing in the store grows without end.
+/// `deep_link_codes` is bounded by the LIFETIME of what it holds instead: every mint drops
+/// the codes whose expiry has passed, and the longest lifetime a request can ask for is the
+/// 600 seconds `ttlSeconds` admits.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     /// The account's persisted domain, keyed by its `domainId`. An account holds at
@@ -394,6 +397,11 @@ pub struct ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
     pub views: HashMap<String, StoredView>,
     /// `CreateView` `clientToken` -> the view name that token created.
     pub create_view_tokens: HashMap<String, String>,
+    /// The LIVE one-time deep-link codes, keyed by
+    /// [`deep_link_code_digest`] of the code handed to the caller — never by the code. A
+    /// code expires, and a mint drops every record whose expiry has passed, so this map
+    /// holds only the codes of one lifetime's worth of calls (see [`deep_link`]).
+    pub deep_link_codes: DeepLinkCodes,
     /// Hands out [`StoredDomain::seq`] / [`StoredSpace::seq`] / [`StoredAccessProfile::seq`]
     /// / [`StoredAccessGrant::seq`] / [`StoredOmniDashboard::seq`] / [`StoredAlert::seq`].
     next_seq: u64,
@@ -1509,6 +1517,21 @@ pub use principal_search::{
     identity_center_principals, is_identity_center_domain, principal_matches,
     NOT_IDENTITY_CENTER_MESSAGE, PRINCIPAL_TYPE_GROUP, PRINCIPAL_TYPE_USER,
     SEARCH_ALL_PRINCIPALS,
+};
+
+/// The one-time deep-link codes a domain hands a browser, and the rules a request for one
+/// is admitted under. It lives beside the store because a code belongs to a domain — the
+/// endpoints it may redirect to and the URL it is redeemed at are the domain's own.
+mod deep_link;
+
+pub use deep_link::{
+    deep_link_code_digest, deep_link_expiry, deep_link_url, mint_deep_link_code,
+    redirect_url_rejection, DeepLinkCodes, StoredDeepLinkCode, DEEP_LINK_CODE_PARAMETER,
+    DEEP_LINK_CODE_UNAVAILABLE, DEEP_LINK_DOMAIN_PARAMETER, DEEP_LINK_PATH,
+    DEEP_LINK_REDIRECT_PARAMETER, DEEP_LINK_REDIRECT_PATH, DEEP_LINK_REGION_PARAMETER,
+    DEFAULT_DEEP_LINK_TTL_SECONDS, HTTPS_SCHEME, MALFORMED_REDIRECT_URI,
+    REDIRECT_CARRIES_QUERY_OR_FRAGMENT, REDIRECT_MUST_BE_HTTPS, REDIRECT_PATH_REQUIRED,
+    UNRECOGNIZED_DOMAIN,
 };
 
 pub use dashboard_body::{

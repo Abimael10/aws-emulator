@@ -27,6 +27,13 @@ hex = { workspace = true }
 # `sqlparser`: a view's `definition` is a SQL query, so it is PARSED with it rather than
 # inspected as text — see `state::view_definition`.
 sqlparser = "0.59"
+# `url`: a `redirectUrl` a deep-link request carries is PARSED with it rather than split as
+# text, so its scheme, origin, path, query and fragment are read the way a browser reads
+# them — see `state::deep_link`.
+url = "2"
+# `sha2`: a one-time deep-link code is recorded as its SHA-256 digest, never as the code —
+# see `state::deep_link`.
+sha2 = { workspace = true }
 # `service-common` carries the workspace's ONE wording of a constraint-violation refusal —
 # the clause, the envelope, the `@pattern` rendering and the order an enumerated type's
 # value set is listed in — which `service::validation` delegates to.
@@ -40,7 +47,8 @@ service-com-amazonaws-identitystore-awsidentitystore = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
+# Declares one module per `tests/all/<name>.rs`, so a new suite needs no declaration.
+automod = { workspace = true }
 hex = { workspace = true }
 # Decodes the rpcv2Cbor error envelope a test reads a refusal's message out of.
 aws-smithy-cbor = "0.62.2"
