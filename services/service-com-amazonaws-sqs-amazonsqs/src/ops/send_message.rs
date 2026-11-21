@@ -331,10 +331,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialise_due(now);
         let store_bytes = state.retained_message_bytes();
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
-            return Err(SendMessageErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(ctx.parts()),
-            )
-            .into());
+            return Err(sqs::unresolved_queue_address(&input.queue_url, ctx.parts())
+                .into_error(
+                    SendMessageErrorModeled::InvalidAddress,
+                    SendMessageErrorModeled::QueueDoesNotExist,
+                )
+                .into());
         };
         let fifo = queue.is_fifo();
 

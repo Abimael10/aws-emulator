@@ -206,7 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(GetQueueUrlOutput {
-            queue_url: Some(queue.url.clone()),
+            // The url a client is handed names the endpoint THIS call reached, so the
+            // string it sends back addresses the queue here.
+            queue_url: Some(state::reported_queue_url(ctx, &region, &queue.name)),
         })
     }
 }

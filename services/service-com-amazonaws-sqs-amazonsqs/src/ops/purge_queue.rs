@@ -183,10 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = sqs::request_region(ctx.parts());
 
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
-            return Err(PurgeQueueErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(ctx.parts()),
-            )
-            .into());
+            return Err(sqs::unresolved_queue_address(&input.queue_url, ctx.parts())
+                .into_error(
+                    PurgeQueueErrorModeled::InvalidAddress,
+                    PurgeQueueErrorModeled::QueueDoesNotExist,
+                )
+                .into());
         };
 
         // Whether this caller may purge this queue is decided against the queue's own

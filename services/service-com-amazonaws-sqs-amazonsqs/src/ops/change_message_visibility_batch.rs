@@ -239,10 +239,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
-            return Err(ChangeMessageVisibilityBatchErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(ctx.parts()),
-            )
-            .into());
+            return Err(sqs::unresolved_queue_address(&input.queue_url, ctx.parts())
+                .into_error(
+                    ChangeMessageVisibilityBatchErrorModeled::InvalidAddress,
+                    ChangeMessageVisibilityBatchErrorModeled::QueueDoesNotExist,
+                )
+                .into());
         };
         queue.materialise_due(now);
 

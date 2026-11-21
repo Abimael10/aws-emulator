@@ -277,7 +277,12 @@ async fn the_message_lifecycle_round_trips_through_state() {
 }
 
 /// Every operation that names a queue by url answers `QueueDoesNotExist` (400) for a
-/// url no queue in state has, whatever shape that url takes.
+/// url that IS a queue address and whose queue no state holds, whatever shape that
+/// address takes.
+///
+/// A value that is no queue address of this endpoint at all is the other fault, refused
+/// `InvalidAddress`; that class is the addressing suite's
+/// (`tests/all/queue_url_endpoint_form.rs`), so no row here carries one.
 #[tokio::test]
 async fn an_unknown_queue_url_is_queue_does_not_exist_everywhere() {
     let sqs = Emulator::new();
@@ -287,11 +292,11 @@ async fn an_unknown_queue_url_is_queue_does_not_exist_everywhere() {
     let unknown = [
         format!("https://{HOST}/000000000000/never-created"),
         format!("{real}-but-longer"),
-        format!("https://{HOST}/000000000000/"),
         "not-even-a-url".to_string(),
         // The right queue name under the wrong account is not this emulator's queue.
         format!("https://{HOST}/999999999999/real-queue"),
-        "https://unrelated.example.com/anything/real-queue".to_string(),
+        // This account's address of a name no queue carries, on another endpoint.
+        "https://unrelated.example.com/000000000000/absent-queue".to_string(),
     ];
     let calls: [(&str, Value); 4] = [
         ("SendMessage", json!({ "MessageBody": "x" })),

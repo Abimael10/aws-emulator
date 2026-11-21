@@ -198,10 +198,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove_queue_by_url(&region, &input.queue_url, ::std::time::SystemTime::now())
             .is_none()
         {
-            return Err(DeleteQueueErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(ctx.parts()),
-            )
-            .into());
+            return Err(sqs::unresolved_queue_address(&input.queue_url, ctx.parts())
+                .into_error(
+                    DeleteQueueErrorModeled::InvalidAddress,
+                    DeleteQueueErrorModeled::QueueDoesNotExist,
+                )
+                .into());
         }
 
         Ok(DeleteQueueOutput)

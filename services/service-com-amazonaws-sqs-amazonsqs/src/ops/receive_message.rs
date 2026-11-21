@@ -515,10 +515,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let (messages, wait) = {
                 let mut state = store.lock();
                 let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
-                    return Err(ReceiveMessageErrorModeled::QueueDoesNotExist(
-                        sqs::queue_does_not_exist(ctx.parts()),
-                    )
-                    .into());
+                    return Err(sqs::unresolved_queue_address(&input.queue_url, ctx.parts())
+                        .into_error(
+                            ReceiveMessageErrorModeled::InvalidAddress,
+                            ReceiveMessageErrorModeled::QueueDoesNotExist,
+                        )
+                        .into());
                 };
                 // Retention lapses and visibility timeouts are owed by the clock: this
                 // materialises what was already due, it does not consume anything. It

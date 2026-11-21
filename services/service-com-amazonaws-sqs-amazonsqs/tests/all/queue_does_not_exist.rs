@@ -146,8 +146,13 @@ async fn assert_refused(
     );
 }
 
-/// Every operation addressed by a `QueueUrl` refuses every form of a url no queue of this
-/// account answers to with the same code and the same fixed message.
+/// Every operation addressed by a `QueueUrl` refuses every form of an ADDRESS no queue of
+/// this account answers to with the same code and the same fixed message.
+///
+/// Every row here is a queue ADDRESS — a `/<accountId>/<QueueName>` pair, or a bare queue
+/// name — whose queue is absent. A value that is no address of this endpoint at all is the
+/// other fault, refused `InvalidAddress`; that class belongs to the addressing suite
+/// (`tests/all/queue_url_endpoint_form.rs`).
 #[tokio::test]
 async fn every_url_addressed_operation_refuses_an_absent_queue_with_the_fixed_message() {
     let router = emulator();
@@ -170,9 +175,9 @@ async fn every_url_addressed_operation_refuses_an_absent_queue_with_the_fixed_me
             "never-created".to_string(),
         ),
         (
-            "a url with no account segment",
-            format!("https://{HOST}/present"),
-            "present".to_string(),
+            "this account's address of a name no queue carries, with no endpoint before it",
+            format!("{}/never-created", account()),
+            "never-created".to_string(),
         ),
     ];
 

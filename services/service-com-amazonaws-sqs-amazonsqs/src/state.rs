@@ -184,6 +184,9 @@ pub mod message_arrivals;
 /// The bounds a queue policy is held to, and the wording of every refusal a grant or a
 /// revoke answers with.
 mod permissions;
+/// The url this service reports for a queue, and what a value supplied where a `QueueUrl`
+/// is expected addresses.
+pub mod queue_addressing;
 /// The `AWS/SQS` series a queue publishes about itself: the backlog gauges it is sampled into
 /// and the counters its data-plane calls are counted into, with the clock that keeps taking
 /// those readings.
@@ -201,6 +204,7 @@ pub use refusals::*;
 pub use message_arrivals::*;
 pub use message_attributes::*;
 pub use permissions::*;
+pub use queue_addressing::*;
 pub use queue_depth_metrics::*;
 pub use redrive::*;
 
@@ -1191,9 +1195,6 @@ pub struct Queue {
     /// ([`mint_receipt_handle`](Self::mint_receipt_handle)), which is what lets a handle
     /// be traced back to the queue that issued it after the queue is gone.
     pub incarnation: String,
-    /// The url minted when the queue was created, and the one every later reference
-    /// to this queue reports.
-    pub url: String,
     pub arn: String,
     /// The configuration attributes the queue carries: what the create supplied,
     /// overlaid on the documented defaults, plus whatever a later
@@ -1277,8 +1278,12 @@ impl Queue {
     ///
     /// The one place a queue record comes into being, so every API that provisions one —
     /// `CreateQueue`, and the Cloud Control API resource handler that stands behind
-    /// `AWS::SQS::Queue` — makes the SAME record: the same url and ARN for the name, a
-    /// fresh incarnation, and a queue nothing has sent to, purged or received from.
+    /// `AWS::SQS::Queue` — makes the SAME record: the same ARN for the name, a fresh
+    /// incarnation, and a queue nothing has sent to, purged or received from.
+    ///
+    /// No url is stored with it: a queue is addressed by its `(account, QueueName)` pair,
+    /// and the url a call REPORTS names the endpoint that call reached
+    /// ([`queue_addressing::reported_queue_url`]), so there is no one string to keep here.
     pub fn created(
         region: &str,
         name: &str,
@@ -1293,7 +1298,6 @@ impl Queue {
             // carried it before: the handles the previous one minted name that one, so
             // presenting one to this queue is presenting a handle of a queue that is gone.
             incarnation: new_identifier(),
-            url: queue_url(region, name),
             arn: queue_arn(region, name),
             attributes,
             tags,
@@ -3416,33 +3420,22 @@ pub fn queue_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, name)
 }
 
-/// The DNS suffix AWS publishes its commercial-partition service endpoints under: the tail
-/// of the authority a queue url names. Named rather than spelled inline, as the other
-/// crates in this tree that report an endpoint host do.
-const ENDPOINT_DNS_SUFFIX: &str = "amazonaws.com";
-
-/// The url of the queue named `name` in `region`, as Amazon SQS names it:
-/// `https://<endpoint prefix>.<region>.<dns suffix>/<accountId>/<QueueName>`.
+/// The url of the queue named `name` in `region` written against Amazon SQS's own REGIONAL
+/// endpoint: `https://<endpoint prefix>.<region>.amazonaws.com/<accountId>/<QueueName>`.
 ///
-/// The authority is the service's REGIONAL endpoint — the endpoint prefix the model
-/// publishes ([`ARN_SERVICE`], which is also this service's signing name and
-/// `arnNamespace`) under the region the call was made in — and never the socket a request
-/// happened to arrive on, because this value is what a client stores, derives the queue
-/// ARN from, embeds in a policy document and reads the region and the account back out of:
-/// it has to be ONE string for one queue, whatever address its caller reached this
-/// emulator at and across restarts. The account segment is this emulator's own
-/// ([`::engine::emulator_account_id`]) — the account every resource it mints belongs to —
-/// rather than anything the request carried.
+/// The form AWS publishes a queue url in, for a caller that resolves AWS's own names and
+/// for every reference another service of this emulator RECORDS for a queue (a dead-letter
+/// destination, an event source, a resource identifier): it names the service, the region
+/// and the queue and depends on no request, so it is the same string however the queue is
+/// reached.
 ///
-/// What that authority is NOT is an address anything here connects to. This service opens
-/// no client, no socket and no resolver: it answers the requests that arrive and makes
-/// none of its own. Nor does the authority decide anything, even for the urls this service
-/// is HANDED back: a `QueueUrl` resolves to its queue by its `/<accountId>/<QueueName>`
-/// path alone ([`queue_name_from_url`]). So a caller holding one of these keeps reaching
-/// its queue here — it is already talking to this emulator, which is how it was handed the
-/// url — and one that instead took the authority for an endpoint would be asking a public
-/// endpoint about a queue of the emulator's own account, which holds nothing of that
-/// caller's to read or to change.
+/// It is NOT what this service REPORTS to a client, because a reported url is a string the
+/// client sends straight back and so has to name an endpoint this emulator answers on:
+/// [`queue_addressing::reported_queue_url`] is that reading, and this authority is its last
+/// resort. Which authority a url carries decides nothing about WHICH queue it addresses
+/// either way — that is its `/<accountId>/<QueueName>` path alone
+/// ([`queue_name_from_url`]) — so a caller holding either form keeps reaching its queue
+/// here.
 pub fn queue_url(region: &str, name: &str) -> String {
     queue_url_of_account(region, ::engine::emulator_account_id(), name)
 }
@@ -3456,21 +3449,32 @@ pub fn queue_url(region: &str, name: &str) -> String {
 /// another account's queue is NAMED by: a caller holding a queue ARN resolves it to the
 /// address `/<accountId>/<QueueName>` of the account the ARN carries, and this endpoint
 /// answers for exactly one account's addresses ([`queue_name_from_url`]) — so an address of
-/// any other account is one it does not serve ([`invalid_address_for_endpoint_message`]).
+/// any other account is one whose queue it does not hold.
 pub fn queue_url_of_account(region: &str, account: &str, name: &str) -> String {
-    format!("https://{ARN_SERVICE}.{region}.{ENDPOINT_DNS_SUFFIX}/{account}/{name}")
+    queue_addressing::queue_url_at(
+        &::service_common::data_plane_addressing::service_endpoint_host(ARN_SERVICE, region),
+        account,
+        name,
+    )
 }
 
 /// The error code Amazon SQS refuses an address it does not serve under, from the model's
 /// `awsQueryError` for `InvalidAddress` ("The specified ID is invalid.").
 pub const INVALID_ADDRESS_CODE: &str = "InvalidAddress";
 
-/// How Amazon SQS words the refusal of a queue address this endpoint does not serve — an
-/// address whose account segment is not the account the endpoint answers for.
+/// How Amazon SQS words the refusal of a value that is no queue address this endpoint
+/// serves, for the `address` that value names.
+///
+/// RECORDED: a `GetQueueAttributes` whose `QueueUrl` names an endpoint no queue path
+/// follows is refused with exactly this sentence
+/// ([`queue_addressing::QueueAddress::NotForThisEndpoint`], whose address is
+/// [`queue_addressing::addressed_endpoint`]), and the same wording is what another service
+/// reports when the address a reference of its own resolves to is one nothing here answers
+/// for.
 ///
 /// The address is the ONE variable part: the fixed text states that this endpoint is not
-/// where that address is served, and the address names which one to go look at, which is
-/// what the caller has to fix or re-address.
+/// where that address is served, and the address names which one the caller has to fix or
+/// re-address.
 pub fn invalid_address_for_endpoint_message(address: &str) -> String {
     format!("The address {address} is not valid for this endpoint.")
 }
@@ -3478,46 +3482,29 @@ pub fn invalid_address_for_endpoint_message(address: &str) -> String {
 /// The `QueueName` the value supplied for a `QueueUrl` addresses, or `None` for a value
 /// that addresses no queue of this account at all.
 ///
-/// A queue address names a queue by the `(account, QueueName)` pair it carries: the name is
-/// its last path segment, and the account is the segment BEFORE that one — when it carries
-/// one at all. An address with no path prefix therefore carries no account and names the
-/// caller's own queue of that name, so a bare `QueueName` is a queue address like any
-/// other: RECORDED — a `GetQueueAttributes` whose `QueueUrl` is the queue's name alone is
-/// served the queue's attributes, not refused. Reading the pair rather than the whole
-/// string is also what lets a client reach its queue through any endpoint this emulator
-/// answers on — the url it was handed, or one built for another host name.
+/// The ONE reading of a queue address is [`queue_addressing::queue_address`] — a queue is
+/// named by the `(account, QueueName)` pair an address carries, and a bare `QueueName` is
+/// an address like any other — and this is that reading narrowed to the queues this
+/// endpoint can resolve: this account's, under a name a queue of it could carry.
 ///
-/// What does NOT address a queue of this account:
+/// So this answers `None` for an address of another account, for a value that is no queue
+/// address of this endpoint at all (which the operations that take a `QueueUrl` tell apart
+/// when they refuse it, [`queue_addressing::unresolved_queue_address`]), and for a last
+/// segment longer than a queue name can be ([`MAX_QUEUE_NAME_LENGTH`]), which no queue of
+/// any account carries.
 ///
-/// - an address whose account segment is some other account's: that account's queues are
-///   not this one's to resolve, whatever name follows;
-/// - an address that carries a path prefix but no account segment
-///   (`<endpoint>/<QueueName>`): the segment before the name is then not an account id, so
-///   the pair names nothing;
-/// - an empty name, and a last segment longer than a queue name can be
-///   ([`MAX_QUEUE_NAME_LENGTH`]), which no queue of any account carries.
-///
-/// A trailing `/` is not part of the name. WHICH region's queue the name resolves in is
-/// the caller's to decide ([`ComAmazonawsSqsAmazonsqsState::queue_by_url`]), because a
-/// queue belongs to the region its create addressed.
+/// WHICH region's queue the name resolves in is the caller's to decide
+/// ([`ComAmazonawsSqsAmazonsqsState::queue_by_url`]), because a queue belongs to the region
+/// its create addressed.
 pub fn queue_name_from_url(queue_url: &str) -> Option<&str> {
-    let (account, name) = match queue_url.trim_end_matches('/').rsplit_once('/') {
-        // `<...>/<accountId>/<QueueName>`, or `<accountId>/<QueueName>` with no endpoint
-        // before it: whatever precedes the name has to end in this account's id.
-        Some((prefix, name)) => (
-            Some(prefix.rsplit_once('/').map_or(prefix, |(_, account)| account)),
-            name,
-        ),
-        // A bare `<QueueName>`: no account segment to read, so it is this account's.
-        None => (None, queue_url.trim_end_matches('/')),
-    };
-    if name.is_empty() || name.chars().count() > MAX_QUEUE_NAME_LENGTH {
-        return None;
+    match queue_addressing::queue_address(queue_url) {
+        queue_addressing::QueueAddress::OfThisAccount(name)
+            if name.chars().count() <= MAX_QUEUE_NAME_LENGTH =>
+        {
+            Some(name)
+        }
+        _ => None,
     }
-    if account.is_some_and(|account| account != ::engine::emulator_account_id()) {
-        return None;
-    }
-    Some(name)
 }
 
 /// The modelled refusal for a `SourceArn` or `DestinationArn` that is not an ARN naming

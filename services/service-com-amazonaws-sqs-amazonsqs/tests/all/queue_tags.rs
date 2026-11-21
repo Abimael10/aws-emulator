@@ -294,8 +294,11 @@ async fn list_queue_tags_omits_tags_for_an_untagged_queue_and_mutates_nothing() 
     );
 }
 
-/// Both operations refuse a `QueueUrl` no queue answers to as `QueueDoesNotExist`,
-/// over every form of url that resolves to nothing.
+/// Both operations refuse a `QueueUrl` that IS a queue address and whose queue no state
+/// holds as `QueueDoesNotExist`, over every form of address that resolves to nothing.
+///
+/// A value that is no queue address of this endpoint at all earns `InvalidAddress`
+/// instead, which the addressing suite (`tests/all/queue_url_endpoint_form.rs`) owns.
 #[tokio::test]
 async fn a_queue_url_no_queue_answers_to_is_refused_as_queue_does_not_exist() {
     let router = emulator();
@@ -311,8 +314,8 @@ async fn a_queue_url_no_queue_answers_to_is_refused_as_queue_does_not_exist() {
             format!("https://{HOST}/210987654321/existing"),
         ),
         (
-            "a value that carries no account segment",
-            format!("https://{HOST}/existing"),
+            "the account and a name no queue carries, with no endpoint before them",
+            format!("{}/never-created", account()),
         ),
         (
             "a bare name no queue of this account carries",

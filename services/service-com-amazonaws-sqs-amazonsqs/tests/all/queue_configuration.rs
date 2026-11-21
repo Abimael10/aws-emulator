@@ -879,9 +879,13 @@ async fn a_queue_name_is_accepted_only_in_the_documented_form() {
     );
 }
 
-/// A `QueueUrl` no queue answers to is refused as `QueueDoesNotExist` by every
-/// operation that takes one; a url for the right account and name resolves whatever
-/// endpoint it was built against.
+/// A `QueueUrl` that IS a queue address and whose queue no state holds is refused as
+/// `QueueDoesNotExist` by every operation that takes one; a url for the right account and
+/// name resolves whatever endpoint it was built against.
+///
+/// A value that is no queue address of this endpoint at all earns the other refusal
+/// (`InvalidAddress`), which the addressing suite
+/// (`tests/all/queue_url_endpoint_form.rs`) owns — so no row here carries one.
 #[tokio::test]
 async fn a_queue_url_no_queue_answers_to_is_refused_as_queue_does_not_exist() {
     let router = emulator();
@@ -900,10 +904,10 @@ async fn a_queue_url_no_queue_answers_to_is_refused_as_queue_does_not_exist() {
             "a bare name no queue of this account carries",
             "never-created".to_string(),
         ),
-        ("an empty url", String::new()),
         (
-            "a url with no account segment",
-            format!("https://{HOST}/reachable"),
+            "a url of this account built against another endpoint, for a name no queue \
+             carries",
+            format!("https://127.0.0.1:40921/{}/never-created", account()),
         ),
     ];
     for (case, bad) in &unknown {

@@ -196,8 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let dead_letter_name = sqs::queue_name_from_url(&input.queue_url)
             .filter(|name| state.holds_queue(&region, name))
             .ok_or_else(|| {
-                ListDeadLetterSourceQueuesErrorModeled::QueueDoesNotExist(
-                    sqs::queue_does_not_exist(ctx.parts()),
+                sqs::unresolved_queue_address(&input.queue_url, ctx.parts()).into_error(
+                    ListDeadLetterSourceQueuesErrorModeled::InvalidAddress,
+                    ListDeadLetterSourceQueuesErrorModeled::QueueDoesNotExist,
                 )
             })?;
 
@@ -223,7 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page: Vec<&String> = sources.iter().skip(start).take(page_size).collect();
         let queue_urls: Vec<String> = page
             .iter()
-            .filter_map(|name| state.queue(&region, name).map(|queue| queue.url.clone()))
+            // Each source queue's own url, named at the endpoint THIS call reached.
+            .filter_map(|name| {
+                state
+                    .queue(&region, name)
+                    .map(|queue| sqs::reported_queue_url(ctx, &region, &queue.name))
+            })
             .collect();
 
         Ok(ListDeadLetterSourceQueuesOutput {

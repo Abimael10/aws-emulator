@@ -121,9 +121,9 @@ impl NativeResourceProvider for QueueProvider {
         let store = self.state.lock();
         store
             .queues_in(region)
-            .filter(|queue| after.is_none_or(|after| queue.url.as_str() > after))
+            .map(|queue| (sqs::queue_url(region, &queue.name), model(queue)))
+            .filter(|(url, _)| after.is_none_or(|after| url.as_str() > after))
             .take(limit)
-            .map(|queue| (queue.url.clone(), model(queue)))
             .collect()
     }
 
@@ -193,7 +193,11 @@ impl NativeResourceProvider for QueueProvider {
         let name = queue_name(region, identifier).ok_or(NativeRefusal::NotFound)?;
         let mut store = self.state.lock();
         let held = store.queue(region, &name).ok_or(NativeRefusal::NotFound)?;
-        let (arn, url, was_fifo) = (held.arn.clone(), held.url.clone(), held.is_fifo());
+        let (arn, url, was_fifo) = (
+            held.arn.clone(),
+            sqs::queue_url(region, &name),
+            held.is_fifo(),
+        );
         let (held_attributes, held_tags) = (held.attributes.clone(), held.tags.clone());
         let desired = DesiredModel::read(&name, &arn, &url, properties)?;
         // "You can provide this attribute only during queue creation. You can't change it
@@ -390,7 +394,7 @@ fn model(queue: &sqs::Queue) -> Value {
     let mut model = Map::new();
     model.insert(
         IDENTIFIER_PROPERTY.to_string(),
-        Value::from(queue.url.clone()),
+        Value::from(sqs::queue_url(&queue.region, &queue.name)),
     );
     model.insert(ARN.to_string(), Value::from(queue.arn.clone()));
     model.insert(QUEUE_NAME.to_string(), Value::from(queue.name.clone()));

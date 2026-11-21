@@ -254,10 +254,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // borrowed for writing: it is a property of the OTHER queues of this store.
         let origin = state.receipt_handle_origin(&region, &input.queue_url, &input.receipt_handle);
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
-            return Err(ChangeMessageVisibilityErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(ctx.parts()),
-            )
-            .into());
+            return Err(sqs::unresolved_queue_address(&input.queue_url, ctx.parts())
+                .into_error(
+                    ChangeMessageVisibilityErrorModeled::InvalidAddress,
+                    ChangeMessageVisibilityErrorModeled::QueueDoesNotExist,
+                )
+                .into());
         };
         // Retention lapses and visibility timeouts are owed by the clock, not by this call:
         // a message whose retention period has run out is gone, and one whose timeout has

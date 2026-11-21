@@ -187,7 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let urls: Vec<String> = state
             .queues_in(&region)
             .filter(|queue| queue.name.starts_with(&prefix))
-            .map(|queue| queue.url.clone())
+            // Every url a listing reports names the endpoint THIS call reached, the one
+            // builder every reported queue url goes through.
+            .map(|queue| crate::state::reported_queue_url(ctx, &region, &queue.name))
             .collect();
 
         // `NextToken` is this listing's own cursor, under the one cursor rule every paged

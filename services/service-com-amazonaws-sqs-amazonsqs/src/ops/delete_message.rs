@@ -212,10 +212,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // borrowed for writing: it is a property of the OTHER queues of this store.
         let origin = state.receipt_handle_origin(&region, &input.queue_url, &input.receipt_handle);
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
-            return Err(DeleteMessageErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(ctx.parts()),
-            )
-            .into());
+            return Err(sqs::unresolved_queue_address(&input.queue_url, ctx.parts())
+                .into_error(
+                    DeleteMessageErrorModeled::InvalidAddress,
+                    DeleteMessageErrorModeled::QueueDoesNotExist,
+                )
+                .into());
         };
         queue.materialise_due(now);
 

@@ -192,7 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|name| store.holds_queue(&region, name))
             .map(str::to_string)
             .ok_or_else(|| {
-                RemovePermissionErrorModeled::QueueDoesNotExist(sqs::queue_does_not_exist(ctx.parts()))
+                sqs::unresolved_queue_address(&input.queue_url, ctx.parts()).into_error(
+                    RemovePermissionErrorModeled::InvalidAddress,
+                    RemovePermissionErrorModeled::QueueDoesNotExist,
+                )
             })?;
         // "Only the owner of a queue can remove permissions from it": whether this caller
         // may is decided against the queue's own policy and the caller's identity-based

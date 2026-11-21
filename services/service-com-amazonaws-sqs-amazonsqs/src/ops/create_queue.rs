@@ -370,7 +370,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state::encryption::apply_encryption_choice(&mut would_carry, &supplied);
             return match state::recreate_refusal(existing, &would_carry, tags.as_ref()) {
                 None => Ok(CreateQueueOutput {
-                    queue_url: Some(existing.url.clone()),
+                    queue_url: Some(state::reported_queue_url(ctx, &region, &existing.name)),
                 }),
                 Some(why) => Err(CreateQueueErrorModeled::QueueNameExists(QueueNameExists {
                     message: Some(why),
@@ -440,7 +440,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags.unwrap_or_default(),
             now,
         );
-        let url = queue.url.clone();
+        // The url the client is handed is an address on the endpoint THIS call reached,
+        // with only the queue's own `/<accountId>/<QueueName>` path taken from the store:
+        // a client that sends the string straight back — which is what every later
+        // queue-addressed operation takes — reaches the queue that was just created.
+        let url = state::reported_queue_url(ctx, &region, &queue.name);
         store.insert_queue(queue);
 
         Ok(CreateQueueOutput {
