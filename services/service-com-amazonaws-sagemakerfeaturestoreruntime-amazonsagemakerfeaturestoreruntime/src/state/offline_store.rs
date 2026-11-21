@@ -9,8 +9,11 @@
 //! record into the group's offline location, whether or not the online store took it. A
 //! DELETION appends to the same location rather than ingesting — "In both cases, Feature
 //! Store appends the deleted record marker to the OfflineStore" (`DeleteRecord`) — so the row
-//! one write lands as is either an ingested record or a delete marker
-//! ([`OfflineRecord::delete_marker`]), and the store is append-only either way.
+//! one write lands as is either a record or a delete marker
+//! ([`OfflineRecord::delete_marker`]), and the store is append-only either way. A PARTIAL
+//! update appends too, since "By default, Amazon SageMaker Feature Store updates the record
+//! in all stores associated with the FeatureGroup" (`UpdateRecord$TargetStores`): the row it
+//! appends is the record AS MERGED, which is the record that store then holds the latest of.
 //!
 //! WHERE it goes, UNDER WHICH role and WHEN that destination is blocked are the facts the
 //! two planes of the Feature Store share, so they are read from

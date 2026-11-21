@@ -1300,3 +1300,330 @@ async fn a_deletions_marker_is_written_only_while_the_groups_role_may_write_it()
         "case {case:?}: expected the appended row to be the delete marker of C1, got {held:?}"
     );
 }
+
+impl Aws {
+    /// `POST /FeatureGroup/<group>/Record` — one `UpdateRecord`, answering its status and
+    /// body.
+    async fn update_record(&self, group: &str, body: Value) -> (u16, Value) {
+        self.data_plane("POST", &format!("/FeatureGroup/{group}/Record"), Some(body))
+            .await
+    }
+}
+
+/// The value the online record holds for `feature_name`, out of what a `GetRecord` served.
+fn served_value(answered: &Value, feature_name: &str) -> String {
+    answered["Record"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .find(|feature| feature["FeatureName"] == json!(feature_name))
+        .and_then(|feature| feature["ValueAsString"].as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One row of the update table.
+struct Update {
+    case: &'static str,
+    /// The feature group the record is updated in.
+    group: &'static str,
+    /// The bucket its offline store lives in; a row's own, so its listing holds only its
+    /// own objects.
+    bucket: &'static str,
+    /// Whether the group's role is granted the object write on that bucket.
+    granted: bool,
+    /// The `TargetStores` the update names, or `None` for an update that names none at
+    /// all.
+    target_stores: Option<&'static [&'static str]>,
+    /// The `EventTime` the update carries among its `Features`, or `None` for one that
+    /// carries none — which keeps the record's stored event time.
+    event_time: Option<&'static str>,
+    /// The payload value the update posts.
+    payload: &'static str,
+    /// The status the update must answer.
+    status: u16,
+    /// The partition the appended object must land in, and `None` for an update that
+    /// appends nothing.
+    appended_partition: Option<&'static str>,
+    /// The event time the MERGED record carries — the update's own when it carries one,
+    /// and the stored one otherwise — which is what the appended row holds.
+    merged_event_time: &'static str,
+    /// The payload the ONLINE record must hold after the update.
+    online_payload: &'static str,
+    /// The event time the ONLINE record must hold after the update.
+    online_event_time: &'static str,
+}
+
+/// RULE: an `UpdateRecord` the service accepts is made in every store the request's
+/// `TargetStores` names, defaulting to all the stores the feature group has — "The target
+/// stores for the record update. By default, Amazon SageMaker Feature Store updates the
+/// record in all stores associated with the FeatureGroup" — so an update naming the
+/// OfflineStore APPENDS one more object holding the record AS MERGED (the stored feature
+/// values with the posted ones applied), in the partition of that merged record's event
+/// time, while an update naming only the OnlineStore appends none and one naming only the
+/// OfflineStore leaves the online record standing.
+///
+/// The rows differ along what the rule generalises over: WHICH stores the request names
+/// (none, both, each alone), whether the update MOVES the record's event time (which
+/// decides the appended object's partition), whether the service accepts the update at all,
+/// and whether the group's role may write the destination.
+#[tokio::test]
+async fn an_accepted_update_is_replicated_into_every_store_the_request_targets() {
+    let updates: [Update; 7] = [
+        Update {
+            case: "no TargetStores at all",
+            group: "updatedefaulted",
+            bucket: "features-update-defaulted",
+            granted: true,
+            target_stores: None,
+            event_time: Some("2026-06-02T08:00:00Z"),
+            payload: "updated",
+            status: 200,
+            appended_partition: Some("year=2026/month=06/day=02/hour=08"),
+            merged_event_time: "2026-06-02T08:00:00Z",
+            online_payload: "updated",
+            online_event_time: "2026-06-02T08:00:00Z",
+        },
+        Update {
+            case: "both stores named",
+            group: "updatebothstores",
+            bucket: "features-update-both",
+            granted: true,
+            target_stores: Some(&["OnlineStore", "OfflineStore"]),
+            event_time: Some("2026-07-02T13:00:00Z"),
+            payload: "both",
+            status: 200,
+            appended_partition: Some("year=2026/month=07/day=02/hour=13"),
+            merged_event_time: "2026-07-02T13:00:00Z",
+            online_payload: "both",
+            online_event_time: "2026-07-02T13:00:00Z",
+        },
+        Update {
+            case: "the OfflineStore alone",
+            group: "updateofflineonly",
+            bucket: "features-update-offline-only",
+            granted: true,
+            target_stores: Some(&["OfflineStore"]),
+            event_time: Some("2026-06-02T08:00:00Z"),
+            payload: "offline",
+            status: 200,
+            appended_partition: Some("year=2026/month=06/day=02/hour=08"),
+            merged_event_time: "2026-06-02T08:00:00Z",
+            // The online record is left exactly as the ingestion stored it.
+            online_payload: SEEDED_PAYLOAD,
+            online_event_time: SEED_EVENT_TIME,
+        },
+        Update {
+            case: "the OnlineStore alone",
+            group: "updateonlineonly",
+            bucket: "features-update-online-only",
+            granted: true,
+            target_stores: Some(&["OnlineStore"]),
+            event_time: Some("2026-06-02T08:00:00Z"),
+            payload: "online",
+            status: 200,
+            appended_partition: None,
+            merged_event_time: "2026-06-02T08:00:00Z",
+            online_payload: "online",
+            online_event_time: "2026-06-02T08:00:00Z",
+        },
+        Update {
+            // "If you omit EventTime, the service keeps the record's existing EventTime",
+            // so the merged record — and the partition its row lands in — is the stored
+            // event time's.
+            case: "an update carrying no EventTime",
+            group: "updatenoeventtime",
+            bucket: "features-update-no-event-time",
+            granted: true,
+            target_stores: None,
+            event_time: None,
+            payload: "merged",
+            status: 200,
+            appended_partition: Some("year=2026/month=06/day=01/hour=07"),
+            merged_event_time: SEED_EVENT_TIME,
+            online_payload: "merged",
+            online_event_time: SEED_EVENT_TIME,
+        },
+        Update {
+            // An update the service refuses writes nowhere: "the service rejects the update
+            // with a ConflictException… The record was not modified."
+            case: "an EventTime older than the record's",
+            group: "updateconflicting",
+            bucket: "features-update-conflicting",
+            granted: true,
+            target_stores: None,
+            event_time: Some("2026-01-01T00:00:00Z"),
+            payload: "stale",
+            status: 409,
+            appended_partition: None,
+            merged_event_time: SEED_EVENT_TIME,
+            online_payload: SEEDED_PAYLOAD,
+            online_event_time: SEED_EVENT_TIME,
+        },
+        Update {
+            // The replication is the service's own asynchronous work, so a role that may
+            // not write the destination retains nothing and the update still succeeds.
+            case: "a role that may not write the offline store",
+            group: "updatewithheld",
+            bucket: "features-update-withheld",
+            granted: false,
+            target_stores: None,
+            event_time: Some("2026-06-02T08:00:00Z"),
+            payload: "withheld",
+            status: 200,
+            appended_partition: None,
+            merged_event_time: "2026-06-02T08:00:00Z",
+            online_payload: "withheld",
+            online_event_time: "2026-06-02T08:00:00Z",
+        },
+    ];
+
+    for update in updates {
+        let case = update.case;
+        let aws = Aws::new();
+        aws.create_bucket(update.bucket).await;
+        let role_name = format!("{}-role", update.group);
+        let role_arn = aws.create_role(case, &role_name).await;
+        if update.granted {
+            aws.grant_write(case, &role_name, &format!("arn:aws:s3:::{}/*", update.bucket))
+                .await;
+        }
+        let described = aws
+            .create_feature_group(
+                case,
+                update.group,
+                true,
+                Some((
+                    &format!("s3://{}/offline", update.bucket),
+                    role_arn.as_str(),
+                )),
+            )
+            .await;
+        let resolved = resolved_key(&described);
+
+        // The record the update is made against, ingested first: the update is PARTIAL, so
+        // the merged record is this one with the posted values applied.
+        aws.put_record(case, update.group, record("C1", SEED_EVENT_TIME, SEEDED_PAYLOAD))
+            .await;
+        let seeded = aws.keys(update.bucket).await;
+        assert_eq!(
+            seeded.len(),
+            usize::from(update.granted),
+            "case {case:?}: expected the ingestion's own object before the update, got \
+             {seeded:?}"
+        );
+
+        let mut features = vec![json!({
+            "FeatureName": PAYLOAD_FEATURE,
+            "ValueAsString": update.payload,
+        })];
+        if let Some(at) = update.event_time {
+            features.push(json!({
+                "FeatureName": EVENT_TIME_FEATURE,
+                "ValueAsString": at,
+            }));
+        }
+        let mut body = json!({
+            "RecordIdentifierValueAsString": "C1",
+            "Features": features,
+        });
+        if let Some(targets) = update.target_stores {
+            body.as_object_mut()
+                .expect("a JSON object body")
+                .insert("TargetStores".to_string(), json!(targets));
+        }
+        let (status, answered) = aws.update_record(update.group, body).await;
+        assert_eq!(
+            status, update.status,
+            "case {case:?}: expected HTTP {} from UpdateRecord, got {status} with {answered}",
+            update.status
+        );
+
+        // The offline store is APPEND-ONLY: whatever the update wrote, the object the
+        // ingestion left is still there and still holds the ingested record.
+        let keys = aws.keys(update.bucket).await;
+        for key in &seeded {
+            assert!(
+                keys.contains(key),
+                "case {case:?}: expected the ingestion's object {key:?} to be left standing, \
+                 got {keys:?}"
+            );
+            let held = parquet_rows(aws.object(update.bucket, key).await);
+            assert!(
+                held.first().is_some_and(|row| row.contains(SEEDED_PAYLOAD)),
+                "case {case:?}: expected the ingested row to be unchanged, got {held:?}"
+            );
+        }
+        let appended: Vec<String> = keys
+            .iter()
+            .filter(|key| !seeded.contains(*key))
+            .cloned()
+            .collect();
+        match update.appended_partition {
+            None => assert!(
+                appended.is_empty(),
+                "case {case:?}: expected nothing appended to the offline store, got \
+                 {appended:?}"
+            ),
+            Some(partition) => {
+                assert_eq!(
+                    appended.len(),
+                    1,
+                    "case {case:?}: expected exactly one object appended by the update, got \
+                     {keys:?}"
+                );
+                let expected_prefix = format!("{resolved}/{partition}/");
+                assert!(
+                    appended[0].starts_with(&expected_prefix)
+                        && appended[0].ends_with(".parquet"),
+                    "case {case:?}: expected a Parquet object under {expected_prefix:?}, got \
+                     {:?}",
+                    appended[0]
+                );
+                let held = parquet_rows(aws.object(update.bucket, &appended[0]).await);
+                assert_eq!(
+                    held.len(),
+                    1,
+                    "case {case:?}: expected the appended object to hold the one updated \
+                     record, got {held:?}"
+                );
+                // The row is the record AS MERGED: the identifier and the event time the
+                // merged record carries, the posted payload, and not a delete marker.
+                for expected in [
+                    "C1",
+                    update.merged_event_time,
+                    update.payload,
+                    DELETED_COLUMN_FALSE,
+                ] {
+                    assert!(
+                        held[0].contains(expected),
+                        "case {case:?}: expected the appended row to carry {expected:?}, got \
+                         {:?}",
+                        held[0]
+                    );
+                }
+            }
+        }
+
+        // And the ONLINE record is what the target list says it is.
+        let (status, answered) = aws.get_record(update.group, "C1").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the online store to serve C1, got {status} with \
+             {answered}"
+        );
+        let (payload, event_time) = (
+            served_value(&answered, PAYLOAD_FEATURE),
+            served_value(&answered, EVENT_TIME_FEATURE),
+        );
+        assert_eq!(
+            (payload.as_str(), event_time.as_str()),
+            (update.online_payload, update.online_event_time),
+            "case {case:?}: expected the online record to hold ({:?}, {:?}) after the \
+             update, got ({payload:?}, {event_time:?}) in {answered}",
+            update.online_payload,
+            update.online_event_time
+        );
+    }
+}

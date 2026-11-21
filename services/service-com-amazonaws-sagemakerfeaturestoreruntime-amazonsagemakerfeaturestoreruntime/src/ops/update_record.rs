@@ -35,9 +35,16 @@
 //! Standard_V2 or InMemory online store type". The recorded units that exercise this
 //! operation's rejections create their feature group with no `StorageType` at all and
 //! AWS still answered those rejections rather than refusing the update, so the recording
-//! rules that gate out. The OfflineStore side of an UPDATE — the partially updated record
-//! AWS replicates there — is left to the issue that owns this operation: the ingestion of a
-//! WHOLE record is what [`crate::state::offline_store`] replicates today.
+//! rules that gate out.
+//!
+//! `TargetStores` names the stores the update is made in, defaulting to all the stores the
+//! feature group has, and the two are written independently: the OnlineStore takes the
+//! merged record when the request names it, and the OfflineStore — a location the control
+//! plane configured for the group — takes the merged record as one appended row
+//! ([`crate::state::offline_store`]), since that store is append-only and holds the record
+//! AS UPDATED. An update naming only the OfflineStore therefore leaves the online record
+//! standing and still appends the row, and an update naming only the OnlineStore appends
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -368,12 +375,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A feature group that HAS no `OnlineStore` holds no online record to update, and
-        // the update AWS would replicate to the OfflineStore is not replicated here (see
-        // the module docs), so
-        // there is nothing for this handler to do once the request itself has been found
-        // well-formed — the same answer a request naming only the OfflineStore gets
-        // below, and not a refusal, which no recording shows.
+        // A feature group that HAS no `OnlineStore` holds no record to merge the posted
+        // feature values onto, and a PARTIAL update states no whole record of its own: the
+        // row the OfflineStore would take is the record AS UPDATED, which cannot be
+        // computed from a record this emulator does not hold. So there is nothing for this
+        // handler to do once the request itself has been found well-formed, and not a
+        // refusal, which no recording shows.
         if !definition.online_store_enabled {
             return Ok(UpdateRecordOutput);
         }
@@ -382,102 +389,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // time decides whether the update is accepted at all, so reading it under the
         // same guard that performs the write is what keeps two concurrent updates from
         // each merging onto the record the other replaced. Nothing below can panic —
-        // every failure is a modelled error return, which releases the guard.
-        let mut store = state.lock();
-        // "The record must already exist. If the record does not exist or has been
-        // soft-deleted, the operation returns a ResourceNotFound error. To create a
-        // record, use PutRecord." `live_record` is exactly that: present and not
-        // soft-deleted. A feature group that resolves but has taken no record yet holds
-        // no online store here, which is the same "no such record" answer.
-        let Some(group) = store.group_mut(&input.feature_group_name) else {
-            return Err(no_such_record(&identifier));
-        };
-        let Some(existing) = group.live_record(&identifier) else {
-            return Err(no_such_record(&identifier));
-        };
-        // The merge runs on a CLONE of the stored record, so a refusal below leaves the
-        // store untouched.
-        let mut updated = existing.clone();
+        // every failure is a modelled error return, which releases the guard. The guard
+        // is released with this block, before the offline replication below is awaited:
+        // no guard is held across an await.
+        let offline_row = {
+            let mut store = state.lock();
+            // "The record must already exist. If the record does not exist or has been
+            // soft-deleted, the operation returns a ResourceNotFound error. To create a
+            // record, use PutRecord." `live_record` is exactly that: present and not
+            // soft-deleted. A feature group that resolves but has taken no record yet
+            // holds no online store here, which is the same "no such record" answer.
+            let Some(group) = store.group_mut(&input.feature_group_name) else {
+                return Err(no_such_record(&identifier));
+            };
+            let Some(existing) = group.live_record(&identifier) else {
+                return Err(no_such_record(&identifier));
+            };
+            // The merge runs on a CLONE of the stored record, so a refusal below leaves
+            // the store untouched.
+            let mut updated = existing.clone();
 
-        // "If you provide an EventTime that is older than the record's current EventTime,
-        // the service rejects the update with a ConflictException. If the EventTime is
-        // equal to or newer than the current value, the service applies the update." A
-        // stored record carrying no event time orders against nothing, so the update
-        // applies.
-        if let (Some(posted), Some(current)) = (posted_secs, updated.event_time_secs()) {
-            if posted < current {
-                return Err(UpdateRecordErrorModeled::ConflictException(ConflictException {
-                    message: Some(crate::state::bounded_message(CONFLICTING_EVENT_TIME)),
-                })
-                .into());
-            }
-        }
-
-        // "The target stores for the record update. By default, Amazon SageMaker
-        // Feature Store updates the record in all stores associated with the
-        // FeatureGroup." This service is the OnlineStore data plane, so a request naming
-        // only the OfflineStore leaves the online record standing. It is answered HERE,
-        // and not earlier: the request's own rules, the record's existence and the
-        // ordering against its event time hold whichever store an update is aimed at, so
-        // an offline-only request is validated and resolved exactly as any other and only
-        // the WRITE is skipped.
-        if !crate::state::targets_online_store(input.target_stores.as_ref()) {
-            return Ok(UpdateRecordOutput);
-        }
-
-        // "Updates one or more feature values for an existing record… Features that you
-        // do not include in the request remain unchanged": each posted feature replaces
-        // the stored value of the feature it names, in place, and a feature the record
-        // does not carry yet is added — up to the store's per-record capacity bound,
-        // which is this operation's to respect because it is the only one that GROWS a
-        // record (`PutRecord` replaces a record's features wholesale).
-        for posted in posted_features.iter().copied() {
-            let value = crate::state::StoredFeatureValue::from(posted);
-            match updated
-                .features
-                .iter_mut()
-                .find(|held| held.feature_name == value.feature_name)
-            {
-                Some(held) => *held = value,
-                None => {
-                    if updated.features.len() >= crate::state::MAX_FEATURES_PER_RECORD {
-                        return Err(at_capacity(format!(
-                            "record '{identifier}' of feature group '{key}' already holds {} \
-                             feature values",
-                            crate::state::MAX_FEATURES_PER_RECORD
-                        )));
-                    }
-                    updated.features.push(value);
+            // "If you provide an EventTime that is older than the record's current
+            // EventTime, the service rejects the update with a ConflictException. If the
+            // EventTime is equal to or newer than the current value, the service applies
+            // the update." A stored record carrying no event time orders against nothing,
+            // so the update applies.
+            if let (Some(posted), Some(current)) = (posted_secs, updated.event_time_secs()) {
+                if posted < current {
+                    return Err(UpdateRecordErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(crate::state::bounded_message(CONFLICTING_EVENT_TIME)),
+                        },
+                    )
+                    .into());
                 }
             }
-        }
 
-        // "If you omit EventTime, the service keeps the record's existing EventTime."
-        if let Some(at) = posted_event_time {
-            updated.event_time = Some(at);
-        }
-        // "If you omit this parameter, the record's existing TTL setting remains
-        // unchanged" (`TtlDuration`), so a request that names one replaces the record's
-        // duration and one that does not keeps it — and where neither the request nor the
-        // record states a duration, the record is under the DEFAULT its feature group
-        // configures, the same precedence an ingestion settles a record's TTL by
-        // (`crate::state::effective_ttl_seconds`). `ExpiresAt` is re-derived from the
-        // duration and the record's event time either way, because an update may have
-        // moved that event time.
-        updated.ttl_secs = crate::state::effective_ttl_seconds(
-            &definition,
-            ttl_secs.or(updated.ttl_secs),
-        );
-        updated.recompute_expiry();
+            // "Updates one or more feature values for an existing record… Features that
+            // you do not include in the request remain unchanged": each posted feature
+            // replaces the stored value of the feature it names, in place, and a feature
+            // the record does not carry yet is added — up to the store's per-record
+            // capacity bound, which is this operation's to respect because it is the only
+            // one that GROWS a record (`PutRecord` replaces a record's features
+            // wholesale).
+            for posted in posted_features.iter().copied() {
+                let value = crate::state::StoredFeatureValue::from(posted);
+                match updated
+                    .features
+                    .iter_mut()
+                    .find(|held| held.feature_name == value.feature_name)
+                {
+                    Some(held) => *held = value,
+                    None => {
+                        if updated.features.len() >= crate::state::MAX_FEATURES_PER_RECORD {
+                            return Err(at_capacity(format!(
+                                "record '{identifier}' of feature group '{key}' already holds \
+                                 {} feature values",
+                                crate::state::MAX_FEATURES_PER_RECORD
+                            )));
+                        }
+                        updated.features.push(value);
+                    }
+                }
+            }
 
-        // The record already exists, so this over-writes it rather than growing the
-        // group; the capacity answer is kept all the same, so a future change to the
-        // store cannot turn a refused write into a silent success.
-        if !group.insert_record(updated) {
-            return Err(at_capacity(format!(
-                "the online store of feature group '{key}' already holds {} records",
-                crate::state::MAX_RECORDS_PER_GROUP
-            )));
+            // "If you omit EventTime, the service keeps the record's existing EventTime."
+            if let Some(at) = posted_event_time {
+                updated.event_time = Some(at);
+            }
+            // "If you omit this parameter, the record's existing TTL setting remains
+            // unchanged" (`TtlDuration`), so a request that names one replaces the
+            // record's duration and one that does not keeps it — and where neither the
+            // request nor the record states a duration, the record is under the DEFAULT
+            // its feature group configures, the same precedence an ingestion settles a
+            // record's TTL by (`crate::state::effective_ttl_seconds`). `ExpiresAt` is
+            // re-derived from the duration and the record's event time either way,
+            // because an update may have moved that event time.
+            updated.ttl_secs =
+                crate::state::effective_ttl_seconds(&definition, ttl_secs.or(updated.ttl_secs));
+            updated.recompute_expiry();
+
+            // "The target stores for the record update. By default, Amazon SageMaker
+            // Feature Store updates the record in all stores associated with the
+            // FeatureGroup." The merge above is made whichever stores the request named —
+            // the request's own rules, the record's existence and the ordering against
+            // its event time hold for every update, and the merged record is what BOTH
+            // stores take — so only the two WRITES are conditioned on the target list.
+            // The row the offline store appends is read off the merged record here, under
+            // the same guard the merge ran under, so the appended row and the online
+            // record can never disagree.
+            let offline_row = crate::state::targets_offline_store(input.target_stores.as_ref())
+                .then(|| updated.project(None));
+            if crate::state::targets_online_store(input.target_stores.as_ref()) {
+                // The record already exists, so this over-writes it rather than growing
+                // the group; the capacity answer is kept all the same, so a future change
+                // to the store cannot turn a refused write into a silent success.
+                if !group.insert_record(updated) {
+                    return Err(at_capacity(format!(
+                        "the online store of feature group '{key}' already holds {} records",
+                        crate::state::MAX_RECORDS_PER_GROUP
+                    )));
+                }
+            }
+            offline_row
+        };
+
+        // The OfflineStore side of the update: the record AS UPDATED is appended to the
+        // location the control plane configured for this feature group, under the role it
+        // recorded with it — the same delivery every write of this data plane replicates
+        // through. A group created without an `OfflineStoreConfig` has nowhere to append
+        // to, and the replication is the service's own asynchronous work, so neither a
+        // withheld permission nor a failed write changes the answer this call gives its
+        // client.
+        if let Some(row) = offline_row {
+            if let Some(delivery) = definition.offline_store.as_ref() {
+                crate::state::offline_store::replicate(
+                    ctx.callback(),
+                    &crate::state::request_region(ctx),
+                    &key,
+                    delivery,
+                    &crate::state::offline_store::OfflineRecord::of(&definition, &row),
+                    ::std::time::SystemTime::now(),
+                )
+                .await;
+            }
         }
 
         Ok(UpdateRecordOutput)
