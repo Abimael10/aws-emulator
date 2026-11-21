@@ -11,9 +11,11 @@
 //! deletion the Region has recorded; either way the answer is the LISTING the operation is
 //! `@paginated` over, in ascending deletion-id order and one page at a time. So an id this
 //! Region recorded no deletion under is reported as the empty list it matches, the same answer
-//! an account with no deletion history gets: the deletion history a read projects is what has
-//! been recorded, and nothing has been recorded under an id no delete of this endpoint
-//! handed out.
+//! an account with no deletion history gets (RECORDED BEHAVIOUR: the recorded call naming a
+//! well-formed id no delete handed out is SERVED, not refused — `InvalidDeletionIdException`
+//! is what a value that is no deletion id at all is judged by): the deletion history a read
+//! projects is what has been recorded, and nothing has been recorded under an id no delete of
+//! this endpoint handed out.
 //!
 //! ## Shape of an operation
 //!
