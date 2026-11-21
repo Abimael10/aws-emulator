@@ -475,7 +475,8 @@ pub const SNAPSHOT_STATUS_CREATING: &str = "creating";
 
 /// The `SnapshotType` of every snapshot a CALLER asked for, from the values
 /// [`SNAPSHOT_TYPES`] lists: AWS classes one the caller took as `manual`, reserving
-/// `automated` for the backups it schedules itself — and this service schedules none.
+/// `automated` for the backups it schedules itself ([`SNAPSHOT_TYPE_AUTOMATED`], which the
+/// automated backups of an instance that keeps them take).
 pub const SNAPSHOT_TYPE_MANUAL: &str = "manual";
 
 /// How many cluster parameter groups one region may hold: Amazon RDS's published default

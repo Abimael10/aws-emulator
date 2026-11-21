@@ -27,7 +27,7 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    DB_PROXY_STATUS_AVAILABLE, TARGET_STATE_AVAILABLE,
+    DB_PROXY_STATUS_AVAILABLE, PROXY_REQUIRES_TLS_MESSAGE, TARGET_STATE_AVAILABLE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 use tokio::net::TcpStream;
@@ -636,4 +636,214 @@ async fn a_proxy_endpoint_serves_a_session_only_while_it_has_a_database_and_a_pr
             }
         }
     }
+}
+
+/// One row of the refusal-wording table: which server refuses a plaintext session through a
+/// proxy, and therefore in whose words.
+struct RefusalWordingCase {
+    case: &'static str,
+    proxy: &'static str,
+    engine_family: &'static str,
+    instance: &'static str,
+    engine: &'static str,
+    /// The engine version the database runs, which is what its OWN secure-transport default
+    /// follows (`rds.force_ssl` is 1 from RDS for PostgreSQL 15 on, 0 before it).
+    version: &'static str,
+    /// `CreateDBProxy$RequireTLS`.
+    require_tls: bool,
+    /// The code the server answers the refusal under.
+    code: &'static str,
+    /// Whether the PROXY is the server that refused, so the sentence is the proxy's own.
+    refused_by_the_proxy: bool,
+}
+
+/// The rows differ along what the rule generalises over: both engine families a proxy can
+/// announce, and whose requirement the session fell foul of — the proxy's `RequireTLS` or
+/// the database's own parameter.
+const REFUSAL_WORDING_CASES: &[RefusalWordingCase] = &[
+    RefusalWordingCase {
+        case: "a PostgreSQL proxy that requires TLS",
+        proxy: "emu-proxy-word-pg",
+        engine_family: "POSTGRESQL",
+        instance: "emu-proxy-word-pg-target",
+        engine: "postgres",
+        version: "14.13",
+        require_tls: true,
+        code: "28000",
+        refused_by_the_proxy: true,
+    },
+    RefusalWordingCase {
+        case: "a MySQL proxy that requires TLS",
+        proxy: "emu-proxy-word-my",
+        engine_family: "MYSQL",
+        instance: "emu-proxy-word-my-target",
+        engine: "mysql",
+        version: "8.0.39",
+        require_tls: true,
+        code: "3159",
+        refused_by_the_proxy: true,
+    },
+    RefusalWordingCase {
+        case: "a PostgreSQL proxy that does not, in front of a database that does",
+        proxy: "emu-proxy-word-pg-forced",
+        engine_family: "POSTGRESQL",
+        instance: "emu-proxy-word-pg-forced-target",
+        engine: "postgres",
+        version: "17.2",
+        require_tls: false,
+        code: "28000",
+        refused_by_the_proxy: false,
+    },
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plaintext_session_a_proxy_refuses_carries_the_proxys_own_sentence() {
+    let router = emulator();
+    for row in REFUSAL_WORDING_CASES {
+        available_instance(
+            &router,
+            row.instance,
+            row.engine,
+            &[("EngineVersion", row.version.to_string())],
+        )
+        .await;
+        let published = available_proxy(&router, row.proxy, row.engine_family, row.require_tls)
+            .await;
+        registered_target(&router, row.case, row.proxy, row.instance).await;
+        let port = dialled_port(row.case, &published);
+        let refusal = match row.engine {
+            "postgres" => postgres_login(
+                LOOPBACK,
+                port,
+                Transport::Plaintext,
+                MASTER_USER,
+                MASTER_PASSWORD,
+                Some(DATABASE),
+            )
+            .await
+            .map(|_| ()),
+            _ => mysql_login(
+                LOOPBACK,
+                port,
+                Transport::Plaintext,
+                MASTER_USER,
+                MASTER_PASSWORD,
+                Some(DATABASE),
+            )
+            .await
+            .map(|_| ()),
+        }
+        .expect_err(&format!(
+            "case {:?}: a session in the clear must be refused",
+            row.case
+        ));
+        assert_eq!(
+            refusal.code, row.code,
+            "case {:?}: expected the refusal {}, got {refusal:?}",
+            row.case, row.code
+        );
+        if row.refused_by_the_proxy {
+            // The proxy refused the client's own hop before it opened a connection to any
+            // database, so the sentence is the proxy's and names nothing of the login.
+            assert_eq!(
+                refusal.message, PROXY_REQUIRES_TLS_MESSAGE,
+                "case {:?}: expected the proxy's own sentence, got {refusal:?}",
+                row.case
+            );
+        } else {
+            // The proxy admitted the session and the DATABASE refused it, so the sentence
+            // is the engine's own and not the proxy's.
+            assert_ne!(
+                refusal.message, PROXY_REQUIRES_TLS_MESSAGE,
+                "case {:?}: a database's own refusal must not be worded as the proxy's, got \
+                 {refusal:?}",
+                row.case
+            );
+            assert!(
+                refusal.message.contains("pg_hba.conf"),
+                "case {:?}: expected the engine's own sentence for a connection no \
+                 pg_hba.conf line admits, got {refusal:?}",
+                row.case
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_server_address_a_session_reports_is_the_database_that_serves_it() {
+    let router = emulator();
+    let (instance_host, instance_port) =
+        available_instance(&router, "emu-proxy-addr-target", "postgres", &[]).await;
+    let published = available_proxy(&router, "emu-proxy-addr", "POSTGRESQL", false).await;
+    registered_target(
+        &router,
+        "the proxy's target",
+        "emu-proxy-addr",
+        "emu-proxy-addr-target",
+    )
+    .await;
+    let proxy_port = dialled_port("the proxy's endpoint", &published);
+    assert_ne!(
+        proxy_port, instance_port,
+        "the proxy's endpoint must be its own listener, not the database's"
+    );
+
+    // `inet_server_addr()` is "the IP address on which the server accepted the current
+    // connection" and `inet_server_port()` its port: on the database's OWN endpoint that is
+    // the listener the client dialled.
+    let read = "SELECT inet_server_addr(), inet_server_port()";
+    let mut direct = postgres_login(
+        &instance_host,
+        instance_port,
+        Transport::Tls,
+        MASTER_USER,
+        MASTER_PASSWORD,
+        Some(DATABASE),
+    )
+    .await
+    .expect("the instance's own endpoint admits its master user");
+    let on_the_database = direct
+        .query(read)
+        .await
+        .expect("the instance's endpoint runs the statement");
+    assert_eq!(
+        on_the_database.rows,
+        vec![vec![
+            Some(instance_host.clone()),
+            Some(instance_port.to_string()),
+        ]],
+        "case \"a session on the database's own endpoint\": expected the listener it \
+         arrived on, got {on_the_database:?}"
+    );
+    // The address is described as PostgreSQL's `inet` (OID 869), which is the type a driver
+    // decodes it with.
+    assert_eq!(
+        on_the_database.type_oids.first().copied(),
+        Some(869),
+        "case \"a session on the database's own endpoint\": expected the address to be \
+         described as `inet`, got {on_the_database:?}"
+    );
+
+    // Through the proxy the client's hop ends at the proxy, but the server that answers the
+    // statement is the DATABASE its target group holds — so the address and port it reports
+    // are that database's own, which is what tells a client its session reached the target.
+    let mut pooled = postgres_login(
+        LOOPBACK,
+        proxy_port,
+        Transport::Tls,
+        MASTER_USER,
+        MASTER_PASSWORD,
+        Some(DATABASE),
+    )
+    .await
+    .expect("the proxy's endpoint admits the database's master user");
+    let through_the_proxy = pooled
+        .query(read)
+        .await
+        .expect("the proxy's endpoint runs the statement");
+    assert_eq!(
+        through_the_proxy.rows, on_the_database.rows,
+        "case \"a session pooled through the proxy\": expected the database's own server \
+         address, got {through_the_proxy:?}"
+    );
 }

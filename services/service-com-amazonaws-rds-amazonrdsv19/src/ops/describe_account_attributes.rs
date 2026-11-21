@@ -484,15 +484,11 @@ fn manual_cluster_snapshots_used(store: &Store, region: &str) -> i64 {
     )
 }
 
-/// The manual DB instance snapshots the region holds.
+/// The manual DB instance snapshots the region holds — the count `CreateDBSnapshot` and
+/// `CopyDBSnapshot` compare against the published quota, read through the store's own
+/// predicate so the report and those refusals cannot count differently.
 fn manual_snapshots_used(store: &Store, region: &str) -> i64 {
-    count(
-        store
-            .snapshots_in(region)
-            .into_iter()
-            .filter(|record| record.snapshot_type == MANUAL_SNAPSHOT)
-            .count(),
-    )
+    count(store.manual_snapshots_in(region))
 }
 
 /// The nondefault option groups the region holds — the count `CreateOptionGroup`

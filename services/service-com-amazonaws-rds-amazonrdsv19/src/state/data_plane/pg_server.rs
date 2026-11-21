@@ -1170,6 +1170,11 @@ pub fn function_result_type(function: &str) -> Option<&'static str> {
         "pg_postmaster_start_time" => Some("timestamptz"),
         "pg_is_in_recovery" => Some("boolean"),
         "pg_backend_pid" => Some("integer"),
+        // The two SERVER-ADDRESS functions: "the IP address on which the server accepted the
+        // current connection" is an `inet`, and "the port number on which the server accepted
+        // the current connection" an `integer` (PostgreSQL, "System Information Functions").
+        "inet_server_addr" => Some("inet"),
+        "inet_server_port" => Some("integer"),
         "current_setting" => Some("text"),
         "md5" => Some("text"),
         "char_length" | "character_length" => Some("integer"),
@@ -1261,10 +1266,15 @@ fn has_role_lookup(user: &str, role: &str) -> String {
 /// connection), so a statement that calls one is planned and run by the engine like any
 /// other — and so a function this list does not carry is refused as undefined rather than
 /// silently answered.
-pub const SERVER_FUNCTIONS: [(&str, i32); 11] = [
+pub const SERVER_FUNCTIONS: [(&str, i32); 13] = [
     ("pg_postmaster_start_time", 0),
     ("pg_is_in_recovery", 0),
     ("pg_backend_pid", 0),
+    // `inet_server_addr()` and `inet_server_port()` — the address and the port "on which the
+    // server accepted the current connection", which is how a client reads WHICH server end
+    // its session is served by.
+    ("inet_server_addr", 0),
+    ("inet_server_port", 0),
     ("pg_sleep", 1),
     ("current_setting", -1),
     // `md5(text)` — "Computes the MD5 hash of the argument, with the result written in

@@ -330,7 +330,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The region's manual snapshot quota, and the number of regions this store keeps
         // records for at all: the store cannot be grown without bound, and the modelled
         // fault says exactly this.
-        if store.snapshots_in(&region).len() >= crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
+        if store.manual_snapshots_in(&region) >= crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
             || !store.has_room_for_region(&region)
         {
             return Err(CopyDBSnapshotErrorModeled::SnapshotQuotaExceededFault(

@@ -686,12 +686,21 @@ pub(super) fn facts_of(record: RecordFacts, database: &Arc<InstanceDatabase>) ->
         databases: database.database_names(),
         default_database,
         requires_secure_transport: record.requires_secure_transport,
+        // A session on a resource's OWN endpoint reaches no proxy, so no proxy decides
+        // anything about it; [`super::proxy_endpoint::proxy_session`] is what writes this on
+        // the facts of one that was pooled through one.
+        tls_required_by_proxy: false,
         // A resource with no listener of its own is reached through a name this machine does
         // not resolve, so the host a refusal names is this machine.
         endpoint_host: record
             .served_host
+            .clone()
             .unwrap_or_else(|| "localhost".to_string()),
         endpoint_port: record.served_port.unwrap_or_default(),
+        // The address of the resource's OWN listener, which stays this resource's even where
+        // the session arrived somewhere else (see [`InstanceFacts::server_host`]).
+        server_host: record.served_host.unwrap_or_default(),
+        server_port: record.served_port.unwrap_or_default(),
         region: record.region,
         iam_database_authentication_enabled: record.iam_database_authentication_enabled,
         read_only: record.read_only,
@@ -952,11 +961,32 @@ pub struct InstanceFacts {
     pub default_database: String,
     /// Whether the instance's parameter group requires an encrypted session.
     pub requires_secure_transport: bool,
+    /// Whether the session arrived through a DB PROXY that requires an encrypted one:
+    /// `DBProxy$RequireTLS`, "specifies whether Transport Layer Security (TLS) encryption is
+    /// required for connections to the proxy".
+    ///
+    /// Separate from [`Self::requires_secure_transport`] because the two refusals are made by
+    /// different servers: the PROXY refuses the client's own hop before it opens a connection
+    /// to any database, and says so in its own words
+    /// ([`super::proxy_endpoint::PROXY_REQUIRES_TLS_MESSAGE`]), while the database refuses a
+    /// session its own parameter group does not admit in the engine's.
+    pub tls_required_by_proxy: bool,
     /// The host the instance's listener is bound to, which is the host a refusal names.
     pub endpoint_host: String,
     /// The port that listener published, which is the port an authentication token has to
     /// have been generated for.
     pub endpoint_port: u16,
+    /// The address of the listener of the resource whose ENGINE serves this session, and the
+    /// port it published — what `inet_server_addr()` and `inet_server_port()` report.
+    ///
+    /// The same listener as [`Self::endpoint_host`] for a session on the resource's own
+    /// endpoint. They differ for a session pooled through a DB PROXY: the client's hop ends
+    /// at the proxy, so the endpoint the session ARRIVED on is the proxy's, while the server
+    /// answering its statements is the database the proxy's target group holds — which is the
+    /// server end PostgreSQL reports. EMPTY for a resource that published no listener at all.
+    pub server_host: String,
+    /// The port of that same listener; see [`Self::server_host`].
+    pub server_port: u16,
     /// The Region the instance lives in, which such a token has to be signed in.
     pub region: String,
     /// Whether the instance has IAM database authentication turned on
@@ -994,6 +1024,10 @@ pub enum LoginRefusal {
     NotRunning { status: String },
     /// The session is in the clear and the instance's parameter group requires TLS.
     PlaintextRefused,
+    /// The session is in the clear and the DB PROXY it arrived on requires TLS
+    /// (`DBProxy$RequireTLS`), which the proxy refuses in its own words rather than the
+    /// engine's.
+    ProxyTlsRequired,
     /// The login named a database this instance does not have.
     UnknownDatabase { database: String },
     /// The login did not prove the master user's password — a wrong password, a password
@@ -1008,6 +1042,7 @@ impl LoginRefusal {
         match self {
             Self::NotRunning { .. } => "engine-not-running",
             Self::PlaintextRefused => "encryption-required",
+            Self::ProxyTlsRequired => "proxy-encryption-required",
             Self::UnknownDatabase { .. } => "unknown-database",
             Self::AuthenticationFailed { .. } => "authentication-failed",
         }
@@ -1074,6 +1109,11 @@ pub fn precheck(facts: &InstanceFacts, encrypted: bool) -> Result<(), LoginRefus
             status: facts.status.clone(),
         });
     }
+    // The PROXY's requirement comes first: the client's hop ends there, so a session in the
+    // clear is refused by the proxy before any database is asked to admit it.
+    if facts.tls_required_by_proxy && !encrypted {
+        return Err(LoginRefusal::ProxyTlsRequired);
+    }
     if facts.requires_secure_transport && !encrypted {
         return Err(LoginRefusal::PlaintextRefused);
     }
@@ -1102,6 +1142,9 @@ pub fn admit(
         return Err(LoginRefusal::NotRunning {
             status: facts.status.clone(),
         });
+    }
+    if facts.tls_required_by_proxy && !encrypted {
+        return Err(LoginRefusal::ProxyTlsRequired);
     }
     if facts.requires_secure_transport && !encrypted {
         return Err(LoginRefusal::PlaintextRefused);
@@ -1304,6 +1347,12 @@ pub struct SessionFacts {
     /// The host the instance's listener is bound to, which is the host a refusal names —
     /// and the host a MySQL `USER()` reports the session as connecting from.
     pub endpoint_host: String,
+    /// The address and port of the listener of the resource whose ENGINE serves this
+    /// session, which is the server end `inet_server_addr()` and `inet_server_port()`
+    /// report; see [`InstanceFacts::server_host`].
+    pub server_host: String,
+    /// The port of that same listener; see [`Self::server_host`].
+    pub server_port: u16,
     /// Whether this session serves NO WRITES: it is on a read replica's endpoint or on a DB
     /// cluster's reader endpoint ([`EndpointRole`]), so the statements [`read_only`] names
     /// are refused and the engine reports itself as replaying from a primary.
@@ -2259,6 +2308,8 @@ pub fn server_view(facts: &SessionFacts) -> super::sql_engine::ServerView {
         postmaster_start_time: facts.runtime.postmaster_start_time,
         in_recovery: facts.runtime.in_recovery,
         backend_pid: facts.connection_id,
+        server_address: facts.server_host.clone(),
+        server_port: facts.server_port,
         // `statement_timeout`: "the time in milliseconds after which a statement is
         // aborted; 0 disables the timeout" — the session's own value where it set one, else
         // the instance's.

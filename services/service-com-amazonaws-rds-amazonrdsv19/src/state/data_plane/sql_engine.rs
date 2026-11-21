@@ -395,6 +395,13 @@ pub struct ServerView {
     pub in_recovery: bool,
     /// The session's own backend pid: `pg_backend_pid()`.
     pub backend_pid: u32,
+    /// The address of the server end this session is served by, which is what
+    /// `inet_server_addr()` reports; empty where the session's server published no address
+    /// of its own, which the function then answers NULL for, as PostgreSQL does for a
+    /// connection over a Unix-domain socket.
+    pub server_address: String,
+    /// The port of that same server end: `inet_server_port()`.
+    pub server_port: u16,
     /// `statement_timeout` for this statement, in milliseconds; 0 disables it, as the
     /// parameter documents.
     pub statement_timeout_ms: u64,
@@ -1736,6 +1743,37 @@ fn register_server_functions(
     conn.create_scalar_function("pg_backend_pid", 0, FunctionFlags::SQLITE_UTF8, move |_| {
         Ok(i64::from(read(&backend).backend_pid))
     })
+    .map_err(unavailable)?;
+
+    // `inet_server_addr()` — "Returns the IP address on which the server accepted the current
+    // connection" — and `inet_server_port()`, its port. They are the SERVER end of the
+    // session: for a session on a database's own endpoint that is the listener it arrived on,
+    // and for one pooled through a DB proxy it is the endpoint of the DATABASE serving it,
+    // since the backend answering the statement is that database's and not the proxy's.
+    // `NULL` for a server that published no address, which is what PostgreSQL answers for a
+    // connection made over a Unix-domain socket.
+    let server_address = Arc::clone(view);
+    conn.create_scalar_function(
+        "inet_server_addr",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        move |_| {
+            let address = read(&server_address).server_address;
+            Ok((!address.is_empty()).then_some(address))
+        },
+    )
+    .map_err(unavailable)?;
+
+    let server_port = Arc::clone(view);
+    conn.create_scalar_function(
+        "inet_server_port",
+        0,
+        FunctionFlags::SQLITE_UTF8,
+        move |_| {
+            let view = read(&server_port);
+            Ok((!view.server_address.is_empty()).then(|| i64::from(view.server_port)))
+        },
+    )
     .map_err(unavailable)?;
 
     // `pg_sleep(seconds)` — "Makes the current session's process sleep until the given

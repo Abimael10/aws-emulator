@@ -266,6 +266,8 @@ async fn serve_session(
         settings: std::collections::BTreeMap::new(),
         databases: facts.databases.clone(),
         endpoint_host: facts.endpoint_host.clone(),
+        server_host: facts.server_host.clone(),
+        server_port: facts.server_port,
         read_only: facts.read_only,
         runtime: facts.runtime.clone(),
         sessions: context.sessions.clone(),
@@ -1206,6 +1208,9 @@ fn type_oid(column: &ColumnInfo, sample: Option<&Cell>) -> i32 {
             "timestamp" | "timestamp without time zone" => Some((1114, 1115)),
             "timestamptz" | "timestamp with time zone" => Some((1184, 1185)),
             "numeric" | "decimal" => Some((1700, 1231)),
+            // `inet` — "IPv4 and IPv6 hosts and networks" (PostgreSQL, "Network Address
+            // Types"), the type the server-address functions answer with.
+            "inet" => Some((869, 1041)),
             "uuid" => Some((2950, 2951)),
             "jsonb" => Some((3802, 3807)),
             _ => None,
@@ -1330,6 +1335,12 @@ fn refusal_sentence(
                 user,
                 database.unwrap_or(user)
             ),
+        ),
+        // The refusal of the PROXY the session arrived on, in the proxy's own words: no
+        // database was reached, so nothing of the login is named.
+        LoginRefusal::ProxyTlsRequired => (
+            "28000",
+            super::proxy_endpoint::PROXY_REQUIRES_TLS_MESSAGE.to_string(),
         ),
         LoginRefusal::UnknownDatabase { database } => (
             "3D000",

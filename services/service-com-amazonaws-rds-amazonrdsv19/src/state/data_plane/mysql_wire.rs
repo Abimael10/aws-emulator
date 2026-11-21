@@ -278,6 +278,8 @@ async fn serve_session(
         settings: std::collections::BTreeMap::new(),
         databases: facts.databases.clone(),
         endpoint_host: facts.endpoint_host.clone(),
+        server_host: facts.server_host.clone(),
+        server_port: facts.server_port,
         read_only: facts.read_only,
         runtime: facts.runtime.clone(),
         sessions: context.sessions.clone(),
@@ -878,6 +880,14 @@ fn refusal_sentence(
             "Connections using insecure transport are prohibited while \
              --require_secure_transport=ON."
                 .to_string(),
+        ),
+        // The refusal of the PROXY the session arrived on, under the same error number — the
+        // one a client reads as "this server will not take a session in the clear" — in the
+        // proxy's own words.
+        LoginRefusal::ProxyTlsRequired => (
+            3159,
+            "HY000",
+            super::proxy_endpoint::PROXY_REQUIRES_TLS_MESSAGE.to_string(),
         ),
         // `ER_BAD_DB_ERROR`.
         LoginRefusal::UnknownDatabase { database } => (

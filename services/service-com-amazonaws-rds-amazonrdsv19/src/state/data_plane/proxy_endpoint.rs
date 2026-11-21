@@ -57,6 +57,18 @@ use crate::state::{
     ENGINE_FAMILY_POSTGRESQL,
 };
 
+/// What a DB PROXY answers a login that arrives in the clear while `RequireTLS` is on:
+/// "specifies whether Transport Layer Security (TLS) encryption is required for connections
+/// to the proxy. By enabling this setting, you can enforce encrypted TLS connections to the
+/// proxy."
+///
+/// The sentence is the PROXY's own and has no variable part: it names neither the client, the
+/// user nor the database, because no database was reached — the proxy refused the client's
+/// hop before opening a connection to the one its target group holds. It is what both wires
+/// word [`super::wire_session::LoginRefusal::ProxyTlsRequired`] with, so a client reads the
+/// same sentence whichever engine family the proxy announced.
+pub const PROXY_REQUIRES_TLS_MESSAGE: &str = "This RDS Proxy requires TLS connections";
+
 /// The wire a proxy of `engine_family` speaks, or `None` for a family this emulator serves
 /// no data plane for.
 ///
@@ -305,10 +317,11 @@ pub(super) fn proxy_session(
     }
     // "By enabling this setting, you can enforce encrypted TLS connections to the proxy":
     // the client's hop ends at the proxy, so a proxy that requires TLS requires it of this
-    // session whatever the database behind it would have admitted — and a database that
-    // requires an encrypted session keeps requiring one, since the proxy presents its
-    // traffic to that database as it stands.
-    facts.requires_secure_transport = facts.requires_secure_transport || require_tls;
+    // session whatever the database behind it would have admitted — and that refusal is the
+    // PROXY's own, worded as the proxy words it ([`PROXY_REQUIRES_TLS_MESSAGE`]), not the
+    // engine's. A database that requires an encrypted session keeps requiring one, since the
+    // proxy presents its traffic to that database as it stands.
+    facts.tls_required_by_proxy = require_tls;
     // The address this session arrived on is the PROXY's own endpoint: that is the pair a
     // client generates an IAM authentication token for, and the one a refusal names.
     facts.endpoint_host = served.host;

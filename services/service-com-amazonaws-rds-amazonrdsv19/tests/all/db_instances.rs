@@ -1912,13 +1912,18 @@ async fn a_snapshot_copies_the_source_instance_and_reads_back() {
         );
         wait_for_settle();
 
-        // Readable back through DescribeDBSnapshots, filtered by the source instance.
+        // Readable back through DescribeDBSnapshots, filtered by the source instance — and
+        // by the MANUAL snapshot type, since an instance that keeps automated backups also
+        // has the `automated` snapshot those took.
         let listed = expect_ok(
             row.case,
             call(
                 &router,
                 "DescribeDBSnapshots",
-                &params!["DBInstanceIdentifier" => row.instance],
+                &params![
+                    "DBInstanceIdentifier" => row.instance,
+                    "SnapshotType" => "manual",
+                ],
             )
             .await,
         );
@@ -2062,30 +2067,50 @@ async fn a_snapshot_copies_the_source_instance_and_reads_back() {
         .map(|row| row.snapshot.to_string())
         .collect();
     expected.sort();
-    assert_eq!(
-        all, expected,
-        "the unfiltered report must list every stored snapshot in identifier order"
-    );
     let (manual, _) = snapshot_identifiers(&router, &params!["SnapshotType" => "manual"]).await;
     assert_eq!(
         manual, expected,
-        "every stored snapshot is `manual`, so the manual report lists them all"
+        "the manual report lists exactly the snapshots the caller asked for"
     );
+    // Every one of these instances keeps automated backups (`BackupRetentionPeriod` defaults
+    // to 1), so each also has the ONE `automated` snapshot those backups took, named after
+    // the instance it was taken of.
     let (automated, _) =
         snapshot_identifiers(&router, &params!["SnapshotType" => "automated"]).await;
-    assert!(
-        automated.is_empty(),
-        "this store holds no automated snapshots, got {automated:?}"
+    for row in SNAPSHOT_CASES {
+        let prefix = format!("rds:{}-", row.instance);
+        assert_eq!(
+            automated
+                .iter()
+                .filter(|name| name.starts_with(&prefix))
+                .count(),
+            1,
+            "case {:?}: expected one automated snapshot named {prefix}…, got {automated:?}",
+            row.case
+        );
+    }
+    let mut every: Vec<String> = expected.iter().cloned().chain(automated.clone()).collect();
+    every.sort();
+    assert_eq!(
+        all, every,
+        "the unfiltered report must list every stored snapshot in identifier order, \
+         got {all:?}"
     );
     let (by_engine, _) = snapshot_identifiers(
         &router,
         &params!["Filters.Filter.1.Name" => "engine", "Filters.Filter.1.Values.Value.1" => "mysql"],
     )
     .await;
+    let mut mysql_snapshots: Vec<String> = automated
+        .iter()
+        .filter(|name| name.starts_with("rds:emu-snap-my-"))
+        .cloned()
+        .chain(["Emu-Snap-My-1".to_string()])
+        .collect();
+    mysql_snapshots.sort();
     assert_eq!(
-        by_engine,
-        vec!["Emu-Snap-My-1".to_string()],
-        "the engine filter must select only the mysql snapshot"
+        by_engine, mysql_snapshots,
+        "the engine filter must select only the snapshots of the mysql instance"
     );
     let (by_arn, _) = snapshot_identifiers(
         &router,
@@ -2095,9 +2120,15 @@ async fn a_snapshot_copies_the_source_instance_and_reads_back() {
         ],
     )
     .await;
+    let mut oracle_snapshots: Vec<String> = automated
+        .iter()
+        .filter(|name| name.starts_with("rds:emu-snap-ora-"))
+        .cloned()
+        .chain(["emu-snap-ora-1".to_string()])
+        .collect();
+    oracle_snapshots.sort();
     assert_eq!(
-        by_arn,
-        vec!["emu-snap-ora-1".to_string()],
+        by_arn, oracle_snapshots,
         "db-instance-id must accept a DB instance ARN as well as an identifier"
     );
     let body = expect_error(
@@ -2412,10 +2443,18 @@ async fn delete_removes_the_instance_and_can_take_a_final_snapshot() {
         !identifiers.contains(&"emu-del-skip".to_string()),
         "the deleted instance must be gone from the unfiltered report, got {identifiers:?}"
     );
-    let (snapshots, _) = snapshot_identifiers(&router, &[]).await;
+    let (snapshots, _) = snapshot_identifiers(&router, &params!["SnapshotType" => "manual"]).await;
     assert!(
         snapshots.is_empty(),
         "skipping the final snapshot must store none, got {snapshots:?}"
+    );
+    // And the automated snapshot the instance's own backups had taken went with the
+    // instance: an instance this store no longer holds keeps no automated backups.
+    let (its_own, _) =
+        snapshot_identifiers(&router, &params!["DBInstanceIdentifier" => "emu-del-skip"]).await;
+    assert!(
+        its_own.is_empty(),
+        "the deleted instance must leave no snapshot of its own behind, got {its_own:?}"
     );
 
     // Taking the final snapshot: the instance goes and the snapshot stays, carrying

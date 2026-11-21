@@ -322,11 +322,18 @@ async fn a_stop_takes_an_available_instance_to_stopped_and_retains_its_metadata(
         );
 
         // The snapshot the stop was asked for outlives the stop and reads back as a
-        // manual snapshot of this instance; asking for none stores none.
+        // manual snapshot of this instance; asking for none stores none. The MANUAL
+        // snapshots are what the stop decides about: an instance that keeps automated
+        // backups also has the `automated` snapshot those took.
         let stored = texts(
             &expect_ok(
                 row.case,
-                call(&router, "DescribeDBSnapshots", &[] as &[(&str, String)]).await,
+                call(
+                    &router,
+                    "DescribeDBSnapshots",
+                    &[("SnapshotType", "manual".to_string())],
+                )
+                .await,
             ),
             "DBSnapshotIdentifier",
         );

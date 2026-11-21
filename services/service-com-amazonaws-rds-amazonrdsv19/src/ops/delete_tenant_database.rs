@@ -308,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            if store.snapshots_in(&region).len() < crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
+            if store.manual_snapshots_in(&region) < crate::state::DB_SNAPSHOT_QUOTA_PER_REGION
                 && store.has_room_for_region(&region)
             {
                 let source = &store.db_instances[&instance_key];

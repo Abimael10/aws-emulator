@@ -321,10 +321,11 @@ async fn each_acting_db_instance_call_words_the_one_state_fault_its_own_way() {
         }
 
         // The refusals changed nothing: the snapshot the refused `CreateDBSnapshot` named
-        // was never taken.
+        // was never taken. Asked for the MANUAL snapshots, since an instance that keeps
+        // automated backups has the `automated` snapshot those took whatever this call did.
         let snapshots = expect_ok(
             row.case,
-            call(&router, "DescribeDBSnapshots", &[] as &[(&str, &str)]).await,
+            call(&router, "DescribeDBSnapshots", &[("SnapshotType", "manual")]).await,
         );
         assert!(
             texts(&snapshots, "DBSnapshotIdentifier").is_empty(),
@@ -391,7 +392,14 @@ async fn an_available_instance_takes_the_calls_the_blocked_statuses_refuse() {
     );
     let snapshots = expect_ok(
         "the snapshot report",
-        call(&router, "DescribeDBSnapshots", &[] as &[(&str, &str)]).await,
+        call(
+            &router,
+            "DescribeDBSnapshots",
+            // The MANUAL snapshots: an instance that keeps automated backups also has the
+            // `automated` snapshot its own backups took, which is not what this call made.
+            &[("SnapshotType", "manual")],
+        )
+        .await,
     );
     assert_eq!(
         texts(&snapshots, "DBSnapshotIdentifier"),

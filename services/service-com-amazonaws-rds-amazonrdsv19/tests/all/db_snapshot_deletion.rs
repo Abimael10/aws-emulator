@@ -36,9 +36,6 @@ macro_rules! params {
     };
 }
 
-/// A call that carries no parameters beyond `Action` and `Version`.
-const NO_PARAMS: [(&str, String); 0] = [];
-
 /// How the snapshot a row deletes was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TakenBy {
@@ -144,9 +141,17 @@ async fn take_the_snapshot(router: &MultiServiceRouter, row: &DeleteCase) -> Str
     }
 }
 
-/// The identifiers of every DB snapshot the Region holds, in the order it reports them.
+/// The identifiers of every MANUAL DB snapshot the Region holds, in the order it reports
+/// them.
+///
+/// The report is asked for the snapshots a CALLER took: an instance that keeps automated
+/// backups also has the `automated` snapshot those took, which belongs to the instance's
+/// backups rather than to the deletes under test here.
 async fn stored_snapshots(router: &MultiServiceRouter, case: &str) -> Vec<String> {
-    let body = expect_ok(case, call(router, "DescribeDBSnapshots", &NO_PARAMS).await);
+    let body = expect_ok(
+        case,
+        call(router, "DescribeDBSnapshots", &params!["SnapshotType" => "manual"]).await,
+    );
     texts(&body, "DBSnapshotIdentifier")
 }
 
@@ -349,7 +354,12 @@ async fn a_delete_removes_only_the_snapshot_it_names_in_the_region_it_is_signed_
             call(
                 &router,
                 "DescribeDBSnapshots",
-                &params!["DBInstanceIdentifier" => instance],
+                &params![
+                    "DBInstanceIdentifier" => instance,
+                    // The caller's own snapshots; the instance's automated backups have one
+                    // of their own, which no delete here names.
+                    "SnapshotType" => "manual",
+                ],
             )
             .await,
         );

@@ -290,10 +290,16 @@ async fn a_delete_is_accepted_from_every_status_and_the_instance_then_disappears
         );
 
         // The final snapshot the delete was asked for outlives the instance; skipping
-        // it stores nothing.
+        // it stores nothing. The MANUAL snapshots are what a delete decides about: the
+        // automated snapshot an instance's own backups took goes with the instance.
         let snapshots = expect_ok(
             row.case,
-            call(&router, "DescribeDBSnapshots", &[] as &[(&str, String)]).await,
+            call(
+                &router,
+                "DescribeDBSnapshots",
+                &[("SnapshotType", "manual".to_string())],
+            )
+            .await,
         );
         let stored = texts(&snapshots, "DBSnapshotIdentifier");
         match row.final_snapshot {

@@ -324,6 +324,10 @@ pub use instance_automated_backups::*;
 // destination Region's own record of one, which the start enables and the stop ends.
 mod instance_backup_replication;
 pub use instance_backup_replication::*;
+// The AUTOMATED DB snapshots those backups take of an instance, which `DescribeDBSnapshots`
+// reports under the `automated` snapshot type.
+mod automated_snapshots;
+pub use automated_snapshots::*;
 // The weekly maintenance window both resource kinds keep: the form it is STORED in, and
 // when its next occurrence begins.
 pub mod maintenance_window;
@@ -407,7 +411,10 @@ pub use data_plane::{
     capture_instance_storage,
     cluster_endpoint::cluster_engine_wire,
     engine_wire, open_engine_endpoint,
-    proxy_endpoint::{open_proxy_endpoint, proxy_engine_wire, DbProxyEndpoint, ProxyEndpointPlan},
+    proxy_endpoint::{
+        open_proxy_endpoint, proxy_engine_wire, DbProxyEndpoint, ProxyEndpointPlan,
+        PROXY_REQUIRES_TLS_MESSAGE,
+    },
     rewind_cluster_storage, wire_session::SessionTarget,
     DbEngineEndpoint, EndpointRole, EngineEndpointPlan, EngineWire, ServedEndpoint,
 };
@@ -425,6 +432,17 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     pub db_instances: BTreeMap<RegionalKey, DbInstanceRecord>,
     /// DB snapshots by `(region, DBSnapshotIdentifier)`. Ordered, for the same reason.
     pub db_snapshots: BTreeMap<RegionalKey, DbSnapshotRecord>,
+    /// The AUTOMATED snapshot each DB instance that keeps automated backups has taken, by
+    /// `(region, DbiResourceId)` — the source instance's immutable id — holding the
+    /// `DBSnapshotIdentifier` of its entry in [`Self::db_snapshots`].
+    ///
+    /// This is what makes the automated snapshot a change the clock owes ONCE rather than
+    /// one every read could mint again: [`Self::settle_automated_db_snapshots`] is its only
+    /// writer, it inserts for an instance that has none and removes the record and the
+    /// snapshot with it when the instance stops keeping automated backups. One instance has
+    /// one, so the map is bounded by [`DB_INSTANCE_QUOTA_PER_REGION`] per region and by
+    /// [`MAX_REGIONS`] regions, like every other record here.
+    pub automated_db_snapshots: BTreeMap<RegionalKey, String>,
     /// The RETAINED automated backups of DB instances that have been DELETED, by
     /// `(region, DbiResourceId)` — the id of the source instance, which "can't be changed
     /// and ... is unique to an Amazon Web Services Region", so one deleted instance leaves
@@ -765,6 +783,11 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         for key in gone.drain(..) {
             self.db_snapshots.remove(&key);
         }
+        // The automated snapshots the instances of this region owe, now that their statuses
+        // are the ones the clock has made due: an instance whose automated backup has
+        // reached `active` has its first automated snapshot
+        // ([`Self::settle_automated_db_snapshots`] says why that is owed at this instant).
+        self.settle_automated_db_snapshots(region);
         let mut gone: Vec<RegionalKey> = Vec::new();
         for (key, snapshot) in self
             .db_cluster_snapshots
