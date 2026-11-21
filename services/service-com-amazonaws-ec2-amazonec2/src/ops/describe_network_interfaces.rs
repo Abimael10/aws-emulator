@@ -92,6 +92,7 @@ use std::borrow::Cow;
 use crate::state::{
     CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
     MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, boolean_filter_values, integer_filter_values,
+    reported_network_interface,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -371,7 +372,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(DescribeNetworkInterfacesOutput {
-            network_interfaces: Some(page.iter().map(|interface| (*interface).clone()).collect()),
+            network_interfaces: Some(
+                page.iter()
+                    .map(|interface| reported_network_interface(interface))
+                    .collect(),
+            ),
             next_token,
         })
     }

@@ -1969,6 +1969,7 @@ use crate::ops::types::{
     OperatorResponse, PathFilter, PeeringAttachmentStatus,
     PlacementGroup, PrefixListId, PtrUpdateStatus,
     PrivateDnsDetails, PrivateDnsNameConfiguration, PrivateDnsNameOptionsOnLaunch,
+    PublicIpDnsNameOptions,
     ReferencedSecurityGroup,
     SecurityGroupRule, SecurityGroupVpcAssociation,
     DnsEntry, PayerResponsibilityEntry, ProductCode,

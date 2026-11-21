@@ -740,6 +740,24 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
+/// One stored network interface as the operations that report the interface's OWN shape
+/// answer with it (`NetworkInterface`).
+///
+/// The stored record with the members DERIVED from the public hostname it holds filled in:
+/// the public-hostname options NAME that hostname ([`public_ip_dns_name_options`]), so they
+/// are computed where the interface is reported rather than written beside the hostname by
+/// every caller that assigns, moves or releases a public address — which is what keeps the
+/// two from disagreeing. The same derivation the instance's projection of an interface takes
+/// ([`instance_network_interface_view`]).
+pub fn reported_network_interface(interface: &NetworkInterface) -> NetworkInterface {
+    NetworkInterface {
+        public_ip_dns_name_options: public_ip_dns_name_options(
+            interface.public_dns_name.as_deref().unwrap_or_default(),
+        ),
+        ..interface.clone()
+    }
+}
+
 /// One stored network interface as the INSTANCE that holds it reports it
 /// (`Instance$NetworkInterfaces`, whose entries are `InstanceNetworkInterface`).
 ///
@@ -752,6 +770,19 @@ pub(super) fn instance_network_interface_view(
     interface: &NetworkInterface,
     attachment: &NetworkInterfaceAttachment,
 ) -> InstanceNetworkInterface {
+    // The public hostname of the address this interface holds, and the public-hostname
+    // options naming it, are members of the interface's OWN shape
+    // (`NetworkInterface$PublicDnsName` and `NetworkInterface$PublicIpDnsNameOptions`) that
+    // `InstanceNetworkInterface` declares none of, so they are handed to the one seam that
+    // renders an element this model does not declare — off the SAME stored record this
+    // projection reads everything else from, so the two reports of one interface cannot
+    // disagree about the name it answers to.
+    if let Some(network_interface_id) = interface.network_interface_id.as_deref() {
+        crate::service::recorded_response_members::hold_instance_interface_public_hostname(
+            network_interface_id,
+            interface.public_dns_name.as_deref().unwrap_or_default(),
+        );
+    }
     // The public address the interface holds, in the shape the INSTANCE report carries it
     // in: the same stored association, which has no member for the allocation or the
     // association id — those belong to the Elastic IP address record `DescribeAddresses`

@@ -450,7 +450,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(state::dry_run_operation());
             }
             return Ok(CreateNetworkInterfaceOutput {
-                network_interface: Some(stored),
+                network_interface: Some(state::reported_network_interface(&stored)),
                 client_token: input.client_token.clone(),
             });
         }
@@ -595,7 +595,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         Ok(CreateNetworkInterfaceOutput {
-            network_interface: Some(interface),
+            network_interface: Some(state::reported_network_interface(&interface)),
             client_token: input.client_token.clone(),
         })
     }

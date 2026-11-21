@@ -776,6 +776,39 @@ pub fn public_hostname(hands_out: bool, public_ip: &str, region: &str) -> String
     }
 }
 
+/// `PublicIpDnsOption`'s `public-ipv4-dns-name` member — the public hostname type of an
+/// IPv4-only resource, which is every resource of this store: "an IPv4-enabled public
+/// hostname for a network interface" (`PublicIpDnsNameOptions$PublicIpv4DnsName`) is the only
+/// public hostname anything here holds, no launch path of this crate asking for IPv6 space.
+/// One of the catalog `crate::ops::types::PUBLIC_IP_DNS_OPTION_VALUES` holds, so only a
+/// modelled option word can reach a response.
+pub const PUBLIC_IP_DNS_OPTION_IPV4: &str = "public-ipv4-dns-name";
+
+/// The `PublicIpDnsNameOptions` a resource holding the public IPv4 hostname
+/// `public_dns_name` reports, and `None` for one holding no public hostname at all.
+///
+/// "Public hostname type options" (`PublicIpDnsNameOptions`) NAME the public hostname a
+/// resource holds, so the options are a function of that hostname rather than a second
+/// record of it: the type is the IPv4 one ([`PUBLIC_IP_DNS_OPTION_IPV4`]) and the name is the
+/// hostname itself. A resource that holds no public address has the EMPTY hostname
+/// ([`public_hostname`], which is also what a VPC handing out no public hostnames gives one),
+/// and there is then no hostname for the options to name — so the structure is left out
+/// rather than naming an empty one.
+///
+/// The ONE derivation of those options this crate has, so an interface reported on its own
+/// (`NetworkInterface$PublicIpDnsNameOptions`) and the same interface reported under the
+/// instance holding it cannot disagree about them.
+pub fn public_ip_dns_name_options(public_dns_name: &str) -> Option<PublicIpDnsNameOptions> {
+    (!public_dns_name.is_empty()).then(|| PublicIpDnsNameOptions {
+        dns_hostname_type: Some(PUBLIC_IP_DNS_OPTION_IPV4.to_string()),
+        public_ipv4_dns_name: Some(public_dns_name.to_string()),
+        // An IPv6 and a dual-stack public hostname name an IPv6 Global Unicast Address the
+        // interface holds, and no launch path of this crate assigns one.
+        public_ipv6_dns_name: None,
+        public_dual_stack_dns_name: None,
+    })
+}
+
 /// The processor architecture an instance type runs on.
 ///
 /// AWS names an instance type `<family><generation><capabilities>.<size>` and

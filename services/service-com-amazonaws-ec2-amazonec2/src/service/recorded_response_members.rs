@@ -45,10 +45,12 @@
 //! # What it does NOT derive here
 //!
 //! An element whose value is NOT a function of the reported record — a subnet's inherited
-//! DHCP option set id, which has to be resolved from the subnet's VPC — needs the store, and
-//! a protocol has none. The PROJECTION that owns the value resolves it and hands it here
-//! ([`hold_subnet_dhcp_options`]), because writing an element the model does not declare is
-//! still only possible at this seam.
+//! DHCP option set id, which has to be resolved from the subnet's VPC, or the public hostname
+//! a network interface holds, which the instance's projection of that interface reads off the
+//! interface's own record — needs the store, and a protocol has none. The PROJECTION that
+//! owns the value resolves it and hands it here ([`hold_subnet_dhcp_options`],
+//! [`hold_instance_interface_public_hostname`]), because writing an element the model does
+//! not declare is still only possible at this seam.
 
 use ::aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -124,6 +126,49 @@ fn held_subnet_dhcp_options(subnet_id: &str) -> Option<String> {
     SUBNET_DHCP_OPTIONS.with(|slot| slot.borrow().get(subnet_id).cloned())
 }
 
+thread_local! {
+    /// The public hostname each network interface THIS response reports under the instance
+    /// holding it holds, keyed by `NetworkInterfaceId`.
+    ///
+    /// Held for the same reason as [`SUBNET_DHCP_OPTIONS`], and on the same invariant: a
+    /// public hostname is a member of the interface's OWN shape
+    /// (`NetworkInterface$PublicDnsName`) and `InstanceNetworkInterface` declares none, so the
+    /// projection that reports an interface under its instance
+    /// ([`crate::state::instance_network_interfaces`]) hands the hostname here and this seam
+    /// writes it. An interface left out of the slot is reported without the elements below.
+    static INSTANCE_INTERFACE_PUBLIC_HOSTNAMES: RefCell<BTreeMap<String, String>> =
+        const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Hold the public hostname the network interface `network_interface_id` holds, as the
+/// instance's projection of that interface read it off the interface's own record.
+///
+/// Keyed by interface id and added to rather than replacing, because one response reports the
+/// interfaces of every instance it answers with, projected one instance at a time. The run
+/// about to serve a call clears the slot ([`forget_any_held_instance_interface_hostnames`]),
+/// so nothing another call held can be written onto this one's interfaces.
+pub fn hold_instance_interface_public_hostname(network_interface_id: &str, public_dns_name: &str) {
+    INSTANCE_INTERFACE_PUBLIC_HOSTNAMES.with(|slot| {
+        slot.borrow_mut().insert(
+            network_interface_id.to_string(),
+            public_dns_name.to_string(),
+        )
+    });
+}
+
+/// Drop whatever interface hostnames this thread may still hold: they belong to no call the
+/// run about to start serves.
+pub fn forget_any_held_instance_interface_hostnames() {
+    INSTANCE_INTERFACE_PUBLIC_HOSTNAMES.with(|slot| slot.borrow_mut().clear());
+}
+
+/// The public hostname held for the interface `network_interface_id`, or `None` when the
+/// projection held none for it.
+fn held_instance_interface_public_hostname(network_interface_id: &str) -> Option<String> {
+    INSTANCE_INTERFACE_PUBLIC_HOSTNAMES
+        .with(|slot| slot.borrow().get(network_interface_id).cloned())
+}
+
 /// The Smithy member name a Verified Access instance's own id is written under, which is
 /// what says the structure being walked IS such an instance.
 const VERIFIED_ACCESS_INSTANCE_ID_MEMBER: &str = "VerifiedAccessInstanceId";
@@ -172,6 +217,15 @@ const ENA_SUPPORT_MEMBER: &str = "EnaSupport";
 /// The Smithy member name an instance type's bare metal flag is written under, which is
 /// what says a type runs the caller's software on the host with no hypervisor under it.
 const BARE_METAL_MEMBER: &str = "BareMetal";
+
+/// The Smithy member name a network interface's own id is written under, which is what says
+/// WHICH interface a structure named after one is, and the key its public hostname was held
+/// under.
+const NETWORK_INTERFACE_ID_MEMBER: &str = "NetworkInterfaceId";
+
+/// The Smithy member name a public hostname is written under, on every shape that reports
+/// one — on a reported instance, the `dnsName` the public-hostname options below name.
+const PUBLIC_DNS_NAME_MEMBER: &str = "PublicDnsName";
 
 /// `cpuBurstModel` of a burstable performance type: its vCPUs run at a baseline rate and
 /// spend the CPU credits they earn to run above it.
@@ -256,6 +310,53 @@ static SUBNET_DHCP_OPTIONS_SOURCE: Schema = Schema::new_member(
     ),
     ShapeType::String,
     "dhcpOptionsSource",
+    0,
+);
+
+/// `<publicIpDnsNameOptions>` on a reported INSTANCE — a member schema for the same reason
+/// as [`VPC_DHCP_OPTIONS_SOURCE`]: `com.amazonaws.ec2#Instance` declares the public hostname
+/// (`dnsName`) and no options naming it, where the network interface's own shape declares
+/// both.
+///
+/// The element is a STRUCTURE, so the modelled `PublicIpDnsNameOptions` shape is what is
+/// written into it ([`crate::state::public_ip_dns_name_options`]) rather than a second
+/// hand-built rendering of the same members.
+static INSTANCE_PUBLIC_IP_DNS_NAME_OPTIONS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#Instance$publicIpDnsNameOptions",
+        EC2_NAMESPACE,
+        "publicIpDnsNameOptions",
+    ),
+    ShapeType::Structure,
+    "publicIpDnsNameOptions",
+    0,
+);
+
+/// `<publicDnsName>` on a network interface reported under the instance holding it — a member
+/// schema for the same reason as [`VPC_DHCP_OPTIONS_SOURCE`]:
+/// `com.amazonaws.ec2#InstanceNetworkInterface` declares neither this member nor the options
+/// below, where `com.amazonaws.ec2#NetworkInterface` declares both.
+static INSTANCE_NETWORK_INTERFACE_PUBLIC_DNS_NAME: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#InstanceNetworkInterface$publicDnsName",
+        EC2_NAMESPACE,
+        "publicDnsName",
+    ),
+    ShapeType::String,
+    "publicDnsName",
+    0,
+);
+
+/// `<publicIpDnsNameOptions>` on a network interface reported under the instance holding it,
+/// naming the hostname written above.
+static INSTANCE_NETWORK_INTERFACE_PUBLIC_IP_DNS_NAME_OPTIONS: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.ec2#InstanceNetworkInterface$publicIpDnsNameOptions",
+        EC2_NAMESPACE,
+        "publicIpDnsNameOptions",
+    ),
+    ShapeType::Structure,
+    "publicIpDnsNameOptions",
     0,
 );
 
@@ -455,6 +556,13 @@ struct WrittenMembers {
     /// The Elastic Network Adapter support the structure reported for itself, which is what
     /// says it IS a reported `networkInfo`.
     ena_support: Option<String>,
+    /// The network interface id the structure wrote for itself, which is what says WHICH
+    /// interface it is and whose public hostname is written on it.
+    network_interface_id: Option<String>,
+    /// The public hostname the structure wrote for itself, which an instance's
+    /// public-hostname options NAME — and whose emptiness says the instance holds no public
+    /// address for them to name.
+    public_dns_name: Option<String>,
     /// The context the structure reported for ITSELF — the zone it is in, and whether it is
     /// a bare metal instance type — which is what the structures nested under it are handed.
     zone: EnclosingRecord,
@@ -490,6 +598,8 @@ fn recorded_writer_for(schema: &Schema) -> Option<RecordedWriter> {
         "VerifiedAccessInstance" => Some(write_verified_access_instance_recorded_members),
         "InternetGateway" => Some(write_internet_gateway_recorded_members),
         "VolumeAttachment" => Some(write_volume_attachment_recorded_members),
+        "Instance" => Some(write_instance_recorded_members),
+        "InstanceNetworkInterface" => Some(write_instance_network_interface_recorded_members),
         "InstanceTypeInfo" => Some(write_instance_type_recorded_members),
         "NetworkInfo" => Some(write_network_info_recorded_members),
         // An INSTANCE's metadata option set (`InstanceMetadataOptionsResponse`), which this
@@ -581,6 +691,70 @@ fn write_volume_attachment_recorded_members(
         s.write_string(&VOLUME_ATTACHMENT_AVAILABILITY_ZONE_ID, availability_zone_id)?;
     }
     Ok(())
+}
+
+/// A reported INSTANCE's recorded elements: the public-hostname options naming the public
+/// hostname it reported.
+///
+/// "Public hostname type options" (`PublicIpDnsNameOptions`) name the public hostname a
+/// resource holds, so they are derived from the hostname the instance itself wrote
+/// (`Instance$PublicDnsName`, the `dnsName` element) through the one derivation this crate
+/// has ([`crate::state::public_ip_dns_name_options`]) — never resolved a second time, so the
+/// options and the hostname they name cannot disagree.
+///
+/// Written only for a structure that reported a public hostname of its own, and only when
+/// that hostname is not the EMPTY one an instance holding no public address reports: there is
+/// then no hostname for the options to name.
+fn write_instance_recorded_members(
+    s: &mut dyn ShapeSerializer,
+    written: &WrittenMembers,
+    _zone: &EnclosingRecord,
+) -> Result<(), SerdeError> {
+    let Some(public_dns_name) = written.public_dns_name.as_deref() else {
+        return Ok(());
+    };
+    let Some(options) = crate::state::public_ip_dns_name_options(public_dns_name) else {
+        return Ok(());
+    };
+    s.write_struct(&INSTANCE_PUBLIC_IP_DNS_NAME_OPTIONS, &options)
+}
+
+/// A network interface reported UNDER its instance: the public hostname it holds, and the
+/// public-hostname options naming it.
+///
+/// The same two facts `DescribeNetworkInterfaces` reports for that interface off its own
+/// shape, read off the one record both reports project — handed here by that projection
+/// ([`hold_instance_interface_public_hostname`]), a protocol having no store to resolve an
+/// interface in. So an interface read through the instance holding it and the same interface
+/// read on its own cannot disagree about the hostname it answers to.
+///
+/// The hostname is written whenever one was held, EMPTY included: an interface holding no
+/// public address reports the empty hostname, which is the member AWS renders for one rather
+/// than no member at all. The options are written only when there is a hostname for them to
+/// name.
+fn write_instance_network_interface_recorded_members(
+    s: &mut dyn ShapeSerializer,
+    written: &WrittenMembers,
+    _zone: &EnclosingRecord,
+) -> Result<(), SerdeError> {
+    let Some(network_interface_id) = written.network_interface_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(public_dns_name) = held_instance_interface_public_hostname(network_interface_id)
+    else {
+        return Ok(());
+    };
+    s.write_string(
+        &INSTANCE_NETWORK_INTERFACE_PUBLIC_DNS_NAME,
+        &public_dns_name,
+    )?;
+    let Some(options) = crate::state::public_ip_dns_name_options(&public_dns_name) else {
+        return Ok(());
+    };
+    s.write_struct(
+        &INSTANCE_NETWORK_INTERFACE_PUBLIC_IP_DNS_NAME_OPTIONS,
+        &options,
+    )
 }
 
 /// A reported instance type's recorded elements: the burst model of its vCPUs.
@@ -931,6 +1105,10 @@ impl ShapeSerializer for RecordedMemberSerializer<'_> {
                         written.zone.instance_type = Some(value.to_string());
                     }
                     ENA_SUPPORT_MEMBER => written.ena_support = Some(value.to_string()),
+                    NETWORK_INTERFACE_ID_MEMBER => {
+                        written.network_interface_id = Some(value.to_string());
+                    }
+                    PUBLIC_DNS_NAME_MEMBER => written.public_dns_name = Some(value.to_string()),
                     _ => {}
                 }
             }

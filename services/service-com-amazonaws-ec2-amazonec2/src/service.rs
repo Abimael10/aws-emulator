@@ -928,6 +928,10 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for FinishedEnvelope<Eng> {
             // ([`recorded_response_members`]): cleared before the call that fills the slot,
             // so one call's reported subnets can never carry another call's answer.
             recorded_response_members::forget_any_held_subnet_options();
+            // Same for the public hostnames an instance's projection of its network
+            // interfaces hands that renderer ([`recorded_response_members`]), cleared for the
+            // same reason: one call's reported interfaces can never carry another call's.
+            recorded_response_members::forget_any_held_instance_interface_hostnames();
             let mut response = self.served(svc, req, ctx).await;
             stamp_envelope(&mut response);
             // The AUDIT leg, after the response the caller gets has been finished and
