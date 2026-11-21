@@ -59,7 +59,7 @@ const LOGS_TARGET_PREFIX: &str = "Logs_20140328";
 /// A key id no store holds, which is the account's own published credential — the
 /// credential the cluster below is created with, so the cluster creator's access entry
 /// is filed under the principal it speaks for.
-const AMBIENT_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+pub(crate) const AMBIENT_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 
 /// An identity-based policy allowing every Amazon EKS action, which an IAM user this
 /// suite creates needs to call the service at all.
@@ -69,26 +69,26 @@ const EKS_ADMIN_POLICY: &str = concat!(
 );
 
 /// How long the suite waits between looks at a condition it is waiting for.
-const POLL_WAIT: Duration = Duration::from_millis(100);
+pub(crate) const POLL_WAIT: Duration = Duration::from_millis(100);
 
 /// How many times it looks, which bounds every wait here far above the spans the
 /// emulator owes.
-const POLL_ATTEMPTS: usize = 150;
+pub(crate) const POLL_ATTEMPTS: usize = 150;
 
 /// The four services this rule spans, over ONE engine.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 /// One answer from a cluster's Kubernetes API address.
 #[derive(Debug)]
-struct ApiAnswer {
-    status: u16,
-    body: Value,
+pub(crate) struct ApiAnswer {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These rows exercise handler behaviour, not request signing.
@@ -176,7 +176,7 @@ impl Emulator {
     }
 
     /// One EKS call (restJson1) as `access_key_id`.
-    async fn eks(
+    pub(crate) async fn eks(
         &self,
         access_key_id: &str,
         method: &str,
@@ -196,7 +196,7 @@ impl Emulator {
     }
 
     /// One CloudWatch Logs call that must succeed.
-    async fn logs(&self, operation: &str, body: Value, case: &str) -> Value {
+    pub(crate) async fn logs(&self, operation: &str, body: Value, case: &str) -> Value {
         let (status, parsed) = self
             .dispatch(AwsCall {
                 signing_name: LOGS,
@@ -276,7 +276,7 @@ impl Emulator {
     /// One request to the cluster's published Kubernetes API address, as a client
     /// built from its kubeconfig makes it: one HTTP/1.1 exchange on the port the
     /// cluster published, carrying the bearer token when the row presents one.
-    async fn k8s(
+    pub(crate) async fn k8s(
         &self,
         endpoint: &str,
         case: &str,
@@ -334,7 +334,7 @@ impl Emulator {
     }
 
     /// Every message the cluster's audit stream holds, as a client reads them.
-    async fn audit_records(&self, cluster: &str, case: &str) -> Vec<Value> {
+    pub(crate) async fn audit_records(&self, cluster: &str, case: &str) -> Vec<Value> {
         let group = format!("/aws/eks/{cluster}/cluster");
         let streams = self
             .logs(
@@ -371,7 +371,11 @@ impl Emulator {
 
     /// Create an IAM user carrying [`EKS_ADMIN_POLICY`] and one long-term access key
     /// of its own; answers `(user ARN, access key id)`.
-    async fn user_with_key(&self, user_name: &str, case: &str) -> (String, String) {
+    pub(crate) async fn user_with_key(
+        &self,
+        user_name: &str,
+        case: &str,
+    ) -> (String, String) {
         let created = self
             .query(
                 "iam",
@@ -402,7 +406,7 @@ impl Emulator {
     }
 
     /// `CreateAccessEntry`: map `principal_arn` to `username` and `groups`.
-    async fn access_entry(
+    pub(crate) async fn access_entry(
         &self,
         cluster: &str,
         principal_arn: &str,
@@ -432,7 +436,7 @@ impl Emulator {
 /// The bearer token a kubeconfig's credential plugin builds for the credential
 /// `access_key_id`: `k8s-aws-v1.` followed by the base64url form of a presigned
 /// `sts:GetCallerIdentity` request, whose SigV4 credential scope names that key.
-fn bearer_token(access_key_id: &str) -> String {
+pub(crate) fn bearer_token(access_key_id: &str) -> String {
     bearer_token_for_url(&format!(
         "https://sts.{REGION}.amazonaws.com/?Action=GetCallerIdentity&Version=2011-06-15\
          &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={access_key_id}%2F20260101%2F\
