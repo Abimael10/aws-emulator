@@ -3,22 +3,27 @@
 //! End-to-end cover for the S3 WEBSITE ENDPOINT: the surface a bucket configured for static
 //! website hosting is served on.
 //!
-//! RULE: a request addressed to a bucket's website host — `<bucket>.s3-website-<Region>.…`,
-//! which is a different endpoint from the REST API's — is served from that bucket's website
+//! RULE: a request addressed to a bucket's WEBSITE surface — which is a different endpoint
+//! from the REST API's, reached at the bucket's website host
+//! (`<bucket>.s3-website-<Region>.…`) and, for a client that resolves nothing but this
+//! emulator's own endpoint, at the reserved data-plane path this emulator serves the same
+//! surface under on it (`/_aws/s3-website/<bucket>`) — is served from that bucket's website
 //! configuration: a request addressing a directory gets that directory's `IndexDocument`
 //! suffix, a key the public may read gets its bytes, a key it may read that is not there gets
 //! the `ErrorDocument` body with HTTP 404, content the bucket does not make public gets 403, an
 //! object carrying `x-amz-website-redirect-location` gets a 301 to it, a `RoutingRule` whose
 //! `Condition` holds gets the redirect that rule names, and any method but a read gets 405.
 //! The REST endpoint is untouched: a missing key there is still `NoSuchKey`, whatever routing
-//! rules the bucket carries.
+//! rules the bucket carries, and the bytes of a redirecting object are still what it serves.
 //!
 //! Every request here is ANONYMOUS and goes over the wire through the router, exactly as a
 //! browser addressing a static site makes it, so what is pinned is the HTTP behaviour (status,
 //! `Location`, body, media type) rather than any handler's internals. The suites are TABLES
 //! whose rows differ along what the rule generalises over: which path is addressed (the root, a
 //! directory, a key, a missing key, a private key), which method is used, which condition a
-//! routing rule carries and which replacement it names.
+//! routing rule carries and which replacement it names, which of the two addresses the request
+//! reached the surface by, and which of the addressable forms a stored redirect location
+//! carries.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -595,4 +600,312 @@ async fn a_bucket_whose_name_carries_dots_is_served_at_its_own_website_host() {
             );
         }
     }
+}
+
+// --- the address this emulator serves the same surface at on its OWN endpoint --------------
+//
+// A website host is a name a client RESOLVES and then dials, and a client configured with this
+// emulator's one endpoint resolves nothing else — so the surface is served on that endpoint
+// too, under the reserved data-plane path this workspace addresses a local plane by. What the
+// host cannot carry (WHICH bucket's site), the path carries.
+
+/// The endpoint this emulator publishes to a client on the machine it runs on: a loopback
+/// address and a port, which carries no bucket and no Region.
+const EMULATOR_ENDPOINT_HOST: &str = "127.0.0.1:9297";
+
+/// The path this emulator serves ONE bucket's website surface at on its own endpoint: the
+/// reserved data-plane namespace (`_aws`), the website plane's own label (`s3-website`, the
+/// label the bucket's website host carries too) and the bucket.
+///
+/// Spelled out here rather than taken from the crate: this address IS what a client is pointed
+/// at, so the suite pins the spelling itself.
+fn site_path(bucket: &str) -> String {
+    format!("/_aws/s3-website/{bucket}")
+}
+
+/// One ANONYMOUS request to a bucket's website surface at the address this emulator publishes:
+/// its own endpoint, the site's path, and the path within the site.
+async fn published(
+    router: &MultiServiceRouter,
+    method: &str,
+    bucket: &str,
+    within: &str,
+) -> Answer {
+    let path = format!("{}{within}", site_path(bucket));
+    website(router, method, EMULATOR_ENDPOINT_HOST, &path).await
+}
+
+#[tokio::test]
+async fn the_published_address_serves_the_same_surface_as_the_buckets_website_host() {
+    // The rows span the bucket-name forms the address is read over beside the request table
+    // itself: a plain name, a name carrying dots, and one whose own name carries a label
+    // shaped like the website endpoint's.
+    let names: &[(&str, &str)] = &[
+        ("a plain name", "published-website-site"),
+        ("a name carrying dots", "published.website.site"),
+        (
+            "a name carrying a label shaped like the website endpoint's",
+            "published.s3-website-us-east-1.site",
+        ),
+    ];
+    for (name_case, name) in names {
+        let router = router();
+        site(&router, name, "").await;
+        for row in rows() {
+            let answered = published(&router, row.method, name, row.path).await;
+            assert_eq!(
+                answered.status,
+                row.status,
+                "case {:?} of {name_case:?}: expected HTTP {} at {}, got {} with body {:?}",
+                row.case,
+                row.status,
+                site_path(name),
+                answered.status,
+                text(&answered)
+            );
+            if let Some(expected) = row.body {
+                assert_eq!(
+                    text(&answered),
+                    expected,
+                    "case {:?} of {name_case:?}: expected the body {expected:?}, got {:?}",
+                    row.case,
+                    text(&answered)
+                );
+            }
+            if row.status == 200 {
+                assert_eq!(
+                    answered.header("content-type").as_deref(),
+                    Some(HTML),
+                    "case {:?} of {name_case:?}: expected the media type the object is stored \
+                     under, got {:?}",
+                    row.case,
+                    answered.header("content-type")
+                );
+                assert_eq!(
+                    answered.header("location"),
+                    None,
+                    "case {:?} of {name_case:?}: a served document carries no Location, got {:?}",
+                    row.case,
+                    answered.header("location")
+                );
+            }
+            // ONE surface, two addresses: the bucket's website host answers the same request
+            // the same way, so neither address is a second reading of the configuration.
+            let at_host = website(&router, row.method, &website_host(name), row.path).await;
+            assert_eq!(
+                at_host.status, answered.status,
+                "case {:?} of {name_case:?}: the website host answered HTTP {} where the \
+                 published address answered {}",
+                row.case, at_host.status, answered.status
+            );
+            assert_eq!(
+                text(&at_host),
+                text(&answered),
+                "case {:?} of {name_case:?}: the website host answered {:?} where the published \
+                 address answered {:?}",
+                row.case,
+                text(&at_host),
+                text(&answered)
+            );
+        }
+        // And the site root is addressed with nothing at all after the bucket, which is the
+        // same directory as `/`.
+        let bare = published(&router, "GET", name, "").await;
+        assert_eq!(
+            (bare.status, text(&bare).as_str()),
+            (200, INDEX_BODY),
+            "case {name_case:?}: the bare site path must serve the index document, got {} with \
+             {:?}",
+            bare.status,
+            text(&bare)
+        );
+    }
+}
+
+/// The stored redirect locations the suite below spans: the three forms
+/// `WebsiteRedirectLocation` admits — "the website redirect location must have a prefix of
+/// 'http://' or 'https://' or '/'", which is what that member's own refusal states — and one
+/// carrying a query.
+const REDIRECTS: &[(&str, &str, &str)] = &[
+    ("a path on the site itself", "old.html", "/new.html"),
+    (
+        "an absolute URL over TLS",
+        "ext.html",
+        "https://example.com/landing",
+    ),
+    (
+        "an absolute URL in the clear",
+        "plain.html",
+        "http://example.com/landing",
+    ),
+    ("a path carrying a query", "query.html", "/new.html?from=old"),
+];
+
+/// The bytes stored BEHIND each redirecting object, which is what the REST endpoint serves.
+const BEHIND_THE_REDIRECT: &[u8] = b"the bytes behind the redirect";
+
+#[tokio::test]
+async fn a_stored_redirect_answers_301_at_the_published_address_while_rest_serves_the_body() {
+    let router = router();
+    let name = "published-website-redirect";
+    site(&router, name, "").await;
+    for (case, key, location) in REDIRECTS {
+        let written = put_object(
+            &router,
+            name,
+            key,
+            BEHIND_THE_REDIRECT,
+            &[
+                ("content-type", HTML),
+                ("x-amz-website-redirect-location", location),
+            ],
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: the redirecting object must be written, got {} with {:?}",
+            written.status,
+            text(&written)
+        );
+    }
+
+    for (case, key, location) in REDIRECTS {
+        // The website surface at the address this emulator publishes: the redirect, with the
+        // Location the object carries, verbatim, and no body at all.
+        let answered = published(&router, "GET", name, &format!("/{key}")).await;
+        assert_eq!(
+            answered.status,
+            301,
+            "case {case:?}: expected a 301 at {}, got {} with {:?}",
+            site_path(name),
+            answered.status,
+            text(&answered)
+        );
+        assert_eq!(
+            answered.header("location").as_deref(),
+            Some(*location),
+            "case {case:?}: expected the Location the object carries, got {:?}",
+            answered.header("location")
+        );
+        assert_eq!(
+            text(&answered),
+            "",
+            "case {case:?}: a redirect serves no body, got {:?}",
+            text(&answered)
+        );
+        // The same key at the bucket's website host answers the same redirect.
+        let at_host = website(&router, "GET", &website_host(name), &format!("/{key}")).await;
+        assert_eq!(
+            (at_host.status, at_host.header("location")),
+            (301, Some((*location).to_string())),
+            "case {case:?}: the website host must answer the same redirect, got {} with {:?}",
+            at_host.status,
+            at_host.header("location")
+        );
+
+        // The REST endpoint of the SAME key serves the object's bytes: the redirect is the
+        // website surface's reading of that member, not a property of the object plane.
+        let read = send_bytes(&router, "GET", &format!("/{name}/{key}"), &[], b"").await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected the REST endpoint to serve the object, got {} with {:?}",
+            read.status,
+            text(&read)
+        );
+        assert_eq!(
+            read.body.as_ref(),
+            BEHIND_THE_REDIRECT,
+            "case {case:?}: expected the REST endpoint to serve the stored bytes, got {:?}",
+            text(&read)
+        );
+        assert_eq!(
+            read.header("location"),
+            None,
+            "case {case:?}: the REST endpoint redirects nothing, got {:?}",
+            read.header("location")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_routing_rule_redirects_back_into_the_same_site_at_the_published_address() {
+    let router = router();
+    let name = "published-website-routing";
+    site(&router, name, ROUTING_RULES).await;
+
+    for row in routing_rows() {
+        let answered = published(&router, "GET", name, row.path).await;
+        assert_eq!(
+            answered.status, row.status,
+            "case {:?}: expected HTTP {}, got {} with body {:?}",
+            row.case,
+            row.status,
+            answered.status,
+            text(&answered)
+        );
+        // A rule that names no host redirects WITHIN the site, so the Location is the site's
+        // own base at the address the request reached it by — otherwise the redirect would
+        // lead a client to the endpoint's root, where no site is served at all.
+        let expected = row.location.map(|target| {
+            format!(
+                "http://{EMULATOR_ENDPOINT_HOST}{}{target}",
+                site_path(name)
+            )
+        });
+        assert_eq!(
+            answered.header("location"),
+            expected,
+            "case {:?}: expected the Location {expected:?}, got {:?}",
+            row.case,
+            answered.header("location")
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_published_address_serves_no_website_for_a_bucket_that_has_none() {
+    let router = router();
+    let name = "published-website-unconfigured";
+    bucket(&router, name).await;
+
+    // A bucket with no website configuration serves no website, at this address as at the
+    // bucket's website host.
+    let answered = published(&router, "GET", name, "/").await;
+    assert_eq!(
+        answered.status, 404,
+        "expected 404 for a bucket that was never configured, got {} with {:?}",
+        answered.status,
+        text(&answered)
+    );
+    assert!(
+        text(&answered).contains("NoSuchWebsiteConfiguration"),
+        "expected the code for a bucket with no website configuration, got {:?}",
+        text(&answered)
+    );
+
+    // And a published address naming no bucket at all answers the code for a bucket that does
+    // not exist.
+    let absent = published(&router, "GET", "published-website-absent", "/").await;
+    assert_eq!(
+        absent.status, 404,
+        "expected 404 for a bucket this emulator does not hold, got {} with {:?}",
+        absent.status,
+        text(&absent)
+    );
+    assert!(
+        text(&absent).contains("NoSuchBucket"),
+        "expected the code for a bucket that does not exist, got {:?}",
+        text(&absent)
+    );
+
+    // The REST surface of the same bucket is untouched by any of it: a missing key is still
+    // the object plane's own refusal, under its own code.
+    let missing = send_bytes(&router, "GET", &format!("/{name}/missing.html"), &[], b"").await;
+    assert_eq!(
+        missing.error_code(),
+        "NoSuchKey",
+        "expected the REST endpoint's own refusal, got {:?} in {:?}",
+        missing.error_code(),
+        text(&missing)
+    );
 }

@@ -2138,10 +2138,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the note can never be read as a previous request's.
         chunked_upload::remember(parts);
         // The WEBSITE ENDPOINT is this service's before anything about a credential is read:
-        // such a request is addressed to a bucket's website host ([`website_endpoint`]), which
-        // no other service of this emulator is reached under, and it is ANONYMOUS by design —
-        // so no credential scope names a service for the router to resolve it by.
-        if website_endpoint::addressed_bucket(parts).is_some() {
+        // such a request is addressed to a bucket's website host, or to the website path this
+        // emulator serves the same surface at on its own endpoint ([`website_endpoint`]),
+        // which no other service of this emulator is reached under, and it is ANONYMOUS by
+        // design — so no credential scope names a service for the router to resolve it by.
+        if website_endpoint::addressed_website(parts).is_some() {
             return true;
         }
         // This service signs as `s3` — a signing name it SHARES with S3 Control, whose
@@ -2228,13 +2229,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // worded from that bucket's own configuration, and the seam that words it is handed
         // no request to read it from.
         sigv4::remember(req, first_path_segment(&self.path_style_path(req)));
-        // The WEBSITE ENDPOINT answers the requests addressed to a bucket's website host, and
-        // the model's routing table cannot name it at all: the endpoint is not the REST API, so
-        // the same method and path mean something else there (`GET /` is the bucket's index
+        // The WEBSITE ENDPOINT answers the requests addressed to a bucket's website host and
+        // the ones addressed to the website path this emulator serves the same surface at on
+        // its own endpoint, and the model's routing table can name neither: the endpoint is
+        // not the REST API, so the same method and path mean something else there (`GET /` is
+        // the bucket's index
         // document, not a listing). Resolved FIRST, so nothing of the REST surface — the
         // bucket-name refusal, a session token, a subresource — is applied to a request that
         // never addressed it. See [`website_endpoint`].
-        if website_endpoint::addressed_bucket_of(req).is_some() {
+        if website_endpoint::addressed_website_of(req).is_some() {
             return self.door.get(website_endpoint::WEBSITE_ENDPOINT);
         }
         // A write whose body arrived in the `aws-chunked` transfer encoding without saying how

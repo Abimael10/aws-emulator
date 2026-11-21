@@ -13,12 +13,24 @@
 //! but a read. The REST endpoint is untouched by all of it: a missing key there is still
 //! `NoSuchKey`, whatever routing rules the bucket carries.
 //!
-//! WHICH requests are this surface's is read off the address: the host's first label is the
-//! bucket and the label after it begins with [`WEBSITE_ENDPOINT_LABEL`], which is what tells a
-//! website-endpoint address from the REST endpoint's virtual-hosted one
-//! ([`addressed_bucket`]). A client of this emulator reaches both on one port, so the HOST is
-//! the only thing that can tell them apart — exactly as it is for AWS, where the two endpoints
-//! differ in nothing else.
+//! WHICH requests are this surface's is read off the address ([`addressed_website`]): the
+//! host's first label is the bucket and the label after it begins with
+//! [`WEBSITE_ENDPOINT_LABEL`], which is what tells a website-endpoint address from the REST
+//! endpoint's virtual-hosted one. A client of this emulator reaches both on one port, so the
+//! HOST is the only thing that can tell them apart — exactly as it is for AWS, where the two
+//! endpoints differ in nothing else.
+//!
+//! A website host is a name a client RESOLVES and then dials, and a client configured with
+//! this emulator's one endpoint resolves nothing else — so a bucket's website surface is ALSO
+//! served, on that endpoint, under the reserved data-plane path this workspace addresses such
+//! a plane by ([`website_plane_prefix`], `/_aws/s3-website/<bucket>`): what the host cannot
+//! carry, the path carries, which is the shared reading every local data plane of this
+//! emulator is reached through. Both addresses are the SAME surface — the index and error
+//! documents, the stored redirect, the routing rules and the refusal of a write — and both are
+//! distinct from the REST API, which keeps serving the object's own bytes at `/<bucket>/<key>`.
+//! A redirect this surface builds itself is rooted on the base the request reached the site at
+//! ([`AddressedWebsite::prefix`]), so a redirect served on the local address leads back into
+//! the same site rather than to the endpoint's root.
 //!
 //! The rules this module implements, each from the published behaviour of that endpoint:
 //!
@@ -65,26 +77,13 @@ pub const WEBSITE_ENDPOINT: &str = "@s3-website-endpoint";
 /// so the label is this value, or this value with the Region after a hyphen.
 pub const WEBSITE_ENDPOINT_LABEL: &str = "s3-website";
 
-/// The bucket `parts` addresses on the WEBSITE endpoint, or `None` for a request addressed to
-/// anything else.
+/// The bucket `host` addresses on the website endpoint.
 ///
 /// The first label of the host is the bucket, and the label after it is what says this is the
 /// website endpoint ([`WEBSITE_ENDPOINT_LABEL`]). The name is not resolved against the store
 /// here: a website host naming a bucket this emulator does not hold is still a website-endpoint
 /// request, and is answered as one ([`WebsiteEndpoint::serve`]) rather than left to another
 /// surface.
-pub fn addressed_bucket(parts: &::http::request::Parts) -> Option<String> {
-    addressed_bucket_in_host(super::request_host(parts)?)
-}
-
-/// [`addressed_bucket`] for the runtime-API request the routing seam is handed, which carries
-/// its host the same two ways ([`super::request_host_of`]).
-pub fn addressed_bucket_of(req: &RtRequest) -> Option<String> {
-    addressed_bucket_in_host(super::request_host_of(req)?)
-}
-
-/// The bucket `host` addresses on the website endpoint — the one reading both forms above
-/// share.
 fn addressed_bucket_in_host(host: &str) -> Option<String> {
     // The port is not part of the name, and neither is any userinfo in front of it.
     let host = host.rsplit('@').next().unwrap_or(host);
@@ -106,6 +105,105 @@ fn addressed_bucket_in_host(host: &str) -> Option<String> {
     }
     let bucket = labels[..at].join(".");
     super::names_a_bucket(&bucket).then_some(bucket)
+}
+
+/// The segment that names THIS plane under the reserved data-plane marker, ahead of the
+/// bucket: `/_aws/s3-website/<bucket>`.
+///
+/// It is the website endpoint's own label ([`WEBSITE_ENDPOINT_LABEL`]), so the path names the
+/// same surface the host does and no other plane of this emulator reads a path under it.
+pub const WEBSITE_PLANE_LABEL: &str = WEBSITE_ENDPOINT_LABEL;
+
+/// The path prefix this emulator serves ONE bucket's website surface under on its own
+/// endpoint: the reserved data-plane marker, this plane's label and the bucket
+/// (`/_aws/s3-website/<bucket>`).
+///
+/// One spelling, shared by the address a client dials and the reading that claims such a
+/// request back ([`addressed_website`]), so the address this plane serves and the request it
+/// claims cannot drift apart.
+#[must_use]
+pub fn website_plane_prefix(bucket: &str) -> String {
+    format!(
+        "/{namespace}/{WEBSITE_PLANE_LABEL}/{bucket}",
+        namespace = ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE,
+    )
+}
+
+/// How a request ADDRESSES a bucket's website surface: which bucket, the path WITHIN that
+/// site, and the base that site is served at.
+#[derive(Debug, Clone)]
+pub struct AddressedWebsite<'r> {
+    /// The bucket whose website surface the request addressed.
+    pub bucket: String,
+    /// The path inside that site, as the request spelled it: the whole request path for a
+    /// request addressed to a website HOST, whose root IS the site, and what follows the
+    /// site's prefix for one addressed on this emulator's own endpoint.
+    pub path: &'r str,
+    /// The path prefix the site is served under at the address the request reached it by,
+    /// which a redirect this surface builds has to keep: empty for a website host.
+    pub prefix: String,
+}
+
+/// The website surface `parts` addresses, by either address, or `None` for a request addressed
+/// to anything else.
+#[must_use]
+pub fn addressed_website(parts: &::http::request::Parts) -> Option<AddressedWebsite<'_>> {
+    addressed_website_at(super::request_host(parts), parts.uri.path())
+}
+
+/// [`addressed_website`] for the runtime-API request the routing seam is handed, which carries
+/// its host and its path the same two ways ([`super::request_host_of`],
+/// [`super::wire::request_path`]).
+#[must_use]
+pub fn addressed_website_of(req: &RtRequest) -> Option<AddressedWebsite<'_>> {
+    addressed_website_at(
+        super::request_host_of(req),
+        super::wire::request_path(req.uri()),
+    )
+}
+
+/// The website surface a request addressed, from the host it named and the path it carried —
+/// the one reading both forms above share.
+///
+/// The PATH is read first and on any host, because the marker it carries is explicit: a
+/// request under this plane's prefix addresses the bucket that prefix names whatever host it
+/// reached the emulator at. Everything else is the website HOST reading, whose site is the
+/// whole path.
+fn addressed_website_at<'r>(host: Option<&str>, path: &'r str) -> Option<AddressedWebsite<'r>> {
+    if let Some((bucket, within)) = addressed_site_in_path(path) {
+        return Some(AddressedWebsite {
+            prefix: website_plane_prefix(bucket),
+            bucket: bucket.to_string(),
+            path: within,
+        });
+    }
+    Some(AddressedWebsite {
+        bucket: addressed_bucket_in_host(host?)?,
+        path,
+        prefix: String::new(),
+    })
+}
+
+/// The bucket a request PATH addresses on this emulator's own endpoint, and the path WITHIN
+/// that site — the reading of [`website_plane_prefix`]: the reserved marker, this plane's
+/// label, the bucket, and everything after it (`/` when nothing follows, which addresses the
+/// site's root).
+///
+/// The name is not resolved against the store, exactly as the host reading does not: a path
+/// naming a bucket this emulator does not hold is still a website-endpoint request, and is
+/// answered as one ([`WebsiteEndpoint::serve`]).
+fn addressed_site_in_path(path: &str) -> Option<(&str, &str)> {
+    let first_segment = ::service_common::data_plane_addressing::first_segment;
+    let (namespace, rest) = first_segment(path)?;
+    if namespace != ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (plane, rest) = first_segment(rest)?;
+    if plane != WEBSITE_PLANE_LABEL {
+        return None;
+    }
+    let (bucket, within) = first_segment(rest)?;
+    super::names_a_bucket(bucket).then_some((bucket, within))
 }
 
 /// Whether `label` is the host label that says a request addresses the WEBSITE endpoint.
@@ -167,14 +265,16 @@ impl<Eng: Send + Sync + 'static> WebsiteEndpoint<Eng> {
     /// Serve one website-endpoint request.
     fn serve(&self, ctx: &OperationContext<'_>) -> RtResponse {
         let parts = ctx.parts();
-        let Some(name) = addressed_bucket(parts) else {
-            // Nothing routes here without a website host, so this cannot be reached; a bare
-            // 404 is the honest answer to an address that names no bucket at all.
+        let Some(addressed) = addressed_website(parts) else {
+            // Nothing routes here without one of this surface's two addresses, so this cannot
+            // be reached; a bare 404 is the honest answer to an address that names no bucket
+            // at all.
             return answered(
                 NOT_FOUND_STATUS,
                 error_document(NOT_FOUND_STATUS, crate::state::NO_SUCH_BUCKET_CODE, ""),
             );
         };
+        let name = addressed.bucket.clone();
         let method = parts.method.as_str().to_ascii_uppercase();
         if method != "GET" && method != "HEAD" {
             return answered(
@@ -192,9 +292,9 @@ impl<Eng: Send + Sync + 'static> WebsiteEndpoint<Eng> {
                 error_document(NOT_FOUND_STATUS, crate::state::NO_SUCH_BUCKET_CODE, ""),
             );
         };
-        // The key the request addressed, as the request spelled it: the path with its leading
-        // separator off, decoded the way this service decodes a path label.
-        let requested = super::sigv4::percent_decoded(parts.uri.path().trim_start_matches('/'));
+        // The key the request addressed, as the request spelled it: the path WITHIN the site
+        // with its leading separator off, decoded the way this service decodes a path label.
+        let requested = super::sigv4::percent_decoded(addressed.path.trim_start_matches('/'));
         let host = super::request_host(parts).unwrap_or_default().to_string();
 
         let store = state.lock();
@@ -231,7 +331,7 @@ impl<Eng: Send + Sync + 'static> WebsiteEndpoint<Eng> {
         }
         // A rule conditioned on the KEY alone redirects the request whatever the object plane
         // would have answered, which is what makes a prefix rule a redirect of the ADDRESS.
-        if let Some(redirect) = routed(&website, &requested, None, &host) {
+        if let Some(redirect) = routed(&website, &requested, None, &host, &addressed.prefix) {
             return redirect;
         }
         // The key that is read: a request addressing a directory — the root, or a path ending
@@ -254,7 +354,9 @@ impl<Eng: Send + Sync + 'static> WebsiteEndpoint<Eng> {
                 // A rule conditioned on the error this request earned redirects it instead of
                 // answering it, which is what "if the error code equals this value, then the
                 // specified redirect is applied" says.
-                if let Some(redirect) = routed(&website, &requested, Some(status), &host) {
+                if let Some(redirect) =
+                    routed(&website, &requested, Some(status), &host, &addressed.prefix)
+                {
                     return redirect;
                 }
                 // Else the configured error document is the body of the answer, served with
@@ -337,11 +439,18 @@ fn resolve(
 /// rule naming only `KeyPrefixEquals` applies to the address whatever it would have answered.
 /// Both members of a `Condition` have to hold where a rule names both. The FIRST rule that
 /// applies is the one applied, which is the order the configuration names them in.
+///
+/// `base` is the path prefix the SITE is served under at the address the request reached it by
+/// ([`AddressedWebsite::prefix`]): a rule that names no `HostName` redirects within the same
+/// site, so the redirect keeps that base — empty for a website host, whose root is the site
+/// itself. A rule that DOES name a host addresses another site entirely and keeps nothing of
+/// this one.
 fn routed(
     website: &crate::state::BucketWebsite,
     requested: &str,
     error: Option<u16>,
     host: &str,
+    base: &str,
 ) -> Option<RtResponse> {
     for rule in &website.routing_rules {
         let condition = rule.condition.clone().unwrap_or_default();
@@ -377,13 +486,16 @@ fn routed(
             (None, None) => requested.to_string(),
         };
         let protocol = redirect.protocol.as_deref().unwrap_or(DEFAULT_PROTOCOL);
-        let host = redirect.host_name.as_deref().unwrap_or(host);
+        let (host, base) = match redirect.host_name.as_deref() {
+            Some(named) => (named, ""),
+            None => (host, base),
+        };
         let status = redirect
             .http_redirect_code
             .as_deref()
             .and_then(|code| code.trim().parse::<u16>().ok())
             .unwrap_or(DEFAULT_REDIRECT_STATUS);
-        return Some(redirected(status, &format!("{protocol}://{host}/{key}")));
+        return Some(redirected(status, &format!("{protocol}://{host}{base}/{key}")));
     }
     None
 }

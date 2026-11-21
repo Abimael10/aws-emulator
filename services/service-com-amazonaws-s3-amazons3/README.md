@@ -26,6 +26,23 @@ service-com-amazonaws-s3-amazons3/
     └── ops/              # ONE FILE PER OPERATION
 ```
 
+## The website surface
+
+A bucket configured for static website hosting (`PutBucketWebsite`) is served on a surface
+distinct from the REST API, reachable at two addresses:
+
+- the bucket's own website host — `<bucket>.s3-website-<Region>.amazonaws.com`, or
+  `<bucket>.s3-website.<Region>.amazonaws.com` — for a client that resolves Amazon's names;
+- `<emulator endpoint>/_aws/s3-website/<bucket>/<key>`, for a client configured with this
+  emulator's one endpoint, which resolves no such name. It is the reserved data-plane path
+  this workspace addresses a local plane by (`service_common::data_plane_addressing`).
+
+Both answer the one surface, from the bucket's stored configuration and objects: the index
+document of a directory, the error document of a failed read, HTTP 301 to a stored
+`x-amz-website-redirect-location`, the redirects the routing rules call for, and 405 for
+anything but a read. The REST address `/<bucket>/<key>` is untouched by all of it and keeps
+serving the object's own bytes (`src/service/website_endpoint.rs`).
+
 ## Implementing an operation
 
 Each file in `src/ops/` owns exactly one operation and declares which one
