@@ -779,6 +779,10 @@ pub mod service_principal_calls;
 /// service's resources and so can only ask it for the rotation of a credential it manages.
 pub mod managed_secret_rotations;
 pub mod shared_path;
+/// The ONE reading of the payload hash a SigV4-signed request declares, and of whether that
+/// hash covers the body that arrived — for every data plane whose own front end is handed a
+/// streamed push and has to judge what the signature it carries covers.
+pub mod signed_payload_hash;
 /// How AWS Signer states a refusal of an input member a request supplied nothing for, for
 /// the two service crates that are two views of that one endpoint.
 pub mod signer_input_refusals;

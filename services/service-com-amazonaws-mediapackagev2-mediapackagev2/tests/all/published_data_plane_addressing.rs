@@ -30,7 +30,9 @@ use serde_json::{json, Value};
 // sourced from the model) by `published_data_plane_urls`, so neither suite can drift from
 // the model's container/family pairings on its own.
 use crate::published_data_plane_urls::{manifest_url, EgressRow, EGRESS_ROWS};
-use crate::rejection_rule_and_negative_paths::{encoded, grant_policy, split_url, Answer, Emulator};
+use crate::rejection_rule_and_negative_paths::{
+    encoded, grant_policy, split_url, Answer, Emulator, DECLARED_PAYLOAD_HASH,
+};
 
 /// The Region every request in this suite is signed for: it travels in the SigV4 credential
 /// scope, which is what the service reads its Region from, and is the Region whose
@@ -300,7 +302,14 @@ async fn the_published_address_is_answered_by_this_services_data_plane() {
             unauthenticated.body
         );
         let pushed = emulator
-            .send_raw("PUT", &object, "segment".to_string(), &ingest_host, true, &[])
+            .send_raw(
+                "PUT",
+                &object,
+                "segment".to_string(),
+                &ingest_host,
+                true,
+                &DECLARED_PAYLOAD_HASH,
+            )
             .await;
         assert_eq!(
             pushed.status, 200,

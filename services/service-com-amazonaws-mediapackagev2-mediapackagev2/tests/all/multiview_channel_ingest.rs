@@ -25,7 +25,9 @@
 
 use serde_json::{json, Value};
 
-use crate::rejection_rule_and_negative_paths::{split_url, Answer, Emulator};
+use crate::rejection_rule_and_negative_paths::{
+    split_url, Answer, Emulator, DECLARED_PAYLOAD_HASH,
+};
 
 /// The channel group every row hangs under. Nothing in either rule depends on it.
 const GROUP: &str = "mv-ingest";
@@ -234,7 +236,7 @@ async fn push(emulator: &Emulator, method: &str, path: &str, host: &str) -> Answ
             Some(json!({"segment": "bytes"})),
             host,
             true,
-            &[],
+            &DECLARED_PAYLOAD_HASH,
         )
         .await
 }

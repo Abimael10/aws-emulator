@@ -36,7 +36,9 @@ use service_com_amazonaws_mediapackagev2_mediapackagev2::state::{
     MAX_INGESTED_BYTES, MAX_INGESTED_OBJECTS_PER_CHANNEL, MAX_INGESTED_OBJECT_BYTES,
 };
 
-use crate::rejection_rule_and_negative_paths::{split_url, Answer, Emulator};
+use crate::rejection_rule_and_negative_paths::{
+    split_url, Answer, Emulator, DECLARED_PAYLOAD_HASH,
+};
 
 /// The channel group every channel in this suite hangs under. No part of the rule depends
 /// on it.
@@ -146,7 +148,7 @@ async fn push(
             "x".repeat(bytes),
             host,
             true,
-            &[],
+            &DECLARED_PAYLOAD_HASH,
         )
         .await
 }

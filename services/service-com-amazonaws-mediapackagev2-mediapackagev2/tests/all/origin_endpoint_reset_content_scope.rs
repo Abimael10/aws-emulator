@@ -27,7 +27,9 @@
 use serde_json::{json, Value};
 
 use crate::published_data_plane_urls::{manifest_url, sibling_object};
-use crate::rejection_rule_and_negative_paths::{grant_policy, split_url, Answer, Emulator};
+use crate::rejection_rule_and_negative_paths::{
+    grant_policy, split_url, Answer, Emulator, DECLARED_PAYLOAD_HASH,
+};
 
 /// The methods the ingest data plane serves: a contributing encoder writes a segment with
 /// either of them.
@@ -231,7 +233,7 @@ async fn push(emulator: &Emulator, host: &str, path: &str, method: &str) -> Answ
             Some(json!({"segment": "bytes"})),
             host,
             true,
-            &[],
+            &DECLARED_PAYLOAD_HASH,
         )
         .await
 }

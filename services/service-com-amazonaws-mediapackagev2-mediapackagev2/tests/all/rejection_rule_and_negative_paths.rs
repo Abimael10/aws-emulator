@@ -26,9 +26,11 @@
 //!    an anonymous egress fetch is 403 until the endpoint's resource policy grants
 //!    `mediapackagev2:GetObject` to `*` and 404 once it does, and an ingest push with no
 //!    credential is 403. This suite runs with request authentication OFF, where the
-//!    emulator verifies no signature anywhere, so a push that merely PRESENTS a credential
-//!    is served; `data_plane_credentials.rs` covers what verification does with one when
-//!    authentication is on.
+//!    emulator verifies no signature anywhere, so a push that presents a credential and
+//!    declares the payload hash that credential's signature covers is served;
+//!    `published_data_plane_urls.rs` covers what the plane does with a push whose signature
+//!    covers no payload it can be held to, and `data_plane_credentials.rs` covers what
+//!    verification does with a credential when authentication is on.
 
 use std::sync::{Arc, Barrier};
 
@@ -70,6 +72,20 @@ const CHANNEL_GROUP_IN_USE: &str = "The channel group you tried to delete has ch
 const CHANNEL_IN_USE: &str = "The channel you tried to delete has origin endpoints attached \
      to it. If you want to delete this channel, you must first delete the origin endpoints \
      attached to it";
+
+/// The extra headers one credentialed ingest push carries: the payload hash its SigV4
+/// signature covers, declared as the unsigned-payload marker — what a contribution encoder
+/// streaming its segments signs, and what the ingest data plane holds a push to
+/// (`service_common::signed_payload_hash`).
+///
+/// `pub(crate)` because it is the ONE such declaration this crate's suites push with:
+/// every suite that pushes to a published ingest URL passes this rather than writing the
+/// header's name again, and `published_data_plane_urls` varies the value row by row through
+/// the same shared reading.
+pub(crate) const DECLARED_PAYLOAD_HASH: [(&str, &str); 1] = [(
+    ::service_common::signed_payload_hash::CONTENT_SHA256_HEADER,
+    "UNSIGNED-PAYLOAD",
+)];
 
 /// A MediaPackageV2 emulator plus a tiny restJson1 client for it.
 ///
@@ -1632,7 +1648,7 @@ async fn the_ingest_store_is_bounded_per_object_per_channel_and_overall() {
                     "x".repeat(bytes),
                     &host,
                     true,
-                    &[],
+                    &DECLARED_PAYLOAD_HASH,
                 )
                 .await
         }
@@ -1775,7 +1791,7 @@ async fn the_published_data_plane_urls_are_served_and_gated_by_the_endpoint_poli
             Some(json!({"segment": "bytes"})),
             &ingest_host,
             true,
-            &[],
+            &DECLARED_PAYLOAD_HASH,
         )
         .await;
     assert_eq!(

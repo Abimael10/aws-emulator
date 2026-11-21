@@ -25,10 +25,26 @@
 //! The client, the policy writer and the URL splitter are the ones
 //! `rejection_rule_and_negative_paths` already owns, reached through `pub(crate)`, so there
 //! is no second copy of them here.
+//!
+//! The second rule here is about the push that DOES carry a credential. A contribution
+//! encoder streams its segments, so the payload hash its SigV4 signature covers is the one
+//! the request declares in `x-amz-content-sha256` rather than one the ingest front end
+//! computes for it: a push that declares none, or declares a digest that is not the digest
+//! of the body that arrived, carries a signature that cannot be held to the request as
+//! presented and is refused `403` in the SIGNATURE class — a different answer from the
+//! access-denied `403` a push presenting no credential gets. Its rows differ along the
+//! declaration (absent, each marker SigV4 defines, the body's own digest, a digest of other
+//! bytes, a value that is neither) crossed with the write methods, and the egress half is
+//! swept too, since a fetch carries no payload to declare a hash of and so is gated by the
+//! resource policy alone.
 
 use serde_json::{json, Value};
 
 use crate::rejection_rule_and_negative_paths::{grant_policy, split_url, Emulator};
+// The header a push declares the payload hash its signature covers in, and the digest a
+// caller that hashed its payload declares: both from the tree's one home for them
+// (`service_common::signed_payload_hash`), so neither is written a second time here.
+use ::service_common::signed_payload_hash::{payload_digest, CONTENT_SHA256_HEADER};
 
 /// The channel group every fixture hangs under. Nothing in the rule depends on it.
 const GROUP: &str = "pub-group";
@@ -342,4 +358,249 @@ async fn every_published_ingest_url_refuses_an_unauthenticated_push() {
             }
         }
     }
+}
+
+/// The bytes every row of the declaration table pushes. Short, because what those rows
+/// differ along is the DECLARATION about these bytes and not their size, which
+/// `rejection_rule_and_negative_paths` owns.
+const PUSHED_BODY: &str = "one CMAF segment";
+
+/// One row of the declaration table: what a push says its signature covers, and whether the
+/// plane can hold that signature to the request as presented.
+struct Declaration {
+    label: &'static str,
+    /// The value of [`CONTENT_SHA256_HEADER`], or `None` for a push that declares nothing at
+    /// all — what a caller signing with a generic SigV4 signer sends.
+    declared: Option<String>,
+    /// Whether the push is served (`true`) or refused in the signature class (`false`).
+    covers_the_request: bool,
+}
+
+/// Every declaration a push can carry about [`PUSHED_BODY`].
+///
+/// The two markers are SigV4's own, the ones a streaming caller sends: `UNSIGNED-PAYLOAD`
+/// for a payload the signature leaves out, and `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` for one
+/// signed chunk by chunk. The whole marker set is pinned where it is read
+/// (`service_common::signed_payload_hash`).
+fn declarations() -> Vec<Declaration> {
+    let digest = payload_digest(PUSHED_BODY.as_bytes());
+    // One character of that digest altered: still a digest, and not this body's.
+    let altered = match digest.strip_prefix('a') {
+        Some(rest) => format!("b{rest}"),
+        None => format!("a{}", &digest[1..]),
+    };
+    vec![
+        Declaration {
+            label: "no declaration at all",
+            declared: None,
+            covers_the_request: false,
+        },
+        Declaration {
+            label: "an empty declaration",
+            declared: Some(String::new()),
+            covers_the_request: false,
+        },
+        Declaration {
+            label: "the unsigned-payload marker",
+            declared: Some("UNSIGNED-PAYLOAD".to_string()),
+            covers_the_request: true,
+        },
+        Declaration {
+            label: "the streaming-payload marker",
+            declared: Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string()),
+            covers_the_request: true,
+        },
+        Declaration {
+            label: "the digest of the body pushed",
+            declared: Some(digest),
+            covers_the_request: true,
+        },
+        Declaration {
+            label: "that digest with one character altered",
+            declared: Some(altered),
+            covers_the_request: false,
+        },
+        Declaration {
+            label: "the digest of other bytes",
+            declared: Some(payload_digest(b"")),
+            covers_the_request: false,
+        },
+        Declaration {
+            label: "a value that is neither a marker nor a digest",
+            declared: Some("sha256".to_string()),
+            covers_the_request: false,
+        },
+        Declaration {
+            // Shaped like a marker and not one of the finite set SigV4 defines, so it
+            // declares nothing rather than covering everything.
+            label: "a hyphenated word that is not one of the markers",
+            declared: Some("STREAMING-SOMETHING-ELSE".to_string()),
+            covers_the_request: false,
+        },
+    ]
+}
+
+/// A credentialed push is served only while the payload hash it declares is one the plane
+/// can hold its signature to; every other declaration earns the signature refusal, which is
+/// `403` with a body that names the signature and is NOT the body a push presenting no
+/// credential gets.
+#[tokio::test]
+async fn a_credentialed_push_is_held_to_the_payload_hash_its_signature_covers() {
+    let emulator = Emulator::new();
+    let group = emulator.create_group(GROUP, json!({})).await;
+    assert_eq!(
+        group.status, 200,
+        "the channel group must be created, got {} with body {}",
+        group.status, group.body
+    );
+    let (channel, input_type) = INGEST_CHANNELS[0];
+    let created = emulator
+        .create_channel(GROUP, channel, json!({"InputType": input_type}))
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the channel must be created, got {} with body {}",
+        created.status, created.body
+    );
+    let url = created
+        .json
+        .get("IngestEndpoints")
+        .and_then(Value::as_array)
+        .and_then(|endpoints| endpoints.first())
+        .and_then(|endpoint| endpoint.get("Url"))
+        .and_then(Value::as_str)
+        .expect("a channel publishes ingest URLs")
+        .to_string();
+    let (host, path) = split_url(&url);
+
+    // The answer a push presenting NO credential gets, which every refusal below has to be
+    // distinguishable from: the service's own access-denied body.
+    let unauthenticated = emulator
+        .send_raw(
+            "PUT",
+            &format!("{path}/unauthenticated.mp4"),
+            PUSHED_BODY.to_string(),
+            &host,
+            false,
+            &[],
+        )
+        .await;
+    assert_eq!(
+        unauthenticated.status, 403,
+        "case \"no credential at all\": expected HTTP 403, got {} with body {}",
+        unauthenticated.status, unauthenticated.body
+    );
+
+    for (index, declaration) in declarations().iter().enumerate() {
+        for method in INGEST_METHODS {
+            let case = format!("{} / {method}", declaration.label);
+            let headers: Vec<(&str, &str)> = declaration
+                .declared
+                .iter()
+                .map(|value| (CONTENT_SHA256_HEADER, value.as_str()))
+                .collect();
+            let answer = emulator
+                .send_raw(
+                    method,
+                    &format!("{path}/{index}-{method}.mp4"),
+                    PUSHED_BODY.to_string(),
+                    &host,
+                    true,
+                    &headers,
+                )
+                .await;
+            if declaration.covers_the_request {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: a push whose signature covers the body that arrived must be \
+                     served, got {} with body {}",
+                    answer.status, answer.body
+                );
+                continue;
+            }
+            assert_eq!(
+                answer.status, 403,
+                "case {case:?}: a push whose signature covers no payload this plane can hold it \
+                 to must be refused HTTP 403, got {} with body {}",
+                answer.status, answer.body
+            );
+            assert!(
+                answer.body.to_lowercase().contains("signature"),
+                "case {case:?}: the refusal must name the signature it would not accept, got {}",
+                answer.body
+            );
+            assert_ne!(
+                answer.body, unauthenticated.body,
+                "case {case:?}: the signature refusal must not answer the same body as a push \
+                 that presented no credential at all, got {}",
+                answer.body
+            );
+        }
+    }
+}
+
+/// The egress half is NOT held to a payload hash: a fetch carries no payload to declare one
+/// of, so a credentialed fetch declaring nothing is answered by the endpoint's resource
+/// policy exactly as an anonymous one is — refused with the access-denied body before the
+/// grant, and taken to the object lookup (`404`, nothing packaged) after it.
+#[tokio::test]
+async fn a_credentialed_egress_fetch_is_gated_by_the_policy_rather_than_by_a_payload_hash() {
+    let emulator = Emulator::new();
+    let egress_domain = egress_fixtures(&emulator).await;
+    let row = &EGRESS_ROWS[0];
+    let mut body = json!({"ContainerType": row.container});
+    body[row.family] = json!([{"ManifestName": row.manifest}]);
+    let created = emulator
+        .create_endpoint(GROUP, EGRESS_CHANNEL, row.endpoint, body)
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the origin endpoint must be created, got {} with body {}",
+        created.status, created.body
+    );
+    let url = manifest_url(&created.json, row.family);
+    let (host, path) = split_url(&url);
+    assert_eq!(
+        host, egress_domain,
+        "the manifest must be published on the group's egress domain, got {url}"
+    );
+
+    let anonymous = emulator.send("GET", &path, None, &host, false, &[]).await;
+    let credentialed = emulator.send("GET", &path, None, &host, true, &[]).await;
+    assert_eq!(
+        (credentialed.status, credentialed.body.as_str()),
+        (anonymous.status, anonymous.body.as_str()),
+        "case \"before any grant\": a credentialed fetch declaring no payload hash must be \
+         answered by the policy exactly as an anonymous one is, got {} with body {}",
+        credentialed.status,
+        credentialed.body
+    );
+    assert!(
+        credentialed.body.to_lowercase().contains("access denied"),
+        "case \"before any grant\": the refusal must say access denied, got {}",
+        credentialed.body
+    );
+
+    let granted = emulator
+        .call(
+            "POST",
+            &format!(
+                "/channelGroup/{GROUP}/channel/{EGRESS_CHANNEL}/originEndpoint/{}/policy",
+                row.endpoint
+            ),
+            Some(json!({"Policy": grant_policy("mediapackagev2:GetObject")})),
+        )
+        .await;
+    assert_eq!(
+        granted.status, 200,
+        "the grant must be stored, got {} with body {}",
+        granted.status, granted.body
+    );
+    let credentialed = emulator.send("GET", &path, None, &host, true, &[]).await;
+    assert_eq!(
+        credentialed.status, 404,
+        "case \"once the policy grants GetObject\": an authorized fetch with nothing packaged \
+         expected HTTP 404, got {} with body {}",
+        credentialed.status, credentialed.body
+    );
 }

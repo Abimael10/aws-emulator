@@ -93,13 +93,18 @@
 //!   identity policy is not one it can honour.
 //! - INGEST (`PUT`/`POST /in/v1/<group>/<index>/<channel>/<object>`) requires a SigV4
 //!   credential: MediaPackage returns no credential for ingest, so an unauthenticated push
-//!   is `403` with an access-denied body. Whether a credential that IS present carries a
-//!   valid signature is the emulator's own business — the emulator verifies every request
-//!   signature and a service never checks signatures itself — so this handler does not
-//!   re-verify it; the credentialed push is routed as an operation instead
-//!   ([`CredentialedDataPlane`]) so the router's authenticator judges that signature
-//!   first, and a push that reaches this handler is one the emulator accepted. It is then
-//!   recorded against the channel, within the three
+//!   is `403` with an access-denied body. Whether the SIGNATURE over a credential that IS
+//!   present is the right one is the emulator's own business — the emulator verifies every
+//!   request signature with the caller's secret and a service never holds one — so the
+//!   credentialed push is routed as an operation ([`CredentialedDataPlane`]) and the
+//!   router's authenticator judges that signature first. What this plane judges is what the
+//!   signature COVERS: a contribution encoder streams its segments, so the payload hash its
+//!   signature covers is the one the push declares in `x-amz-content-sha256`, and a push
+//!   that declares none — or declares a digest that is not the digest of the body that
+//!   arrived — carries a signature that cannot be held to the request as presented and is
+//!   refused `403` in the signature class ([`declared_payload_hash`]), a DIFFERENT answer
+//!   from the access-denied `403` a push presenting no credential gets. A push that gets
+//!   past both is then recorded against the channel, within the three
 //!   bounds the store declares: the per-object size, the per-channel object count, and the
 //!   store-wide retained bytes (`state::MAX_INGESTED_BYTES`), since the channel count is
 //!   itself caller-driven. What a channel retains is released by resetting the channel,
@@ -762,7 +767,9 @@ fn serve_egress<Eng: Send + Sync + 'static>(
 /// refused `403` here — it carries no signature for the emulator to judge, and the router
 /// hands this seam the request before it authenticates anything. A push that DOES carry a
 /// SigV4 credential reaches this function only through [`CredentialedDataPlane`], i.e.
-/// only once the emulator's authenticator accepted that credential, and is recorded
+/// only once the emulator's authenticator accepted that credential, and is held to the
+/// payload hash its signature covers ([`declared_payload_hash`]) before anything is
+/// resolved or stored. It is then recorded
 /// against the channel, bounded by [`crate::state::MAX_INGESTED_OBJECTS_PER_CHANNEL`] and
 /// [`crate::state::MAX_INGESTED_OBJECT_BYTES`]. A path under a channel that publishes no
 /// ingest endpoint is not a path this service published, so it resolves to nothing (`404`)
@@ -782,6 +789,13 @@ fn serve_ingest<Eng: Send + Sync + 'static>(
     if !carries_sigv4_credential(req) {
         return error_response(403, "AccessDenied", ACCESS_DENIED_MESSAGE);
     }
+    // The push presents a credential, so WHAT its signature covers is read before anything
+    // is resolved or stored — authentication precedes the lookup, as it does for the push
+    // that presents nothing. A push that declares no payload hash at all has nothing for
+    // the signature to be held to, and is refused here.
+    let Some(declared) = declared_payload_hash(req) else {
+        return signature_not_verified();
+    };
     let Some(target) = crate::state::parse_ingest_path(&addressed.path) else {
         return error_response(
             404,
@@ -805,6 +819,12 @@ fn serve_ingest<Eng: Send + Sync + 'static>(
         );
     }
     let region = addressed.region.as_str();
+    // And the body is the payload the declaration above named, or it is not the request
+    // that was signed. Judged here, past the per-object bound, so a push can never make
+    // this plane hash more bytes than it would have retained.
+    if !declared.covers(body) {
+        return signature_not_verified();
+    }
     let mut store = state.lock();
     // Both store bounds are judged under this one hold of the lock, so two concurrent
     // pushes cannot both see room that only one of them has.
@@ -880,6 +900,48 @@ fn egress_action(method: &str) -> &'static str {
         "HEAD" => EGRESS_HEAD_ACTION,
         _ => EGRESS_GET_ACTION,
     }
+}
+
+/// The code this plane refuses a push whose signature it cannot hold to the request with:
+/// the SigV4 front end's own class, which is what a mis-signing encoder's credential-refresh
+/// and re-signing path branches on. No mediapackagev2 shape is declared for it (the model
+/// describes no push protocol), so it is stated in this plane's own error envelope, with the
+/// tree's one sentence for that class
+/// (`service_common::authentication_refusal::SIGNATURE_MISMATCH_MESSAGE`).
+const INVALID_SIGNATURE_CODE: &str = "InvalidSignatureException";
+
+/// What a push says its SigV4 signature covers, or `None` when it says nothing a signature
+/// could be held to.
+///
+/// A contribution encoder STREAMS its segments, so the payload hash its signature covers is
+/// the one the request declares in `x-amz-content-sha256` rather than one the ingest front
+/// end computes for it — the same value the emulator's own verifier signs as written. Read
+/// through the tree's one reading of that declaration
+/// (`service_common::signed_payload_hash`), shared with every other ingest plane, so this
+/// one writes no second rule for it. The SIGNATURE itself is still the emulator's own check,
+/// made with a secret no service holds: what this plane can judge is therefore the
+/// declaration, and a push that declares nothing is answered in the signature class because
+/// nothing about its signature can be held to the request it arrived with — this plane's
+/// stand-in for the unverifiable-signature class, not a hash it recomputed.
+///
+/// The egress half is not held to this: a fetch carries no payload to declare a hash of.
+fn declared_payload_hash(
+    req: &RtRequest,
+) -> Option<::service_common::signed_payload_hash::DeclaredPayloadHash> {
+    ::service_common::signed_payload_hash::DeclaredPayloadHash::of(
+        req.headers()
+            .get(::service_common::signed_payload_hash::CONTENT_SHA256_HEADER),
+    )
+}
+
+/// The refusal of a push whose signature covers no payload this plane can hold it to: the
+/// signature class, at the status AWS refuses one with, carrying nothing from the request.
+fn signature_not_verified() -> RtResponse {
+    error_response(
+        403,
+        INVALID_SIGNATURE_CODE,
+        ::service_common::authentication_refusal::SIGNATURE_MISMATCH_MESSAGE,
+    )
 }
 
 /// Whether the request presents a SigV4 credential at all — in the `Authorization`

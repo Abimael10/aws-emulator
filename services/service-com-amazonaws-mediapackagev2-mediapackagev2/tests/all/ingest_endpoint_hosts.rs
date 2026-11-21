@@ -27,7 +27,9 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::rejection_rule_and_negative_paths::{split_url, Answer, Emulator};
+use crate::rejection_rule_and_negative_paths::{
+    split_url, Answer, Emulator, DECLARED_PAYLOAD_HASH,
+};
 
 /// The channel groups the rows hang under: a host is derived from the group as well as the
 /// channel, so the same channel name in two groups is two hosts.
@@ -123,7 +125,7 @@ async fn push(emulator: &Emulator, url: &str) -> Answer {
             Some(json!({"segment": "bytes"})),
             &host,
             true,
-            &[],
+            &DECLARED_PAYLOAD_HASH,
         )
         .await
 }

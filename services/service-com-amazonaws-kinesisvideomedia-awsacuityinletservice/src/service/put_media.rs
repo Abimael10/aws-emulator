@@ -90,13 +90,14 @@ const STREAM_ARN_HEADER: &str = "x-amzn-stream-arn";
 /// The header saying how the container's Cluster timecodes are to be read.
 const TIMECODE_TYPE_HEADER: &str = "x-amzn-fragment-timecode-type";
 
-/// The header a producer declares the payload hash its SigV4 signature covers in.
+/// The header a producer declares the payload hash its SigV4 signature covers in, named by
+/// the tree's one home for it (`service_common::signed_payload_hash`).
 ///
 /// The ingest front end is handed a stream rather than a body — a producer sends its
 /// container as it captures it — so there is no payload for it to hash: what the
 /// signature covers has to be the marker the producer declared here, which is why a
 /// request that declares nothing cannot be verified at all.
-const CONTENT_SHA256_HEADER: &str = "x-amz-content-sha256";
+const CONTENT_SHA256_HEADER: &str = ::service_common::signed_payload_hash::CONTENT_SHA256_HEADER;
 
 /// The header carrying the producer's clock at the start of the session, in epoch
 /// seconds — what a RELATIVE Cluster timecode is relative to.
@@ -669,12 +670,15 @@ fn stream_not_found(_session: &SubmittedSession) -> Refusal {
 /// verify the signature over, so the signature cannot be held to cover the request as
 /// presented — the failure a mis-signing producer meets, and what its re-signing path
 /// branches on.
+///
+/// WHAT a request declares is read by the tree's one reading of that header
+/// (`service_common::signed_payload_hash`), shared with every other ingest plane that has
+/// to judge what the signature it was handed covers, so a value that names neither a marker
+/// nor a digest is read as the non-declaration it is in one place rather than two.
 fn undeclared_payload_hash(req: &RtRequest) -> Option<Refusal> {
-    let declared = req
-        .headers()
-        .get(CONTENT_SHA256_HEADER)
-        .map(str::trim)
-        .filter(|declared| !declared.is_empty());
+    let declared = ::service_common::signed_payload_hash::DeclaredPayloadHash::of(
+        req.headers().get(CONTENT_SHA256_HEADER),
+    );
     declared.is_none().then(|| Refusal {
         status: 403,
         code: INVALID_SIGNATURE,
