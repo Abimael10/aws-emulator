@@ -3,6 +3,50 @@ Issue-Commit: a2c0c19d1874b6d8f510c899cc1a51333f7d4b07
 
 # DynamoDB data-plane limits are unenforced or wrongly worded: size/nesting, the N and set domains, Query/Scan request defects, PartiQL semantics, vector metering and batch shape (8 causes)
 
+## Resolution
+
+All eight causes are satisfied by the current tree: every refusal this issue reports as
+missing fires, and every message it reports as invented is the wording the recorded
+behaviour quoted in the landed issues below states. The emulator has drifted far from the
+commit this issue was filed against (`a2c0c19d`) — each cause was closed by a later issue
+that carried the same replay keys and the recording to derive the wording from:
+
+- cause 1 (item/key/nesting ceilings, the 4 MB transaction aggregate) —
+  `20261103T065250Z-dynamodb-expression-engine-10-root-causes-in-expression.md` cause 7,
+  `20261116T115301Z-dynamodb-validation-gaps-7-net-new-causes-batchgetitem.md`;
+- cause 2 (the `N` domain) —
+  `20261103T065250Z-dynamodb-partiql-and-legacy-parameter-surface-10-root.md` cause 9 and
+  `20261105T114920Z-dynamodb-10-net-new-key-attribute-value-validation.md` cause 7;
+- cause 3 (set members) — the same two issues' set causes;
+- cause 4 (Query/Scan/DescribeTable/RestoreTable request defects, the absorbed batch) —
+  `20261103T065250Z-dynamodb-legal-projection-reads-answered-501-notimplemented-validation.md`
+  cause 9, `20261103T065250Z-dynamodb-expression-engine-10-root-causes-in-expression.md`
+  cause 6 and
+  `20261103T065250Z-dynamodb-key-validation-messages-batch-request-shape-messages.md`
+  causes 4 and 5;
+- causes 5 and 6 (PartiQL semantics, index projection and operand types) —
+  `20261103T065250Z-dynamodb-partiql-and-legacy-parameter-surface-10-root.md` causes 2
+  and 7, and
+  `20261103T065250Z-dynamodb-key-validation-messages-batch-request-shape-messages.md`
+  cause 3;
+- cause 7 (vector validation and metering) —
+  `20261108T051530Z-dynamodb-8-net-new-createtable-putitem-validation-causes.md` and
+  `20261109T021218Z-dynamodb-3-net-new-vector-index-causes-createtable.md`;
+- cause 8 (the batched write's request shape) —
+  `20261103T065250Z-dynamodb-key-validation-messages-batch-request-shape-messages.md`
+  cause 2: the member path is the lowerCamel `requestItems` the validator builds, and the
+  over-25 clause quotes the submitted map in the object rendering the recording carries.
+
+Two accounts in this issue are NOT followed, because the recorded behaviour quoted in
+those landed issues disagrees with them: the partition-key sentence's missing space before
+`2048` is DynamoDB's own, and a projected document path is reported from its last named
+step on (`m.b` reports `b`, `l[1]` reports `l[1]`), which is the rendering this issue's own
+evidence line shows the recording expecting.
+
+`tests/all/data_plane_domain_ceilings.rs` pins all eight over the wire, each as a table of
+inputs spanning its class with the published bound driven beside every refusal. This issue
+carries no corpus, so replay cannot verify it and that suite is the evidence.
+
 > _Note: this issue was identified against the code base at commit `a2c0c19d1874b6d8f510c899cc1a51333f7d4b07`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
