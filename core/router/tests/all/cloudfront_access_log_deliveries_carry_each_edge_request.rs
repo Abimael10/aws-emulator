@@ -131,7 +131,11 @@ pub(crate) struct Wired {
 /// created over it.
 pub(crate) struct Pipeline {
     pub(crate) setup: MultiServiceRouter,
-    viewers: MultiServiceRouter,
+    /// The router VIEWER requests are dispatched through: request authentication on, so a
+    /// request carrying no credential is served only where the edge is reachable without one.
+    /// `pub(crate)` so a sibling suite over the same wired pipeline reaches the edge the same
+    /// way rather than standing one up again.
+    pub(crate) viewers: MultiServiceRouter,
     pub(crate) domain: String,
     pub(crate) deliveries: Vec<Wired>,
 }
