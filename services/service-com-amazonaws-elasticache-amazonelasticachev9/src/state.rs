@@ -5,12 +5,12 @@
 //! The transient statuses this service reports — a cluster `creating`, a snapshot
 //! `copying`, a group `modifying` — are held for a span the EMULATOR chooses, not
 //! one AWS documents: [`CLUSTER_TRANSITION`] and its siblings compress what
-//! ElastiCache takes minutes over into the span of the CALL that starts the work,
-//! so the answer that call writes carries the transient status and the next
-//! request reads the resource settled. No call waits for such a span: the due
-//! instant is stored on the record and whichever later call reads it materialises
-//! what the clock owed. The span is this emulator's deliberate choice, stated
-//! here beside the durations it does take from AWS — a maintenance
+//! ElastiCache takes minutes over into a few seconds, long enough that a caller
+//! acting straight after the starting call still meets the resource in its
+//! transient phase and the state gates that phase carries. No call waits for such
+//! a span: the due instant is stored on the record and whichever later call reads
+//! it materialises what the clock owed. The span is this emulator's deliberate
+//! choice, stated here beside the durations it does take from AWS — a maintenance
 //! window's minimum, a snapshot's retention, a reservation's term — which are
 //! kept as the service publishes them.
 //!
@@ -444,34 +444,34 @@ pub fn maintenance_window_refusal(value: &str) -> Option<String> {
 /// `rebooting cluster nodes` after a reboot) before the clock owes it
 /// `available`.
 ///
-/// The span is that CALL, and nothing beyond it. ElastiCache takes minutes, and
-/// a client written against it polls a lifecycle status on an interval sized for
-/// minutes (tens of seconds); every poll answered with the transient status
-/// therefore costs that client its whole interval, so a span a client's FIRST
-/// poll lands inside makes each wait cost an interval and a flow that chains
-/// several waits never converge. This span is shorter than the gap between two
-/// requests: the answer the starting call writes is computed inside it, and the
-/// clock owes the settled status from the instant that call sampled, so the
-/// first read that FOLLOWS the call reads the resource settled.
+/// The span has to OUTLAST the call that follows the one that started the work.
+/// A client that creates a cluster and acts on it straight away — a delete, a
+/// reboot, a modify, a second create under the same id — is the case every
+/// lifecycle state gate of this service exists for, and a span shorter than one
+/// request round trip makes every one of those gates unreachable: the record is
+/// already settled by the time the next request arrives, so the refusal AWS
+/// serves for a resource that is still being worked on can never be observed.
+/// A few seconds is therefore the floor, and the spans ElastiCache really takes
+/// (minutes) are compressed to it so a client that waits for a resource to
+/// settle converges in one or two polls rather than in minutes.
 ///
-/// It is deliberately NOT zero. A handler samples one instant and uses it for
-/// the whole call, so inside the call that schedules the transition the record
-/// still carries the transient status — which is what that call answers with,
-/// and what the status the response reports is taken from. The due instant is
-/// stored on the record and materialised by whichever later call reads it;
-/// nothing of this service sleeps for a transition it has scheduled, and a
-/// record whose due instant has been moved out (a test holding a resource in its
-/// transient phase) is still reported, and still gated, as the status it carries.
-pub const CLUSTER_TRANSITION: Duration = Duration::from_nanos(1);
+/// A handler samples one instant and uses it for the whole call, so inside the
+/// call that schedules the transition the record still carries the transient
+/// status — which is what that call answers with. The due instant is stored on
+/// the record and materialised by whichever later call reads it; nothing of this
+/// service sleeps for a transition it has scheduled, and a record whose due
+/// instant has been moved out (a test holding a resource in its transient phase)
+/// is still reported, and still gated, as the status it carries.
+pub const CLUSTER_TRANSITION: Duration = Duration::from_secs(3);
 
 /// How long a snapshot stays in the status the call that started the work
 /// returned — `creating` after a create or a copy before the clock owes it
 /// `available`, and `deleting` after a delete before the clock owes its removal.
 ///
-/// The same span, for the same reason, as [`CLUSTER_TRANSITION`]: a client
-/// waiting for a snapshot to become available, or for a deleted one to go away,
-/// polls on an AWS-sized interval, and a snapshot the emulator has already taken
-/// is reported settled to the first read that follows the call that took it.
+/// The same span, for the same reason, as [`CLUSTER_TRANSITION`]: a client that
+/// takes a snapshot and acts on it — or on the cluster it was taken of — straight
+/// away reads it still in its transient status, so the refusals that phase carries
+/// are reachable, and a client waiting for it to settle converges in a poll or two.
 pub const SNAPSHOT_TRANSITION: Duration = CLUSTER_TRANSITION;
 
 /// How many clusters, and how many subnet groups, the store holds before a
@@ -2674,11 +2674,11 @@ pub const USER_STATUS_DELETING: &str = "deleting";
 /// How long a user stays `deleting` before the clock owes its removal from the
 /// store.
 ///
-/// The same span, for the same reason, as [`CLUSTER_TRANSITION`]: it is the CALL
-/// that asked for the removal, so `DeleteUser` answers with the transient
-/// `deleting` status and the read that follows it finds the user gone. The due
-/// instant is stored on the record and materialised by whichever later call reads
-/// it.
+/// The same span, for the same reason, as [`CLUSTER_TRANSITION`]: `DeleteUser`
+/// answers with the transient `deleting` status and a caller acting straight
+/// after it still reads the user in that status, so the refusals that phase
+/// carries are reachable. The due instant is stored on the record and
+/// materialised by whichever later call reads it.
 pub const USER_DELETION_TRANSITION: Duration = CLUSTER_TRANSITION;
 
 /// How many passwords one user may hold, as `CreateUser$Passwords` documents it:

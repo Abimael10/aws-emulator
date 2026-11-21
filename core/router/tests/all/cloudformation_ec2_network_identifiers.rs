@@ -40,10 +40,75 @@ use smithy_server_runtime::MultiServiceRouter;
 // (`tests/all/query_wire.rs`): "Nothing new should write another one — call this module."
 use super::query_wire::{elements, form_encode, opt_element};
 
-/// Long enough for the stack's own clock-owed span and for Route 53 Resolver's provisioning
-/// span to come due, so the stack reports its outputs and the association reports the
-/// status the clock owed it.
-const PAST_PROVISIONING_SPANS: Duration = Duration::from_millis(900);
+/// Look again until the stack's DELETE has CONCLUDED: a stack whose delete has gone through
+/// is no longer described under its name, and one still deleting reports a status ending in
+/// `_IN_PROGRESS`.
+async fn delete_concluded(
+    router: &MultiServiceRouter,
+    region: &str,
+    stack_name: &str,
+    case: &str,
+) {
+    /// How long one read waits before the next, and how many times it reads.
+    const INTERVAL: Duration = Duration::from_millis(250);
+    const ATTEMPTS: usize = 40;
+
+    let mut last = String::new();
+    for _ in 0..ATTEMPTS {
+        let (answered, described) =
+            cloudformation(router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+        let status = opt_element(&described, "StackStatus").unwrap_or_default();
+        if answered != 200 || (!status.is_empty() && !status.ends_with("_IN_PROGRESS")) {
+            return;
+        }
+        last = described;
+        tokio::time::sleep(INTERVAL).await;
+    }
+    panic!("case {case:?}: expected the stack's delete to conclude, it still reports {last}");
+}
+
+/// `GetResolverRuleAssociation` for `association_id`, looked at again until it reports the
+/// status a settled association carries (`COMPLETE`), and answered as the association
+/// itself.
+///
+/// The wait is for the CONDITION rather than for a span: an association's status is one
+/// Route 53 Resolver owes a span of its own choosing, so a test that slept for that span
+/// would depend on how fast the host runs.
+async fn settled_rule_association(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    association_id: &str,
+) -> Value {
+    /// How long one read waits before the next, and how many times it reads.
+    const INTERVAL: Duration = Duration::from_millis(250);
+    const ATTEMPTS: usize = 40;
+
+    let mut association = Value::Null;
+    for _ in 0..ATTEMPTS {
+        let (status, answered) = route53resolver(
+            router,
+            region,
+            "GetResolverRuleAssociation",
+            &json!({ "ResolverRuleAssociationId": association_id }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from GetResolverRuleAssociation, got {status} with \
+             body {answered}"
+        );
+        association = answered
+            .get("ResolverRuleAssociation")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if association.get("Status").and_then(Value::as_str) == Some("COMPLETE") {
+            return association;
+        }
+        tokio::time::sleep(INTERVAL).await;
+    }
+    panic!("case {case:?}: expected the association to settle at COMPLETE, got {association}");
+}
 
 /// How many hexadecimal characters an Amazon EC2 resource identifier carries after its
 /// prefix: the current (long) id form is 17 (`vpc-0123456789abcdef0`).
@@ -404,8 +469,6 @@ async fn a_declared_ec2_network_resource_reports_the_identifier_its_type_publish
             status, 200,
             "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
         );
-        tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
-
         let described = poll_to_terminal(&router, region, &stack_name).await;
         assert_eq!(
             opt_element(&described, "StackStatus").as_deref(),
@@ -588,14 +651,7 @@ async fn a_stack_forwards_through_the_network_it_declares_itself() {
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
-
-    let (status, described) =
-        cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body {described}"
-    );
+    let described = poll_to_terminal(&router, region, stack_name).await;
     assert_eq!(
         opt_element(&described, "StackStatus").as_deref(),
         Some("CREATE_COMPLETE"),
@@ -623,29 +679,9 @@ async fn a_stack_forwards_through_the_network_it_declares_itself() {
     let vpc_id = outputs.get("VpcId").cloned().unwrap_or_default();
 
     // The association Route 53 Resolver holds under the id the stack published: it names the
-    // rule and the VPC the template wired together, and the clock has made its status due.
-    let (status, answered) = route53resolver(
-        &router,
-        region,
-        "GetResolverRuleAssociation",
-        &json!({ "ResolverRuleAssociationId": association_id }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: expected HTTP 200 from GetResolverRuleAssociation, got {status} with \
-         body {answered}"
-    );
-    let association = answered
-        .get("ResolverRuleAssociation")
-        .cloned()
-        .unwrap_or(Value::Null);
-    assert_eq!(
-        association.get("Status").and_then(Value::as_str),
-        Some("COMPLETE"),
-        "case {case:?}: expected the association to have settled at COMPLETE, got \
-         {association}"
-    );
+    // rule and the VPC the template wired together, and it settles at COMPLETE — which is
+    // the condition this wait is for, the status being one the clock owes it.
+    let association = settled_rule_association(&router, region, case, &association_id).await;
     assert_eq!(
         association.get("ResolverRuleId").and_then(Value::as_str),
         Some(rule_id.as_str()),
@@ -714,7 +750,10 @@ async fn a_stack_forwards_through_the_network_it_declares_itself() {
         status, 200,
         "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
+    // The stack's delete has to have concluded before the removals are read, which is what
+    // this poll waits for: a stack whose delete has gone through is no longer described
+    // under its name.
+    delete_concluded(&router, region, stack_name, case).await;
     for (operation, member, id) in [
         ("GetResolverRule", "ResolverRuleId", rule_id.clone()),
         (

@@ -34,7 +34,11 @@ pub const API_VERSION: &str = "2015-02-02";
 
 /// Long enough past [`state::CLUSTER_TRANSITION`] that the clock owes a
 /// resource its next status; the handlers never sleep, so only the test waits.
-pub const PAST_TRANSITION: Duration = Duration::from_millis(750);
+///
+/// Derived from the span itself, so a suite that waits for a transition to fall
+/// due keeps waiting long enough when that span changes.
+pub const PAST_TRANSITION: Duration =
+    Duration::from_millis(state::CLUSTER_TRANSITION.as_millis() as u64 + 250);
 
 /// A span far longer than any transition this service schedules, for a suite that
 /// reads a record while the clock still owes it a change.
@@ -48,16 +52,14 @@ pub const HELD_OUT_OF_REACH: Duration = Duration::from_secs(60 * 60);
 /// ([`Duration::ZERO`]). Only the DUE INSTANT moves: the status the clock owes,
 /// and everything else the record carries, is the handler's own.
 ///
-/// This is how a suite puts a resource in a transient phase at all. The span a
-/// transition is owed after is the CALL that scheduled it
-/// ([`state::CLUSTER_TRANSITION`]), so by the time a suite can make a SECOND
-/// request the clock has already carried the record to its settled state — which
-/// is the whole point of that span, because a client polling on an AWS-sized
-/// interval must not lose that interval to a resource the emulator has already
-/// finished. A suite about what the service answers WHILE a resource is being
-/// created, changed or removed therefore holds the change out of reach rather
-/// than racing the span, and what it asserts does not depend on how fast the
-/// host runs.
+/// This is how a suite puts a resource in a transient phase for longer than the
+/// span the clock owes it. That span ([`state::CLUSTER_TRANSITION`]) out-lasts
+/// the request that follows the call which scheduled the transition, so a suite
+/// about what the service answers WHILE a resource is being created, changed or
+/// removed can read it straight back — but a suite that needs the phase to hold
+/// across several calls, or across a wait, holds the change out of reach rather
+/// than racing the span, and what it asserts then does not depend on how fast
+/// the host runs.
 pub fn every_pending_change_due_in(emulator: &Emulator, due_in: Duration) {
     let due = ::std::time::SystemTime::now() + due_in;
     emulator.with_state(|store| {
@@ -128,14 +130,19 @@ pub fn hold_pending_changes(emulator: &Emulator) {
     every_pending_change_due_in(emulator, HELD_OUT_OF_REACH);
 }
 
-/// Materialise everything the clock owes this store at this instant, exactly as
-/// the next call of the service would.
+/// Carry every change the clock owes this store through now, exactly as the next
+/// call of the service would once those changes fall due.
 ///
-/// For a suite that is about to put ONE resource in a transient phase and hold it
-/// there: a record whose due instant has already passed but which no call has
-/// read since is settled first, so [`hold_pending_changes`] holds only what the
-/// call that follows this one made transient.
+/// The outstanding change falls due first ([`every_pending_change_due_in`]) and is
+/// materialised here, so a suite that has just started work on a resource —
+/// taking a snapshot, failing a shard over, creating a group — reaches the settled
+/// resource without waiting out the span the clock owes it
+/// ([`state::CLUSTER_TRANSITION`]). For a suite that is about to put ONE resource
+/// in a transient phase and hold it there, this leaves nothing else outstanding,
+/// so [`hold_pending_changes`] then holds only what the call that follows made
+/// transient.
 pub fn settle_pending_changes(emulator: &Emulator) {
+    every_pending_change_due_in(emulator, Duration::ZERO);
     let now = ::std::time::SystemTime::now();
     emulator.with_state(|store| {
         store.settle_all(now);

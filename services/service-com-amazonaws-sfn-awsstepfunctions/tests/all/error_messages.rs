@@ -147,6 +147,15 @@ async fn a_client_error_names_its_condition_and_the_request_value() {
     // condition they need, rather than for a span of the clock.
     poll_until_absent(&emulator, &deleted).await;
 
+    // A second state machine, under another definition, so the conflict rows below
+    // differ in the state machine the name is in use by as well as in the definition
+    // the repeat create sent.
+    let conflicting = create_machine(&emulator, "msg-conflict", OTHER_DEFINITION).await;
+    // A version number this state machine has never published: a version-qualified ARN
+    // is about the VERSION it names, so the rows that start an execution through one,
+    // or scope a listing to one, state the version's condition.
+    let absent_version = format!("{standard}:4242");
+
     let absent_machine = state_machine_arn("msg-never-created");
     let absent_execution = execution_arn("msg-never-created", "msg-never-started");
 
@@ -235,6 +244,40 @@ async fn a_client_error_names_its_condition_and_the_request_value() {
             json!({ "stateMachineArn": deleted, "roleArn": ROLE_ARN }),
             "StateMachineDoesNotExist",
             format!("State Machine Does Not Exist: '{deleted}'"),
+        ),
+        // A repeat create under a name already in use by a state machine this
+        // request does not describe states the same template, and the value it
+        // reports is the ARN of the state machine holding the name.
+        (
+            "CreateStateMachine under a name already in use, with another definition",
+            "CreateStateMachine",
+            json!({ "name": "msg-standard", "definition": OTHER_DEFINITION, "roleArn": ROLE_ARN }),
+            "StateMachineAlreadyExists",
+            format!("State Machine Already Exists: '{standard}'"),
+        ),
+        (
+            "CreateStateMachine under a second name in use, with another definition",
+            "CreateStateMachine",
+            json!({ "name": "msg-conflict", "definition": HELLO_DEFINITION, "roleArn": ROLE_ARN }),
+            "StateMachineAlreadyExists",
+            format!("State Machine Already Exists: '{conflicting}'"),
+        ),
+        // A version-qualified ARN the store holds no version for is about the
+        // VERSION: the condition names the version, whatever the operation then
+        // does with the reference.
+        (
+            "StartExecution through a version number never published",
+            "StartExecution",
+            json!({ "stateMachineArn": absent_version, "input": "{}" }),
+            "StateMachineDoesNotExist",
+            format!("State Machine Version Does Not Exist: '{absent_version}'"),
+        ),
+        (
+            "ListExecutions scoped to a version number never published",
+            "ListExecutions",
+            json!({ "stateMachineArn": absent_version }),
+            "StateMachineDoesNotExist",
+            format!("State Machine Version Does Not Exist: '{absent_version}'"),
         ),
     ];
 

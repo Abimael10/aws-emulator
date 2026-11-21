@@ -41,12 +41,6 @@ use smithy_server_runtime::MultiServiceRouter;
 // (`tests/all/query_wire.rs`): "Nothing new should write another one — call this module."
 use super::query_wire::{elements, form_encode, opt_element};
 
-/// Long enough for the stack's own clock-owed span (`STATUS_TRANSITION_DELAY`, 500 ms) and
-/// for Route 53 Resolver's provisioning span (`PROVISIONING_DELAY`, 500 ms) to come due, so
-/// the stack reports the template it deployed and the resources report their settled
-/// statuses.
-const PAST_PROVISIONING_SPANS: Duration = Duration::from_millis(900);
-
 /// How long a poll waits before it looks at the stack again.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -80,6 +74,115 @@ async fn settled_stack(
         assert!(
             Instant::now() < deadline,
             "case {case:?}: the stack operation must finish, it still reports {status:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Look again until the stack's DELETE has CONCLUDED: a stack whose delete has gone through
+/// is no longer described under its name, and one still deleting reports a status ending in
+/// `_IN_PROGRESS`.
+async fn delete_concluded(
+    router: &MultiServiceRouter,
+    region: &str,
+    stack_name: &str,
+    case: &str,
+) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (answered, described) = cloudformation(
+            router,
+            region,
+            "DescribeStacks",
+            &[("StackName", stack_name)],
+        )
+        .await;
+        let status = opt_element(&described, "StackStatus").unwrap_or_default();
+        if answered != 200 || (!status.is_empty() && !status.ends_with("_IN_PROGRESS")) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the stack's delete must conclude, it still reports {status:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// `GetFirewallDomainList` for `list_id`, looked at again until the list reports the status
+/// a settled one carries (`COMPLETE`), and answered as the list itself.
+///
+/// The wait is for the CONDITION rather than for a span: a change to a domain list is owed
+/// a span Route 53 Resolver chooses, and a test that slept for it would depend on how fast
+/// the host runs.
+async fn settled_domain_list(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    list_id: &str,
+) -> Value {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (answered, body) = route53resolver(
+            router,
+            region,
+            "GetFirewallDomainList",
+            &json!({ "FirewallDomainListId": list_id }),
+        )
+        .await;
+        assert_eq!(
+            answered, 200,
+            "case {case:?}: expected HTTP 200 from GetFirewallDomainList on the id the stack \
+             reported, got {answered} with body {body}"
+        );
+        let list = body
+            .get("FirewallDomainList")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if list.get("Status").and_then(Value::as_str) == Some("COMPLETE") {
+            return list;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the domain list {list_id} to settle at COMPLETE, got {list}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// `GetFirewallRuleGroupAssociation` for `association_id`, looked at again until it reports
+/// `COMPLETE`; see [`settled_domain_list`] for why it waits for the condition.
+async fn settled_association(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    association_id: &str,
+) -> Value {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (answered, body) = route53resolver(
+            router,
+            region,
+            "GetFirewallRuleGroupAssociation",
+            &json!({ "FirewallRuleGroupAssociationId": association_id }),
+        )
+        .await;
+        assert_eq!(
+            answered, 200,
+            "case {case:?}: expected HTTP 200 from GetFirewallRuleGroupAssociation on the id the \
+             stack reported, got {answered} with body {body}"
+        );
+        let association = body
+            .get("FirewallRuleGroupAssociation")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if association.get("Status").and_then(Value::as_str) == Some("COMPLETE") {
+            return association;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the association {association_id} to settle at COMPLETE, got \
+             {association}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -438,18 +541,19 @@ async fn a_stack_provisions_the_dns_firewall_resources_its_template_declares() {
             "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
         );
 
-        tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
+        // The stack reports the template it deployed once the create COMPLETES, which is
+        // the condition this wait is for.
+        let stack_status = settled_stack(&router, region, &stack_name, case).await;
+        assert_eq!(
+            stack_status, "CREATE_COMPLETE",
+            "case {case:?}: expected the stack to reach CREATE_COMPLETE, got {stack_status}"
+        );
         let (status, described) =
             cloudformation(&router, region, "DescribeStacks", &[("StackName", &stack_name)]).await;
         assert_eq!(
             status, 200,
             "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body \
              {described}"
-        );
-        assert_eq!(
-            opt_element(&described, "StackStatus").as_deref(),
-            Some("CREATE_COMPLETE"),
-            "case {case:?}: expected the stack to reach CREATE_COMPLETE, got {described}"
         );
 
         let (_, resources) = cloudformation(
@@ -492,23 +596,10 @@ async fn a_stack_provisions_the_dns_firewall_resources_its_template_declares() {
         }
 
         // The domain list Route 53 Resolver holds under that id is the one the template
-        // declared, with the domains its `Domains` property asked for.
-        let (status, answer) = route53resolver(
-            &router,
-            region,
-            "GetFirewallDomainList",
-            &json!({ "FirewallDomainListId": list_id }),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected HTTP 200 from GetFirewallDomainList on the id the stack \
-             reported, got {status} with body {answer}"
-        );
-        let domain_list = answer
-            .get("FirewallDomainList")
-            .cloned()
-            .unwrap_or(Value::Null);
+        // declared, with the domains its `Domains` property asked for. The list reports
+        // COMPLETE once the span Route 53 Resolver owes the change it was created with has
+        // passed, which is the condition this wait is for.
+        let domain_list = settled_domain_list(&router, region, case, &list_id).await;
         assert_eq!(
             domain_list.get("Name").and_then(Value::as_str),
             Some(row.expected_list_name),
@@ -518,11 +609,6 @@ async fn a_stack_provisions_the_dns_firewall_resources_its_template_declares() {
             domain_list.get("DomainCount").and_then(Value::as_i64),
             Some(row.expected_domains.len() as i64),
             "case {case:?}: expected the declared domains to be counted, got {domain_list}"
-        );
-        assert_eq!(
-            domain_list.get("Status").and_then(Value::as_str),
-            Some("COMPLETE"),
-            "case {case:?}: expected the domain list to have settled, got {domain_list}"
         );
         let (status, listed) = route53resolver(
             &router,
@@ -656,22 +742,9 @@ async fn a_stack_provisions_the_dns_firewall_resources_its_template_declares() {
             );
         }
         if let Some(association_id) = &association_id {
-            let (status, answer) = route53resolver(
-                &router,
-                region,
-                "GetFirewallRuleGroupAssociation",
-                &json!({ "FirewallRuleGroupAssociationId": association_id }),
-            )
-            .await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected HTTP 200 from GetFirewallRuleGroupAssociation on the id \
-                 the stack reported, got {status} with body {answer}"
-            );
-            let association = answer
-                .get("FirewallRuleGroupAssociation")
-                .cloned()
-                .unwrap_or(Value::Null);
+            // The association reports COMPLETE once the span Route 53 Resolver owes it has
+            // passed, which is the condition this wait is for.
+            let association = settled_association(&router, region, case, association_id).await;
             assert_eq!(
                 association
                     .get("FirewallRuleGroupId")
@@ -700,12 +773,6 @@ async fn a_stack_provisions_the_dns_firewall_resources_its_template_declares() {
                 row.expected_mutation_protection,
                 "case {case:?}: expected the declared MutationProtection, got {association}"
             );
-            assert_eq!(
-                association.get("Status").and_then(Value::as_str),
-                Some("COMPLETE"),
-                "case {case:?}: expected the association to have reached COMPLETE, got \
-                 {association}"
-            );
         }
 
         // Deleting the stack removes every DNS Firewall resource it created — the
@@ -716,10 +783,11 @@ async fn a_stack_provisions_the_dns_firewall_resources_its_template_declares() {
             status, 200,
             "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with body {body}"
         );
-        tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
-        // The stack's own delete has to have gone through: a resource the owning service
-        // refused to delete would leave the stack in DELETE_FAILED with that refusal, and
-        // the reads below would then be asserting the refusal rather than the removal.
+        // The stack's own delete has to have CONCLUDED, which is the condition this wait
+        // is for: a resource the owning service refused to delete would leave the stack in
+        // DELETE_FAILED with that refusal, and the reads below would then be asserting the
+        // refusal rather than the removal.
+        delete_concluded(&router, region, &stack_name, case).await;
         let (_, deleted_stack) = cloudformation(
             &router,
             region,

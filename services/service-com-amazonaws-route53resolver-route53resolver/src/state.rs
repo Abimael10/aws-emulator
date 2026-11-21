@@ -173,10 +173,14 @@ pub const DEFAULT_PROTOCOL: &str = "Do53";
 ///
 /// AWS answers `CreateResolverEndpoint` with `Status: CREATING` and takes
 /// minutes to reach `OPERATIONAL`; an emulator must not make a caller wait that
-/// long, so the transition is owed after this span instead. It is deliberately
-/// not zero: a caller that reads straight after the create still observes the
-/// transient status, exactly as it would against AWS.
-pub const PROVISIONING_DELAY: Duration = Duration::from_millis(500);
+/// long, so the transition is owed after this span instead. It has to OUT-LAST
+/// the call that follows the one which started the work: a caller that creates or
+/// changes a resource and acts on it straight away is the case every transient
+/// status and every in-progress conflict of this service exists for, and a span
+/// shorter than a client's next few requests leaves them unreachable — the record
+/// is settled again before the caller can read it, so a conflict AWS raises for a
+/// change still in flight is never raised here.
+pub const PROVISIONING_DELAY: Duration = Duration::from_secs(3);
 
 /// Page size applied when a request omits `MaxResults`: the maximum the model's
 /// `MaxResults` range (1..100) allows, so an unpaged caller sees everything it

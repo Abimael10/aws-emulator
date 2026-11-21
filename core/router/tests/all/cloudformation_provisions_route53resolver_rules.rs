@@ -30,7 +30,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -43,11 +43,16 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
     failed_action, resource_failure_summary,
 };
 
-/// Long enough for the stack's own clock-owed span (`STATUS_TRANSITION_DELAY`, 500 ms) and
-/// for Route 53 Resolver's provisioning span (`PROVISIONING_DELAY`, 500 ms) to come due, so
-/// the stack reports the template it deployed and the resources report their settled
-/// statuses.
-const PAST_PROVISIONING_SPANS: Duration = Duration::from_millis(900);
+/// How long a test waits for a status the CLOCK owes — the stack's own transition and the
+/// provisioning of the Route 53 Resolver resources it declares — before giving up, and how
+/// often it looks again while it waits.
+///
+/// Generous on purpose: every wait here is for the CONDITION
+/// ([`stack_reporting`], [`endpoint_reporting`]) rather than for a span, so what these
+/// tests assert does not depend on how fast or how loaded the host is.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+/// See [`SETTLE_DEADLINE`].
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(25);
 
 /// The prefixes Route 53 Resolver mints its three identifiers under: an outbound endpoint
 /// is `rslvr-out-…`, a rule `rslvr-rr-…` and a rule association `rslvr-rrassoc-…`.
@@ -158,6 +163,115 @@ async fn route53resolver(
     let status = response.status().as_u16();
     let payload: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
     (status, payload)
+}
+
+/// `DescribeStacks` for `stack_name`, looked at again until it reports `status`.
+///
+/// The wait is for the CONDITION the clock owes rather than for a span
+/// ([`SETTLE_DEADLINE`]): a stack's own transition and the provisioning of the resources it
+/// declares are each owed a span the service chooses, and a test that slept for the sum of
+/// them would depend on how fast the host runs.
+async fn stack_reporting(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    stack_name: &str,
+    status: &str,
+) -> String {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (answered, described) =
+            cloudformation(router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
+        assert_eq!(
+            answered, 200,
+            "case {case:?}: expected HTTP 200 from DescribeStacks, got {answered} with body \
+             {described}"
+        );
+        if opt_element(&described, "StackStatus").as_deref() == Some(status) {
+            return described;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the stack {stack_name} to report {status} within \
+             {SETTLE_DEADLINE:?}, got {described}"
+        );
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
+}
+
+/// `GetResolverEndpoint` for `endpoint_id`, looked at again until the endpoint reports
+/// `status`; see [`stack_reporting`] for why it waits for the condition.
+async fn endpoint_reporting(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    endpoint_id: &str,
+    status: &str,
+) -> Value {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (answered, body) = route53resolver(
+            router,
+            region,
+            "GetResolverEndpoint",
+            &json!({ "ResolverEndpointId": endpoint_id }),
+        )
+        .await;
+        assert_eq!(
+            answered, 200,
+            "case {case:?}: expected HTTP 200 from GetResolverEndpoint on the id the stack \
+             reported, got {answered} with body {body}"
+        );
+        let endpoint = body.get("ResolverEndpoint").cloned().unwrap_or(Value::Null);
+        if endpoint.get("Status").and_then(Value::as_str) == Some(status) {
+            return endpoint;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the endpoint {endpoint_id} to report {status} within \
+             {SETTLE_DEADLINE:?}, got {endpoint}"
+        );
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
+}
+
+/// `GetResolverRuleAssociation` for `association_id`, looked at again until the association
+/// reports `status`; see [`stack_reporting`] for why it waits for the condition.
+async fn association_reporting(
+    router: &MultiServiceRouter,
+    case: &str,
+    region: &str,
+    association_id: &str,
+    status: &str,
+) -> Value {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (answered, body) = route53resolver(
+            router,
+            region,
+            "GetResolverRuleAssociation",
+            &json!({ "ResolverRuleAssociationId": association_id }),
+        )
+        .await;
+        assert_eq!(
+            answered, 200,
+            "case {case:?}: expected HTTP 200 from GetResolverRuleAssociation on the id the \
+             stack reported, got {answered} with body {body}"
+        );
+        let association = body
+            .get("ResolverRuleAssociation")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if association.get("Status").and_then(Value::as_str) == Some(status) {
+            return association;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the association {association_id} to report {status} within \
+             {SETTLE_DEADLINE:?}, got {association}"
+        );
+        tokio::time::sleep(LOOK_AGAIN_AFTER).await;
+    }
 }
 
 /// A `DescribeStacks` answer's `Outputs`, as the key/value map a client reads it as. Each
@@ -436,21 +550,9 @@ async fn a_stack_provisions_the_resolver_rules_its_template_declares() {
             "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
         );
 
-        // The stack reports the template it deployed once the create COMPLETES, and by then
-        // the Resolver resources' own clock-owed transitions are due too.
-        tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
-        let (status, described) =
-            cloudformation(&router, region, "DescribeStacks", &[("StackName", &stack_name)]).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected HTTP 200 from DescribeStacks, got {status} with body \
-             {described}"
-        );
-        assert_eq!(
-            opt_element(&described, "StackStatus").as_deref(),
-            Some("CREATE_COMPLETE"),
-            "case {case:?}: expected the stack to reach CREATE_COMPLETE, got {described}"
-        );
+        // The stack reports the template it deployed once the create COMPLETES, which is
+        // the condition this wait is for.
+        let described = stack_reporting(&router, case, region, &stack_name, "CREATE_COMPLETE").await;
 
         let (status, resources) = cloudformation(
             &router,
@@ -513,28 +615,14 @@ async fn a_stack_provisions_the_resolver_rules_its_template_declares() {
             );
         }
         if let Some(endpoint_id) = &endpoint_id {
-            let (status, answer) = route53resolver(
-                &router,
-                region,
-                "GetResolverEndpoint",
-                &json!({ "ResolverEndpointId": endpoint_id }),
-            )
-            .await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected HTTP 200 from GetResolverEndpoint on the id the stack \
-                 reported, got {status} with body {answer}"
-            );
-            let endpoint = answer.get("ResolverEndpoint").cloned().unwrap_or(Value::Null);
+            // The endpoint is OPERATIONAL once the span Route 53 Resolver owes its
+            // provisioning has passed, which is the condition this wait is for.
+            let endpoint =
+                endpoint_reporting(&router, case, region, endpoint_id, "OPERATIONAL").await;
             assert_eq!(
                 endpoint.get("Direction").and_then(Value::as_str),
                 Some("OUTBOUND"),
                 "case {case:?}: expected the declared Direction, got {endpoint}"
-            );
-            assert_eq!(
-                endpoint.get("Status").and_then(Value::as_str),
-                Some("OPERATIONAL"),
-                "case {case:?}: expected the endpoint to have reached OPERATIONAL, got {endpoint}"
             );
             assert_eq!(
                 endpoint.get("IpAddressCount").and_then(Value::as_i64),
@@ -638,32 +726,14 @@ async fn a_stack_provisions_the_resolver_rules_its_template_declares() {
             );
         }
         if let Some(association_id) = &association_id {
-            let (status, answer) = route53resolver(
-                &router,
-                region,
-                "GetResolverRuleAssociation",
-                &json!({ "ResolverRuleAssociationId": association_id }),
-            )
-            .await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: expected HTTP 200 from GetResolverRuleAssociation on the id the \
-                 stack reported, got {status} with body {answer}"
-            );
-            let association = answer
-                .get("ResolverRuleAssociation")
-                .cloned()
-                .unwrap_or(Value::Null);
+            // The association settles at COMPLETE once the span Route 53 Resolver owes it
+            // has passed, which is the condition this wait is for.
+            let association =
+                association_reporting(&router, case, region, association_id, "COMPLETE").await;
             assert_eq!(
                 association.get("ResolverRuleId").and_then(Value::as_str),
                 Some(rule_id.as_str()),
                 "case {case:?}: expected the association to name the rule {rule_id:?}, got \
-                 {association}"
-            );
-            assert_eq!(
-                association.get("Status").and_then(Value::as_str),
-                Some("COMPLETE"),
-                "case {case:?}: expected the association to have reached COMPLETE, got \
                  {association}"
             );
             assert_eq!(
@@ -787,14 +857,7 @@ async fn re_deploying_the_same_template_keeps_the_minted_ids() {
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
-    let (_, described) =
-        cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
-    assert_eq!(
-        opt_element(&described, "StackStatus").as_deref(),
-        Some("CREATE_COMPLETE"),
-        "case {case:?}: expected the create to complete, got {described}"
-    );
+    let described = stack_reporting(&router, case, region, stack_name, "CREATE_COMPLETE").await;
     let created = outputs_of(&described);
 
     let (status, body) = cloudformation(
@@ -808,14 +871,7 @@ async fn re_deploying_the_same_template_keeps_the_minted_ids() {
         status, 200,
         "case {case:?}: expected HTTP 200 from UpdateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
-    let (_, updated) =
-        cloudformation(&router, region, "DescribeStacks", &[("StackName", stack_name)]).await;
-    assert_eq!(
-        opt_element(&updated, "StackStatus").as_deref(),
-        Some("UPDATE_COMPLETE"),
-        "case {case:?}: expected the re-deploy to complete, got {updated}"
-    );
+    let updated = stack_reporting(&router, case, region, stack_name, "UPDATE_COMPLETE").await;
     let after = outputs_of(&updated);
     for key in ["EndpointId", "RuleId", "AssociationId"] {
         assert_eq!(
@@ -898,20 +954,8 @@ async fn a_rule_through_an_inbound_endpoint_fails_the_stack() {
         status, 200,
         "case {case:?}: expected HTTP 200 from CreateStack, got {status} with body {body}"
     );
-    tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
-
-    let (_, described) = cloudformation(
-        &router,
-        region,
-        "DescribeStacks",
-        &[("StackName", "resolver-refused")],
-    )
-    .await;
-    assert_eq!(
-        opt_element(&described, "StackStatus").as_deref(),
-        Some("ROLLBACK_COMPLETE"),
-        "case {case:?}: expected the failed create to be rolled back, got {described}"
-    );
+    let described =
+        stack_reporting(&router, case, region, "resolver-refused", "ROLLBACK_COMPLETE").await;
     // The STACK's reason summarises which resource failed; Route 53 Resolver's own
     // refusal is reported on that resource's event.
     let reason = opt_element(&described, "StackStatusReason").unwrap_or_default();

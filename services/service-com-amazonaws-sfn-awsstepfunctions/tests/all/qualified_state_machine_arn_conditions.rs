@@ -6,15 +6,15 @@
 //!
 //! The rules under test:
 //!
-//! 1. the refusal names the resource the request is ABOUT: an operation that acts on
-//!    the state machine behind the ARN — starting an execution through a version or an
-//!    alias — states the STATE MACHINE's condition and the ARN exactly as submitted,
-//!    while a READ of the resource the ARN refers to states that resource's own
-//!    condition, so a version-qualified `DescribeStateMachine` reads the version's;
-//! 2. `ListExecutions` is about the state machine whose executions it lists, so a
-//!    qualifier that state machine holds no version or alias under is reported as that
-//!    state machine — never as an empty page, which would make a version that never
-//!    existed indistinguishable from one that ran nothing;
+//! 1. the refusal names the resource the ARN REFERS to, whatever the operation then
+//!    does with it: an ARN qualified with a VERSION number the store holds no version
+//!    under states the version's condition — for a read of it, for a start of an
+//!    execution through it and for a listing scoped to it — while an ALIAS qualifier
+//!    keeps the state machine's condition, an alias being a route to a version rather
+//!    than a resource of its own. The ARN is stated exactly as submitted;
+//! 2. `ListExecutions` reports such a reference as a refusal — never as an empty page,
+//!    which would make a version that never existed indistinguishable from one that
+//!    ran nothing;
 //! 3. `PublishStateMachineVersion` publishes "a version from the current revision of a
 //!    state machine", which neither a version nor an alias is: such an ARN is a defect
 //!    in the request, reported as `InvalidArn` naming the qualifier suffix.
@@ -61,22 +61,35 @@ async fn machine_with_dangling_references(emulator: &Emulator) -> (String, Strin
     (machine, deleted, never_published, never_created)
 }
 
-/// An operation that ACTS ON the state machine behind the ARN reports the state
-/// machine's own condition, with the ARN as submitted — whatever the qualifier was.
+/// An operation that starts an execution through a dangling reference reports the
+/// condition of the resource the ARN refers to: the VERSION's for a version-qualified
+/// ARN, the state machine's for an alias-qualified one.
 #[tokio::test]
-async fn a_start_through_a_dangling_reference_names_the_state_machine() {
+async fn a_start_through_a_dangling_reference_names_the_resource_the_arn_refers_to() {
     let emulator = Emulator::new();
     let (_machine, deleted, never_published, never_created) =
         machine_with_dangling_references(&emulator).await;
 
-    // The rows differ along the qualifier's kind and along which start operation reads
-    // it: both are operations on the state machine the reference belongs to.
+    // The rows differ along the qualifier's kind — which decides WHICH resource the ARN
+    // referred to — and along which start operation reads it.
     let references = [
-        ("a version whose version was deleted", &deleted),
-        ("a version number never published", &never_published),
-        ("an alias name no alias was created under", &never_created),
+        (
+            "a version whose version was deleted",
+            &deleted,
+            STATE_MACHINE_VERSION_DOES_NOT_EXIST,
+        ),
+        (
+            "a version number never published",
+            &never_published,
+            STATE_MACHINE_VERSION_DOES_NOT_EXIST,
+        ),
+        (
+            "an alias name no alias was created under",
+            &never_created,
+            STATE_MACHINE_DOES_NOT_EXIST,
+        ),
     ];
-    for (case, arn) in references {
+    for (case, arn, condition) in references {
         for (operation, request) in [
             (
                 "StartExecution",
@@ -95,7 +108,7 @@ async fn a_start_through_a_dangling_reference_names_the_state_machine() {
                 "case {case:?} / {operation}: expected 400 StateMachineDoesNotExist, got {status} \
                  {code} with body {body:?}"
             );
-            let expected = resource_error_message(STATE_MACHINE_DOES_NOT_EXIST, arn);
+            let expected = resource_error_message(condition, arn);
             assert_eq!(
                 body.get("message").and_then(Value::as_str),
                 Some(expected.as_str()),
@@ -182,17 +195,35 @@ async fn listing_a_dangling_reference_is_refused_too() {
         "the state machine's own listing must report its execution, got {listed:?}"
     );
 
-    // The rows differ along the qualifier's kind, and along whether the state machine
-    // behind the ARN is one the store holds at all.
+    // The rows differ along the qualifier's kind — which decides which resource the
+    // reference named — and along whether the state machine behind the ARN is one the
+    // store holds at all.
     let absent = format!("{machine}-never-created");
-    for (case, arn) in [
-        ("a version whose version was deleted", deleted),
-        ("a version number never published", never_published),
-        ("an alias name no alias was created under", never_created),
-        ("an unqualified ARN that names nothing", absent.clone()),
+    for (case, arn, condition) in [
+        (
+            "a version whose version was deleted",
+            deleted,
+            STATE_MACHINE_VERSION_DOES_NOT_EXIST,
+        ),
+        (
+            "a version number never published",
+            never_published,
+            STATE_MACHINE_VERSION_DOES_NOT_EXIST,
+        ),
+        (
+            "an alias name no alias was created under",
+            never_created,
+            STATE_MACHINE_DOES_NOT_EXIST,
+        ),
+        (
+            "an unqualified ARN that names nothing",
+            absent.clone(),
+            STATE_MACHINE_DOES_NOT_EXIST,
+        ),
         (
             "a version of a state machine that names nothing",
             format!("{absent}:1"),
+            STATE_MACHINE_VERSION_DOES_NOT_EXIST,
         ),
     ] {
         let (status, body) = emulator
@@ -205,7 +236,7 @@ async fn listing_a_dangling_reference_is_refused_too() {
             "case {case:?}: expected 400 StateMachineDoesNotExist, got {status} {code} with body \
              {body:?}"
         );
-        let expected = resource_error_message(STATE_MACHINE_DOES_NOT_EXIST, &arn);
+        let expected = resource_error_message(condition, &arn);
         assert_eq!(
             body.get("message").and_then(Value::as_str),
             Some(expected.as_str()),

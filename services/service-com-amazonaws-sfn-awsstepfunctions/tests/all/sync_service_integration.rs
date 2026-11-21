@@ -51,7 +51,10 @@ const TASK_FAILED: &str = "States.TaskFailed";
 /// A parked task is resolved by polling the job, so the parent's own outcome arrives
 /// a few poll intervals and one settle delay after the child's does: this is well
 /// past that and far short of the ceiling on a parked job.
-const PATIENCE: Duration = Duration::from_secs(20);
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling
+/// suite waiting for the same condition reads this rather than carrying a second copy.
+pub(crate) const PATIENCE: Duration = Duration::from_secs(20);
 
 /// A child definition that finishes at once with a static result.
 const CHILD_SUCCEEDS: &str =
@@ -63,7 +66,9 @@ const CHILD_FAILS: &str = r#"{"StartAt":"Boom","States":{"Boom":{"Type":"Fail",
 
 /// A child definition that keeps running: its one `Wait` state is owed an hour, so
 /// the child is `RUNNING` for as long as a test needs it to be.
-const CHILD_RUNS_ON: &str = r#"{"StartAt":"Hold","States":{"Hold":{"Type":"Wait",
+///
+/// `pub(crate)` for the reason [`PATIENCE`] is.
+pub(crate) const CHILD_RUNS_ON: &str = r#"{"StartAt":"Hold","States":{"Hold":{"Type":"Wait",
     "Seconds":3600,"Next":"Done"},"Done":{"Type":"Pass","End":true}}}"#;
 
 /// A parent definition whose one `Task` state starts `child_arn` through the
@@ -90,8 +95,9 @@ fn parent_definition(child_arn: &str, suffix: &str) -> String {
     .to_string()
 }
 
-/// `DescribeExecution`, as the API answers it.
-async fn described(emulator: &Emulator, execution_arn: &str) -> Value {
+/// `DescribeExecution`, as the API answers it. `pub(crate)` for the reason
+/// [`PATIENCE`] is.
+pub(crate) async fn described(emulator: &Emulator, execution_arn: &str) -> Value {
     emulator
         .ok(
             "DescribeExecution",
@@ -101,8 +107,8 @@ async fn described(emulator: &Emulator, execution_arn: &str) -> Value {
 }
 
 /// The execution `execution_arn` names once it has left `RUNNING`, or a panic naming
-/// the case when it never does.
-async fn settled(emulator: &Emulator, case: &str, execution_arn: &str) -> Value {
+/// the case when it never does. `pub(crate)` for the reason [`PATIENCE`] is.
+pub(crate) async fn settled(emulator: &Emulator, case: &str, execution_arn: &str) -> Value {
     let began = Instant::now();
     loop {
         let described = described(emulator, execution_arn).await;
@@ -129,7 +135,8 @@ async fn event(emulator: &Emulator, execution_arn: &str, event_type: &str) -> Op
 
 /// The child execution the parent's `TaskSubmitted` event names: the job identifier
 /// the invoked service answered, read off the event rather than guessed at.
-async fn submitted_job(emulator: &Emulator, case: &str, parent_arn: &str) -> String {
+/// `pub(crate)` for the reason [`PATIENCE`] is.
+pub(crate) async fn submitted_job(emulator: &Emulator, case: &str, parent_arn: &str) -> String {
     let submitted = event(emulator, parent_arn, EVENT_TASK_SUBMITTED)
         .await
         .unwrap_or_else(|| {

@@ -1,29 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What the FIRST read issued after the call that started work on a resource answers.
+//! What the first read issued once an owed change has fallen DUE answers.
 //!
-//! The rule under test: a transition this service owes a resource is owed from the call
-//! that started the work, so the transient status the service documents for that phase is
-//! what THAT call's own answer carries, and the next request — a client's first poll —
-//! reads the resource in its settled state (a status, or, for a removal, the resource's
-//! absence). A client written against AWS polls a lifecycle status on an interval sized for
-//! AWS, tens of seconds; a poll answered with the transient status costs it that whole
-//! interval, so a flow that chains several waits would take minutes and be
-//! indistinguishable from a resource that never settles.
+//! The rule under test: the call that starts work on a resource answers with the transient
+//! status the service documents for that phase, and the change the clock owes it is
+//! materialised by whichever later call reads the record — so the first read taken after
+//! that change falls due reports the settled state (a status, or, for a removal, the
+//! resource's absence) without any call having waited for it.
 //!
 //! The rows span what the rule generalises over: WHICH resource (cache cluster, replication
 //! group, serverless cache, user group, RBAC user, snapshot, snapshot copy, Global
 //! datastore, reserved cache node), WHICH phase (being created, being changed, being
 //! restarted, being removed) and whether the settled state is a STATUS or the resource's
-//! ABSENCE. Nothing here sleeps and nothing polls: ONE read follows each starting call, and
-//! what it answers is the assertion. Everything goes over the wire through the same router
-//! the production emulator mounts.
+//! ABSENCE. Nothing here sleeps and nothing polls: the owed change is made due through the
+//! store ([`crate::harness::release_pending_changes`]) and ONE read follows, so what this
+//! suite asserts does not depend on how fast the host runs. Everything goes over the wire
+//! through the same router the production emulator mounts.
 //!
-//! The companion of [`crate::lifecycle_convergence`], which asserts the other half: a
-//! report issued while the change is held out of reach still answers the transient status,
-//! and the state gates that go with it still refuse a change.
+//! The companions of this suite are [`crate::transient_phase_outlasts_the_next_call`],
+//! which asserts the other half — the span is long enough that a caller acting straight
+//! after the starting call still meets the transient phase, and the state gates that phase
+//! carries — and [`crate::lifecycle_convergence`], which holds a change out of reach.
 
-use crate::harness::{params, Emulator, Reply, REGION};
+use crate::harness::{params, release_pending_changes, Emulator, Reply, REGION};
 
 /// One row: the call that starts work on a resource, the transient status its own answer
 /// must carry, and the single read that follows it.
@@ -71,6 +70,11 @@ async fn assert_first_read_is_settled(emulator: &Emulator, phase: &Phase) {
         phase.transient,
         started.text(phase.transient_path)
     );
+
+    // The change the clock owes the resource is made DUE rather than waited out: the span
+    // itself is the subject of [`crate::transient_phase_outlasts_the_next_call`], and what
+    // this suite is about is that the first read past that span answers the settled state.
+    release_pending_changes(emulator);
 
     let read = emulator.call(phase.read, &phase.read_request).await;
     match phase.settled {
@@ -140,8 +144,9 @@ async fn available_cluster(emulator: &Emulator, id: &str) {
         "the cluster {id} must be created, got {} {}",
         created.status, created.body
     );
-    // The rule under test, used as the setup: the read that follows the create reports the
-    // cluster settled, so there is nothing to wait for.
+    // The rule under test, used as the setup: once the create's owed change is due, the
+    // read that follows reports the cluster settled, so there is nothing to wait for.
+    release_pending_changes(emulator);
     let described = emulator
         .call("DescribeCacheClusters", &params(&[("CacheClusterId", id)]))
         .await;
@@ -192,6 +197,7 @@ async fn active_user_group(emulator: &Emulator, id: &str) {
         "the user group {id} must be created, got {} {}",
         created.status, created.body
     );
+    release_pending_changes(emulator);
     let described = emulator
         .call("DescribeUserGroups", &params(&[("UserGroupId", id)]))
         .await;
@@ -528,8 +534,8 @@ async fn a_global_datastore_reads_back_settled_to_the_first_call_after_the_creat
         "the primary must be created, got {} {}",
         primary.status, primary.body
     );
-    // One read, and the primary is ready to be built on — which is what the rule buys a
-    // client driving a multi-step flow.
+    // One read past the create's owed change, and the primary is ready to be built on.
+    release_pending_changes(&emulator);
     let available = emulator
         .call(
             "DescribeReplicationGroups",
@@ -571,7 +577,8 @@ async fn a_global_datastore_reads_back_settled_to_the_first_call_after_the_creat
         .to_string();
 
     // A datastore that has only the primary it was built around settles at `primary-only`,
-    // which is what that status means — and the first read after the create answers it.
+    // which is what that status means — and the first read past the owed change answers it.
+    release_pending_changes(&emulator);
     let described = emulator
         .call_in(
             REGION,

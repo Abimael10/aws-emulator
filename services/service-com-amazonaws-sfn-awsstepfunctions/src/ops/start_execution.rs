@@ -360,9 +360,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(StartExecutionErrorModeled::StateMachineDoesNotExist(
                     StateMachineDoesNotExist {
                         message: Some(crate::state::resource_error_message(
-                            // ONE condition for every ARN a start can name, stated
-                            // with the ARN as submitted.
-                            crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                            // The condition the refusal states is the one of the
+                            // resource the ARN REFERS to — the version's for a
+                            // version-qualified ARN — stated with the ARN as
+                            // submitted ([`crate::state::absent_state_machine_condition`]).
+                            crate::state::absent_state_machine_condition(&parsed),
                             &input.state_machine_arn,
                         )),
                     },

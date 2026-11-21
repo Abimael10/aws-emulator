@@ -90,6 +90,14 @@ async fn poll<Eng: Send + Sync + 'static>(
     depth: u8,
     execution_arn: &str,
 ) {
+    // The job this watcher last saw in the store, kept across passes: WHICHEVER caller
+    // materialises the closure of this task removes the record — the settle below, or any
+    // request of this service that settles first (a report of the parent execution, a
+    // start of another one) — so the record is often already gone by the time this watcher
+    // sees the task end. The job behind it is still running, and it is this watcher's
+    // business to stop it, so what the stop needs is held HERE rather than read back out of
+    // a store that no longer has it.
+    let mut last_seen: Option<super::JobTask> = None;
     loop {
         ::tokio::time::sleep(super::PARKED_JOB_POLL_INTERVAL).await;
         let Some(state) = super::service_state(&**engine) else {
@@ -128,8 +136,11 @@ async fn poll<Eng: Send + Sync + 'static>(
             // nobody, so the job is STOPPED rather than left running behind the task
             // that started it — the same thing that happens to a job a failed state
             // abandoned ([`integration::stop_abandoned`]). A job that had already
-            // ended ignores the call.
-            if let Some(parked) = parked {
+            // ended ignores the call. The job is the one this pass found still parked,
+            // else the one the previous pass saw: the closure is the clock's, so it is
+            // carried through by whichever caller reads the store first and the record
+            // may have gone before this pass looked.
+            if let Some(parked) = parked.or(last_seen) {
                 let (call, request) = integration::stopping(
                     parked.api,
                     parked.family,
@@ -156,6 +167,9 @@ async fn poll<Eng: Send + Sync + 'static>(
 
         let (call, request) =
             integration::describing(task.api, task.family, task.job, &task.job_id, &task.naming);
+        // What this pass saw, for the pass that finds the task closed: the stop it then
+        // makes names the job this record carries.
+        last_seen = Some(task.clone());
         // The poll is one of the execution's own calls, so the policies in force on
         // its role decide whether it is made: a role that may not report the job
         // cannot be told what the job did, and the task it belongs to has already been
@@ -175,6 +189,9 @@ async fn poll<Eng: Send + Sync + 'static>(
             .map(asl::reported);
         if let Some(refusal) = denied {
             resolve(engine, callback, depth, execution_arn, &task, Err(refusal)).await;
+            // The task was resolved HERE, so its record is gone by the walk's own doing
+            // rather than by the clock closing it: there is no abandoned job to stop.
+            last_seen = None;
             continue;
         }
         let reported = integration::call_api(callback, &task.region, &call, &request).await;
@@ -206,6 +223,9 @@ async fn poll<Eng: Send + Sync + 'static>(
         // may itself have parked at another job — the next pass finds it, and finds
         // nothing to poll when there is none.
         resolve(engine, callback, depth, execution_arn, &task, outcome).await;
+        // As above: a task this loop resolved leaves no job for the pass that finds the
+        // record gone to stop.
+        last_seen = None;
     }
 }
 

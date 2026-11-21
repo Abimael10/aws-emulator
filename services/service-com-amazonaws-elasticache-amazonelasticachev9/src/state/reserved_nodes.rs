@@ -427,10 +427,9 @@ pub const RESERVATION_STATE_RETIRED: &str = "retired";
 ///
 /// The same span, for the same reason, as [`CLUSTER_TRANSITION`]: AWS takes as
 /// long as the payment takes, the purchase itself answers with the transient
-/// state, and a client that reads the reservation back — on an interval sized
-/// for AWS — is answered with the state the clock already owes it. The due
-/// instant is stored on the record and materialised by whichever later call
-/// reads it.
+/// state, and a client that reads the reservation straight back still sees that
+/// state. The due instant is stored on the record and materialised by whichever
+/// later call reads it.
 pub const RESERVATION_TRANSITION: Duration = CLUSTER_TRANSITION;
 
 /// How many reserved cache nodes the store holds before a purchase is refused

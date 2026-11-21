@@ -5,16 +5,14 @@
 //!
 //! Every transient status this service reports — a cluster `creating`, a
 //! snapshot `creating` or `deleting`, a replication group `modifying`, a user
-//! group `modifying` — is held for the span of the CALL that started the work
+//! group `modifying` — is held for the span the clock owes that change
 //! ([`CLUSTER_TRANSITION`]), stored as the due instant on the record and
 //! materialised by whichever later call reads it. No call of this service waits
 //! for such a span to pass: the call that STARTS the work answers with the
 //! transient status, and a report arriving before the change falls due answers
-//! that status too. That span is shorter than the gap between two requests, so
-//! the FIRST read a client issues after the starting call answers with the
-//! settled state: a client polling a lifecycle status on an interval sized for
-//! AWS must not lose that interval to a resource this emulator has already
-//! finished, or a flow that chains several waits never converges.
+//! that status too. That span out-lasts the next request, so a caller acting
+//! straight after the starting call still sees the resource in its transient
+//! phase — which is what every lifecycle state gate of this service is about.
 //!
 //! What a report DOES write is the change the clock had already made due at the
 //! instant it answers: each reporting operation runs the settling pass for the

@@ -3068,39 +3068,36 @@ pub fn stale_revision_message(requested: &str, current: Option<&str>) -> String 
 
 /// `StateMachineDoesNotExist`'s own name, as its message spells it. RECORDED text.
 ///
-/// What an operation that ACTS ON the state machine behind the ARN states for every ARN
-/// it can be given, whatever qualifier it carries: the refusal states this condition and
-/// then the ARN AS SUBMITTED ([`resource_error_message`]), so a version- or
-/// alias-qualified ARN no record answers for reads the same sentence an unqualified one
-/// does — what the request asked that operation to do was about the state machine. A
-/// READ of the resource the ARN REFERS to states the referenced resource's condition
-/// instead ([`absent_state_machine_condition`]).
+/// What an operation states for an ARN that is unqualified, or qualified with an ALIAS:
+/// the refusal states this condition and then the ARN AS SUBMITTED
+/// ([`resource_error_message`]), because an alias is a route to a version rather than a
+/// resource of its own, so an alias no record answers for is the state machine answering
+/// for nothing. A version-qualified ARN states the version's condition instead
+/// ([`absent_state_machine_condition`]).
 pub const STATE_MACHINE_DOES_NOT_EXIST: &str = "State Machine Does Not Exist";
 
 /// What the same error says when the ARN named a state machine VERSION that the store
 /// holds nothing for. RECORDED text.
 ///
-/// Which of the two conditions an operation states is decided by what that operation is
-/// ABOUT ([`absent_state_machine_condition`]): a READ addressed by a version-qualified
-/// ARN is about the version, so the condition is the version's, even though the error
-/// shape is the state machine's (the model declares no version-specific one), while an
-/// operation that runs or lists the executions OF a state machine is about the state
-/// machine and states its condition for every ARN that names it.
+/// Which of the two conditions a refusal states is decided by the resource the ARN REFERS
+/// to ([`absent_state_machine_condition`]), not by what the operation does with it: an
+/// ARN qualified with a version number is about that version, so the condition is the
+/// version's — for a read of it, for a start through it and for a listing scoped to it —
+/// even though the error shape is the state machine's (the model declares no
+/// version-specific one).
 pub const STATE_MACHINE_VERSION_DOES_NOT_EXIST: &str = "State Machine Version Does Not Exist";
 
-/// The condition a resource-absent refusal names for the state machine ARN `parsed`,
-/// for an operation whose SUBJECT is the resource the ARN refers to — the reads that
-/// report a state machine, a version of it, or its aliases.
+/// The condition a resource-absent refusal names for the state machine ARN `parsed`.
 ///
-/// The ONE place that choice is made, so every such operation words the refusal the
-/// same way: the VERSION condition for an ARN qualified with a version number, and the
-/// state machine's own otherwise. An alias qualifier keeps the state machine's
-/// condition: an alias is a route to a version rather than a resource of its own.
+/// The ONE place that choice is made, so every operation addressed by such an ARN words
+/// the refusal the same way: the VERSION condition for an ARN qualified with a version
+/// number, and the state machine's own otherwise. An alias qualifier keeps the state
+/// machine's condition: an alias is a route to a version rather than a resource of its
+/// own, so an ARN naming no alias names no resource but the state machine.
 ///
-/// An operation that ACTS ON the state machine behind the ARN — starting an execution
-/// through a version or an alias, listing the executions associated with one — states
-/// [`STATE_MACHINE_DOES_NOT_EXIST`] for every ARN it can be given, because the state
-/// machine is what it is about.
+/// What the refusal is about is the resource the ARN REFERS to, whatever the operation
+/// then does with it — read it, start an execution through it, or scope a listing to it —
+/// because the ARN is how the request named the thing the service holds nothing for.
 pub fn absent_state_machine_condition(parsed: &StateMachineArn) -> &'static str {
     match parsed.qualifier.as_deref() {
         Some(qualifier)
