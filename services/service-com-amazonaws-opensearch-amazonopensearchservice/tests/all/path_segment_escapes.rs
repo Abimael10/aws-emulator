@@ -29,6 +29,15 @@
 //! [`super::domain_rest_data_plane`]'s; the session and policy seeding is
 //! [`super::published_domain_address`]'s. This suite adds no second copy of either.
 
+/// The same rule read over the segment's ROLE rather than over the escaped character: every
+/// other name this surface takes in a path — an alias, a template, an ingest pipeline — and
+/// the naming rules applied to what a segment spells.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself reached
+/// through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a SIBLING suite.
+#[path = "path_segment_escapes/escaped_name_segments.rs"]
+mod escaped_name_segments;
+
 use serde_json::{json, Value};
 
 use super::data_source_registry::created_domain;
