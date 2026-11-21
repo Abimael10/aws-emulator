@@ -16,6 +16,14 @@
 //! and every top-level category carrying its whole subtree's listings, matches several
 //! listings rather than one.
 //!
+//! This tier is also what a client reaches FIRST when it discovers the catalog the
+//! documented way — a default, unfiltered `SearchListings`, then a drill-down into an
+//! associated product — so the multiplicity the model gives a product's fulfillment
+//! ([`KIND_FULFILLMENT`]) has to be visible here: the rows whose kind of product is
+//! delivered through two routes offer two fulfillment options, so a client that pages
+//! `ListFulfillmentOptions` over a product it found by searching meets a list longer than
+//! one page of `maxResults=1`.
+//!
 //! The records are this emulator's own seed data: each row's listing, product, offer, offer
 //! terms and (for some rows) offer set are built by [`seed_rows`], the same path the
 //! hand-written rows above go through, so no tier's records are shaped differently from
@@ -66,8 +74,8 @@ const PRODUCT_KINDS: &[&str] = &[
     "Studio",
 ];
 
-/// How a row of this tier is fulfilled, by the kind of product it is: `(kind,
-/// FulfillmentOptionType)`.
+/// How a row of this tier is fulfilled, by the kind of product it is: `(kind, every
+/// FulfillmentOptionType that kind is delivered through)`.
 ///
 /// A record's fulfillment is a property of the record, so this tier reads it off the same
 /// thing the rest of the row is derived from — what the product IS — rather than from the
@@ -77,27 +85,40 @@ const PRODUCT_KINDS: &[&str] = &[
 /// toolkit is build components; a gateway is provisioned into the buyer's network from a
 /// template. Spanning the whole `FulfillmentOptionType` union is [`BREADTH_ROWS`]' job,
 /// which names every one of its values.
-const KIND_FULFILLMENT: &[(&str, &str)] = &[
-    ("Platform", "SAAS"),
-    ("Suite", "SAAS"),
-    ("Service", "SAAS"),
-    ("Hub", "CONTAINER"),
-    ("Workbench", "AMAZON_MACHINE_IMAGE"),
-    ("Toolkit", "EC2_IMAGE_BUILDER_COMPONENT"),
-    ("Gateway", "CLOUDFORMATION_TEMPLATE"),
-    ("Studio", "SAAS"),
+///
+/// A kind delivered through MORE THAN ONE route names every one of them, because a product
+/// stands in a one-to-many relation to its fulfillment options — `ListFulfillmentOptions`
+/// is `@paginated` over `fulfillmentOptions` and `fulfillmentOptionSummaries` is a list of
+/// the types a product offers — and software offered through two routes is the ordinary
+/// case rather than the exception: a platform its seller hosts is subscribed to and called
+/// as an API; a hub ships as a container image and as the Helm chart that installs it; a
+/// workbench ships as a machine image and as the Image Builder component that bakes it into
+/// the buyer's own image. The kinds delivered one way name one route, so this tier carries
+/// single-route and multi-route products alike.
+const KIND_FULFILLMENT: &[(&str, &[&str])] = &[
+    ("Platform", &["SAAS", "API"]),
+    ("Suite", &["SAAS"]),
+    ("Service", &["SAAS"]),
+    ("Hub", &["CONTAINER", "HELM"]),
+    (
+        "Workbench",
+        &["AMAZON_MACHINE_IMAGE", "EC2_IMAGE_BUILDER_COMPONENT"],
+    ),
+    ("Toolkit", &["EC2_IMAGE_BUILDER_COMPONENT"]),
+    ("Gateway", &["CLOUDFORMATION_TEMPLATE"]),
+    ("Studio", &["SAAS"]),
 ];
 
-/// The `FulfillmentOptionType` a product of `kind` is delivered through, per
-/// [`KIND_FULFILLMENT`].
+/// The `FulfillmentOptionType`s a product of `kind` is delivered through, per
+/// [`KIND_FULFILLMENT`], the first of them being the route the row's prose names.
 ///
 /// A kind this table does not name is delivered as SaaS, the way a product the catalog
 /// knows nothing more about than that its seller hosts it is reached.
-fn fulfillment_for_kind(kind: &str) -> &'static str {
+fn fulfillment_for_kind(kind: &str) -> &'static [&'static str] {
     KIND_FULFILLMENT
         .iter()
         .find(|(candidate, _)| *candidate == kind)
-        .map_or("SAAS", |(_, option_type)| *option_type)
+        .map_or(&["SAAS"], |(_, option_types)| *option_types)
 }
 
 /// Seed one listing (with its product, offer and terms) per subcategory of the taxonomy.
@@ -159,7 +180,9 @@ struct BuiltRow {
     short_description: String,
     categories: Vec<&'static str>,
     /// The fulfillment option types this row's record offers, read off the kind of product
-    /// it is ([`fulfillment_for_kind`]).
+    /// it is ([`fulfillment_for_kind`]): one per route that kind is delivered through, so a
+    /// row of a multi-route kind offers several options and one of a single-route kind
+    /// offers one.
     fulfillment: Vec<&'static str>,
     support_phone: String,
 }
@@ -184,7 +207,7 @@ impl BuiltRow {
                 paired_name.to_lowercase()
             ),
             categories: vec![category, paired],
-            fulfillment: vec![fulfillment_for_kind(kind)],
+            fulfillment: fulfillment_for_kind(kind).to_vec(),
             support_phone: format!(
                 "+1-{}-555-{:04}",
                 PHONE_AREA_CODES[(index / PHONE_LINES) % PHONE_AREA_CODES.len()],
