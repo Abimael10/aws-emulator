@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(job) = store.resolve_search_job(&input.search_id) else {
             return Err(GetArchiveSearchResultsErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::SEARCH_ID_INVALID.to_string()),
+                    message: Some(crate::state::SEARCH_NOT_FOUND.to_string()),
                 },
             )
             .into());

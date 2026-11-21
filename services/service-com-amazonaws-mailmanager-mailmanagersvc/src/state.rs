@@ -656,16 +656,16 @@ impl ArchivedMessageRecord {
 /// no id back.
 pub const SEARCH_NOT_COMPLETED: &str = "Search is not completed yet.";
 
-/// How `GetArchiveSearch` words the refusal of a `SearchId` that resolves to no search job
+/// How the search reads word the refusal of a `SearchId` that resolves to no search job
 /// this store serves — one that was never minted, and one whose archive is gone or no
 /// longer [`ARCHIVE_STATE_ACTIVE`].
 ///
-/// The text is entirely fixed and echoes no id back: it states that the `SearchId` member
-/// is not acceptable, which is why this is the modelled `ValidationException` (already
-/// `@httpError 400`) — `GetArchiveSearch` models no `ResourceNotFoundException` at all, so
-/// a `SearchId` that names nothing is a fault in the request. The same shape of answer this
-/// service gives for an import job's id (see [`IMPORT_JOB_ID_INVALID`]).
-pub const SEARCH_ID_INVALID: &str = "Invalid SearchId";
+/// The condition reported is a search that is NOT THERE, so the text says exactly that: it
+/// is entirely fixed and echoes no id back. It is carried by the modelled
+/// `ValidationException` (already `@httpError 400`) because the search reads model no
+/// `ResourceNotFoundException` at all, so a `SearchId` that names nothing is answered as a
+/// fault in the request.
+pub const SEARCH_NOT_FOUND: &str = "Search not found.";
 
 /// Per-service state for com-amazonaws-mailmanager-mailmanagersvc. A handler reaches it through [`service_state`].
 ///
@@ -843,7 +843,7 @@ impl ComAmazonawsMailmanagerMailmanagersvcState {
     /// Shared by the two search reads, so one `SearchId` resolves the same way for both: a
     /// job of an archive that is gone, or one no longer [`ARCHIVE_STATE_ACTIVE`], is no
     /// longer reachable and is reported exactly as one that was never minted (see
-    /// [`SEARCH_ID_INVALID`]).
+    /// [`SEARCH_NOT_FOUND`]).
     pub fn resolve_search_job(&self, search_id: &str) -> Option<&SearchJobRecord> {
         self.archive_searches
             .get(search_id)

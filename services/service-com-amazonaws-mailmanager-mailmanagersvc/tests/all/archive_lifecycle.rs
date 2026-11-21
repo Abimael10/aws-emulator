@@ -100,6 +100,10 @@ impl Harness {
     }
 }
 
+/// The message every refusal of an id that resolves to no search job carries, spelled out
+/// here rather than read off the implementation so a change of wording fails this suite.
+const SEARCH_NOT_FOUND: &str = "Search not found.";
+
 /// The wire error code of a failure body: the `__type` member, without its namespace.
 fn error_code(body: &Value) -> String {
     body.get("__type")
@@ -1671,7 +1675,7 @@ async fn a_pending_deletion_archive_serves_no_job_operations() {
     );
     assert_eq!(
         out["Message"].as_str(),
-        Some(state::SEARCH_ID_INVALID),
+        Some(SEARCH_NOT_FOUND),
         "case \"GetArchiveSearch\": unexpected message, got {out:?}"
     );
 }
@@ -1703,7 +1707,7 @@ async fn get_archive_search_refuses_a_search_id_it_never_minted() {
         );
         assert_eq!(
             out["Message"].as_str(),
-            Some(state::SEARCH_ID_INVALID),
+            Some(SEARCH_NOT_FOUND),
             "case {case:?}: unexpected message, got {out:?}"
         );
     }
