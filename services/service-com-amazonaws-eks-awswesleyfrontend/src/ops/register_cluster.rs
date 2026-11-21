@@ -109,11 +109,10 @@ use std::time::SystemTime;
 /// the refusal itself, which the model fixes at 400 for `InvalidRequestException`.
 const CONNECTOR_REFUSAL_STATUS: u16 = 400;
 
-/// The member a registration carries its cloud provider in, as the request spells it
-/// from the root of the body (`RegisterCluster$connectorConfig` ->
-/// `ConnectorConfigRequest$provider`) — which is how the refusal of a value outside
-/// that enum's set names it.
-const CONNECTOR_PROVIDER_MEMBER: &str = "connectorConfig.provider";
+/// The member a registration carries its cloud provider in, as the model declares it
+/// (`ConnectorConfigRequest$provider`) — which is how the refusal of a value outside
+/// that enum's set names it: the member's own name, with no parent structure named.
+const CONNECTOR_PROVIDER_MEMBER: &str = "provider";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -233,8 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the order the MODEL declares them — the order the walk reports. This arm is
         // the backstop for a schema that carried no such trait: it states the same
         // sentence ([`state::value_must_be_one_of_message`]), naming the member by its
-        // path from the request root, from the generated constant, whose order is its
-        // own.
+        // own name, from the generated constant, whose order is its own.
         let provider = input.connector_config.provider.clone();
         if !CONNECTOR_CONFIG_PROVIDER_VALUES.contains(&provider.as_str()) {
             let accepted: Vec<String> = CONNECTOR_CONFIG_PROVIDER_VALUES

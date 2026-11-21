@@ -434,7 +434,7 @@ async fn the_provider_must_be_a_modelled_member() {
         CONNECTOR_CONFIG_PROVIDER_VALUES
     );
     let expected_message = format!(
-        "The value of connectorConfig.provider must be one of [{}]",
+        "provider must be one of [{}]",
         DECLARED_PROVIDERS.join(", ")
     );
     // Every member of the enum, straight from the model — so a model that grows a
@@ -472,8 +472,8 @@ async fn the_provider_must_be_a_modelled_member() {
             Some("InvalidParameterException"),
             "case {case:?}: expected InvalidParameterException, got {answer:?}"
         );
-        // The sentence names the member by its path from the request root, and the
-        // values it accepts in the model's own order.
+        // The sentence names the member by its own name, and the values it accepts in
+        // the model's own order.
         assert_eq!(
             answer.message(),
             expected_message,

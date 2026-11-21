@@ -1239,15 +1239,15 @@ pub const CONNECTION_ALREADY_EXISTS: &str = "Connection already exists.";
 /// `TestConnection` of a connection whose `ConnectionType` is one of the LEGACY kinds
 /// ([`super::LEGACY_CONNECTION_TYPES`]) rather than a unified connection's.
 ///
-/// RECORDED constant, and the whole message: the service states which connections the
-/// operation supports and names NOTHING of the request — not the operation itself, not the
-/// type it was handed, not the connection addressed — so one wording answers every kind
-/// outside the unified surface. Its subject is the generic "This operation". It carries no
-/// trailing period, as recorded. The refusal is a 400 `ValidationException` — a class this
-/// operation's own `errors` list omits and the SERVICE models, so the handler widens that
-/// shape in rather than inventing one.
+/// RECORDED constant, and the whole message: its SUBJECT is the operation the restriction is
+/// a restriction on, named as the API names it, and it states which connections that
+/// operation supports; nothing else of the request reaches it — not the type it was handed,
+/// not the connection addressed — so one wording answers every kind outside the unified
+/// surface. It carries no trailing period, as recorded. The refusal is a 400
+/// `ValidationException` — a class this operation's own `errors` list omits and the SERVICE
+/// models, so the handler widens that shape in rather than inventing one.
 pub const TEST_CONNECTION_UNIFIED_ONLY: &str =
-    "This operation is only supported for the Unified Connections";
+    "TestConnection is only supported for the Unified Connections";
 
 /// `TestConnection` whose inline `TestConnectionInput` states an `AuthenticationType`
 /// without the member its credentials live in

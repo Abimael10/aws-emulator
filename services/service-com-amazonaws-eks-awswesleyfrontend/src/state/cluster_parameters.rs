@@ -123,12 +123,17 @@ pub fn unsupported_log_type_message(value: &str) -> String {
 }
 
 /// The sentence a member judged by an enum's value set is refused with when the value
-/// is outside it: fixed text, the member named by its PATH from the request root — a
-/// nested member as the request spells it, `<parent>.<member>` — and the values it
-/// accepts, in the order the model declares them. The rejected value is NOT echoed into
-/// the sentence; the accepted set is what the caller has to pick from.
-pub fn value_must_be_one_of_message(path: &str, accepted: &[String]) -> String {
-    format!("The value of {path} must be one of [{}]", accepted.join(", "))
+/// is outside it: the member's OWN name — the member as the model declares it, not the
+/// path the request spelled it at — then fixed text, then the values it accepts, in the
+/// order the model declares them. The rejected value is NOT echoed into the sentence;
+/// the accepted set is what the caller has to pick from.
+///
+/// RECORDED: a `CreateCluster` whose `accessConfig.authenticationMode` carries a value
+/// outside `AuthenticationMode` is refused with "authenticationMode must be one of
+/// [API, API_AND_CONFIG_MAP, CONFIG_MAP]" — the leaf member alone, with no parent
+/// structure named and no preamble before it.
+pub fn value_must_be_one_of_message(member: &str, accepted: &[String]) -> String {
+    format!("{member} must be one of [{}]", accepted.join(", "))
 }
 
 /// The sentence the deprecated cluster-version `status` filter is refused with when

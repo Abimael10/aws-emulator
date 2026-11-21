@@ -8,10 +8,10 @@
 //!
 //! RULE under test: a refusal's message is the sentence the service words for THAT error
 //! class, with only the variable parts the class has — and the restriction on which
-//! connections this operation can test has NONE: it states the restriction about the
-//! operation generically ("This operation"), so the one byte-identical sentence answers
-//! every kind outside the unified surface, whichever form the definition under test arrived
-//! in and whatever the request named.
+//! connections this operation can test has NONE: its subject is the restricted OPERATION,
+//! named as the API names it, so the one byte-identical sentence answers every kind outside
+//! the unified surface, whichever form the definition under test arrived in and whatever the
+//! request named.
 //!
 //! The rows below span what the rule generalises over: every legacy `ConnectionType` the
 //! model declares, the two forms a definition arrives in (inline, and a stored connection
@@ -28,7 +28,7 @@ use crate::wire::{call, emulator, error_code, error_message, ok, ACCOUNT_ID};
 /// AWS's own sentence for this refusal, spelled out here rather than read from the service's
 /// constant: what the rule requires is this exact text on the wire, so the expectation may
 /// not be the very value under test.
-const UNIFIED_ONLY: &str = "This operation is only supported for the Unified Connections";
+const UNIFIED_ONLY: &str = "TestConnection is only supported for the Unified Connections";
 
 /// The legacy connection kinds a `CreateConnection` admits with the JDBC-shaped properties
 /// below, so a stored definition of each can be addressed by name. The rest of
@@ -157,6 +157,56 @@ async fn the_unified_only_refusal_is_aws_fixed_sentence() {
         "the service's own constant must carry AWS's sentence, got {:?}",
         messages::TEST_CONNECTION_UNIFIED_ONLY
     );
+}
+
+/// The SUBJECT of the sentence is the restricted operation, named as this API names it: a
+/// client reading the refusal is told which call the restriction is about, and no generic
+/// stand-in ("This operation", "The operation") takes that place. The rows span the two forms
+/// a definition under test arrives in and a legacy kind of each.
+#[tokio::test]
+async fn the_unified_only_refusal_names_the_restricted_operation() {
+    let router = emulator();
+    given_connection(&router, "stored-mongodb", "MONGODB").await;
+
+    // The operation the restriction is a restriction on, as the model names it
+    // (`smithy_query(query="operation",operation="TestConnection")`).
+    const OPERATION: &str = "TestConnection";
+
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "an inline SFTP definition",
+            json!({
+                "TestConnectionInput": {
+                    "ConnectionType": "SFTP",
+                    "ConnectionProperties": jdbc_properties(),
+                },
+            }),
+        ),
+        (
+            "a stored MONGODB connection",
+            json!({ "ConnectionName": "stored-mongodb" }),
+        ),
+    ];
+
+    for (case, body) in rows {
+        let actual = refusal_message(case, &router, &body).await;
+        assert!(
+            actual.starts_with(&format!("{OPERATION} ")),
+            "case {case}: the sentence names the restricted operation first, expected it to \
+             open with {OPERATION:?}, got {actual:?}"
+        );
+        for stand_in in ["This operation", "The operation", "This API"] {
+            assert!(
+                !actual.starts_with(stand_in),
+                "case {case}: a generic subject takes no place of the operation's name, \
+                 got {actual:?}"
+            );
+        }
+        assert_eq!(
+            actual, UNIFIED_ONLY,
+            "case {case}: expected {UNIFIED_ONLY:?}, got {actual:?}"
+        );
+    }
 }
 
 /// The restriction's sentence is its OWN, not one of the other `TestConnection` refusals

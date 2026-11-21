@@ -810,7 +810,9 @@ async fn a_vpc_configuration_the_service_cannot_provision_is_refused() {
 
 // ---------------------------------------------------------------------------
 // RULE: a value outside the set an enum member is judged by is refused with the
-// sentence this service states for that member, wherever the model puts it.
+// sentence this service states for that member, wherever the model puts it — and that
+// sentence names the member by its OWN name, never by the path the request spelled it
+// at.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -824,14 +826,19 @@ async fn a_value_outside_an_enum_member_is_refused_in_the_services_own_sentence(
         (
             "an authenticationMode in the wrong case",
             serde_json::json!({ "accessConfig": { "authenticationMode": "api" } }),
-            "The value of accessConfig.authenticationMode must be one of \
-             [API, API_AND_CONFIG_MAP, CONFIG_MAP]",
+            "authenticationMode must be one of [API, API_AND_CONFIG_MAP, CONFIG_MAP]",
         ),
         (
             "an authenticationMode nothing declares",
             serde_json::json!({ "accessConfig": { "authenticationMode": "NONE" } }),
-            "The value of accessConfig.authenticationMode must be one of \
-             [API, API_AND_CONFIG_MAP, CONFIG_MAP]",
+            "authenticationMode must be one of [API, API_AND_CONFIG_MAP, CONFIG_MAP]",
+        ),
+        (
+            // Another member of another nested structure, so the rule holds for a member
+            // this operation reads at a different depth and from a different enum.
+            "a supportType nothing declares",
+            serde_json::json!({ "upgradePolicy": { "supportType": "LONG" } }),
+            "supportType must be one of [STANDARD, EXTENDED]",
         ),
         (
             "a log type in the wrong case",

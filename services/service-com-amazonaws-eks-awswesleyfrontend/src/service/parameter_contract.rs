@@ -131,18 +131,19 @@ pub fn refusal_message(violations: &[Violation]) -> Option<String> {
             Some(state::max_results_range_message())
         }
         // Every member judged by an enum's value set that this API states no sentence
-        // of its own for: the sentence names the member by its PATH from the request
-        // root and the values it accepts, both read off the violation, so they are the
-        // set the model declares, in the order it declares them.
+        // of its own for: the sentence names the member by its OWN name and the values it
+        // accepts, both read off the violation, so they are the set the model declares, in
+        // the order it declares them. A member nested in a structure is named by that
+        // member alone — the recorded refusal of an `accessConfig.authenticationMode`
+        // outside its set names `authenticationMode` and no parent.
         //
         // The two members whose sentence is their operation's own — a capability
         // `type` and an add-on `resolveConflicts` — never reach this seam: both are
         // answered before dispatch, in the sentence that operation states (see
         // [`super::off_enum_member_contract`]).
-        ViolationKind::EnumValue(declared) => Some(state::value_must_be_one_of_message(
-            &violation.path,
-            declared,
-        )),
+        ViolationKind::EnumValue(declared) => {
+            Some(state::value_must_be_one_of_message(member, declared))
+        }
         _ => None,
     }
 }
@@ -363,12 +364,12 @@ mod tests {
                 Some("api"),
             )])
             .as_deref(),
-            Some("The value of authenticationMode must be one of [API, API_AND_CONFIG_MAP, CONFIG_MAP]"),
+            Some("authenticationMode must be one of [API, API_AND_CONFIG_MAP, CONFIG_MAP]"),
             "another enum member earns the sentence naming it and the values it accepts"
         );
 
-        // And a member NESTED in a structure is named by its path from the request
-        // root, which is how the request spells it.
+        // And a member NESTED in a structure is named by its OWN name, not by the path the
+        // request spelled it at.
         assert_eq!(
             refusal_message(&[violation(
                 "connectorConfig.provider",
@@ -381,8 +382,8 @@ mod tests {
                 Some("eks_anywhere"),
             )])
             .as_deref(),
-            Some("The value of connectorConfig.provider must be one of [EKS_ANYWHERE, OTHER]"),
-            "a nested enum member is named by its path from the request root"
+            Some("provider must be one of [EKS_ANYWHERE, OTHER]"),
+            "a nested enum member is named by the member alone"
         );
 
         // A value INSIDE a collection, judged against an enum this API states no
