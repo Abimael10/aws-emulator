@@ -134,6 +134,17 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // emulator provisions over this signing name is that service's
     // (`crate::state::provisioner`'s pipeline, custom-action-type and webhook arms).
     ("codepipeline", "CodePipeline", SdkDiagnostic::Attempts),
+    // Amazon Data Lifecycle Manager's SDK names it `Dlm` — that model's own `sdkId` (`DLM`) with
+    // only the initial capitalised, exactly as Amazon RDS's and Amazon EC2's below are — and
+    // words the ATTEMPT-counting shape, as the recorded `ResourceStatusReason` of an
+    // `AWS::DLM::LifecyclePolicy` whose declared execution role names a principal in another
+    // account carries it (in the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `cloudformation__dlm.deploy-cfn-dlm-lifecyclepolicy-cross-account-role-rejected`, whose
+    // reason reads `Resource handler returned message: "<the service's sentence> (Service: Dlm,
+    // Status Code: 403, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …,
+    // HandlerErrorCode: AccessDenied)`). The one resource type this emulator provisions over
+    // this signing name is that service's ([`provisioner::dlm_lifecycle_policies`]).
+    ("dlm", "Dlm", SdkDiagnostic::Attempts),
     // Amazon EC2's SDK names it by that model's own `sdkId` (`EC2`,
     // `smithy_query(query="service_info")` on that service's model) written as one word with a
     // capital initial, exactly as Amazon RDS's below is, and words the diagnostic with the

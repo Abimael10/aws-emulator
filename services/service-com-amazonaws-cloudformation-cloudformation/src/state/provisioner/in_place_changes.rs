@@ -627,6 +627,14 @@ impl Provisioner {
             Self::RbinRule => update_rbin_rule(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `UpdateLifecyclePolicy` reconfigures the lifecycle policy the stack created, by the
+            // id Amazon Data Lifecycle Manager minted for it, taking its description, its
+            // activation state, the role it runs under and its whole configuration — so a changed
+            // declaration of one of those is applied to that policy rather than replacing it. Its
+            // tags travel separately ([`Self::retag`]).
+            Self::DlmLifecyclePolicy => update_dlm_lifecycle_policy(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // Each entity's own `Update…` reconfigures the one the stack created, by the ARN
             // AWS Network Security Manager minted for it, taking the description and the
             // configuration or associations it enforces — so a changed declaration of one of
@@ -795,6 +803,13 @@ impl Provisioner {
             // up carrying is reconciled.
             Self::RbinRule => {
                 retag_rbin_rule(ctx, region, resource, declared, propagated).await
+            }
+            // A lifecycle policy's tags are Amazon Data Lifecycle Manager's own `TagResource` and
+            // `UntagResource`: `CreateLifecyclePolicy`'s `Tags` map applies to the policy that
+            // call creates, and `UpdateLifecyclePolicy` carries no tags at all, so this is where
+            // the set a policy is to end up carrying is reconciled.
+            Self::DlmLifecyclePolicy => {
+                retag_dlm_lifecycle_policy(ctx, region, resource, declared, propagated).await
             }
             // A hypervisor's tags are Backup Gateway's own `TagResource` and `UntagResource`:
             // `ImportHypervisorConfiguration`'s `Tags` list applies to the hypervisor that call

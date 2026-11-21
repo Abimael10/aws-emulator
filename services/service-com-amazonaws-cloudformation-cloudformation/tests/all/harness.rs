@@ -385,6 +385,12 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             Arc::clone(&engine),
         ),
     );
+    // Amazon Data Lifecycle Manager, for the `AWS::DLM::LifecyclePolicy` a stack really creates
+    // there, so a suite that deploys one reads the policy back through that service's own wire,
+    // by the id the stack publishes.
+    router.register_service(
+        service_com_amazonaws_dlm_dlm_20180112::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 

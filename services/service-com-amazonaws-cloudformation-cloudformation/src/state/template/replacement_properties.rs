@@ -204,6 +204,12 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // "currently not supported. You can't update a retention rule's resource type after
         // creation" — so a declaration naming another type asks for a different rule.
         RBIN_RULE => &["ResourceType"],
+        // A lifecycle policy keeps the KIND of default policy it was created as: `DefaultPolicy`
+        // is a member of `CreateLifecyclePolicy` ("Specify the type of default policy to
+        // create") and of no member of `UpdateLifecyclePolicy`, whose `PolicyDetails` is
+        // documented "You cannot update the policy type or the resource type" — so a
+        // declaration naming another kind asks for a different policy.
+        DLM_LIFECYCLE_POLICY => &["DefaultPolicy"],
         // Each AWS Network Security Manager entity keeps the FIREWALL TYPE it was created for:
         // `firewallType` is a member of `CreateRule`, `CreateTemplate` and `CreatePolicy`, and
         // of no member of the matching `Update…` (each takes the entity's description and the

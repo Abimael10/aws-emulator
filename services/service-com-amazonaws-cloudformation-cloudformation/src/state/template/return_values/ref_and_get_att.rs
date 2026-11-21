@@ -2264,6 +2264,26 @@ pub(crate) fn return_values(
             );
             (arn, attributes)
         }
+        // Amazon Data Lifecycle Manager's own control plane: the lifecycle policy an
+        // `AWS::DLM::LifecyclePolicy` declares. "Ref returns the policy id" — the `PolicyId`
+        // every call of that service on a policy takes — and `Fn::GetAtt` reads `Arn`. That
+        // service MINTS the id: `CreateLifecyclePolicy` takes no identifier for the policy and
+        // answers the `PolicyId` it assigned (`^policy-[a-f0-9]+$`), with the `PolicyArn` built
+        // around it, so the two values here are STAND-INS of the forms its own model fixes,
+        // which `super::provisioning` re-points at what that service really answered
+        // ([`super::provisioner::Provisioner::DlmLifecyclePolicy`]).
+        DLM_LIFECYCLE_POLICY => {
+            let id = generated_service_id(DLM_POLICY_ID_PREFIX, name, DLM_POLICY_ID_DIGITS);
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    DLM_ARN_NAMESPACE,
+                    region,
+                    &format!("{DLM_LIFECYCLE_POLICY_PATH}/{id}"),
+                ),
+            );
+            (id, attributes)
+        }
         // Neptune Analytics' own control plane: the graph an `AWS::NeptuneGraph::Graph`
         // declares and the snapshot an `AWS::NeptuneGraph::GraphSnapshot` declares. "Ref
         // returns the graph id" / the snapshot id — each type's primary identifier — and a

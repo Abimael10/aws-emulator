@@ -500,7 +500,7 @@ use super::template::{
     CODEPIPELINE_WEBHOOK,
     DIRECT_CONNECT_GATEWAY, DIRECT_CONNECT_RESILIENCY_GROUP,
     AUTOSCALING_GROUP, CUSTOMER_PROFILES_DOMAIN,
-    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_LAUNCH_TEMPLATE, EC2_SECURITY_GROUP,
+    COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, DLM_LIFECYCLE_POLICY, EC2_LAUNCH_TEMPLATE, EC2_SECURITY_GROUP,
     EC2_SUBNET,
     EC2_VOLUME, EC2_VPC,
     ECR_PUBLIC_REPOSITORY, ECR_REPOSITORY, ECS_CLUSTER, ECS_SERVICE, EKS_ACCESS_ENTRY,
@@ -1386,6 +1386,14 @@ pub(super) enum Provisioner {
     /// identifier inside it is the handle every call on a rule takes
     /// ([`rbin_rules`]).
     RbinRule,
+    /// `AWS::DLM::LifecyclePolicy`: the Amazon Data Lifecycle Manager lifecycle policy
+    /// `CreateLifecyclePolicy` makes out of the configuration the declaration states,
+    /// `UpdateLifecyclePolicy` reconfigures and `DeleteLifecyclePolicy` removes. That service
+    /// MINTS the policy's id — the create takes no identifier at all — so the `PolicyId` it
+    /// answered is the resource's physical id and the handle every call on a policy takes, and
+    /// the `PolicyArn` it built around that id is the one attribute the type publishes
+    /// ([`dlm_lifecycle_policies`]).
+    DlmLifecyclePolicy,
     /// `AWS::NetworkSecurityManager::{Rule,Template,Policy,Scope}`: the rule, the template,
     /// the policy and the scope AWS Network Security Manager's own `CreateRule`,
     /// `CreateTemplate`, `CreatePolicy` and `CreateScope` make, the matching `Update…`
@@ -1695,6 +1703,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         NEPTUNE_GRAPH_GRAPH => Some(Provisioner::NeptuneGraphGraph),
         NEPTUNE_GRAPH_GRAPH_SNAPSHOT => Some(Provisioner::NeptuneGraphGraphSnapshot),
         RBIN_RULE => Some(Provisioner::RbinRule),
+        DLM_LIFECYCLE_POLICY => Some(Provisioner::DlmLifecyclePolicy),
         // Each AWS Network Security Manager entity names which of the four it is, so the one
         // set of arms serves every type; the catalogue still lists every provisioned type here.
         NETWORK_SECURITY_MANAGER_RULE => Some(Provisioner::NetworkSecurityManagerEntity(
@@ -2624,6 +2633,12 @@ impl Provisioner {
             // own, so a retention rule a stack creates carries the tags CloudFormation gives
             // it beside the ones the declaration asks for.
             Self::RbinRule => create_rbin_rule(ctx, region, resource, propagated).await,
+            // `AWS::DLM::LifecyclePolicy` publishes `Tags`, and `CreateLifecyclePolicy` takes a
+            // `TagMap` of its own, so a lifecycle policy a stack creates carries the tags
+            // CloudFormation gives it beside the ones the declaration asks for.
+            Self::DlmLifecyclePolicy => {
+                create_dlm_lifecycle_policy(ctx, region, resource, propagated).await
+            }
             // Every `AWS::NetworkSecurityManager::*` type publishes `Tags`, and each of their
             // creates takes a `tags` MAP of its own, so an entity a stack creates carries the
             // tags CloudFormation gives it beside the ones the declaration asks for.
@@ -2807,6 +2822,11 @@ impl Provisioner {
                 // one check its own crate's tag validation makes — so a retention rule carries
                 // the stack's own tags without the three.
                 | Self::RbinRule
+                // Amazon Data Lifecycle Manager refuses a tag key in the reserved namespace on
+                // every call that takes tags — `CreateLifecyclePolicy`'s own `Tags` map and
+                // `TagResource` alike, in the one check its own crate's tag validation makes — so
+                // a lifecycle policy carries the stack's own tags without the three.
+                | Self::DlmLifecyclePolicy
                 // Neptune Analytics refuses a tag key in the reserved namespace on every call
                 // that takes tags — the `tags` map of each create and `TagResource` alike, in
                 // the one check its own crate's tag validation makes — so a graph and a
@@ -3674,6 +3694,11 @@ impl Provisioner {
             // The delete addresses the rule by the identifier inside the ARN Recycle Bin
             // minted for it, which is this resource's physical id.
             Self::RbinRule => delete_rbin_rule(ctx, region, physical_resource_id).await,
+            // The delete addresses the policy by the id Amazon Data Lifecycle Manager minted for
+            // it, which is this resource's physical id.
+            Self::DlmLifecyclePolicy => {
+                delete_dlm_lifecycle_policy(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the entity by the ARN AWS Network Security Manager minted
             // for it, which is this resource's physical id.
             Self::NetworkSecurityManagerEntity(entity) => {
@@ -3799,6 +3824,10 @@ mod customer_profiles_domains;
 /// Visible to the rest of this service's state because the LOCK STATE a declaration asks for
 /// is read by the return-value catalogue too, beside the arms that provision the rule.
 pub(in crate::state) mod rbin_rules;
+/// The Amazon Data Lifecycle Manager LIFECYCLE POLICY arms: the policy an
+/// `AWS::DLM::LifecyclePolicy` declares, created in the service that owns it so a client's own
+/// `GetLifecyclePolicy` and `GetLifecyclePolicies` resolve the identity the stack publishes.
+mod dlm_lifecycle_policies;
 /// The AWS Network Security Manager arms: the rule, the template, the policy and the scope an
 /// `AWS::NetworkSecurityManager::*` declares, created in the service that owns them so a
 /// client's own `ListRules`, `ListTemplates`, `ListPolicies` and `Get…` resolve the identities
@@ -4018,6 +4047,7 @@ pub(in crate::state) mod directory_service_directories;
 use directory_service_directories::*;
 use customer_profiles_domains::*;
 use rbin_rules::*;
+use dlm_lifecycle_policies::*;
 use network_security_manager::*;
 use neptune_graphs::*;
 use glue_table_optimizers::*;

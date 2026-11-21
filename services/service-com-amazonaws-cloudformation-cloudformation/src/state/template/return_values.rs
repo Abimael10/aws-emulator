@@ -354,6 +354,10 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // the lock state it keeps, all three of which these naming rules compute a stand-in
         // for before the rule exists.
         RBIN_RULE => RBIN_RULE_ATTRIBUTES,
+        // A lifecycle policy publishes the ARN Amazon Data Lifecycle Manager built around the
+        // id it minted, which these naming rules compute a stand-in for before the policy
+        // exists.
+        DLM_LIFECYCLE_POLICY => DLM_LIFECYCLE_POLICY_ATTRIBUTES,
         // Each AWS Network Security Manager entity publishes the ARN that service minted for
         // it and the id inside that ARN, both of which these naming rules compute a stand-in
         // for before the entity exists.
@@ -1005,6 +1009,15 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // `UpdateRule` and `DeleteRule` each address a rule by. A name CloudFormation decides
         // satisfies neither, so the identity in force is the one that service answered.
         || resource_type == RBIN_RULE
+        // An AMAZON DATA LIFECYCLE MANAGER lifecycle policy is one more:
+        // `CreateLifecyclePolicy` takes no identifier for the policy — the declaration states the
+        // role it runs under, its activation state and the configuration it runs — and answers
+        // the `PolicyId` that service minted (`^policy-[a-f0-9]+$`), which is what "Ref returns
+        // the policy id" publishes and what `GetLifecyclePolicy`, `UpdateLifecyclePolicy` and
+        // `DeleteLifecyclePolicy` each address a policy by. A name CloudFormation decides
+        // satisfies that pattern for no template, so the identity in force is the one that
+        // service answered.
+        || resource_type == DLM_LIFECYCLE_POLICY
         // The four AWS NETWORK SECURITY MANAGER entities are four more: `CreateRule`,
         // `CreateTemplate`, `CreatePolicy` and `CreateScope` each take the entity's NAME and
         // no identifier at all, and each answers the `…Id` that service minted

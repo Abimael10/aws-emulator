@@ -3064,6 +3064,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // The Recycle Bin retention rule, publishing the ARN and the identifier that service
     // mints for it and the lock state it keeps.
     RBIN_RULE,
+    // The Amazon Data Lifecycle Manager lifecycle policy, publishing the ARN that service
+    // builds around the policy id it mints.
+    DLM_LIFECYCLE_POLICY,
     // The AWS Direct Connect gateway and resiliency group, each publishing the identifier
     // that service mints for it, inside the ARN its `Ref` returns.
     DIRECT_CONNECT_GATEWAY,

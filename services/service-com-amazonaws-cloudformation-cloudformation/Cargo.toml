@@ -341,6 +341,11 @@ service-com-amazonaws-networksecuritymanager-piccolocustomerapiservice = { works
 # and the gateway and the group the stack published are read back through that service's own
 # wire.
 service-com-amazonaws-directconnect-overtureservice = { workspace = true }
+# Amazon Data Lifecycle Manager, for the `AWS::DLM::LifecyclePolicy` a stack really creates
+# there (`state::provisioner::dlm_lifecycle_policies`): a suite that deploys one must have its
+# owning service mounted beside CloudFormation, or the create is refused and the stack fails —
+# and the lifecycle policy the stack published is read back through that service's own wire.
+service-com-amazonaws-dlm-dlm-20180112 = { workspace = true }
 
 [lints]
 workspace = true

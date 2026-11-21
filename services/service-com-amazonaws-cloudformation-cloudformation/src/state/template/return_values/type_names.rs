@@ -862,6 +862,40 @@ pub(super) const RBIN_RULE_PATH: &str = "rule";
 pub(super) const RBIN_RULE_ID_SALT: &str = "rbin/rule";
 pub(super) const RBIN_RULE_ID_DIGITS: usize = 11;
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of an AMAZON DATA LIFECYCLE MANAGER
+/// LIFECYCLE POLICY: the policy that automates the creation, retention and deletion of EBS
+/// snapshots and EBS-backed AMIs, which that service's own `CreateLifecyclePolicy` makes. The
+/// middle segment is that model's own `awsService.cloudFormationName` (`DLM`).
+///
+/// "Ref returns the policy id" — what every call of that service on a policy takes as its
+/// `PolicyId` — and `Fn::GetAtt` reads [`DLM_LIFECYCLE_POLICY_ATTRIBUTES`]. Amazon Data
+/// Lifecycle Manager MINTS that id (`^policy-[a-f0-9]+$`, which no name CloudFormation decides
+/// satisfies) and builds the `PolicyArn` around it, and the create takes no identifier at all,
+/// which is why [`identity_is_service_assigned`] names this type: the identity in force is the
+/// one that service answered.
+pub const DLM_LIFECYCLE_POLICY: &str = "AWS::DLM::LifecyclePolicy";
+
+/// The one `Fn::GetAtt` attribute a [`DLM_LIFECYCLE_POLICY`] publishes: the ARN of the policy,
+/// from the type's own "Return values" section.
+///
+/// It is that service's to build — around the id it minted — so it is a STAND-IN of the form its
+/// own model fixes (`PolicyArn`:
+/// `^arn:aws(-[a-z]{1,3}){0,2}:dlm:[A-Za-z0-9_/.-]{0,63}:\d+:policy/[0-9A-Za-z_-]{1,128}$`) until
+/// [`crate::state::provisioner`] has reported the ARN that service really holds the policy under.
+pub(super) const DLM_LIFECYCLE_POLICY_ATTRIBUTES: &[&str] = &["Arn"];
+
+/// Amazon Data Lifecycle Manager's ARN namespace, which is the namespace a policy ARN carries
+/// (that model's own `awsService.arnNamespace`, and that same `PolicyArn` pattern), and the
+/// resource path such an ARN carries before the id that service minted.
+pub(super) const DLM_ARN_NAMESPACE: &str = "dlm";
+pub(super) const DLM_LIFECYCLE_POLICY_PATH: &str = "policy";
+
+/// The prefix a policy id carries and how many hexadecimal characters follow it: a `PolicyId` is
+/// `^policy-[a-f0-9]+$`, so the stand-in opens with that prefix and carries sixteen lower-case
+/// hexadecimal digits.
+pub(super) const DLM_POLICY_ID_PREFIX: &str = "policy";
+pub(super) const DLM_POLICY_ID_DIGITS: usize = 16;
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of a NEPTUNE ANALYTICS graph: the graph
 /// database that service's own `CreateGraph` makes. The middle segment is the one the
 /// resource-type namespace publishes (`NeptuneGraph`), which is that model's own
