@@ -22,6 +22,14 @@
 //! live issuance stands behind is refused `AccessDeniedException` before anything the request
 //! named is resolved.
 //!
+//! The last four cases are the plane's other half of the same flow:
+//! `CompleteResourceTokenAuth`, which CONFIRMS a user authorization session this account had
+//! issued. A session is a record of this plane's own making, held with the user the
+//! authorization was started for, so only a session this plane handed out, inside its own
+//! window, for the very user the confirmation acts for is confirmed; every other session URI
+//! — one no initiation ever handed out included — is refused with the single fixed sentence
+//! AWS words that gate with, and confirms nothing.
+//!
 //! Every case drives real HTTP through the same `MultiServiceRouter` the emulator serves
 //! with, so the wire shape (route, status code, `restJson1` body, modelled error code) is
 //! exercised, not just the handler function.
@@ -1024,4 +1032,475 @@ async fn the_api_key_call_refuses_a_token_no_live_issuance_backs() {
         status, 404,
         "a live token must get past the token check, got {status} with {body:?}"
     );
+}
+
+// --- confirming a user authorization session of the resource-token flow --------------------
+//
+// `CompleteResourceTokenAuth` is the second half of the plane's OAuth2 resource-token flow:
+// the session a `sessionUri` names is a record of this plane's own making, held with the user
+// the authorization was started for, and confirming one is accepted only for a session this
+// account had issued, inside its own window, for the very user the confirmation acts for.
+// Every other session URI is one refusal class, with the single fixed sentence AWS words it
+// with, so an unrecognized session is never read as a completed authorization.
+
+/// `CompleteResourceTokenAuth`: `POST /identities/CompleteResourceTokenAuth` (source:
+/// smithy_query query="operation" operation="CompleteResourceTokenAuth": `http`).
+const COMPLETE_ROUTE: &str = "/identities/CompleteResourceTokenAuth";
+
+/// The one sentence the plane refuses a resource-token session it does not accept with: fixed
+/// text carrying no part of the request. Spelled out here rather than read off the emulator,
+/// so the assertion states the expectation instead of restating the code.
+const SESSION_REFUSED_MESSAGE: &str = "Invalid or expired session";
+
+/// The sentence the plane refuses an EXPIRED user bearer token with.
+const EXPIRED_USER_TOKEN_MESSAGE: &str = "Token has expired";
+
+/// The sentence the plane refuses a user bearer token it cannot accept for any other reason
+/// with.
+const INVALID_USER_TOKEN_MESSAGE: &str = "Invalid JWT token";
+
+/// `CompleteResourceTokenAuth` naming `session_uri`, for the user `user_identifier` resolves
+/// to.
+async fn complete_resource_token_auth(
+    router: &MultiServiceRouter,
+    user_identifier: Value,
+    session_uri: &str,
+) -> (u16, Value) {
+    post(
+        router,
+        "us-east-1",
+        COMPLETE_ROUTE,
+        json!({"userIdentifier": user_identifier, "sessionUri": session_uri}),
+    )
+    .await
+}
+
+/// `time` as RFC 7519 §2's NumericDate — whole seconds since the epoch, which is how a claim
+/// carries an instant.
+fn numeric_date(time: SystemTime) -> i64 {
+    i64::try_from(
+        time.duration_since(SystemTime::UNIX_EPOCH)
+            .expect("the clock is past the epoch")
+            .as_secs(),
+    )
+    .expect("the instant fits an i64")
+}
+
+/// A compact JWS carrying `claims`, with a JOSE header naming a signing algorithm and a
+/// non-empty signature segment: the form a caller presents as the user's own identity
+/// provider token. Its segments are base64url, so the value is inside `UserTokenType`'s
+/// `@pattern`.
+fn presented_user_token(claims: &Value) -> String {
+    format!(
+        "{}.{}.{}",
+        service_common::jwt::encode_base64url(br#"{"alg":"RS256","typ":"JWT","kid":"k1"}"#),
+        service_common::jwt::encode_base64url(claims.to_string().as_bytes()),
+        service_common::jwt::encode_base64url(b"presented-signature")
+    )
+}
+
+/// A user bearer token for `subject`, inside its own window at this instant.
+fn user_token_for(subject: &str) -> String {
+    let seconds = numeric_date(SystemTime::now());
+    presented_user_token(&json!({"sub": subject, "iat": seconds - 30, "exp": seconds + 600}))
+}
+
+/// Hand out one PENDING user authorization session for `user`, the way the initiation of the
+/// flow records one: handed out `age` ago, for the plane's own window. The test reaches into
+/// the store the handlers share rather than waiting for a clock, which is not an emulator
+/// behaviour.
+fn handed_out_session(
+    engine: &engine::InMemoryEngine,
+    user: &str,
+    age: Duration,
+    seq: u64,
+) -> String {
+    let issued_at = SystemTime::now() - age;
+    let session_uri = agentcore::state::mint_resource_token_session_uri(issued_at, seq);
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    state.lock().resource_token_auth_sessions.record(
+        session_uri.clone(),
+        agentcore::state::ResourceTokenAuthSession {
+            workload_name: "exchange.agent".to_string(),
+            resource_credential_provider_name: "partner-api".to_string(),
+            user_id: user.to_string(),
+            issued_at,
+            expires_at: issued_at + agentcore::state::RESOURCE_TOKEN_AUTH_SESSION_TTL,
+            confirmed_at: None,
+            seq,
+        },
+        issued_at,
+    );
+    session_uri
+}
+
+/// When the session `session_uri` was confirmed, as the store holds it at this instant, and
+/// `None` while it is still pending or no live session stands behind the URI at all.
+fn session_confirmed_at(
+    engine: &engine::InMemoryEngine,
+    session_uri: &str,
+) -> Option<SystemTime> {
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    let store = state.lock();
+    store
+        .resource_token_auth_sessions
+        .issued(session_uri, SystemTime::now())
+        .and_then(|held| held.confirmed_at)
+}
+
+/// Whether the store holds a live session under `session_uri` at this instant.
+fn session_is_live(engine: &engine::InMemoryEngine, session_uri: &str) -> bool {
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    let store = state.lock();
+    store
+        .resource_token_auth_sessions
+        .issued(session_uri, SystemTime::now())
+        .is_some()
+}
+
+/// A session this account had issued is confirmed for the user it was started for: the call
+/// answers the modelled empty 200 output and the confirmation is written, so a later read of
+/// the session carries it.
+///
+/// The rows differ along the form of the `userIdentifier` (a `userId`, and the user's own
+/// bearer token, whose subject is the user) and the form of the user itself (both published
+/// bounds of `UserIdType`'s 1..128 length, an opaque identifier and one that is an address;
+/// source: smithy_query query="shape" shape="UserIdentifier"), and along how long ago the
+/// session was handed out.
+#[tokio::test]
+async fn a_session_this_account_issued_is_confirmed_for_its_own_user() {
+    let (router, engine) = emulator();
+
+    let long_user = "u".repeat(128);
+    let cases: Vec<(&str, String, bool, Duration)> = vec![
+        (
+            "a user id, handed out a moment ago",
+            "sim2real-test".to_string(),
+            false,
+            Duration::from_secs(1),
+        ),
+        (
+            "the shortest user id the shape admits",
+            "u".to_string(),
+            false,
+            Duration::from_secs(30),
+        ),
+        (
+            "the longest user id the shape admits",
+            long_user,
+            false,
+            Duration::from_secs(5),
+        ),
+        (
+            "an opaque user id, confirmed with the user's own token",
+            "a3f1c0de-0000-4a1b-9c2d-5e6f70819203".to_string(),
+            true,
+            Duration::from_secs(10),
+        ),
+        (
+            "a user id that is an address, confirmed with the user's own token",
+            "user@example.com".to_string(),
+            true,
+            Duration::from_secs(60),
+        ),
+    ];
+
+    for (index, (case, user, by_token, age)) in cases.into_iter().enumerate() {
+        let seq = u64::try_from(index).unwrap_or(0) + 1;
+        let session_uri = handed_out_session(&engine, &user, age, seq);
+        assert_eq!(
+            session_confirmed_at(&engine, &session_uri),
+            None,
+            "case {case:?}: expected the handed-out session to be pending"
+        );
+        let identifier = if by_token {
+            json!({"userToken": user_token_for(&user)})
+        } else {
+            json!({"userId": user})
+        };
+
+        let (status, body) =
+            complete_resource_token_auth(&router, identifier.clone(), &session_uri).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body:?}"
+        );
+        // The modelled output declares no member at all, so the answer carries none.
+        assert!(
+            body.as_object().is_none_or(|members| members.is_empty()),
+            "case {case:?}: expected an empty output, got {body:?}"
+        );
+        let confirmed = session_confirmed_at(&engine, &session_uri);
+        assert!(
+            confirmed.is_some(),
+            "case {case:?}: expected the confirmation to be recorded on the session, got \
+             {confirmed:?}"
+        );
+
+        // Confirming the same session again states the same confirmation rather than a second
+        // one: the instant the first call wrote stands.
+        let (status, body) =
+            complete_resource_token_auth(&router, identifier, &session_uri).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected confirming twice to answer 200, got {status} with {body:?}"
+        );
+        assert_eq!(
+            session_confirmed_at(&engine, &session_uri),
+            confirmed,
+            "case {case:?}: expected the instant of the first confirmation to stand"
+        );
+
+        // Only this session was touched: a session of another user handed out beside it is
+        // still pending.
+        let other = handed_out_session(&engine, "someone-else", Duration::from_secs(1), seq + 100);
+        assert_eq!(
+            session_confirmed_at(&engine, &other),
+            None,
+            "case {case:?}: expected another user's session to stay pending"
+        );
+    }
+}
+
+/// A `sessionUri` no live authorization of this account stands behind is refused
+/// `AccessDeniedException` (HTTP 403) with the one fixed sentence of that gate, and confirms
+/// nothing — a well-formed URI inside the modelled pattern that no initiation ever handed out
+/// included, which is the whole point of the gate: an unrecognized session is not a completed
+/// authorization.
+///
+/// The rows span why no live session backs the URI: two well-formed URIs this plane never
+/// handed out (one at the longest length the shape admits), a session whose window the clock
+/// has closed, and a live session handed out for ANOTHER user, asked for both by that other
+/// user's id and by that other user's own bearer token.
+#[tokio::test]
+async fn a_session_no_live_authorization_backs_is_refused_with_403() {
+    let (router, engine) = emulator();
+
+    let closed = handed_out_session(
+        &engine,
+        "sim2real-test",
+        agentcore::state::RESOURCE_TOKEN_AUTH_SESSION_TTL + Duration::from_secs(60),
+        1,
+    );
+    let someone_elses = handed_out_session(&engine, "user-1", Duration::from_secs(5), 2);
+    // Inside `RequestUri`'s `^urn:ietf:params:oauth:request_uri:[a-zA-Z0-9-._~]+$`, so the
+    // request reaches the handler and is refused by the gate rather than by a constraint.
+    let never_issued = "urn:ietf:params:oauth:request_uri:9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+    let longest = format!(
+        "urn:ietf:params:oauth:request_uri:{}",
+        "a-b._c~0".repeat(123)
+    );
+
+    let cases: Vec<(&str, String, Value)> = vec![
+        (
+            "a-well-formed-uri-no-initiation-ever-handed-out",
+            never_issued.to_string(),
+            json!({"userId": "sim2real-test"}),
+        ),
+        (
+            "the-longest-uri-the-shape-admits-handed-out-by-nobody",
+            longest.clone(),
+            json!({"userId": "sim2real-test"}),
+        ),
+        (
+            "a-session-whose-window-the-clock-has-closed",
+            closed.clone(),
+            json!({"userId": "sim2real-test"}),
+        ),
+        (
+            "a-session-handed-out-for-another-user",
+            someone_elses.clone(),
+            json!({"userId": "sim2real-test"}),
+        ),
+        (
+            "another-users-session-asked-for-with-a-token-of-a-third-subject",
+            someone_elses.clone(),
+            json!({"userToken": user_token_for("user-2")}),
+        ),
+    ];
+
+    assert!(
+        longest.len() <= 1_024,
+        "the longest row must stay inside the shape's 1..1024 length, got {}",
+        longest.len()
+    );
+
+    for (case, session_uri, identifier) in cases {
+        let (status, body) =
+            complete_resource_token_auth(&router, identifier, &session_uri).await;
+        assert_eq!(
+            status, 403,
+            "case {case:?}: expected HTTP 403, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "AccessDeniedException",
+            "case {case:?}: expected AccessDeniedException, got {body:?}"
+        );
+        assert_eq!(
+            text(&body, "message"),
+            SESSION_REFUSED_MESSAGE,
+            "case {case:?}: expected {SESSION_REFUSED_MESSAGE:?}, got {body:?}"
+        );
+        // Fixed text: the refusal quotes neither the session asked about nor the user.
+        assert!(
+            !text(&body, "message").contains(session_uri.as_str()),
+            "case {case:?}: the sentence must carry no part of the request, got {body:?}"
+        );
+    }
+
+    // Nothing was confirmed: the other user's session is still pending, and the closed one is
+    // still closed.
+    assert_eq!(
+        session_confirmed_at(&engine, &someone_elses),
+        None,
+        "a refused confirmation must leave another user's session pending"
+    );
+    assert!(
+        !session_is_live(&engine, &closed),
+        "a refused confirmation must not revive a session the clock has closed"
+    );
+
+    // The gate is about the session, not about the call: the same request for the session this
+    // user really holds is confirmed.
+    let own = handed_out_session(&engine, "sim2real-test", Duration::from_secs(2), 3);
+    let (status, body) =
+        complete_resource_token_auth(&router, json!({"userId": "sim2real-test"}), &own).await;
+    assert_eq!(
+        status, 200,
+        "the user's own live session must be confirmed, got {status} with {body:?}"
+    );
+}
+
+/// A `userIdentifier` carrying a user bearer token this plane cannot accept is refused
+/// `UnauthorizedException` (HTTP 401) in the sentence of its own class — the token is a value
+/// to be validated, never one to be trusted — and the session the request named stays pending.
+///
+/// The rows span why the token is not accepted: expired, expiring at this very instant, naming
+/// no expiry at all, naming no subject, unsecured (so nothing signed it), and three segments
+/// that are no compact JWS.
+#[tokio::test]
+async fn a_user_token_this_plane_cannot_accept_is_refused_with_401() {
+    let (router, engine) = emulator();
+    let seconds = numeric_date(SystemTime::now());
+    let session_uri = handed_out_session(&engine, "user-1", Duration::from_secs(1), 1);
+
+    let unsecured = format!(
+        "{}.{}.",
+        service_common::jwt::encode_base64url(br#"{"alg":"none","typ":"JWT"}"#),
+        service_common::jwt::encode_base64url(
+            json!({"sub": "user-1", "exp": seconds + 600}).to_string().as_bytes()
+        )
+    );
+
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "expired-a-moment-ago",
+            presented_user_token(&json!({"sub": "user-1", "exp": seconds - 1})),
+            EXPIRED_USER_TOKEN_MESSAGE,
+        ),
+        (
+            "expiring-at-this-very-instant",
+            presented_user_token(&json!({"sub": "user-1", "exp": seconds})),
+            EXPIRED_USER_TOKEN_MESSAGE,
+        ),
+        (
+            "naming-no-expiry",
+            presented_user_token(&json!({"sub": "user-1"})),
+            INVALID_USER_TOKEN_MESSAGE,
+        ),
+        (
+            "naming-no-subject",
+            presented_user_token(&json!({"exp": seconds + 600})),
+            INVALID_USER_TOKEN_MESSAGE,
+        ),
+        ("unsecured-so-nothing-signed-it", unsecured, INVALID_USER_TOKEN_MESSAGE),
+        (
+            "three-segments-that-are-not-base64url-json",
+            "abc.def.ghi".to_string(),
+            INVALID_USER_TOKEN_MESSAGE,
+        ),
+    ];
+
+    for (case, token, expected) in cases {
+        let (status, body) =
+            complete_resource_token_auth(&router, json!({"userToken": token}), &session_uri).await;
+        assert_eq!(
+            status, 401,
+            "case {case:?}: expected HTTP 401, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "UnauthorizedException",
+            "case {case:?}: expected UnauthorizedException, got {body:?}"
+        );
+        assert_eq!(
+            text(&body, "message"),
+            expected,
+            "case {case:?}: expected {expected:?}, got {body:?}"
+        );
+        assert!(
+            !text(&body, "message").contains(&token),
+            "case {case:?}: the refusal must not quote the presented token, got {body:?}"
+        );
+        assert_eq!(
+            session_confirmed_at(&engine, &session_uri),
+            None,
+            "case {case:?}: a refused confirmation must leave the session pending"
+        );
+    }
+}
+
+/// A `CompleteResourceTokenAuth` request outside a modelled constraint is refused with a 400
+/// `ValidationException` and confirms nothing: `sessionUri` outside its
+/// `^urn:ietf:params:oauth:request_uri:[a-zA-Z0-9-._~]+$` pattern, past its 1..1024 length,
+/// and each required member missing (source: smithy_query query="operation"
+/// operation="CompleteResourceTokenAuth").
+#[tokio::test]
+async fn the_confirmation_refuses_input_outside_a_modelled_constraint_with_400() {
+    let (router, engine) = emulator();
+    let session_uri = handed_out_session(&engine, "user-1", Duration::from_secs(1), 1);
+
+    let past_length = format!("urn:ietf:params:oauth:request_uri:{}", "a".repeat(991));
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "session-uri-outside-its-pattern",
+            json!({"userIdentifier": {"userId": "user-1"}, "sessionUri": "not-a-request-uri"}),
+        ),
+        (
+            "session-uri-carrying-a-character-the-pattern-refuses",
+            json!({
+                "userIdentifier": {"userId": "user-1"},
+                "sessionUri": "urn:ietf:params:oauth:request_uri:has spaces",
+            }),
+        ),
+        (
+            "session-uri-past-its-length",
+            json!({"userIdentifier": {"userId": "user-1"}, "sessionUri": past_length}),
+        ),
+        (
+            "no-session-uri-at-all",
+            json!({"userIdentifier": {"userId": "user-1"}}),
+        ),
+        ("no-user-identifier-at-all", json!({"sessionUri": session_uri})),
+        ("neither-member-at-all", json!({})),
+    ];
+
+    for (case, request) in cases {
+        let (status, body) = post(&router, "us-east-1", COMPLETE_ROUTE, request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+        assert_eq!(
+            session_confirmed_at(&engine, &session_uri),
+            None,
+            "case {case:?}: a refused request must confirm nothing"
+        );
+    }
 }

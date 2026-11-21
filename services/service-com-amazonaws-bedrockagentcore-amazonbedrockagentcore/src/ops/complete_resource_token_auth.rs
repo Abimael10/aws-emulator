@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteResourceTokenAuth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteResourceTokenAuth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! The second half of this plane's OAuth2 resource-token flow: the call that CONFIRMS the
+//! user authentication session a `sessionUri` names, once the user it was started for has
+//! authorized.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteResourceTokenAuth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A session is a record of this plane's own making, held with the user the authorization was
+//! started for ([`crate::state::ResourceTokenAuthSessions`]), so this call is decided from
+//! that record rather than from the bytes the request carried:
+//!
+//! 1. the `userIdentifier` is READ for the user it speaks for — a `userId` names one
+//!    directly, while a `userToken` is the user's own OAuth 2.0 bearer token, which is
+//!    validated before anything is confirmed ([`crate::state::user_of_presented_token`]) and,
+//!    when this plane cannot accept it, earns the modelled `UnauthorizedException` (401) that
+//!    class is worded with;
+//! 2. the `sessionUri` is resolved against the sessions this account had issued and CONFIRMED
+//!    for that user ([`crate::state::ResourceTokenAuthSessions::confirm`]). A URI this plane
+//!    never handed out, a session whose window the clock has closed, and one handed out for
+//!    another user are one refusal class: `AccessDeniedException` (403) with the fixed
+//!    sentence of that gate ([`crate::state::INVALID_OR_EXPIRED_SESSION_MESSAGE`]), which
+//!    quotes nothing of the request — so an unrecognized session is never read as a completed
+//!    authorization, and a caller learns nothing about the sessions this account has open.
+//!
+//! Whether the CALLER may complete a session of this account at all is decided first, from
+//! the IAM policies in force on the principal the request signed with
+//! ([`crate::state::authorize`]), as on every other call of this plane. The request names no
+//! resource of its own, so the resource that decision is taken on is the account's token
+//! vault, which the sessions belong to ([`crate::state::token_vault_resource`]).
+//!
+//! The success output is empty: AWS answers HTTP 200 with no member at all, and the
+//! confirmation itself is what a later call of the flow reads off the session.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +180,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteResourceTokenAuth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteResourceTokenAuthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteResourceTokenAuth"))
+        let region = crate::state::request_region(ctx.parts());
+        // The resource this call addresses: the account's token vault, which the sessions of
+        // this flow belong to, built from the request alone — it names no resource of its own.
+        let resource = crate::state::token_vault_resource(&region);
+        // IAM decides BEFORE the session the request named is resolved.
+        crate::state::authorize(&*self.engine, ctx, Self::NAME, &resource)
+            .map_err(CompleteResourceTokenAuthErrorModeled::AccessDeniedException)?;
+
+        let now = ::std::time::SystemTime::now();
+        // Which user the confirmation acts for, which is what the session is bound to.
+        let user_id = user_of(&input.user_identifier, now)?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(missing_state)?;
+        let mut store = state.lock();
+        // Confirming the session is what this operation DOES, so the confirmation is written —
+        // and only for a session this plane handed out, inside its own window, for that very
+        // user. Everything else is the one refusal class of this gate.
+        store
+            .resource_token_auth_sessions
+            .confirm(&input.session_uri, &user_id, now)
+            .ok_or_else(invalid_or_expired_session)?;
+
+        Ok(CompleteResourceTokenAuthOutput {})
     }
+}
+
+/// The user a `userIdentifier` speaks for: the `userId` a request names directly, or the
+/// subject of the user's own OAuth 2.0 token when it presents one.
+///
+/// A presented token is a value to be VALIDATED, never one to be trusted, so a token this
+/// plane cannot accept confirms nothing and is refused with the modelled
+/// `UnauthorizedException` — "thrown when the JWT bearer token is invalid or not found" — in
+/// the sentence of its own class, exactly as on the mint of this plane that is handed one.
+fn user_of(
+    identifier: &UserIdentifier,
+    now: ::std::time::SystemTime,
+) -> Result<String, CompleteResourceTokenAuthError> {
+    match identifier {
+        UserIdentifier::userId(user_id) => Ok(user_id.clone()),
+        UserIdentifier::userToken(user_token) => {
+            crate::state::user_of_presented_token(user_token, now).map_err(|refusal| {
+                CompleteResourceTokenAuthErrorModeled::UnauthorizedException(
+                    UnauthorizedException {
+                        message: Some(refusal.message().to_string()),
+                    },
+                )
+                .into()
+            })
+        }
+    }
+}
+
+/// How this operation answers a session URI no pending authorization of this account stands
+/// behind: the modelled authorization verdict on the session the request asked to complete,
+/// with the one fixed sentence of that gate. The presented URI is NOT quoted back — it is the
+/// handle a pending authorization is completed with, and one sentence for every way a session
+/// fails to resolve is what keeps the refusal from telling a caller which way it failed.
+fn invalid_or_expired_session() -> CompleteResourceTokenAuthError {
+    CompleteResourceTokenAuthErrorModeled::AccessDeniedException(AccessDeniedException {
+        message: Some(crate::state::INVALID_OR_EXPIRED_SESSION_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The modelled server failure for an engine that carries no store this operation needs.
+fn missing_state() -> CompleteResourceTokenAuthError {
+    CompleteResourceTokenAuthErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the shared engine does not carry this service's state".to_string()),
+    })
+    .into()
 }

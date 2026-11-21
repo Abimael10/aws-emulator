@@ -56,6 +56,12 @@
 //! provider it named against the plane that owns the account's token vault, and reads the
 //! credential out of the service holding it ([`resource_api_keys`]).
 //!
+//! The same plane also hands out the USER AUTHORIZATION SESSIONS of its OAuth2 resource-token
+//! flow ([`ResourceTokenAuthSessions`]): a session is handed out by the call that INITIATES a
+//! user authorization, and `CompleteResourceTokenAuth` confirms one — accepting only a session
+//! this plane handed out, inside its own window, for the very user the confirmation acts for,
+//! and refusing every other session URI as one class ([`resource_token_auth_sessions`]).
+//!
 //! # The store has an explicit ceiling
 //!
 //! `CreateEvent` and `IngestData` are the memory plane's growth sites, and a caller
@@ -141,6 +147,12 @@ pub use workload_identity_tokens::*;
 /// the plane that owns it and read the key out of the secret holding it.
 mod resource_api_keys;
 pub use resource_api_keys::*;
+
+/// The USER AUTHORIZATION SESSION of the plane's OAuth2 resource-token flow:
+/// [`ResourceTokenAuthSessions`], the sessions it hands out and the one gate a confirmation
+/// of one goes through.
+mod resource_token_auth_sessions;
+pub use resource_token_auth_sessions::*;
 
 /// The batch-evaluation plane: [`BatchEvaluationRecord`], the job records
 /// `StartBatchEvaluation` writes and `GetBatchEvaluation` reports back.
@@ -498,6 +510,11 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     pub browsers: HashMap<String, BrowserStore>,
     /// Every workload access token this service issued and has not pruned.
     pub workload_access_tokens: IssuedWorkloadAccessTokens,
+    /// Every user authorization session of the OAuth2 resource-token flow this plane handed
+    /// out and has not pruned, keyed by the `sessionUri` it was handed out under. Bounded by
+    /// each session's own window and by [`MAX_RESOURCE_TOKEN_AUTH_SESSIONS`]; see
+    /// [`resource_token_auth_sessions`].
+    pub resource_token_auth_sessions: ResourceTokenAuthSessions,
     /// The A/B tests `CreateABTest` created, keyed by the `abTestId` this emulator
     /// minted for each one. Bounded by [`MAX_AB_TESTS`]; see [`ab_tests`].
     pub ab_tests: BTreeMap<String, ABTestRecord>,
