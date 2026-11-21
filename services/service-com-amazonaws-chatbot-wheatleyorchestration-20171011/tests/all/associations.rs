@@ -40,7 +40,7 @@ use serde_json::json;
 use service_com_amazonaws_chatbot_wheatleyorchestration_20171011 as chatbot;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{post, OTHER_REGION, REGION};
+use crate::wire::{post, Answer, OTHER_REGION, REGION};
 
 /// The canonical emulator account id (`emulator_server::EMULATOR_ACCOUNT_ID`), spelled out
 /// here so the test pins the ARN a client actually sees.
@@ -709,5 +709,209 @@ async fn a_next_token_this_service_did_not_issue_names_no_position_in_the_scan()
         empty,
         Vec::<String>::new(),
         "a configuration holding no association answers an empty list"
+    );
+}
+
+/// Assert `answer` is this service's resource-scoped authorization refusal: the modelled
+/// 403, the fixed sentence, and the header restJson1 resolves the error SHAPE from — so the
+/// answer names the modelled error and not the framework's synthetic validation shape.
+fn assert_unauthorized(answer: &Answer, case: &str) {
+    assert_eq!(
+        answer.status, 403,
+        "case {case}: expected HTTP 403, got {} with {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.code(),
+        UNAUTHORIZED_EXCEPTION,
+        "case {case}: expected the modelled {UNAUTHORIZED_EXCEPTION}, got {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.message(),
+        UNAUTHORIZED_MESSAGE,
+        "case {case}: expected the fixed refusal sentence, got {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.error_type.as_deref(),
+        Some(UNAUTHORIZED_EXCEPTION),
+        "case {case}: expected x-amzn-errortype {UNAUTHORIZED_EXCEPTION}, got {:?}",
+        answer.error_type
+    );
+}
+
+/// Assert `answer` is the request-boundary refusal of a value outside a member's modelled
+/// constraints: this service's client-input class, its fixed sentence, and the same header.
+fn assert_invalid_request(answer: &Answer, case: &str) {
+    assert_eq!(
+        answer.status, 400,
+        "case {case}: expected HTTP 400, got {} with {}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.code(),
+        INVALID_REQUEST_EXCEPTION,
+        "case {case}: expected the modelled {INVALID_REQUEST_EXCEPTION}, got {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.message(),
+        INVALID_REQUEST_BODY_MESSAGE,
+        "case {case}: expected the fixed refusal sentence, got {}",
+        answer.body
+    );
+    assert_eq!(
+        answer.error_type.as_deref(),
+        Some(INVALID_REQUEST_EXCEPTION),
+        "case {case}: expected x-amzn-errortype {INVALID_REQUEST_EXCEPTION}, got {:?}",
+        answer.error_type
+    );
+}
+
+#[tokio::test]
+async fn the_resource_decision_precedes_member_constraints_for_every_target_kind() {
+    let router = router();
+    // The dimension this test spans is the KIND of chat configuration the unlink addresses,
+    // which the tables above hold fixed at a Slack channel configuration: the two kinds this
+    // model can create, and an ARN inside `ChatConfigurationArn`'s pattern this account holds
+    // no configuration under. The decision below is taken on `Resource` — the member naming
+    // the resource the call addresses — before any target is looked up, so none of the three
+    // may change it.
+    let chime = given_chime_webhook_configuration(&router, "disassoc-order-chime").await;
+    let slack = given_slack_channel_configuration(&router, "disassoc-order-slack").await;
+    let unknown =
+        format!("arn:aws:chatbot:{REGION}:{ACCOUNT}:chat-configuration/slack-channel/never-made");
+    // The configurations this account HOLDS, which is as far as the success half below goes:
+    // what an unlink answers against a configuration that does not exist is not recorded.
+    let held: [(&str, &str); 2] = [
+        ("a Chime webhook configuration", chime.as_str()),
+        ("a Slack channel configuration", slack.as_str()),
+    ];
+    let targets: [(&str, &str); 3] = [
+        held[0],
+        held[1],
+        ("an ARN no configuration is stored under", unknown.as_str()),
+    ];
+
+    // Each row names a `Resource` no custom action of this account could be minted under,
+    // differing in HOW it falls outside that namespace: a string that is no ARN at all
+    // (outside `ResourceIdentifier`'s @pattern as well), another account's id, a region
+    // segment filled in where an account-scoped action carries none, and another service's
+    // namespace.
+    let unauthorized: [(&str, String); 4] = [
+        ("a Resource that is not an ARN at all", "not-a-valid-arn-at-all".to_string()),
+        (
+            "a Resource of another account",
+            "arn:aws:chatbot::210987654321:custom-action/order-probe".to_string(),
+        ),
+        (
+            "a Resource with a region segment filled in",
+            format!("arn:aws:chatbot:{REGION}:{ACCOUNT}:custom-action/order-probe"),
+        ),
+        (
+            "a Resource of another service",
+            format!("arn:aws:lambda::{ACCOUNT}:custom-action/order-probe"),
+        ),
+    ];
+
+    // Inside the namespace this account mints actions under, the member's own modelled
+    // constraints still decide: the action NAME is a property of the name rather than of the
+    // namespace, so one outside the pattern's `[a-zA-Z0-9_-]{1,64}` stays client input
+    // (smithy_query query="operation" operation="DisassociateFromConfiguration").
+    let out_of_pattern_name = format!("arn:aws:chatbot::{ACCOUNT}:custom-action/order probe");
+
+    for (target_case, target) in targets {
+        for (case, resource) in &unauthorized {
+            let answer = post(
+                &router,
+                REGION,
+                "/disassociate-from-configuration",
+                &json!({"Resource": resource, "ChatConfiguration": target}),
+            )
+            .await;
+            assert_unauthorized(&answer, &format!("{case:?} against {target_case}"));
+        }
+        let refused = post(
+            &router,
+            REGION,
+            "/disassociate-from-configuration",
+            &json!({"Resource": out_of_pattern_name, "ChatConfiguration": target}),
+        )
+        .await;
+        assert_invalid_request(
+            &refused,
+            &format!("an action name outside the pattern against {target_case}"),
+        );
+    }
+
+    // The other half of the contract, on each configuration this account holds: a well-formed
+    // custom-action ARN the configuration was never associated with unlinks without error —
+    // the caller asked for it to be unlinked, and afterwards it is — and the configuration
+    // lists no association for it.
+    let never_associated = given_custom_action(&router, "order-control").await;
+    for (target_case, target) in held {
+        for attempt in 0..2 {
+            let answer = post(
+                &router,
+                REGION,
+                "/disassociate-from-configuration",
+                &json!({"Resource": never_associated, "ChatConfiguration": target}),
+            )
+            .await;
+            assert_eq!(
+                answer.status, 204,
+                "case a never-associated resource against {target_case} attempt {attempt}: \
+                 expected HTTP 204, got {} with {}",
+                answer.status, answer.body
+            );
+            assert!(
+                answer
+                    .body
+                    .as_object()
+                    .is_none_or(|members| members.is_empty()),
+                "case a never-associated resource against {target_case} attempt {attempt}: \
+                 the success carries no members, got {}",
+                answer.body
+            );
+        }
+        assert_eq!(
+            associated_resources(&router, target, None).await,
+            Vec::<String>::new(),
+            "case {target_case}: a no-op unlink lists no association"
+        );
+    }
+
+    // And the no-op removes nothing that IS linked: the configuration that hosts links keeps
+    // the resource associated with it while another, never-associated one is unlinked.
+    let linked = given_custom_action(&router, "order-linked").await;
+    let associated = post(
+        &router,
+        REGION,
+        "/associate-to-configuration",
+        &json!({"Resource": linked, "ChatConfiguration": slack}),
+    )
+    .await;
+    assert_eq!(
+        associated.status, 201,
+        "linking the control resource: expected HTTP 201, got {} with {}",
+        associated.status, associated.body
+    );
+    let no_op = post(
+        &router,
+        REGION,
+        "/disassociate-from-configuration",
+        &json!({"Resource": never_associated, "ChatConfiguration": slack}),
+    )
+    .await;
+    assert_eq!(
+        no_op.status, 204,
+        "unlinking a never-associated resource: expected HTTP 204, got {} with {}",
+        no_op.status, no_op.body
+    );
+    assert_eq!(
+        associated_resources(&router, &slack, None).await,
+        vec![linked],
+        "a no-op unlink leaves every other link in place"
     );
 }
