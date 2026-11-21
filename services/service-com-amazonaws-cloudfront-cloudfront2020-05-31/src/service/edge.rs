@@ -114,8 +114,9 @@
 //! relayed: the origin is named by the distribution's stored configuration, so an
 //! `Authorization` header (or a session token) a viewer presents is dropped rather than
 //! forwarded to a destination that viewer did not choose
-//! ([`HEADERS_NEVER_FORWARDED`]) — every other viewer header travels exactly as the
-//! behaviour's origin request policy says.
+//! ([`HEADERS_NEVER_FORWARDED`]) — every other viewer header the behaviour's policies name
+//! travels to the origin carrying the value the viewer stated for it, wherever the request
+//! carried that value ([`forwarding`], [`viewer_origin`]).
 //!
 //! An origin fetch is made ON BEHALF OF the distribution that configured it. The
 //! `OriginAccessControl` the origin's `OriginAccessControlId` names decides whether that
@@ -193,6 +194,9 @@ pub mod response_headers;
 /// SIGNED URLs and SIGNED COOKIES: whether a cache behaviour that restricts its content to
 /// trusted signers serves one viewer request.
 pub mod signed_access;
+/// The STANDARD access-log FILE one served viewer request delivers into the Amazon S3 bucket
+/// the distribution's own `Logging` configuration names.
+pub mod standard_logs;
 
 use aws_smithy_runtime_api::client::http::HttpConnector;
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
@@ -284,6 +288,45 @@ const VIA_CLOUDFRONT: &str = SERVER;
 /// The `User-Agent` CloudFront sends an origin request with when the viewer's own is not
 /// forwarded to the origin.
 const ORIGIN_USER_AGENT: &str = "Amazon CloudFront";
+
+/// The request header naming the client that made the request, which an origin request carries
+/// the viewer's own value for exactly where the behaviour's policies name it
+/// ([`ORIGIN_USER_AGENT`] is what it carries otherwise).
+const USER_AGENT: &str = "user-agent";
+
+/// The request header naming the chain of addresses a request has travelled.
+const FORWARDED_FOR: &str = "x-forwarded-for";
+
+/// The `X-Forwarded-For` ONE origin request carries.
+///
+/// "CloudFront appends the IP address of the viewer to the end of the header value, or adds the
+/// header if the viewer didn't include one": every origin request states the address the request
+/// came from, whatever the behaviour's policies forward, so an origin that decides anything by
+/// the caller's address has one to read. The address is the ONE reading of it this plane has
+/// ([`generated_headers::viewer_address`]), which is the LAST entry of the viewer's own chain
+/// wherever it stated one that parses — so a chain this plane already read that address out of
+/// travels as the viewer sent it, rather than ending with the same address twice.
+fn forwarded_for(req: &RtRequest) -> String {
+    let address = generated_headers::viewer_address(req);
+    let chain = req
+        .headers()
+        .get(FORWARDED_FOR)
+        .map(str::trim)
+        .filter(|chain| !chain.is_empty());
+    match chain {
+        Some(chain)
+            if chain
+                .rsplit(',')
+                .next()
+                .map(str::trim)
+                .is_some_and(|last| last == address) =>
+        {
+            chain.to_string()
+        }
+        Some(chain) => format!("{chain}, {address}"),
+        None => address.to_string(),
+    }
+}
 
 /// The status a viewer request gets when CloudFront refuses it at the edge.
 const FORBIDDEN: u16 = 403;
@@ -378,7 +421,7 @@ const METHOD_NOT_ALLOWED_DETAIL: &str =
 /// by the distribution's stored configuration, so forwarding a caller's credential there
 /// would hand it to a destination the caller of THIS request did not choose. Every other
 /// viewer header is forwarded exactly as the behaviour's origin request policy says
-/// ([`forwarding`]).
+/// ([`forwarding`]), carrying the value the viewer stated for it.
 ///
 /// [`X_AMZ_CF_ID`] is here for the other reason: it is CloudFront's OWN identifier for the
 /// request it is serving ([`stamp`] mints one per request), so an origin request carries the
@@ -409,9 +452,10 @@ const HEADERS_NEVER_FORWARDED: [&str; 15] = [
     "x-amz-security-token",
     X_AMZ_CF_ID,
     // The reserved name the viewer's `Origin` reaches this data plane under when the request
-    // came in on a distribution's own address ([`response_headers::VIEWER_ORIGIN`]): it is
-    // this emulator's own plumbing between one of its addresses and this service, so it stops
-    // here rather than travelling on to an origin.
+    // came in on a distribution's own address ([`response_headers::VIEWER_ORIGIN`]): the NAME
+    // is this emulator's own plumbing between one of its addresses and this service, so no
+    // origin request carries it. The VALUE is the viewer's `Origin`, and it travels under that
+    // header where the behaviour's policies name it ([`viewer_origin`]).
     response_headers::VIEWER_ORIGIN,
 ];
 
@@ -508,6 +552,28 @@ const CONTENT_TYPE: &str = "content-type";
 /// The request header naming the host the request is addressed to, which an origin request
 /// carries as [`origin_request_host`] decides.
 const HOST: &str = "host";
+
+/// The request header a browser states the site it is acting for in, and the one a CORS
+/// preflight's answer is decided from.
+const ORIGIN: &str = "origin";
+
+/// The `Origin` the VIEWER stated for this request, wherever the request carries it.
+///
+/// A viewer that reached a distribution's OWN address states it under the reserved name that
+/// address forwards it as ([`response_headers::VIEWER_ORIGIN`]), because the leg from there
+/// into this data plane is this emulator calling itself and a leg carrying a browser's own
+/// headers is one the front door refuses; a request dispatched at this service's endpoint
+/// carries the header itself. Either way the value is the one the VIEWER sent, so everything
+/// that reads the viewer's `Origin` — the response headers policy's CORS group
+/// ([`response_headers::ViewerCors`]), the cache key and the origin request — reads it from
+/// here and reads the same value.
+fn viewer_origin(req: &RtRequest) -> Option<String> {
+    req.headers()
+        .get(response_headers::VIEWER_ORIGIN)
+        .or_else(|| req.headers().get(ORIGIN))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
 
 /// What a viewer request addresses, as the wire carries it: the request's host — absent
 /// on a request that carries neither a `Host` header nor an absolute URI — its path, and
@@ -1673,6 +1739,14 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         // distribution's access logs names ([`access_logs`]), whichever cache behaviour matched:
         // standard logging is configured on the distribution as a whole, in CloudWatch Logs.
         access_logs::deliver(engine, ctx, &served.id, &logged).await;
+        // And the STANDARD access-log FILE goes into the Amazon S3 bucket the distribution's own
+        // `Logging` configuration names, for a distribution that runs under one
+        // ([`standard_logs`]) — the other way a client has a distribution's access logs
+        // delivered, configured on CloudFront itself. Delivered with this service's store
+        // released, since the write locks the object store's.
+        if let Some(destination) = &served.standard_logging {
+            standard_logs::deliver(ctx, &served.id, destination, &logged).await;
+        }
     }
     response
 }
@@ -1806,6 +1880,11 @@ struct ServedFor {
     /// Stated on the DISTRIBUTION rather than on a behaviour, so it covers every behaviour's
     /// answers.
     custom_error_responses: Vec<CustomErrorResponse>,
+    /// WHERE this distribution's standard access logs are delivered, from the `Logging`
+    /// configuration it runs under, or `None` for a distribution that enables none
+    /// ([`standard_logs`]). Stated on the DISTRIBUTION, so every behaviour's answers are
+    /// logged into the one bucket.
+    standard_logging: Option<standard_logs::Destination>,
 }
 
 /// The distribution one viewer request resolved to and the FUNCTIONS its matched cache
@@ -2055,6 +2134,9 @@ fn plan_request(
             .clone()
             .unwrap_or_default(),
         custom_error_responses: custom_errors::of_config(&resolved.distribution.config),
+        standard_logging: standard_logs::Destination::of_logging(
+            resolved.distribution.config.logging.as_ref(),
+        ),
     };
     let plan = plan_resolved(store, &addressed, &resolved, req, cf_id, now, behavior);
     (Some(served_for), plan)
@@ -2379,12 +2461,23 @@ fn keyed_values(
             parts.push(format!("h:{name}={value}"));
         }
     }
+    // The viewer's `Origin` is one of the viewer's own headers wherever the request carries it
+    // ([`viewer_origin`]), so a policy keying on it really does give two sites two cache
+    // entries: an answer the origin produced for one `Origin` is never served to another.
+    if req.headers().get(ORIGIN).is_none() && keyed.headers.contains_header(ORIGIN) {
+        if let Some(origin) = viewer_origin(req) {
+            parts.push(format!("h:{ORIGIN}={origin}"));
+        }
+    }
     for name in keyed.headers.named() {
         // A `CloudFront-*` header is never one the VIEWER sent, so it is not keyed on as a
         // header the viewer did not send: the two the edge generates are keyed on by their
         // generated value above, and another member of the family contributes nothing to the
         // key at all, as it reaches no origin request either.
         if generated_headers::is_generated(name) {
+            continue;
+        }
+        if name.eq_ignore_ascii_case(ORIGIN) && viewer_origin(req).is_some() {
             continue;
         }
         if req.headers().get(name).is_none() {
@@ -2623,7 +2716,8 @@ fn origin_read_timeout(origin: &Origin) -> Duration {
 /// The origin's own `CustomHeaders` ("CloudFront adds these headers to every origin
 /// request"), the `Host` the origin request carries ([`origin_request_host`]), the
 /// `X-Amz-Cf-Id` of the request the origin is
-/// being fetched for, a `Via` naming CloudFront, the `User-Agent` CloudFront sends when
+/// being fetched for, a `Via` naming CloudFront, the `X-Forwarded-For` naming the address the
+/// request came from ([`forwarded_for`]), the `User-Agent` CloudFront sends when
 /// the viewer's is not forwarded, the viewer headers the behaviour's ORIGIN REQUEST POLICY
 /// forwards, the ones its CACHE POLICY keys on — "the headers, cookies, and query strings
 /// that are included in the cache key are also included in requests that CloudFront sends
@@ -2634,7 +2728,9 @@ fn origin_read_timeout(origin: &Origin) -> Duration {
 /// `Accept-Encoding` travels normalized where the cache policy normalizes it. A header that
 /// belongs to one hop of a connection, the viewer's own credential, and a value the viewer
 /// stated for a header CloudFront generates itself are never forwarded
-/// ([`HEADERS_NEVER_FORWARDED`], [`generated_headers::is_generated`]).
+/// ([`HEADERS_NEVER_FORWARDED`], [`generated_headers::is_generated`]); every other viewer
+/// header the policies name travels with the value the viewer stated for it, and the viewer's
+/// `Origin` travels wherever the request carried it ([`viewer_origin`]).
 fn origin_request_headers(
     store: &ComAmazonawsCloudfrontCloudfront20200531State,
     behavior: &Behavior,
@@ -2648,6 +2744,7 @@ fn origin_request_headers(
     let accept_encoding = forwarding::accept_encoding(&keyed, req.headers().get(ACCEPT_ENCODING));
     let generated = generated_headers::Generated::of_request(req);
     let mut headers: Vec<(String, String)> = Vec::new();
+    let mut forwarded_viewer_user_agent = false;
     for (name, value) in req.headers().iter() {
         let name = name.to_ascii_lowercase();
         // `Host` is not copied from the viewer's request here: WHICH host the origin request
@@ -2662,8 +2759,12 @@ fn origin_request_headers(
             continue;
         }
         // The cookies and the negotiated content coding are selected and normalized below,
-        // rather than forwarded as the viewer sent them.
-        if name == COOKIE || (name == ACCEPT_ENCODING && accept_encoding.normalizes()) {
+        // rather than forwarded as the viewer sent them — and so is the forwarded-for chain,
+        // which every origin request carries whatever the policies name ([`forwarded_for`]).
+        if name == COOKIE
+            || (name == ACCEPT_ENCODING && accept_encoding.normalizes())
+            || name == FORWARDED_FOR
+        {
             continue;
         }
         // The body's own description travels with the body, whatever the policies say
@@ -2673,7 +2774,21 @@ fn origin_request_headers(
             || keyed.headers.contains_header(&name)
             || forwarded.headers.contains_header(&name)
         {
+            forwarded_viewer_user_agent |= name == USER_AGENT;
             headers.push((name, value.to_string()));
+        }
+    }
+    // The viewer's `Origin`, where the behaviour's policies name that header and the request
+    // carried it under the reserved name a distribution's own address forwards it as
+    // ([`viewer_origin`]): the header the ORIGIN is sent is the one the viewer stated, so a
+    // CORS request a browser made through a distribution reaches the origin as the browser
+    // sent it — which is what an origin that answers a preflight from its own CORS
+    // configuration is asked.
+    if req.headers().get(ORIGIN).is_none()
+        && (keyed.headers.contains_header(ORIGIN) || forwarded.headers.contains_header(ORIGIN))
+    {
+        if let Some(origin) = viewer_origin(req) {
+            headers.push((ORIGIN.to_string(), origin));
         }
     }
     // The cookies the cache key carries, and the ones the origin request policy forwards
@@ -2703,7 +2818,16 @@ fn origin_request_headers(
         "via".to_string(),
         format!("1.1 {cf_id}.cloudfront.net ({VIA_CLOUDFRONT})"),
     ));
-    headers.push(("user-agent".to_string(), ORIGIN_USER_AGENT.to_string()));
+    // CloudFront's OWN `User-Agent`, for a request whose viewer `User-Agent` the policies do
+    // not forward: the origin is then told who is calling it, which is CloudFront. A behaviour
+    // that DOES forward the header has already put the viewer's own value on the request
+    // above, and that one value is what the origin sees ([`ORIGIN_USER_AGENT`]).
+    if !forwarded_viewer_user_agent {
+        headers.push((USER_AGENT.to_string(), ORIGIN_USER_AGENT.to_string()));
+    }
+    // The chain of addresses the request has travelled, which EVERY origin request carries
+    // whatever the behaviour's policies name ([`forwarded_for`]).
+    headers.push((FORWARDED_FOR.to_string(), forwarded_for(req)));
     // The headers the edge generated for this request, where the origin request policy names
     // them: a behaviour with no origin request policy, or one whose policy does not list a
     // generated header, sends the origin none of them.
@@ -2843,6 +2967,36 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
                  so it is made as a request carrying no credential"
             ),
         }
+    } else if let Some(region) = signed_as_this_emulator(&fetch.uri) {
+        // An origin fronted by NO access mechanism is fetched as AWS fetches one: carrying no
+        // credential. This emulator verifies every request it serves, though, so such a leg is
+        // refused by its own front door before the origin's surface decides anything — and for
+        // ONE origin surface that refusal is the whole answer: an Amazon S3 WEBSITE ENDPOINT
+        // serves what the bucket makes PUBLIC and nothing else, to whoever asks
+        // (`website_endpoint`, whose every read is judged by the bucket's anonymous-read rule),
+        // so the identity on the leg decides nothing about what the edge may read. That leg
+        // therefore travels with the signature every in-process call of this emulator carries
+        // ([`::service_common::in_process_sigv4`]).
+        //
+        // No other origin is signed here. An origin whose service decides a read by the CALLER
+        // — a bucket's REST endpoint among them — would serve a private object to the account's
+        // own credential, so a distribution that was granted nothing must reach it exactly as
+        // it does now: unsigned, and answered as the origin answers a caller presenting none.
+        if let Err(error) = ::service_common::in_process_sigv4::sign_in_process_request(
+            &mut request,
+            S3_SIGNING_NAME,
+            &region,
+            ctx,
+        )
+        .await
+        {
+            ::tracing::warn!(
+                uri = %fetch.uri,
+                %error,
+                "this origin request could not be signed as this emulator's own in-process \
+                 call, so it is made carrying no credential"
+            );
+        }
     }
     let (parts, body) = request.into_parts();
     let built = RtRequest::try_from(::http::Request::from_parts(
@@ -2952,6 +3106,34 @@ async fn fetch_origin<Eng: Send + Sync + 'static>(
         response: served_origin_answer(&answer, fetch.encode, x_cache, cf_id),
         origin_latency: Some(origin_latency),
     }
+}
+
+/// The signing name of the service an Amazon S3 surface is addressed under, which is what the
+/// signature of an in-process leg to one names.
+const S3_SIGNING_NAME: &str = "s3";
+
+/// The REGION to sign an origin leg for, for the one origin surface whose answer the identity
+/// on that leg cannot change: an Amazon S3 WEBSITE ENDPOINT
+/// ([`origin_access::names_an_s3_website_endpoint`]), which serves what the bucket makes PUBLIC
+/// and nothing else, whoever asks. `None` for every other origin, which is fetched as AWS
+/// fetches one an access mechanism does not sign: carrying no credential.
+///
+/// Why the leg is signed HERE rather than the surface being served unsigned where that refusal
+/// comes from: the front door asks the MODEL which schemes the route a request names is served
+/// under, and the website surface is no modelled route of its own — a request to it names a
+/// modelled operation of the REST API (a bucket or service listing, by its method and path), so
+/// the scheme that operation's model declares is the one required however the surface itself
+/// would be served. A door that declares no scheme of its own is therefore not reached for
+/// such a request (verified against this emulator's own front door), which leaves the CALLER
+/// of the leg as the layer that can state what the leg is: this emulator calling itself. A
+/// client dialling the bucket's website host directly is in the same position and is not
+/// repaired by this, which the S3 service's own anonymous-read work owns.
+fn signed_as_this_emulator(uri: &str) -> Option<String> {
+    let host = bare_host(authority_of(uri)?);
+    if !origin_access::names_an_s3_website_endpoint(host) {
+        return None;
+    }
+    origin_access::s3_endpoint_bucket(host).map(|(_bucket, region)| region)
 }
 
 /// The error types that are the in-process TRANSPORT's own refusal rather than an answer

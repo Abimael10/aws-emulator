@@ -16,6 +16,13 @@ Issue-Key: apigateway__cloudfront__s3.cloudfront-s3-signed-url-restricted-access
 Issue-Key: apigateway__cloudfront__s3.cloudfront-s3-website-endpoint-origin-positive|_poll_http_get#19|Timeout|time.sleep(interval_s)
 Issue-Commit: 69cb8c4786d799a8a66c2117bf8eebb4fb69db3f
 
+> _Resolution note: ten of the twelve keys above pass. The two that do not —
+> `cloudfront-apigw-viewer-request-header-passthrough|_http_get#12` (line 12) and
+> `cloudfront-s3-website-endpoint-origin-positive|_poll_http_get#19` (line 16) — are carried,
+> with both keys, both trace ids and the evidence gathered about them, by the open report
+> `issues/things-that-do-not-work/20261121T120000Z-apigateway-cloudfront-s3-two-edge-data-plane-checks-still-time-out.md`,
+> which is where they are tracked from now on; this record claims neither of them._
+
 # apigateway__cloudfront__s3: 5 net-new causes at the distribution edge — whitelisted viewer headers are not forwarded, responses carry no Content-Type, an OAI-granted S3 origin is refused 403, an http-only origin protocol mismatch answers 200 instead of 502/504, and eight edge checks never reach their asserted state
 
 > _Note: this issue was identified against the code base at commit `69cb8c4786d799a8a66c2117bf8eebb4fb69db3f`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._

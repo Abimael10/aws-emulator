@@ -54,11 +54,11 @@ const ACCESS_LOGS_LOG_TYPE: &str = "ACCESS_LOGS";
 /// The standard access-log field naming the DATE the request was served on: "the date on which
 /// the event occurred in Coordinated Universal Time (UTC), for example, 2019-06-26" — the day
 /// of the instant the edge finished responding.
-const DATE_FIELD: &str = "date";
+pub(super) const DATE_FIELD: &str = "date";
 
 /// The standard access-log field naming the TIME the request was served at: "the time when the
 /// CloudFront server finished responding to the request (in UTC), for example, 01:42:39".
-const TIME_FIELD: &str = "time";
+pub(super) const TIME_FIELD: &str = "time";
 
 /// How many destinations ONE served viewer request delivers its access-log record to.
 ///
@@ -123,7 +123,11 @@ pub(super) async fn deliver<Eng: Send + Sync + 'static>(
 /// reading of the field ([`LoggedRequest::value`]), including the placeholder a field this
 /// request has no value for carries: one request is reported identically whichever log plane
 /// reports it.
-fn field_value(logged: &LoggedRequest<'_>, field: &str) -> String {
+///
+/// Reached by the legacy standard-logging plane as well ([`super::standard_logs`]), whose own
+/// field catalogue names the same values: a record delivered to a log group and a log file
+/// delivered to a bucket describe one request the same way.
+pub(super) fn field_value(logged: &LoggedRequest<'_>, field: &str) -> String {
     match field {
         DATE_FIELD => calendar_halves(logged.at).0,
         TIME_FIELD => calendar_halves(logged.at).1,

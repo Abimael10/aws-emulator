@@ -497,7 +497,11 @@ pub async fn deliver(
 }
 
 /// `value` with the characters a record's framing owns percent-encoded ([`FRAMING`]).
-fn encoded(value: &str) -> String {
+///
+/// Reached by the STANDARD access-log plane as well ([`super::standard_logs`]), whose records
+/// are delimited the same way: one value is rendered once, so neither plane can frame a value
+/// the other would read differently.
+pub(super) fn encoded(value: &str) -> String {
     utf8_percent_encode(value, FRAMING).to_string()
 }
 
