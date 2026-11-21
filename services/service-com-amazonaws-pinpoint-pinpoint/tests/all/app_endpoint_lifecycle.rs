@@ -16,7 +16,10 @@
 //! * a page of a paginated list is a prefix of one deterministic order, and the
 //!   `NextToken` resumes exactly where the page stopped — absent on the last page;
 //! * an endpoint write persists every member it carries and keeps the members it
-//!   omits, and only a `ChannelType` the model lists is accepted.
+//!   omits, and only a `ChannelType` the model lists is accepted;
+//! * every failure names the request it answers in the `RequestID` member its exception
+//!   shapes declare — a per-response id, never two failures under one, and never on a
+//!   success, whose body is the modelled output alone.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -1327,5 +1330,194 @@ async fn an_application_the_service_does_not_hold_reads_the_same_refusal_everywh
     assert_eq!(
         status, 200,
         "the stored endpoint still reads back after every refusal, got {status} with {body:?}"
+    );
+}
+
+/// The member an exception body of this service names the request it answers in, written
+/// out here independently of the code under test: `RequestID`, the member every exception
+/// shape of this model declares beside `Message`
+/// (`smithy_query(query="shape",shape="NotFoundException,BadRequestException")`).
+const REQUEST_ID_MEMBER: &str = "RequestID";
+
+/// The id a failure names its request by, or the empty string when the body names none.
+fn request_id_of(body: &Value) -> String {
+    body[REQUEST_ID_MEMBER]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn every_failure_names_the_request_it_answers() {
+    let emulator = Emulator::new();
+
+    // A live application carrying one endpoint, so a row can be a resource missing FROM
+    // something that exists rather than only an application that does not.
+    let (_, live) = emulator
+        .create_app("us-east-1", json!({ "Name": "named-request" }))
+        .await;
+    let live_id = live["Id"]
+        .as_str()
+        .expect("a minted application id")
+        .to_string();
+    let (status, body) = emulator
+        .update_endpoint(
+            "us-east-1",
+            &live_id,
+            "known",
+            json!({ "Address": "known@example.com", "ChannelType": "EMAIL" }),
+        )
+        .await;
+    assert_eq!(
+        status, 202,
+        "setup: the endpoint write must be accepted, got {status} with {body:?}"
+    );
+
+    // An id the service never minted, used by the rows that name a missing application.
+    let missing_id = "00000000000000000000000000000000";
+
+    // The rows differ along the operation asked, the HTTP method, the status, the
+    // exception shape and — the point of the table — the LAYER that answered: a
+    // handler's own modelled error, a request refused by the modelled walk before any
+    // handler ran, and a request that named no modelled operation at all, which no
+    // handler ever saw.
+    let answers: Vec<(&str, u16, Value)> = vec![
+        {
+            let (status, body) = emulator.get_app("us-east-1", missing_id).await;
+            ("GetApp on an application that does not exist", status, body)
+        },
+        {
+            let (status, body) = emulator.delete_app("us-east-1", missing_id).await;
+            (
+                "DeleteApp on an application that does not exist",
+                status,
+                body,
+            )
+        },
+        {
+            let (status, body) = emulator
+                .get_endpoint("us-east-1", missing_id, "known")
+                .await;
+            (
+                "GetEndpoint on an application that does not exist",
+                status,
+                body,
+            )
+        },
+        {
+            let (status, body) = emulator
+                .get_endpoint("us-east-1", &live_id, "no-such-endpoint")
+                .await;
+            (
+                "GetEndpoint on an endpoint a live application does not hold",
+                status,
+                body,
+            )
+        },
+        {
+            let (status, body) = emulator
+                .update_endpoint(
+                    "us-east-1",
+                    missing_id,
+                    "known",
+                    json!({ "Address": "x@example.com", "ChannelType": "EMAIL" }),
+                )
+                .await;
+            (
+                "UpdateEndpoint on an application that does not exist",
+                status,
+                body,
+            )
+        },
+        {
+            let (status, body) = emulator
+                .create_app("us-east-1", json!({ "Name": "   " }))
+                .await;
+            (
+                "CreateApp whose Name names nothing (the handler's own refusal)",
+                status,
+                body,
+            )
+        },
+        {
+            // `Name` is required, so this request is refused by the modelled walk
+            // before the handler runs: nothing a handler holds could have named it.
+            let (status, body) = emulator.create_app("us-east-1", json!({})).await;
+            (
+                "CreateApp with no Name at all (refused before any handler runs)",
+                status,
+                body,
+            )
+        },
+        {
+            // A path the model binds no operation to: no operation produced this
+            // answer, so it is the entry's own routing failure.
+            let (status, body) = emulator
+                .call("GET", "/v1/not-a-modelled-resource", "us-east-1", None)
+                .await;
+            ("a path naming no modelled operation", status, body)
+        },
+    ];
+
+    let mut reported: BTreeSet<String> = BTreeSet::new();
+    for (case, status, body) in answers {
+        assert!(
+            status >= 400,
+            "case {case:?}: expected a failure status, got {status} with {body:?}"
+        );
+        let request_id = request_id_of(&body);
+        assert!(
+            service_common::query_error_envelope::is_request_id(&request_id),
+            "case {case:?}: expected {REQUEST_ID_MEMBER} to name the request, got {body:?}"
+        );
+        assert!(
+            !request_id.contains(missing_id) && !request_id.contains(live_id.as_str()),
+            "case {case:?}: the id names the response, not what the request asked for, got {request_id:?}"
+        );
+        assert!(
+            reported.insert(request_id.clone()),
+            "case {case:?}: each failure names its OWN request, got the already-reported {request_id:?}"
+        );
+    }
+
+    // The id belongs to the response, not to the resource the request named: the SAME
+    // request answered twice names two requests.
+    for round in 0..4 {
+        let (status, body) = emulator.get_app("us-east-1", missing_id).await;
+        assert_eq!(
+            status, 404,
+            "round {round}: expected the same 404, got {status} with {body:?}"
+        );
+        let request_id = request_id_of(&body);
+        assert!(
+            service_common::query_error_envelope::is_request_id(&request_id),
+            "round {round}: expected {REQUEST_ID_MEMBER} to name the request, got {body:?}"
+        );
+        assert!(
+            reported.insert(request_id.clone()),
+            "round {round}: one repeated request must not be answered under one id, got {request_id:?}"
+        );
+    }
+
+    // A refusal states the class's text and the request it answers, and nothing else is
+    // added to it: the message carries no request value, as the message rule for the
+    // application-level refusal already holds.
+    let (_, body) = emulator.get_app("us-east-1", missing_id).await;
+    assert_eq!(
+        (error_code(&body).as_str(), body["Message"].as_str()),
+        ("NotFoundException", Some(APPLICATION_NOT_FOUND)),
+        "the refusal keeps its code and its fixed text beside the id it names, got {body:?}"
+    );
+
+    // A SUCCESS is the modelled output alone: the model declares no such member on an
+    // application response, so none is written there.
+    let (status, body) = emulator.get_app("us-east-1", &live_id).await;
+    assert_eq!(
+        status, 200,
+        "the stored application still reads back, got {status} with {body:?}"
+    );
+    assert!(
+        body.get(REQUEST_ID_MEMBER).is_none(),
+        "a success body is the modelled output alone, got {body:?}"
     );
 }

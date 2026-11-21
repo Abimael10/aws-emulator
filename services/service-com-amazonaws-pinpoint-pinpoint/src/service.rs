@@ -39,11 +39,64 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## Naming the request a failure answers
+//!
+//! Every exception shape of this model is a structure of TWO members, `Message` and
+//! `RequestID` ("The unique identifier for the request or response.") —
+//! `smithy_query(query="shape",shape="NotFoundException,BadRequestException,ForbiddenException,InternalServerErrorException,MethodNotAllowedException,PayloadTooLargeException,TooManyRequestsException")`
+//! lists exactly those two on each of the seven — so every failure this service answers
+//! names the request it answers in [`REQUEST_ID_MEMBER`] of its JSON error body.
+//!
+//! The id belongs to the RESPONSE and not to the resource the request named: it is a
+//! correlation id a client logs and an SDK's retry and telemetry layers read, so it is
+//! minted per response, carries nothing out of the request, and two failures never report
+//! one id. Nothing a handler holds is it, and a request refused BEFORE any handler runs
+//! (a missing required member, a value outside a modelled bound) or refused with no
+//! handler to run at all (a path naming no modelled operation, a transport failure
+//! detected up front) has no handler to set it — which is why it is reported at the
+//! layers every response of this service passes through rather than per exception.
+//!
+//! The rule itself is not restated here: `service_common::query_error_envelope` owns it
+//! for every emulated service, and this file chooses only the report this protocol takes
+//! (the body member — restJson1 has no envelope element for the id) and wires it at the
+//! two layers:
+//!
+//! * [`RequestIdReportedOperation`], the wrapper [`Service::override_operation`] hands the
+//!   router in place of each modelled operation, covers every failure an operation answers
+//!   — a modelled error, and a constraint refusal raised while that operation was being
+//!   served;
+//! * [`RequestIdEnvelopeDefinition::reporting`], the definition wrapper
+//!   [`Service::definition`] hands back, covers a response NO operation produced: a
+//!   routing failure, a transport failure detected up front, and a pre-dispatch
+//!   authentication refusal.
+//!
+//! A SUCCESS is left exactly as the renderer wrote it: its body is the modelled output,
+//! which states whatever the model declares for it. Nothing else about a failure changes
+//! either — the status, the error code and every other byte of the body stay as the
+//! renderer wrote them.
 
+use service_common::query_error_envelope::{
+    with_request_id_error_member_named, RequestIdEnvelopeDefinition, RequestIdReportedOperation,
+};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The member this service's JSON error bodies name the request they answer in: the
+/// `RequestID` member every exception shape of this model declares beside `Message`
+/// (see the module docs for the `smithy_query` call that lists them).
+const REQUEST_ID_MEMBER: &str = "RequestID";
+
+/// How one response of this service reports the request it answers — the one report both
+/// layers below are handed, so a failure an operation produced and a failure no operation
+/// produced name their request the same way.
+fn with_request_id_member(
+    resp: ::aws_smithy_runtime_api::http::Response,
+) -> ::aws_smithy_runtime_api::http::Response {
+    with_request_id_error_member_named(resp, REQUEST_ID_MEMBER)
+}
 
 /// The `com-amazonaws-pinpoint-pinpoint` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -51,7 +104,13 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its framework-level error renderers wrapped so a failure
+    /// NO operation produced still names the request it answers (see the module docs).
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// Serves the modelled operation this service's own routing table names for a request,
+    /// so every failure an operation answers names the request it answers. Held, not built
+    /// per request: `override_operation` hands back a reference to it.
+    served: RequestIdReportedOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,7 +119,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::reporting(
+                crate::ServiceDefinition::new(engine),
+                with_request_id_member,
+            ),
+            served: RequestIdReportedOperation::new(with_request_id_member),
         }
     }
 }
@@ -69,7 +132,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // The router reads it through this one accessor. Do not edit the entry: what is
+        // handed back is the shared `RequestIdEnvelopeDefinition` over that entry, which
+        // reads identity, protocol and the routing table straight off it and adds the
+        // request-id member to the three framework-level error renderers (see the module
+        // docs).
         &self.entry
     }
 
@@ -91,8 +158,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        //
+        // NOT a re-route: the operation served is the one this service's own routing
+        // table names for the request, reached through the shared
+        // `RequestIdReportedOperation` — the one place every operation's response passes,
+        // so no operation can answer a failure without naming the request it answered. A
+        // request the table does not answer declines here exactly as it would there,
+        // leaving the router's routing-error path (reported by the entry above) unchanged.
+        self.entry
+            .routes(req)
+            .then_some(&self.served as &dyn ErasedOperation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

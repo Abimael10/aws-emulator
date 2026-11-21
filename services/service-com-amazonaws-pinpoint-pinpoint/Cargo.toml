@@ -24,6 +24,10 @@ tracing = { workspace = true }
 # Hashing + hex encoding for the server-generated ids and cohort assignment in `src/state.rs`.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `service-common` owns this tree's ONE statement of the request id a response names the
+# request it answers by, which this service reports in the `RequestID` member its
+# exception shapes declare (see `src/service.rs`).
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
