@@ -106,7 +106,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::bot_definition::SeedRefused;
-use crate::state::bot_model::{built_locale, LocaleUnavailable};
+use crate::state::bot_model::{built_locale, AddressRefused, LocaleUnavailable};
 use crate::state::headers::{encode_json, member_schema};
 // `asks_for_speech` and `TEXT_CONTENT_TYPE` are `crate::state`'s, because the
 // two operations that take a `responseContentType` must answer the same way for
@@ -166,24 +166,16 @@ fn locale_unavailable(
     bot_id: &str,
     bot_alias_id: &str,
 ) -> PutSessionError {
-    match error {
-        LocaleUnavailable::UnknownBotAlias => {
+    match error.refusal(bot_id, bot_alias_id) {
+        AddressRefused::NotFound(message) => {
             PutSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::bot_model::bot_alias_not_valid_message(
-                    bot_id,
-                    bot_alias_id,
-                ),
+                message,
             })
             .into()
         }
-        LocaleUnavailable::NotBuilt => {
-            PutSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::bot_model::BOT_LOCALE_NOT_VALID_MESSAGE.to_string(),
-            })
-            .into()
-        }
-        LocaleUnavailable::StoreUnavailable => {
-            internal("the Lex V2 bot definitions are unavailable")
+        AddressRefused::Internal(message) => {
+            PutSessionErrorModeled::InternalServerException(InternalServerException { message })
+                .into()
         }
     }
 }

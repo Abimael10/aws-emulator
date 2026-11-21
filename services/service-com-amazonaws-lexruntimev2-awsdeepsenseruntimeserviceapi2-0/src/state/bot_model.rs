@@ -278,6 +278,41 @@ pub enum LocaleUnavailable {
     StoreUnavailable,
 }
 
+/// How a call addressed to a bot, alias and locale that resolve to no built
+/// model is refused: which modelled error answers it, and the sentence that
+/// error carries.
+///
+/// Every operation this service binds to the bot/alias/locale labels resolves
+/// the SAME address, so the two refusals are worded in one place rather than in
+/// each operation's own error channel — a handler only lifts the answer into the
+/// error type its model declares.
+#[derive(Debug, Clone)]
+pub enum AddressRefused {
+    /// The modelled `ResourceNotFoundException`, with the sentence for the
+    /// condition actually hit: a `botId`/`botAliasId` pair that is not an
+    /// alias of that bot, or a locale with no built model.
+    NotFound(String),
+    /// The modelled `InternalServerException`: the store that holds the bots
+    /// could not be read, which is the emulator's fault and not the caller's.
+    Internal(String),
+}
+
+impl LocaleUnavailable {
+    /// The refusal this condition owes the caller, for the pair the request
+    /// addressed the bot by.
+    pub fn refusal(&self, bot_id: &str, bot_alias_id: &str) -> AddressRefused {
+        match self {
+            Self::UnknownBotAlias => {
+                AddressRefused::NotFound(bot_alias_not_valid_message(bot_id, bot_alias_id))
+            }
+            Self::NotBuilt => AddressRefused::NotFound(BOT_LOCALE_NOT_VALID_MESSAGE.to_string()),
+            Self::StoreUnavailable => {
+                AddressRefused::Internal("the Lex V2 bot definitions are unavailable".to_string())
+            }
+        }
+    }
+}
+
 /// The built locale the four labels of a runtime request address, read off the
 /// control plane's store.
 ///

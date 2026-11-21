@@ -956,24 +956,48 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
             refused.json()
         );
 
-        // The refusal has no effect: no session came into existence.
+        // The address a turn is refused for is one every operation addressed by
+        // the same labels is refused for: the read of that session carries the
+        // very same sentence, because what resolves to nothing is the address
+        // and not the session.
         let read = emulator.send("GET", path, None).await;
         assert_eq!(
             read.status, 404,
-            "case {case:?}: a refused turn must start no session, got {} {:?}",
+            "case {case:?}: the read of an unresolvable address is refused too, got {} {:?}",
             read.status,
             String::from_utf8_lossy(&read.body)
         );
         assert_eq!(
             at(&read.json(), "/message").as_deref(),
-            Some("The session for user unbuilt doesn\u{2019}t exist or has expired."),
-            "case {case:?}: the absent session is worded as the service words it, got {:?}",
+            Some(expected_message.as_str()),
+            "case {case:?}: the read is refused as the address, got {:?}",
             read.json()
         );
     }
 
-    // Built, and the very same turn is served.
+    // Built, and the session the refused turns addressed is still absent: the
+    // refusals had no effect, which is now observable because the address
+    // resolves.
     build(&emulator, &bot.bot_id).await;
+    let session_path = format!(
+        "/bots/{}/botAliases/{}/botLocales/{}/sessions/unbuilt",
+        bot.bot_id, bot.bot_alias_id, bot.locale_id
+    );
+    let read = emulator.send("GET", &session_path, None).await;
+    assert_eq!(
+        read.status, 404,
+        "a refused turn must start no session, got {} {:?}",
+        read.status,
+        String::from_utf8_lossy(&read.body)
+    );
+    assert_eq!(
+        at(&read.json(), "/message").as_deref(),
+        Some("The session for user unbuilt doesn\u{2019}t exist or has expired."),
+        "the absent session is worded as the service words it, got {:?}",
+        read.json()
+    );
+
+    // And the very same turn is served.
     let turn = say(&emulator, &bot, "unbuilt", "I want a large pizza").await;
     assert_eq!(
         at(&turn, "/interpretations/0/intent/name").as_deref(),

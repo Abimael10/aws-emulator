@@ -108,7 +108,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::bot_model::{built_locale, BotLocaleModel, LocaleUnavailable};
+use crate::state::bot_model::{built_locale, AddressRefused, BotLocaleModel, LocaleUnavailable};
 use crate::state::{AttributesRefused, SessionKey, SessionStoreFull, TurnRefused};
 use std::time::SystemTime;
 
@@ -135,24 +135,14 @@ fn locale_unavailable(
     bot_id: &str,
     bot_alias_id: &str,
 ) -> RecognizeTextError {
-    match error {
-        LocaleUnavailable::UnknownBotAlias => {
+    match error.refusal(bot_id, bot_alias_id) {
+        AddressRefused::NotFound(message) => {
             RecognizeTextErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::bot_model::bot_alias_not_valid_message(
-                    bot_id,
-                    bot_alias_id,
-                ),
+                message,
             })
         }
-        LocaleUnavailable::NotBuilt => {
-            RecognizeTextErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::bot_model::BOT_LOCALE_NOT_VALID_MESSAGE.to_string(),
-            })
-        }
-        LocaleUnavailable::StoreUnavailable => {
-            RecognizeTextErrorModeled::InternalServerException(InternalServerException {
-                message: "the Lex V2 bot definitions are unavailable".to_string(),
-            })
+        AddressRefused::Internal(message) => {
+            RecognizeTextErrorModeled::InternalServerException(InternalServerException { message })
         }
     }
     .into()

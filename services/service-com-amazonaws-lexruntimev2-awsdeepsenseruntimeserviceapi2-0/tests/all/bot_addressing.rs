@@ -11,12 +11,13 @@
 //! The rules under test, each over a TABLE of inputs rather than one recorded
 //! request:
 //!
-//! 1. A call that needs the bot's runtime model (`RecognizeText`,
-//!    `RecognizeUtterance`, `PutSession`) resolves the `botId`/`botAliasId`
-//!    PAIR and the addressed locale's build state first: an alias that is not
-//!    an alias of that bot, and a locale with no built model, are refused with
+//! 1. A call addressed by the four session labels (`GetSession`,
+//!    `DeleteSession`, `PutSession`, `RecognizeText`, `RecognizeUtterance`)
+//!    resolves the `botId`/`botAliasId` PAIR and the addressed locale's build
+//!    state before it touches the session store: an alias that is not an alias
+//!    of that bot, and a locale with no built model, are refused with
 //!    HTTP 404 `ResourceNotFoundException` in AWS's own words — and the refusal
-//!    has no effect, so no session comes into existence.
+//!    has no effect, so no session comes into existence and none is removed.
 //! 2. A `sessionState` seeded by `PutSession` names resources the resolved
 //!    locale defines: an intent it does not declare, or an elicited slot that
 //!    intent does not declare, is HTTP 400 `ValidationException` and stores
@@ -33,7 +34,8 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 
 use crate::harness::{
-    Bot, Emulator, CLOSING_MESSAGE, CONFIRMATION_PROMPT, INTENT, SLOT, SLOT_PROMPT, TEST_ALIAS,
+    Bot, Emulator, CLOSING_MESSAGE, CONFIRMATION_PROMPT, DRAFT, INTENT, SLOT, SLOT_PROMPT,
+    TEST_ALIAS,
 };
 
 /// The text `requestContentType` `RecognizeUtterance` accepts.
@@ -72,14 +74,15 @@ impl Call {
         }
     }
 
-    /// Is this call served AGAINST the bot's runtime model? `PutSession` seeds a
-    /// dialog state the locale has to define, and the two encodings of a turn are
-    /// interpreted by that locale's model; the read and the delete address the
-    /// stored session alone.
-    fn needs_the_runtime_model(&self) -> bool {
+    /// Does this call answer from a session that is already STORED? A read and
+    /// a delete do, so a case that expects one of them to be served seeds the
+    /// session first; `PutSession` and the two encodings of a turn create the
+    /// session they address. Every one of the five resolves the bot address
+    /// first, whichever side of this it is on.
+    fn needs_a_stored_session(&self) -> bool {
         match self {
-            Self::GetSession | Self::DeleteSession => false,
-            Self::PutSession | Self::RecognizeText | Self::RecognizeUtterance => true,
+            Self::GetSession | Self::DeleteSession => true,
+            Self::PutSession | Self::RecognizeText | Self::RecognizeUtterance => false,
         }
     }
 
@@ -123,18 +126,9 @@ impl Call {
     }
 }
 
-/// Every call that needs the runtime model: the subset of [`session_calls`] that
-/// is served AGAINST the bot's built locale — stated as that subset so the two
-/// tables cannot drift when another operation is wired.
-fn calls() -> Vec<Call> {
-    session_calls()
-        .into_iter()
-        .filter(Call::needs_the_runtime_model)
-        .collect()
-}
-
 /// EVERY operation this service binds to a session address — the five that bind
-/// the same four `@httpLabel` values, model-needing or not.
+/// the same four `@httpLabel` values, and each of which resolves that address
+/// before the session store is touched.
 fn session_calls() -> [Call; 5] {
     [
         Call::GetSession,
@@ -154,6 +148,20 @@ fn alias_not_valid(bot_id: &str, bot_alias_id: &str) -> String {
 /// The sentence AWS states for a session that is not there.
 fn session_not_found(session_id: &str) -> String {
     format!("The session for user {session_id} doesn\u{2019}t exist or has expired.")
+}
+
+/// Seed the session the path addresses with `PutSession`, so a call that answers
+/// from a STORED session has one to answer from — what those rows are about is
+/// the addressing, not whether a conversation happens to be in progress.
+async fn seed(emulator: &Emulator, path: &str, case: &str) {
+    let reply = Call::PutSession.send(emulator, path).await;
+    assert_eq!(
+        reply.status,
+        200,
+        "case {case:?}: seeding {path} must succeed, got {} {:?}",
+        reply.status,
+        String::from_utf8_lossy(&reply.body)
+    );
 }
 
 /// Rule 1, on the alias: the pair is resolved, so an alias id the bot does not
@@ -213,12 +221,17 @@ async fn a_call_is_refused_unless_the_bot_alias_pair_resolves() {
     ];
 
     for (index, (case, bot_id, bot_alias_id, resolves)) in rows.iter().enumerate() {
-        for call in calls() {
+        for call in session_calls() {
             let session_id = format!("alias-{index}-{}", call.name());
             let path = format!(
                 "/bots/{bot_id}/botAliases/{bot_alias_id}/botLocales/{}/sessions/{session_id}",
                 bot.locale()
             );
+            // A row whose pair resolves has to find the call servable, so a
+            // read or a delete is given the session it answers from.
+            if *resolves && call.needs_a_stored_session() {
+                seed(&emulator, &path, case).await;
+            }
             let reply = call.send(&emulator, &path).await;
             if *resolves {
                 assert_eq!(
@@ -315,7 +328,7 @@ async fn a_call_is_refused_until_the_locale_is_built() {
     ];
 
     for (case, locale_id) in unbuilt {
-        for call in calls() {
+        for call in session_calls() {
             let session_id = format!("locale-{}", call.name());
             let path = format!(
                 "/bots/{bot_id}/botAliases/{}/botLocales/{locale_id}/sessions/{session_id}",
@@ -354,7 +367,7 @@ async fn a_call_is_refused_until_the_locale_is_built() {
         status, "Built",
         "the submitted build must have settled, got {status:?}"
     );
-    for call in calls() {
+    for call in session_calls() {
         let session_id = format!("locale-{}", call.name());
         let read = emulator
             .send("GET", &bot.session_path(&session_id), None)
@@ -368,9 +381,11 @@ async fn a_call_is_refused_until_the_locale_is_built() {
             String::from_utf8_lossy(&read.body)
         );
 
-        let served = call
-            .send(&emulator, &bot.session_path(&format!("built-{}", call.name())))
-            .await;
+        let servable = bot.session_path(&format!("built-{}", call.name()));
+        if call.needs_a_stored_session() {
+            seed(&emulator, &servable, "the built locale").await;
+        }
+        let served = call.send(&emulator, &servable).await;
         assert_eq!(
             served.status,
             200,
@@ -398,6 +413,137 @@ async fn a_call_is_refused_until_the_locale_is_built() {
         "the locale that was not built is still refused, got {} {:?}",
         reply.status,
         String::from_utf8_lossy(&reply.body)
+    );
+}
+
+/// Rule 1, after the fact: the address is resolved on EVERY call addressed by
+/// the session labels, so a session stored while that address resolved is
+/// refused — and left untouched, the delete included — once the control plane
+/// drops the locale it is held in, and is still exactly as it was when the
+/// locale is built again.
+#[tokio::test]
+async fn a_stored_session_is_refused_once_the_control_plane_drops_its_locale() {
+    let (emulator, bot) = Emulator::with_bot().await;
+    let session_id = "survives-the-drop";
+    let path = bot.session_path(session_id);
+
+    let put = emulator
+        .send(
+            "POST",
+            &path,
+            Some(json!({
+                "sessionState": {
+                    "dialogAction": {"type": "Delegate"},
+                    "sessionAttributes": {"marker": "kept"},
+                },
+            })),
+        )
+        .await;
+    assert_eq!(
+        put.status,
+        200,
+        "the session is stored while the address resolves, got {} {:?}",
+        put.status,
+        String::from_utf8_lossy(&put.body)
+    );
+
+    // The control plane drops the locale that session is held in, as a client
+    // drops it: "when you delete a locale, all intents, slots, and slot types
+    // defined for the locale are also deleted".
+    let dropped = emulator
+        .send_control_plane(
+            "DELETE",
+            &format!(
+                "/bots/{}/botversions/{DRAFT}/botlocales/{}",
+                bot.bot_id,
+                bot.locale()
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        dropped.status,
+        202,
+        "DeleteBotLocale must be accepted, got {} {:?}",
+        dropped.status,
+        String::from_utf8_lossy(&dropped.body)
+    );
+
+    // The address now resolves to no built locale, so every call addressed by
+    // it is refused with the locale's own sentence — the delete among them.
+    for call in session_calls() {
+        let reply = call.send(&emulator, &path).await;
+        assert_eq!(
+            reply.status,
+            404,
+            "on {}: a dropped locale is refused, got {} {:?}",
+            call.name(),
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        assert!(
+            reply.error_type().ends_with("ResourceNotFoundException"),
+            "on {}: expected ResourceNotFoundException, got {:?}",
+            call.name(),
+            reply.error_type()
+        );
+        let message = reply.error_message();
+        assert_eq!(
+            message,
+            LOCALE_NOT_VALID,
+            "on {}: expected the locale's own sentence, got {message:?}",
+            call.name()
+        );
+    }
+
+    // Built again, and the session is exactly as it was left: none of the
+    // refused calls — the delete included — touched the store.
+    emulator.create_locale(&bot.bot_id, bot.locale()).await;
+    emulator
+        .create_intent_with_slot(&bot.bot_id, bot.locale())
+        .await;
+    emulator.build_locale(&bot.bot_id, bot.locale()).await;
+
+    let read = emulator.send("GET", &path, None).await;
+    assert_eq!(
+        read.status,
+        200,
+        "the refused delete removed nothing, got {} {:?}",
+        read.status,
+        String::from_utf8_lossy(&read.body)
+    );
+    let stored = read.json();
+    assert_eq!(
+        stored
+            .pointer("/sessionState/sessionAttributes/marker")
+            .and_then(Value::as_str),
+        Some("kept"),
+        "the stored session is the one that was seeded, got {stored:?}"
+    );
+
+    // And the delete the dropped locale refused is served now that the address
+    // resolves again.
+    let deleted = emulator.send("DELETE", &path, None).await;
+    assert_eq!(
+        deleted.status,
+        200,
+        "the delete is served against a built locale, got {} {:?}",
+        deleted.status,
+        String::from_utf8_lossy(&deleted.body)
+    );
+    let gone = emulator.send("GET", &path, None).await;
+    assert_eq!(
+        gone.status,
+        404,
+        "the deleted session is gone, got {} {:?}",
+        gone.status,
+        String::from_utf8_lossy(&gone.body)
+    );
+    assert_eq!(
+        gone.error_message(),
+        session_not_found(session_id),
+        "the absent session is stated as AWS states it, got {:?}",
+        gone.error_message()
     );
 }
 

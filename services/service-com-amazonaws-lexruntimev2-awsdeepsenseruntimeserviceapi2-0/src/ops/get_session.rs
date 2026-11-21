@@ -6,6 +6,9 @@
 //! as the last `PutSession` or `RecognizeText` left it. A read: it never changes
 //! what a later caller sees.
 //!
+//! The bot/alias pair and the locale are resolved against the control plane
+//! first, so an address that names no built model is refused as the address.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -85,8 +88,34 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::bot_model::{built_locale, AddressRefused, LocaleUnavailable};
 use crate::state::SessionKey;
 use std::time::SystemTime;
+
+/// The bot, alias and locale the request addresses resolve to no model this
+/// runtime holds a conversation against, or the control plane that holds them
+/// cannot be reached at all.
+///
+/// A session belongs to one bot alias in one locale, so this operation's own
+/// documented failures — "if the bot, alias, or session identifier doesn't
+/// exist" and "if the locale doesn't exist or is not enabled for the alias" —
+/// are refusals of the ADDRESS, answered here exactly as every sibling
+/// addressed by the same labels answers them.
+fn locale_unavailable(
+    error: LocaleUnavailable,
+    bot_id: &str,
+    bot_alias_id: &str,
+) -> GetSessionError {
+    match error.refusal(bot_id, bot_alias_id) {
+        AddressRefused::NotFound(message) => {
+            GetSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
+        }
+        AddressRefused::Internal(message) => {
+            GetSessionErrorModeled::InternalServerException(InternalServerException { message })
+        }
+    }
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -175,6 +204,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.locale_id,
             &input.session_id,
         );
+
+        // The address is resolved BEFORE the store is read: the three labels
+        // that name the conversation have to resolve to a model Amazon Lex V2
+        // has built — the bot/alias PAIR, then that version's locale — so a
+        // read addressed to a pair that is not an alias of that bot, or to a
+        // locale with no built model, is refused as the address rather than
+        // answered as a missing session.
+        built_locale(
+            &*self.engine,
+            &input.bot_id,
+            &input.bot_alias_id,
+            &input.locale_id,
+        )
+        .map_err(|error| locale_unavailable(error, &input.bot_id, &input.bot_alias_id))?;
 
         // A read: the store is only looked up (and swept of the sessions the
         // clock has already expired). An unknown or idle session is the modelled

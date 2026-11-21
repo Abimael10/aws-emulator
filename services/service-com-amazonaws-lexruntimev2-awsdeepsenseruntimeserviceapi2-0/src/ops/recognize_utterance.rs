@@ -165,7 +165,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::bot_model::{built_locale, BotLocaleModel, LocaleUnavailable};
+use crate::state::bot_model::{built_locale, AddressRefused, BotLocaleModel, LocaleUnavailable};
 use crate::state::headers::{
     decode_string_map, decode_struct, encode_json, encode_text, member_schema, HeaderRejected,
 };
@@ -266,24 +266,18 @@ fn locale_unavailable(
     bot_id: &str,
     bot_alias_id: &str,
 ) -> RecognizeUtteranceError {
-    match error {
-        LocaleUnavailable::UnknownBotAlias => {
+    match error.refusal(bot_id, bot_alias_id) {
+        AddressRefused::NotFound(message) => {
             RecognizeUtteranceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::bot_model::bot_alias_not_valid_message(
-                    bot_id,
-                    bot_alias_id,
-                ),
+                message,
             })
             .into()
         }
-        LocaleUnavailable::NotBuilt => {
-            RecognizeUtteranceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::bot_model::BOT_LOCALE_NOT_VALID_MESSAGE.to_string(),
+        AddressRefused::Internal(message) => {
+            RecognizeUtteranceErrorModeled::InternalServerException(InternalServerException {
+                message,
             })
             .into()
-        }
-        LocaleUnavailable::StoreUnavailable => {
-            internal("the Lex V2 bot definitions are unavailable")
         }
     }
 }

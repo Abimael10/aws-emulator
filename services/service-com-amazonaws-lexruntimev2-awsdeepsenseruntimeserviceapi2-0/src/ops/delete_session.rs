@@ -5,6 +5,9 @@
 //! Removes the stored session addressed by the four `@httpLabel` values and
 //! echoes the four back. A later `GetSession` for that key is a 404.
 //!
+//! The bot/alias pair and the locale are resolved against the control plane
+//! first, so an address that names no built model removes nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -83,8 +86,36 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::bot_model::{built_locale, AddressRefused, LocaleUnavailable};
 use crate::state::SessionKey;
 use std::time::SystemTime;
+
+/// The bot, alias and locale the request addresses resolve to no model this
+/// runtime holds a conversation against, or the control plane that holds them
+/// cannot be reached at all.
+///
+/// A session belongs to one bot alias in one locale, so this operation's own
+/// documented failures — "if you specify a bot or alias ID that doesn't exist"
+/// and "if the locale doesn't exist in the bot, or if the locale hasn't been
+/// enables for the alias" — are refusals of the ADDRESS, answered here exactly
+/// as every sibling addressed by the same labels answers them.
+fn locale_unavailable(
+    error: LocaleUnavailable,
+    bot_id: &str,
+    bot_alias_id: &str,
+) -> DeleteSessionError {
+    match error.refusal(bot_id, bot_alias_id) {
+        AddressRefused::NotFound(message) => {
+            DeleteSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message,
+            })
+        }
+        AddressRefused::Internal(message) => {
+            DeleteSessionErrorModeled::InternalServerException(InternalServerException { message })
+        }
+    }
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,6 +204,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.locale_id,
             &input.session_id,
         );
+
+        // The address is resolved BEFORE the store is touched: the three labels
+        // that name the conversation have to resolve to a model Amazon Lex V2
+        // has built — the bot/alias PAIR, then that version's locale — so a
+        // delete addressed to a pair that is not an alias of that bot, or to a
+        // locale with no built model, removes nothing and is refused where the
+        // siblings addressed by the same labels refuse it.
+        built_locale(
+            &*self.engine,
+            &input.bot_id,
+            &input.bot_alias_id,
+            &input.locale_id,
+        )
+        .map_err(|error| locale_unavailable(error, &input.bot_id, &input.bot_alias_id))?;
 
         // Deleting a session that is not there — or one the clock has already
         // expired — removes nothing, so it is the modelled 404 rather than a
