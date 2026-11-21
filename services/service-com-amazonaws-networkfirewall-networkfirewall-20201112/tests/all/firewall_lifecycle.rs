@@ -198,6 +198,9 @@ async fn a_created_firewall_policy_reads_back_identically() {
                 "StatelessDefaultActions": ["aws:pass"],
                 "StatelessFragmentDefaultActions": ["aws:drop"],
                 "StatefulDefaultActions": ["aws:drop_strict"],
+                // A stateful default action is only valid under the strict rule
+                // order, so the document that carries one names it.
+                "StatefulEngineOptions": { "RuleOrder": "STRICT_ORDER" },
             }),
             Some("strict"),
         ),

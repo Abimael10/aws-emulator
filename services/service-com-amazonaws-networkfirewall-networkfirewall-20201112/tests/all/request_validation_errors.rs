@@ -7,13 +7,13 @@
 //! Five rules, each a property of the MEMBER or of the CONSTRAINT rather than of one request,
 //! so every test below is a TABLE whose rows span the class its rule covers:
 //!
-//! * a value in a member an operation uses to IDENTIFY a resource that already exists — the
-//!   optional name/ARN pair its handler resolves — that cannot be a resource ARN, or cannot
-//!   be a resource name, is refused as the malformed REFERENCE it is: the modelled
-//!   `InvalidRequestException` carrying one constant per half of the pair, which is what the
-//!   resolution path answers the same defect with once a value reaches a handler. The same
-//!   member name on the CREATE of that resource carries the new resource's name, which the
-//!   model marks `@required`, and keeps the generic constraint clause;
+//! * a value in a member an operation uses to IDENTIFY a resource — the optional name/ARN
+//!   pair its handler resolves, and the name a create gives the resource it mints — that
+//!   cannot be a resource ARN, or cannot be a resource name, is refused as the malformed
+//!   IDENTIFIER it is: the modelled `InvalidRequestException` carrying one constant per half
+//!   of the pair, which is what the resolution path answers the same defect with once a value
+//!   reaches a handler. A member of a create that is NOT a resource name — the required ARN
+//!   reference to another resource it takes beside it — keeps the generic constraint clause;
 //! * the text of a body naming one of the error shapes this model declares travels in its
 //!   `Message` member, whichever layer rendered the body, because that is the member every
 //!   error shape of this model declares it in; the generic constraint refusal names
@@ -224,34 +224,36 @@ async fn a_malformed_identifier_is_refused_as_a_bad_reference() {
     }
 }
 
-/// RULE: on the CREATE of a resource the same member names the resource being created — the
-/// model marks it `@required` there — so a value outside its declared form keeps the generic
-/// constraint clause, under the error class the framework names for one.
+/// RULE: on the CREATE of a resource, the member naming the resource being created is held to
+/// the same form as the reference half of the pair — a value that cannot be a resource name is
+/// refused with the modelled `InvalidRequestException` carrying the name constant — while a
+/// member of the create that is NOT a resource name keeps the generic constraint clause.
 ///
-/// The rows differ along the resource kind created, the bound the value broke (pattern,
-/// length maximum, length minimum) and the member kind (the created resource's name, and a
-/// required reference to another resource the create takes beside it).
+/// The rows differ along the resource kind created, the bound the value broke (pattern, length
+/// maximum, length minimum) and, for the clause half, the member kind: the required ARN
+/// reference to another resource the create takes beside the name.
 #[tokio::test]
-async fn a_create_states_a_malformed_name_as_a_constraint_clause() {
+async fn a_create_states_a_malformed_name_as_a_bad_reference() {
     let harness = Harness::new();
     let over_the_maximum = "a".repeat(129);
     let rule_group_document =
         json!({ "RulesSource": { "RulesString": "pass tcp any any -> any any (sid:1;)" } });
-    // (case, operation, request body, member path, the requirement expected)
-    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+    // (case, operation, request body) — each refused as a malformed resource name
+    let names: Vec<(&str, &str, Value)> = vec![
         (
             "a firewall name outside its pattern",
             "CreateFirewall",
             json!({ "FirewallName": "bad name!", "FirewallPolicyArn": policy_arn("p-one") }),
-            "firewallName",
-            "Member must satisfy regular expression pattern: ^[a-zA-Z0-9-]+$",
         ),
         (
             "a firewall name past its maximum",
             "CreateFirewall",
             json!({ "FirewallName": over_the_maximum, "FirewallPolicyArn": policy_arn("p-two") }),
-            "firewallName",
-            "Member must have length less than or equal to 128",
+        ),
+        (
+            "an empty firewall name, under its minimum",
+            "CreateFirewall",
+            json!({ "FirewallName": "", "FirewallPolicyArn": policy_arn("p-three") }),
         ),
         (
             "a policy name outside its pattern",
@@ -260,8 +262,14 @@ async fn a_create_states_a_malformed_name_as_a_constraint_clause() {
                 "FirewallPolicyName": "p one",
                 "FirewallPolicy": crate::harness::minimal_policy_document(),
             }),
-            "firewallPolicyName",
-            "Member must satisfy regular expression pattern: ^[a-zA-Z0-9-]+$",
+        ),
+        (
+            "a policy name carrying a path separator",
+            "CreateFirewallPolicy",
+            json!({
+                "FirewallPolicyName": "p/one",
+                "FirewallPolicy": crate::harness::minimal_policy_document(),
+            }),
         ),
         (
             "a rule group name outside its pattern",
@@ -272,15 +280,58 @@ async fn a_create_states_a_malformed_name_as_a_constraint_clause() {
                 "Capacity": 10,
                 "RuleGroup": rule_group_document,
             }),
-            "ruleGroupName",
-            "Member must satisfy regular expression pattern: ^[a-zA-Z0-9-]+$",
         ),
+        (
+            "a TLS inspection configuration name outside its pattern",
+            "CreateTLSInspectionConfiguration",
+            json!({
+                "TLSInspectionConfigurationName": "tls config",
+                "TLSInspectionConfiguration": { "ServerCertificateConfigurations": [] },
+            }),
+        ),
+    ];
+
+    for (case, target, body) in names {
+        let (status, parsed) = harness.call(target, &body).await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (400, INVALID_REQUEST_EXCEPTION),
+            "case {case}: expected 400 {INVALID_REQUEST_EXCEPTION}, got {status} with body \
+             {parsed:?}"
+        );
+        let actual = modelled_message(&parsed);
+        assert_eq!(
+            actual,
+            Some(NAME_INVALID_FORMAT),
+            "case {case}: expected the Message {NAME_INVALID_FORMAT:?}, got {actual:?} in \
+             {parsed:?}"
+        );
+        assert_eq!(
+            rendered_message(&parsed),
+            None,
+            "case {case}: the text must be carried under ONE member, got {parsed:?}"
+        );
+    }
+
+    // (case, operation, request body, member path, the requirement expected)
+    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
         (
             "a required reference the create takes beside the name",
             "CreateFirewall",
             json!({ "FirewallName": "fw-one", "FirewallPolicyArn": "not-an-arn" }),
             "firewallPolicyArn",
             "Member must satisfy regular expression pattern: ^arn:aws",
+        ),
+        (
+            "a description past its maximum, beside a well-formed name",
+            "CreateFirewall",
+            json!({
+                "FirewallName": "fw-two",
+                "FirewallPolicyArn": policy_arn("p-four"),
+                "Description": "d".repeat(513),
+            }),
+            "description",
+            "Member must have length less than or equal to 512",
         ),
     ];
 

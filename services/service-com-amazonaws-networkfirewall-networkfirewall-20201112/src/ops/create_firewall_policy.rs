@@ -212,6 +212,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The same for the document's STATEFUL default action: it may only be
+        // used under the strict rule order, and each entry must name one of the
+        // documented stateful default actions. Like the check above it reads only
+        // the request, so it runs before anything is looked up or inserted and a
+        // refused request consumes neither the name nor any other state.
+        if let Some(breach) = crate::state::stateful_default_action_breach(&input.firewall_policy) {
+            return Err(
+                CreateFirewallPolicyErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(breach),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let region = crate::state::request_region(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateFirewallPolicyErrorModeled::InternalServerError(

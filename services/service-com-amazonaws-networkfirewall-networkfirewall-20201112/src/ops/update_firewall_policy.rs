@@ -199,15 +199,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // scope: the policy it edits is the one already stored.
         let _ = ctx;
 
-        // The two checks that read only the SUBMITTED DOCUMENT run first, before
+        // The checks that read only the SUBMITTED DOCUMENT run first, before
         // the store is reached at all, so no caller-driven walk of the document
         // happens while this service's state guard is held. They are the same
         // checks the create runs, in the same order: what this emulator will
         // retain of the document — which is also what caps the lists the next
-        // check reads — and then whether its default stateless actions name
-        // actions this service can take. Both run for a dry run too, and both run
-        // before the record is touched, so a refused update leaves the stored
-        // policy as it was.
+        // checks read — and then whether its default stateless and stateful
+        // actions name actions this service can take. All run for a dry run too,
+        // and all run before the record is touched, so a refused update leaves
+        // the stored policy as it was.
         if let Some(breach) = crate::state::policy_document_breach(&input.firewall_policy) {
             // This operation's model declares no limit error, so a document
             // past what this emulator retains is refused as the bad request it
@@ -221,6 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         if let Some(breach) = crate::state::stateless_default_action_breach(&input.firewall_policy) {
+            return Err(UpdateFirewallPolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(breach),
+                },
+            )
+            .into());
+        }
+        if let Some(breach) = crate::state::stateful_default_action_breach(&input.firewall_policy) {
             return Err(UpdateFirewallPolicyErrorModeled::InvalidRequestException(
                 InvalidRequestException {
                     message: Some(breach),

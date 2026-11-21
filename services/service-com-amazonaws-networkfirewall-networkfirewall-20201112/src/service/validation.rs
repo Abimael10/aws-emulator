@@ -9,17 +9,15 @@
 //! reached from [`crate::service`]'s `override_refusal`, the one seam that sees a refusal
 //! taken before dispatch.
 //!
-//! Six rules distinguish this service's wording from the framework's default. Two are keyed
-//! to the OPERATION as well as to what was refused — the references this service resolves
-//! itself, one half of which is a reference only on an operation acting on a resource that
-//! already exists, and the rule-group type, which is a parameter of its own only on an
-//! operation that writes a rule group — and the next two are keyed to nothing at all, so each
-//! of those holds for every constrained member of every operation of this service; rules 3 and
-//! 5 are keyed to the SHAPE a member targets, since what a requirement states about a shape is
-//! a property of that shape:
+//! Six rules distinguish this service's wording from the framework's default. One is keyed
+//! to the OPERATION as well as to what was refused — the rule-group type, which is a
+//! parameter of its own only on an operation that writes a rule group — and rules 0, 1 and 2
+//! are keyed to nothing but the member and the constraint, so each of those holds for every
+//! operation of this service; rules 3 and 5 are keyed to the SHAPE a member targets, since
+//! what a requirement states about a shape is a property of that shape:
 //!
-//! 0. a value in a member that carries a RESOURCE REFERENCE this service resolves itself
-//!    ([`REFERENCE_ARN_MEMBERS`], [`REFERENCE_NAME_MEMBERS`]), refused because it is outside
+//! 0. a value in a member that carries one of this service's RESOURCE IDENTIFIERS
+//!    ([`REFERENCE_ARN_MEMBERS`], [`RESOURCE_NAME_MEMBERS`]), refused because it is outside
 //!    the form or the length a `ResourceArn` or a `ResourceName` declares, is not a
 //!    validation clause at all: it cannot be one of this service's ARNs, or a resource name
 //!    at all. For an ARN that is the same defect the resolution path refuses once a value
@@ -28,8 +26,9 @@
 //!    the one `ResourceName` shape, so this seam is the only place that half is stated
 //!    ([`crate::state::NAME_INVALID_FORMAT_MESSAGE`]). Either way it leaves as the modelled
 //!    client error with that constant — never as an error shape this service's model does not
-//!    declare. This one is keyed to member names because a reference is a member-level fact:
-//!    the model says which members name a resource;
+//!    declare. This one is keyed to member names alone, because what a value CAN be is a fact
+//!    about the member's shape and not about the call it arrived on: the model says which
+//!    members carry a resource's name or ARN;
 //! 1. a clause names the offending MEMBER PATH and the CONSTRAINT it broke, and NOTHING of
 //!    the value the caller sent — not the submitted bytes, and not the `null` the framework
 //!    writes where a member was absent. The requirement states what the request must
@@ -109,12 +108,15 @@ const REFERENCE_ARN_MEMBERS: [&str; 2] = ["firewallArn", "ruleGroupArn"];
 /// (`smithy_query(query="shape",shape="ResourceName")`: `@length` 1..128, `@pattern`
 /// `^[a-zA-Z0-9-]+$`).
 ///
-/// Unlike an ARN, a resource name is a reference only on an operation acting on a resource
-/// that ALREADY EXISTS: on a create the same member name carries the name of the resource
-/// being created, which is content the request supplies and which the recorded refusals state
-/// as a validation clause. That is the one fact about the OPERATION this wording needs, and
-/// [`crate::service::served_operation::serves_an_existing_resource`] is where it comes from.
-const REFERENCE_NAME_MEMBERS: [&str; 4] = [
+/// Keyed by member NAME on every operation, like the ARN half: a value either satisfies the
+/// form a `ResourceName` declares or it names no resource of this service at all, and which
+/// of those it is does not depend on whether the call identifies a resource that already
+/// exists or names the one it is creating — the recorded refusal of a CREATE whose resource
+/// name is outside that form is the same modelled client error carrying the same constant.
+/// What a create takes BESIDE the name keeps its own refusal: the required ARN reference to
+/// another resource is recorded as a validation clause, which is why `firewallPolicyArn` is
+/// absent from the ARN half above.
+const RESOURCE_NAME_MEMBERS: [&str; 4] = [
     "firewallName",
     "firewallPolicyName",
     "ruleGroupName",
@@ -384,8 +386,9 @@ fn names_a_rule_group_type(violation: &Violation) -> bool {
         .eq(MODELLED_RULE_GROUP_TYPES.iter().copied())
 }
 
-/// Rule 0: the malformed-reference refusal when EVERY violation is a reference member whose
-/// value cannot be a resource ARN or a resource name, and `None` otherwise.
+/// Rule 0: the malformed-identifier refusal when EVERY violation is a member carrying one of
+/// this service's resource identifiers whose value cannot be a resource ARN or a resource
+/// name, and `None` otherwise.
 ///
 /// A value outside the member's declared form and one outside its declared length are the
 /// same answer: both are bounds a `ResourceArn` or a `ResourceName` has to satisfy to be one
@@ -408,7 +411,7 @@ fn malformed_reference(violations: &[Violation]) -> Option<Refused> {
         let path = violation.path.as_str();
         if REFERENCE_ARN_MEMBERS.contains(&path) {
             arn = true;
-        } else if !names_a_reference(path) {
+        } else if !RESOURCE_NAME_MEMBERS.contains(&path) {
             return None;
         }
     }
@@ -421,14 +424,6 @@ fn malformed_reference(violations: &[Violation]) -> Option<Refused> {
         code: MODELLED_REFUSAL_CODE.to_owned(),
         message: message.to_owned(),
     })
-}
-
-/// Whether the member at `path` carries a resource NAME that is a reference on the operation
-/// being served: one of [`REFERENCE_NAME_MEMBERS`], on an operation acting on a resource that
-/// already exists rather than on the create that names a new one.
-fn names_a_reference(path: &str) -> bool {
-    REFERENCE_NAME_MEMBERS.contains(&path)
-        && crate::service::served_operation::serves_an_existing_resource()
 }
 
 /// `violation` with an enumerated type's value set stated as the SERVICE enumerates it, and

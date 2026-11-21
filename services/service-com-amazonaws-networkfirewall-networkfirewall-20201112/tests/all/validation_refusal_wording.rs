@@ -278,7 +278,6 @@ async fn an_element_constraint_is_stated_at_the_collection_member() {
 async fn a_scalar_constraint_is_stated_without_the_submitted_value() {
     let harness = Harness::new();
     let over_the_maximum = "d".repeat(513);
-    let long_name = "a".repeat(129);
     // (case, operation, request body, member path, the requirement expected)
     let rows: Vec<(&str, &str, Value, &str, String)> = vec![
         (
@@ -329,20 +328,6 @@ async fn a_scalar_constraint_is_stated_without_the_submitted_value() {
             RULE_ORDER_SET.to_string(),
         ),
         (
-            "a firewall name outside its pattern",
-            "CreateFirewall",
-            json!({ "FirewallName": "bad name!", "FirewallPolicyArn": policy_arn("p-six") }),
-            "firewallName",
-            "Member must satisfy regular expression pattern: ^[a-zA-Z0-9-]+$".to_string(),
-        ),
-        (
-            "a firewall name one character over its maximum",
-            "CreateFirewall",
-            json!({ "FirewallName": long_name, "FirewallPolicyArn": policy_arn("p-seven") }),
-            "firewallName",
-            "Member must have length less than or equal to 128".to_string(),
-        ),
-        (
             "a description one character over its maximum",
             "CreateFirewall",
             json!({
@@ -352,6 +337,17 @@ async fn a_scalar_constraint_is_stated_without_the_submitted_value() {
             }),
             "description",
             "Member must have length less than or equal to 512".to_string(),
+        ),
+        (
+            "an empty tag list, under the collection's own minimum",
+            "CreateFirewall",
+            json!({
+                "FirewallName": "fw-eight",
+                "FirewallPolicyArn": policy_arn("p-nine-tags"),
+                "Tags": [],
+            }),
+            "tags",
+            "Member must have length greater than or equal to 1".to_string(),
         ),
         (
             "a policy ARN of no partition at all",
@@ -401,19 +397,20 @@ async fn the_envelope_counts_clauses_and_valid_input_is_served() {
     let same_member = refusal(
         &harness,
         "one member breaking two of its constraints",
-        "CreateFirewall",
-        &json!({ "FirewallName": "", "FirewallPolicyArn": policy_arn("p-ten") }),
+        "UpdateFirewallDescription",
+        &json!({ "FirewallName": "fw-eleven", "UpdateToken": "", "Description": "x" }),
     )
     .await;
     let expected_same_member = format!(
         "2 validation errors detected: {}; {}",
         clause(
-            "firewallName",
+            "updateToken",
             "Member must have length greater than or equal to 1"
         ),
         clause(
-            "firewallName",
-            "Member must satisfy regular expression pattern: ^[a-zA-Z0-9-]+$"
+            "updateToken",
+            "Member must satisfy regular expression pattern: \
+             ^([0-9a-f]{8})-([0-9a-f]{4}-){3}([0-9a-f]{12})$"
         )
     );
     assert_eq!(

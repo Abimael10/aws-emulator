@@ -441,6 +441,115 @@ fn standard_action_token(action: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// The member a firewall policy document's stateful default actions arrive on,
+/// which is also the member name its refusals name and the input path they
+/// report as their context.
+pub const STATEFUL_DEFAULT_ACTIONS_MEMBER: &str = "StatefulDefaultActions";
+
+/// The rule order a stateful default action is valid under: "The stateful default
+/// action is optional, and is only valid when using the strict rule order"
+/// (`FirewallPolicy$StatefulDefaultActions`).
+pub const STRICT_RULE_ORDER: &str = "STRICT_ORDER";
+
+/// The rule order in force when a policy document names none:
+/// "`STRICT_ORDER` is the recommended option, but `DEFAULT_ACTION_ORDER` is the
+/// default option" (`StatefulEngineOptions$RuleOrder`). Both values are the two
+/// `RuleOrder` carries ([`crate::ops::types::RULE_ORDER_VALUES`]).
+pub const DEFAULT_RULE_ORDER: &str = "DEFAULT_ACTION_ORDER";
+
+/// The actions a firewall policy's `StatefulDefaultActions` may name.
+///
+/// The documented value list of `FirewallPolicy$StatefulDefaultActions`
+/// (`smithy_query(query="doc",shape="FirewallPolicy",member="StatefulDefaultActions")`:
+/// "Valid values of the stateful default action"), in the order it states them.
+/// The target shape is a plain list of string rather than an enum, so the
+/// vocabulary is enforced here rather than by the model's constraint validator.
+pub const STATEFUL_DEFAULT_ACTIONS: [&str; 8] = [
+    "aws:drop_strict",
+    "aws:drop_established",
+    "aws:alert_strict",
+    "aws:alert_established",
+    "aws:drop_established_app_layer",
+    "aws:alert_established_app_layer",
+    "aws:drop_established_app_layer_to_server",
+    "aws:alert_established_app_layer_to_server",
+];
+
+/// The rule order `policy` is evaluated under: the one its
+/// `StatefulEngineOptions` names, or [`DEFAULT_RULE_ORDER`] when the document
+/// leaves it out — which is what "`DEFAULT_ACTION_ORDER` is the default option"
+/// (`StatefulEngineOptions$RuleOrder`) means. Whatever arrives here is one of
+/// [`crate::ops::types::RULE_ORDER_VALUES`]: the value set is a declared
+/// enumeration, so a value
+/// outside it is refused before any handler runs.
+pub fn effective_rule_order(policy: &FirewallPolicy) -> &str {
+    policy
+        .stateful_engine_options
+        .as_ref()
+        .and_then(|options| options.rule_order.as_deref())
+        .unwrap_or(DEFAULT_RULE_ORDER)
+}
+
+/// Why `policy`'s stateful default actions are not a set of actions this service
+/// can act on, or `None` when they are — including when the document names none.
+///
+/// Two conditions, both stated by the documentation of the member that takes them
+/// (`FirewallPolicy$StatefulDefaultActions`: "The default actions to take on a
+/// packet that doesn't match any stateful rules. The stateful default action is
+/// optional, and is only valid when using the strict rule order", followed by the
+/// list of "Valid values of the stateful default action"):
+///
+/// * the member may only be USED under the strict rule order, so a document that
+///   names a stateful default action while any other rule order is in effect
+///   ([`effective_rule_order`]) is refused for the order it is asking for, not
+///   for the actions it names — the order governs whether the member may carry
+///   anything at all, so it is judged first;
+/// * every entry must name one of the [`STATEFUL_DEFAULT_ACTIONS`]. The
+///   documented names are lower-case and this vocabulary is matched as published,
+///   so a differently-cased spelling names none of them.
+///
+/// A document naming no stateful default action — the member absent, or present
+/// and empty — specifies nothing for either condition to judge, which is what
+/// makes the action "optional" under both rule orders.
+///
+/// Each refusal is built FROM the request in the service's request-derived
+/// message shape ([`parameter_context_message`]): the stem names the member and
+/// what failed about it, the brackets carry the offending value — the rule order
+/// in effect, or the rejected action verbatim as the request spelled it — and the
+/// context is the input path the check looked at. The first failure is reported,
+/// entries in request order. Both handlers run this after
+/// [`policy_document_breach`], which caps the list at
+/// [`MAX_POLICY_LIST_ENTRIES`].
+///
+/// Either way the document is refused rather than retained: a stored policy whose
+/// stateful default action nothing implements, or that asks for a default action
+/// the rule order it runs under does not apply, would silently inspect traffic
+/// differently from the policy the caller asked for.
+pub fn stateful_default_action_breach(policy: &FirewallPolicy) -> Option<String> {
+    let actions = policy.stateful_default_actions.as_ref()?;
+    if actions.is_empty() {
+        return None;
+    }
+
+    let rule_order = effective_rule_order(policy);
+    if rule_order != STRICT_RULE_ORDER {
+        return Some(parameter_context_message(
+            &format!("{STATEFUL_DEFAULT_ACTIONS_MEMBER} has invalid rule order"),
+            rule_order,
+            STATEFUL_DEFAULT_ACTIONS_MEMBER,
+        ));
+    }
+
+    let unsupported = actions
+        .iter()
+        .find(|action| !STATEFUL_DEFAULT_ACTIONS.contains(&action.as_str()))?;
+    Some(parameter_context_message(
+        &format!("{STATEFUL_DEFAULT_ACTIONS_MEMBER} has invalid action"),
+        unsupported,
+        STATEFUL_DEFAULT_ACTIONS_MEMBER,
+    ))
+}
+
 /// How many `LogDestinationConfigs` entries one logging configuration may carry.
 ///
 /// CHOSEN, not an AWS quota: the model puts NO length constraint on the list, and
