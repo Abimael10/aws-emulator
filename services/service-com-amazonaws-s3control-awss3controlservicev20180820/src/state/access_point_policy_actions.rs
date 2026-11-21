@@ -27,7 +27,10 @@
 //! policy states WHO its grants reach: a value in none of the forms the policy language
 //! defines for its principal type denotes no identity any policy engine could evaluate,
 //! and neither does an IAM identity this account's IAM does not hold
-//! ([`POLICY_INVALID_PRINCIPAL_MESSAGE`], [`unresolved_policy_principal`]).
+//! ([`POLICY_INVALID_PRINCIPAL_MESSAGE`], [`unresolved_policy_principal`]). Either way the
+//! refusal quotes the submitted document's own MEMBER naming that principal — the type key
+//! and the value together ([`invalid_policy_principal`]) — because a principal is valid only
+//! relative to the type it is named under.
 //!
 //! A statement's RESOURCE elements are read beside them, because a resource-based
 //! policy governs the resource it is attached to: an access point's policy names that
@@ -327,24 +330,39 @@ pub fn access_point_policy_refusal<E>(document: &str) -> Option<crate::scaffolde
     // language defines per principal type: a value in none of them denotes no identity,
     // so the document grants to nobody a policy engine could evaluate.
     ::service_common::iam_policy_principals::unreadable_policy_principal(document)
-        .map(|named| invalid_policy_principal(&named))
+        .map(|named| invalid_policy_principal(document, &named))
 }
 
-/// `MalformedPolicy` (HTTP 400) naming `principal`: a statement of the document names
+/// `MalformedPolicy` (HTTP 400) naming `principal`: a statement of `document` names
 /// something that is not a principal of the type it was named under, or names an identity
 /// this account's IAM does not hold.
 ///
-/// The message is the fixed sentence AWS words this clause with; the offending value
-/// travels in the member beside it, taken from the submitted document, as the
-/// invalid-action and invalid-resource refusals carry theirs.
-pub fn invalid_policy_principal<E>(principal: &str) -> crate::scaffolded::Scaffolded<E> {
+/// The message is the fixed sentence AWS words this clause with; WHERE in the submitted
+/// document the fault is travels in the member beside it, as the invalid-action and
+/// invalid-resource refusals carry theirs.
+///
+/// What that member carries is the document's own MEMBER naming the principal — the type
+/// key, the separator and the value, written as a policy member is
+/// ([`::service_common::iam_policy_principals::principal_member`]) — and not the value
+/// lifted out of it: a principal is valid only relative to the type key it is named under,
+/// so the entry is what the caller has to fix and what tooling locates the offending
+/// statement by. An action or a resource element names its values on their own, which is
+/// why those two refusals report a value where this one reports a member. A value no
+/// statement of the document names (a document whose text could not be parsed at all) has
+/// no member to quote, so the value itself is reported.
+pub fn invalid_policy_principal<E>(
+    document: &str,
+    principal: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    let named = ::service_common::iam_policy_principals::principal_member(document, principal)
+        .unwrap_or_else(|| principal.to_string());
     crate::scaffolded::Scaffolded::service_failure_naming(
         crate::state::MALFORMED_POLICY_CODE,
         crate::state::MALFORMED_POLICY_STATUS,
         POLICY_INVALID_PRINCIPAL_MESSAGE,
         vec![crate::scaffolded::ErrorDetail::new(
             &POLICY_DETAIL_MEMBER,
-            principal,
+            named,
         )],
     )
 }
@@ -375,7 +393,7 @@ pub async fn unresolved_policy_principal<E>(
 ) -> Option<crate::scaffolded::Scaffolded<E>> {
     for principal in ::service_common::iam_policy_principals::policy_principals(document) {
         if ::service_common::iam_principal::identity_is_absent(ctx, region, &principal).await {
-            return Some(invalid_policy_principal(&principal));
+            return Some(invalid_policy_principal(document, &principal));
         }
     }
     None
@@ -647,41 +665,47 @@ mod tests {
         // where only the wildcard is written without a type, a type the language does
         // not define, an account id that is no account id, an ARN that names no
         // identity, a service principal that is no DNS name, a canonical user of the
-        // wrong length, and the same in the complement element.
+        // wrong length, and the same in the complement element. Each row states the
+        // document's own MEMBER the refusal quotes: the type key and the value, or the
+        // statement element itself where the shorthand names no type.
         let rows = [
-            ("a bare word for the untyped form", "\"everyone\"", "everyone"),
+            (
+                "a bare word for the untyped form",
+                "\"everyone\"",
+                "\"Principal\" : \"everyone\"",
+            ),
             (
                 "a type the language does not define",
                 "{\"Account\":\"123456789012\"}",
-                "Account",
+                "\"Account\" : \"123456789012\"",
             ),
             (
                 "an account id of the wrong length",
                 "{\"AWS\":\"12345\"}",
-                "12345",
+                "\"AWS\" : \"12345\"",
             ),
             (
                 "an ARN that names no identity",
                 "{\"AWS\":\"arn:aws:s3:::reports\"}",
-                "arn:aws:s3:::reports",
+                "\"AWS\" : \"arn:aws:s3:::reports\"",
             ),
             (
                 "a service principal that is no DNS name",
                 "{\"Service\":\"lambda\"}",
-                "lambda",
+                "\"Service\" : \"lambda\"",
             ),
             (
                 "a canonical user id of the wrong length",
                 "{\"CanonicalUser\":\"abc\"}",
-                "abc",
+                "\"CanonicalUser\" : \"abc\"",
             ),
             (
                 "the first value outside the forms in a list",
                 "{\"AWS\":[\"123456789012\",\"nobody\"]}",
-                "nobody",
+                "\"AWS\" : \"nobody\"",
             ),
         ];
-        for (case, element, named) in rows {
+        for (case, element, quoted) in rows {
             let document = format!(
                 "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
                  \"Principal\":{element},\"Action\":\"s3:GetObject\"}}]}}"
@@ -691,9 +715,9 @@ mod tests {
                 found,
                 Some((
                     POLICY_INVALID_PRINCIPAL_MESSAGE.to_string(),
-                    Some(named.to_string())
+                    Some(quoted.to_string())
                 )),
-                "case {case:?}: expected the invalid-principal refusal naming {named:?}, got \
+                "case {case:?}: expected the invalid-principal refusal quoting {quoted:?}, got \
                  {found:?}"
             );
         }

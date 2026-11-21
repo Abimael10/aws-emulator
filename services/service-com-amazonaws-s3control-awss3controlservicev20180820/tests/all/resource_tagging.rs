@@ -10,9 +10,10 @@
 //! MERGES ("Creates a new user-defined tag or updates an existing tag", `TagResource`),
 //! untagging removes exactly the keys it names, and a read reports the set without
 //! changing it. An ARN naming a resource no store holds is refused as that resource being
-//! missing, and an ARN naming no S3 resource at all as a bad request — both in this
-//! service's own S3-style XML `<Code>`/`<Message>` envelope, never in a JSON
-//! `ValidationException`.
+//! missing, and an ARN in a form this surface addresses no resource in as a path it could
+//! not parse — both in this service's own S3-style XML `<Code>`/`<Message>` envelope, never
+//! in a JSON `ValidationException`. WHICH forms those are is the table in the sibling
+//! `tagged_resource_arn_forms` suite.
 //!
 //! The rows span what the rule generalises over: the KIND of resource addressed (an
 //! access point, a Storage Lens group, an S3 Access Grants instance, a registered Access
@@ -50,6 +51,11 @@ const LOCATION_ROLE: &str = "arn:aws:iam::123456789012:role/AccessGrantsLocation
 /// read from the implementation's own constants, so a change to them fails this suite.
 const NO_SUCH_RESOURCE_CODE: &str = "NoSuchResource";
 const NO_SUCH_RESOURCE_MESSAGE: &str = "The specified resource doesn't exist.";
+
+/// The code this surface answers for an ARN in a form it addresses no resource in: the
+/// greedy label is the whole path, so such a label is a path this service cannot parse
+/// (the sibling `tagged_resource_arn_forms` suite is that rule's own table).
+const UNPARSABLE_CODE: &str = "InvalidURI";
 
 /// Which S3 resource a row addresses. Each kind is a different `ResourceArn` form, and
 /// the ARN itself is always the one that resource's own create or read reports.
@@ -507,19 +513,19 @@ async fn an_arn_naming_no_resource_this_store_holds_is_refused_in_this_services_
             "another vendor's resource ARN",
             format!("arn:aws:sqs:{REGION}:{account}:queue"),
             400,
-            "InvalidRequest",
+            UNPARSABLE_CODE,
         ),
         (
             "an S3 ARN of a resource type this surface does not tag",
             format!("arn:aws:s3:{REGION}:{account}:storage-lens/default-account-dashboard"),
             400,
-            "InvalidRequest",
+            UNPARSABLE_CODE,
         ),
         (
             "a value that is no ARN at all",
             "tagged-group".to_string(),
             400,
-            "InvalidRequest",
+            UNPARSABLE_CODE,
         ),
     ];
 

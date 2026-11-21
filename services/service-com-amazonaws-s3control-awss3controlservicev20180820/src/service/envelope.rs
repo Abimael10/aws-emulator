@@ -53,7 +53,11 @@
 //!   bucket's S3 on Outposts ARN, or its name together with the Outpost header
 //!   the REST API requires — is answered the same way, before the request's body
 //!   is read at all: what the caller has to change is the resource it addressed,
-//!   not the document it sent.
+//!   not the document it sent;
+//! * a request addressing a resource of the generic TAGGING surface by an ARN in
+//!   no form that surface addresses a resource in is answered the same way, for
+//!   the same reason: the greedy label is the whole path there, so a label naming
+//!   no addressable form is a path that resolves to no resource.
 //!
 //! Not every failure travels in the wrapped envelope: the Storage Lens
 //! CONFIGURATION surface answers the refusals of its OWN resource in the FLAT
@@ -197,6 +201,40 @@ const JOBS_PATH: &str = "/v20180820/jobs/";
 /// own name rules and are NOT in this space — the prefix ends in a separator,
 /// so a sibling segment that merely starts with it is not claimed.
 const ACCESS_POINT_PATH: &str = "/v20180820/accesspoint/";
+
+/// The path space the generic tagging surface addresses a resource in: all
+/// three of its routes are `/v20180820/tags/{ResourceArn+}`
+/// (`smithy_query(query="operation",operation="ListTagsForResource")`), so
+/// everything after this prefix is the ARN of the resource the request is about.
+/// The prefix ends in a separator, so a sibling segment that merely starts with
+/// it is not claimed.
+const TAGGED_RESOURCE_PATH: &str = "/v20180820/tags/";
+
+/// The resource path a tagging request addressed, when the ARN in its greedy
+/// label is in NO form the generic tagging surface addresses a resource in
+/// ([`crate::state::tagged_resource`]) — so the path resolves to no resource at
+/// all — and `None` for every other path.
+///
+/// The greedy label IS the whole path here, so a label naming no addressable
+/// resource form leaves nothing for the path to address and the URI cannot be
+/// parsed — a different answer from an addressable form naming a resource no
+/// store holds, which is that resource being missing. The escapes are the wire's
+/// rather than part of the ARN, so the label is percent-decoded the way the codec
+/// that deserializes it would decode it
+/// ([`::service_common::percent_decode_path_label`]) before it is read, and the
+/// path the refusal echoes is built from the ARN the caller addressed
+/// ([`crate::state::tags_resource_path`]) — the same path the refusal a handler
+/// raises for the same label carries.
+fn unparsable_tagged_resource_path(path: &str) -> Option<String> {
+    let label = path.strip_prefix(TAGGED_RESOURCE_PATH)?;
+    if label.is_empty() {
+        return None;
+    }
+    let decoded = ::service_common::percent_decode_path_label(label);
+    crate::state::tagged_resource(&decoded)
+        .is_none()
+        .then(|| crate::state::tags_resource_path(&decoded))
+}
 
 /// The path space a BUCKET is addressed in: every bucket route is
 /// `/v20180820/bucket/{Bucket}` or a sub-resource of it, so what follows this
@@ -1004,6 +1042,22 @@ impl ErasedOperation for Dispatch {
                     crate::state::INVALID_URI_CODE,
                     crate::state::INVALID_URI_MESSAGE,
                     &[("URI", addressed_resource(path))],
+                );
+            }
+            // The same stage for the generic tagging space: those three routes
+            // address the resource in the greedy label ALONE, so a label in no
+            // form this surface addresses a resource in
+            // ([`unparsable_tagged_resource_path`]) leaves the path naming
+            // nothing — the refusal is answered here, before an operation is
+            // named and so before the request's body is read or any tag set is
+            // reported or written.
+            if let Some(named) = unparsable_tagged_resource_path(path) {
+                return error_response(
+                    Envelope::Wrapped,
+                    crate::state::INVALID_URI_STATUS,
+                    crate::state::INVALID_URI_CODE,
+                    crate::state::INVALID_URI_MESSAGE,
+                    &[("URI", &named)],
                 );
             }
             // The same stage for the Storage Lens configuration space: an id

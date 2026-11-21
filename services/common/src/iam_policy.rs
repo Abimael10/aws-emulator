@@ -750,6 +750,23 @@ pub fn canonical_document(text: &str) -> String {
     render_canonically(text, false, true)
 }
 
+/// ONE member of a policy document as the canonical rendering writes it: the key, the
+/// [`CANONICAL_KEY_SEPARATOR`] and the value, with `value` rendered by the walk above.
+///
+/// What a refusal quotes when the fault it reports is a whole MEMBER of the submitted
+/// document rather than a value standing on its own — a principal, which is valid only
+/// relative to the type key it is named under, so the key and the value together are what
+/// identifies it. The rendering is the same one a read of a stored document reports
+/// ([`canonical_document`]), so a member quoted back at a caller is written the way that
+/// service's policy engine writes one, whatever layout the caller submitted it in.
+pub fn canonical_member(key: &str, value: &::serde_json::Value) -> String {
+    let key = ::serde_json::Value::String(key.to_string());
+    format!(
+        "{key}{CANONICAL_KEY_SEPARATOR}{value}",
+        value = canonical_document(&value.to_string())
+    )
+}
+
 /// [`canonical_document`] for a service that reports a VALUE LIST as it was written: a list
 /// holding exactly one value keeps its brackets (`"Action" : [ "svc:DoThing" ]`).
 ///

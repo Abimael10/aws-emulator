@@ -10,8 +10,9 @@
 //!   statements name as a principal is a principal of the type it was named
 //!   under, and every IAM identity it names by ARN is one this account's IAM
 //!   holds — a grant to an identity that does not exist is a grant to nobody, so
-//!   the document is refused `MalformedPolicy` naming the offending value and
-//!   nothing is stored;
+//!   the document is refused `MalformedPolicy` quoting the submitted document's
+//!   own member that names that principal — the type key and the value together,
+//!   written as a policy member is — and nothing is stored;
 //! * a resource-based policy governs the resource it is attached to, so every
 //!   value its statements name as a resource is the access point the request
 //!   addresses, or an object reached through it; anything else — a bucket, a
@@ -146,6 +147,12 @@ fn access_point_objects() -> String {
     format!("arn:aws:s3:{REGION}:{ACCOUNT}:accesspoint/{ACCESS_POINT}/object/*")
 }
 
+/// The member of a submitted document a refusal quotes for the principal named under the
+/// `AWS` type as `value`: the type key and the value, written as a policy member is.
+fn aws_principal_member(value: &str) -> String {
+    format!("\"AWS\" : \"{value}\"")
+}
+
 #[tokio::test]
 async fn a_document_granting_to_an_identity_iam_does_not_hold_is_refused_naming_it() {
     let store = fixture().await;
@@ -221,9 +228,10 @@ async fn a_document_granting_to_an_identity_iam_does_not_hold_is_refused_naming_
                     put.body
                 );
                 assert_eq!(
-                    put.text("Detail").as_deref(),
-                    Some(named),
-                    "case {case:?}: expected the refusal to name {named:?}, got body {}",
+                    put.text("Detail"),
+                    Some(aws_principal_member(named)),
+                    "case {case:?}: expected the refusal to quote the document's member naming \
+                     {named:?}, got body {}",
                     put.body
                 );
             }
@@ -243,41 +251,43 @@ async fn a_document_naming_something_that_is_no_principal_is_refused_naming_it()
     // The rows differ along the FORM the principal element takes: the untyped
     // shorthand, which the language defines for the wildcard alone; a type the
     // language does not define; and a value outside the forms of each type it
-    // does define.
+    // does define. What the refusal quotes is the document's own member in each
+    // case — the type key and the value, or the statement element itself where
+    // the shorthand names no type.
     let rows: [(&str, &str, &str); 6] = [
         (
             "a bare word where only the wildcard is written untyped",
             r#""Principal":"everyone""#,
-            "everyone",
+            r#""Principal" : "everyone""#,
         ),
         (
             "a type the policy language does not define",
             r#""Principal":{"Account":"123456789012"}"#,
-            "Account",
+            r#""Account" : "123456789012""#,
         ),
         (
             "an account id of the wrong length",
             r#""Principal":{"AWS":"1234"}"#,
-            "1234",
+            r#""AWS" : "1234""#,
         ),
         (
             "an ARN that names no identity",
             r#""Principal":{"AWS":"arn:aws:s3:::reports"}"#,
-            "arn:aws:s3:::reports",
+            r#""AWS" : "arn:aws:s3:::reports""#,
         ),
         (
             "a service principal that is no DNS name",
             r#""Principal":{"Service":"lambda"}"#,
-            "lambda",
+            r#""Service" : "lambda""#,
         ),
         (
             "a canonical user id of the wrong length",
             r#""Principal":{"CanonicalUser":"abc"}"#,
-            "abc",
+            r#""CanonicalUser" : "abc""#,
         ),
     ];
 
-    for (case, element, named) in rows {
+    for (case, element, member) in rows {
         let put = put_policy(&store, &policy(element)).await;
         assert_eq!(
             (put.status, put.code().as_str(), put.text("Message")),
@@ -289,8 +299,106 @@ async fn a_document_naming_something_that_is_no_principal_is_refused_naming_it()
         );
         assert_eq!(
             put.text("Detail").as_deref(),
-            Some(named),
-            "case {case:?}: expected the refusal to name {named:?}, got body {}",
+            Some(member),
+            "case {case:?}: expected the refusal to quote {member:?}, got body {}",
+            put.body
+        );
+        assert_eq!(
+            stored_policy(&store).await,
+            None,
+            "case {case:?}: expected the refused put to store nothing"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_refusal_quotes_the_member_of_the_document_that_names_the_principal() {
+    let store = fixture().await;
+    let held = user_arn(HELD_USER);
+    let absent = role_arn("no-such-role");
+    let objects = access_point_objects();
+
+    // Each row is a whole submitted document and the member its refusal must quote. The
+    // rows differ along what the rule generalises over: the LAYOUT the caller wrote the
+    // document in (compact, indented, a space before the separator, line breaks inside the
+    // member), the form the principal element takes (one value, a one-value list, a list
+    // whose second value is the offending one), which statement element names it
+    // (`Principal` and its complement), which statement of several carries it, and whether
+    // the clause is the identity not being there or the value being no principal of its
+    // type. The quoted member is the same text in every layout: a stored document is
+    // reported in the layout this service's policy engine writes, and so is a member of one
+    // quoted back in a refusal.
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "a compact document",
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Principal":{{"AWS":"{absent}"}},"Resource":"{objects}"}}]}}"#
+            ),
+            format!("\"AWS\" : \"{absent}\""),
+        ),
+        (
+            "a document indented with a space after the separator",
+            format!(
+                "{{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": [\n    {{\n      \
+                 \"Effect\": \"Allow\",\n      \"Action\": \"s3:GetObject\",\n      \
+                 \"Principal\": {{\n        \"AWS\": \"{absent}\"\n      }},\n      \
+                 \"Resource\": \"{objects}\"\n    }}\n  ]\n}}"
+            ),
+            format!("\"AWS\" : \"{absent}\""),
+        ),
+        (
+            "a document written with a space on both sides of the separator",
+            format!(
+                "{{ \"Version\" : \"2012-10-17\", \"Statement\" : [ {{ \"Effect\" : \"Allow\", \
+                 \"Action\" : \"s3:GetObject\", \"Principal\" : {{ \"AWS\" : \"{absent}\" }}, \
+                 \"Resource\" : \"{objects}\" }} ] }}"
+            ),
+            format!("\"AWS\" : \"{absent}\""),
+        ),
+        (
+            "the identity written as a one-value list",
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Principal":{{"AWS":["{absent}"]}},"Resource":"{objects}"}}]}}"#
+            ),
+            format!("\"AWS\" : \"{absent}\""),
+        ),
+        (
+            "the offending identity second in a list beside a held one",
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Principal":{{"AWS":["{held}","{absent}"]}},"Resource":"{objects}"}}]}}"#
+            ),
+            format!("\"AWS\" : \"{absent}\""),
+        ),
+        (
+            "the identity named by the complement element",
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Action":"s3:GetObject","NotPrincipal":{{"AWS":"{absent}"}},"Resource":"{objects}"}}]}}"#
+            ),
+            format!("\"AWS\" : \"{absent}\""),
+        ),
+        (
+            "a value that is no principal of its type, in the second statement",
+            format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Principal":{{"AWS":"{held}"}},"Resource":"{objects}"}},{{"Effect":"Allow","Action":"s3:GetObject","Principal":{{"Service":"lambda"}},"Resource":"{objects}"}}]}}"#
+            ),
+            "\"Service\" : \"lambda\"".to_string(),
+        ),
+    ];
+
+    for (case, document, member) in rows {
+        let put = put_policy(&store, &document).await;
+        assert_eq!(
+            (put.status, put.code().as_str(), put.text("Message")),
+            (400, MALFORMED_POLICY, Some(BAD_PRINCIPAL.to_string())),
+            "case {case:?}: expected 400 {MALFORMED_POLICY} stating {BAD_PRINCIPAL:?}, got {} \
+             with body {}",
+            put.status,
+            put.body
+        );
+        assert_eq!(
+            put.text("Detail"),
+            Some(member.clone()),
+            "case {case:?}: expected the refusal to quote {member:?}, got body {}",
             put.body
         );
         assert_eq!(

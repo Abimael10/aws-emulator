@@ -266,6 +266,68 @@ fn values(element: &::serde_json::Value) -> Vec<String> {
     }
 }
 
+/// The policy document `text`'s own MEMBER that names `principal`, written as a policy
+/// member is ([`super::iam_policy::canonical_member`]), or `None` when no statement of the
+/// document names it.
+///
+/// A principal is not a value standing on its own: the policy language writes it as a member
+/// keyed by the principal TYPE, and the same ARN is a principal under one type and nothing
+/// under another — so what a service's refusal quotes back is the member, key included,
+/// rather than the value lifted out of it. `principal` is the offending text one of the
+/// readings above reported ([`unreadable_policy_principal`], [`policy_principals`]):
+///
+/// * a VALUE under a type is quoted under the type that named it (`"AWS" : "<value>"`),
+///   whether the document wrote one value or a list of them — the fault is the one value, so
+///   the member names it rather than the whole list;
+/// * a type KEY the language does not define is quoted with the value it keyed, because the
+///   key is itself what names no principal type;
+/// * a value written in the untyped shorthand is quoted under the statement element that
+///   carried it (`"Principal" : "<value>"`), which is the member there is.
+#[must_use]
+pub fn principal_member(text: &str, principal: &str) -> Option<String> {
+    let document = ::serde_json::from_str::<::serde_json::Value>(text).ok()?;
+    super::iam_policy::statements(&document)
+        .into_iter()
+        .find_map(|statement| {
+            let statement = statement.as_object()?;
+            PRINCIPAL_STATEMENT_ELEMENTS
+                .into_iter()
+                .find_map(|element| {
+                    let named = statement.get(element)?;
+                    naming_member(element, named, principal)
+                })
+        })
+}
+
+/// [`principal_member`] for ONE principal element, however that element is written.
+fn naming_member(
+    element: &str,
+    named: &::serde_json::Value,
+    principal: &str,
+) -> Option<String> {
+    let quoted = |key: &str| {
+        super::iam_policy::canonical_member(
+            key,
+            &::serde_json::Value::String(principal.to_string()),
+        )
+    };
+    match named {
+        ::serde_json::Value::Object(types) => types.iter().find_map(|(principal_type, under)| {
+            if principal_type == principal {
+                return Some(super::iam_policy::canonical_member(principal_type, under));
+            }
+            values(under)
+                .iter()
+                .any(|value| value == principal)
+                .then(|| quoted(principal_type))
+        }),
+        other => values(other)
+            .iter()
+            .any(|value| value == principal)
+            .then(|| quoted(element)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,5 +587,85 @@ mod tests {
                 "case {case:?}: expected {unreadable:?}, got {read:?}"
             );
         }
+    }
+
+    /// RULE: the member a document names a principal in is quoted as a policy member is —
+    /// the type key and the value — whatever layout the document was written in.
+    ///
+    /// The rows differ along what the rule generalises over: the layout (compact, indented,
+    /// a space on either side of the separator), the form the element takes (the typed map,
+    /// a one-value list, a list whose later value is the one asked about, the untyped
+    /// shorthand), which statement element names it, which statement of several carries it,
+    /// a type the language does not define, and a value no statement names at all.
+    #[test]
+    fn the_member_naming_a_principal_is_quoted_as_a_policy_member_is() {
+        let compact = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\
+                       \"Action\":\"svc:A\",\"Principal\":{\"AWS\":\"nobody\"}}]}";
+        let indented = "{\n  \"Statement\": [\n    {\n      \"Principal\": {\n        \
+                        \"AWS\": \"nobody\"\n      }\n    }\n  ]\n}";
+        let spaced = "{ \"Statement\" : [ { \"Principal\" : { \"AWS\" : \"nobody\" } } ] }";
+        let listed = "{\"Statement\":[{\"Principal\":{\"AWS\":[\"nobody\"]}}]}";
+        let later = "{\"Statement\":[{\"Principal\":{\"AWS\":[\"123456789012\",\"nobody\"]}}]}";
+        let shorthand = "{\"Statement\":[{\"Principal\":\"nobody\"}]}";
+        let complement = "{\"Statement\":[{\"NotPrincipal\":{\"Service\":\"nobody\"}}]}";
+        let second = "{\"Statement\":[{\"Principal\":{\"AWS\":\"123456789012\"}},\
+                      {\"Principal\":{\"Federated\":\"nobody\"}}]}";
+        let undefined = "{\"Statement\":[{\"Principal\":{\"Account\":\"123456789012\"}}]}";
+        let rows: [(&str, &str, &str, Option<&str>); 10] = [
+            ("a compact document", compact, "nobody", Some("\"AWS\" : \"nobody\"")),
+            ("an indented document", indented, "nobody", Some("\"AWS\" : \"nobody\"")),
+            (
+                "a document spaced on both sides of the separator",
+                spaced,
+                "nobody",
+                Some("\"AWS\" : \"nobody\""),
+            ),
+            ("a one-value list", listed, "nobody", Some("\"AWS\" : \"nobody\"")),
+            (
+                "the later value of a list",
+                later,
+                "nobody",
+                Some("\"AWS\" : \"nobody\""),
+            ),
+            (
+                "the untyped shorthand",
+                shorthand,
+                "nobody",
+                Some("\"Principal\" : \"nobody\""),
+            ),
+            (
+                "the complement element",
+                complement,
+                "nobody",
+                Some("\"Service\" : \"nobody\""),
+            ),
+            (
+                "the second statement of two",
+                second,
+                "nobody",
+                Some("\"Federated\" : \"nobody\""),
+            ),
+            (
+                "a type the language does not define, reported by its key",
+                undefined,
+                "Account",
+                Some("\"Account\" : \"123456789012\""),
+            ),
+            ("a value no statement names", compact, "somebody", None),
+        ];
+
+        for (case, document, principal, expected) in rows {
+            let quoted = principal_member(document, principal);
+            assert_eq!(
+                quoted.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {quoted:?}"
+            );
+        }
+        assert_eq!(
+            principal_member("not a policy", "nobody"),
+            None,
+            "case \"a text that is no policy\": expected no member, got a quote"
+        );
     }
 }

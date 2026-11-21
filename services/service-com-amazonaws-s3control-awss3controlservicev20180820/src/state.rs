@@ -2574,6 +2574,14 @@ pub enum TaggedResource {
 /// purpose bucket ARN: the service accepts that form, which is why the pattern
 /// is off the boundary for these three operations (`skip_validation` in
 /// `src/ops/types/`) and the ARN is read here instead.
+///
+/// A resource type is read only in the NAMESPACE that publishes the resource it
+/// names: a typed `bucket/<name>` resource is the S3 Express One Zone form of a
+/// directory bucket, and a Storage Lens group or an S3 Access Grants resource is
+/// published in the `s3` namespace alone. So the same resource type under the
+/// other namespace — a regional `arn:<partition>:s3:<region>:<account>:bucket/<name>`
+/// among them — addresses no resource of this surface at all, and a path carrying
+/// it is one this service cannot parse ([`unparsable_tagged_resource_uri`]).
 pub fn tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
     let arn = ::service_common::arn::parse(resource_arn)?;
     if arn.vendor != S3_ARN_NAMESPACE && arn.vendor != S3_EXPRESS_ARN_NAMESPACE {
@@ -2588,11 +2596,25 @@ pub fn tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
             .then(|| TaggedResource::Bucket(arn.resource.to_string()));
     }
     let id = ::service_common::arn::resource_id_of_type(resource_arn, resource_type)?;
+    // A typed resource field with no id after its separator names a TYPE and no
+    // resource of it, so it addresses nothing either.
+    if id.is_empty() {
+        return None;
+    }
+    let express = arn.vendor == S3_EXPRESS_ARN_NAMESPACE;
     match resource_type {
-        BUCKET_RESOURCE_TYPE => Some(TaggedResource::Bucket(id.to_string())),
-        ACCESS_POINT_RESOURCE_TYPE
-        | STORAGE_LENS_GROUP_RESOURCE_TYPE
-        | ACCESS_GRANTS_RESOURCE_TYPE => Some(TaggedResource::Held),
+        // A directory bucket, which only S3 Express One Zone publishes in this
+        // typed form: a general purpose bucket's ARN carries its name as the
+        // whole resource field and is read above.
+        BUCKET_RESOURCE_TYPE if express => Some(TaggedResource::Bucket(id.to_string())),
+        // An access point of either kind — one for a general purpose bucket and
+        // one for a directory bucket — which both namespaces publish.
+        ACCESS_POINT_RESOURCE_TYPE => Some(TaggedResource::Held),
+        // A Storage Lens group and the three S3 Access Grants resources, which
+        // S3 Express One Zone publishes none of.
+        STORAGE_LENS_GROUP_RESOURCE_TYPE | ACCESS_GRANTS_RESOURCE_TYPE if !express => {
+            Some(TaggedResource::Held)
+        }
         _ => None,
     }
 }
@@ -2660,7 +2682,11 @@ impl TagSetChange<'_> {
 /// resource's in this service's own ([`
 /// ComAmazonawsS3controlAwss3controlservicev20180820State::resource_tags_mut`]),
 /// and an ARN naming a resource no store holds is refused as that resource being
-/// missing ([`no_such_tagged_resource`]) rather than as a bad request.
+/// missing ([`no_such_tagged_resource`]) rather than as a bad request — where an
+/// ARN in a form this surface addresses NO resource in is refused as a path this
+/// service could not parse ([`unparsable_tagged_resource_uri`]), which is the
+/// same answer `crate::service::envelope` gives such a path before any operation
+/// is named.
 pub fn change_resource_tags<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     account_id: &str,
@@ -2668,7 +2694,7 @@ pub fn change_resource_tags<Eng: Send + Sync + 'static, E>(
     change: TagSetChange<'_>,
 ) -> Result<Vec<Tag>, crate::scaffolded::Scaffolded<E>> {
     let Some(resource) = tagged_resource(resource_arn) else {
-        return Err(untaggable_resource_arn(resource_arn));
+        return Err(unparsable_tagged_resource_uri(resource_arn));
     };
     if let TaggedResource::Bucket(bucket) = &resource {
         return change_bucket_tags(engine, bucket, change);
@@ -2748,20 +2774,72 @@ fn change_bucket_tags<Eng: Send + Sync + 'static, E>(
     }
 }
 
-/// `InvalidRequest` (HTTP 400): `ResourceArn` names no S3 resource the generic
-/// tagging surface tags.
+/// The resource path the generic tagging routes address a resource under,
+/// relative to this service's API version segment: all three are
+/// `/v20180820/tags/{ResourceArn+}`
+/// (`smithy_query(query="operation",operation="ListTagsForResource")`), so the
+/// path a refusal of an unparsable one echoes is this followed by the ARN the
+/// request addressed the resource by.
+const TAGS_RESOURCE_PATH: &str = "tags/";
+
+/// The resource path a generic tagging call addressing `resource_arn` names,
+/// under this service's API version segment ([`TAGS_RESOURCE_PATH`]).
 ///
-/// The code and status are the ones this service answers a well-formed request
-/// it cannot carry out with (see [`job_not_found`]); a refusal of this service
-/// travels in its own S3-style XML `<Code>`/`<Message>` envelope, as every
-/// refusal above does.
-pub fn untaggable_resource_arn<E>(resource_arn: &str) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
-        "InvalidRequest",
-        400,
-        format!("The specified ARN names no S3 resource that can be tagged: {resource_arn}"),
+/// What the `URI` member of an unparsable-path refusal carries, built in ONE
+/// place so the refusal a handler raises
+/// ([`unparsable_tagged_resource_uri`]) and the one `crate::service::envelope`
+/// answers before any operation is named echo the same path. The ARN is the one
+/// the LABEL carried, with the wire's own escaping resolved — the value the
+/// codec hands a handler — because the escapes are how the path was transmitted
+/// rather than part of the resource the caller addressed.
+pub fn tags_resource_path(resource_arn: &str) -> String {
+    format!("{TAGS_RESOURCE_PATH}{resource_arn}")
+}
+
+/// [`INVALID_URI_CODE`] (HTTP 400): the `ResourceArn` in the greedy label is in
+/// no form the generic tagging surface addresses a resource in
+/// ([`tagged_resource`]), so the path resolves to no resource and there is
+/// nothing for the call to act on.
+///
+/// A refusal of the request's URI rather than of a resource: the label IS the
+/// path, so a label naming no addressable resource form is a path this service
+/// cannot parse — which is a different answer from an addressable form naming a
+/// resource no store holds ([`no_such_tagged_resource`]). The message is the
+/// fixed sentence ([`INVALID_URI_MESSAGE`]) and the path the caller addressed
+/// travels in the `URI` member beside it ([`tags_resource_path`]), as it does for
+/// every other path space this service cannot parse
+/// (`crate::service::envelope`), which answers this same refusal from the
+/// request path itself before any operation is named.
+pub fn unparsable_tagged_resource_uri<E>(resource_arn: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure_naming(
+        INVALID_URI_CODE,
+        INVALID_URI_STATUS,
+        INVALID_URI_MESSAGE,
+        vec![crate::scaffolded::ErrorDetail::new(
+            &UNPARSABLE_URI_MEMBER,
+            tags_resource_path(resource_arn),
+        )],
     )
 }
+
+/// The `<Error>` member a refusal of a path this service could not parse echoes
+/// that path in.
+///
+/// S3 Control's model declares no error shape for these operations, so the
+/// member exists only on the wire: a path that parses to no resource names none
+/// to report, so what the refusal carries is the request target the caller has
+/// to fix.
+static UNPARSABLE_URI_MEMBER: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "com.amazonaws.s3control#ErrorDetails$URI",
+        "com.amazonaws.s3control",
+        "URI",
+    ),
+    ShapeType::String,
+    "URI",
+    1,
+)
+.with_xml_name("URI");
 
 /// `NoSuchResource` (HTTP 404): no resource the generic tagging surface holds
 /// tags for answers to that ARN — the resource was never created, or has been
@@ -4488,7 +4566,7 @@ pub const NO_SUCH_ACCESS_GRANTS_INSTANCE_MESSAGE: &str = "Access Grants Instance
 /// The SAME precondition as [`no_such_access_grants_instance`], answered the way
 /// `DissociateAccessGrantsIdentityCenter` answers it: the code and status this
 /// service gives a well-formed request it cannot carry out (see
-/// [`untaggable_resource_arn`]), with the fixed sentence naming the instance the
+/// [`request_invalid`]), with the fixed sentence naming the instance the
 /// request asked about — the request's own account and Region are not
 /// interpolated, for the same reason they are not in the read's refusal.
 pub fn no_access_grants_instance_to_dissociate<E>() -> crate::scaffolded::Scaffolded<E> {
