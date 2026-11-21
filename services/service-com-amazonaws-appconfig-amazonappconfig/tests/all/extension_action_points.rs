@@ -128,26 +128,70 @@ pub(crate) async fn given_queue(router: &MultiServiceRouter, name: &str) -> (Str
     (url, queue_arn)
 }
 
-/// Every event waiting on the queue, parsed, oldest first.
+/// The most messages one `ReceiveMessage` may hand over: "Valid values: 1 to 10"
+/// (`smithy_query(query="shape",shape="ReceiveMessageRequest")` for `MaxNumberOfMessages`),
+/// so a queue holding more than this many events needs more than one poll to be read.
+pub(crate) const RECEIVE_PAGE: usize = 10;
+
+/// The most polls one [`drain`] takes, a backstop on the walk below rather than a limit on
+/// what a queue may hold: [`RECEIVE_PAGE`] events per poll is far more than any suite of
+/// this target delivers, so a drain that hits this bound is reading a queue nothing is
+/// emptying rather than the events one dispatch delivered — and it FAILS there instead of
+/// answering a partial read its caller would take for the whole of it.
+const MAX_DRAIN_POLLS: usize = 64;
+
+/// Every event waiting on the queue, parsed, oldest first — CONSUMED as it is read, so each
+/// one is answered to exactly one drain.
+///
+/// One `ReceiveMessage` answers at most [`RECEIVE_PAGE`] messages and LEAVES every one it
+/// answered on the queue, hidden only for the queue's visibility timeout, so a single poll
+/// is neither all of what is waiting nor the last word on it: the events past the first page
+/// stay behind, and the ones it did answer come back once that window passes. Either would
+/// hand a caller an event that was delivered long before this call — which a suite reading
+/// an event against the state of the rollout that dispatched it would then rule on as
+/// though it had just arrived. So this polls until a poll answers none and DELETES each
+/// message it took: every event dispatched before this call is answered by it, exactly once,
+/// and by no later one. A queue that is still answering messages after [`MAX_DRAIN_POLLS`]
+/// polls panics rather than answering a truncated read, which a caller cannot tell from a
+/// queue that really held that much.
 pub(crate) async fn drain(router: &MultiServiceRouter, url: &str) -> Vec<Value> {
-    let received = sqs(
-        router,
-        "ReceiveMessage",
-        &json!({ "QueueUrl": url, "MaxNumberOfMessages": 10 }),
-    )
-    .await;
-    received["Messages"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .map(|message| {
+    let mut events: Vec<Value> = Vec::new();
+    for _ in 0..MAX_DRAIN_POLLS {
+        let received = sqs(
+            router,
+            "ReceiveMessage",
+            &json!({ "QueueUrl": url, "MaxNumberOfMessages": RECEIVE_PAGE }),
+        )
+        .await;
+        let messages = received["Messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if messages.is_empty() {
+            return events;
+        }
+        for message in &messages {
             let body = message["Body"].as_str().unwrap_or_default();
-            serde_json::from_str(body).unwrap_or_else(|error| {
+            events.push(serde_json::from_str(body).unwrap_or_else(|error| {
                 panic!("an action-point event must be a JSON document ({error}): {body:?}")
-            })
-        })
-        .collect()
+            }));
+            let handle = message["ReceiptHandle"].as_str().unwrap_or_else(|| {
+                panic!("a received message must carry a receipt handle, got {message}")
+            });
+            sqs(
+                router,
+                "DeleteMessage",
+                &json!({ "QueueUrl": url, "ReceiptHandle": handle }),
+            )
+            .await;
+        }
+    }
+    panic!(
+        "the queue {url} was still answering messages after {MAX_DRAIN_POLLS} polls of \
+         {RECEIVE_PAGE}, having handed over {} events: a drain answers everything waiting or \
+         nothing at all",
+        events.len()
+    );
 }
 
 /// An extension binding one action at each of `action_points`, all of them pointing at
