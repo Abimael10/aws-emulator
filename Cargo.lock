@@ -11293,6 +11293,7 @@ dependencies = [
  "http",
  "json-patch",
  "percent-encoding",
+ "regex",
  "serde_json",
  "service-com-amazonaws-cloudformation-cloudformation",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",

@@ -355,31 +355,20 @@ async fn a_create_of_a_resource_the_owning_service_already_holds_is_the_owning_v
 #[tokio::test]
 async fn a_model_the_owning_service_cannot_hold_is_refused_rather_than_dropped() {
     let emulator = Emulator::with_cloudwatch_logs();
-    // The rows differ along which rule of the OWNING service the model breaks: a name
-    // outside the domain its model gives one, a name in the prefix it keeps for its own
-    // groups, a retention outside the published catalogue, a class outside the published
-    // set, a property of the type's schema this emulator's handler does not apply, and a
-    // property the type does not declare at all.
+    // The rows differ along which rule of the OWNING service the model breaks: a name in the
+    // prefix it keeps for its own groups, a property of the type's schema this emulator's
+    // handler does not apply, a tag key it keeps for itself, and a property the type does not
+    // declare at all.
+    //
+    // A value the TYPE'S REGISTRY SCHEMA itself excludes — a name outside the class that
+    // schema states, a retention or a class outside a set it publishes — is not a row here:
+    // such a model never reaches a handler at all, the front door refusing the call before a
+    // request is minted (`front_door_model_validation`).
     let rows = [
-        (
-            "a name outside the domain the owning service holds",
-            json!({ "LogGroupName": "refused name" }),
-            "LogGroupName must be 1 to 512 characters of letters, numbers and `. - _ / #`",
-        ),
         (
             "a name in the prefix the owning service keeps",
             json!({ "LogGroupName": "aws/refused" }),
             "logGroupName must not start with the string 'aws/'",
-        ),
-        (
-            "a retention outside the published catalogue",
-            json!({ "LogGroupName": "refused-retention", "RetentionInDays": 2 }),
-            "Invalid retention value.",
-        ),
-        (
-            "a class outside the published set",
-            json!({ "LogGroupName": "refused-class", "LogGroupClass": "PLATINUM" }),
-            "Invalid logGroupClass value.",
         ),
         (
             "a key whose grant only KMS can answer for",

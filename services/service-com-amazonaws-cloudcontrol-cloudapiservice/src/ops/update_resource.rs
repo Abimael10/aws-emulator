@@ -604,6 +604,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_updatable(&named));
         }
 
+        // The model the patch leaves behind is the model this update SUBMITS, so it is
+        // validated against the resource type's registry schema at the front door exactly as
+        // a create's desired state is: a value outside a constraint that schema declares is
+        // refused synchronously, before a resource operation request is minted, rather than
+        // forwarded to the type's handler ([`crate::state::model_validation_failure`]).
+        if let Some(failure) = crate::state::model_validation_failure(&input.type_name, &patched) {
+            return Err(crate::scaffolded::Scaffolded::validation(failure));
+        }
+
         // The request is recorded under a fresh lock and judged against the store once
         // more under THAT lock, so what lands is judged against the store as it is THEN.
         let now = ::std::time::SystemTime::now();

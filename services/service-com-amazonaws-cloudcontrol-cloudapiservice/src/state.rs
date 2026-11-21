@@ -31,12 +31,14 @@
 pub mod native;
 pub mod owning_api;
 mod primary_identifiers;
+mod registry_schema;
 mod request_listing;
 
 pub use primary_identifiers::{
     addressed_identifier, compound_identifier_properties, handler_rendered_identifier,
     identifier_properties, model_identifier, COMPOUND_IDENTIFIER_DELIMITER,
 };
+pub use registry_schema::model_validation_failure;
 pub use request_listing::{
     decode_request_page_token, request_page_token, RequestFilter, RequestPosition,
     INVALID_NEXT_TOKEN,

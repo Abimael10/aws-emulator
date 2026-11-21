@@ -264,6 +264,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries the type's primary identifier has to hold something that can be one.
         let properties = crate::state::parse_properties("DesiredState", &input.desired_state)
             .map_err(invalid_request)?;
+        // The desired state is validated against the resource type's REGISTRY SCHEMA here,
+        // at the front door: a value outside a constraint that schema declares is a fault in
+        // the call itself, so it is refused synchronously — with the model validator's own
+        // diagnostic, and before a resource operation request is minted — rather than
+        // forwarded to the type's handler and reported as that handler's verdict, which a
+        // caller would have to poll for ([`crate::state::model_validation_failure`]).
+        if let Some(failure) =
+            crate::state::model_validation_failure(&input.type_name, &properties)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(failure));
+        }
         // The Region this call addressed, as its SigV4 credential scope names it: the
         // Region a resource the OWNING service provisions is created in.
         let region = crate::state::request_region(ctx.parts());

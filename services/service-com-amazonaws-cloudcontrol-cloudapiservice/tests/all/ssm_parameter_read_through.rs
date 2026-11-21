@@ -546,17 +546,16 @@ async fn a_patch_through_cloud_control_is_a_new_version_of_the_parameter_systems
 #[tokio::test]
 async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdict() {
     let emulator = Emulator::with_ssm();
-    // The rows differ along WHICH rule the desired state breaks: the types this resource
-    // type admits, the naming rules the owning service holds every parameter name to (the
-    // hierarchy's leading separator, the prefixes it keeps for itself), the two properties
-    // the schema declares required, and a property the type does not declare at all.
-    let rows: [(&str, &str, Value, String); 6] = [
-        (
-            "a type this resource type does not admit",
-            "refused-secure",
-            json!({ "Name": "refused-secure", "Type": "SecureString", "Value": "v" }),
-            "Type must be one of String, StringList".to_string(),
-        ),
+    // The rows differ along WHICH rule the desired state breaks: the naming rules the owning
+    // service holds every parameter name to (the hierarchy's leading separator, the prefixes
+    // it keeps for itself), the two properties the schema declares required, and a property
+    // the type does not declare at all.
+    //
+    // A value outside a set the TYPE'S REGISTRY SCHEMA publishes — a parameter type or tier
+    // it does not carry — is not a row here: such a model never reaches a handler at all, the
+    // front door refusing the call before a request is minted
+    // (`front_door_model_validation`).
+    let rows: [(&str, &str, Value, String); 5] = [
         (
             "a hierarchical name with no leading separator",
             "Dev/DBServer",
