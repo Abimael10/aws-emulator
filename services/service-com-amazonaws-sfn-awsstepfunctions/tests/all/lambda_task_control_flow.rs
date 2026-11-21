@@ -34,6 +34,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_sfn_awsstepfunctions::EmulatedService;
 
 use crate::execution_data_encryption::{form_encode, xml_element};
+use crate::form_protocol_integration::{SQS_JSON_VERSION, SQS_SIGNING_NAME, SQS_TARGET_PREFIX};
 use crate::state_machine_lifecycle::{string, PAST_THE_EXECUTION_DELAY, REGION, ROLE_ARN};
 
 /// Where `CreateFunction` is bound (`POST /2015-03-31/functions`).
@@ -52,8 +53,10 @@ const HANDLER: &str = "index.handler";
 /// How long one poll of a status that the clock owes sleeps between reads.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// How long a row waits for a function to reach [`FUNCTION_ACTIVE`].
-const PATIENCE: Duration = Duration::from_secs(20);
+/// How long a row waits for a function to reach [`FUNCTION_ACTIVE`]: generously wider than
+/// the span this emulator holds a created function before it, so a loaded host does not
+/// decide a row. A ceiling on patience, never a span anything here counts on.
+const PATIENCE: Duration = Duration::from_secs(60);
 
 /// The `Error` the poller's own `Fail` state carries, which is what the execution must
 /// report once anything routes to that state.
@@ -108,21 +111,39 @@ def handler(event, context):
 const SFN_SIGNING_NAME: &str = "states";
 /// See [`SFN_SIGNING_NAME`].
 const SFN_TARGET_PREFIX: &str = "AWSStepFunctions";
+/// See [`SFN_SIGNING_NAME`].
+const SFN_JSON_VERSION: &str = "1.0";
 
 /// The same, for the service a sibling suite mounts beside the two through
 /// [`Chain::with_dynamodb`] so a handler's own SDK call is served for real: DynamoDB's
-/// signing name and `X-Amz-Target` prefix, from its model's own `service_info`.
+/// signing name, `X-Amz-Target` prefix and `awsJson` version, from its model's own
+/// `service_info`.
 const DYNAMODB_SIGNING_NAME: &str = "dynamodb";
 /// See [`DYNAMODB_SIGNING_NAME`].
 const DYNAMODB_TARGET_PREFIX: &str = "DynamoDB_20120810";
+/// See [`DYNAMODB_SIGNING_NAME`].
+const DYNAMODB_JSON_VERSION: &str = "1.0";
 
 /// The same, for the service a sibling suite mounts beside the two through
 /// [`Chain::with_eventbridge`] so a rule's own delivery starts a real execution:
-/// EventBridge's signing name and `X-Amz-Target` prefix, from its model's own
-/// `service_info`.
+/// EventBridge's signing name, `X-Amz-Target` prefix and `awsJson` version, from its
+/// model's own `service_info`.
 const EVENTS_SIGNING_NAME: &str = "events";
 /// See [`EVENTS_SIGNING_NAME`].
 const EVENTS_TARGET_PREFIX: &str = "AWSEvents";
+/// See [`EVENTS_SIGNING_NAME`].
+const EVENTS_JSON_VERSION: &str = "1.1";
+
+/// What a chain mounts BESIDE Step Functions and Lambda: one flag per service whose own
+/// API a suite's rule needs served for real. A struct rather than a row of positional
+/// flags, so a suite that needs one more service names the one it means.
+#[derive(Clone, Copy, Default)]
+struct Mounts {
+    dynamodb: bool,
+    iam: bool,
+    events: bool,
+    sqs: bool,
+}
 
 /// Step Functions and Lambda over ONE engine, so the invocation a task makes is served
 /// by the very function the test created.
@@ -136,14 +157,28 @@ pub(crate) struct Chain {
 
 impl Chain {
     pub(crate) fn new() -> Self {
-        Self::mounted(false, false, false)
+        Self::mounted(Mounts::default())
     }
 
     /// [`Self::new`] with DynamoDB mounted beside the two, for a suite whose handlers
     /// call it through the SDK their runtime supplies: what a run wrote is then read
     /// back through DynamoDB's own API rather than claimed by the handler's answer.
     pub(crate) fn with_dynamodb() -> Self {
-        Self::mounted(true, false, false)
+        Self::mounted(Mounts {
+            dynamodb: true,
+            ..Mounts::default()
+        })
+    }
+
+    /// [`Self::new`] with Amazon SQS mounted beside the two, for a suite whose rule is
+    /// about what a `Task` state's own send really DELIVERS: with SQS there the message
+    /// the state built is read back out of the queue through that service's own API
+    /// ([`Self::sqs`]).
+    pub(crate) fn with_sqs() -> Self {
+        Self::mounted(Mounts {
+            sqs: true,
+            ..Mounts::default()
+        })
     }
 
     /// [`Self::new`] with IAM mounted beside the two, for a suite whose rule is about the
@@ -151,7 +186,10 @@ impl Chain {
     /// role this account really holds, so the access gate in front of the call really
     /// runs ([`Self::role`]).
     pub(crate) fn with_iam() -> Self {
-        Self::mounted(false, true, false)
+        Self::mounted(Mounts {
+            iam: true,
+            ..Mounts::default()
+        })
     }
 
     /// [`Self::new`] with EventBridge mounted beside the two, for a suite whose rule is
@@ -159,10 +197,19 @@ impl Chain {
     /// really delivered to its state-machine target, so the execution under test is the
     /// delivery's own ([`Self::events`]).
     pub(crate) fn with_eventbridge() -> Self {
-        Self::mounted(false, false, true)
+        Self::mounted(Mounts {
+            events: true,
+            ..Mounts::default()
+        })
     }
 
-    fn mounted(dynamodb: bool, iam: bool, events: bool) -> Self {
+    fn mounted(mounts: Mounts) -> Self {
+        let Mounts {
+            dynamodb,
+            iam,
+            events,
+            sqs,
+        } = mounts;
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -188,6 +235,11 @@ impl Chain {
                 )),
             );
         }
+        if sqs {
+            router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
+                Arc::clone(&engine),
+            ));
+        }
         router.register_service(
             service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(engine),
         );
@@ -204,15 +256,29 @@ impl Chain {
         )
     }
 
-    /// One Step Functions call, requiring a 200.
-    pub(crate) async fn sfn(&self, case: &str, operation: &str, body: &Value) -> Value {
+    /// One `awsJson` RPC call to the service whose signing name is `signing_name`, requiring
+    /// a 200: the shape every such service's calls share — the root as the request-target,
+    /// the protocol version in the content type, and `<target prefix>.<operation>` as the
+    /// target — stated once rather than per service.
+    async fn json_rpc(
+        &self,
+        case: &str,
+        signing_name: &str,
+        target_prefix: &str,
+        json_version: &str,
+        operation: &str,
+        body: &Value,
+    ) -> Value {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
-            .header("host", format!("{SFN_SIGNING_NAME}.{REGION}.amazonaws.com"))
-            .header("content-type", "application/x-amz-json-1.0")
-            .header("x-amz-target", format!("{SFN_TARGET_PREFIX}.{operation}"))
-            .header("authorization", Self::authorization(SFN_SIGNING_NAME))
+            .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
+            .header(
+                "content-type",
+                format!("application/x-amz-json-{json_version}"),
+            )
+            .header("x-amz-target", format!("{target_prefix}.{operation}"))
+            .header("authorization", Self::authorization(signing_name))
             .body(Bytes::from(body.to_string()))
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;
@@ -223,61 +289,64 @@ impl Chain {
             "case {case:?}: {operation} must answer 200, got {status} with {parsed}"
         );
         parsed
+    }
+
+    /// One Step Functions call, requiring a 200.
+    pub(crate) async fn sfn(&self, case: &str, operation: &str, body: &Value) -> Value {
+        self.json_rpc(
+            case,
+            SFN_SIGNING_NAME,
+            SFN_TARGET_PREFIX,
+            SFN_JSON_VERSION,
+            operation,
+            body,
+        )
+        .await
     }
 
     /// One EventBridge call (`awsJson1_1`), requiring a 200: how a suite wires the rule
     /// whose delivery starts the execution under test. Only a
     /// [`Chain::with_eventbridge`] chain serves one.
     pub(crate) async fn events(&self, case: &str, operation: &str, body: &Value) -> Value {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header(
-                "host",
-                format!("{EVENTS_SIGNING_NAME}.{REGION}.amazonaws.com"),
-            )
-            .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("{EVENTS_TARGET_PREFIX}.{operation}"))
-            .header("authorization", Self::authorization(EVENTS_SIGNING_NAME))
-            .body(Bytes::from(body.to_string()))
-            .expect("a well-formed request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let parsed = parsed(response.into_body());
-        assert_eq!(
-            status, 200,
-            "case {case:?}: {operation} must answer 200, got {status} with {parsed}"
-        );
-        parsed
+        self.json_rpc(
+            case,
+            EVENTS_SIGNING_NAME,
+            EVENTS_TARGET_PREFIX,
+            EVENTS_JSON_VERSION,
+            operation,
+            body,
+        )
+        .await
+    }
+
+    /// One Amazon SQS call (`awsJson1_0`), requiring a 200: how a suite reads back what a
+    /// `Task` state's own send really delivered. Only a [`Chain::with_sqs`] chain serves
+    /// one.
+    pub(crate) async fn sqs(&self, case: &str, operation: &str, body: &Value) -> Value {
+        self.json_rpc(
+            case,
+            SQS_SIGNING_NAME,
+            SQS_TARGET_PREFIX,
+            SQS_JSON_VERSION,
+            operation,
+            body,
+        )
+        .await
     }
 
     /// One DynamoDB call (`awsJson1_0`), requiring a 200: how a suite reads back what a
     /// handler's own SDK call really wrote. Only a [`Chain::with_dynamodb`] chain serves
     /// one.
     pub(crate) async fn ddb(&self, case: &str, operation: &str, body: &Value) -> Value {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header(
-                "host",
-                format!("{DYNAMODB_SIGNING_NAME}.{REGION}.amazonaws.com"),
-            )
-            .header("content-type", "application/x-amz-json-1.0")
-            .header(
-                "x-amz-target",
-                format!("{DYNAMODB_TARGET_PREFIX}.{operation}"),
-            )
-            .header("authorization", Self::authorization(DYNAMODB_SIGNING_NAME))
-            .body(Bytes::from(body.to_string()))
-            .expect("a well-formed request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let parsed = parsed(response.into_body());
-        assert_eq!(
-            status, 200,
-            "case {case:?}: {operation} must answer 200, got {status} with {parsed}"
-        );
-        parsed
+        self.json_rpc(
+            case,
+            DYNAMODB_SIGNING_NAME,
+            DYNAMODB_TARGET_PREFIX,
+            DYNAMODB_JSON_VERSION,
+            operation,
+            body,
+        )
+        .await
     }
 
     /// One `restJson1` call to Lambda, as its status and parsed body.
@@ -590,8 +659,12 @@ const LAMBDA_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/LambdaExecutionRol
 
 /// How long a row waits for an execution to leave `RUNNING`: the span this emulator
 /// holds a started execution in `RUNNING` for, plus the longest a row's own `Wait` and
-/// `Retry` intervals add to it, plus room for the invocations themselves.
-const TERMINAL_PATIENCE: Duration = PAST_THE_EXECUTION_DELAY.saturating_add(Duration::from_secs(30));
+/// `Retry` intervals add to it, plus generous room for the invocations themselves — each of
+/// which starts an interpreter and runs a caller's own code, so how long one takes is the
+/// host's business and no row's verdict. A ceiling on patience, never a span anything here
+/// counts on.
+const TERMINAL_PATIENCE: Duration =
+    PAST_THE_EXECUTION_DELAY.saturating_add(Duration::from_secs(120));
 
 /// A response body, parsed; the null document for an empty one.
 ///
