@@ -29,7 +29,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use std::time::{Duration, SystemTime};
 
 use crate::db_instances::{
-    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts,
+    call, element_is_empty, emulator, expect_error, expect_ok, optional_text, subtrees, text,
 };
 use crate::pending_modified_values::window_days_ahead;
 
@@ -197,9 +197,7 @@ async fn poll_instance(
 fn pending(instance: &str) -> Option<String> {
     subtrees(instance, "PendingModifiedValues")
         .into_iter()
-        .zip(texts(instance, "PendingModifiedValues"))
-        .find(|(_, inside)| !inside.trim().is_empty())
-        .map(|(staged, _)| staged)
+        .find(|reported| !element_is_empty(reported, "PendingModifiedValues"))
 }
 
 #[tokio::test]

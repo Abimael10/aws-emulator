@@ -210,6 +210,9 @@ pub(crate) fn stored_task(region: &str, spec: &SeedSpec) -> ExportTaskRecord {
         export_only: spec.export_only.iter().map(|only| only.to_string()).collect(),
         snapshot_time: state::now_as_wire_timestamp(),
         task_start_time: state::now_as_wire_timestamp(),
+        // A record built by hand has been running since it was stored, which is what the
+        // span of its own `COMPLETE` step would run from.
+        started_at: std::time::Instant::now(),
         task_end_time: TERMINAL_STATUSES
             .contains(&spec.status)
             .then(state::now_as_wire_timestamp),

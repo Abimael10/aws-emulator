@@ -144,14 +144,25 @@ impl AutomatedBackupReference {
         self.names_resource_id(dbi_resource_id) || self.names_arn(arn)
     }
 
-    /// What a refusal names the backup by: the member the request carried, so a caller
-    /// matching the message against what it sent finds it there. EMPTY for a request that
-    /// named neither, which is refused before any lookup.
-    pub fn describe(&self) -> &str {
-        self.dbi_resource_id
-            .as_deref()
-            .or(self.automated_backups_arn.as_deref())
-            .unwrap_or_default()
+    /// What a refusal names the backup by: the SOURCE INSTANCE'S `DbiResourceId`, which is
+    /// the id an automated backup is identified by — "the identifier for the source DB
+    /// instance, which can't be changed and which is unique to an Amazon Web Services
+    /// Region".
+    ///
+    /// A request that named the backup by `DBInstanceAutomatedBackupsArn` is answered with
+    /// the resource id THAT ARN belongs to, read back out of it: the ARN is a function of the
+    /// source instance's resource id ([`instance_automated_backups_arn`]), so the backup an
+    /// ARN names has exactly one, whether or not this Region still holds a record of it.
+    /// EMPTY for a request that named neither member, which is refused before any lookup.
+    pub fn describe(&self) -> String {
+        if let Some(resource_id) = self.dbi_resource_id.as_deref() {
+            return resource_id.to_string();
+        }
+        match self.automated_backups_arn.as_deref() {
+            Some(arn) => dbi_resource_id_in_automated_backups_arn(arn)
+                .unwrap_or_else(|| arn.to_string()),
+            None => String::new(),
+        }
     }
 }
 
@@ -371,9 +382,43 @@ impl DbInstanceRecord {
 /// member publishes.
 pub fn instance_automated_backups_arn(region: &str, dbi_resource_id: &str) -> String {
     let id = dbi_resource_id
-        .strip_prefix("db-")
+        .strip_prefix(DBI_RESOURCE_ID_PREFIX)
         .unwrap_or(dbi_resource_id);
-    emulator_server::emulator_arn(ARN_NAMESPACE, region, &format!("auto-backup:ab-{id}"))
+    emulator_server::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{AUTOMATED_BACKUP_RESOURCE}:{AUTOMATED_BACKUP_ID_PREFIX}{id}"),
+    )
+}
+
+/// The `db-` an instance's resource id begins with, which the automated backup's own
+/// `ab-` id is read against ([`instance_automated_backups_arn`]).
+const DBI_RESOURCE_ID_PREFIX: &str = "db-";
+
+/// The resource type of an automated backup's ARN, and the prefix of the id in it.
+const AUTOMATED_BACKUP_RESOURCE: &str = "auto-backup";
+const AUTOMATED_BACKUP_ID_PREFIX: &str = "ab-";
+
+/// The segment an automated backup's ARN carries its own id behind, which is what the id is
+/// read back out of it after ([`dbi_resource_id_in_automated_backups_arn`]).
+const AUTOMATED_BACKUP_ARN_SEGMENT: &str = ":auto-backup:";
+
+/// The SOURCE INSTANCE's `DbiResourceId` an automated-backups ARN names, read back out of
+/// the ARN — the inverse of [`instance_automated_backups_arn`] for every id that function is
+/// given, which is a minted one and so always carries the [`DBI_RESOURCE_ID_PREFIX`] this
+/// puts back.
+///
+/// `None` for a value of any other form, which names no automated backup of this service at
+/// all. This is what lets a refusal name the backup by the id it is identified by even when
+/// the request named it by its ARN and no record of it is left
+/// ([`AutomatedBackupReference::describe`]).
+pub fn dbi_resource_id_in_automated_backups_arn(arn: &str) -> Option<String> {
+    let (_, resource) = arn.rsplit_once(AUTOMATED_BACKUP_ARN_SEGMENT)?;
+    let id = resource.strip_prefix(AUTOMATED_BACKUP_ID_PREFIX)?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(format!("{DBI_RESOURCE_ID_PREFIX}{id}"))
 }
 
 /// `RestoreWindow`: "the earliest and latest time a DB instance can be restored to".

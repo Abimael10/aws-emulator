@@ -29,7 +29,8 @@ use service_com_amazonaws_rds_amazonrdsv19::state::STATUS_TRANSITION_DELAY;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{
-    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts, REGION,
+    call, element_is_empty, emulator, expect_error, expect_ok, optional_text, subtrees, text,
+    REGION,
 };
 
 /// How long a test waits before expecting the `creating` → `available` transition this
@@ -412,9 +413,9 @@ async fn every_db_instance_envelope_projects_the_whole_stored_record() {
             // nothing is pending for an instance nothing has modified: the element is
             // there (above) with nothing inside it.
             assert!(
-                texts(instance, "PendingModifiedValues")
+                subtrees(instance, "PendingModifiedValues")
                     .iter()
-                    .all(|inside| inside.trim().is_empty()),
+                    .all(|pending| element_is_empty(pending, "PendingModifiedValues")),
                 "case {:?}: the {envelope} envelope must report no pending change \
                  for an instance with no pending change, got {instance}",
                 row.case

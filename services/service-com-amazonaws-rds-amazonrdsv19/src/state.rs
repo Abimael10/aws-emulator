@@ -2148,6 +2148,33 @@ impl PendingStatus {
     }
 }
 
+/// The provisioning transition a NEW resource is stored with, and the instant it makes that
+/// resource ready: `(pending_status, ready_at)`.
+///
+/// `source_ready_at` is the instant the resource this one is PROVISIONED FROM became ready —
+/// the DB instance a snapshot is taken of, the snapshot a copy is made of, the DB cluster a
+/// member joins — or `None` for a resource this service provisions from nothing (a new DB
+/// instance, a new DB cluster).
+///
+/// The span is charged once per DEPENDENCY LEVEL rather than once per call: a resource that
+/// waits on another one is ready [`STATUS_TRANSITION_DELAY`] after THAT one was, so a chain
+/// of derived resources is ready one span per level after its root was created, however long
+/// after each other the calls that asked for them arrive. That is what lets a client drive a
+/// whole chain with a poll loop: by the time it has polled one level to its terminal status —
+/// which costs it at least one poll of its own — the next level's span has already elapsed,
+/// so a resource created from a settled source is reported ready by the first read after the
+/// create rather than one poll interval later. A caller that creates the source and the
+/// derivative back to back still sees the derivative in its transient status, and the state
+/// errors that go with it, for the rest of that span.
+pub fn provisioning_to(status: &str, source_ready_at: Option<Instant>) -> (PendingStatus, Instant) {
+    let pending = match source_ready_at {
+        Some(ready_at) => PendingStatus::in_a_moment_after(ready_at, status),
+        None => PendingStatus::in_a_moment(status),
+    };
+    let ready_at = pending.due_at;
+    (pending, ready_at)
+}
+
 // ---------------------------------------------------------------------------
 // Cluster parameter groups
 //

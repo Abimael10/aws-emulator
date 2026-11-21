@@ -614,17 +614,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reference is the only place the membership is recorded. The resolved cluster's
         // identifier is what gets stored, not the request's spelling of it, so the two
         // records agree whatever case the request used.
-        let (db_cluster_identifier, cluster_db_subnet_group_name) = match &input
+        let (db_cluster_identifier, cluster_db_subnet_group_name, cluster_ready_at) = match &input
             .db_cluster_identifier
         {
-            None => (None, None),
+            None => (None, None, None),
             Some(named) => match store.resolve_db_cluster(&region, named) {
                 // The cluster's own DB subnet group comes back with it: an instance joins
                 // the network of the cluster it belongs to, so a member created without
-                // naming a group is placed in the cluster's (see below).
+                // naming a group is placed in the cluster's (see below). So does the instant
+                // the cluster became ready: a member joins a cluster that is already there,
+                // so the span it owes runs from then (`crate::state::provisioning_to`).
                 Some(cluster) => (
                     Some(cluster.identifier.clone()),
                     cluster.db_subnet_group_name.clone(),
+                    Some(cluster.ready_at),
                 ),
                 None => {
                     return Err(CreateDBInstanceErrorModeled::DBClusterNotFoundFault(
@@ -638,6 +641,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
+        // A standalone instance is provisioned from nothing, so its span runs from this
+        // call; a cluster member's runs from the instant its cluster became ready.
+        let (provisioning, ready_at) = crate::state::provisioning_to(
+            crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+            cluster_ready_at,
+        );
         // `DBSubnetGroupName` is optional, and every DB instance sits in a DB subnet
         // group all the same: "if there is no DB subnet group, then the DB instance is a
         // non-VPC DB instance" is the legacy EC2-Classic case, which no create reaches
@@ -795,8 +804,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A newly created DB instance is not yet usable: RDS answers `creating`,
             // and the instance reaches `available` on its own. The due instant is
             // stored on the record, so nothing sleeps on this thread.
-            status: "creating".to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment("available")),
+            status: crate::state::DB_INSTANCE_STATUS_CREATING.to_string(),
+            pending_status: Some(provisioning),
+            ready_at,
             db_name: input.db_name,
             allocated_storage: input.allocated_storage,
             max_allocated_storage: input.max_allocated_storage,

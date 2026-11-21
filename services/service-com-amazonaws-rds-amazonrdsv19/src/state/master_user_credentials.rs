@@ -106,6 +106,7 @@ mod tests {
             engine_version: None,
             status: DB_INSTANCE_STATUS_AVAILABLE.to_string(),
             pending_status: None,
+            ready_at: ::std::time::Instant::now(),
             db_name: None,
             allocated_storage: Some(20),
             max_allocated_storage: None,

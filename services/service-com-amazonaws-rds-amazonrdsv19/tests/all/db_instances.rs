@@ -374,6 +374,21 @@ pub(crate) fn subtrees(xml: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether the `<tag>` subtree `subtree` is the EMPTY element: one that carries no member at
+/// all, which is the form an element identifying nothing takes on the wire —
+/// `<PendingModifiedValues></PendingModifiedValues>` for an instance with nothing pending.
+///
+/// `pub(crate)` so the sibling suites of this one test target read an empty element the same
+/// way rather than growing a copy of it.
+pub(crate) fn element_is_empty(subtree: &str, tag: &str) -> bool {
+    let inner = subtree.split_once('>').map(|(_, rest)| rest).unwrap_or("");
+    inner
+        .strip_suffix(&format!("</{tag}>"))
+        .unwrap_or(inner)
+        .trim()
+        .is_empty()
+}
+
 /// The one `<DBInstance>` subtree in `xml`.
 ///
 /// `pub(crate)` so the sibling suites of this one test target read the one instance a

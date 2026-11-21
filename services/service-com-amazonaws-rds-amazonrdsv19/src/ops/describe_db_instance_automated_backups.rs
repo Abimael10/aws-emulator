@@ -246,14 +246,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             automated_backups_arn: input.db_instance_automated_backups_arn.clone(),
         };
         let mut named: Option<String> = None;
-        if let Some(requested) = &input.dbi_resource_id {
+        if input.dbi_resource_id.is_some() {
             backups.retain(|(_, backup)| {
                 backup
                     .dbi_resource_id
                     .as_deref()
                     .is_some_and(|stored| reference.names_resource_id(stored))
             });
-            named = Some(requested.clone());
+            named = Some(reference.describe());
         }
         if let Some(requested) = &input.db_instance_identifier {
             // "The user-supplied instance identifier", which "isn't case-sensitive" — and
@@ -265,16 +265,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_deref()
                     .is_some_and(|stored| stored.eq_ignore_ascii_case(identifier))
             });
+            // This member names an INSTANCE rather than a backup, and an instance this
+            // Region holds no backup of has no resource id to name one by: the refusal
+            // names the value the request carried, which is all there is to identify.
             named = Some(requested.clone());
         }
-        if let Some(requested) = &input.db_instance_automated_backups_arn {
+        if input.db_instance_automated_backups_arn.is_some() {
             backups.retain(|(_, backup)| {
                 backup
                     .db_instance_automated_backups_arn
                     .as_deref()
                     .is_some_and(|stored| reference.names_arn(stored))
             });
-            named = Some(requested.clone());
+            // A refusal names the backup by the source instance's `DbiResourceId`, read back
+            // out of the ARN the request carried ([`AutomatedBackupReference::describe`]),
+            // since that ARN is a function of that one id.
+            named = Some(reference.describe());
         }
         if let (Some(named), true) = (named, backups.is_empty()) {
             return Err(not_found(&named));

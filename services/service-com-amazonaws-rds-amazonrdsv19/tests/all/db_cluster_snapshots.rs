@@ -115,6 +115,9 @@ fn stored_snapshot(region: &str, identifier: &str, cluster: &str) -> DbClusterSn
         snapshot_type: "manual".to_string(),
         status: state::SNAPSHOT_STATUS_AVAILABLE.to_string(),
         pending_status: None,
+        // A record built by hand has already finished: it has been ready since it was
+        // stored, which is what a resource derived from it charges its own span from.
+        ready_at: std::time::Instant::now(),
         cluster_create_time: state::now_as_wire_timestamp(),
         snapshot_create_time: state::now_as_wire_timestamp(),
         source_snapshot_arn: None,

@@ -761,6 +761,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 _ => source.tags.clone(),
             };
 
+            // A restore reads a source that is already there, so the span the restored
+            // instance owes runs from the instant that source became ready
+            // (`crate::state::provisioning_to`).
+            let (provisioning, ready_at) = crate::state::provisioning_to(
+                crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+                Some(source.ready_at),
+            );
             let mut record = crate::state::DbInstanceRecord {
                 identifier: identifier.clone(),
                 region: region.clone(),
@@ -782,9 +789,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A restored DB instance is not usable the instant the call returns: RDS
                 // answers `creating` and the instance reaches `available` on its own.
                 status: crate::state::DB_INSTANCE_STATUS_CREATING.to_string(),
-                pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                    crate::state::DB_INSTANCE_STATUS_AVAILABLE,
-                )),
+                pending_status: Some(provisioning),
+                ready_at,
                 // `DBName` "doesn't apply to ... RDS for Db2, RDS for MariaDB, RDS for
                 // MySQL", whose restored instance carries the databases the source's data
                 // holds.

@@ -356,6 +356,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The copy is a snapshot OF the same cluster, so it carries the source's cluster
         // and the cluster's own facts; only the identifier, the ARN, the creation time,
         // the source link, the tags and the status are the copy's own.
+        //
+        // A copy is made FROM the source snapshot, so the span it owes runs from the instant
+        // that snapshot became ready (`crate::state::provisioning_to`).
+        let (pending_status, ready_at) = crate::state::provisioning_to(
+            crate::state::SNAPSHOT_STATUS_AVAILABLE,
+            Some(source.ready_at),
+        );
         let copy = crate::state::DbClusterSnapshotRecord {
             snapshot_identifier: target_key.clone(),
             region: region.clone(),
@@ -365,9 +372,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `available`, so a caller that reads it straight back sees the copy in
             // progress, as it would against the real service.
             status: crate::state::SNAPSHOT_STATUS_COPYING.to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                crate::state::SNAPSHOT_STATUS_AVAILABLE,
-            )),
+            pending_status: Some(pending_status),
+            ready_at,
             // `KmsKeyId`: "If you don't specify a value for KmsKeyId, then the copy of the
             // DB cluster snapshot is encrypted with the same KMS key as the source DB
             // cluster snapshot" — and a copy encrypted under a named key is an encrypted

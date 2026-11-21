@@ -375,6 +375,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the instance's own facts, down to the copy of the storage the source holds, which
         // is what makes the copy restorable. Only the identifier, the ARN, the creation
         // time, the tags and the status are the copy's own.
+        //
+        // A copy is made FROM the source snapshot, so the span it owes runs from the instant
+        // that snapshot became ready (`crate::state::provisioning_to`).
+        let (pending_status, ready_at) = crate::state::provisioning_to(
+            crate::state::SNAPSHOT_STATUS_AVAILABLE,
+            Some(source.ready_at),
+        );
         let copy = crate::state::DbSnapshotRecord {
             snapshot_identifier: target_key.clone(),
             region: region.clone(),
@@ -383,9 +390,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // so a caller that reads it straight back sees the copy in progress, as it would
             // against the real service.
             status: crate::state::SNAPSHOT_STATUS_COPYING.to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                crate::state::SNAPSHOT_STATUS_AVAILABLE,
-            )),
+            pending_status: Some(pending_status),
+            ready_at,
             // `KmsKeyId`: "If you don't specify a value for this parameter, then the copy of
             // the DB snapshot is encrypted with the same Amazon Web Services KMS key as the
             // source DB snapshot" — and a copy encrypted under a named key is an encrypted

@@ -641,6 +641,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The replica is a copy of the source: every setting it reports is the source's
             // unless this request names its own, which is what "Default: Inherits from the
             // source DB instance" says for the members that document a default at all.
+            //
+            // A replica is provisioned FROM the source, so the span it owes runs from the
+            // instant that source became ready (`crate::state::provisioning_to`).
+            let (provisioning, ready_at) = crate::state::provisioning_to(
+                crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+                Some(source.ready_at),
+            );
             let mut record = crate::state::DbInstanceRecord {
                 identifier: identifier.clone(),
                 region: region.clone(),
@@ -655,9 +662,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A read replica is not usable the instant the call returns: RDS answers
                 // `creating` and the replica reaches `available` on its own.
                 status: crate::state::DB_INSTANCE_STATUS_CREATING.to_string(),
-                pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                    crate::state::DB_INSTANCE_STATUS_AVAILABLE,
-                )),
+                pending_status: Some(provisioning),
+                ready_at,
                 // The source this replica replicates, on the half of the relationship the
                 // REPLICA carries: whichever kind of resource it is ([`ResolvedSource`]).
                 // The source DB instance's own half is recorded below, on that instance; a
@@ -1345,6 +1351,9 @@ fn resolve_source_cluster(
         engine_version: cluster.engine_version.clone(),
         status: cluster.status.clone(),
         pending_status: None,
+        // The instant the SOURCE CLUSTER became ready, which is what a replica of it charges
+        // its own span from ([`crate::state::provisioning_to`]).
+        ready_at: cluster.ready_at,
         // "DatabaseName: the name of the database the cluster hosts" — the database the
         // replica serves, since it serves a copy of the cluster's data.
         db_name: cluster.database_name.clone(),

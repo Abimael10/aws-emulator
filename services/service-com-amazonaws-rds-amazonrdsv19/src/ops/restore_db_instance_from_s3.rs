@@ -682,6 +682,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 })
             });
+            // The backup this restore reads is in Amazon S3 rather than in a resource of
+            // this service, so there is no earlier readiness to charge the span from: it
+            // runs from this call (`crate::state::provisioning_to`).
+            let (provisioning, ready_at) = crate::state::provisioning_to(
+                crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+                None,
+            );
             let mut record = crate::state::DbInstanceRecord {
                 identifier: identifier.clone(),
                 region: region.clone(),
@@ -704,9 +711,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A restored DB instance is not usable the instant the call returns: RDS
                 // answers `creating` and the instance reaches `available` on its own.
                 status: crate::state::DB_INSTANCE_STATUS_CREATING.to_string(),
-                pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                    crate::state::DB_INSTANCE_STATUS_AVAILABLE,
-                )),
+                pending_status: Some(provisioning),
+                ready_at,
                 // "The name of the database to create when the DB instance is created."
                 db_name: input.db_name.clone(),
                 allocated_storage: input.allocated_storage,

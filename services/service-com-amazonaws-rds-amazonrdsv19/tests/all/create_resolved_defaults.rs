@@ -33,8 +33,8 @@
 //! every subnet id and zone an assertion names is one the owner of subnets reported.
 
 use crate::db_instances::{
-    call, call_in, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts,
-    wait_for_settle, REGION,
+    call, call_in, element_is_empty, emulator, expect_error, expect_ok, optional_text, subtrees,
+    text, texts, wait_for_settle, REGION,
 };
 use crate::db_subnet_group_ec2_zones::Account;
 use service_com_amazonaws_rds_amazonrdsv19::state::OPTION_GROUP_ENGINE_NAMES;
@@ -489,9 +489,7 @@ async fn a_master_credential_still_being_applied_is_the_only_pending_value() {
         // change, so a resource with nothing pending carries it EMPTY.
         let pending: Vec<String> = subtrees(&envelope, "PendingModifiedValues")
             .into_iter()
-            .zip(texts(&envelope, "PendingModifiedValues"))
-            .filter(|(_, inside)| !inside.trim().is_empty())
-            .map(|(staged, _)| staged)
+            .filter(|reported| !element_is_empty(reported, "PendingModifiedValues"))
             .collect();
         if *with_password {
             let pending = pending.into_iter().next().unwrap_or_else(|| {
@@ -540,9 +538,9 @@ async fn a_master_credential_still_being_applied_is_the_only_pending_value() {
             the_instance(case, &body)
         };
         assert!(
-            texts(&envelope, "PendingModifiedValues")
+            subtrees(&envelope, "PendingModifiedValues")
                 .iter()
-                .all(|inside| inside.trim().is_empty()),
+                .all(|reported| element_is_empty(reported, "PendingModifiedValues")),
             "case {case:?}: a resource that is up has nothing pending, got {envelope}"
         );
     }

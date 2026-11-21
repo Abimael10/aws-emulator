@@ -80,6 +80,11 @@ pub struct DbClusterRecord {
     pub status: String,
     /// The transition the clock owes this cluster, if any.
     pub pending_status: Option<PendingStatus>,
+    /// The instant the clock makes — or made — this cluster READY for the first time, as
+    /// [`DbInstanceRecord::ready_at`] records it for a DB instance: what a resource
+    /// provisioned FROM this cluster (a member, a cluster snapshot) charges its own span
+    /// from ([`provisioning_to`]).
+    pub ready_at: Instant,
     /// `Engine`.
     pub engine: String,
     /// `EngineVersion`: the version the cluster RUNS, resolved against the engine-version

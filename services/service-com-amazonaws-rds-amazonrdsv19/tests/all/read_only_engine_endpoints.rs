@@ -579,7 +579,20 @@ async fn a_cluster_members_endpoint_serves_the_cluster_volume_in_the_role_the_cl
             );
             endpoints.push((identifier, endpoint_of(&created)));
         }
-        wait_for_settle();
+        // Each member joins a cluster that is still coming up, so it is ready one span after
+        // that cluster is — the chain costs one span per level. This waits for the CONDITION
+        // each member's own engine listener answers on, so nothing here depends on how fast
+        // the host runs.
+        for (identifier, _) in &endpoints {
+            let request = [("DBInstanceIdentifier", identifier.clone())];
+            crate::lifecycle_poll_loops::poll_until(
+                case,
+                "the cluster's member reaching available",
+                || call(&router, "DescribeDBInstances", &request),
+                |status, body| status == 200 && text(body, "DBInstanceStatus") == "available",
+            )
+            .await;
+        }
         let [(primary, primary_endpoint), (replica, replica_endpoint)] = endpoints.as_slice()
         else {
             panic!("case {case:?}: two members were created");

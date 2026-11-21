@@ -357,6 +357,10 @@ pub struct ExportTaskRecord {
     pub snapshot_time: ::aws_smithy_types::DateTime,
     /// `TaskStartTime`.
     pub task_start_time: ::aws_smithy_types::DateTime,
+    /// The same instant on this service's own clock: when the export STARTED WRITING, which
+    /// is what the span of its `COMPLETE` step runs from, since the task cannot finish
+    /// before it began ([`Self::settle`]).
+    pub started_at: Instant,
     /// `TaskEndTime`, once the task has reached a terminal status.
     pub task_end_time: Option<::aws_smithy_types::DateTime>,
     /// `S3Bucket`.
@@ -387,9 +391,10 @@ impl ExportTaskRecord {
     ///
     /// An export's progression has two steps, so a read that comes after BOTH of them were
     /// due reports the task as far along as the clock has taken it: each step's span runs
-    /// from the instant the step before it was due ([`PendingStatus::in_a_moment_after`]),
-    /// and they are applied in one pass. A caller polling at its own interval therefore sees
-    /// a terminal status as soon as the clock owed one, rather than one step per poll.
+    /// from the instant the step before it was due, or from the instant the task began where
+    /// that is later ([`PendingStatus::in_a_moment_after`]), and they are applied in one
+    /// pass. A caller polling at its own interval therefore sees a terminal status as soon as
+    /// the clock owed one, rather than one step per poll.
     ///
     /// A task that reaches a terminal status has ENDED, so this is also where
     /// `TaskEndTime` is taken: the instant the clock made the terminal status due is the
@@ -409,8 +414,15 @@ impl ExportTaskRecord {
                     // caller polling the task walks the same STARTING → IN_PROGRESS →
                     // COMPLETE progression the real service reports.
                     if self.status == EXPORT_TASK_STATUS_IN_PROGRESS {
+                        // The span of this step runs from the instant the task STARTED, not
+                        // from the instant the step before it was due: a task whose first
+                        // step was owed from the readiness of the source it reads (see
+                        // `StartExportTask`) has not been writing since before it existed,
+                        // so its `COMPLETE` is owed one span after it began — the window a
+                        // client that polled the task to a status it can act on then
+                        // cancels it in.
                         self.pending_status = Some(PendingStatus::in_a_moment_after(
-                            pending.due_at,
+                            pending.due_at.max(self.started_at),
                             EXPORT_TASK_STATUS_COMPLETE,
                         ));
                     }
@@ -515,6 +527,7 @@ mod tests {
             export_only: Vec::new(),
             snapshot_time: crate::state::now_as_wire_timestamp(),
             task_start_time: crate::state::now_as_wire_timestamp(),
+            started_at: Instant::now(),
             task_end_time: None,
             s3_bucket: "destination".to_string(),
             s3_prefix: None,

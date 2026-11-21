@@ -642,14 +642,39 @@ async fn a_snapshot_copy_this_service_cannot_serve_is_refused_and_stores_nothing
     }
 
     // A source that is not available yet cannot be copied: the snapshot a caller has only
-    // just started is still being taken, and the modelled state fault says so.
+    // just started is still being taken, and the modelled state fault says so. The snapshot
+    // is taken the moment its instance reaches `available`, which is when the span it owes
+    // begins — a snapshot waits on the instance it is taken of, so that is the instant its
+    // own span runs from.
+    expect_ok(
+        "create the instance the second snapshot is taken of",
+        call(
+            &router,
+            "CreateDBInstance",
+            &[
+                ("DBInstanceIdentifier", "copy-prompt-instance"),
+                ("Engine", "mysql"),
+                ("DBInstanceClass", "db.t3.micro"),
+                ("AllocatedStorage", "20"),
+            ],
+        )
+        .await,
+    );
+    let prompt_request = [("DBInstanceIdentifier", "copy-prompt-instance")];
+    crate::lifecycle_poll_loops::poll_until(
+        "a source still being taken",
+        "the instance the second snapshot is taken of reaching available",
+        || call(&router, "DescribeDBInstances", &prompt_request),
+        |status, body| status == 200 && text(body, "DBInstanceStatus") == "available",
+    )
+    .await;
     expect_ok(
         "take a second snapshot",
         call(
             &router,
             "CreateDBSnapshot",
             &[
-                ("DBInstanceIdentifier", SOURCE_INSTANCE),
+                ("DBInstanceIdentifier", "copy-prompt-instance"),
                 ("DBSnapshotIdentifier", "copy-source-creating"),
             ],
         )

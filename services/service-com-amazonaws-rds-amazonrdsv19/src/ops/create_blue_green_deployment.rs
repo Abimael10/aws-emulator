@@ -377,9 +377,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             green.resource_id = crate::state::mint_db_cluster_resource_id(mint);
             green.endpoint_host = crate::state::mint_endpoint_host(mint);
             green.status = crate::state::DB_CLUSTER_STATUS_CREATING.to_string();
-            green.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+            // The green environment is provisioned FROM the blue one, which is already
+            // there, so the span it owes runs from the instant that source became ready
+            // (`crate::state::provisioning_to`).
+            let (provisioning, ready_at) = crate::state::provisioning_to(
                 crate::state::DB_CLUSTER_STATUS_AVAILABLE,
-            ));
+                Some(source.ready_at),
+            );
+            green.pending_status = Some(provisioning);
+            green.ready_at = ready_at;
             green.cluster_create_time = crate::state::now_as_wire_timestamp();
             // A clone of a cluster is not a member of the source's global database and
             // replicates from nothing: those are properties of the blue cluster alone.
@@ -456,8 +462,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             green.identifier = crate::state::green_identifier(&source_identifier, mint, 63);
             green.dbi_resource_id = crate::state::mint_dbi_resource_id(mint);
             green.endpoint_host = crate::state::mint_endpoint_host(mint);
-            green.status = "creating".to_string();
-            green.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
+            green.status = crate::state::DB_INSTANCE_STATUS_CREATING.to_string();
+            // The green environment is provisioned FROM the blue one, which is already
+            // there, so the span it owes runs from the instant that source became ready
+            // (`crate::state::provisioning_to`).
+            let (provisioning, ready_at) = crate::state::provisioning_to(
+                crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+                Some(source.ready_at),
+            );
+            green.pending_status = Some(provisioning);
+            green.ready_at = ready_at;
             green.instance_create_time = crate::state::now_as_wire_timestamp();
             green.tags = tags.clone();
             // The green database starts its own log, with the reason it exists as its

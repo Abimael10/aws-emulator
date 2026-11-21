@@ -534,13 +534,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     export_only: export_only.clone(),
                     snapshot_time: source.snapshot_time,
                     task_start_time: crate::state::now_as_wire_timestamp(),
+                    started_at: ::std::time::Instant::now(),
                     task_end_time: None,
                     s3_bucket: input.s3_bucket_name.clone(),
                     s3_prefix: input.s3_prefix.clone(),
                     iam_role_arn: input.iam_role_arn.clone(),
                     kms_key_id: input.kms_key_id.clone(),
+                    // A task STARTS on the source it reads, which is already there, so the
+                    // span of its first step runs from the instant that source became ready
+                    // (`crate::state::provisioning_to`): a client polling the task reaches
+                    // the status it can act on without paying a poll interval for the start.
+                    // What the task then does — writing the objects out — runs on its OWN
+                    // clock from the instant it started
+                    // (`crate::state::ExportTaskRecord::settle`).
                     status: crate::state::EXPORT_TASK_STATUS_STARTING.to_string(),
-                    pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                    pending_status: Some(crate::state::PendingStatus::in_a_moment_after(
+                        source.ready_at,
                         crate::state::EXPORT_TASK_STATUS_IN_PROGRESS,
                     )),
                     percent_progress: crate::state::INITIAL_PERCENT_PROGRESS,
@@ -773,6 +782,9 @@ struct ExportSource {
     /// The ARN as the resolved source's own, so the task reports the source it really
     /// exported.
     arn: String,
+    /// The instant the source became ready, which is what the task charges the span of its
+    /// own first step from ([`crate::state::provisioning_to`]).
+    ready_at: ::std::time::Instant,
     /// `SourceType`, one of the values `ExportSourceType` publishes.
     source_type: &'static str,
     /// "The time when the snapshot was created" — the snapshot's own creation time, and the
@@ -840,6 +852,7 @@ fn resolve_export_source(
             }
             Ok(ExportSource {
                 arn: snapshot.arn(),
+                ready_at: snapshot.ready_at,
                 source_type: crate::state::EXPORT_SOURCE_TYPE_SNAPSHOT,
                 snapshot_time: snapshot.snapshot_create_time,
                 wire: crate::state::engine_wire(&snapshot.engine)
@@ -878,6 +891,7 @@ fn resolve_export_source(
             }
             Ok(ExportSource {
                 arn: snapshot.arn(),
+                ready_at: snapshot.ready_at,
                 source_type: crate::state::EXPORT_SOURCE_TYPE_SNAPSHOT,
                 snapshot_time: snapshot.snapshot_create_time,
                 wire: crate::state::engine_wire(&snapshot.engine)
@@ -938,6 +952,7 @@ fn resolve_export_source(
                 });
             Ok(ExportSource {
                 arn: cluster.arn(),
+                ready_at: cluster.ready_at,
                 source_type: crate::state::EXPORT_SOURCE_TYPE_CLUSTER,
                 // An export of a CLUSTER reads it as it stands, so the instant it was read
                 // at is what the task reports as the time of the data it exported.

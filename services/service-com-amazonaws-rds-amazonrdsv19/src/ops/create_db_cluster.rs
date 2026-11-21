@@ -1147,6 +1147,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // to resolve against, so what the request named stands.
             None => input.engine_version.clone(),
         };
+        // A new DB cluster is provisioned from nothing — a restore is what provisions one
+        // from a snapshot — so the span it owes runs from this call
+        // (`crate::state::provisioning_to`).
+        let (provisioning, ready_at) =
+            crate::state::provisioning_to(crate::state::DB_CLUSTER_STATUS_AVAILABLE, None);
         let mut record = crate::state::DbClusterRecord {
             identifier: identifier.clone(),
             region: region.clone(),
@@ -1159,9 +1164,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // cluster reaches `available` on its own. The due instant is stored on the
             // record, so nothing sleeps on this thread.
             status: crate::state::DB_CLUSTER_STATUS_CREATING.to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
-            )),
+            pending_status: Some(provisioning),
+            ready_at,
             engine: input.engine.clone(),
             engine_version,
             engine_mode,

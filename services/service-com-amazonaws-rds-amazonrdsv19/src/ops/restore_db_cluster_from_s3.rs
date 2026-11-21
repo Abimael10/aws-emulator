@@ -846,6 +846,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_ref()
             .map(|secret| secret.secret_arn.clone());
 
+        // The backup this restore reads is in Amazon S3 rather than in a resource of this
+        // service, so there is no earlier readiness to charge the span from: it runs from
+        // this call (`crate::state::provisioning_to`).
+        let (provisioning, ready_at) =
+            crate::state::provisioning_to(crate::state::DB_CLUSTER_STATUS_AVAILABLE, None);
         let mut record = crate::state::DbClusterRecord {
             identifier: identifier.clone(),
             region: region.clone(),
@@ -860,9 +865,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // instances only after the RestoreDBClusterFromS3 operation has completed and the
             // DB cluster is available."
             status: crate::state::DB_CLUSTER_STATUS_CREATING.to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
-            )),
+            pending_status: Some(provisioning),
+            ready_at,
             engine: input.engine.clone(),
             engine_version,
             // `EngineMode` is not a member of this operation, so the restored cluster runs in

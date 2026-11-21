@@ -46,7 +46,7 @@ use service_com_amazonaws_rds_amazonrdsv19::EmulatedService;
 
 use crate::db_clusters::describe_one;
 use crate::db_instances::{
-    call, call_in, emulator, expect_error, expect_ok, subtrees, text, wait_for_settle, REGION,
+    call, call_in, emulator, expect_error, expect_ok, subtrees, text, REGION,
 };
 
 /// The Neptune engine, whose API documents `MasterUserPassword` as "Not supported by
@@ -156,8 +156,18 @@ async fn a_master_password_is_refused_for_an_engine_whose_api_takes_none() {
         .await,
     );
     // A modification is taken only on an instance that has reached `available`, so the two
-    // rows addressing one wait out the transition this service owes it first.
-    wait_for_settle();
+    // rows addressing one wait for it to get there first. The member joins a cluster that is
+    // still coming up, so it is ready one span after the cluster is — the chain costs one
+    // span per level — and this waits for the CONDITION rather than for a span, so nothing
+    // here depends on how fast the host runs.
+    let member_request = [("DBInstanceIdentifier", "emu-npt-pass-1")];
+    crate::lifecycle_poll_loops::poll_until(
+        "the Neptune instance the modifications address",
+        "the cluster's member reaching available",
+        || call(&router, "DescribeDBInstances", &member_request),
+        |status, body| status == 200 && text(body, "DBInstanceStatus") == "available",
+    )
+    .await;
 
     for (index, (case, password)) in password_rows().into_iter().enumerate() {
         for operation in PASSWORD_OPERATIONS {

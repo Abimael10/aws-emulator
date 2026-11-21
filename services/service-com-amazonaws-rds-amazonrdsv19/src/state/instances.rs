@@ -135,6 +135,12 @@ pub struct DbInstanceRecord {
     pub engine_version: Option<String>,
     pub status: String,
     pub pending_status: Option<PendingStatus>,
+    /// The instant the clock makes — or made — this instance READY for the first time: the
+    /// due instant of the provisioning transition it was stored with, or the instant it was
+    /// stored for a record that was ready at once. What a resource provisioned FROM this
+    /// instance (a snapshot of it, a replica of it, a restore of it) charges its own span
+    /// from ([`provisioning_to`]).
+    pub ready_at: Instant,
     pub db_name: Option<String>,
     pub allocated_storage: Option<i32>,
     pub max_allocated_storage: Option<i32>,

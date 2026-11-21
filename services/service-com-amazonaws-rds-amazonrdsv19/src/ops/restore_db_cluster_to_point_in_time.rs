@@ -694,6 +694,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
                 SourceCluster {
                     identifier: record.identifier.clone(),
+                    ready_at: record.ready_at,
                     engine: record.engine.clone(),
                     engine_version: record.engine_version.clone(),
                     engine_mode: record.engine_mode.clone(),
@@ -962,6 +963,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let multi_az_cluster = crate::state::is_multi_az_db_cluster(&source.engine);
         let resource_id = crate::state::mint_db_cluster_resource_id(mint);
+        // A restore reads a source cluster that is already there, so the span the restored
+        // cluster owes runs from the instant that source became ready
+        // (`crate::state::provisioning_to`).
+        let (provisioning, ready_at) = crate::state::provisioning_to(
+            crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+            Some(source.ready_at),
+        );
         let mut record = crate::state::DbClusterRecord {
             identifier: identifier.clone(),
             region: region.clone(),
@@ -977,9 +985,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // instances only after the RestoreDBClusterToPointInTime operation has completed
             // and the DB cluster is available."
             status: crate::state::DB_CLUSTER_STATUS_CREATING.to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
-            )),
+            pending_status: Some(provisioning),
+            ready_at,
             // This operation publishes no `Engine`, `EngineVersion`, `DatabaseName`,
             // `PreferredMaintenanceWindow`, `CharacterSetName`, `AllocatedStorage`,
             // `AutoMinorVersionUpgrade`, `EnableHttpEndpoint`, `ClusterScalabilityType` or
@@ -1420,6 +1427,9 @@ struct Resolved {
 /// cluster's storage. The request's own members then override it, member by member.
 struct SourceCluster {
     identifier: String,
+    /// The instant the source cluster became ready, which is what the restored cluster
+    /// charges its own span from ([`crate::state::provisioning_to`]).
+    ready_at: ::std::time::Instant,
     engine: String,
     engine_version: Option<String>,
     engine_mode: String,

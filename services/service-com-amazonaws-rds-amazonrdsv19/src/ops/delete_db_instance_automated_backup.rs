@@ -282,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DBInstanceAutomatedBackupNotFoundFault {
                         message: Some(
                             crate::ops::describe_db_instance_automated_backups::automated_backup_not_found_message(
-                                reference.describe(),
+                                &reference.describe(),
                             ),
                         ),
                     },

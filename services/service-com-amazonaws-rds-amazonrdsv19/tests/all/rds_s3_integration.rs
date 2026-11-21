@@ -55,6 +55,7 @@ use crate::db_instances::{
     call, call_in, expect_error, expect_ok, optional_text, subtrees, text, texts, wait_for_settle,
     REGION,
 };
+use crate::lifecycle_poll_loops::poll_until;
 
 /// The canonical account id every generated emulator presents.
 const ACCOUNT: &str = "000000000000";
@@ -1130,37 +1131,19 @@ async fn an_export_writes_its_objects_and_completes() {
             "case {case:?}: expected the source's own integers, got {ledger:?}"
         );
 
-        // The task the export recorded walks the progression the real service reports.
-        wait_for_settle();
-        let described = expect_ok(
+        // The task the export recorded walks the progression the real service reports: it
+        // has left STARTING — the step it was waiting on is the readiness of the source it
+        // reads — and the clock then takes it to COMPLETE one span after it started. This
+        // waits for that CONDITION rather than for a span, since the reads above have
+        // already taken time of their own.
+        let task_request = params!["ExportTaskIdentifier" => identifier];
+        let (described, _polls) = poll_until(
             case,
-            call(
-                &fixture.router,
-                "DescribeExportTasks",
-                &params!["ExportTaskIdentifier" => identifier],
-            )
-            .await,
-        );
-        assert_eq!(
-            text(&described, "Status"),
-            st::EXPORT_TASK_STATUS_IN_PROGRESS,
-            "case {case:?}: one span after the start the export is IN_PROGRESS, got {described}"
-        );
-        wait_for_settle();
-        let described = expect_ok(
-            case,
-            call(
-                &fixture.router,
-                "DescribeExportTasks",
-                &params!["ExportTaskIdentifier" => identifier],
-            )
-            .await,
-        );
-        assert_eq!(
-            text(&described, "Status"),
-            st::EXPORT_TASK_STATUS_COMPLETE,
-            "case {case:?}: the export then completes, got {described}"
-        );
+            "the export task completing",
+            || call(&fixture.router, "DescribeExportTasks", &task_request),
+            |status, body| status == 200 && text(body, "Status") == st::EXPORT_TASK_STATUS_COMPLETE,
+        )
+        .await;
         assert_eq!(
             text(&described, "PercentProgress"),
             st::COMPLETE_PERCENT_PROGRESS.to_string(),

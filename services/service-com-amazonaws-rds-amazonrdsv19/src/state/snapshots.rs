@@ -73,6 +73,11 @@ pub struct DbClusterSnapshotRecord {
     pub status: String,
     /// The status this record owes, and when; see [`PendingStatus`].
     pub pending_status: Option<PendingStatus>,
+    /// The instant the clock makes — or made — this snapshot READY for the first time, as
+    /// [`DbInstanceRecord::ready_at`] records it for a DB instance: what a resource
+    /// provisioned FROM this snapshot (a copy of it, a restore of it, an export of it)
+    /// charges its own span from ([`provisioning_to`]).
+    pub ready_at: Instant,
     pub cluster_create_time: ::aws_smithy_types::DateTime,
     pub snapshot_create_time: ::aws_smithy_types::DateTime,
     /// `SourceDBClusterSnapshotArn`: the snapshot this one was copied from, absent for a
@@ -152,6 +157,10 @@ impl DbClusterSnapshotRecord {
         data_bytes: i64,
         tags: Vec<Tag>,
     ) -> Self {
+        // A snapshot is taken OF the cluster, so the span it owes runs from the instant that
+        // cluster became ready ([`provisioning_to`]).
+        let (pending_status, ready_at) =
+            provisioning_to(SNAPSHOT_STATUS_AVAILABLE, Some(cluster.ready_at));
         Self {
             snapshot_identifier: snapshot_identifier.to_string(),
             region: cluster.region.clone(),
@@ -196,7 +205,8 @@ impl DbClusterSnapshotRecord {
             iam_database_authentication_enabled: cluster.iam_database_authentication_enabled,
             snapshot_type: SNAPSHOT_TYPE_MANUAL.to_string(),
             status: SNAPSHOT_STATUS_CREATING.to_string(),
-            pending_status: Some(PendingStatus::in_a_moment(SNAPSHOT_STATUS_AVAILABLE)),
+            pending_status: Some(pending_status),
+            ready_at,
             cluster_create_time: cluster.cluster_create_time,
             snapshot_create_time: now_as_wire_timestamp(),
             source_snapshot_arn: None,
@@ -587,6 +597,11 @@ pub struct DbSnapshotRecord {
     pub license_model: Option<String>,
     pub status: String,
     pub pending_status: Option<PendingStatus>,
+    /// The instant the clock makes — or made — this snapshot READY for the first time, as
+    /// [`DbInstanceRecord::ready_at`] records it for a DB instance: what a resource
+    /// provisioned FROM this snapshot (a copy of it, a restore of it, an export of it)
+    /// charges its own span from ([`provisioning_to`]).
+    pub ready_at: Instant,
     pub snapshot_type: String,
     pub instance_create_time: ::aws_smithy_types::DateTime,
     pub snapshot_create_time: ::aws_smithy_types::DateTime,
@@ -651,6 +666,10 @@ impl DbSnapshotRecord {
         storage: Option<::std::sync::Arc<data_plane::sql_engine::InstanceDatabase>>,
         tenant_databases: Vec<SnapshotTenantDatabaseRecord>,
     ) -> Self {
+        // A snapshot is taken OF the instance, so the span it owes runs from the instant that
+        // instance became ready ([`provisioning_to`]).
+        let (pending_status, ready_at) =
+            provisioning_to(SNAPSHOT_STATUS_AVAILABLE, Some(instance.ready_at));
         Self {
             snapshot_identifier: snapshot_identifier.to_string(),
             region: instance.region.clone(),
@@ -674,7 +693,8 @@ impl DbSnapshotRecord {
             iops: instance.iops,
             license_model: instance.license_model.clone(),
             status: SNAPSHOT_STATUS_CREATING.to_string(),
-            pending_status: Some(PendingStatus::in_a_moment(SNAPSHOT_STATUS_AVAILABLE)),
+            pending_status: Some(pending_status),
+            ready_at,
             snapshot_type: SNAPSHOT_TYPE_MANUAL.to_string(),
             instance_create_time: instance.instance_create_time,
             snapshot_create_time: now_as_wire_timestamp(),

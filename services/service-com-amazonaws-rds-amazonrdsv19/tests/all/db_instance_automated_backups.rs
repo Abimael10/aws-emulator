@@ -69,10 +69,12 @@ macro_rules! params {
     };
 }
 
-/// The sentence every not-found refusal of an automated backup carries: fixed text with
-/// the value the request named as its only variable part.
-fn expected_not_found(requested: &str) -> String {
-    format!("Automated backups could not be found for: {requested}")
+/// The sentence every not-found refusal of an automated backup carries: fixed text with the
+/// SOURCE INSTANCE's `DbiResourceId` as its only variable part — the id an automated backup
+/// is identified by, which a request that named the backup by its ARN is answered with too,
+/// since that ARN is a function of that one id.
+fn expected_not_found(dbi_resource_id: &str) -> String {
+    format!("Automated backups could not be found for: {dbi_resource_id}")
 }
 
 /// `CreateDBInstance` for one row, and the `DbiResourceId` the created instance reports.
@@ -908,7 +910,9 @@ async fn the_requests_the_automated_backup_calls_refuse() {
     );
 
     // An id nothing was ever created under is the not-found refusal, from both calls, and
-    // so is an automated-backups ARN naming one — each refusal naming the value it was sent.
+    // so is an automated-backups ARN naming one — each refusal naming the backup by the
+    // source instance's resource id, which is read back out of the ARN where that is the
+    // member the request carried.
     let unknown = "db-NOTHINGWASEVERCREATEDUNDERTHIS";
     for operation in [
         "DescribeDBInstanceAutomatedBackups",
@@ -918,7 +922,6 @@ async fn the_requests_the_automated_backup_calls_refuse() {
             params!["DbiResourceId" => unknown].to_vec(),
             params!["DBInstanceAutomatedBackupsArn" => backups_arn(unknown)].to_vec(),
         ] {
-            let sent = named[0].1.clone();
             let refused = expect_error(
                 operation,
                 call(&router, operation, &named).await,
@@ -927,7 +930,7 @@ async fn the_requests_the_automated_backup_calls_refuse() {
             );
             assert_eq!(
                 text(&refused, "Message"),
-                expected_not_found(&sent),
+                expected_not_found(unknown),
                 "case {operation:?}: expected the sentence this refusal carries, got {refused}"
             );
         }

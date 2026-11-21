@@ -38,7 +38,8 @@ use service_com_amazonaws_rds_amazonrdsv19::state::window_is_open;
 use std::time::SystemTime;
 
 use crate::db_instances::{
-    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, texts,
+    call, element_is_empty, emulator, expect_error, expect_ok, optional_text, subtrees, text,
+    texts,
 };
 use crate::lifecycle_poll_loops::{poll_until, read_instance};
 
@@ -275,9 +276,7 @@ async fn settled_instance(
 fn pending(instance: &str) -> Option<String> {
     subtrees(instance, "PendingModifiedValues")
         .into_iter()
-        .zip(texts(instance, "PendingModifiedValues"))
-        .find(|(_, inside)| !inside.trim().is_empty())
-        .map(|(staged, _)| staged)
+        .find(|reported| !element_is_empty(reported, "PendingModifiedValues"))
 }
 
 #[tokio::test]

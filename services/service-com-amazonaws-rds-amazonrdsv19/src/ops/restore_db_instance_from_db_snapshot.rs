@@ -670,6 +670,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 _ => source.tags.clone(),
             };
 
+            let (provisioning, ready_at) = crate::state::provisioning_to(
+                crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+                Some(source.ready_at),
+            );
             let mut record = crate::state::DbInstanceRecord {
                 identifier: identifier.clone(),
                 region: region.clone(),
@@ -690,11 +694,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 engine: engine.clone(),
                 engine_version,
                 // A restored DB instance is not usable the instant the call returns: RDS
-                // answers `creating` and the instance reaches `available` on its own.
+                // answers `creating` and the instance reaches `available` on its own. The
+                // restore reads a snapshot that is already there, so the span it owes runs
+                // from the instant that snapshot became ready.
                 status: "creating".to_string(),
-                pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                    crate::state::DB_INSTANCE_STATUS_AVAILABLE,
-                )),
+                pending_status: Some(provisioning),
+                ready_at,
                 // `DBName` "only applies to RDS for Oracle and RDS for SQL Server DB
                 // instances. It doesn't apply to the other engines" — whose restored
                 // instance carries the database the snapshot's data lives in.
@@ -1099,6 +1104,9 @@ struct SourceSettings {
     tags: Vec<crate::ops::types::Tag>,
     /// The copy of the source's storage the snapshot holds, if the source had any.
     storage: Option<::std::sync::Arc<crate::state::data_plane::sql_engine::InstanceDatabase>>,
+    /// The instant the snapshot this restore reads became ready, which is what the restored
+    /// instance charges its own span from ([`crate::state::provisioning_to`]).
+    ready_at: ::std::time::Instant,
 }
 
 /// Resolve the snapshot `named` names in `region`, and read the settings a restore of it
@@ -1156,6 +1164,7 @@ fn resolve_source(
                 );
             }
             Ok(SourceSettings {
+                ready_at: snapshot.ready_at,
                 engine: snapshot.engine.clone(),
                 engine_version: snapshot.engine_version.clone(),
                 db_instance_class: Some(snapshot.db_instance_class.clone()),
@@ -1233,6 +1242,7 @@ fn resolve_source(
                 );
             }
             Ok(SourceSettings {
+                ready_at: snapshot.ready_at,
                 engine: snapshot.engine.clone(),
                 engine_version: snapshot.engine_version.clone(),
                 db_instance_class: snapshot.db_instance_class.clone(),

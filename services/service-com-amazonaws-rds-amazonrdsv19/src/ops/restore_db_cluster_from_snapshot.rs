@@ -921,6 +921,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let resource_id = crate::state::mint_db_cluster_resource_id(mint);
+        // A restore reads a snapshot that is already there, so the span the restored cluster
+        // owes runs from the instant that snapshot became ready
+        // (`crate::state::provisioning_to`).
+        let (provisioning, ready_at) = crate::state::provisioning_to(
+            crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+            Some(source.ready_at),
+        );
         let mut record = crate::state::DbClusterRecord {
             identifier: identifier.clone(),
             region: region.clone(),
@@ -936,9 +943,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // instances only after the RestoreDBClusterFromSnapshot operation has completed
             // and the DB cluster is available."
             status: crate::state::DB_CLUSTER_STATUS_CREATING.to_string(),
-            pending_status: Some(crate::state::PendingStatus::in_a_moment(
-                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
-            )),
+            pending_status: Some(provisioning),
+            ready_at,
             engine: input.engine.clone(),
             engine_version,
             engine_mode,
@@ -1373,6 +1379,9 @@ struct SourceSnapshot {
     /// The copy of the DATA API databases the snapshot holds, if the cluster it was taken
     /// from served any: the other half of the data the restored cluster is given.
     data_api_storage: Option<::std::sync::Arc<crate::state::DataApiClusterData>>,
+    /// The instant the snapshot this restore reads became ready, which is what the restored
+    /// cluster charges its own span from ([`crate::state::provisioning_to`]).
+    ready_at: ::std::time::Instant,
 }
 
 /// Resolve the snapshot `requested` names in `region`, and read the settings a restore of it
@@ -1419,6 +1428,7 @@ fn resolve_source(
             );
         }
         return Ok(SourceSnapshot {
+            ready_at: snapshot.ready_at,
             engine: snapshot.engine.clone(),
             engine_version: snapshot.engine_version.clone(),
             engine_mode: snapshot.engine_mode.clone(),
@@ -1485,6 +1495,7 @@ fn resolve_source(
             );
         }
         return Ok(SourceSnapshot {
+            ready_at: snapshot.ready_at,
             engine: snapshot.engine.clone(),
             engine_version: snapshot.engine_version.clone(),
             // A DB snapshot was taken of a standalone DB INSTANCE, which runs in no engine

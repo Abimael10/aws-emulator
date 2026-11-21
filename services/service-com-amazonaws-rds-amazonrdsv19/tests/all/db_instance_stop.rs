@@ -493,7 +493,17 @@ async fn a_cluster_member_is_refused_with_the_cluster_state_fault() {
         )
         .await,
     );
-    wait_for_settle();
+    // The member joins a cluster that is still coming up, so it is ready one span after the
+    // cluster is — the chain costs one span per level. This waits for the CONDITION rather
+    // than for a span, so nothing here depends on how fast the host runs.
+    let member_request = params!["DBInstanceIdentifier" => "emu-stop-member"];
+    crate::lifecycle_poll_loops::poll_until(
+        "a member of a DB cluster",
+        "the cluster's member reaching available",
+        || call(&router, "DescribeDBInstances", &member_request),
+        |status, body| status == 200 && text(body, "DBInstanceStatus") == "available",
+    )
+    .await;
 
     let body = expect_error(
         "a member of a DB cluster",
