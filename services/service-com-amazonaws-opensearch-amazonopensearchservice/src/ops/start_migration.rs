@@ -16,7 +16,8 @@
 //! A `clientToken` a start was already served under answers with THAT job rather than
 //! starting another, and an `applicationId` naming no application of this account names
 //! nothing to migrate into: that miss is the modelled not-found shape stating that no
-//! such application exists and naming the id ([`application_does_not_exist`]), under
+//! such application exists and naming the id
+//! ([`crate::state::application_does_not_exist_named`]), under
 //! the status this service answers that shape on
 //! ([`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`]).
 //!
@@ -150,11 +151,12 @@ impl From<StartMigrationErrorModeled> for StartMigrationError {
 /// request carried named in it, because a start names the application among its other
 /// input and the refusal tells a caller WHICH value could not be resolved. That is how
 /// the wire refusal recorded for this operation words it.
-fn application_does_not_exist(application_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("Application {application_id} does not exist")),
-    }
-}
+///
+/// The sentence is the state tree's ([`crate::state::application_does_not_exist_named`]),
+/// which is the ONE home of that wording and is what every operation wording the miss this
+/// way answers through — `crate::ops::register_capability` among them — so no two of them
+/// can drift apart.
+use crate::state::application_does_not_exist_named as application_does_not_exist;
 
 /// The `StartMigration` operation.
 ///

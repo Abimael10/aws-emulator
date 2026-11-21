@@ -29,15 +29,24 @@
 //! * a deregistration reports the capability being removed, is idempotent, and the clock
 //!   takes the record away — after which a read is the modelled not-found refusal and a
 //!   register mints the capability afresh;
+//! * a removal starts only from a capability whose lifecycle has SETTLED: while a status
+//!   move the clock still owes the record is outstanding the deregistration is the modelled
+//!   conflict refusal and the stored record is left where it stood, over a table of states
+//!   differing in the status the record stands in, in whether a move is owed and in whether
+//!   a removal is already running;
 //! * every one of the three operations refuses an id naming no application, and the two
-//!   that address a registration refuse a name the application holds none under;
+//!   that address a registration refuse a name the application holds none under — each
+//!   stating the missing application in ITS own wording, over a table of ids differing in
+//!   length and in the characters the service admits;
 //! * the set one application holds is bounded: one register per name and one name, so
 //!   however many registers arrive the application holds a single record.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
-    CAPABILITY_STATUS_ACTIVE, CAPABILITY_STATUS_CREATING, CAPABILITY_STATUS_DELETING,
+    OwedStatus, CAPABILITY_STATUS_ACTIVE, CAPABILITY_STATUS_CREATE_FAILED,
+    CAPABILITY_STATUS_CREATING, CAPABILITY_STATUS_DELETING, CAPABILITY_STATUS_UPDATING,
 };
+use std::time::{Duration, SystemTime};
 
 use super::data_source_attachments::application;
 use super::domain_lifecycle::{
@@ -561,13 +570,27 @@ async fn every_capability_operation_refuses_an_id_that_names_no_application() {
     served(&register(&emulator, &held, name, ai_config()).await, "the held capability");
 
     // Ids this account holds no application under, differing in length and in the
-    // characters the service admits, so the refusal is not a property of one value.
+    // characters the service admits, so the refusal is not a property of one value. Each
+    // operation states the miss in ITS own wording: the register says the application does
+    // not exist, the two that address a registration say it was not found.
     for absent in ["noapplication0", "abc", "a1b2c3d4e5f6g7h8i9j0"] {
-        let expected = format!("Application {absent} not found");
-        for (case, answer) in [
-            ("register", register(&emulator, absent, name, ai_config()).await),
-            ("get", get_capability(&emulator, absent, name).await),
-            ("deregister", deregister(&emulator, absent, name).await),
+        let not_found = format!("Application {absent} not found");
+        for (case, answer, expected) in [
+            (
+                "register",
+                register(&emulator, absent, name, ai_config()).await,
+                format!("Application {absent} does not exist"),
+            ),
+            (
+                "get",
+                get_capability(&emulator, absent, name).await,
+                not_found.clone(),
+            ),
+            (
+                "deregister",
+                deregister(&emulator, absent, name).await,
+                not_found.clone(),
+            ),
         ] {
             refused(
                 &answer,
@@ -629,5 +652,278 @@ async fn the_capability_set_of_one_application_is_bounded() {
             "case \"register round {round}\": the application holds one record, got {:?}",
             held_capabilities(&emulator, &id)
         );
+    }
+}
+
+// =============================================================================
+// Which states a removal can start from
+// =============================================================================
+
+/// `ConflictException`'s modelled HTTP status
+/// (`smithy_query(query="operation",operation="DeregisterCapability")`).
+const CONFLICT_STATUS: u16 = 409;
+
+/// A span far longer than any case of this suite takes, so a move or a removal the store is
+/// given at this distance is still outstanding when the call under test arrives: the state
+/// the row is about is PINNED rather than raced against the clock.
+const WELL_BEYOND_THE_CASE: Duration = Duration::from_secs(3_600);
+
+/// A second, shorter such span, so no row is pinned by one distance only.
+const ALSO_BEYOND_THE_CASE: Duration = Duration::from_secs(900);
+
+/// One row of the removal table: the state the stored capability stands in when the
+/// deregistration arrives, and whether the service starts a removal from it.
+struct Removal {
+    case: &'static str,
+    /// The status the record stands in.
+    status: &'static str,
+    /// The status move the clock still owes the record, as the span left until it falls due,
+    /// and `None` for a record that is owed nothing.
+    owed_in: Option<Duration>,
+    /// The removal already under way, as the span left until it lands, and `None` for a
+    /// record nothing has asked to remove.
+    removal_in: Option<Duration>,
+    /// Whether the service refuses to start a removal from this state.
+    conflicts: bool,
+}
+
+/// The states the rule is asserted over: they differ in the status the record stands in, in
+/// whether a status move is still owed and in whether a removal is already running — so what
+/// decides the answer is the outstanding work rather than one status name.
+fn removal_rows() -> Vec<Removal> {
+    vec![
+        Removal {
+            case: "a registration still being enabled",
+            status: CAPABILITY_STATUS_CREATING,
+            owed_in: Some(WELL_BEYOND_THE_CASE),
+            removal_in: None,
+            conflicts: true,
+        },
+        Removal {
+            case: "a capability with a move owed while it is updating",
+            status: CAPABILITY_STATUS_UPDATING,
+            owed_in: Some(ALSO_BEYOND_THE_CASE),
+            removal_in: None,
+            conflicts: true,
+        },
+        Removal {
+            case: "an enabled capability",
+            status: CAPABILITY_STATUS_ACTIVE,
+            owed_in: None,
+            removal_in: None,
+            conflicts: false,
+        },
+        Removal {
+            case: "a capability whose registration failed",
+            status: CAPABILITY_STATUS_CREATE_FAILED,
+            owed_in: None,
+            removal_in: None,
+            conflicts: false,
+        },
+        Removal {
+            case: "a removal already under way",
+            status: CAPABILITY_STATUS_DELETING,
+            owed_in: None,
+            removal_in: Some(WELL_BEYOND_THE_CASE),
+            conflicts: false,
+        },
+    ]
+}
+
+/// Put the application's capability into the state a row is about, in the store the handlers
+/// read — a state no sequence of calls can hold a record in for the length of a case, since
+/// the clock would settle it.
+fn hold(emulator: &Emulator, application_id: &str, row: &Removal) {
+    let now = SystemTime::now();
+    let store = emulator.store();
+    let mut guard = store.lock();
+    let capability = guard
+        .applications
+        .get_mut(application_id)
+        .unwrap_or_else(|| panic!("case {:?}: the account holds the application", row.case))
+        .capabilities
+        .get_mut(CAPABILITY)
+        .unwrap_or_else(|| panic!("case {:?}: the capability was registered", row.case));
+    capability.status = row.status.to_string();
+    capability.owed = row.owed_in.map(|left| OwedStatus {
+        status: CAPABILITY_STATUS_ACTIVE.to_string(),
+        message: None,
+        due: now + left,
+    });
+    capability.removal_due = row.removal_in.map(|left| now + left);
+}
+
+/// What the store holds for this application's capability: the status it stands in and the
+/// instant its removal is due, if any.
+fn stored_capability(
+    emulator: &Emulator,
+    application_id: &str,
+) -> Option<(String, Option<SystemTime>)> {
+    let store = emulator.store();
+    let guard = store.lock();
+    let capability = guard
+        .applications
+        .get(application_id)?
+        .capabilities
+        .get(CAPABILITY)?;
+    Some((capability.status.clone(), capability.removal_due))
+}
+
+#[tokio::test]
+async fn a_removal_starts_only_from_a_settled_capability() {
+    let emulator = Emulator::new();
+
+    for (index, row) in removal_rows().into_iter().enumerate() {
+        // One application per row, so no row is answered about a record another row left.
+        let id = application(&emulator, &format!("capability-states-{index}")).await;
+        served(
+            &register(&emulator, &id, CAPABILITY, ai_config()).await,
+            row.case,
+        );
+        hold(&emulator, &id, &row);
+        let before = stored_capability(&emulator, &id);
+
+        let answer = deregister(&emulator, &id, CAPABILITY).await;
+        if row.conflicts {
+            refused(
+                &answer,
+                row.case,
+                CONFLICT_STATUS,
+                "ConflictException",
+                &format!("Conflict while deregister AI capability for application {id}"),
+            );
+            // The refusal is the whole of what the call did: the record stands exactly where
+            // it stood, and no removal was started for it.
+            assert_eq!(
+                stored_capability(&emulator, &id),
+                before,
+                "case {:?}: a refused deregistration leaves the stored capability untouched",
+                row.case
+            );
+            assert_eq!(
+                held_capabilities(&emulator, &id),
+                vec![CAPABILITY.to_string()],
+                "case {:?}: the application still holds the capability, got {:?}",
+                row.case,
+                held_capabilities(&emulator, &id)
+            );
+            continue;
+        }
+
+        let body = served(&answer, row.case);
+        assert_eq!(
+            string_member(&body, "status", row.case),
+            CAPABILITY_STATUS_DELETING,
+            "case {:?}: the removal started, so the capability is being removed, got {body:?}",
+            row.case
+        );
+        let (status, removal_due) = stored_capability(&emulator, &id).unwrap_or_else(|| {
+            panic!("case {:?}: the record rests in its deleting status", row.case)
+        });
+        assert_eq!(
+            status, CAPABILITY_STATUS_DELETING,
+            "case {:?}: the stored record carries the status the call reported",
+            row.case
+        );
+        assert!(
+            removal_due.is_some(),
+            "case {:?}: the clock owes the record's removal",
+            row.case
+        );
+        if let Some((_, already_due)) = before.filter(|(_, due)| due.is_some()) {
+            // A removal already under way keeps the instant it was owed at, so repeating the
+            // call cannot push that removal back.
+            assert_eq!(
+                removal_due, already_due,
+                "case {:?}: the removal keeps the instant it was owed at",
+                row.case
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_removal_conflict_lifts_once_the_owed_move_lands() {
+    let emulator = Emulator::new();
+    let id = application(&emulator, "capability-conflict-lifts").await;
+    let case = "a registration that settles";
+    served(
+        &register(&emulator, &id, CAPABILITY, ai_config()).await,
+        case,
+    );
+
+    // Nothing asks for the move: the span the clock owed the registration falls due on its
+    // own, and from there the removal starts. Nothing is written to the store for this case,
+    // and it waits for THAT condition rather than for a stretch of time.
+    poll_until("the capability becoming active", || async {
+        let read = get_capability(&emulator, &id, CAPABILITY).await;
+        read.body["status"].as_str() == Some(CAPABILITY_STATUS_ACTIVE)
+    })
+    .await;
+
+    let body = served(&deregister(&emulator, &id, CAPABILITY).await, case);
+    assert_eq!(
+        string_member(&body, "status", case),
+        CAPABILITY_STATUS_DELETING,
+        "case {case:?}: a settled capability's removal starts, got {body:?}"
+    );
+}
+
+// =============================================================================
+// How a missing application is stated
+// =============================================================================
+
+/// The ids the register's wording is asserted over: each is inside `ApplicationId`'s
+/// published expression `^[a-z0-9]{3,30}$`
+/// (`smithy_query(query="operation",operation="RegisterCapability")`) — both of its length
+/// bounds included — and none of them names an application of this account.
+fn absent_application_ids() -> Vec<(&'static str, String)> {
+    vec![
+        ("the published minimum length", "abc".to_string()),
+        ("the published maximum length", "z".repeat(30)),
+        ("digits throughout", "0123456789".to_string()),
+        ("letters and digits", "noapplication9x".to_string()),
+    ]
+}
+
+#[tokio::test]
+async fn the_register_states_a_missing_application_as_one_that_does_not_exist() {
+    let emulator = Emulator::new();
+    // An application this account DOES hold, so what refuses the rows below is the id each
+    // carries rather than an account holding no application at all.
+    let held = application(&emulator, "capability-missing-application").await;
+    served(
+        &register(&emulator, &held, CAPABILITY, ai_config()).await,
+        "the held application",
+    );
+
+    for (case, absent) in absent_application_ids() {
+        refused(
+            &register(&emulator, &absent, CAPABILITY, ai_config()).await,
+            &format!("a register on {case}"),
+            RECORDED_NOT_FOUND_STATUS,
+            "ResourceNotFoundException",
+            &format!("Application {absent} does not exist"),
+        );
+        // The two operations that address a registration state the same miss in their own
+        // wording, so the sentence belongs to the operation rather than to the lookup.
+        for (operation, answer) in [
+            (
+                "a read",
+                get_capability(&emulator, &absent, CAPABILITY).await,
+            ),
+            (
+                "a deregistration",
+                deregister(&emulator, &absent, CAPABILITY).await,
+            ),
+        ] {
+            refused(
+                &answer,
+                &format!("{operation} on {case}"),
+                RECORDED_NOT_FOUND_STATUS,
+                "ResourceNotFoundException",
+                &format!("Application {absent} not found"),
+            );
+        }
     }
 }

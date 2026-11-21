@@ -203,13 +203,14 @@ async fn the_value_rule_is_decided_before_the_application_is_resolved() {
 
         // The registrable name against that same id reaches the lookup, so THAT one is the
         // missing-resource refusal — the two refusals are distinguishable, which is what
-        // tells a caller which value was wrong.
+        // tells a caller which value was wrong. A register states the missing application in
+        // its own wording (`super::application_capabilities`'s own table of that rule).
         refused(
             &register(&emulator, absent, CAPABILITY, ai_config()).await,
             &format!("the registrable name against the absent application {absent:?}"),
             RECORDED_NOT_FOUND_STATUS,
             "ResourceNotFoundException",
-            &format!("Application {absent} not found"),
+            &format!("Application {absent} does not exist"),
         );
     }
 }

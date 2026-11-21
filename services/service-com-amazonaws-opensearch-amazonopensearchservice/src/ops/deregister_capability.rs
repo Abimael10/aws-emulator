@@ -16,6 +16,12 @@
 //! owed at, so repeating the call reports the same deleting status rather than pushing the
 //! removal back.
 //!
+//! The removal starts from a capability whose lifecycle has SETTLED: while the enabling a
+//! register asked for is still being carried out, the capability is in use by that work and
+//! the call is the modelled conflict refusal
+//! ([`crate::state::capability_removal_conflict`]), with the stored record left exactly
+//! where it stood.
+//!
 //! An `applicationId` naming no application of this account, or a `capabilityName` that
 //! application holds no registration under, is the modelled not-found refusal.
 //!
@@ -92,7 +98,8 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_found_named, capability_not_found, service_state, state_unavailable,
+    application_not_found_named, capability_not_found, capability_removal_conflict, service_state,
+    state_unavailable,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -197,6 +204,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.capability_name,
                 ))
             })?;
+
+        // A removal starts from a SETTLED record: while the status move the clock owes the
+        // capability is still outstanding — the enabling a register asked for, being carried
+        // out — the capability is in use by that work, so the call is refused and the stored
+        // record left exactly where it stood rather than torn down from a state the removal
+        // cannot start in ([`crate::state::Capability::removal_can_start`]). A capability
+        // whose removal is already under way is owed no move, so a repeat is still the
+        // idempotent report below.
+        if !capability.removal_can_start() {
+            return Err(DeregisterCapabilityErrorModeled::ConflictException(
+                capability_removal_conflict(&input.application_id),
+            )
+            .into());
+        }
 
         // The record is left where it stands in its deleting status and the clock owes its
         // removal, so a caller acting straight after this call still observes the capability

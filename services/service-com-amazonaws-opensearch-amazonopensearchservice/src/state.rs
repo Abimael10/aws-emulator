@@ -1675,6 +1675,28 @@ pub fn application_not_found_named(id: &str) -> ResourceNotFoundException {
     }
 }
 
+/// What the operations that word the same miss as the application NOT EXISTING state about
+/// an id naming no application of this account: the sentence the CRUD surface states
+/// ([`APPLICATION_DOES_NOT_EXIST`]) with the id the request carried named inside it.
+///
+/// A call that names the application among OTHER input — a migration a start asks for, a
+/// capability a register asks for — words it this way, because the refusal tells a caller
+/// handed several values WHICH one could not be resolved; that is how the wire refusals
+/// recorded for those operations word it. The other sub-APIs of an application word their
+/// own miss differently ([`application_not_found_message`]), so both sentences live here,
+/// one per wording, and no operation writes either of them for itself.
+pub fn application_does_not_exist_message(id: &str) -> String {
+    format!("Application {id} does not exist")
+}
+
+/// The `ResourceNotFoundException` payload those operations answer with
+/// ([`application_does_not_exist_message`]).
+pub fn application_does_not_exist_named(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(application_does_not_exist_message(id)),
+    }
+}
+
 /// The `ResourceNotFoundException` payload for an ARN this account holds no application
 /// under.
 ///

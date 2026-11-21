@@ -29,6 +29,14 @@ pub const CAPABILITY_STATUS_ACTIVE: &str = "active";
 /// (`DeregisterCapabilityResponse$status`).
 pub const CAPABILITY_STATUS_DELETING: &str = "deleting";
 
+/// `CapabilityStatus`'s `updating` value: a capability whose configuration is being changed,
+/// which is a status move the clock still owes the record.
+pub const CAPABILITY_STATUS_UPDATING: &str = "updating";
+
+/// `CapabilityStatus`'s `create_failed` value: a capability whose enabling did not complete.
+/// A status the record SETTLED in — nothing is owed from it.
+pub const CAPABILITY_STATUS_CREATE_FAILED: &str = "create_failed";
+
 /// How many capabilities ONE application holds before a register is refused rather than
 /// adding another record.
 ///
@@ -131,6 +139,23 @@ impl Capability {
         self.removal_due.is_some()
     }
 
+    /// Whether a removal of this capability can START from where the record stands.
+    ///
+    /// A removal starts from a capability whose lifecycle has SETTLED: while a status move
+    /// the clock still owes it is outstanding — the enabling a register asked for, being
+    /// carried out — the capability is in use by that work, so the deregistration is
+    /// refused ([`capability_removal_conflict`]) rather than taking away a record that work
+    /// is still writing. It is the capability's own form of the rule a detach of a PENDING
+    /// data source attachment is refused by.
+    ///
+    /// A capability whose removal is already under way is owed no status move
+    /// ([`Self::begin_deregistration`] drops whatever was outstanding), so it answers this —
+    /// which is what keeps a repeated deregistration the idempotent report of the same
+    /// deleting status rather than a conflict.
+    pub fn removal_can_start(&self) -> bool {
+        self.owed.is_none()
+    }
+
     /// The stored configuration as `RegisterCapability` reports it.
     ///
     /// The register and the response configurations are separate shapes declaring the
@@ -223,6 +248,23 @@ pub fn capability_not_found(application_id: &str, capability_name: &str) -> Reso
     ResourceNotFoundException {
         message: Some(format!(
             "Capability {capability_name} not found for application {application_id}"
+        )),
+    }
+}
+
+/// The `ConflictException` payload for a deregistration asked for while the capability's
+/// lifecycle has not settled ([`Capability::removal_can_start`]).
+///
+/// `DeregisterCapability` models that error — "an error occurred because the client attempts
+/// to remove a resource that is currently in use" — so a removal the service will not start
+/// from where the record stands is reported through it rather than served. One sentence for
+/// the condition, naming the application the capability was registered for as the only value
+/// of the request it states; the capability it is about is the one capability this service
+/// registers ([`AI_CAPABILITY_NAME`]).
+pub fn capability_removal_conflict(application_id: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Conflict while deregister AI capability for application {application_id}"
         )),
     }
 }

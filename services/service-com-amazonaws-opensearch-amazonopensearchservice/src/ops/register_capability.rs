@@ -19,7 +19,8 @@
 //! [`crate::state::PROVISIONING`] span later.
 //!
 //! An `applicationId` naming no application of this account is the modelled not-found
-//! refusal ([`crate::state::application_not_found_named`]); an application already
+//! refusal, stated in the wording this operation words that miss in
+//! ([`crate::state::application_does_not_exist_named`]); an application already
 //! holding [`crate::state::CAPABILITY_QUOTA`] capabilities is the modelled quota refusal.
 //!
 //! `capabilityName` names WHICH capability is being registered, and this service registers
@@ -117,8 +118,8 @@
 use super::types::*;
 
 use crate::state::{
-    application_not_found_named, capability_name_refusal, capability_quota_exceeded, service_state,
-    state_unavailable, Capability, CAPABILITY_QUOTA,
+    application_does_not_exist_named, capability_name_refusal, capability_quota_exceeded,
+    service_state, state_unavailable, Capability, CAPABILITY_QUOTA,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -218,13 +219,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The capability belongs to the application, so an id naming none has nothing to
         // register a capability for. A call about a SUB-RESOURCE of an application names
-        // that application among other values, so the refusal names the id back.
+        // that application among other values, so the refusal names the id back — in the
+        // wording this operation states that miss in
+        // ([`crate::state::application_does_not_exist_named`], the one home of that
+        // sentence, which `crate::ops::start_migration` states it through too).
         let application = store
             .applications
             .get_mut(&input.application_id)
             .ok_or_else(|| {
                 RegisterCapabilityErrorModeled::ResourceNotFoundException(
-                    application_not_found_named(&input.application_id),
+                    application_does_not_exist_named(&input.application_id),
                 )
             })?;
 
