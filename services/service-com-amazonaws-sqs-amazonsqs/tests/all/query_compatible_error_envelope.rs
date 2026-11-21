@@ -51,7 +51,6 @@
 //! (`UnknownOperationException`), and a request declaring a media type neither protocol
 //! reads a document in is not read at all.
 
-use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::scaffolded::{
     INVALID_PARAMETER_VALUE, INVALID_PARAMETER_VALUE_SHAPE_ID, MISSING_PARAMETER,
@@ -59,9 +58,15 @@ use service_com_amazonaws_sqs_amazonsqs::scaffolded::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+// The AWS Query request builder, the answer a client reads off the wire and that surface's
+// media types and API version are the shared harness's
+// ([`super::support::query_call`]): this suite and the absence suite drive the same
+// surface, so they drive it through one builder rather than two.
 use super::support::{
-    authorization_in, call, call_with_query_mode, create_ok, emulator, error_shape, expected_url,
-    form_encode, messages, ok, HOST, QUERY_ERROR_HEADER, QUERY_MODE_ON, REGION,
+    authorization_in, call, call_with_query_mode, create_ok, dispatched as answered, emulator,
+    error_shape, expected_url, messages, ok, query_call as query, request_with, QueryField,
+    WireAnswer as Answered, FORM_CONTENT_TYPE, HOST, QUERY_API_VERSION, QUERY_ERROR_HEADER,
+    QUERY_MODE_ON, REGION, XML_CONTENT_TYPE,
 };
 
 /// The legacy query code the model states for a queue that does not exist, and for a purge
@@ -361,20 +366,8 @@ async fn an_accepted_call_reports_no_error_class() {
     }
 }
 
-/// The media type an AWS Query request carries its body in.
-const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
-
-/// The media type its answers come back as.
-const XML_CONTENT_TYPE: &str = "text/xml";
-
 /// The media type this endpoint's `awsJson1_0` wire carries a document in.
 const JSON_CONTENT_TYPE: &str = "application/x-amz-json-1.0";
-
-/// The API version an AWS Query client of this endpoint names in every request
-/// (`smithy_query(query="service_info",
-/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`:
-/// version `2012-11-05`).
-const QUERY_API_VERSION: &str = "2012-11-05";
 
 /// The target prefix a JSON client of this endpoint names the service by: the model's own
 /// service shape name, which is what an SDK builds `X-Amz-Target` from.
@@ -395,72 +388,10 @@ const QUEUE_DOES_NOT_EXIST_IN_THIS_VERSION: &str =
 /// The whole document that refusal carries: the class as its own empty element.
 const UNKNOWN_OPERATION_DOCUMENT: &str = "<UnknownOperationException/>\n";
 
-/// One answer as a client reads it off the wire: the status, the media type and the bytes.
-struct Answered {
-    status: u16,
-    content_type: Option<String>,
-    body: String,
-}
-
-/// One request to this endpoint, built header by header so a row can leave out the very
-/// header it is about.
-fn request_with(headers: &[(&str, &str)], body: Vec<u8>) -> http::Request<Bytes> {
-    let mut builder = http::Request::builder().method("POST").uri("/");
-    for (name, value) in headers {
-        builder = builder.header(*name, *value);
-    }
-    builder
-        .body(Bytes::from(body))
-        .expect("a well-formed request")
-}
-
-/// Dispatch `request` and read its answer the way a client does.
-async fn answered(router: &MultiServiceRouter, request: http::Request<Bytes>) -> Answered {
-    let response = router.dispatch(request).await;
-    Answered {
-        status: response.status().as_u16(),
-        content_type: response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .map(ToString::to_string),
-        body: String::from_utf8_lossy(response.body()).to_string(),
-    }
-}
-
-/// One AWS Query request: a form-encoded `POST /` naming `action` and this API's version,
-/// carrying `params` verbatim, signed the way every other call of this suite is.
-fn query_request(action: &str, params: &[Param]) -> http::Request<Bytes> {
-    let mut body = format!("Action={action}&Version={QUERY_API_VERSION}");
-    for (name, value) in params {
-        body.push('&');
-        body.push_str(name);
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let authorization = authorization_in(REGION);
-    request_with(
-        &[
-            ("host", HOST),
-            ("content-type", FORM_CONTENT_TYPE),
-            ("authorization", authorization.as_str()),
-        ],
-        body.into_bytes(),
-    )
-}
-
-/// One AWS Query call.
-async fn query(
-    router: &MultiServiceRouter,
-    action: &str,
-    params: &[Param],
-) -> Answered {
-    answered(router, query_request(action, params)).await
-}
-
 /// One form parameter of a query request: the name, which is this suite's own literal, and
-/// the value it carries.
-type Param = (&'static str, String);
+/// the value it carries — the shared harness's field type, so a row built here is a row
+/// that builder takes.
+type Param = QueryField;
 
 /// One row of the SERVED table: the case, the action, its parameters, and the elements the
 /// answer owes as `(element, expected text)`.

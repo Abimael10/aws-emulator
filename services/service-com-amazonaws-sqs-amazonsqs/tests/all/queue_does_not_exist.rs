@@ -22,6 +22,13 @@
 //! the constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], which one test
 //! pins to AWS's own sentence written out literally.
 //!
+//! They span one axis further: the WIRE SURFACE the request arrived on. This one API is
+//! published over two of them, and each words this class with its own fixed sentence —
+//! the sentence above on the `awsJson1_0` surface every current SDK sends, and the
+//! WSDL-versioned one on the form-encoded AWS Query surface. The surface decides the
+//! sentence; the operation never does, so no operation that resolves a queue may answer
+//! one surface's wording to the other's client.
+//!
 //! The rows further span WHAT the queue was and held when it went away — nothing, messages
 //! nobody had received, a message received and still in flight (probed with the receipt
 //! handle that queue itself minted), tags and a changed attribute, a FIFO queue's message
@@ -34,12 +41,15 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sqs_amazonsqs::state::QUEUE_DOES_NOT_EXIST_MESSAGE;
+use service_com_amazonaws_sqs_amazonsqs::state::{
+    QUEUE_DOES_NOT_EXIST_IN_THIS_VERSION, QUEUE_DOES_NOT_EXIST_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::support::{
     account, call, call_in_query_mode, call_with_headers, create_ok, dead_letter_queue, emulator,
-    error_code, fifo_attributes, messages, ok, send_all, HOST, OTHER_ACCOUNT, QUERY_ERROR_HEADER,
+    error_code, fifo_attributes, messages, ok, query_call, send_all, xml_element, QueryField, HOST,
+    OTHER_ACCOUNT, QUERY_ERROR_HEADER, XML_CONTENT_TYPE,
 };
 
 /// AWS's own sentence for a queue the account does not hold, written out here rather than
@@ -695,6 +705,250 @@ async fn an_absent_queue_earns_the_one_sentence_whatever_it_held() {
             );
         }
     }
+}
+
+/// The sentence the WSDL-versioned AWS Query surface words this class with, written out here
+/// so neither surface's wording can drift into the other's: it is the JSON surface's sentence
+/// plus that surface's own trailing clause, and no client of the JSON surface may be handed
+/// it.
+const QUERY_SURFACE_SENTENCE: &str = "The specified queue does not exist for this wsdl version.";
+
+/// The legacy query code this class is named by on either surface — the model's
+/// `awsQueryError.code` for the error shape — which is what the query surface's
+/// `<Code>` element carries.
+const NON_EXISTENT_QUEUE_CODE: &str = "AWS.SimpleQueueService.NonExistentQueue";
+
+/// The fault side a refusal the caller caused is reported under, which that surface's
+/// `<Type>` element carries.
+const SENDER_FAULT: &str = "Sender";
+
+/// The SAME requests as [`url_requests`], in the form the AWS Query protocol carries them in,
+/// so one row drives one operation on both surfaces of this API.
+///
+/// A list or a map arrives under the wire names this API's own model gives it
+/// (`smithy_query(query="shape", shape="TagQueueRequest,UntagQueueRequest,
+/// AddPermissionRequest,SendMessageBatchRequest,DeleteMessageBatchRequest,
+/// ChangeMessageVisibilityBatchRequest,GetQueueAttributesRequest,SetQueueAttributesRequest",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`):
+/// `Tag.N.Key`/`Tag.N.Value` for `Tags` (`@xmlName("Tag") @xmlFlattened` over a `TagMap`
+/// whose key and value are `@xmlName("Key")`/`@xmlName("Value")`), `TagKey.N` for `TagKeys`,
+/// `AWSAccountId.N` and `ActionName.N` for `AddPermission`, `AttributeName.N` for an
+/// attribute-name list, `Attribute.N.Name`/`Attribute.N.Value` for an attribute map, and
+/// `<EntryShape>.N.<member>` for each batch's entry list.
+///
+/// Everything beside the `QueueUrl` is well formed, so the only thing either answer can be
+/// about is the queue.
+fn url_query_requests(url: &str) -> Vec<(&'static str, Vec<QueryField>)> {
+    let fields = |rest: &[(&'static str, &str)]| -> Vec<QueryField> {
+        let mut fields: Vec<QueryField> = vec![("QueueUrl", url.to_string())];
+        fields.extend(
+            rest.iter()
+                .map(|(name, value)| (*name, (*value).to_string())),
+        );
+        fields
+    };
+    vec![
+        ("GetQueueAttributes", fields(&[("AttributeName.1", "All")])),
+        (
+            "SetQueueAttributes",
+            fields(&[
+                ("Attribute.1.Name", "VisibilityTimeout"),
+                ("Attribute.1.Value", "10"),
+            ]),
+        ),
+        (
+            "AddPermission",
+            fields(&[
+                ("Label", "shared"),
+                ("AWSAccountId.1", OTHER_ACCOUNT),
+                ("ActionName.1", "SendMessage"),
+            ]),
+        ),
+        ("RemovePermission", fields(&[("Label", "shared")])),
+        ("SendMessage", fields(&[("MessageBody", "hello")])),
+        (
+            "SendMessageBatch",
+            fields(&[
+                ("SendMessageBatchRequestEntry.1.Id", "one"),
+                ("SendMessageBatchRequestEntry.1.MessageBody", "hello"),
+            ]),
+        ),
+        ("ReceiveMessage", fields(&[])),
+        (
+            "ChangeMessageVisibility",
+            fields(&[
+                ("ReceiptHandle", "not-a-handle"),
+                ("VisibilityTimeout", "30"),
+            ]),
+        ),
+        (
+            "ChangeMessageVisibilityBatch",
+            fields(&[
+                ("ChangeMessageVisibilityBatchRequestEntry.1.Id", "one"),
+                (
+                    "ChangeMessageVisibilityBatchRequestEntry.1.ReceiptHandle",
+                    "not-a-handle",
+                ),
+                (
+                    "ChangeMessageVisibilityBatchRequestEntry.1.VisibilityTimeout",
+                    "30",
+                ),
+            ]),
+        ),
+        (
+            "DeleteMessage",
+            fields(&[("ReceiptHandle", "not-a-handle")]),
+        ),
+        (
+            "DeleteMessageBatch",
+            fields(&[
+                ("DeleteMessageBatchRequestEntry.1.Id", "one"),
+                (
+                    "DeleteMessageBatchRequestEntry.1.ReceiptHandle",
+                    "not-a-handle",
+                ),
+            ]),
+        ),
+        ("DeleteQueue", fields(&[])),
+        ("PurgeQueue", fields(&[])),
+        ("ListQueueTags", fields(&[])),
+        ("ListDeadLetterSourceQueues", fields(&[])),
+        (
+            "TagQueue",
+            fields(&[("Tag.1.Key", "team"), ("Tag.1.Value", "platform")]),
+        ),
+        ("UntagQueue", fields(&[("TagKey.1", "team")])),
+    ]
+}
+
+/// The SURFACE a request arrived on decides the sentence, and the operation decides nothing:
+/// every operation that resolves a queue answers the `awsJson1_0` surface AWS's current
+/// sentence and the form-encoded AWS Query surface that surface's WSDL-versioned one, with
+/// HTTP 400 and the one legacy code on both.
+///
+/// This is the half of the rule a single operation could drift on, because each one reaches
+/// the shared refusal through its own resolution step: the rows run EVERY operation that
+/// resolves a `QueueUrl` over the forms of absence, on both surfaces, and compare the two
+/// sentences — so a JSON client is never handed the query surface's trailing clause and a
+/// query client is never handed the JSON surface's sentence.
+#[tokio::test]
+async fn the_wire_surface_decides_the_sentence_and_the_operation_decides_nothing() {
+    let router = emulator();
+    let deleted = create_ok(&router, "surface-deleted", &json!({})).await;
+    let (status, parsed) = call(&router, "DeleteQueue", &json!({"QueueUrl": &deleted})).await;
+    assert_eq!(
+        status, 200,
+        "case deleting the queue: expected HTTP 200, got {status} with {parsed}"
+    );
+
+    let forms: Vec<(&str, String)> = vec![
+        ("a url that was deleted", deleted.clone()),
+        (
+            "a url that was never created",
+            format!("https://{HOST}/{}/surface-never-created", account()),
+        ),
+        (
+            "another account's url for a name this account held",
+            format!("https://{HOST}/{OTHER_ACCOUNT}/surface-deleted"),
+        ),
+        (
+            "a bare name no queue of this account carries",
+            "surface-never-created".to_string(),
+        ),
+    ];
+
+    for (case, url) in &forms {
+        let json_rows = url_requests(url);
+        let query_rows = url_query_requests(url);
+        // The two tables are one table read on two surfaces: an operation named by only one
+        // of them would leave that surface unasserted for it.
+        let json_operations: Vec<&str> = json_rows
+            .iter()
+            .map(|(operation, _)| *operation)
+            .collect();
+        let query_operations: Vec<&str> = query_rows
+            .iter()
+            .map(|(operation, _)| *operation)
+            .collect();
+        assert_eq!(
+            json_operations, query_operations,
+            "case {case}: every operation driven on one surface must be driven on the other, \
+             got {json_operations:?} and {query_operations:?}"
+        );
+
+        for (operation, request) in &json_rows {
+            let (status, parsed) = call(&router, operation, request).await;
+            let message = message_of(&parsed);
+            assert_eq!(
+                (status, error_code(&parsed).as_str(), message.as_str()),
+                (400, "QueueDoesNotExist", AWS_SENTENCE),
+                "case {operation} on {case} over the JSON surface: expected a 400 \
+                 QueueDoesNotExist reading {AWS_SENTENCE:?}, got {status} with {parsed}"
+            );
+            assert_ne!(
+                message, QUERY_SURFACE_SENTENCE,
+                "case {operation} on {case} over the JSON surface: the WSDL-versioned \
+                 surface's sentence may not be answered to a JSON client, got {message:?}"
+            );
+        }
+
+        for (operation, fields) in &query_rows {
+            let answer = query_call(&router, operation, fields).await;
+            let code = xml_element(&answer.body, "Code");
+            let message = xml_element(&answer.body, "Message");
+            assert_eq!(
+                (
+                    answer.status,
+                    answer.content_type.as_deref(),
+                    code.as_deref(),
+                    message.as_deref(),
+                    xml_element(&answer.body, "Type").as_deref(),
+                ),
+                (
+                    400,
+                    Some(XML_CONTENT_TYPE),
+                    Some(NON_EXISTENT_QUEUE_CODE),
+                    Some(QUERY_SURFACE_SENTENCE),
+                    Some(SENDER_FAULT),
+                ),
+                "case {operation} on {case} over the AWS Query surface: expected a 400 \
+                 {NON_EXISTENT_QUEUE_CODE} reading {QUERY_SURFACE_SENTENCE:?} as \
+                 {XML_CONTENT_TYPE}, got {} with {:?} and {}",
+                answer.status,
+                answer.content_type,
+                answer.body
+            );
+            assert_ne!(
+                message.as_deref(),
+                Some(AWS_SENTENCE),
+                "case {operation} on {case} over the AWS Query surface: that surface words \
+                 this class with its own sentence, got {message:?}"
+            );
+        }
+    }
+}
+
+/// Each surface's sentence is the string that surface serves, written out above: the JSON
+/// surface's is AWS's current one, and the query surface's is that one with its own trailing
+/// clause — so neither constant can be edited into the other's wording.
+#[test]
+fn each_surface_exports_the_sentence_it_serves() {
+    assert_eq!(
+        QUEUE_DOES_NOT_EXIST_MESSAGE, AWS_SENTENCE,
+        "case the JSON surface's exported sentence: expected {AWS_SENTENCE:?}, got {:?}",
+        QUEUE_DOES_NOT_EXIST_MESSAGE
+    );
+    assert_eq!(
+        QUEUE_DOES_NOT_EXIST_IN_THIS_VERSION, QUERY_SURFACE_SENTENCE,
+        "case the AWS Query surface's exported sentence: expected \
+         {QUERY_SURFACE_SENTENCE:?}, got {:?}",
+        QUEUE_DOES_NOT_EXIST_IN_THIS_VERSION
+    );
+    assert_ne!(
+        QUEUE_DOES_NOT_EXIST_MESSAGE, QUEUE_DOES_NOT_EXIST_IN_THIS_VERSION,
+        "case the two surfaces' sentences: expected them to stay distinct, got {:?} for both",
+        QUEUE_DOES_NOT_EXIST_MESSAGE
+    );
 }
 
 /// The two sentences this one error code carries are two values: an absent queue reads the

@@ -392,6 +392,93 @@ pub async fn ok_in(
 /// one the service itself made, so the two cannot name different statuses for it.
 pub const REQUEST_ENTITY_TOO_LARGE: u16 = 413;
 
+/// The media type a client of this endpoint's AWS Query surface carries its body in, which
+/// is the one thing that says a request arrived on that surface rather than on the JSON one.
+pub const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
+
+/// The media type that surface answers in.
+pub const XML_CONTENT_TYPE: &str = "text/xml";
+
+/// The API version an AWS Query client of this endpoint names in every request
+/// (`smithy_query(query="service_info",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`:
+/// version `2012-11-05`).
+pub const QUERY_API_VERSION: &str = "2012-11-05";
+
+/// One form field of an AWS Query request: the name, which is the suite's own literal read
+/// off the model, and the value it carries.
+pub type QueryField = (&'static str, String);
+
+/// One answer as a client reads it off the wire: the status, the media type and the bytes.
+///
+/// The seam for an answer that is not a JSON document — the XML one the AWS Query surface
+/// serves, and the empty body a transport refusal answers with, which parses to the same
+/// `Value` as a body holding `null`.
+#[derive(Debug)]
+pub struct WireAnswer {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: String,
+}
+
+/// One request to this endpoint, built header by header so a row can leave out the very
+/// header it is about.
+pub fn request_with(headers: &[(&str, &str)], body: Vec<u8>) -> http::Request<Bytes> {
+    let mut builder = http::Request::builder().method("POST").uri("/");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder
+        .body(Bytes::from(body))
+        .expect("a well-formed request")
+}
+
+/// Dispatch `request` and read its answer the way a client does.
+pub async fn dispatched(router: &MultiServiceRouter, request: http::Request<Bytes>) -> WireAnswer {
+    let response = router.dispatch(request).await;
+    WireAnswer {
+        status: response.status().as_u16(),
+        content_type: response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string),
+        body: String::from_utf8_lossy(response.body()).to_string(),
+    }
+}
+
+/// One AWS Query request: a form-encoded `POST /` naming `action` and this API's version,
+/// carrying `fields` percent-encoded, signed the way every other call here is.
+///
+/// The ONE builder of a request on that surface, so no suite re-derives the form.
+pub fn query_request(action: &str, fields: &[QueryField]) -> http::Request<Bytes> {
+    let mut body = format!("Action={action}&Version={QUERY_API_VERSION}");
+    for (name, value) in fields {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let authorization = authorization_in(REGION);
+    request_with(
+        &[
+            ("host", HOST),
+            ("content-type", FORM_CONTENT_TYPE),
+            ("authorization", authorization.as_str()),
+        ],
+        body.into_bytes(),
+    )
+}
+
+/// One AWS Query call.
+pub async fn query_call(
+    router: &MultiServiceRouter,
+    action: &str,
+    fields: &[QueryField],
+) -> WireAnswer {
+    dispatched(router, query_request(action, fields)).await
+}
+
 /// The error SHAPE a refusal names: the body's `__type` discriminator, verbatim.
 ///
 /// On `awsJson1_0` that is the shape id of the error that was thrown — a local shape name
