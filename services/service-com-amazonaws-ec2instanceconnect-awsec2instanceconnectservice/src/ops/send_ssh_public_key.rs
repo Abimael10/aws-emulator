@@ -234,15 +234,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The instance, as the service that OWNS instances reports it: what EC2 answered
         // about the id decides the push, and this service's own registry is read only when no
-        // EC2 could be asked at all. Resolved before the decision below, because the
-        // instance's tags are part of the request's condition context.
-        let found = match owner_says {
-            crate::state::ec2::InstanceLookup::Owned(instance) => Some(instance),
-            crate::state::ec2::InstanceLookup::Absent => None,
-            crate::state::ec2::InstanceLookup::Unanswered => {
-                store.lock().instance(&input.instance_id).cloned()
-            }
-        };
+        // EC2 could be asked at all. That rule is applied in one place for both pushes
+        // (`crate::state::ec2::InstanceLookup::resolve`). Resolved before the decision below,
+        // because the instance's tags are part of the request's condition context.
+        let found = owner_says.resolve(&input.instance_id, &store);
 
         // Whether the caller may push a key at that instance at all is IAM's decision, and it
         // is taken BEFORE anything about the instance is reported: a caller holding no grant is

@@ -233,16 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let owner_says = crate::state::ec2::instance(ctx, &region, &input.instance_id).await;
 
         // The instance, as the service that owns instances reports it: this service's own
-        // registry is read only when no EC2 could be asked at all. Resolved before the
-        // decision below, because the instance's tags are part of the request's condition
-        // context.
-        let found = match owner_says {
-            crate::state::ec2::InstanceLookup::Owned(instance) => Some(instance),
-            crate::state::ec2::InstanceLookup::Absent => None,
-            crate::state::ec2::InstanceLookup::Unanswered => {
-                store.lock().instance(&input.instance_id).cloned()
-            }
-        };
+        // registry is read only when no EC2 could be asked at all. Same rule, and the same
+        // helper, as `SendSSHPublicKey` (`crate::state::ec2::InstanceLookup::resolve`).
+        // Resolved before the decision below, because the instance's tags are part of the
+        // request's condition context.
+        let found = owner_says.resolve(&input.instance_id, &store);
 
         // Whether the caller may push a serial-console key at that instance at all is IAM's
         // decision, taken before anything about the account or the instance is reported, and

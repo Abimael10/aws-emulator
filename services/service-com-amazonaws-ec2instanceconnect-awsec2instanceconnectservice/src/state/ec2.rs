@@ -17,9 +17,14 @@
 //! EC2 cannot be asked AT ALL — an emulator with no EC2 mounted, where no service can
 //! answer for an instance — is nothing known
 //! ([`InstanceLookup::Unanswered`]), and the caller falls back to this service's own
-//! registry ([`super::seed_instances`]) rather than inventing an answer here.
+//! registry ([`super::seed_instances`]) rather than inventing an answer here. Applying that
+//! rule is [`InstanceLookup::resolve`], which is where both pushes resolve the instance a
+//! key is pushed at.
 
-use super::{Instance, InstanceState};
+use super::{
+    ComAmazonawsEc2instanceconnectAwsec2instanceconnectserviceState as ServiceStore, Instance,
+    InstanceState,
+};
 
 /// What EC2 said about one instance id.
 #[derive(Debug, Clone)]
@@ -30,6 +35,33 @@ pub enum InstanceLookup {
     Absent,
     /// EC2 could not be asked at all, so nothing is known about the id.
     Unanswered,
+}
+
+impl InstanceLookup {
+    /// The record a push is served against, or `None` for an id whose owner holds no
+    /// instance.
+    ///
+    /// This is the fallback rule, in one place for both pushes: EC2's answer decides — an
+    /// instance it reported IS the instance the push is served against, and an id it
+    /// answered "absent" for is not found whatever this service's own registry holds — and
+    /// the fallback registry ([`super::seed_instances`]) is read ONLY when EC2 could not be
+    /// asked at all. Both operations map the `None` to their own
+    /// `EC2InstanceNotFoundException`, so the rule lives here rather than once per handler,
+    /// the way the state-to-outcome rule lives on [`InstanceState::blocks_connect`].
+    ///
+    /// `fallback` is this service's store ([`super::service_state`]); it is locked only on
+    /// the branch that reads it, so the registry is never touched while EC2's answer stands.
+    pub fn resolve(
+        self,
+        instance_id: &str,
+        fallback: &::engine::ServiceState<ServiceStore>,
+    ) -> Option<Instance> {
+        match self {
+            Self::Owned(instance) => Some(instance),
+            Self::Absent => None,
+            Self::Unanswered => fallback.lock().instance(instance_id).cloned(),
+        }
+    }
 }
 
 /// The `InstanceTypeHypervisor` value EC2 reports for the instance types the serial console
