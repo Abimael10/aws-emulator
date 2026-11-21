@@ -7,6 +7,44 @@ Issue-Commit: 9d0149c39ab5c73582ec7b48950d23789498e457
 
 # acm__ec2__elbv2__iam__lambda__route53: a Route 53 alias record for an ALB never resolves to an address the load balancer's own DNS name resolves to
 
+## Resolution
+
+The invariant this report names — "the resolver/state that answers a query for an alias record must
+return the address set the aliased load balancer announces, and the ALIAS record must become
+resolvable once the change is applied" — HOLDS in the emulator, and is now pinned end to end by
+`core/router/tests/all/route53_alias_fronted_alb_https_listener.rs`, which drives exactly this
+report's trajectory over three alias names (a label under the zone's apex, two labels, the apex
+itself):
+
+* an `A` alias whose `AliasTarget.DNSName` is what `CreateLoadBalancer` published as the load
+  balancer's `DNSName`, written with the load balancer's own `CanonicalHostedZoneId`, is answered by
+  `TestDNSAnswer` with the ADDRESS that published name resolves to and with no port
+  (`services/service-com-amazonaws-route53-awsdnsv20130401/src/ops/test_dns_answer.rs`,
+  `src/state.rs::dns_name_address`) — so the alias name and the load balancer's own name share an
+  address;
+* the name is resolvable BECAUSE of the change: before the batch the same query answers `NXDOMAIN`
+  (`NOERROR` with no record data at the zone's apex, which carries the zone's `NS`/`SOA` sets), and
+  after it reaches `INSYNC` it answers that address;
+* and the address really is the load balancer's: a client that resolves the alias name to it and
+  addresses the load balancer by that name over TLS is served by the HTTPS listener on the issued
+  ACM certificate — the rule's `200` for a request carrying the gating header, the listener's
+  default `403` for one without.
+
+What REMAINS for this check, and no service crate can serve it: the check resolves BOTH names
+through the HOST resolver of the vantage point it runs from. Nothing the emulator publishes is
+resolvable there — a load balancer reports the `host:port` of the socket the core opened for it
+(`services/.../src/state/load_balancer_endpoint.rs`), and a hostname (the alias name, or a name in
+Elastic Load Balancing's own zone) would answer nowhere. Serving it needs the core listener API to
+accept a REQUESTED port and a UDP socket: `Listeners` offers `tcp`, `tcp_plaintext` and `http` only,
+each bound by `bind_std`/`bind_tokio` on an OS- or operator-chosen port
+(`vendor/server/src/listeners.rs`), so this emulator can neither stand up the authoritative name
+server a resolver would consult on 53 nor answer a bare host on 443. That gap is the subject of the
+open issues `20261117T145616Z-route53-7-net-new-causes-the-authoritative-dns.md` and
+`20261117T134237Z-acm-cloudfront-iam-lambda-route53-s3-a-route-53-public-hosted-zone-s-delegated`
+(the delegation set resolves nowhere and answers nothing), and it is the same core gap recorded for
+the API Gateway custom domain in
+`issues/things-that-now-work/20261114T121226Z-acm-apigateway-a-regional-custom-domain-s-data.md`.
+
 > _Note: this issue was identified against the code base at commit `9d0149c39ab5c73582ec7b48950d23789498e457`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
