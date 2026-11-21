@@ -231,6 +231,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "You must associate 1 or more compute node groups with the queue" (this
+        // operation's own documentation): a queue assigns jobs to the compute node groups
+        // its `computeNodeGroupConfigurations` name, so a create that would store none
+        // leaves a queue that assigns jobs to nothing. An entry carrying no
+        // `computeNodeGroupId` names no group, so it associates none either — what counts
+        // is how many configurations NAME a group, held to the lower bound stated once for
+        // every path that writes that list ([`crate::state::queue_association_violation`]),
+        // the way a compute node group's stored subnet list is held to its own.
+        let named_groups = input
+            .compute_node_group_configurations
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|configuration| configuration.compute_node_group_id.is_some())
+            .count();
+        if let Some(constraint) = crate::state::queue_association_violation(named_groups) {
+            return Err(CreateQueueErrorModeled::ValidationException(
+                crate::state::field_validation("computeNodeGroupConfigurations", constraint),
+            )
+            .into());
+        }
+
         // A resource holds at most `MAX_TAGS_PER_RESOURCE` tags on EVERY path that writes
         // them, so a create carrying more is refused the way a `TagResource` past the
         // ceiling is; `RequestTagMap`'s modelled maximum bounds one request, not the

@@ -119,8 +119,15 @@ fn cluster_scoped_calls(cluster: &str) -> Vec<(&'static str, Value)> {
         ),
         ("ListQueues", json!({"clusterIdentifier": cluster})),
         (
+            // A queue associates at least one compute node group, so the row names the
+            // `nodes` group its sibling row creates; what this call is refused about is
+            // the cluster it is scoped to, not the group.
             "CreateQueue",
-            json!({"clusterIdentifier": cluster, "queueName": "work"}),
+            json!({
+                "clusterIdentifier": cluster,
+                "queueName": "work",
+                "computeNodeGroupConfigurations": [{"computeNodeGroupId": "nodes"}],
+            }),
         ),
         (
             "DeleteQueue",
@@ -466,7 +473,7 @@ async fn a_cluster_scoped_delete_is_refused_by_what_its_cluster_identifier_resol
         &json!({
             "clusterIdentifier": "held-cluster",
             "queueName": "work",
-            "computeNodeGroupConfigurations": [],
+            "computeNodeGroupConfigurations": [{"computeNodeGroupId": "nodes"}],
         }),
     )
     .await;

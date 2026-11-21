@@ -368,8 +368,14 @@ async fn a_chained_workflow_sees_each_wait_settled_on_its_first_probe() {
         let mut queues: Vec<Value> = Vec::new();
         for index in 0..*queue_count {
             let name = format!("chained-work-{index}");
-            let (status, created) =
-                call(&router, "CreateQueue", &create_queue(&cluster_id, &name, &[])).await;
+            let (status, created) = call(
+                &router,
+                "CreateQueue",
+                // Every row creates at least one compute node group above, and a queue
+                // associates one.
+                &create_queue(&cluster_id, &name, &["chained-nodes-0"]),
+            )
+            .await;
             assert_eq!(
                 status, 200,
                 "case {case}: CreateQueue {name} got {status} with {created}"
@@ -478,8 +484,11 @@ async fn a_cluster_that_is_not_settled_refuses_what_needs_it_active() {
                 create_compute_node_group("gated-cluster", "gated-nodes"),
             ),
             (
+                // The queue associates the compute node group the row above would create:
+                // a stored queue assigns jobs to at least one group, and the cluster's
+                // status is what this row is refused about.
                 "CreateQueue",
-                create_queue("gated-cluster", "gated-queue", &[]),
+                create_queue("gated-cluster", "gated-queue", &["gated-nodes"]),
             ),
             ("UpdateCluster", update_cluster("gated-cluster", 700)),
             (
@@ -526,10 +535,23 @@ async fn a_cluster_that_is_not_settled_refuses_what_needs_it_active() {
             cluster.status = STATUS_CREATING.to_string();
             cluster.pending = Some(PendingChange::Activate);
         }
+        // ... starting with the compute node group the refused queue named, which is one of
+        // the calls the gate refused a moment ago.
+        let (status, group) = call(
+            &router,
+            "CreateComputeNodeGroup",
+            &create_compute_node_group("gated-cluster", "gated-nodes"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {held}: expected the same CreateComputeNodeGroup to be served once the \
+             cluster was owed ACTIVE again, got {status} with {group}"
+        );
         let (status, served) = call(
             &router,
             "CreateQueue",
-            &create_queue("gated-cluster", "gated-queue", &[]),
+            &create_queue("gated-cluster", "gated-queue", &["gated-nodes"]),
         )
         .await;
         assert_eq!(

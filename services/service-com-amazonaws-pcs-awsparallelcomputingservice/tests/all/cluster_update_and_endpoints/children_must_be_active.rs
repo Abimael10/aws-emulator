@@ -78,12 +78,20 @@ fn update_cluster(cluster: &str, seconds: i64) -> Value {
 /// `queues` queues inside it, and answer the cluster's id with the ids of the children in
 /// creation order. Every resource is settled `ACTIVE` by the time this returns, because the
 /// request that follows a create observes it settled.
+///
+/// A stored queue assigns jobs to at least one compute node group, so each queue associates
+/// the first group — a cluster holding a queue holds a group as well.
 async fn cluster_with_children(
     router: &MultiServiceRouter,
     name: &str,
     groups: usize,
     queues: usize,
 ) -> (String, Vec<String>, Vec<String>) {
+    assert!(
+        queues == 0 || groups > 0,
+        "setup {name}: a queue associates a compute node group, so {queues} queue(s) need \
+         at least one group, got {groups}"
+    );
     let mut request = create_cluster(name, "SMALL");
     request["slurmConfiguration"] = json!({"scaleDownIdleTimeInSeconds": SETTLED_SCALE_DOWN});
     let (status, created) = call(router, "CreateCluster", &request).await;
@@ -121,7 +129,7 @@ async fn cluster_with_children(
         let (status, created) = call(
             router,
             "CreateQueue",
-            &create_queue(&cluster_id, &queue_name(index), &[]),
+            &create_queue(&cluster_id, &queue_name(index), &[group_name(0).as_str()]),
         )
         .await;
         assert_eq!(
@@ -284,7 +292,7 @@ async fn an_update_is_served_while_every_child_of_the_cluster_is_active() {
     let rows: [(&str, usize, usize); 4] = [
         ("no child at all", 0, 0),
         ("one compute node group", 1, 0),
-        ("one queue", 0, 1),
+        ("one queue, with the group it assigns jobs to", 1, 1),
         ("two children of each kind", 2, 2),
     ];
     for (case, groups, queues) in rows {

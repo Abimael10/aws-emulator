@@ -21,6 +21,10 @@
 #[path = "cluster_lifecycle/settles_on_the_next_request.rs"]
 mod settles_on_the_next_request;
 
+// The associations a stored queue carries are their own suite, declared the same way.
+#[path = "cluster_lifecycle/queue_associations.rs"]
+mod queue_associations;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_pcs_awsparallelcomputingservice::state::{
@@ -470,13 +474,15 @@ async fn a_child_create_refuses_a_cluster_it_cannot_find() {
             "ResourceNotFoundException",
         ),
         (
+            // Each queue row associates a compute node group, as a stored queue must; the
+            // row is about the cluster its identifier fails to resolve to.
             "CreateQueue",
-            create_queue("no-such-cluster", "demo-queue", &[]),
+            create_queue("no-such-cluster", "demo-queue", &["demo-cng"]),
             "AccessDeniedException",
         ),
         (
             "CreateQueue",
-            create_queue("pcs_0000000000000000", "demo-queue", &[]),
+            create_queue("pcs_0000000000000000", "demo-queue", &["demo-cng"]),
             "ResourceNotFoundException",
         ),
         ("GetQueue", json!({
@@ -829,7 +835,7 @@ async fn an_idempotency_token_replays_the_first_create_instead_of_conflicting() 
         "case CreateComputeNodeGroup retry: expected the first call's group, got {group_retry}"
     );
 
-    let mut first_queue = create_queue(&cluster_id, "demo-queue", &[]);
+    let mut first_queue = create_queue(&cluster_id, "demo-queue", &["demo-cng"]);
     first_queue["clientToken"] = json!("queue-token-0001");
     let (status, queue) = call(&router, "CreateQueue", &first_queue).await;
     assert_eq!(status, 200, "case first CreateQueue: got {queue}");
@@ -906,15 +912,29 @@ async fn an_idempotency_token_cannot_be_replayed_into_another_cluster() {
         .unwrap_or_default()
         .to_string();
 
+    // A compute node group in each cluster, because every queue below associates one.
+    for cluster in [&first_cluster, &second_cluster] {
+        let (status, group) = call(
+            &router,
+            "CreateComputeNodeGroup",
+            &create_compute_node_group(cluster, "demo-cng"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case create demo-cng in {cluster}: got {status} {group}"
+        );
+    }
+
     let token = "shared-token-0001";
-    let mut request = create_queue(&first_cluster, "demo-queue", &[]);
+    let mut request = create_queue(&first_cluster, "demo-queue", &["demo-cng"]);
     request["clientToken"] = json!(token);
     let (status, created) = call(&router, "CreateQueue", &request).await;
     assert_eq!(status, 200, "case first CreateQueue: got {created}");
 
     // The token names the first call's queue, in the cluster that call created it in.
     // Replaying it against another cluster must not create a second queue.
-    let mut elsewhere = create_queue(&second_cluster, "demo-queue", &[]);
+    let mut elsewhere = create_queue(&second_cluster, "demo-queue", &["demo-cng"]);
     elsewhere["clientToken"] = json!(token);
     let (status, refused) = call(&router, "CreateQueue", &elsewhere).await;
     assert_eq!(
@@ -940,7 +960,7 @@ async fn an_idempotency_token_cannot_be_replayed_into_another_cluster() {
     let (status, body) = call(
         &router,
         "CreateQueue",
-        &create_queue(&first_cluster, "second-queue", &[]),
+        &create_queue(&first_cluster, "second-queue", &["demo-cng"]),
     )
     .await;
     assert_eq!(status, 200, "case create second-queue: got {body}");
@@ -1031,7 +1051,12 @@ async fn a_child_create_past_its_cluster_ceiling_is_refused_with_the_modelled_qu
 
     for index in 0..MAX_QUEUES_PER_CLUSTER {
         let name = format!("cap-queue-{index}");
-        let (status, body) = call(&router, "CreateQueue", &create_queue(&cluster, &name, &[])).await;
+        let (status, body) = call(
+            &router,
+            "CreateQueue",
+            &create_queue(&cluster, &name, &["cap-cng-0"]),
+        )
+        .await;
         assert_eq!(
             status, 200,
             "case queue {index} of {MAX_QUEUES_PER_CLUSTER}: expected 200, got {status} {body}"
@@ -1040,7 +1065,7 @@ async fn a_child_create_past_its_cluster_ceiling_is_refused_with_the_modelled_qu
     let (status, refused) = call(
         &router,
         "CreateQueue",
-        &create_queue(&cluster, "cap-queue-over", &[]),
+        &create_queue(&cluster, "cap-queue-over", &["cap-cng-0"]),
     )
     .await;
     assert_eq!(

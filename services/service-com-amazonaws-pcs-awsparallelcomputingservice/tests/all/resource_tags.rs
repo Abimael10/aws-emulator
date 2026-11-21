@@ -139,6 +139,8 @@ async fn tagged_resources(router: &MultiServiceRouter, tags: &Value) -> Tagged {
         &json!({
             "clusterIdentifier": &cluster_id,
             "queueName": "tag-queue",
+            // A queue associates at least one compute node group: the one created above.
+            "computeNodeGroupConfigurations": [{"computeNodeGroupId": "tag-cng"}],
             "tags": tags,
         }),
     )

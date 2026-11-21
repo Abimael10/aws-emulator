@@ -117,8 +117,14 @@ async fn a_child_create_refused_on_an_absent_cluster_id_persists_nothing() {
     // Both kinds of child a cluster holds, created against an identifier nothing resolves.
     for (operation, request) in [
         (
+            // The queue associates a compute node group, as a stored queue must: what this
+            // row is refused about is the cluster identifier.
             "CreateQueue",
-            json!({"clusterIdentifier": &absent, "queueName": "work"}),
+            json!({
+                "clusterIdentifier": &absent,
+                "queueName": "work",
+                "computeNodeGroupConfigurations": [{"computeNodeGroupId": "nodes"}],
+            }),
         ),
         (
             "CreateComputeNodeGroup",
