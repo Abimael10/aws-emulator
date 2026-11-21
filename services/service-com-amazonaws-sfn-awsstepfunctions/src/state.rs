@@ -3143,17 +3143,13 @@ pub const EXECUTION_DOES_NOT_EXIST: &str = "Execution Does Not Exist";
 /// `ExecutionAlreadyExists`'s, for [`resource_error_message`]. RECORDED text.
 pub const EXECUTION_ALREADY_EXISTS: &str = "Execution Already Exists";
 
-/// What the modelled `StateMachineAlreadyExists` says.
-///
-/// The sentence the SHAPE documents for this condition, and the WHOLE message: what the
-/// caller is told is the rule the create broke — a name is in use by a state machine
-/// this request does not describe — rather than the words of the shape name. It carries
-/// no value of the request, because the name the caller sent is the one it sent, so it
-/// is not the condition-and-value envelope ([`resource_error_message`]) a refusal about
-/// a resource the request named is otherwise stated in.
-pub const STATE_MACHINE_ALREADY_EXISTS: &str = "A state machine with the same name but a \
-                                                different definition or role ARN already \
-                                                exists.";
+/// `StateMachineAlreadyExists`'s condition, for [`resource_error_message`]. RECORDED
+/// text (`sfn-state-machine-create-idempotent-repeat#task#5` records
+/// `State Machine Already Exists: '<arn>'`): the service states this condition the way
+/// it states every other refusal about a resource the request named — the condition in
+/// spaced Title Case, then the ARN of the state machine already holding the name — and
+/// not as the prose its shape's documentation summarises the rule with.
+pub const STATE_MACHINE_ALREADY_EXISTS: &str = "State Machine Already Exists";
 
 /// What the modelled `ConflictException` says when a `CreateStateMachineAlias`
 /// names an alias that already exists under other parameters.

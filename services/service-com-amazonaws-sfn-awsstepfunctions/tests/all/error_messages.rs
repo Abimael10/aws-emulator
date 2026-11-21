@@ -411,55 +411,25 @@ async fn the_unsupported_type_message_is_a_constant() {
 }
 
 /// The refusals whose whole message is a FIXED sentence about the rule the request
-/// broke read that sentence whatever the request named: the conflict a repeat create
-/// under a name already in use earns — the sentence its error shape documents — and the
-/// update of an alias that names neither of the two members it may change.
+/// broke read that sentence whatever the request named: the update of an alias that
+/// names neither of the two members it may change.
 ///
-/// The sentences are spelled LITERALLY here, not read from the service's constants, so
+/// (The conflict a repeat create under a name already in use earns is NOT one of them:
+/// it reports the ARN already holding the name, through the rule-1 template, which
+/// `state_machine_name_conflict_message` asserts.)
+///
+/// The sentence is spelled LITERALLY here, not read from the service's constants, so
 /// a reworded constant fails as well as a varying one.
 ///
-/// The rows differ along WHICH request value is varied — the state machine's name, its
-/// definition, the alias — none of which may reach the message.
+/// The rows differ along which alias the update names, which may not reach the message.
 #[tokio::test]
 async fn a_fixed_sentence_carries_no_value_of_the_request() {
-    const ALREADY_EXISTS: &str =
-        "A state machine with the same name but a different definition or role ARN already exists.";
     const NEITHER_ALIAS_MEMBER: &str =
         "Either description or routing configuration must be specified";
 
     let emulator = Emulator::new();
 
-    // Two state machines differing in name and definition: a repeat create of each,
-    // under a different definition, reads the same sentence.
-    for (index, definition) in [HELLO_DEFINITION, OTHER_DEFINITION].into_iter().enumerate() {
-        let name = format!("fixed-sentence-{index}");
-        let created = create_machine(&emulator, &name, definition).await;
-        let case = format!("CreateStateMachine on the name {name} already in use");
-        let (status, code, message) = failure(
-            &emulator,
-            &case,
-            "CreateStateMachine",
-            &json!({
-                "name": &name,
-                "definition": format!(
-                    "{{\"StartAt\":\"X{index}\",\"States\":{{\"X{index}\":{{\"Type\":\"Succeed\"}}}}}}"
-                ),
-                "roleArn": ROLE_ARN,
-            }),
-        )
-        .await;
-        assert_eq!(
-            (status, code.as_str(), message.as_str()),
-            (400, "StateMachineAlreadyExists", ALREADY_EXISTS),
-            "case {case:?}: expected the conflict's own sentence, got {status} {code} {message:?}"
-        );
-        assert!(
-            !message.contains(&name) && !message.contains(created.as_str()),
-            "case {case:?}: expected no request value in the message, got {message:?}"
-        );
-    }
-
-    // And two aliases of one state machine: an update naming neither member reads the
+    // Two aliases of one state machine: an update naming neither member reads the
     // same sentence for each.
     let machine = create_machine(&emulator, "fixed-sentence-aliases", HELLO_DEFINITION).await;
     let version = string(
