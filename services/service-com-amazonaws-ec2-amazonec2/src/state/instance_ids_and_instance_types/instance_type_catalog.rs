@@ -28,11 +28,13 @@ use crate::ops::types::{
 };
 
 mod amd_epyc_rows;
+mod burstable_rows;
 mod burstable_xen_rows;
 mod dense_hdd_storage_rows;
 mod eighth_generation_intel_rows;
 mod general_purpose_nvme_rows;
 mod gpu_rows;
+mod intel_nvme_compute_rows;
 mod network_optimized_rows;
 mod previous_generation_rows;
 
@@ -916,10 +918,20 @@ const NESTED_VIRTUALIZATION: &[&str] = &["nested-virtualization"];
 /// bare metal size of an x86 family publishes.
 const LEGACY_BIOS_BOOT_MODE: &[&str] = &["legacy-bios"];
 
+/// The `BootModeType` value of a type offered the UEFI mode alone, which is what a bare metal
+/// size of the newest x86 generation publishes — and what its trusted platform module needs to
+/// be offered at all.
+const UEFI_BOOT_MODE: &[&str] = &["uefi"];
+
 /// The Elastic Fabric Adapters (`EfaInfo$MaximumEfaInterfaces`) the newest hardware
 /// generation's whole-host sizes are offered: its adapter carries many more of them than the
 /// single one an earlier generation's largest size publishes.
 const NEWEST_GENERATION_EFA_INTERFACES: i32 = 16;
+
+/// The sustained all-core frequency, in GHz, of the Intel Xeon 6 processor the eighth
+/// generation Intel families are built on — shared by the burstable and the compute families
+/// built on it, which is why it is here rather than in one of their tables.
+const XEON6_SUSTAINED_GHZ: f64 = 3.9;
 
 /// The published hardware facts of the instance types recorded so far, one row per type.
 ///
@@ -3902,7 +3914,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
     PublishedInstanceTypeFacts::of("r8ib.large")
         .ebs(1_563, 7_500, 25_000, 120_000)
         .dedicated_ebs_attachments(32)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .ena_srd(false)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
@@ -3911,7 +3923,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
     PublishedInstanceTypeFacts::of("r8ib.xlarge")
         .ebs(3_125, 15_000, 25_000, 120_000)
         .dedicated_ebs_attachments(32)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .ena_srd(false)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
@@ -3920,7 +3932,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
     PublishedInstanceTypeFacts::of("r8ib.2xlarge")
         .ebs(6_250, 30_000, 25_000, 120_000)
         .dedicated_ebs_attachments(32)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .ena_srd(false)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
@@ -3929,7 +3941,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
     PublishedInstanceTypeFacts::of("r8ib.4xlarge")
         .ebs(12_500, 60_000, 25_000, 120_000)
         .dedicated_ebs_attachments(32)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .ena_srd(false)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
@@ -3938,7 +3950,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
     PublishedInstanceTypeFacts::of("r8ib.8xlarge")
         .ebs(25_000, 120_000, 25_000, 120_000)
         .dedicated_ebs_attachments(32)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
         .traffic_mirroring(false)
@@ -3946,7 +3958,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
     PublishedInstanceTypeFacts::of("r8ib.12xlarge")
         .ebs(37_500, 180_000, 37_500, 180_000)
         .dedicated_ebs_attachments(32)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
         .traffic_mirroring(false)
@@ -3954,7 +3966,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
     PublishedInstanceTypeFacts::of("r8ib.16xlarge")
         .ebs(50_000, 240_000, 50_000, 240_000)
         .dedicated_ebs_attachments(32)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
         .traffic_mirroring(false)
@@ -3963,7 +3975,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .cores_in_steps_of(2)
         .ebs(75_000, 360_000, 75_000, 360_000)
         .dedicated_ebs_attachments(32)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
         .traffic_mirroring(false)
@@ -3972,7 +3984,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .cores_in_steps_of(2)
         .ebs(100_000, 480_000, 100_000, 480_000)
         .dedicated_ebs_attachments(32)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
         .traffic_mirroring(false)
@@ -3982,7 +3994,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ebs(150_000, 720_000, 150_000, 720_000)
         .dedicated_ebs_attachments(32)
         .efa(1)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
         .traffic_mirroring(false)
@@ -3992,7 +4004,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ebs(300_000, 1_200_000, 300_000, 1_200_000)
         .dedicated_ebs_attachments(32)
         .efa(1)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
         .traffic_mirroring(false)
@@ -4002,7 +4014,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ebs(150_000, 720_000, 150_000, 720_000)
         .dedicated_ebs_attachments(32)
         .efa(1)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
         .traffic_mirroring(false)
@@ -4012,7 +4024,7 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .ebs(300_000, 1_200_000, 300_000, 1_200_000)
         .dedicated_ebs_attachments(32)
         .efa(1)
-        .processor("Intel", 3.9)
+        .processor("Intel", XEON6_SUSTAINED_GHZ)
         .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
         .host_features(true, false)
         .traffic_mirroring(false)
@@ -4668,15 +4680,18 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 ///
 /// The rows of the families above, then the rows each child module holds for the families it
 /// groups — the AMD EPYC families, the accelerated ones, the network optimized ones, the
-/// previous generation ones, the burstable family on pre-Nitro hardware, the dense HDD storage
-/// ones, the eighth generation Intel ones and the general purpose families with local NVMe
-/// devices. A row is reached by its instance type alone, so which table it is written in is
-/// nothing but where the figures of one group of families are kept together.
+/// previous generation ones, the burstable families on Nitro and the one on pre-Nitro
+/// hardware, the dense HDD storage ones, the eighth generation Intel compute optimized ones,
+/// those of them that carry local NVMe devices, and the general purpose families with local
+/// NVMe devices. A row is reached by its instance type alone, so which table it is written in
+/// is nothing but where the figures of one group of families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
     PUBLISHED_INSTANCE_TYPE_FACTS
         .iter()
         .chain(amd_epyc_rows::AMD_EPYC_INSTANCE_TYPE_FACTS)
+        .chain(burstable_rows::BURSTABLE_INSTANCE_TYPE_FACTS)
         .chain(gpu_rows::GPU_INSTANCE_TYPE_FACTS)
+        .chain(intel_nvme_compute_rows::INTEL_NVME_COMPUTE_INSTANCE_TYPE_FACTS)
         .chain(network_optimized_rows::NETWORK_OPTIMIZED_INSTANCE_TYPE_FACTS)
         .chain(previous_generation_rows::PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS)
         .chain(burstable_xen_rows::BURSTABLE_XEN_INSTANCE_TYPE_FACTS)

@@ -441,6 +441,62 @@ pub async fn described_instance_type(
     body
 }
 
+/// The megabits in a megabyte, which is all that separates the `Mbps` figures of
+/// `EbsOptimizedInfo` from its `MB/s` ones.
+///
+/// Here rather than in one suite because more than one suite reads both units of the same
+/// published bandwidth, and the two readings only agree if they divide by the one figure.
+pub const MEGABITS_PER_MEGABYTE: f64 = 8.0;
+
+/// One member of a reported structure, or a panic naming the case when it is absent.
+///
+/// Beside [`element`], which answers `None` for an absent member: a suite that asserts what a
+/// published row serves needs the ABSENCE to fail the case rather than to read as an empty
+/// string, and needs the case named when it does.
+pub fn required(case: &str, xml: &str, name: &str) -> String {
+    element(xml, name).unwrap_or_else(|| panic!("case {case:?}: no <{name}> reported, got {xml}"))
+}
+
+/// The same member read as a number, so a figure a suite compares is never compared as text.
+pub fn number(case: &str, xml: &str, name: &str) -> f64 {
+    let text = required(case, xml, name);
+    text.parse()
+        .unwrap_or_else(|_| panic!("case {case:?}: <{name}> must be a number, got {text:?}"))
+}
+
+/// The six `EbsOptimizedInfo` readings of one instance type, against the four figures
+/// `(sustained Mbps, sustained IOPS, Mbps it reaches, IOPS it reaches)` AWS publishes for it.
+///
+/// The two throughput members are the bandwidth ones in the other unit — a megabyte being
+/// [`MEGABITS_PER_MEGABYTE`] megabits — which is exactly how the published table's Mbps and
+/// MB/s columns relate, so one claim covers all six readings and no suite can assert the two
+/// units inconsistently.
+pub fn assert_published_ebs(case: &str, body: &str, ebs: (f64, f64, f64, f64)) {
+    let ebs_info = required(case, body, "ebsInfo");
+    let performance = required(case, &ebs_info, "ebsOptimizedInfo");
+    let (baseline_mbps, baseline_iops, maximum_mbps, maximum_iops) = ebs;
+    for (member, expected) in [
+        ("baselineBandwidthInMbps", baseline_mbps),
+        ("baselineIops", baseline_iops),
+        ("maximumBandwidthInMbps", maximum_mbps),
+        ("maximumIops", maximum_iops),
+        (
+            "baselineThroughputInMBps",
+            baseline_mbps / MEGABITS_PER_MEGABYTE,
+        ),
+        (
+            "maximumThroughputInMBps",
+            maximum_mbps / MEGABITS_PER_MEGABYTE,
+        ),
+    ] {
+        let actual = number(case, &performance, member);
+        assert!(
+            (actual - expected).abs() < 0.001,
+            "case {case:?}: expected <{member}> {expected}, got {actual}"
+        );
+    }
+}
+
 /// The text of the member at `path` inside the one reported instance type of `body`, or
 /// `None` when the type reports no such member.
 ///

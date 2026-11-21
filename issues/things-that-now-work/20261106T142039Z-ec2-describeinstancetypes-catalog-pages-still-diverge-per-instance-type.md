@@ -663,3 +663,27 @@ The concrete numbers above are the recorded values for those instance types; the
 2. Inspect ec2-catalog-describe-instance-types-a1-c9g#task#31 and diff $.DescribeInstanceTypesResponse.instanceTypeSet.item[instanceType=...] against the recorded page: the ebsInfo.ebsOptimizedInfo numbers, maximumEbsAttachments, instanceStorageInfo sizes and the networkInfo/capability members.
 3. Inspect ec2-catalog-describe-instance-types-r9g-z1d#task#7 (t4g page) and #task#8 (t8i page) for the same per-type members, plus ebsInfo.attachmentLimitType and networkInfo.connectionTrackingConfiguration.defaultTcpEstablishedTimeout.
 4. Then re-replay the whole ec2-catalog-describe-instance-types-* family: 95 clusters in this replay carry the same root cause and must come clean together.
+
+## Resolution
+
+Partly resolved: the three families' rows are seeded and tested, and four C8id members named
+below are still answered by the derivation, so the two `ec2-catalog-describe-instance-types-*`
+fixtures still replay as failed on those members (and on the other families' pages, which have
+issues of their own).
+
+The three families now carry their own rows in the published instance-type catalog
+(`services/service-com-amazonaws-ec2-amazonec2/src/state/instance_ids_and_instance_types/instance_type_catalog/burstable_rows.rs`
+for T4g and T8i, `.../intel_nvme_compute_rows.rs` for C8id), so every member above is reported
+from the type's own row instead of the size-ladder derivation, and
+`services/service-com-amazonaws-ec2-amazonec2/tests/all/published_burstable_and_xeon6_nvme_catalog_rows.rs`
+holds the rule to a table spanning both burstable ladders and the whole C8id ladder.
+
+FOUR members of the C8id rows are still answered by the derivation rather than by a published
+figure, and are left for the family's remaining catalog work:
+`networkInfo.maximumNetworkInterfaces` on the `8xlarge` and wider sizes,
+`networkInfo.ipv4AddressesPerInterface` and `networkInfo.ipv6AddressesPerInterface` at every
+size, and `c8id.32xlarge`'s `ebsInfo.maximumEbsAttachments` (its row publishes the KIND of the
+limit without a count). The replay shows this family's published interface and address ladder
+is neither the generic one the derivation implements nor the one step below it, and no
+published source for its own figures was available, so those members keep the documented
+derivation rather than an invented figure.
