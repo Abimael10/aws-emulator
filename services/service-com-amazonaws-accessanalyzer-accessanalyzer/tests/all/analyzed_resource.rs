@@ -15,8 +15,9 @@
 //! the resource itself, with its external-access findings aggregated into one record whose
 //! access is public when any of them is, whose `actions` are every action they report and
 //! whose `sharedVia` is how they say the access is granted — carrying none of those finding
-//! members when the policy grants nothing outside the account, and no record at all for a
-//! resource the analyzer analyzed nothing for.
+//! members when the policy grants nothing outside the account, and refusing a resource the
+//! analyzer analyzed nothing for with the modelled `ResourceNotFoundException` rather than
+//! answering a success that leaves the record out.
 //!
 //! The table spans the classes that rule generalises over: both resource types whose policy
 //! this emulator holds (an IAM role's trust policy, an S3 bucket's bucket policy), the
@@ -57,10 +58,35 @@ const ROLE_TYPE: &str = "AWS::IAM::Role";
 /// The `ResourceType` of an Amazon S3 general purpose bucket, from the same enum.
 const BUCKET_TYPE: &str = "AWS::S3::Bucket";
 
+/// The wire code of the modelled 404 this operation refuses an unanalyzed resource with:
+/// the shape's own name, as `x-amzn-errortype` carries it.
+const NOT_FOUND_CODE: &str = "ResourceNotFoundException";
+
+/// The fixed `message` of that refusal, as the recorded service words it.
+const NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The `resourceType` that refusal reports: the kind of record the lookup addressed.
+const NOT_FOUND_RESOURCE_TYPE: &str = "analyzed-resource";
+
 /// The account every analyzer and every resource here belongs to: the emulator's own, which
 /// is the zone of trust an account external access analyzer monitors.
 fn own_account() -> String {
     engine::emulator_account_id().to_string()
+}
+
+/// The instant a timestamp member reports, as epoch seconds, ONLY when it is reported in the
+/// modelled `date-time` string form; `None` for an absent member and for one reported in any
+/// other JSON type — which is what makes an assertion on this an assertion about the form.
+fn date_time_secs(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::String(text) => ::aws_smithy_types::DateTime::from_str(
+            text,
+            ::aws_smithy_types::date_time::Format::DateTime,
+        )
+        .ok()
+        .map(|instant| instant.as_secs_f64()),
+        _ => None,
+    }
 }
 
 /// One response, reduced to what the assertions read.
@@ -68,12 +94,22 @@ fn own_account() -> String {
 struct Reply {
     status: u16,
     error_code: Option<String>,
+    /// The `x-amzn-errortype` header alone, which is where a restJson1 client reads the
+    /// name of the error shape — kept apart from [`Reply::error_code`] so an assertion can
+    /// pin the HEADER rather than a body discriminator.
+    error_type_header: Option<String>,
     body: Value,
 }
 
 impl Reply {
     fn code(&self) -> &str {
         self.error_code.as_deref().unwrap_or("")
+    }
+
+    /// The error shape named by the `x-amzn-errortype` header, or `""` when the response
+    /// carries none.
+    fn error_type_header(&self) -> &str {
+        self.error_type_header.as_deref().unwrap_or("")
     }
 
     /// A member of the response body, treating JSON `null` as absent the way an omitted
@@ -157,6 +193,7 @@ impl Emulator {
         } else {
             serde_json::from_slice(response.body()).unwrap_or(Value::Null)
         };
+        let error_type_header = error_code.clone();
         let error_code = error_code.or_else(|| {
             body.get("__type")
                 .and_then(Value::as_str)
@@ -165,6 +202,7 @@ impl Emulator {
         Reply {
             status,
             error_code,
+            error_type_header,
             body,
         }
     }
@@ -295,17 +333,24 @@ impl Emulator {
 
     /// Create a bucket and put `policy` on it, and answer the bucket's ARN.
     async fn create_bucket(&self, case: &str, name: &str, policy: &str) -> String {
-        let (status, body) = self.s3("PUT", &format!("/{name}"), b"").await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: CreateBucket must succeed, got {status} with {body}"
-        );
+        let arn = self.create_bucket_without_policy(case, name).await;
         let (status, body) = self
             .s3("PUT", &format!("/{name}?policy"), policy.as_bytes())
             .await;
         assert!(
             (200..300).contains(&status),
             "case {case:?}: PutBucketPolicy must succeed, got {status} with {body}"
+        );
+        arn
+    }
+
+    /// Create a bucket and put NO policy on it, and answer the bucket's ARN: a resource S3
+    /// holds and the analyzer has no resource-based policy to have analyzed.
+    async fn create_bucket_without_policy(&self, case: &str, name: &str) -> String {
+        let (status, body) = self.s3("PUT", &format!("/{name}"), b"").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateBucket must succeed, got {status} with {body}"
         );
         format!("arn:aws:s3:::{name}")
     }
@@ -681,17 +726,20 @@ async fn an_analyzed_resource_is_the_external_access_its_policy_grants() {
     }
 }
 
-/// RULE (its other half): a resource the analyzer analyzed NOTHING for is not reported at
-/// all, whether the account holds no resource-based policy for it or it belongs to another
-/// account.
+/// RULE (its other half): a read addressed to a resource this service holds no analysis of
+/// is REFUSED with the modelled `ResourceNotFoundException` — HTTP 404, the shape's name in
+/// `x-amzn-errortype`, this error class's fixed message, the ARN asked about in `resourceId`
+/// and the kind of record addressed in `resourceType` — rather than answered with a success
+/// envelope that leaves out the record it was asked for.
 ///
 /// Rows differ along WHY nothing was analyzed: a role of this account that was never
-/// created, a bucket that was never created, a resource of another account, and a resource
-/// type whose policy no service of this emulator holds. The account holds a reported
-/// resource throughout, so what is asserted is that the answer is about the resource asked
-/// for.
+/// created, a bucket that was never created, a resource of another account, a resource type
+/// whose policy no service of this emulator holds, and a bucket that exists but carries no
+/// bucket policy — so the rule is asserted over an absent resource AND over a present one
+/// the analyzer has nothing to report about. The account holds a reported resource
+/// throughout, so what is asserted is that the answer is about the resource asked for.
 #[tokio::test]
-async fn a_resource_the_analyzer_never_analyzed_is_not_reported() {
+async fn a_resource_the_analyzer_never_analyzed_is_refused_as_not_found() {
     let own = own_account();
     let emulator = Emulator::new();
     let analyzer = emulator.analyzer("nothing", "nothing-analyzer", "ACCOUNT").await;
@@ -702,9 +750,13 @@ async fn a_resource_the_analyzer_never_analyzed_is_not_reported() {
             &trust(json!({"AWS": EXTERNAL_ACCOUNT})),
         )
         .await;
+    // A bucket with no bucket policy at all: S3 holds the bucket, so the ARN names a
+    // resource that exists, and there is no resource-based policy for the analyzer to have
+    // analyzed.
+    let unpolicied = emulator.create_bucket_without_policy("nothing", "unpolicied").await;
 
-    // The analyzer does report the account's one analyzable resource, so a missing record
-    // below is about the resource asked for and not about an analyzer reporting nothing.
+    // The analyzer does report the account's one analyzable resource, so a refusal below is
+    // about the resource asked for and not about an analyzer reporting nothing.
     let reply = emulator.get_analyzed_resource(&analyzer, &reported).await;
     assert!(
         reply.resource().is_some(),
@@ -728,17 +780,100 @@ async fn a_resource_the_analyzer_never_analyzed_is_not_reported() {
             "a resource type no service of this emulator holds a policy for",
             format!("arn:aws:sqs:{REGION}:{own}:never-created"),
         ),
+        ("a bucket carrying no bucket policy", unpolicied),
     ] {
         let reply = emulator.get_analyzed_resource(&analyzer, &resource_arn).await;
         assert_eq!(
-            reply.status, 200,
-            "case {case:?}: GetAnalyzedResource must answer 200, got {reply:?}"
+            (reply.status, reply.code()),
+            (404, NOT_FOUND_CODE),
+            "case {case:?}: the analyzer analyzed no {resource_arn}, so the read is refused \
+             with 404 {NOT_FOUND_CODE}, got {reply:?}"
+        );
+        assert_eq!(
+            text(&reply.body, "message"),
+            NOT_FOUND_MESSAGE,
+            "case {case:?}: expected the fixed message {NOT_FOUND_MESSAGE:?}, got {reply:?}"
+        );
+        assert_eq!(
+            text(&reply.body, "resourceId"),
+            resource_arn,
+            "case {case:?}: expected the ARN asked about in resourceId, got {reply:?}"
+        );
+        assert_eq!(
+            text(&reply.body, "resourceType"),
+            NOT_FOUND_RESOURCE_TYPE,
+            "case {case:?}: expected resourceType {NOT_FOUND_RESOURCE_TYPE:?}, got {reply:?}"
+        );
+        assert_eq!(
+            reply.error_type_header(),
+            NOT_FOUND_CODE,
+            "case {case:?}: expected the shape's name in x-amzn-errortype, got {reply:?}"
         );
         assert!(
             reply.resource().is_none(),
-            "case {case:?}: the analyzer analyzed no {resource_arn}, so no record is \
-             reported, got {reply:?}"
+            "case {case:?}: a refusal reports no record, got {reply:?}"
         );
+    }
+}
+
+/// RULE: every instant a record reports is serialized in the `date-time` form the model
+/// declares for this service's `Timestamp` shape — a quoted RFC 3339 string — rather than in
+/// the `restJson1` default of epoch seconds.
+///
+/// Rows span the record kinds the operation reports: a role whose policy grants external
+/// access, a role that grants none, and a bucket whose policy grants some — and all three
+/// members `AnalyzedResource` declares an instant at (`createdAt`, `analyzedAt`,
+/// `updatedAt`, each `@required` with `@timestampFormat("date-time")`, from
+/// `smithy_query(query="shape",shape="AnalyzedResource")`).
+#[tokio::test]
+async fn every_instant_a_record_reports_is_an_rfc3339_date_time_string() {
+    let emulator = Emulator::new();
+    let analyzer = emulator.analyzer("instants", "instants-analyzer", "ACCOUNT").await;
+    let external = emulator
+        .create_role(
+            "instants",
+            "instants-external",
+            &trust(json!({"AWS": format!("arn:aws:iam::{EXTERNAL_ACCOUNT}:root")})),
+        )
+        .await;
+    let internal = emulator
+        .create_role(
+            "instants",
+            "instants-internal",
+            &trust(json!({"AWS": format!("arn:aws:iam::{}:root", own_account())})),
+        )
+        .await;
+    let bucket = emulator
+        .create_bucket(
+            "instants",
+            "instants-bucket",
+            &policy(
+                "Allow",
+                json!({"AWS": EXTERNAL_ACCOUNT}),
+                json!("s3:GetObject"),
+                Some("arn:aws:s3:::instants-bucket/*"),
+                None,
+            ),
+        )
+        .await;
+
+    for (case, resource_arn) in [
+        ("a role granting external access", external),
+        ("a role granting none", internal),
+        ("a bucket granting external access", bucket),
+    ] {
+        let reply = emulator.get_analyzed_resource(&analyzer, &resource_arn).await;
+        let record = reply.resource().unwrap_or_else(|| {
+            panic!("case {case:?}: expected a record for {resource_arn}, got {reply:?}")
+        });
+        for member in ["createdAt", "analyzedAt", "updatedAt"] {
+            let value = record.get(member);
+            assert!(
+                date_time_secs(value).is_some(),
+                "case {case:?}: expected {member} as a quoted RFC 3339 date-time string, got \
+                 {value:?}"
+            );
+        }
     }
 }
 

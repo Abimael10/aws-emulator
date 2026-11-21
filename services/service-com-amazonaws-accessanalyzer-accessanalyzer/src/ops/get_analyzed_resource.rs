@@ -27,9 +27,11 @@
 //!   read. A resource granting no external access carries none of those finding members,
 //!   `isPublic` false and the instants of the analysis that looked at it.
 //! * A `resourceArn` the analyzer analyzed NOTHING for — one whose resource-based policy
-//!   this emulator does not hold, or one that belongs to another account — carries no
-//!   `resource` member at all: `resource` is optional, and there is no analysis of such a
-//!   resource to report.
+//!   this emulator does not hold, or one that belongs to another account — is refused with
+//!   the modelled `ResourceNotFoundException` (404): there is no analysis of such a resource
+//!   to report, so the call cannot answer a success envelope that leaves out the record it
+//!   was asked for. The refusal carries the fixed text of that error class, the ARN asked
+//!   about in `resourceId` and the kind of record addressed in `resourceType`.
 //!
 //! ## What bounds the work
 //!
@@ -233,13 +235,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The analyzer analyzes a resource of its own account whose resource-based policy
         // this emulator holds, so an ARN naming no such resource was analyzed by nothing:
-        // `resource` is an optional member and the answer carries none, rather than a
-        // record claiming an analysis of a resource that was never looked at.
+        // there is no analysis of it to report, which is the modelled
+        // `ResourceNotFoundException` (the model documents the SHAPE as "The specified
+        // resource could not be found.") and never a success envelope leaving out the record
+        // it was asked for. The text the refusal CARRIES is this error class's own fixed
+        // wording, held with the constructor in `crate::state`; the ARN the caller named
+        // travels in `resourceId` and the kind of record the lookup addressed in
+        // `resourceType`, as every other resource-scoped refusal of this service does.
         let Some(resource) = resources
             .into_iter()
             .find(|monitored| monitored.arn == input.resource_arn)
         else {
-            return Ok(GetAnalyzedResourceOutput { resource: None });
+            return Err(GetAnalyzedResourceErrorModeled::ResourceNotFoundException(
+                crate::state::analyzed_resource_not_found(&input.resource_arn),
+            )
+            .into());
         };
 
         // Reading the policy, deriving the resource's findings and aggregating them

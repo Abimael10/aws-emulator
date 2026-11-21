@@ -106,6 +106,15 @@ pub const ACCESS_PREVIEW_RESOURCE_TYPE: &str = "access-preview";
 /// resource a `FindingId` identifies.
 pub const FINDING_RESOURCE_TYPE: &str = "finding";
 
+/// The `resourceType` a refusal about an ANALYZED RESOURCE reports: the kind of record
+/// `GET /analyzed-resource` addresses, named as every other refusal of this service names
+/// the kind of record it could not find. `ResourceNotFoundException$resourceType` targets
+/// the plain `String` shape rather than the model's `ResourceType` enum
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so what it reports is
+/// the kind of record the lookup addressed, while the ARN the caller asked about travels in
+/// `resourceId`.
+pub const ANALYZED_RESOURCE_RESOURCE_TYPE: &str = "analyzed-resource";
+
 /// The only `Type` an access preview can be created against: the account
 /// external-access analyzer. `CreateAccessPreview$analyzerArn` documents it — "You can
 /// only create an access preview for analyzers with an Account type and Active status"
@@ -296,6 +305,25 @@ pub fn finding_not_found(finding_id: &str) -> ResourceNotFoundException {
         message: FINDING_NOT_FOUND_MESSAGE.to_string(),
         resource_id: finding_id.to_string(),
         resource_type: FINDING_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The fixed `message` of a `ResourceNotFoundException` for a resource the analyzer named
+/// analyzed NOTHING for — one whose resource-based policy this emulator does not hold, one
+/// that belongs to another account and one of a kind no service of this emulator holds a
+/// policy for are the same refusal, so they carry the same text. This is the recorded
+/// service's own wording for the refusal, reproduced verbatim, and it names no resource:
+/// the ARN asked about travels in `resourceId`.
+pub const ANALYZED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
+/// The 404 for a resource the analyzer analyzed nothing about: fixed text, the `resourceArn`
+/// the caller named in the modelled `resourceId` and the kind of record the lookup addressed
+/// in `resourceType`.
+pub fn analyzed_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: ANALYZED_RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: resource_arn.to_string(),
+        resource_type: ANALYZED_RESOURCE_RESOURCE_TYPE.to_string(),
     }
 }
 
