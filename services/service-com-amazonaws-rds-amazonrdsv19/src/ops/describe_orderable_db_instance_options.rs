@@ -496,6 +496,19 @@ const X2IEDN_SIZES: &[&str] = &[
 /// `db.t3.medium` and `db.t4g.medium`, not on the smaller burstable sizes.
 const CLUSTER_BURSTABLE_SIZES: &[&str] = &["medium"];
 
+/// The sizes the graph engine's `r5` generations are published in: that line reaches
+/// `24xlarge`, one size past where [`STANDARD_SIZES`] stops.
+const GRAPH_MEMORY_SIZES: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+];
+
+/// The sizes the graph engine's `r6i` generation is published in: the largest of its
+/// memory-optimised lines, which reaches `32xlarge`.
+const GRAPH_LARGEST_MEMORY_SIZES: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+    "32xlarge",
+];
+
 /// The DB instance families a non-Aurora (provisioned-storage) DB instance can be ordered
 /// in.
 ///
@@ -543,6 +556,34 @@ const CLUSTER_FAMILIES: &[InstanceFamily] = &[
     family("r6i", STANDARD_SIZES, false, false),
     family("r6g", STANDARD_SIZES, false, true),
     family("r7g", STANDARD_SIZES, false, true),
+];
+
+/// The DB instance families a member of a GRAPH engine cluster can be ordered in.
+///
+/// Source: the "DB instance classes" section of the Amazon Neptune User Guide, which
+/// publishes that control plane's OWN class list rather than the Aurora one
+/// ([`CLUSTER_FAMILIES`]): beside the two burstable `medium` classes it offers the
+/// memory-optimised `r5` and `r5d` lines up to `24xlarge`, the `r6i` line up to
+/// `32xlarge`, the Graviton `r6g`, `r7g` and `x2g` lines, and the `x2iedn` line — so a
+/// class that engine publishes is reported as orderable instead of being absent from the
+/// report a client pre-flights a create against. `db.serverless`, the serverless capacity
+/// class, is not a family-and-size class and is added by [`instance_classes`].
+///
+/// Published per CONTROL PLANE because the class list is: an option of an engine another
+/// control plane owns is that control plane's own catalogue entry, and the two lists differ
+/// — the graph engine offers the `x2g` line and the 24- and 32-size memory classes the
+/// Aurora list does not, and this report is what a caller sizing a graph cluster member
+/// reads before it creates one.
+const GRAPH_FAMILIES: &[InstanceFamily] = &[
+    family("t3", CLUSTER_BURSTABLE_SIZES, true, false),
+    family("t4g", CLUSTER_BURSTABLE_SIZES, true, true),
+    family("r5", GRAPH_MEMORY_SIZES, false, false),
+    family("r5d", GRAPH_MEMORY_SIZES, false, false),
+    family("r6g", STANDARD_SIZES, false, true),
+    family("r6i", GRAPH_LARGEST_MEMORY_SIZES, false, false),
+    family("r7g", STANDARD_SIZES, false, true),
+    family("x2g", STANDARD_SIZES, false, true),
+    family("x2iedn", X2IEDN_SIZES, false, false),
 ];
 
 /// The serverless capacity class (Aurora Serverless v2, and the serverless capacity a
@@ -654,6 +695,8 @@ const FAMILY_MEMORY_GIB_PER_VCPU: &[(&str, u64)] = &[
     // The memory-optimised `x2iedn` line, whose ratio is its own
     // (`db.x2iedn.xlarge`, 4 vCPUs, 128 GiB).
     ("x2iedn", 32),
+    // The Graviton memory-optimised `x2g` line (`db.x2g.large`, 2 vCPUs, 32 GiB).
+    ("x2g", 16),
 ];
 
 /// The memory the DB instance class `db_instance_class` has, in BYTES, or `None` for a class
@@ -732,6 +775,10 @@ pub fn instance_classes(engine: &str) -> Vec<InstanceClass> {
 /// built from, which is the part of AWS's per-region, per-engine matrix this service
 /// publishes.
 fn instance_families(engine: &str) -> &'static [InstanceFamily] {
+    if engine.eq_ignore_ascii_case(crate::state::NEPTUNE_ENGINE) {
+        // The graph engine's control plane publishes its own class list ([`GRAPH_FAMILIES`]).
+        return GRAPH_FAMILIES;
+    }
     if is_cluster_engine(engine) {
         CLUSTER_FAMILIES
     } else {
@@ -751,6 +798,13 @@ fn instance_families(engine: &str) -> &'static [InstanceFamily] {
 /// family appears in no row of either table names a generation this service offers no
 /// option in — a previous-generation family no engine version it publishes can be created
 /// with — which is what the real service refuses a create of.
+///
+/// The generations of EVERY control plane this door serves are in scope, the graph engine's
+/// own ([`GRAPH_FAMILIES`]) included: the question this answers is whether the generation
+/// exists at all, not whether the engine a create names is offered in it — which engine is
+/// offered which family is exactly the part of AWS's matrix this service does not hold, so a
+/// create naming a published generation is admitted and the per-engine option report
+/// ([`instance_classes`]) remains the one answer to what that engine is orderable as.
 pub fn publishes_instance_family(db_instance_class: &str) -> bool {
     // The serverless capacity class has no family-and-size form at all; it is published as
     // an option of its own, so the class itself is the generation.
@@ -766,6 +820,7 @@ pub fn publishes_instance_family(db_instance_class: &str) -> bool {
     PROVISIONED_FAMILIES
         .iter()
         .chain(CLUSTER_FAMILIES)
+        .chain(GRAPH_FAMILIES)
         .any(|row| row.family.eq_ignore_ascii_case(family))
 }
 
@@ -1430,7 +1485,7 @@ fn to_wire(
         // * no class this door publishes has to have its processor features named at order
         //   time, so the requirement is reported false.
         supports_optimized_reads: Some(docdb.map_or_else(
-            || class_has_local_nvme_storage(&class.name),
+            || offers_optimized_reads(engine, &class.name),
             |capabilities| capabilities.optimized_reads,
         )),
         supports_optimized_writes: Some(docdb.map_or_else(
@@ -1459,6 +1514,19 @@ fn class_has_local_nvme_storage(name: &str) -> bool {
         // letters; only the last of the three is read here.
         .map(|family| family.trim_start_matches(|c: char| c.is_ascii_alphabetic()))
         .is_some_and(|attributes| attributes.contains('d'))
+}
+
+/// Whether an option of `engine` on `class` reports Optimized Reads.
+///
+/// The feature places a query's temporary objects on the instance's LOCAL NVMe SSD storage
+/// ([`class_has_local_nvme_storage`]), so it is offered on a class that HAS one, for an
+/// engine whose DB INSTANCE owns its storage. An engine whose CLUSTER manages the storage
+/// offers it on no class at all — a cluster member's temporary objects are not placed on the
+/// host it happens to run on — which is what the recorded options of the two cluster control
+/// planes this door serves report for every class they publish, the local-NVMe classes of
+/// the graph engine's own class list included.
+fn offers_optimized_reads(engine: &str, class_name: &str) -> bool {
+    !is_cluster_engine(engine) && class_has_local_nvme_storage(class_name)
 }
 
 /// Whether an option of `engine` on `class` reports Optimized Writes.

@@ -52,12 +52,15 @@ pub const DFE_QUERY_ENGINE_DEFAULT: &str = "viaQueryHint";
 pub const DEFAULT_DB_ENGINE_VERSION: &str = "1.4.8.0";
 
 /// The release suffix a /status `dbEngineVersion` carries past the four-part version the
-/// control plane reports: the control plane states the version a cluster was created with
-/// (`1.4.8.0`) and the engine states the RELEASE of it that is running (`1.4.8.0.R1`).
+/// control plane reports, for a version whose published release is its FIRST: the control
+/// plane states the version a cluster was created with (`1.4.8.0`) and the engine states the
+/// RELEASE of it that is running (`1.4.8.0.R1`).
 ///
-/// This emulator runs the first release of whatever version it is asked for, so every
-/// provisioned version reports that release; see [`status_engine_version`].
-pub const ENGINE_RELEASE_SUFFIX: &str = "R1";
+/// Which build a version's published release carries comes from the one shared table of this
+/// engine's published releases (`::service_common::neptune_engine_releases`), which the
+/// control plane's version description reads too, so the two planes cannot name different
+/// releases of one version; see [`status_engine_version`].
+pub const ENGINE_RELEASE_SUFFIX: &str = ::service_common::neptune_engine_releases::FIRST_BUILD;
 
 /// The SPARQL version `GetEngineStatusOutput$sparql` reports. One version across the engine
 /// lines: SPARQL 1.1 is the W3C recommendation Neptune implements.
@@ -336,22 +339,15 @@ impl EngineStatusRecord {
 }
 
 /// `engine_version` as /status states it: the control plane's four-part version with the
-/// engine's own release suffix ([`ENGINE_RELEASE_SUFFIX`]) after it.
+/// build of the release the engine publishes for that version after it
+/// (`::service_common::neptune_engine_releases::release`, whose answer for a version
+/// published with no later build is [`ENGINE_RELEASE_SUFFIX`]).
 ///
 /// A value that is not four numeric parts is reported as it stands: it already carries a
 /// release suffix, or it is not a version this engine can name a release of, and either way
 /// appending a second suffix would report a version that does not exist.
 pub fn status_engine_version(engine_version: &str) -> String {
-    let parts: Vec<&str> = engine_version.split('.').collect();
-    let four_numeric_parts = parts.len() == 4
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
-    if four_numeric_parts {
-        format!("{engine_version}.{ENGINE_RELEASE_SUFFIX}")
-    } else {
-        engine_version.to_string()
-    }
+    ::service_common::neptune_engine_releases::release(engine_version)
 }
 
 /// The Apache TinkerPop version the engine `engine_version` names carries.
@@ -428,8 +424,9 @@ mod tests {
     /// the release form, and the Gremlin version is the one that engine line carries.
     ///
     /// The rows span what the rule generalises over: the engine lines the catalog names, a
-    /// later line it has not caught up with, an earlier one, a version that already carries
-    /// a release suffix, and a value that is no version at all.
+    /// later line it has not caught up with, an earlier one whose published release is a
+    /// later BUILD of that version, a version that already carries a release suffix, and a
+    /// value that is no version at all.
     #[test]
     fn the_reported_versions_follow_the_provisioned_engine_version() {
         let rows: &[(&str, &str, &str, &str)] = &[
@@ -448,9 +445,9 @@ mod tests {
                 "tinkerpop-3.7.1",
             ),
             (
-                "a line before the catalog",
+                "a line before the catalog, whose published release is a later build",
                 "1.1.1.0",
-                "1.1.1.0.R1",
+                "1.1.1.0.R7",
                 "tinkerpop-3.6.2",
             ),
             (

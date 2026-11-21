@@ -3303,7 +3303,11 @@ fn reports_replication_log_capabilities(engine: &str) -> bool {
 ///
 /// Every other engine's version string names its own release (`8.0.39`,
 /// `19.0.0.0.ru-2024-10.rur-2024-10.r1`), so there the description is the product and
-/// that version — except Microsoft SQL Server, whose product is named by its RELEASE YEAR
+/// that version — with three exceptions, each a control plane that describes a version its
+/// own way: the DOCUMENT engine, whose every version is described by the product's own full
+/// name; the GRAPH engine, which numbers a version and ships builds of it, so its
+/// description names the RELEASE (`::service_common::neptune_engine_releases`); and
+/// Microsoft SQL Server, whose product is named by its RELEASE YEAR
 /// ([`sqlserver_product_year`]).
 fn version_description(facts: &EngineFacts, engine_version: &str) -> String {
     if facts.engine == ::service_common::docdb_engine_catalog::ENGINE {
@@ -3312,6 +3316,20 @@ fn version_description(facts: &EngineFacts, engine_version: &str) -> String {
         // own full name, which is the description the shared catalog of that engine holds
         // for both views of this front door.
         return ::service_common::docdb_engine_catalog::ENGINE_DESCRIPTION.to_string();
+    }
+    if facts.engine == crate::state::NEPTUNE_ENGINE {
+        // The GRAPH engine numbers a version (`1.4.8.0`) and ships RELEASES of it
+        // (`1.4.8.0.R1`, a later build for a version patched after it shipped), so its
+        // version description names the release rather than the version alone — the same
+        // release the engine's own status report names for a cluster running that version,
+        // read from the one shared table of published builds
+        // (`::service_common::neptune_engine_releases`) so the two planes cannot name
+        // different releases of one version.
+        return format!(
+            "{} {}",
+            facts.product,
+            ::service_common::neptune_engine_releases::release(engine_version)
+        );
     }
     if facts.engine == "aurora-postgresql" {
         return format!(

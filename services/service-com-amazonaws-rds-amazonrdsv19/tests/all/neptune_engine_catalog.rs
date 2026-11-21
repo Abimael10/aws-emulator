@@ -83,18 +83,47 @@ const FAMILIES: &[Family] = &[
 /// name, as distinct from the product name a version description is built from.
 const ENGINE_DESCRIPTION: &str = "Amazon Neptune";
 
-/// The product name this engine writes into `DBEngineVersionDescription`.
+/// The product name this engine writes into `DBEngineVersionDescription`, before the
+/// RELEASE of the version it describes (`Neptune 1.4.8.0.R1`): this engine ships releases
+/// of a version, and the description names the release the service runs
+/// (`::service_common::neptune_engine_releases`).
 const VERSION_DESCRIPTION_PRODUCT: &str = "Neptune";
+
+/// The description this engine publishes for `version`: its product and the RELEASE of that
+/// version, read from the one shared table of its published releases so this suite states
+/// the rule rather than a second copy of the builds.
+///
+/// The published BUILDS themselves are pinned as literals by the sibling suite
+/// ([`crate::graph_engine_published_classes`]), and by [`A_PUBLISHED_RELEASE`] below, so an
+/// entry described from this table cannot drift silently.
+fn version_description(version: &str) -> String {
+    format!(
+        "{VERSION_DESCRIPTION_PRODUCT} {}",
+        ::service_common::neptune_engine_releases::release(version)
+    )
+}
+
+/// One release of this engine as a LITERAL: the version, and the description the report
+/// publishes for it. It is the oldest published release, whose current build is a later one
+/// than the first, so this suite fails on a wrong published build rather than only on the two
+/// planes disagreeing.
+const A_PUBLISHED_RELEASE: (&str, &str) = ("1.1.1.0", "Neptune 1.1.1.0.R7");
 
 /// The one licence model this engine's orderable options are offered under: it is licensed
 /// by AWS itself rather than by a database vendor.
-const LICENSE_MODEL: &str = "amazon-license";
+///
+/// `pub(crate)` so the sibling suite that spans this engine's published CLASSES
+/// ([`crate::graph_engine_published_classes`]) reads the same constant rather than a second
+/// copy of it.
+pub(crate) const LICENSE_MODEL: &str = "amazon-license";
 
 /// The storage types a cluster member of this engine is offered with, in the order its own
 /// `CreateDBCluster$StorageType` publishes them ("Valid values: standard, iopt1"): the
 /// CLUSTER owns the storage, so the instance orders no size or IOPS of its own, but the type
 /// is part of what an order picks and each of them is its own option.
-const STORAGE_TYPES: [&str; 2] = ["standard", "iopt1"];
+///
+/// `pub(crate)` for the same reason as [`LICENSE_MODEL`].
+pub(crate) const STORAGE_TYPES: [&str; 2] = ["standard", "iopt1"];
 
 /// The network types an option of this engine is offered for: the values `NetworkType`
 /// publishes for a DB cluster of this front door, in the order an option reports them.
@@ -103,7 +132,10 @@ const NETWORK_TYPES: [&str; 2] = ["DUAL", "IPV4"];
 /// Read one engine-version entry's scalar members, with the `<ValidUpgradeTarget>`
 /// subtrees removed: a target carries its own `<Engine>` and `<EngineVersion>`, so the
 /// entry's own members can only be read off the entry with its targets stripped.
-fn scalars_of(entry: &str) -> String {
+///
+/// `pub(crate)` for the same reason as [`LICENSE_MODEL`]: one reader of an entry for both
+/// suites of this engine.
+pub(crate) fn scalars_of(entry: &str) -> String {
     let mut scalars = entry.to_string();
     for target in subtrees(entry, "ValidUpgradeTarget") {
         scalars = scalars.replace(&target, "");
@@ -114,6 +146,16 @@ fn scalars_of(entry: &str) -> String {
 #[tokio::test]
 async fn every_published_family_of_the_graph_engine_reports_its_own_release_line() {
     let router = emulator();
+
+    // The one release this suite pins as a LITERAL ([`A_PUBLISHED_RELEASE`]), so the
+    // description rule below is checked against a published build and not only against the
+    // table the handler reads.
+    let (pinned_version, pinned_description) = A_PUBLISHED_RELEASE;
+    assert_eq!(
+        version_description(pinned_version),
+        pinned_description,
+        "the report must publish {pinned_description} for {pinned_version}"
+    );
 
     for family in FAMILIES {
         let case = format!("{ENGINE} {}", family.major);
@@ -161,9 +203,9 @@ async fn every_published_family_of_the_graph_engine_reports_its_own_release_line
             );
             assert_eq!(
                 text(&scalars, "DBEngineVersionDescription"),
-                format!("{VERSION_DESCRIPTION_PRODUCT} {version}"),
+                version_description(&version),
                 "case {case:?}: expected the version description to name this engine's \
-                 product and the version, got {scalars}"
+                 product and the release of that version, got {scalars}"
             );
             assert_eq!(
                 text(&scalars, "SupportsGlobalDatabases"),
@@ -222,7 +264,7 @@ async fn every_published_family_of_the_graph_engine_reports_its_own_release_line
             );
             assert_eq!(
                 text(within, "Description"),
-                format!("{VERSION_DESCRIPTION_PRODUCT} {next}"),
+                version_description(next),
                 "case {case:?}: an upgrade target describes itself the way the entry for \
                  that version does, got {within}"
             );

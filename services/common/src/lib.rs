@@ -293,6 +293,10 @@ pub mod rds_event_source_types;
 /// published ids, and one mint for a pair none is cited for, for both front doors that
 /// report the member.
 pub mod rds_family_hosted_zones;
+/// The RELEASE the graph engine runs for a published engine version — the version plus its
+/// published build — for the control plane that describes a version and the data plane that
+/// reports the engine serving one.
+pub mod neptune_engine_releases;
 
 /// The directory of which resources of the other services reference an ACM certificate,
 /// written by the service that owns the referencing resource and read by ACM.
