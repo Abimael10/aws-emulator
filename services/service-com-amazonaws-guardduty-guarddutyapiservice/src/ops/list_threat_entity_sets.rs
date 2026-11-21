@@ -178,9 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entity set is owned by its detector, which is regional, so this endpoint names
         // only the entity sets the Region it serves holds.
         //
-        // The LIVE sets: a set a delete has accepted is no longer one of the detector's
-        // entity sets, so this stops naming it even though its record is retained for
-        // `GetThreatEntitySet` to report the status the delete moved it to.
+        // A set a delete has been served for is gone from the detector's holdings
+        // ([`crate::state::delete_entity_set`]), so this stops naming it the instant
+        // that delete answers.
         let ids: Vec<String> = detector.live_threat_entity_set_ids();
         // The list a page token is a position in: this report over this detector,
         // which is everything the ids above are selected by.

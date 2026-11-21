@@ -243,7 +243,7 @@ enum DeletedSubResources {
 impl DeletedSubResources {
     /// Whether a record resolves under this rule, given whether its delete has
     /// been accepted ([`IpSetRecord::is_deleting`],
-    /// [`ThreatIntelSetRecord::is_deleting`], [`EntitySetRecord::is_deleting`]).
+    /// [`ThreatIntelSetRecord::is_deleting`]).
     fn resolves(self, is_deleting: bool) -> bool {
         matches!(self, Self::Resolved) || !is_deleting
     }
@@ -279,9 +279,9 @@ macro_rules! tagged_resource_tags_of {
             return Some(& $($mutability)? detector.tags);
         };
         match sub_resource {
-            // A filter and a publishing destination carry no deleting status at
-            // all: their delete DROPS the record, so the id resolving at all is
-            // already the whole liveness check.
+            // A filter, a publishing destination and an entity set carry no
+            // deleting status at all: their delete DROPS the record, so the id
+            // resolving at all is already the whole liveness check.
             TaggedSubResource::Filter => detector
                 .filters
                 .$get(id)
@@ -296,18 +296,13 @@ macro_rules! tagged_resource_tags_of {
                 .$get(id)
                 .filter(|s| deleted.resolves(s.is_deleting()))
                 .map(|s| & $($mutability)? s.tags),
-            // An entity set past its deletion's retention window is one the service
-            // no longer holds ([`EntitySetRecord::is_reportable`]), so neither half
-            // of the tagging surface resolves it: its own read does not either.
             TaggedSubResource::TrustedEntitySet => detector
                 .trusted_entity_sets
                 .$get(id)
-                .filter(|s| deleted.resolves(s.is_deleting()) && s.is_reportable(now_millis()))
                 .map(|s| & $($mutability)? s.tags),
             TaggedSubResource::ThreatEntitySet => detector
                 .threat_entity_sets
                 .$get(id)
-                .filter(|s| deleted.resolves(s.is_deleting()) && s.is_reportable(now_millis()))
                 .map(|s| & $($mutability)? s.tags),
             TaggedSubResource::PublishingDestination => detector
                 .publishing_destinations

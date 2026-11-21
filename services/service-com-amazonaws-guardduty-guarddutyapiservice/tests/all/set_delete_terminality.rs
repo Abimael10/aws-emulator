@@ -12,13 +12,12 @@
 //! The rules under test, each asserted over a TABLE spanning the four families and
 //! the status the set was in when the delete arrived, rather than over one call:
 //!
-//! 1. A delete takes the set off the detector the instant the call is served, and the
-//!    set stays READABLE on its own id while the service still holds its record: the
-//!    read reports the deletion through the status enum
-//!    (`smithy_query(shape="IpSetStatus")` and its three siblings, each carrying
-//!    `DELETE_PENDING` and the terminal `DELETED`) — the uploaded lists settle on
-//!    `DELETED` at once, the entity sets report `DELETE_PENDING` until the clock owes
-//!    them `DELETED` — and keeps reporting what the create stored while it does.
+//! 1. A delete takes the set off the detector the instant the call is served. What it
+//!    leaves on the set's own id is the family's: an UPLOADED LIST keeps a readable
+//!    record and reports the terminal member of its status enum
+//!    (`smithy_query(shape="IpSetStatus")` and its threat-list sibling carry
+//!    `DELETED`) while still reporting what the create stored, whereas an ENTITY SET
+//!    is gone — its id is refused as absent from the instant the delete answers.
 //! 2. An id the detector does not hold is refused with its family's own absence
 //!    refusal, and the SAME one whatever put the id out of reach — a value no create
 //!    ever minted, or one a delete took out of the detector's holdings: the uploaded
@@ -42,9 +41,9 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::scaffolded::{
     RESOURCE_NOT_FOUND_EXCEPTION,
 };
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    ENTITY_SET_ACTIVE, ENTITY_SET_DELETED, ENTITY_SET_DELETE_PENDING, ENTITY_SET_INACTIVE,
-    IP_SET_ACTIVE, IP_SET_DELETED, IP_SET_INACTIVE, NO_SUCH_RESOURCE_MESSAGE,
-    THREAT_INTEL_SET_ACTIVE, THREAT_INTEL_SET_DELETED, THREAT_INTEL_SET_INACTIVE,
+    ENTITY_SET_ACTIVE, ENTITY_SET_INACTIVE, IP_SET_ACTIVE, IP_SET_DELETED, IP_SET_INACTIVE,
+    NO_SUCH_RESOURCE_MESSAGE, THREAT_INTEL_SET_ACTIVE, THREAT_INTEL_SET_DELETED,
+    THREAT_INTEL_SET_INACTIVE,
 };
 
 /// A well-formed set id (32 lowercase hex characters, the form this service mints)
@@ -156,19 +155,17 @@ struct Family {
     /// The member of this family's own status enum a set GuardDuty is not using
     /// settles on.
     inactive_status: &'static str,
-    /// The transitional `Status` the family's own read reports STRAIGHT after the
-    /// delete, or `None` when its delete settles on the terminal status at once.
-    delete_pending_status: Option<&'static str>,
-    /// The terminal `Status` the family's own read reports once the deletion has
-    /// settled — the terminal member of its status enum.
-    deleted_status: &'static str,
+    /// The `Status` the family's own read reports once a delete has been served, or
+    /// `None` for a family whose delete DROPS the record, which leaves nothing to
+    /// report and refuses the id as absent instead.
+    deleted_status: Option<&'static str>,
     /// Whether an id this family holds no record for is refused with the entity-set
     /// families' 404 rather than the uploaded lists' 400.
     not_found_absence: bool,
 }
 
 /// Every detector-scoped set family, with the two whose delete RETAINS a readable
-/// record and the two whose delete does not.
+/// record and the two whose delete releases the id.
 fn families() -> Vec<Family> {
     vec![
         Family {
@@ -179,8 +176,7 @@ fn families() -> Vec<Family> {
             format: "TXT",
             active_status: IP_SET_ACTIVE,
             inactive_status: IP_SET_INACTIVE,
-            delete_pending_status: None,
-            deleted_status: IP_SET_DELETED,
+            deleted_status: Some(IP_SET_DELETED),
             not_found_absence: false,
         },
         Family {
@@ -191,8 +187,7 @@ fn families() -> Vec<Family> {
             format: "STIX",
             active_status: THREAT_INTEL_SET_ACTIVE,
             inactive_status: THREAT_INTEL_SET_INACTIVE,
-            delete_pending_status: None,
-            deleted_status: THREAT_INTEL_SET_DELETED,
+            deleted_status: Some(THREAT_INTEL_SET_DELETED),
             not_found_absence: false,
         },
         Family {
@@ -204,8 +199,7 @@ fn families() -> Vec<Family> {
             format: "ALIEN_VAULT",
             active_status: ENTITY_SET_ACTIVE,
             inactive_status: ENTITY_SET_INACTIVE,
-            delete_pending_status: Some(ENTITY_SET_DELETE_PENDING),
-            deleted_status: ENTITY_SET_DELETED,
+            deleted_status: None,
             not_found_absence: true,
         },
         Family {
@@ -216,8 +210,7 @@ fn families() -> Vec<Family> {
             format: "PROOF_POINT",
             active_status: ENTITY_SET_ACTIVE,
             inactive_status: ENTITY_SET_INACTIVE,
-            delete_pending_status: Some(ENTITY_SET_DELETE_PENDING),
-            deleted_status: ENTITY_SET_DELETED,
+            deleted_status: None,
             not_found_absence: true,
         },
     ]
@@ -240,22 +233,11 @@ impl Family {
         }
     }
 
-    /// Every status this family's read may report for a set whose delete has been
-    /// accepted: the terminal one, and the transitional one while the clock still
-    /// owes it.
-    fn statuses_after_a_delete(&self) -> Vec<&'static str> {
-        self.delete_pending_status
-            .into_iter()
-            .chain([self.deleted_status])
-            .collect()
-    }
-
     /// Read `set_id` until its reported `Status` is `want`, or until
     /// [`SETTLE_DEADLINE`] has passed — the CONDITION ends the wait, never a fixed
-    /// pause. Answers the body of the read that saw it, or `None` once the service has
-    /// stopped holding the record, which is how a deletion ends: that read is the
-    /// family's absence refusal, so a wait for a deletion status cannot outlive the
-    /// record it is waiting on.
+    /// pause. Answers the body of the read that saw it, or `None` once the service
+    /// has stopped holding the record: that read is the family's absence refusal, so
+    /// a wait cannot outlive the record it is waiting on.
     async fn read_until_status(
         &self,
         router: &Router,
@@ -438,30 +420,36 @@ async fn a_delete_completes_and_the_deleted_id_is_refused_afterwards() {
             );
             let after_first_delete = detector_updated_at(&router, &detector_id, &case).await;
 
-            // Rule 1: the deleted set is still READABLE on its own id, and the status
-            // it reports is how the deletion is reported — the terminal one on the
-            // families whose delete settles at once, and the transitional one while
-            // the clock still owes it on the families that have a pending span.
+            // Rule 1: what the delete left on the id is the family's. A family that
+            // RETAINS the record answers with the terminal member of its status
+            // enum, still reporting what the create stored; a family whose delete
+            // releases the id refuses it as absent from the very next read, with no
+            // window and no waiting.
             let (status, body) = family.get(&router, &detector_id, &set_id).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: a deleted set stays readable while its record is held, got \
-                 {status} {body:?}"
-            );
-            let reported = body["status"].as_str().unwrap_or_default().to_string();
-            let expected = family.statuses_after_a_delete();
-            assert!(
-                expected.contains(&reported.as_str()),
-                "case {case:?}: expected one of {expected:?} straight after the delete, got \
-                 {reported:?} {body:?}"
-            );
-            // The read reports what the create stored: the delete moved the status
-            // and nothing else.
-            assert_eq!(
-                body["name"].as_str().unwrap_or_default(),
-                "deleted_set-1",
-                "case {case:?}: a deleted record must still report the stored name, got {body:?}"
-            );
+            match family.deleted_status {
+                Some(terminal) => {
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?}: a deleted set stays readable while its record is held, \
+                         got {status} {body:?}"
+                    );
+                    assert_eq!(
+                        body["status"].as_str().unwrap_or_default(),
+                        terminal,
+                        "case {case:?}: expected {terminal} straight after the delete, got \
+                         {body:?}"
+                    );
+                    // The read reports what the create stored: the delete moved the
+                    // status and nothing else.
+                    assert_eq!(
+                        body["name"].as_str().unwrap_or_default(),
+                        "deleted_set-1",
+                        "case {case:?}: a deleted record must still report the stored name, got \
+                         {body:?}"
+                    );
+                }
+                None => family.assert_absent(&case, status, &body, &set_id),
+            }
 
             // Rule 3: a second delete is the family's absence refusal, and moves
             // neither the record nor the detector.
@@ -474,33 +462,27 @@ async fn a_delete_completes_and_the_deleted_id_is_refused_afterwards() {
                  expected {after_first_delete:?}, got {after_second_delete:?}"
             );
 
-            // Rule 1 again: the deletion runs to the terminal member of the status
-            // enum, and stays there — a second read of a settled record agrees with
-            // the first, so nothing walks a deleted set back. A family that releases
-            // the record once its deletion is done answers the absence refusal
-            // instead, which `read_until_status` has already asserted.
-            let terminal = family.deleted_status;
-            let Some(settled) = family
-                .read_until_status(&router, &detector_id, &set_id, terminal, &case)
-                .await
-            else {
-                continue;
-            };
-            assert_eq!(
-                settled["name"].as_str().unwrap_or_default(),
-                "deleted_set-1",
-                "case {case:?}: a settled deletion still reports the stored name, got {settled:?}"
-            );
+            // Rule 1 again: a family that retains the record keeps reporting the
+            // terminal member of its status enum and what the create stored, and a
+            // family that releases the id keeps refusing it — so a second read
+            // agrees with the first either way and nothing walks a deleted set back.
             let (status, body) = family.get(&router, &detector_id, &set_id).await;
-            if status != 200 {
-                family.assert_absent(&case, status, &body, &set_id);
-                continue;
+            match family.deleted_status {
+                Some(terminal) => {
+                    assert_eq!(
+                        body["status"].as_str().unwrap_or_default(),
+                        terminal,
+                        "case {case:?}: {terminal} is terminal, got {status} {body:?}"
+                    );
+                    assert_eq!(
+                        body["name"].as_str().unwrap_or_default(),
+                        "deleted_set-1",
+                        "case {case:?}: a settled deletion still reports the stored name, got \
+                         {body:?}"
+                    );
+                }
+                None => family.assert_absent(&case, status, &body, &set_id),
             }
-            assert_eq!(
-                body["status"].as_str().unwrap_or_default(),
-                terminal,
-                "case {case:?}: {terminal} is terminal, got {status} {body:?}"
-            );
 
             // Rule 4: the collection stops naming it.
             let listed = family.list(&router, &detector_id).await;

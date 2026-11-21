@@ -915,64 +915,60 @@ impl Detector {
     /// The trusted entity set a create already minted for `token`, if any — the
     /// seam that makes `CreateTrustedEntitySet` idempotent under a replayed
     /// `ClientToken`.
-    /// A set whose delete has already been accepted
-    /// ([`EntitySetRecord::is_deleting`]) resolves to nothing, so a replayed create
-    /// never answers with a set the service is no longer keeping — the same rule
-    /// [`Self::ip_set_for_token`] follows for a deleted IPSet.
+    ///
+    /// A set whose delete has been served is gone from this map
+    /// ([`delete_entity_set`]), so it resolves to nothing here and a replayed
+    /// create mints a new set rather than answering with one the service is no
+    /// longer keeping — the same outcome [`Self::ip_set_for_token`] reaches for a
+    /// deleted IPSet, whose retained record it filters out instead.
     pub fn trusted_entity_set_for_token(&self, token: &str) -> Option<&EntitySetRecord> {
         self.trusted_entity_sets
             .values()
-            .find(|set| set.client_token.as_deref() == Some(token) && !set.is_deleting())
+            .find(|set| set.client_token.as_deref() == Some(token))
     }
 
     /// The LIVE trusted entity set this detector holds, if any.
     ///
-    /// LIVE excludes a set whose delete has been accepted: "at any given time, you
-    /// can have only one trusted entity set"
+    /// Every set this map holds is live: "at any given time, you can have only one
+    /// trusted entity set"
     /// (`smithy_query(query="doc",shape="CreateTrustedEntitySet")`) bounds the sets
-    /// GuardDuty is keeping, and a deleted one is only still REPORTED, so
-    /// `DeleteTrustedEntitySet` frees the detector's single slot. Its record is
-    /// retained ([`DELETED_ENTITY_SETS_RETAINED`]) so `GetTrustedEntitySet` can
-    /// report the status the delete moved it to.
+    /// GuardDuty is keeping, and a delete DROPS the record it served
+    /// ([`delete_entity_set`]), so `DeleteTrustedEntitySet` frees the detector's
+    /// single slot the instant it answers.
     pub fn live_trusted_entity_set(&self) -> Option<&EntitySetRecord> {
-        self.trusted_entity_sets
-            .values()
-            .find(|set| !set.is_deleting())
+        self.trusted_entity_sets.values().next()
     }
 
-    /// The ids of the LIVE trusted entity sets this detector holds, in
+    /// The ids of the trusted entity sets this detector holds, in
     /// `TrustedEntitySetId` order (the id is the key they are stored under, so the
     /// order is TOTAL — what makes a page token mean the same thing on the call
     /// that handed it back).
     ///
-    /// LIVE excludes a set whose delete has already been accepted
-    /// ([`EntitySetRecord::is_deleting`]): such a record is no longer one of the
-    /// detector's entity sets, so `ListTrustedEntitySets` stops naming it, even
-    /// though it is retained ([`DELETED_ENTITY_SETS_RETAINED`]) so
-    /// `GetTrustedEntitySet` can report the status the delete moved it to — the
-    /// same rule [`Self::live_threat_entity_set_ids`] follows for a threat set and
-    /// [`Self::live_ip_set_ids`] for a deleted IPSet.
+    /// A deleted set is named by nothing: its record is gone from the map
+    /// ([`delete_entity_set`]), so `ListTrustedEntitySets` stops naming it the
+    /// instant its delete is served — the same rule
+    /// [`Self::live_threat_entity_set_ids`] follows for a threat set, reached for a
+    /// deleted IPSet by [`Self::live_ip_set_ids`] filtering its retained record out.
     ///
     /// It reports a LIST and not the single [`Self::live_trusted_entity_set`]
     /// because the one-at-a-time rule bounds what a create may add, not what the
-    /// listing is: the answer is every live record the map holds.
+    /// listing is: the answer is every record the map holds.
     pub fn live_trusted_entity_set_ids(&self) -> Vec<String> {
         self.trusted_entity_sets
             .values()
-            .filter(|set| !set.is_deleting())
             .map(|set| set.id.clone())
             .collect()
     }
 
-    /// Accept the deletion of the trusted entity set `id` names.
+    /// Serve the deletion of the trusted entity set `id` names, reporting whether
+    /// this detector held such a set at all.
     ///
-    /// `None` when this detector holds no such set at all; `Some(true)` when this
-    /// call is the one that accepted the deletion, and `Some(false)` when a delete
-    /// had already been accepted for it — the caller needs that distinction because
-    /// only the first delete changes the set of LIVE sub-resources the detector
-    /// holds, and so only the first moves the detector's own `UpdatedAt`.
-    pub fn delete_trusted_entity_set(&mut self, id: &str, now: i64) -> Option<bool> {
-        delete_entity_set(&mut self.trusted_entity_sets, id, now)
+    /// `false` when it did not, which is the absence its delete refuses; `true`
+    /// when the record was dropped, which is also when the detector's own
+    /// `UpdatedAt` moves, because that is the call that changed the sub-resources
+    /// it holds.
+    pub fn delete_trusted_entity_set(&mut self, id: &str) -> bool {
+        delete_entity_set(&mut self.trusted_entity_sets, id)
     }
 
     /// The threat entity set a create already minted for `token`, if any — the
@@ -983,60 +979,50 @@ impl Detector {
     /// create that carried it made, so one token replayed across the two
     /// entity-set creates never hands back the other one's id.
     ///
-    /// A set whose delete has already been accepted
-    /// ([`EntitySetRecord::is_deleting`]) resolves to nothing, so a replayed
-    /// create never answers with a set the service is no longer keeping — the
-    /// same rule [`Self::trusted_entity_set_for_token`] follows for a deleted
-    /// trusted set and [`Self::ip_set_for_token`] for a deleted IPSet.
+    /// A set whose delete has been served is gone from this map
+    /// ([`delete_entity_set`]), so it resolves to nothing here — the same rule
+    /// [`Self::trusted_entity_set_for_token`] follows for a deleted trusted set.
     pub fn threat_entity_set_for_token(&self, token: &str) -> Option<&EntitySetRecord> {
         self.threat_entity_sets
             .values()
-            .find(|set| set.client_token.as_deref() == Some(token) && !set.is_deleting())
+            .find(|set| set.client_token.as_deref() == Some(token))
     }
 
-    /// The ids of the LIVE threat entity sets this detector holds, in
+    /// The ids of the threat entity sets this detector holds, in
     /// `ThreatEntitySetId` order (the id is the key they are stored under, so the
     /// order is TOTAL — what makes a page token mean the same thing on the call
     /// that handed it back).
     ///
-    /// LIVE excludes a set whose delete has already been accepted
-    /// ([`EntitySetRecord::is_deleting`]): such a record is no longer one of the
-    /// detector's entity sets, so `ListThreatEntitySets` stops naming it, even
-    /// though it is retained ([`DELETED_ENTITY_SETS_RETAINED`]) so
-    /// `GetThreatEntitySet` can report the status the delete moved it to — the
-    /// same rule [`Self::live_ip_set_ids`] follows for a deleted IPSet.
+    /// A deleted set is named by nothing: its record is gone from the map
+    /// ([`delete_entity_set`]), so `ListThreatEntitySets` stops naming it the
+    /// instant its delete is served.
     pub fn live_threat_entity_set_ids(&self) -> Vec<String> {
         self.threat_entity_sets
             .values()
-            .filter(|set| !set.is_deleting())
             .map(|set| set.id.clone())
             .collect()
     }
 
-    /// How many of this detector's threat entity sets are LIVE — held and not
-    /// being deleted.
+    /// How many threat entity sets this detector holds.
     ///
-    /// This is the count [`THREAT_ENTITY_SETS_PER_DETECTOR`] bounds: a set whose
-    /// delete has been accepted is only still REPORTED, never used, so it
-    /// occupies none of the detector's slots — the same rule
-    /// [`Self::live_ip_set_count`] applies to a deleted IPSet and
-    /// [`Self::live_trusted_entity_set`] to a deleted trusted set.
+    /// This is the count [`THREAT_ENTITY_SETS_PER_DETECTOR`] bounds, and it is
+    /// simply the map's size: a delete drops the record it served
+    /// ([`delete_entity_set`]), so a deleted set occupies none of the detector's
+    /// slots — the outcome [`Self::live_ip_set_count`] reaches for a deleted IPSet
+    /// by filtering its retained record out.
     pub fn live_threat_entity_set_count(&self) -> usize {
-        self.threat_entity_sets
-            .values()
-            .filter(|set| !set.is_deleting())
-            .count()
+        self.threat_entity_sets.len()
     }
 
-    /// Accept the deletion of the threat entity set `id` names.
+    /// Serve the deletion of the threat entity set `id` names, reporting whether
+    /// this detector held such a set at all.
     ///
-    /// `None` when this detector holds no such set at all; `Some(true)` when this
-    /// call is the one that accepted the deletion, and `Some(false)` when a delete
-    /// had already been accepted for it — the caller needs that distinction because
-    /// only the first delete changes the set of LIVE sub-resources the detector
-    /// holds, and so only the first moves the detector's own `UpdatedAt`.
-    pub fn delete_threat_entity_set(&mut self, id: &str, now: i64) -> Option<bool> {
-        delete_entity_set(&mut self.threat_entity_sets, id, now)
+    /// `false` when it did not, which is the absence its delete refuses; `true`
+    /// when the record was dropped, which is also when the detector's own
+    /// `UpdatedAt` moves, because that is the call that changed the sub-resources
+    /// it holds.
+    pub fn delete_threat_entity_set(&mut self, id: &str) -> bool {
+        delete_entity_set(&mut self.threat_entity_sets, id)
     }
 
     /// The IPSet a create already minted for `token`, if any — the seam that makes

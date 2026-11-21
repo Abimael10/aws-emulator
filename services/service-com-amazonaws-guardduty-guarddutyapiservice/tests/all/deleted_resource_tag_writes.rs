@@ -19,9 +19,10 @@
 //!    member and echoes nothing of the caller's. That holds whether the record was
 //!    dropped by the delete or RETAINED in a deletion status, and
 //!    whether or not any span this service opens has elapsed.
-//! 2. Reporting is unaffected: a retained record's own `Get` still reports it in the
-//!    status the deletion moved it to, the tag report still answers wherever the store
-//!    retains the record, and a refused write leaves that map exactly as it was.
+//! 2. Reporting follows the record: a class whose delete RETAINS it still reports it
+//!    in the terminal status of its own status enum and still reports its tags, a
+//!    class whose delete DROPS it reports neither, and a refused write moves no tag
+//!    map either way.
 //! 3. The refusal is scoped to the deleted record: every resource still live accepts
 //!    both writes and reports the result.
 
@@ -32,8 +33,7 @@ use crate::resource_tag_addition::tag_in;
 use crate::resource_tag_removal::{tag_map, tagged_resources, tags_of, untag_in, uri_label, Tagged};
 use service_com_amazonaws_guardduty_guarddutyapiservice::service::refusals::INVALID_RESOURCE_ARN_MESSAGE;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    ENTITY_SET_DELETED, ENTITY_SET_DELETE_PENDING, IP_SET_DELETED, TAGGED_SUB_RESOURCE_SEGMENTS,
-    THREAT_INTEL_SET_DELETED,
+    IP_SET_DELETED, TAGGED_SUB_RESOURCE_SEGMENTS, THREAT_INTEL_SET_DELETED,
 };
 
 /// The Region every request in this suite is signed for.
@@ -64,36 +64,14 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// What one class's own read answers once its delete has been served.
 enum OwnRead {
-    /// The record is RETAINED and still reported: `settled` is the terminal `Status`
-    /// it ends on, and `pending` the transitional one it reports first on a family
-    /// whose deletion has a span the caller can observe. A family with a pending span
-    /// also stops holding the record once the deletion is done, so there its own read
-    /// ends in the absence refusal.
-    Reported {
-        pending: Option<&'static str>,
-        settled: &'static str,
-    },
+    /// The record is RETAINED and still reported: the terminal `Status` of its own
+    /// status enum, which is what its read answers from the delete onwards.
+    Reported(&'static str),
     /// The record is no longer one the detector holds, so its own read refuses with
-    /// this HTTP status: the 400 of this service's classified rejection for a record
-    /// its delete drops.
+    /// this HTTP status: the 400 of this service's classified rejection for the
+    /// detector, a filter and a publishing destination, and the entity sets' own 404
+    /// absence refusal.
     Refused(u16),
-}
-
-impl OwnRead {
-    /// The statuses this class's own read may report in `phase`: only the terminal one
-    /// once the deletion has settled, either of them straight after the delete.
-    fn statuses(&self, settled_phase: bool) -> Vec<&'static str> {
-        match self {
-            Self::Reported { pending, settled } => {
-                let mut want = vec![*settled];
-                if !settled_phase {
-                    want.extend(pending.iter().copied());
-                }
-                want
-            }
-            Self::Refused(_) => Vec::new(),
-        }
-    }
 }
 
 /// One class of resource a tagging ARN can name, and what its delete leaves behind.
@@ -107,13 +85,13 @@ struct Class {
     own_read: OwnRead,
     /// Whether the tag REPORT still resolves it. The tagging seam reports the tags of
     /// a record the store retains, which is every class whose delete does not DROP
-    /// the record — so it is reported for the uploaded lists and for the entity sets,
-    /// whose own reads report the deleted record too.
+    /// the record — so it is reported for the uploaded lists, whose own reads report
+    /// the deleted record too, and for nothing else.
     tags_still_reported: bool,
 }
 
-/// Every class a tagging ARN names. A filter, a publishing destination and the
-/// detector itself leave nothing behind: their delete drops the record.
+/// Every class a tagging ARN names. A filter, a publishing destination, an entity
+/// set and the detector itself leave nothing behind: their delete drops the record.
 const CLASSES: [Class; 7] = [
     Class {
         case: "the detector itself",
@@ -130,38 +108,28 @@ const CLASSES: [Class; 7] = [
     Class {
         case: "an IPSet",
         segment: "ipset",
-        own_read: OwnRead::Reported {
-            pending: None,
-            settled: IP_SET_DELETED,
-        },
+        own_read: OwnRead::Reported(IP_SET_DELETED),
         tags_still_reported: true,
     },
     Class {
         case: "a ThreatIntelSet",
         segment: "threatintelset",
-        own_read: OwnRead::Reported {
-            pending: None,
-            settled: THREAT_INTEL_SET_DELETED,
-        },
+        own_read: OwnRead::Reported(THREAT_INTEL_SET_DELETED),
         tags_still_reported: true,
     },
     Class {
         case: "a trusted entity set",
         segment: "trustedentityset",
-        own_read: OwnRead::Reported {
-            pending: Some(ENTITY_SET_DELETE_PENDING),
-            settled: ENTITY_SET_DELETED,
-        },
-        tags_still_reported: true,
+        // An entity set's delete drops the record, so its own read answers the
+        // entity-set families' 404 absence refusal.
+        own_read: OwnRead::Refused(404),
+        tags_still_reported: false,
     },
     Class {
         case: "a threat entity set",
         segment: "threatentityset",
-        own_read: OwnRead::Reported {
-            pending: Some(ENTITY_SET_DELETE_PENDING),
-            settled: ENTITY_SET_DELETED,
-        },
-        tags_still_reported: true,
+        own_read: OwnRead::Refused(404),
+        tags_still_reported: false,
     },
     Class {
         case: "a publishing destination",
@@ -288,7 +256,7 @@ async fn refuses_every_write_on_a_deleted_sub_resource(settled: bool) {
         // than for a span: every class whose record is reported publishes the
         // terminal status it ends on.
         for class in &sub_resources {
-            if let OwnRead::Reported { settled, .. } = &class.own_read {
+            if let OwnRead::Reported(settled) = &class.own_read {
                 read_until_status(&router, resource_of(&resources, class), settled, class.case)
                     .await;
             }
@@ -311,27 +279,24 @@ async fn refuses_every_write_on_a_deleted_sub_resource(settled: bool) {
         assert_refused(&format!("untagging {case}"), &arn, status, &body);
 
         // Its own read: the families whose delete RETAINS a readable record report
-        // the status the deletion moved it to, and the families whose delete drops
-        // the record refuse the id with their own absence refusal. A family that
-        // releases the record once its deletion is done answers that refusal too, so
-        // a reported record is held to the statuses it may report and a released one
-        // only to not being reported as live.
+        // the terminal status of their own status enum, and the classes whose delete
+        // DROPS the record refuse the id — the detector, a filter and a publishing
+        // destination with this service's classified rejection, an entity set with
+        // the entity-set families' absence refusal.
         let (status, body) = read(&router, resource).await;
-        let held = status == 200;
         match &class.own_read {
-            OwnRead::Reported { .. } if status == 200 => {
+            OwnRead::Reported(terminal) => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: a record this family retains must stay reported, got {status} \
+                     {body:?}"
+                );
                 let actual_status = body["status"].as_str().unwrap_or_default();
-                let want = class.own_read.statuses(settled);
-                assert!(
-                    want.contains(&actual_status),
-                    "case {case:?}: expected one of the statuses {want:?}, got {actual_status:?}"
+                assert_eq!(
+                    actual_status, *terminal,
+                    "case {case:?}: expected the terminal {terminal:?}, got {actual_status:?}"
                 );
             }
-            OwnRead::Reported { pending, .. } => assert!(
-                pending.is_some(),
-                "case {case:?}: a record this family retains must stay reported, got {status} \
-                 {body:?}"
-            ),
             OwnRead::Refused(expected_status) => assert_eq!(
                 status, *expected_status,
                 "case {case:?}: a record its delete took off the detector must refuse its own \
@@ -344,7 +309,7 @@ async fn refuses_every_write_on_a_deleted_sub_resource(settled: bool) {
         // holding reports no tags either, for the same reason its own read does not
         // report it.
         let (status, body) = list_tags(&router, &arn).await;
-        if class.tags_still_reported && held {
+        if class.tags_still_reported {
             assert_eq!(
                 status, 200,
                 "case {case:?}: a retained record's tags are still reported, got {status} {body:?}"
@@ -354,19 +319,17 @@ async fn refuses_every_write_on_a_deleted_sub_resource(settled: bool) {
                 listed, untouched,
                 "case {case:?}: expected the reported tags {untouched:?}, got {listed:?}"
             );
-        } else {
-            assert_eq!(
-                status, 400,
-                "case {case:?}: a record the service no longer holds has no tags to report, got \
-                 {status} {body:?}"
-            );
-        }
-        if held && matches!(class.own_read, OwnRead::Reported { .. }) {
             let actual = tags_of(&router, REGION, resource, &case).await;
             assert_eq!(
                 actual, untouched,
                 "case {case:?}: a refused write must leave the tags as they were, expected \
                  {untouched:?}, got {actual:?}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a record the service no longer holds has no tags to report, got \
+                 {status} {body:?}"
             );
         }
     }

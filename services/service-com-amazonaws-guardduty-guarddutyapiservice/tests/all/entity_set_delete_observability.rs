@@ -1,74 +1,59 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a client that DELETES an entity set and then polls its read observes, on both
+//! What a client that DELETES an entity set and then reads it back observes, on both
 //! entity-set families, end to end over the wire.
 //!
 //! `threat_entity_set_delete.rs` and `trusted_entity_set_delete.rs` own one family's
-//! delete each and `entity_set_delete_retention.rs` what churn leaves behind; this
-//! suite owns the one rule both reads follow once a delete has been served.
+//! delete each; this suite owns the one rule both reads follow once a delete has been
+//! served, and what repeated create-and-delete CHURN leaves behind.
 //!
 //! Every request goes through [`smithy_server_runtime::MultiServiceRouter::dispatch`]
 //! (the harness lives in the `detector_lifecycle` suite), so routing, restJson1
 //! (de)serialization, modelled-constraint validation and the handlers are exercised
 //! together.
 //!
-//! The rule under test, asserted over a TABLE spanning both families and everything
+//! The rules under test, asserted over a TABLE spanning both families and everything
 //! the rule generalises over — the status the set was in when the delete arrived
 //! (including the transitional one), the `*EntitySetFormat` the create stored, whether
 //! the caller activated the set, whether it carried an `ExpectedBucketOwner`, the
 //! number of tags, the size of the name and the number of sets deleted under one
 //! detector:
 //!
-//! 1. A served delete starts an ASYNCHRONOUS deletion, so the id it names stays
-//!    addressable while the service still holds its record: the family's own read
-//!    answers HTTP 200 and reports the deletion through its status enum
-//!    (`smithy_query(shape="ThreatEntitySetStatus")` and its trusted sibling carry
-//!    `DELETE_PENDING` and the terminal `DELETED`), never the absence refusal an id
-//!    the detector holds no record for gets.
-//! 2. The deletion runs to `DELETED` and stays there while the service holds the
-//!    record, and every other member the read reports is still the one the create
-//!    stored — so a client can poll a delete to completion.
-//! 3. Once the deletion has run out its retention
-//!    (`state::ENTITY_SET_DELETED_RETENTION_MILLIS`) the service no longer holds the
-//!    set, so the id is refused the way one no create ever minted is: a client that
-//!    polls a delete to the end reaches that refusal instead of polling for ever, and
-//!    can tell "the deletion is running" from "already gone".
-//! 4. Leaving the detector's collection is not the same as leaving the reader: the
-//!    listing stops naming a deleted set while its own id keeps answering.
-//! 5. The 200 is a LOOKUP: an id of the same form that no create minted is refused
-//!    with the entity-set families' absence refusal under the same detector, at the
-//!    same time as the deleted one answers.
+//! 1. A served delete leaves NOTHING on the id it named: the set is gone, so the
+//!    family's own read refuses that id exactly as it refuses one no create ever
+//!    minted — HTTP 404 under the `ResourceNotFoundException` class with the
+//!    entity-set families' fixed sentence — from the very next read on, and on every
+//!    read after that. A client that deletes and then confirms the deletion by
+//!    reading the id reaches its not-found branch at once, with no dependence on how
+//!    long it waits.
+//! 2. The refusal is a LOOKUP over the store, not a blanket answer: a live sibling of
+//!    the same family under the same detector still reads back 200 while the deleted
+//!    id is refused, and the listing names exactly the live sets.
+//!
+//! `entity_set_delete_retention.rs` owns what repeated create-and-delete CHURN leaves
+//! behind, and `entity_set_delete_absence.rs` the other ways an entity-set id fails to
+//! resolve.
 
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{call, enabled_detector, new_router, Router};
 use crate::set_delete_terminality::{assert_entity_set_absent, ABSENT_SET_ID};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    ENTITY_SET_ACTIVE, ENTITY_SET_DELETED, ENTITY_SET_DELETED_RETENTION_MILLIS,
-    ENTITY_SET_DELETE_PENDING, ENTITY_SET_INACTIVE,
+    ENTITY_SET_ACTIVE, ENTITY_SET_INACTIVE,
 };
 
-/// How long a poll may wait for the clock to owe a deletion its terminal status
-/// before the test gives up. Generous on purpose: the wait ends on the CONDITION, and
-/// this is only the deadline past which the emulator is considered broken.
+/// How long a poll may wait for a status the clock owes a LIVE set before the test
+/// gives up. Generous on purpose: the wait ends on the CONDITION, and this is only the
+/// deadline past which the emulator is considered broken.
 const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The gap between two reads of a poll. Only the pause between attempts; no loop
 /// below ever ends on it.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// The statuses a read may report for an entity set whose delete has been served:
-/// the transitional one, and the terminal one the clock settles it to.
-const DELETION_STATUSES: [&str; 2] = [ENTITY_SET_DELETE_PENDING, ENTITY_SET_DELETED];
-
-/// How long the poll for the end of a deletion may run before the test gives up: the
-/// published retention window plus half a minute of slack. Generous on purpose — the
-/// loop ends when the id is refused, and this is only the deadline past which the
-/// emulator is considered broken.
-fn removal_deadline() -> std::time::Duration {
-    let window = u64::try_from(ENTITY_SET_DELETED_RETENTION_MILLIS).unwrap_or_default();
-    std::time::Duration::from_millis(window) + std::time::Duration::from_secs(30)
-}
+/// How many times a read of a deleted id is repeated to show the refusal is not a
+/// phase the caller can wait out: every one of them answers the same way.
+const REPEATED_READS: usize = 3;
 
 /// One entity-set family: the collection segment under `/detector/{DetectorId}`, the
 /// member its create reports the minted id in and the member its listing names ids
@@ -239,10 +224,8 @@ impl Family {
     }
 
     /// Read `set_id` until it reports `want`, or until [`SETTLE_DEADLINE`] has passed
-    /// — the CONDITION ends the wait, never a fixed pause. Answers the read that saw
-    /// it, or `None` once the service has stopped holding the record, which is how a
-    /// deletion ends: that read is the family's absence refusal, so a wait for a
-    /// deletion status cannot outlive the record it waits on.
+    /// — the CONDITION ends the wait, never a fixed pause. Only a LIVE set is waited
+    /// on here, so a read that does not answer 200 is a failure of the wait.
     async fn read_until_status(
         &self,
         router: &Router,
@@ -250,16 +233,17 @@ impl Family {
         set_id: &str,
         want: &str,
         case: &str,
-    ) -> Option<Value> {
+    ) -> Value {
         let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
         loop {
             let (status, body) = self.get(router, detector_id, set_id).await;
-            if status != 200 {
-                assert_entity_set_absent(case, status, &body, set_id);
-                return None;
-            }
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a set nothing deleted must stay readable until it settles, got \
+                 {status} {body:?}"
+            );
             if body["status"].as_str() == Some(want) {
-                return Some(body);
+                return body;
             }
             assert!(
                 std::time::Instant::now() < deadline,
@@ -268,55 +252,30 @@ impl Family {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
-}
 
-/// Assert one read of a set whose delete has been served: while the service holds the
-/// record it answers and the status it reports is one of the two the deletion moves
-/// through; once it has stopped holding it the id is refused as absent. What it never
-/// reports is a live status.
-fn assert_reports_a_deletion(case: &str, status: u16, body: &Value, id: &str) {
-    if status != 200 {
-        assert_entity_set_absent(case, status, body, id);
-        return;
+    /// Assert every one of a handful of consecutive reads of `set_id` is the
+    /// entity-set families' absence refusal, so the refusal is not a phase and the
+    /// answer does not depend on when the caller looks.
+    async fn assert_stays_absent(
+        &self,
+        router: &Router,
+        detector_id: &str,
+        set_id: &str,
+        case: &str,
+    ) {
+        for attempt in 0..REPEATED_READS {
+            let (status, body) = self.get(router, detector_id, set_id).await;
+            assert_entity_set_absent(&format!("{case}: read {attempt}"), status, &body, set_id);
+        }
     }
-    let reported = body["status"].as_str().unwrap_or_default();
-    assert!(
-        DELETION_STATUSES.contains(&reported),
-        "case {case:?}: expected one of {DELETION_STATUSES:?}, got {reported:?} {body:?}"
-    );
-}
-
-/// Assert the read reports the members the create stored, so the answer comes from the
-/// record and not from the delete.
-fn assert_reports_the_stored_set(case: &str, created: &Value, read: &Value) {
-    for member in ["name", "format", "location", "tags", "expectedBucketOwner"] {
-        assert_eq!(
-            read[member], created[member],
-            "case {case:?}: the deletion must leave {member} as the create stored it, expected \
-             {:?}, got {:?}",
-            created[member], read[member]
-        );
-    }
-    assert_eq!(
-        read["createdAt"], created["createdAt"],
-        "case {case:?}: the deletion must not move createdAt, expected {:?}, got {:?}",
-        created["createdAt"], read["createdAt"]
-    );
-    let created_at = created["createdAt"].as_f64().unwrap_or_default();
-    let updated_at = read["updatedAt"].as_f64().unwrap_or_default();
-    assert!(
-        updated_at >= created_at,
-        "case {case:?}: the deletion is a change, so updatedAt must not precede createdAt, got \
-         {updated_at} before {created_at}"
-    );
 }
 
 // ---------------------------------------------------------------------------
-// Rules 1, 2 and 5: the deleted id keeps answering, and the deletion completes.
+// Rule 1: the deleted id answers the absence refusal, on every read.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_deleted_entity_set_reports_its_deletion_until_it_completes() {
+async fn a_deleted_entity_set_is_refused_as_absent_from_the_next_read_on() {
     for family in &FAMILIES {
         for row in rows() {
             let case = format!("{}: {}", family.case, row.case);
@@ -337,13 +296,9 @@ async fn a_deleted_entity_set_reports_its_deletion_until_it_completes() {
                 } else {
                     ENTITY_SET_INACTIVE
                 };
-                let settled_create = family
+                family
                     .read_until_status(&router, &detector_id, &set_id, want, case)
                     .await;
-                assert!(
-                    settled_create.is_some(),
-                    "case {case:?}: a set nothing deleted must stay readable until it settles"
-                );
             }
             let (status, created) = family.get(&router, &detector_id, &set_id).await;
             assert_eq!(
@@ -353,38 +308,19 @@ async fn a_deleted_entity_set_reports_its_deletion_until_it_completes() {
 
             family.delete(&router, &detector_id, &set_id, case).await;
 
-            // Rule 1: the very next read answers, reporting the deletion.
-            let (status, straight_after) = family.get(&router, &detector_id, &set_id).await;
-            assert_eq!(
-                status, 200,
-                "case {case:?}: the read straight after the delete still answers, got {status} \
-                 {straight_after:?}"
-            );
-            assert_reports_a_deletion(case, status, &straight_after, &set_id);
-            assert_reports_the_stored_set(case, &created, &straight_after);
+            // Rule 1: the very next read is the absence refusal, and so is every
+            // read after it.
+            family
+                .assert_stays_absent(&router, &detector_id, &set_id, case)
+                .await;
 
-            // Rule 2: polling it reaches the terminal status, which does not move
-            // again while the record is held, and the record is still the one the
-            // create stored.
-            if let Some(settled) = family
-                .read_until_status(&router, &detector_id, &set_id, ENTITY_SET_DELETED, case)
-                .await
-            {
-                assert_reports_the_stored_set(case, &created, &settled);
-                let (status, again) = family.get(&router, &detector_id, &set_id).await;
-                assert_reports_a_deletion(case, status, &again, &set_id);
-                if status == 200 {
-                    assert_eq!(
-                        again["status"].as_str().unwrap_or_default(),
-                        ENTITY_SET_DELETED,
-                        "case {case:?}: {ENTITY_SET_DELETED} is terminal, got {again:?}"
-                    );
-                }
-            }
+            // A second delete has nothing left to delete, so it is that same
+            // refusal: the id names no entity set at all any more.
+            let (status, body) = family.delete_raw(&router, &detector_id, &set_id).await;
+            assert_entity_set_absent(case, status, &body, &set_id);
 
-            // Rule 5: the 200 above is a lookup over the store — an id of the same
-            // form no create minted is still the absence refusal, under this very
-            // detector.
+            // Rule 2: the refusal is a lookup — an id of the same form no create
+            // minted is refused the same way, under this very detector.
             let (status, body) = family.get(&router, &detector_id, ABSENT_SET_ID).await;
             assert_entity_set_absent(case, status, &body, ABSENT_SET_ID);
         }
@@ -392,75 +328,11 @@ async fn a_deleted_entity_set_reports_its_deletion_until_it_completes() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: the deletion ends in the absence refusal, so a poll for it terminates.
-// ---------------------------------------------------------------------------
-
-/// Polling a served delete to its end reaches the absence refusal: the service stops
-/// holding the set once the deletion has run out its retention, so a client waiting
-/// for "already gone" is not left polling a record that never goes. One row per
-/// family, and the loop ends on the CONDITION — a refused read — never on a fixed
-/// wait.
-#[tokio::test]
-async fn polling_a_deleted_entity_set_reaches_the_absence_refusal() {
-    for family in &FAMILIES {
-        let case = format!("{}: polled to the end", family.case);
-        let case = case.as_str();
-        let router = new_router();
-        let detector_id = enabled_detector(&router).await;
-        let set_id = family
-            .create(
-                &router,
-                &detector_id,
-                json!({
-                    "name": "polled_to_the_end-1",
-                    "format": "ALIEN_VAULT",
-                    "location": "s3://guardduty-lists/polled.csv",
-                    "activate": true,
-                }),
-                case,
-            )
-            .await;
-        family.delete(&router, &detector_id, &set_id, case).await;
-
-        let deadline = std::time::Instant::now() + removal_deadline();
-        let mut reads = 0_u32;
-        let mut saw_settled = false;
-        loop {
-            let (status, body) = family.get(&router, &detector_id, &set_id).await;
-            if status != 200 {
-                // The end of the deletion: the id is refused exactly like one no
-                // create ever minted.
-                assert_entity_set_absent(case, status, &body, &set_id);
-                break;
-            }
-            // Every answering read in between reports the deletion, never a status
-            // the set held while it was in use.
-            assert_reports_a_deletion(case, status, &body, &set_id);
-            reads += 1;
-            saw_settled |= body["status"].as_str() == Some(ENTITY_SET_DELETED);
-            assert!(
-                std::time::Instant::now() < deadline,
-                "case {case:?}: the deletion of {set_id} never ended, last read {body:?}"
-            );
-            tokio::time::sleep(POLL_INTERVAL).await;
-        }
-        // The terminal status is what the poll sees before the id is refused — unless
-        // the record was already released by the time the first read landed, which is
-        // the same deletion seen later rather than a different one.
-        assert!(
-            saw_settled || reads == 0,
-            "case {case:?}: the poll read the set {reads} time(s) and never saw the terminal \
-             {ENTITY_SET_DELETED}"
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Rule 4: the collection stops naming the set its own read still reports.
+// Rule 2: the listing names the live sets, and a live sibling still reads back.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_deleted_entity_set_leaves_the_collection_but_not_its_own_read() {
+async fn a_deleted_entity_set_leaves_the_collection_and_its_own_read() {
     // The rows differ along HOW MANY of a detector's sets are deleted: the trusted
     // family holds one at a time, so it is driven one set per cycle, while the threat
     // family holds several and has two deleted out from under a live sibling.
@@ -516,15 +388,19 @@ async fn a_deleted_entity_set_leaves_the_collection_but_not_its_own_read() {
             "case {case:?}: the listing must name exactly the live set, got {listing:?}"
         );
 
-        // Each deleted set is still answered on its own id, reporting its deletion
-        // while the service holds the record, and a second delete of it is refused:
-        // the detector has nothing left to delete.
+        // Each deleted id is refused, and a second delete of it is refused too: the
+        // detector has nothing left to delete. The live sibling is untouched.
         for id in &deleted {
-            let (status, body) = family.get(&router, &detector_id, id).await;
-            assert_reports_a_deletion(case, status, &body, id);
-
+            family
+                .assert_stays_absent(&router, &detector_id, id, case)
+                .await;
             let (status, body) = family.delete_raw(&router, &detector_id, id).await;
             assert_entity_set_absent(case, status, &body, id);
         }
+        let (status, body) = family.get(&router, &detector_id, &live).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the live sibling must still read back, got {status} {body:?}"
+        );
     }
 }

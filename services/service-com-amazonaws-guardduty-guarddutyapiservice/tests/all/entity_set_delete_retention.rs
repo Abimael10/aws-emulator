@@ -5,64 +5,41 @@
 //! share one deletion helper, so the rule is asserted on each of them.
 //!
 //! `threat_entity_set_delete.rs` and `trusted_entity_set_delete.rs` own one delete
-//! each; this suite owns what MANY of them do. A delete takes the set off the
-//! detector and leaves its record behind so the deletion can still be read on its own
-//! id — and the store bounds how many such records it keeps
-//! (`state::DELETED_ENTITY_SETS_RETAINED`), so the rule a caller can observe is that
-//! the bound only ever LOSES a deleted set: inside the allowance the id answers with
-//! the status the deletion moved it to, past it the id is refused with the same
-//! absence refusal an id no create ever minted gets, and no churn ever brings a
-//! deleted set back into use. Every request goes through
+//! each and `entity_set_delete_observability.rs` the one read rule a served delete
+//! leaves behind; this suite owns what MANY of them do. A delete takes the set off the
+//! detector and leaves NOTHING on its id, so the rule a caller can observe under churn
+//! is that every id the churn deleted is refused with the same absence refusal an id no
+//! create ever minted gets, however many cycles ago it was deleted, and no churn ever
+//! brings a deleted set back into use or makes the store keep what it no longer serves.
+//! Every request goes through
 //! [`smithy_server_runtime::MultiServiceRouter::dispatch`] (the harness lives in the
 //! `detector_lifecycle` suite), so routing, restJson1 (de)serialization and the
 //! handlers are exercised together.
 //!
 //! The rules under test, each asserted over a SET of inputs rather than one call:
 //!
-//! 1. Every id a delete took off the detector never reports a live status again: it
-//!    reports a deletion status (`DELETE_PENDING` or the terminal `DELETED`) while the
-//!    store still holds its record, and is refused with the entity-set families'
-//!    absence refusal once the retention bound has dropped it — for every cycle of the
-//!    churn.
+//! 1. Every id a delete took off the detector is refused as absent afterwards — for
+//!    every cycle of the churn, the oldest as much as the newest — and never reports a
+//!    live status again.
 //! 2. The listing names exactly the sets that are live: the churn leaves no ghost in
 //!    the collection, and the set the last cycle created is readable.
 //!
-//! The rows differ along the family, the number of cycles (one past the retention
-//! ceiling, half again, and twice it) and whether a read lands between a delete and
-//! the next create.
+//! The rows differ along the family, the number of cycles and whether a read lands
+//! between a delete and the next create.
 
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{call, enabled_detector, new_router, Router};
 use crate::set_delete_terminality::assert_entity_set_absent;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    DELETED_ENTITY_SETS_RETAINED, ENTITY_SET_DELETED, ENTITY_SET_DELETE_PENDING,
     ENTITY_SET_INACTIVE, THREAT_ENTITY_SET_ID_MEMBER, TRUSTED_ENTITY_SET_ID_MEMBER,
 };
 
-/// The statuses a read may report for an entity set whose delete has been accepted:
-/// the transitional one, and the terminal one the clock settles it to
-/// (`smithy_query(shape="ThreatEntitySetStatus")` carries both).
-const DELETION_STATUSES: [&str; 2] = [ENTITY_SET_DELETE_PENDING, ENTITY_SET_DELETED];
-
-/// Assert one read of an id a delete has taken off the detector: it never reports a
-/// LIVE status. While the service still holds the record it answers with the status
-/// the deletion moved it to; once the deletion has run out its retention
-/// (`state::ENTITY_SET_DELETED_RETENTION_MILLIS`) the record is gone and the id is
-/// refused like one no create ever minted. Which of the two a given read sees depends
-/// on the clock, so both are accepted here; `entity_set_delete_observability.rs` pins
-/// each of them on its own.
+/// Assert one read of an id a delete has taken off the detector: the set is gone, so
+/// the read is the entity-set families' absence refusal — the same one an id no create
+/// ever minted gets — and never a body reporting a set.
 fn assert_never_live_again(case: &str, status: u16, body: &Value, id: &str) {
-    if status != 200 {
-        assert_entity_set_absent(case, status, body, id);
-        return;
-    }
-    let reported = body["status"].as_str().unwrap_or_default();
-    assert!(
-        DELETION_STATUSES.contains(&reported),
-        "case {case:?}: expected one of {DELETION_STATUSES:?} for the deleted {id}, got \
-         {reported:?} {body:?}"
-    );
+    assert_entity_set_absent(case, status, body, id);
 }
 
 /// One entity-set family: the collection segment of its URI under
@@ -182,16 +159,10 @@ async fn listed(router: &Router, detector_id: &str, family: &Family, case: &str)
 
 #[tokio::test]
 async fn churn_leaves_no_deleted_entity_set_live() {
-    let retained = DELETED_ENTITY_SETS_RETAINED;
-    assert!(
-        retained >= 1,
-        "the retention ceiling must keep at least one record, got {retained}"
-    );
-
-    // The rows differ along the number of create-and-delete cycles: one past the
-    // retention ceiling, half again, and twice it — so each row spans ids the store
-    // still holds a record for and ids whose record the bound has dropped.
-    for cycles in [retained + 1, retained + retained / 2, 2 * retained] {
+    // The rows differ along the number of create-and-delete cycles — one, a few and
+    // many — so each row spans a deletion that has just happened and deletions many
+    // cycles old.
+    for cycles in [1_usize, 4, 9] {
         for family in &FAMILIES {
             let case = format!("{} churned {cycles} times", family.collection);
             let case = case.as_str();
@@ -211,8 +182,8 @@ async fn churn_leaves_no_deleted_entity_set_live() {
                     "case {case:?}: cycle {index} must leave exactly its own set listed"
                 );
                 delete_set(&router, &detector_id, family, &id, case).await;
-                // A read between the delete and the next create: it reports the
-                // deletion rather than a live status, and resurrects nothing.
+                // A read between the delete and the next create: the set is gone, so
+                // the read is refused and resurrects nothing.
                 if index % 2 == 0 {
                     let (status, body) = get_set(&router, &detector_id, family, &id).await;
                     assert_never_live_again(case, status, &body, &id);
@@ -220,19 +191,13 @@ async fn churn_leaves_no_deleted_entity_set_live() {
                 deleted_ids.push(id);
             }
 
-            // Rule 1: an id the bound has dropped is refused the way an id no create
-            // ever minted is, whatever the clock has done since; one whose record the
-            // bound still holds never reports a live status again. Each cycle deletes
-            // one set, so the records the bound kept are the last `retained`
-            // deletions.
+            // Rule 1: every id the churn deleted is refused the way an id no create
+            // ever minted is, the oldest deletion of the row as much as the newest,
+            // and whatever the clock has done since.
             for (index, id) in deleted_ids.iter().enumerate() {
                 let case = format!("{case}: deletion {index}");
                 let (status, body) = get_set(&router, &detector_id, family, id).await;
-                if index + retained < deleted_ids.len() {
-                    assert_entity_set_absent(&case, status, &body, id);
-                } else {
-                    assert_never_live_again(&case, status, &body, id);
-                }
+                assert_never_live_again(&case, status, &body, id);
             }
 
             // Rule 2: the collection is empty, and a fresh create is served and

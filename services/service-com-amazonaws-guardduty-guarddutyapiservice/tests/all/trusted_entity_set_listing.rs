@@ -38,9 +38,10 @@ use crate::client_rejections::page_token_refusal;
 use crate::detector_lifecycle::{
     call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
+use crate::set_delete_terminality::assert_entity_set_absent;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    DETECTOR_ID_MEMBER, ENTITY_SET_ACTIVATING, ENTITY_SET_DELETED, ENTITY_SET_DELETE_PENDING,
-    ENTITY_SET_INACTIVE, ENTITY_SET_TRANSITION_MILLIS, NEXT_TOKEN_MEMBER,
+    DETECTOR_ID_MEMBER, ENTITY_SET_ACTIVATING, ENTITY_SET_INACTIVE, ENTITY_SET_TRANSITION_MILLIS,
+    NEXT_TOKEN_MEMBER,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -320,12 +321,11 @@ async fn a_list_names_every_live_trusted_entity_set_in_order() {
     }
 }
 
-/// A set GuardDuty is no longer keeping drops out of the list while its own read keeps
-/// reporting how far its deletion has got, and the set a later create mints takes its
-/// place — asserted over several create-delete cycles, each create differing from the
-/// last.
+/// A set GuardDuty is no longer keeping drops out of the list and out of the reader
+/// together, and the set a later create mints takes its place — asserted over several
+/// create-delete cycles, each create differing from the last.
 #[tokio::test]
-async fn a_deleted_trusted_entity_set_leaves_the_list_but_not_the_reader() {
+async fn a_deleted_trusted_entity_set_leaves_the_list_and_the_reader() {
     let router = new_router();
     let detector = enabled_detector(&router).await;
     let mut gone: Vec<String> = Vec::new();
@@ -353,12 +353,10 @@ async fn a_deleted_trusted_entity_set_leaves_the_list_but_not_the_reader() {
         );
         gone.push(id);
 
-        // The deleted records are out of the LIST's reach only: the set this cycle
-        // deleted still answers its own id with the status its deletion moved it to,
-        // and an earlier cycle's set never reports a live status again — it either
-        // still reports its deletion or, once that deletion has run out its retention
-        // (`state::ENTITY_SET_DELETED_RETENTION_MILLIS`), is refused as absent.
-        for (index, id) in gone.iter().enumerate() {
+        // A deleted set leaves the LIST and the reader together: every id a cycle
+        // deleted, this cycle's included, is refused on its own id exactly like one
+        // no create ever minted.
+        for id in &gone {
             let (status, body) = call(
                 &router,
                 "GET",
@@ -366,20 +364,7 @@ async fn a_deleted_trusted_entity_set_leaves_the_list_but_not_the_reader() {
                 None,
             )
             .await;
-            let last = index + 1 == gone.len();
-            if status != 200 {
-                assert!(
-                    !last,
-                    "case {case:?}: the set just deleted stays readable on its own id, got \
-                     {status} {body:?}"
-                );
-                continue;
-            }
-            let reported = body["status"].as_str().unwrap_or_default();
-            assert!(
-                [ENTITY_SET_DELETE_PENDING, ENTITY_SET_DELETED].contains(&reported),
-                "case {case:?}: expected a deletion status for {id}, got {reported:?} {body:?}"
-            );
+            assert_entity_set_absent(&case, status, &body, id);
         }
     }
 }

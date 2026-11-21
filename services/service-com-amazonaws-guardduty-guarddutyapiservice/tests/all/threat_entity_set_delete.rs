@@ -15,15 +15,13 @@
 //! The rules under test, each asserted over a SET of inputs rather than one recorded
 //! call:
 //!
-//! 1. `DeleteThreatEntitySet` starts the deletion and takes the set off the
-//!    detector, and the set stays READABLE on its own id while the store holds its
-//!    record: `GetThreatEntitySet` answers HTTP 200 reporting the deletion through
-//!    the modelled status enum — `DELETE_PENDING` until the clock owes it the
-//!    terminal `DELETED` — straight after the delete and for ever afterwards,
-//!    whatever status the set was in when the delete arrived and whatever the create
-//!    stored. A SECOND delete has nothing left to delete, so it is refused with the
-//!    entity-set families' absence refusal — HTTP 404 under the
-//!    `ResourceNotFoundException` class.
+//! 1. `DeleteThreatEntitySet` deletes the set and takes it off the
+//!    detector the instant it answers, so the id it named resolves to nothing:
+//!    `GetThreatEntitySet` refuses it with the entity-set families' absence refusal
+//!    — HTTP 404 under the `ResourceNotFoundException` class — from the very next
+//!    read on, whatever status the set was in when the delete arrived and whatever
+//!    the create stored. A SECOND delete has nothing left to delete, so it is
+//!    refused the same way.
 //! 2. The delete is PERSISTED and is observable on the detector: its own `UpdatedAt`
 //!    moves on the first delete and not on a refused repeat.
 //! 3. A deleted set is no longer one GuardDuty keeps, so it occupies none of the
@@ -45,9 +43,8 @@ use crate::detector_lifecycle::{
 use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violation;
 use crate::set_delete_terminality::assert_entity_set_absent;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    DETECTOR_ID_MEMBER, ENTITY_SET_ACTIVATING, ENTITY_SET_ACTIVE, ENTITY_SET_DELETED,
-    ENTITY_SET_DELETE_PENDING, ENTITY_SET_INACTIVE, THREAT_ENTITY_SETS_PER_DETECTOR,
-    THREAT_ENTITY_SET_ID_MEMBER,
+    DETECTOR_ID_MEMBER, ENTITY_SET_ACTIVATING, ENTITY_SET_ACTIVE, ENTITY_SET_INACTIVE,
+    THREAT_ENTITY_SETS_PER_DETECTOR, THREAT_ENTITY_SET_ID_MEMBER,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -70,10 +67,9 @@ const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// below ever ends on it.
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
-/// The statuses a read reports for a set whose delete has been accepted: the
-/// transitional one and the terminal one the clock settles it to (both members of
-/// `ThreatEntitySetStatus`, `smithy_query(shape="ThreatEntitySetStatus")`).
-const DELETION_STATUSES: [&str; 2] = [ENTITY_SET_DELETE_PENDING, ENTITY_SET_DELETED];
+/// How many times a read of a deleted id is repeated to show the refusal is not a
+/// phase: the answer is the same on every one of them, so no wait is involved.
+const REPEATED_READS: usize = 3;
 
 // ---------------------------------------------------------------------------
 // The four routes this suite drives, under `/detector/{DetectorId}/threatentityset`.
@@ -143,9 +139,8 @@ async fn status_of(router: &Router, detector_id: &str, set_id: &str, case: &str)
 
 /// Read a set until it reports `want`, or until [`SETTLE_DEADLINE`] passes — the
 /// CONDITION ends the wait, never a fixed pause. Answers the read that saw it, or
-/// `None` once the service has stopped holding the record, which is how a deletion
-/// ends: that read is the family's absence refusal, so a wait for a deletion status
-/// cannot outlive the record it waits on.
+/// `None` once the service has stopped holding the record: that read is the family's
+/// absence refusal, so a wait cannot outlive the record it waits on.
 async fn read_until_status(
     router: &Router,
     detector_id: &str,
@@ -171,20 +166,15 @@ async fn read_until_status(
     }
 }
 
-/// Assert a read of a set whose delete has been accepted: while the service holds the
-/// record it answers, reporting how far the deletion has got; once it has stopped
-/// holding it the id is refused as absent. What it never reports is a live status.
-fn assert_reports_a_deletion(case: &str, status: u16, body: &Value, id: &str) {
-    if status != 200 {
-        assert_entity_set_absent(case, status, body, id);
-        return;
+/// Assert every one of a handful of consecutive reads of `id` is the absence refusal:
+/// a delete this service has served leaves nothing on the id, and nothing the clock
+/// does afterwards brings it back, so the answer does not depend on when the caller
+/// looks.
+async fn assert_stays_absent(router: &Router, detector_id: &str, id: &str, case: &str) {
+    for attempt in 0..REPEATED_READS {
+        let (status, body) = get_set(router, detector_id, id).await;
+        assert_entity_set_absent(&format!("{case}: read {attempt}"), status, &body, id);
     }
-    let reported = body["status"].as_str().unwrap_or_default();
-    assert!(
-        DELETION_STATUSES.contains(&reported),
-        "case {case:?}: expected one of {DELETION_STATUSES:?} after the delete, got {reported:?} \
-         {body:?}"
-    );
 }
 
 /// Delete a set, failing the test if the call did not succeed.
@@ -393,19 +383,10 @@ async fn a_delete_takes_the_set_off_the_detector_at_once() {
 
         deleted(&router, &detector_id, &set_id, case).await;
 
-        // Rule 1: the delete was accepted and the set is still readable on its own
-        // id, reporting the deletion rather than the status it held before.
+        // Rule 1: the delete took the set away, so the very next read of its id is
+        // the absence refusal rather than a body reporting a deleted-looking set.
         let (status, after) = get_set(&router, &detector_id, &set_id).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: the read straight after the delete still answers, got {status} \
-             {after:?}"
-        );
-        assert_reports_a_deletion(case, status, &after, &set_id);
-        assert_eq!(
-            after["name"], before["name"],
-            "case {case:?}: the delete moved the status and nothing else, got {after:?}"
-        );
+        assert_entity_set_absent(case, status, &after, &set_id);
 
         // Rule 2: the detector holds one fewer sub-resource, so its own UpdatedAt
         // moved.
@@ -430,24 +411,9 @@ async fn a_delete_takes_the_set_off_the_detector_at_once() {
              must stay put, got {detector_again:?}"
         );
 
-        // And the deletion runs to the terminal member of the status enum, which is
-        // where it stays while the service holds the record; once it stops holding it
-        // the id is refused, which `read_until_status` asserts for itself.
-        if read_until_status(&router, &detector_id, &set_id, ENTITY_SET_DELETED, case)
-            .await
-            .is_some()
-        {
-            let (status, body) = get_set(&router, &detector_id, &set_id).await;
-            if status == 200 {
-                assert_eq!(
-                    body["status"].as_str().unwrap_or_default(),
-                    ENTITY_SET_DELETED,
-                    "case {case:?}: {ENTITY_SET_DELETED} is terminal, got {body:?}"
-                );
-            } else {
-                assert_entity_set_absent(case, status, &body, &set_id);
-            }
-        }
+        // And the refusal is not a phase: every later read of that id answers it
+        // too, so nothing the clock does puts the set back within reach.
+        assert_stays_absent(&router, &detector_id, &set_id, case).await;
     }
 }
 
@@ -457,11 +423,13 @@ async fn a_delete_takes_the_set_off_the_detector_at_once() {
 
 #[tokio::test]
 async fn a_deleted_set_leaves_the_collection_and_frees_its_slot() {
-    // The rows differ along whether the list and the next create arrive straight
-    // after the delete or once the deletion has settled.
-    for (case, wait) in [
-        ("straight after the delete", false),
-        ("once the deletion has settled", true),
+    // The rows differ along WHICH of the detector's sets is deleted — the first, one
+    // in the middle and the last — so the rule is not about a position in the
+    // collection.
+    for (case, position) in [
+        ("the first set deleted", 0),
+        ("a middle set deleted", THREAT_ENTITY_SETS_PER_DETECTOR / 2),
+        ("the last set deleted", THREAT_ENTITY_SETS_PER_DETECTOR - 1),
     ] {
         let (router, detector_id) = detector().await;
 
@@ -508,12 +476,10 @@ async fn a_deleted_set_leaves_the_collection_and_frees_its_slot() {
              {refused:?}"
         );
 
-        // Delete the middle one, so the assertion is not about the first or the last.
-        let victim = ids[ids.len() / 2].clone();
+        // The set this row deletes, taken from the ids in the order they were
+        // created rather than from the listing's order.
+        let victim = ids[position].clone();
         deleted(&router, &detector_id, &victim, case).await;
-        if wait {
-            read_until_status(&router, &detector_id, &victim, ENTITY_SET_DELETED, case).await;
-        }
 
         let remaining = listed(&router, &detector_id, case).await;
         assert!(
@@ -528,10 +494,9 @@ async fn a_deleted_set_leaves_the_collection_and_frees_its_slot() {
             "case {case:?}: the delete must leave every other set in the list"
         );
 
-        // It has left the collection without leaving the reader: the detector no
-        // longer holds it, while its own id still reports how far its deletion got.
-        let (status, body) = get_set(&router, &detector_id, &victim).await;
-        assert_reports_a_deletion(case, status, &body, &victim);
+        // It has left the collection and the reader together: the detector no
+        // longer holds it, so its own id is refused as absent.
+        assert_stays_absent(&router, &detector_id, &victim, case).await;
 
         // The slot is free again, so the create that was just refused now succeeds.
         let replacement = created(
@@ -561,17 +526,24 @@ async fn a_deleted_set_leaves_the_collection_and_frees_its_slot() {
 
 #[tokio::test]
 async fn a_replayed_client_token_whose_set_was_deleted_mints_a_new_set() {
-    for (case, wait) in [
-        ("replayed straight after the delete", false),
-        ("replayed once the deletion has settled", true),
+    // The rows differ along the token the create carries and whether the set it
+    // minted was activated, so the rule is not about one token spelling.
+    for (case, token, activate, settled_status) in [
+        ("a plain token on an activated set", "replayed-token", true, ENTITY_SET_ACTIVATING),
+        (
+            "a uuid-shaped token on a set left unused",
+            "6d5f3b2e-0a1c-4d7e-9b8a-2c3d4e5f6a7b",
+            false,
+            ENTITY_SET_INACTIVE,
+        ),
     ] {
         let (router, detector_id) = detector().await;
         let body = json!({
             "name": "token-set",
             "format": "OTX_CSV",
             "location": LOCATION,
-            "activate": true,
-            "clientToken": "replayed-token",
+            "activate": activate,
+            "clientToken": token,
         });
 
         let first = created(&router, &detector_id, case, body.clone()).await;
@@ -583,9 +555,8 @@ async fn a_replayed_client_token_whose_set_was_deleted_mints_a_new_set() {
         );
 
         deleted(&router, &detector_id, &first, case).await;
-        if wait {
-            read_until_status(&router, &detector_id, &first, ENTITY_SET_DELETED, case).await;
-        }
+        // The deleted set is gone, so the token resolves to nothing.
+        assert_stays_absent(&router, &detector_id, &first, case).await;
 
         let second = created(&router, &detector_id, case, body).await;
         assert_ne!(
@@ -595,8 +566,8 @@ async fn a_replayed_client_token_whose_set_was_deleted_mints_a_new_set() {
         );
         let got = read(&router, &detector_id, &second, case).await;
         assert_eq!(
-            got["status"], ENTITY_SET_ACTIVATING,
-            "case {case:?}: the new set starts its own transition, got {:?}",
+            got["status"], settled_status,
+            "case {case:?}: expected the new set to start on {settled_status}, got {:?}",
             got["status"]
         );
     }

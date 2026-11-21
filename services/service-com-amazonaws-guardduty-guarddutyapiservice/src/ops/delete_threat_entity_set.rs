@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteThreatEntitySet
-//! IMPLEMENTED: starts the deletion of the threat entity set the request names in
+//! IMPLEMENTED: deletes the threat entity set the request names from
 //! [`crate::state`] — the detector no longer HAS it, so a second
 //! `DeleteThreatEntitySet` refuses its id with the entity-set families' absence
-//! refusal and `ListThreatEntitySets` stops naming it, while `GetThreatEntitySet`
-//! keeps reporting the set on its own id with the `DELETE_PENDING` status the
-//! deletion moved it to, which the clock settles to `DELETED`. The slot it held
+//! refusal, `ListThreatEntitySets` stops naming it and `GetThreatEntitySet` refuses
+//! it exactly like an id no create ever minted. The slot it held
 //! among the detector's threat entity sets is freed, so a later create succeeds. An
 //! id outside the alphabet the member is constrained to never reaches that lookup:
 //! it is refused with the constraint-violation template
@@ -180,10 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // A set whose delete this service has already served is that same absence:
         // the detector no longer has it, so there is no second deletion to perform.
-        if detector
+        if !detector
             .threat_entity_sets
-            .get(&input.threat_entity_set_id)
-            .is_none_or(crate::state::EntitySetRecord::is_deleting)
+            .contains_key(&input.threat_entity_set_id)
         {
             return Err(crate::scaffolded::Scaffolded::not_found(
                 crate::scaffolded::ENTITY_SET_NOT_FOUND_MESSAGE,
@@ -205,18 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Deletes the threat entity set that is associated with the specified
-        // threatEntitySetId" (this operation's own documentation): the deletion is
-        // ASYNCHRONOUS, so what the call does is accept it — the set moves to
-        // `DELETE_PENDING` and the clock owes it `DELETED`
-        // ([`crate::state::EntitySetRecord::begin_delete`]). The detector no longer
-        // HAS it from this instant: `ListThreatEntitySets` stops naming it, a
-        // replayed `ClientToken` mints a new set instead of handing this one back,
-        // no write may move it and a second delete has nothing left to delete. Its
-        // record is RETAINED, bounded by the retention every deleted entity set
-        // shares, so `GetThreatEntitySet` can report how far the deletion has got.
-        let deleted = detector
-            .delete_threat_entity_set(&input.threat_entity_set_id, now)
-            .unwrap_or(false);
+        // threatEntitySetId" (this operation's own documentation): the set is GONE
+        // once this call is served — its record is dropped
+        // ([`crate::state::delete_entity_set`]), so from this instant
+        // `ListThreatEntitySets` stops naming it, `GetThreatEntitySet` refuses its
+        // id as absent, a replayed `ClientToken` mints a new set instead of handing
+        // this one back, no write resolves it and a second delete has nothing left
+        // to delete.
+        let deleted = detector.delete_threat_entity_set(&input.threat_entity_set_id);
         if deleted {
             // The detector holds one fewer sub-resource than before, which is the
             // same change `CreateThreatEntitySet` records on it in the other

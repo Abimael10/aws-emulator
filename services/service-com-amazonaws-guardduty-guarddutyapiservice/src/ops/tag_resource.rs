@@ -21,8 +21,9 @@
 //! `InvalidInputException` class rather than answered with a hollow 204, and so is an
 //! add that would take the resource past [`crate::state::TAGS_PER_RESOURCE`] tags.
 //!
-//! A sub-resource whose delete has already been accepted is one of those: it is
-//! retained only to be REPORTED, so this write is refused exactly like an id the
+//! A sub-resource whose delete has already been served is one of those: an entity
+//! set's record is gone and an uploaded list's is retained only to be REPORTED, so
+//! either way this write is refused exactly like an id the
 //! detector never held, the way `UpdateIPSet` and the sibling updates refuse it.
 //!
 //! This is the ONLY file to touch for this operation.

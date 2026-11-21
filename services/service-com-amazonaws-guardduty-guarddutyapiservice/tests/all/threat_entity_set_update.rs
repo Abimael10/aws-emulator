@@ -52,8 +52,7 @@ use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violat
 use crate::set_delete_terminality::assert_entity_set_absent;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     DETECTOR_ID_MEMBER, ENTITY_SET_ACTIVATING, ENTITY_SET_ACTIVE, ENTITY_SET_DEACTIVATING,
-    ENTITY_SET_DELETED, ENTITY_SET_DELETE_PENDING, ENTITY_SET_INACTIVE,
-    ENTITY_SET_TRANSITION_MILLIS, THREAT_ENTITY_SET_ID_MEMBER,
+    ENTITY_SET_INACTIVE, ENTITY_SET_TRANSITION_MILLIS, THREAT_ENTITY_SET_ID_MEMBER,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -791,16 +790,23 @@ async fn an_unresolvable_id_is_refused_rather_than_answered() {
     );
 }
 
-/// A set a delete has taken out of the detector's holdings is no longer one GuardDuty
-/// keeps, so its id is refused for a WRITE exactly like one the detector never held —
-/// an update must not walk a deleted set back into use. Its own read still reports the
-/// record, under the status its deletion moved it to, so the refusal is checked
-/// against that read as well as against the listing.
+/// A set a delete has taken out of the detector's holdings is gone, so its id is
+/// refused for a WRITE exactly like one the detector never held — an update must not
+/// bring a deleted set back. Its own read is refused the same way, so the refusal is
+/// checked against that read as well as against the update.
 #[tokio::test]
 async fn a_set_whose_delete_was_accepted_cannot_be_updated() {
-    for (case, wait) in [
-        ("straight after the delete", false),
-        ("once the deletion has settled", true),
+    // The rows differ along the update the refused call carries: a rename plus an
+    // activation, and a location-only write.
+    for (case, update) in [
+        (
+            "an update that renames and activates",
+            json!({"name": "revived", "activate": true}),
+        ),
+        (
+            "an update that only moves the location",
+            json!({"location": "s3://guardduty-lists/revived.txt"}),
+        ),
     ] {
         let (router, detector_id) = detector().await;
         let set_id = created(&router, &detector_id, case, base_create("TXT", false)).await;
@@ -809,53 +815,14 @@ async fn a_set_whose_delete_was_accepted_cannot_be_updated() {
             status, 200,
             "case {case:?}: expected the delete to answer 200, got {status} {body:?}"
         );
-        if wait {
-            // Waits for the CONDITION the clock owes, never for a span; a record the
-            // service has stopped holding ends the wait too.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                let (status, body) = get_set(&router, &detector_id, &set_id).await;
-                if status != 200 || body["status"].as_str() == Some(ENTITY_SET_DELETED) {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "case {case:?}: {set_id} never reached {ENTITY_SET_DELETED}, last read \
-                     {body:?}"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        }
 
-        let (status, body) = update_set(
-            &router,
-            &detector_id,
-            &set_id,
-            json!({"name": "revived", "activate": true}),
-        )
-        .await;
+        let (status, body) = update_set(&router, &detector_id, &set_id, update).await;
         assert_entity_set_absent(case, status, &body, &set_id);
 
-        // The refused update revived nothing: while the service still holds the
-        // record the read reports it with the name the create stored and a deletion
-        // status, and once it does not the id is refused as absent — never a live set
-        // under the name the update asked for.
+        // The refused update revived nothing: the id is still refused as absent,
+        // never answered with a live set under the name the update asked for.
         let (status, got) = get_set(&router, &detector_id, &set_id).await;
-        if status != 200 {
-            assert_entity_set_absent(case, status, &got, &set_id);
-            continue;
-        }
-        let reported = got["status"].as_str().unwrap_or_default();
-        assert!(
-            [ENTITY_SET_DELETE_PENDING, ENTITY_SET_DELETED].contains(&reported),
-            "case {case:?}: a refused update must leave the deletion where it was, got \
-             {reported:?} {got:?}"
-        );
-        assert_eq!(
-            got["name"].as_str().unwrap_or_default(),
-            "base_set-1",
-            "case {case:?}: a refused update must not rename the deleted set, got {got:?}"
-        );
+        assert_entity_set_absent(case, status, &got, &set_id);
     }
 }
 

@@ -227,8 +227,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A detector may hold SEVERAL threat entity sets - AWS documents no
         // one-at-a-time rule for them - up to the account's threat-list quota for
         // the Region (`crate::state::THREAT_ENTITY_SETS_PER_DETECTOR`). The quota
-        // bounds the LIVE sets: a set whose delete has been accepted is only still
-        // reported, so it occupies none of the detector's slots, the same rule
+        // bounds the sets GuardDuty is KEEPING: a set whose delete has been served
+        // is gone, so it occupies none of the detector's slots, the same rule
         // `CreateIPSet` and `CreateTrustedEntitySet` follow.
         if detector.live_threat_entity_set_count() >= crate::state::THREAT_ENTITY_SETS_PER_DETECTOR
         {
