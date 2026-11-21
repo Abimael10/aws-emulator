@@ -12,6 +12,41 @@ Issue-Commit: 122d2e23ed306dec374f1768a21e001304c75e9d
 
 # codestar-notifications ListNotificationRules reports unmatched rule Id on every page
 
+## Resolution (all three causes declined: a per-run generated resource id)
+
+The emulator's behaviour is correct and all THREE causes are DECLINED, not implemented.
+They are one difference on one member: `NotificationRuleSummary.Id` carries the id the
+service drew for that rule in THIS run, while the recording holds the id AWS drew in the
+recording run. The minting this report blames (`crate::state::new_rule_id` as a sha-256 of
+`notificationrule/<sequence>/<nanos>` laid out in a version-4 shape, at the commit the
+report was filed against) no longer exists: it is now
+`::uuid::Uuid::new_v4().as_hyphenated().to_string()`, a canonical hyphenated lowercase
+version-4 UUID inside `NotificationRuleId`'s `@length` 1..40 — the only constraint the
+model places on it. `crate::state::notification_rule_arn` embeds that exact value as the
+ARN's `notificationrule/<id>` segment, and `src/ops/list_notification_rules.rs` reports the
+stored id verbatim beside the stored ARN on every page, filtered or not. The two values
+therefore differ only in their draw: same modelled type, same length, same form, same
+provenance. Two replays of one unchanged build report two different pairs of ids with an
+identical verdict.
+
+Do NOT implement the remedy the report implies (serve the recording's uuid, or derive the
+id from the request): a rule id is minted once per rule and recurs in no later run, and an
+id taken from the recording would also have to differ from the resource segment of the ARN
+the emulator minted — which this very report requires to stay byte-for-byte identical. The
+replay keys therefore stay failing by construction, each run under that run's own uuids.
+
+What the resolution added instead is the test that pins the part of the rule no suite
+covered: `tests/all/rule_id_identity.rs` gains
+`narrowing_a_listing_never_changes_the_identity_it_reports`, which seeds rules overlapping
+on every attribute a filter selects by and drives all 2^4 combinations of
+`ListNotificationRulesFilterName`'s values (each name with one value and with two, so the
+values are ORed within a name and the names ANDed), plus a value nothing carries for each
+name, at the modelled minimum page size, at a size that splits the selection and with no
+`MaxResults` at all — asserting that narrowing decides only WHICH rules are named, and that
+each named rule still reports its own minted id, byte-for-byte its own ARN's resource
+segment. The sibling suites keep the id's form, its stability across reads and updates, and
+the correlation between a reported id and the ARN that addresses the rule.
+
 > _Note: this issue was identified against the code base at commit `122d2e23ed306dec374f1768a21e001304c75e9d`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

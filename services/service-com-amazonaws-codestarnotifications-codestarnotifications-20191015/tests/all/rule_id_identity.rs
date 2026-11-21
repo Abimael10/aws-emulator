@@ -10,7 +10,9 @@
 //! beside its `Arn` in every listing, unfiltered, filtered on any of
 //! `ListNotificationRulesFilterName`'s values, and on every page of any page size. A
 //! later read or update never changes it, and the id a deleted rule held is never handed
-//! to the rule that replaces it.
+//! to the rule that replaces it. Narrowing a listing — by `Filters`, whose values are
+//! ORed within one name and ANDed across names, or by page size — decides only WHICH
+//! rules are named, never the identity reported for one that is.
 //!
 //! The harness (`Emulator`, `string`, ...) is the one `notification_rule_lifecycle`
 //! already builds: one shared engine behind the same `MultiServiceRouter` dispatch the
@@ -467,6 +469,311 @@ async fn a_recreated_rule_is_minted_a_fresh_id() {
                 listed.iter().all(|(listed_id, _)| listed_id != &id),
                 "case {label:?}: a deleted rule's id must not be listed, got {listed:?}"
             );
+        }
+    }
+}
+
+// --- narrowing a listing -------------------------------------------------------------
+//
+// Narrowing — by `Filters` (the values given for one name ORed, the names ANDed) or by
+// page size — decides WHICH rules a listing names and nothing about the identity it
+// reports for a rule it names: each entry still carries that rule's own minted id,
+// byte-for-byte the resource segment of that rule's own `Arn`.
+
+/// One rule of the narrowing table: the three request-chosen attributes a listing can
+/// select a rule by. `CREATED_BY`, the fourth name the enum lists, is the caller's own
+/// principal, so it is the same for every row and is read back from the store below.
+struct NarrowedRule {
+    label: &'static str,
+    resource: &'static str,
+    /// Event type ids out of the catalog `ListEventTypes` publishes
+    /// (`crate::state::EVENT_TYPE_CATALOG`).
+    event_type_ids: &'static [&'static str],
+    target_addresses: &'static [&'static str],
+}
+
+const NARROW_REPOSITORY: &str = "arn:aws:codecommit:us-east-1:123456789012:NarrowRepo";
+const NARROW_PROJECT: &str = "arn:aws:codebuild:us-east-1:123456789012:project/NarrowProject";
+const NARROW_PIPELINE: &str = "arn:aws:codepipeline:us-east-1:123456789012:NarrowPipeline";
+
+const NARROW_TOPIC_X: &str = "arn:aws:sns:us-east-1:123456789012:narrow-topic-x";
+const NARROW_TOPIC_Y: &str = "arn:aws:sns:us-east-1:123456789012:narrow-topic-y";
+const NARROW_SLACK: &str =
+    "arn:aws:chatbot:us-east-1:123456789012:chat-configuration/slack-channel/narrow";
+
+// Four ids of the published catalog, one per service it covers.
+const NARROW_PULL_REQUEST: &str = "codecommit-repository-pull-request-created";
+const NARROW_BUILD_FAILED: &str = "codebuild-project-build-state-failed";
+const NARROW_APPROVAL: &str = "codepipeline-pipeline-manual-approval-needed";
+const NARROW_DEPLOYMENT: &str = "codedeploy-application-deployment-succeeded";
+
+/// The rules the narrowing suite seeds: the rows overlap on each attribute a filter
+/// selects by — two rules share a resource, two share an event type, three share a
+/// target address, one has no target at all — so a narrowing selects a different,
+/// non-trivial subset of them for every combination below.
+const NARROWED_RULES: &[NarrowedRule] = &[
+    NarrowedRule {
+        label: "repository, one event type, one topic",
+        resource: NARROW_REPOSITORY,
+        event_type_ids: &[NARROW_PULL_REQUEST],
+        target_addresses: &[NARROW_TOPIC_X],
+    },
+    NarrowedRule {
+        label: "repository again, two event types, no target",
+        resource: NARROW_REPOSITORY,
+        event_type_ids: &[NARROW_BUILD_FAILED, NARROW_PULL_REQUEST],
+        target_addresses: &[],
+    },
+    NarrowedRule {
+        label: "build project, two topics",
+        resource: NARROW_PROJECT,
+        event_type_ids: &[NARROW_BUILD_FAILED],
+        target_addresses: &[NARROW_TOPIC_X, NARROW_TOPIC_Y],
+    },
+    NarrowedRule {
+        label: "build project again, approval event",
+        resource: NARROW_PROJECT,
+        event_type_ids: &[NARROW_APPROVAL],
+        target_addresses: &[NARROW_TOPIC_Y],
+    },
+    NarrowedRule {
+        label: "pipeline, two event types, a chat target",
+        resource: NARROW_PIPELINE,
+        event_type_ids: &[NARROW_APPROVAL, NARROW_DEPLOYMENT],
+        target_addresses: &[NARROW_SLACK],
+    },
+    NarrowedRule {
+        label: "pipeline again, a topic and a chat target",
+        resource: NARROW_PIPELINE,
+        event_type_ids: &[NARROW_DEPLOYMENT],
+        target_addresses: &[NARROW_TOPIC_X, NARROW_SLACK],
+    },
+];
+
+/// The `TargetType` an address is subscribed under: a chat configuration is a Chatbot
+/// target, everything else here is a topic.
+fn narrow_target_type(address: &str) -> &'static str {
+    if address.contains(":chatbot:") {
+        "AWSChatbotSlack"
+    } else {
+        "SNS"
+    }
+}
+
+/// Create every row of [`NARROWED_RULES`], in row order, prefixing the rule names with
+/// `label` so the per-region name index cannot collide with another suite's seeding.
+async fn seed_narrowed(emulator: &Emulator, label: &str) -> Vec<String> {
+    let mut arns = Vec::with_capacity(NARROWED_RULES.len());
+    for (index, rule) in NARROWED_RULES.iter().enumerate() {
+        let request = json!({
+            "Name": format!("{label}-{index}"),
+            "Resource": rule.resource,
+            "DetailType": "BASIC",
+            "EventTypeIds": rule.event_type_ids,
+            "Targets": rule.target_addresses
+                .iter()
+                .map(|address| json!({
+                    "TargetType": narrow_target_type(address),
+                    "TargetAddress": address,
+                }))
+                .collect::<Vec<Value>>(),
+        });
+        let created = emulator
+            .ok(rule.label, "/createNotificationRule", &request)
+            .await;
+        let arn = string(&created, "Arn");
+        assert!(
+            !arn.is_empty(),
+            "case {:?}: create must answer with an ARN, got {created}",
+            rule.label
+        );
+        arns.push(arn);
+    }
+    arns
+}
+
+/// The values one filter name is driven with: variant 0 is a single value, variant 1 is
+/// two values for the same name — the OR `Filters` documents.
+fn narrowing_values(name: &str, variant: usize, created_by: &str) -> Vec<String> {
+    let values: Vec<&str> = match (name, variant) {
+        ("RESOURCE", 0) => vec![NARROW_REPOSITORY],
+        ("RESOURCE", _) => vec![NARROW_REPOSITORY, NARROW_PIPELINE],
+        ("EVENT_TYPE_ID", 0) => vec![NARROW_PULL_REQUEST],
+        ("EVENT_TYPE_ID", _) => vec![NARROW_BUILD_FAILED, NARROW_APPROVAL],
+        ("TARGET_ADDRESS", 0) => vec![NARROW_TOPIC_X],
+        ("TARGET_ADDRESS", _) => vec![NARROW_TOPIC_X, NARROW_TOPIC_Y],
+        ("CREATED_BY", 0) => vec![created_by],
+        ("CREATED_BY", _) => vec![created_by, UNMATCHED_PRINCIPAL],
+        (other, _) => panic!("case {other:?}: not a name ListNotificationRulesFilterName lists"),
+    };
+    values.into_iter().map(str::to_string).collect()
+}
+
+const UNMATCHED_PRINCIPAL: &str = "arn:aws:iam::123456789012:user/narrow-unused-principal";
+
+/// One value per filter name that no seeded rule carries, each inside the same value
+/// space as the ones that do: a narrowing that selects nothing must name nothing.
+const UNMATCHED_VALUES: [(&str, &str); 4] = [
+    ("EVENT_TYPE_ID", "codebuild-project-build-phase-failure"),
+    ("CREATED_BY", UNMATCHED_PRINCIPAL),
+    (
+        "RESOURCE",
+        "arn:aws:codecommit:us-east-1:123456789012:NarrowUnusedRepo",
+    ),
+    (
+        "TARGET_ADDRESS",
+        "arn:aws:sns:us-east-1:123456789012:narrow-unused",
+    ),
+];
+
+/// Whether `rule` satisfies one filter name's ORed values, as `Filters` documents the
+/// four names the enum lists.
+fn narrowed_rule_matches(
+    rule: &NarrowedRule,
+    created_by: &str,
+    name: &str,
+    values: &[String],
+) -> bool {
+    match name {
+        "EVENT_TYPE_ID" => rule
+            .event_type_ids
+            .iter()
+            .any(|id| values.iter().any(|value| value == id)),
+        "CREATED_BY" => values.iter().any(|value| value == created_by),
+        "RESOURCE" => values.iter().any(|value| value == rule.resource),
+        "TARGET_ADDRESS" => rule
+            .target_addresses
+            .iter()
+            .any(|address| values.iter().any(|value| value == address)),
+        other => panic!("case {other:?}: not a name ListNotificationRulesFilterName lists"),
+    }
+}
+
+/// One filter name and the values a narrowing ORs for it.
+type NarrowingFilter = (&'static str, Vec<String>);
+
+/// One narrowing: the case it is reported as, and the filters it ANDs together.
+type NarrowingCase = (String, Vec<NarrowingFilter>);
+
+/// Every narrowing the suite drives: each of the 2^4 combinations of the filter names
+/// (the empty one being the unfiltered listing), with one name's values ORed and the
+/// names ANDed, plus one row per name whose value nothing carries.
+fn narrowing_cases(created_by: &str) -> Vec<NarrowingCase> {
+    let mut cases: Vec<NarrowingCase> = Vec::new();
+    for mask in 0..(1usize << FILTER_NAMES.len()) {
+        let mut grouped: Vec<NarrowingFilter> = Vec::new();
+        for (index, name) in FILTER_NAMES.iter().enumerate() {
+            if mask & (1 << index) == 0 {
+                continue;
+            }
+            // One value and two values for one name are both driven across the table.
+            let variant = (mask + index) % 2;
+            grouped.push((*name, narrowing_values(name, variant, created_by)));
+        }
+        let label = if grouped.is_empty() {
+            "no filter".to_string()
+        } else {
+            grouped
+                .iter()
+                .map(|(name, values)| format!("{name}={values:?}"))
+                .collect::<Vec<String>>()
+                .join(" AND ")
+        };
+        cases.push((label, grouped));
+    }
+    for (name, unmatched) in UNMATCHED_VALUES {
+        cases.push((
+            format!("{name}={unmatched:?} matches nothing"),
+            vec![(name, vec![unmatched.to_string()])],
+        ));
+    }
+    cases
+}
+
+/// RULE: narrowing a listing decides only WHICH rules it names — `Filters` select them
+/// (values ORed within a name, names ANDed) and `MaxResults` splits them over pages —
+/// and never what identity is reported for a rule it names: every entry carries that
+/// rule's own minted id, byte-for-byte the resource segment of that entry's own `Arn`,
+/// and no narrowing reports an identity the account was never issued.
+#[tokio::test]
+async fn narrowing_a_listing_never_changes_the_identity_it_reports() {
+    let emulator = Emulator::new();
+    let arns = seed_narrowed(&emulator, "narrowed").await;
+
+    // `CreatedBy` is the caller's own principal, recorded by the service rather than
+    // sent, so the CREATED_BY rows filter on what the store holds.
+    let described = emulator
+        .ok(
+            "created-by",
+            "/describeNotificationRule",
+            &json!({ "Arn": arns[0] }),
+        )
+        .await;
+    let created_by = string(&described, "CreatedBy");
+    assert!(
+        !created_by.is_empty(),
+        "the store must record the caller as CreatedBy, got {described}"
+    );
+
+    // The identity each rule was minted, in creation order: what every narrowing below
+    // must report for the rules it names.
+    let minted: Vec<(String, String)> = arns
+        .iter()
+        .enumerate()
+        .map(|(index, arn)| {
+            let case = NARROWED_RULES[index].label;
+            (id_of_arn(case, arn).to_string(), arn.clone())
+        })
+        .collect();
+    let issued: HashSet<&String> = minted.iter().map(|(id, _)| id).collect();
+
+    for (label, grouped) in narrowing_cases(&created_by) {
+        let filters: Vec<Value> = grouped
+            .iter()
+            .flat_map(|(name, values)| {
+                values
+                    .iter()
+                    .map(move |value| json!({ "Name": name, "Value": value }))
+            })
+            .collect();
+        let body = if filters.is_empty() {
+            json!({})
+        } else {
+            json!({ "Filters": filters })
+        };
+        let expected: Vec<(String, String)> = NARROWED_RULES
+            .iter()
+            .zip(minted.iter())
+            .filter(|(rule, _)| {
+                grouped
+                    .iter()
+                    .all(|(name, values)| narrowed_rule_matches(rule, &created_by, name, values))
+            })
+            .map(|(_, pair)| pair.clone())
+            .collect();
+
+        // Row 1 is the modelled minimum page size, row 2 splits the selection over
+        // pages, and `None` is a request with no `MaxResults` at all.
+        for max_results in [Some(1), Some(2), None] {
+            let case = format!("{label} at MaxResults={max_results:?}");
+            let pairs = list_pairs(&emulator, &case, &body, max_results).await;
+            assert_eq!(
+                pairs, expected,
+                "case {case:?}: a narrowing selects which rules are named and reports each \
+                 one's own identity, got {pairs:?}"
+            );
+            for (id, arn) in &pairs {
+                assert_eq!(
+                    id.as_str(),
+                    id_of_arn(&case, arn),
+                    "case {case:?}: the summary's Id must be its own ARN's resource segment, got {id:?} for {arn:?}"
+                );
+                assert_canonical_rule_id(&case, id);
+                assert!(
+                    issued.contains(id),
+                    "case {case:?}: {id:?} is an identity this account was never issued"
+                );
+            }
         }
     }
 }
