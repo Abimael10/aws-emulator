@@ -1040,10 +1040,20 @@ fn name_mark(mark: &Mark) -> Option<Named> {
                 .iter()
                 .filter(|(ch, _)| *ch != best.0 && STEMS.contains(ch))
                 .any(|(_, scored)| best.1 - scored <= STEM_MARGIN));
+    // The best LETTER OR FIGURE the same ink could be, for an open reading inside a word to
+    // be settled by: a mark whose ink agrees best with a bar, or with one bare stem over
+    // another, may be a character whose own ink is nearly a stem — the `t` of a face whose
+    // crossbar barely reaches past it — and that character is what such a mark reads as.
+    let letter = named
+        .iter()
+        .filter(|(ch, scored)| ch.is_ascii_alphanumeric() && *scored >= MIN_MATCH)
+        .reduce(|held, found| if found.1 > held.1 { found } else { held })
+        .map(|(ch, _)| *ch);
     Some(Named {
         ch: best.0,
         score: best.1,
         open,
+        letter,
     })
 }
 
@@ -1090,6 +1100,11 @@ pub(super) struct Named {
     pub(super) ch: char,
     pub(super) score: f32,
     pub(super) open: bool,
+    /// The best LETTER OR FIGURE this mark's ink could be, when its ink agreed with one at
+    /// all: what the mark is read as where the reading is open and the mark stands inside a
+    /// word, since the words of a page are set with letters and figures and a BAR is not one
+    /// of them.
+    pub(super) letter: Option<char>,
 }
 
 /// The characters a face may draw as nothing but a stem: the capital i, the small l, the

@@ -60,7 +60,9 @@ fn mark(x0: usize, width: usize, ch: char) -> Settled {
             ch,
             score: 0.9,
             open: false,
+            letter: Some(ch),
         }),
+        piece: None,
     }
 }
 

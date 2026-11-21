@@ -2054,7 +2054,9 @@ fn layout_page(
     let rotation = content.page_rotation(page_index);
     let mut laid_out: Vec<LineLayout> = page_text
         .lines()
-        .map(str::trim_end)
+        // Trailing SPACES are no part of a line, while a trailing TAB is: it is the boundary
+        // of the row's last cell, which a table whose last cell holds nothing still draws.
+        .map(|line| line.trim_end_matches(' '))
         .filter(|line| !line.trim().is_empty())
         .enumerate()
         .map(|(index, line)| {

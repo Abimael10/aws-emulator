@@ -27,6 +27,10 @@
 //!    lines; a vertical profile within one line gives its marks, and the way those marks
 //!    are spaced — against the cell a monospaced line sets them in, or against the pitch a
 //!    proportional one advances by — gives the word and column breaks ([`Separators`]).
+//!    The page's RULES are struck out of its ink first ([`rules`]): a long thin straight run
+//!    of ink running clear past the page's own characters is a ruling line, a border or an
+//!    underline — page structure, which no face draws a character as — while a rule standing
+//!    between two marks of a line is the boundary of the two CELLS they stand in.
 //!    Where a line sets its FIGURES on one advance, as a proportional face does, two of them
 //!    are separated by what their step covers past that advance rather than by the gap a
 //!    narrow figure leaves inside its own cell ([`figure_advance`]).
@@ -97,6 +101,9 @@ use image::{ImageFormat, Limits};
 use super::Unreadable;
 
 mod glyphs;
+mod rules;
+
+use rules::Rule;
 
 /// The largest side, in pixels, of a raster this service decodes. NOT an AWS limit: an
 /// emulator-side bound so one request cannot allocate without end.
@@ -200,6 +207,11 @@ const WORD_GAP_PITCH: f32 = 0.4;
 /// is what keeps the boundary between two clusters of BEARINGS from being read as one
 /// between bearings and spaces.
 const MIN_SPACE_PITCH: f32 = 0.25;
+
+/// How many passes a line's word gap is settled in ([`Separators::word_gap`]). NOT an AWS
+/// limit: each pass takes in more of the line's gaps than the last, so a few of them is
+/// where the boundary stops moving on any line a page sets.
+const GAP_PASSES: usize = 4;
 
 /// How much of the line's own character pitch the step from one FIGURE to the next must
 /// cover PAST the advance the face sets its figures on for a space to stand between them.
@@ -373,6 +385,17 @@ const CUT_COST: f32 = 1.0;
 /// match SOMETHING a little better than the whole matched what it is: what the margin asks
 /// for is the clear improvement that separating two letters really gives.
 const CUT_GAIN: f32 = 0.01;
+
+/// How much better than the run's OWN name every piece of a cut must be named for a run no
+/// wider than one character of its line to be cut at all.
+///
+/// Such a run is cut on the evidence that it holds two characters, and the evidence is that
+/// each piece reads as a character of this line better than the whole read as one. A margin
+/// rather than a hair: the halves of a letter whose face sets it with a thin waist — the bowl
+/// and the tail of a `g`, the two arcs of an `s` — each match some mark of punctuation about
+/// as well as the whole matches its own letter, and reading a letter as two of those is a
+/// worse answer than leaving it whole.
+const CUT_PIECE_GAIN: f32 = 0.08;
 
 /// A raster page's recognised text.
 #[derive(Debug, Clone, PartialEq)]
@@ -665,7 +688,9 @@ struct PageRead {
     score_count: usize,
     /// How much of the page's ink was named, and how well: see [`PageRead::strength`].
     named_ink: f32,
-    /// How much ink the page carries in all, which that is measured against.
+    /// How much ink the page carries for its text to be read out of, which that is measured
+    /// against: the ink that is left once its RULES are struck, since a ruling line is
+    /// structure rather than a mark any reading could name ([`rules`]).
     page_ink: f32,
     lines: Vec<MeasuredLine>,
     rotation: f32,
@@ -698,11 +723,20 @@ impl PageRead {
 
 /// Read the lines of ink of `ink`, which is the submitted page turned as `orientation`
 /// says, measuring every word back in the frame of the page as it was submitted.
+///
+/// The page's RULES are read first and struck out of the ink its characters are read from:
+/// a ruling line is page structure rather than text ([`rules`]), so it is never named as a
+/// character, never joins the marks of the row it bounds into one, and never stands in the
+/// frame, the pitch or the word separation the characters beside it are measured against —
+/// while a rule standing between two marks of a line is what tells that row's cells apart.
 fn recognise_page(
     ink: &Ink,
     orientation: Orientation,
     budget: &mut Budget,
 ) -> Result<PageRead, Unreadable> {
+    let ruled = ink.rules();
+    let struck = ink.without(&ruled);
+    let ink = struck.as_ref().unwrap_or(ink);
     let lines = ink.text_lines()?;
 
     let mut text = String::new();
@@ -711,7 +745,7 @@ fn recognise_page(
     let mut score_count = 0usize;
     let mut named_ink = 0.0f32;
     for line in &lines {
-        let Some(rendered) = line.render(ink, budget)? else {
+        let Some(rendered) = line.render(ink, &ruled, budget)? else {
             continue;
         };
         text.push_str(&rendered.text);
@@ -1234,6 +1268,12 @@ impl Ink {
     /// lossy coding puts between them — and it joins them into one mark. Whether such a
     /// column IS a bridge is established the way a rule is: by clearing it, and keeping the
     /// result only where what remains falls into more marks than before.
+    ///
+    /// A bridge stands BETWEEN two characters, so what makes a sliver one is a character's
+    /// own stroke on both sides of it inside the same run of ink. A sliver at the edge of a
+    /// run is part of the character it belongs to — the bar of a `T`, the crossbar of a `t`,
+    /// the arm of an `L`, a serif — and clearing it would trim that character to the one its
+    /// stem alone is shaped like rather than separate anything.
     fn without_hairlines(&self) -> Option<Self> {
         let mut cleared: Option<Vec<u8>> = None;
         for (top, bottom) in self.bands() {
@@ -1245,12 +1285,16 @@ impl Ink {
             // Measured once per column of the band, not once per look: the segmentation
             // below reads the mask a column at a time, over a page whose size the caller
             // chose.
-            let hairlines: Vec<bool> = (left..=right)
+            let inked: Vec<bool> = (left..=right)
+                .map(|x| (top..=bottom).any(|y| self.at(x, y)))
+                .collect();
+            let slivers: Vec<bool> = (left..=right)
                 .map(|x| {
                     let ink = (top..=bottom).filter(|y| self.at(x, *y)).count();
                     ink > 0 && (ink as f32) <= sliver
                 })
                 .collect();
+            let hairlines = bridges(&inked, &slivers);
             if !hairlines.iter().any(|bridge| *bridge) {
                 continue;
             }
@@ -1283,6 +1327,14 @@ impl Ink {
     /// characters; if it does not, the ink was part of one — the bar of a 'T', the crossbar
     /// of an 'H' — and it stays. A band too narrow to hold a line of characters
     /// ([`MIN_RULE_BAND_ASPECT`]) carries no rule at all, for the same reason.
+    ///
+    /// This is the case [`rules`] cannot measure, which is why both survive: a rule that is
+    /// told from a character by its own SHAPE — far out of square, and running clear past the
+    /// page's characters — is struck off the page before it is ever segmented, while the ink
+    /// taken out here is a run too short or too heavy for its shape to say, whose being a
+    /// rule is established only by what taking it out does to the marks of its own band. This
+    /// is offered as one READING of the page beside the page as it stands ([`Self::variants`])
+    /// rather than settled in advance, because that is all its evidence supports.
     fn without_rules(&self) -> Option<Self> {
         let mut cleaned: Option<Vec<u8>> = None;
         for (top, bottom) in self.bands() {
@@ -1573,15 +1625,16 @@ impl Ink {
     /// — a valley of the run's own profile — and carries little enough of what the run's own
     /// columns carry ([`CUT_VALLEY`]) to be the narrowing between two characters rather than
     /// the thin middle of one, as the inner strokes of an M or a W are. The list is the
-    /// deepest [`MAX_CUT_CANDIDATES`] of those, no two closer together than a character of
-    /// this line could be narrow, in column order; a cut nearer an end of the run than that
-    /// separates no character from the rest, so the ends are left out by the same measure
-    /// ([`MIN_PIECE_WIDTH`]).
+    /// deepest `most` of those (and never more than [`MAX_CUT_CANDIDATES`]), no two closer
+    /// together than a character of this line could be narrow, in column order; a cut nearer
+    /// an end of the run than that separates no character from the rest, so the ends are left
+    /// out by the same measure ([`MIN_PIECE_WIDTH`]).
     fn cut_candidates(
         &self,
         run: &GlyphBox,
         band: &InkLine,
         line: glyphs::Line,
+        most: usize,
     ) -> Vec<usize> {
         // At least one column either side: what a cut separates is two characters, so the
         // narrowest piece there can be is a column, and the column before the first of them
@@ -1618,9 +1671,10 @@ impl Ink {
                 .then_with(|| one.1.cmp(&other.1))
         });
         let apart = (MIN_PIECE_WIDTH * line.cap).max(1.0) as usize;
+        let most = most.min(MAX_CUT_CANDIDATES);
         let mut kept: Vec<usize> = Vec::new();
         for (_, x) in valleys {
-            if kept.len() >= MAX_CUT_CANDIDATES {
+            if kept.len() >= most {
                 break;
             }
             if kept.iter().any(|held| held.abs_diff(x) < apart) {
@@ -1631,6 +1685,43 @@ impl Ink {
         kept.sort_unstable();
         kept
     }
+}
+
+/// Which of a band's SLIVER columns bridge two characters: the ones with a character's own
+/// stroke on both sides of them inside the same run of ink.
+///
+/// `inked` and `slivers` are index-aligned, one entry per column of the band:
+/// `inked[column]` says the column carries ink at all, `slivers[column]` that all it carries
+/// is a sliver ([`MAX_HAIRLINE_SHARE`]). One pass each way, so a band costs its own columns
+/// rather than their square.
+fn bridges(inked: &[bool], slivers: &[bool]) -> Vec<bool> {
+    let mut before = vec![false; inked.len()];
+    let mut stroke = false;
+    for (column, inked) in inked.iter().enumerate() {
+        if !inked {
+            stroke = false;
+            continue;
+        }
+        before[column] = stroke;
+        if !slivers[column] {
+            stroke = true;
+        }
+    }
+    let mut after = vec![false; inked.len()];
+    let mut stroke = false;
+    for (column, inked) in inked.iter().enumerate().rev() {
+        if !inked {
+            stroke = false;
+            continue;
+        }
+        after[column] = stroke;
+        if !slivers[column] {
+            stroke = true;
+        }
+    }
+    (0..inked.len())
+        .map(|column| slivers[column] && before[column] && after[column])
+        .collect()
 }
 
 /// The threshold Otsu's method picks, and how far apart the classes it splits are.
@@ -1791,6 +1882,14 @@ struct Settled {
     glyph: GlyphBox,
     ink: f32,
     named: Option<glyphs::Named>,
+    /// Which run of ink this mark was CUT out of, where the cut settled that run's
+    /// characters: the index of that run among the line's own.
+    ///
+    /// Such a cut was taken because every piece of it names a character of this line better
+    /// than the whole run named one ([`LookInside`]), so the pieces are not weighed against
+    /// each other again by [`join`]: putting them back together would be the same comparison
+    /// answered the other way.
+    piece: Option<usize>,
 }
 
 impl Settled {
@@ -1854,23 +1953,47 @@ fn settle(
     )
     .unwrap_or(0.0);
     let mut cut: Vec<Settled> = Vec::new();
-    for (run, whole) in band.glyphs.iter().zip(whole) {
+    for (index, (run, whole)) in band.glyphs.iter().zip(whole).enumerate() {
         // Which readings of this run are worth taking. A run TOO WIDE to be one character of
         // its line holds more than one, and where its characters' strokes touch only a cut
-        // through the narrowing between them separates them. A run whose own name is
-        // UNCONVINCING — a clear margin worse than what the marks of the same line match at —
-        // may hold two characters that are no wider than one: what gives those away is not
-        // the width but that the character they were named as is not the ink they carry.
-        // Only the CONNECTED reading is taken for them, because ink that is not joined is
-        // evidence of two marks, while a cut through ink that is joined, offered to every
-        // middling mark of a page set in a face nothing here is a copy of, would read the
-        // pieces of one letter as the punctuation they are shaped like.
+        // through the narrowing between them separates them: every place such a run narrows
+        // is offered to the segmentation. A run whose own name falls SHORT of what the marks
+        // of the same line match at may hold two characters that are no wider than one — two
+        // narrow letters set tight read as the one letter their joined strokes are shaped
+        // like — and there the single deepest narrowing of its ink is offered: that is where
+        // two such characters divide, and offering one place rather than every place is what
+        // keeps a middling mark of a page set in a face nothing here is a copy of from being
+        // ground into the punctuation its pieces are shaped like. A run whose name is a clear
+        // margin worse than its line's ([`WEAK_MARK_MATCH`]) is read by its own connected
+        // regions too, since ink that is not joined is evidence of two marks.
+        let short = whole.named.is_none_or(|found| found.score < matched);
+        let weak = whole
+            .named
+            .is_none_or(|found| found.score < matched - WEAK_MARK_MATCH);
+        let wide = (run.width() as f32) > too_wide;
         let look = LookInside {
-            cuts: (run.width() as f32) > too_wide,
-            regions: (run.width() as f32) > too_wide
-                || whole
-                    .named
-                    .is_none_or(|found| found.score < matched - WEAK_MARK_MATCH),
+            cuts: if wide {
+                MAX_CUT_CANDIDATES
+            } else {
+                usize::from(short)
+            },
+            // A cut taken on a run that is NOT too wide is taken on the evidence that both
+            // of its pieces are characters of this line, so each of them has to be named as
+            // well as this line's own marks are ([`WEAK_MARK_MATCH`]) AND a clear margin
+            // better than the whole run was ([`CUT_PIECE_GAIN`]): without that, the one
+            // narrowing of a letter the face sets with a thin waist — a `g`, an `s` — would
+            // be read as the two marks of punctuation its halves are shaped like. A run too
+            // wide to be one character holds more than one whatever its pieces are named,
+            // and is cut on the width.
+            floor: if wide {
+                0.0
+            } else {
+                (matched - WEAK_MARK_MATCH)
+                    .max(whole.named.map_or(0.0, |found| found.score) + CUT_PIECE_GAIN)
+            },
+            letters: !wide,
+            settles: (!wide).then_some(index),
+            regions: wide || weak,
         };
         cut_apart(ink, band, whole, line, look, budget, &mut cut)?;
     }
@@ -1881,7 +2004,24 @@ fn settle(
 /// cuts through the places its ink narrows, the run's own connected regions, or neither.
 #[derive(Debug, Clone, Copy)]
 struct LookInside {
-    cuts: bool,
+    /// How many places inside the run — the deepest narrowings of its ink — the segmentation
+    /// may cut it at. Zero leaves the run uncut.
+    cuts: usize,
+    /// How well every piece of a cut must be named for that cut to be taken at all.
+    floor: f32,
+    /// Whether every piece of a cut must be a LETTER OR A FIGURE for that cut to be taken.
+    ///
+    /// What a cut separates is two characters of a word, and the words of a page are set with
+    /// letters and figures: ink that cuts into the marks of PUNCTUATION its halves are shaped
+    /// like — the diagonals of a `V`, the arcs of an `s`, the bowl and tail of a `g` — is one
+    /// character, which is what it stays. Asked of a run no wider than one character of its
+    /// line, where the only evidence of two characters is what the pieces are named.
+    letters: bool,
+    /// The run this look is into, where a cut taken here SETTLES that run's characters, so
+    /// that [`join`] does not weigh its pieces against each other again: `Some` where the
+    /// cut would be taken on the strength of the pieces' own names rather than on the run's
+    /// width.
+    settles: Option<usize>,
     regions: bool,
 }
 
@@ -1897,6 +2037,7 @@ fn name(
         named: glyphs::recognise(ink, &glyph, line),
         ink: ink.ink_in(&glyph),
         glyph,
+        piece: None,
     })
 }
 
@@ -1913,6 +2054,7 @@ fn name_region(
         named: glyphs::recognise_region(ink, region.glyph, line, &|x, y| region.holds(x, y)),
         ink: ink.ink_in_region(region),
         glyph: region.glyph,
+        piece: None,
     })
 }
 
@@ -1943,7 +2085,7 @@ fn cut_apart(
 ) -> Result<(), Unreadable> {
     // Nothing about this run says it holds more than one character: it is the mark it was
     // named as.
-    if !(look.cuts || look.regions) {
+    if look.cuts == 0 && !look.regions {
         out.push(whole);
         return Ok(());
     }
@@ -1977,8 +2119,12 @@ fn cut_apart(
     // one past its right edge, so the piece from `starts[i]` to `starts[j] - 1` is the ink
     // between two of them.
     let mut starts = vec![run.x0];
-    if look.cuts {
-        starts.extend(ink.cut_candidates(&run, band, line).into_iter().map(|at| at + 1));
+    if look.cuts > 0 {
+        starts.extend(
+            ink.cut_candidates(&run, band, line, look.cuts)
+                .into_iter()
+                .map(|at| at + 1),
+        );
     }
     starts.push(run.x1 + 1);
     let last = starts.len() - 1;
@@ -2012,6 +2158,18 @@ fn cut_apart(
                     continue;
                 }
                 let piece = name(ink, piece, line, budget)?;
+                // A cut separates two characters of this line, and a character of this line
+                // is named as well as the line's own marks are, and is a letter or a figure
+                // where the cut is taken on the naming alone: a piece that is neither is no
+                // character of a word, so the cut that would leave it is not taken (see
+                // [`LookInside::floor`] and [`LookInside::letters`]).
+                let character = piece.named.is_some_and(|found| {
+                    found.score >= look.floor
+                        && (!look.letters || found.ch.is_ascii_alphanumeric())
+                });
+                if !character {
+                    continue;
+                }
                 // What the cut at the END of this piece costs: the STROKE it crosses. Two
                 // characters whose ink runs together are bridged by the halo anti-aliasing
                 // leaves around their strokes, which is little ink past the floor that tells
@@ -2050,7 +2208,12 @@ fn cut_apart(
         let Some(piece) = named[at] else {
             break;
         };
-        out.push(piece);
+        out.push(Settled {
+            // Where this cut settles the run's characters, its pieces carry the run they came
+            // out of, so [`join`] does not put them back together.
+            piece: look.settles,
+            ..piece
+        });
         at = then[at];
     }
     Ok(())
@@ -2146,27 +2309,54 @@ fn joined(
     // Only PIECES are joined: two marks each as wide as a character of this line are two
     // characters, and two marks a letter's own side bearing apart are two marks. Which of
     // the two is the piece is not asked — a stroke breaks off either side of a letter.
+    //
+    // Two pieces one CUT settled are not weighed against each other again: that cut was taken
+    // because each of them names a character of this line better than the whole run named
+    // one, which is the same comparison this would answer the other way (see
+    // [`Settled::piece`]).
+    let settled = before.piece.is_some() && before.piece == after.piece;
     let narrow = |mark: &Settled| (mark.glyph.width() as f32) <= MAX_PIECE_WIDTH * line.cap;
     let piece = narrow(before) || narrow(after);
     let close = (after.glyph.x0.saturating_sub(before.glyph.x1 + 1) as f32)
         <= MAX_PIECE_GAP * line.cap;
     let fits = ((after.glyph.x1 + 1).saturating_sub(before.glyph.x0) as f32)
         <= glyphs::widest_glyph() * line.cap;
-    if !(piece && close && fits) {
+    if settled || !(piece && close && fits) {
         return Ok(None);
     }
     let Some(together) = ink.mark_in(before.glyph.x0, after.glyph.x1, band) else {
         return Ok(None);
     };
     let together = name(ink, together, line, budget)?;
-    // How much of the joined ink the one mark accounts for, beside the better of the two
-    // marks it is made of: the same ink either way, so what the two readings are compared on
-    // is how well it is named ([`Settled::value`]).
-    let gain = together.value() - before.value().max(after.value());
-    // Where BOTH marks are too narrow to be characters of this line, neither is one: the ink
-    // is one character's, broken in two — the diagonals a `V` falls into when its apex thins
-    // out, the bar and the stem of a broken `T` — and the pieces are joined wherever the
-    // whole accounts for that ink better than either piece does.
+    // How much of the joined ink the one mark accounts for, beside the marks it is made of:
+    // the same ink either way, so what the two readings are compared on is how well that ink
+    // is named ([`Settled::value`]).
+    //
+    // Which marks it is weighed against is what the two readings ARE. Where both marks name a
+    // CHARACTER OF A WORD — a letter or a figure, or a stem a word's own letter is what it
+    // would be read as ([`glyphs::Named::letter`]) — both readings are readings of the whole
+    // ink, one character or two, so the join is weighed against BOTH of them: weighing it
+    // against the better one alone would join any two characters whose ink one character
+    // middlingly fits, since one mark named over twice the ink is worth more than either of
+    // them however well each was named. Where a mark names no character of a word — a
+    // diagonal, a brace, ink that named nothing at all — it is no reading of its own but a
+    // piece of something, and the join is weighed against the better of the two, which is
+    // what tells a letter whose stroke broke from a narrow character the face set tight
+    // against its neighbour.
+    let character = |mark: &Settled| {
+        mark.named.is_some_and(|found| {
+            found.ch.is_ascii_alphanumeric() || (found.open && found.letter.is_some())
+        })
+    };
+    let gain = if character(before) && character(after) {
+        together.value() - (before.value() + after.value())
+    } else {
+        together.value() - before.value().max(after.value())
+    };
+    // Where BOTH marks are too narrow to be characters of this line, the ink can be one
+    // character's, broken in two — the diagonals a `V` falls into when its apex thins out,
+    // the bar and the stem of a broken `T` — and the pieces are joined wherever the whole
+    // accounts for that ink better than the marks it is made of do.
     if narrow(before) && narrow(after) && gain > 0.0 {
         return Ok(Some(Joined {
             mark: together,
@@ -2174,15 +2364,19 @@ fn joined(
         }));
     }
     // Where only ONE of them is narrow, that one is either a narrow CHARACTER the face set
-    // tight against its neighbour — an `I`, a `1` — or a piece that broke off it. What tells
-    // the two apart is how well the joined ink is named: the pieces of a letter whose stroke
-    // broke name that letter at least as well as the worse of them names what IT is shaped
-    // like, while two characters the face set tight are each named well and their joined ink
-    // is named worse than both, since one character's ink is not read as well as either of
-    // two characters' is. Going by the score of the pieces alone would report a mark the page
-    // never drew: what a thin stroke falling under the floor that tells ink from ground
-    // leaves is the ends of the strokes it joined, and those agree closely with the
-    // punctuation they are shaped like.
+    // tight against its neighbour — an `I`, a `1`, a point — or a piece that broke off it.
+    // Two things have to hold for it to be a piece. The joined ink must be named at least as
+    // well as the worse of the two is: the pieces of a letter whose stroke broke name that
+    // letter at least that well, while two characters the face set tight are each named well
+    // and their joined ink is named worse than both, since one character's ink is not read as
+    // well as either of two characters' is. Going by the score of the pieces alone would
+    // report a mark the page never drew: what a thin stroke falling under the floor that
+    // tells ink from ground leaves is the ends of the strokes it joined, and those agree
+    // closely with the punctuation they are shaped like. And the join must account for the
+    // ink BETTER than the two marks do, the same test the pieces of a broken stroke are
+    // joined by: without it a point the face set tight against the figure beside it — the
+    // point of an amount — would be swallowed into that figure, which is named well over
+    // nearly all of the joined ink however little of it the point is.
     //
     // A part that names nothing counts as named at nothing, so ink that matched no glyph is
     // joined into the character beside it wherever the joined ink names one.
@@ -2190,7 +2384,7 @@ fn joined(
     let whole = together
         .named
         .is_some_and(|found| found.score >= scored(before).min(scored(after)));
-    if !whole {
+    if !whole || gain <= 0.0 {
         return Ok(None);
     }
     Ok(Some(Joined {
@@ -2289,11 +2483,24 @@ impl RenderedLine {
 /// next to small letters is the small letter — except at the start of a word, where it is
 /// the capital that begins it — and a stem next to capitals is the capital. A stem standing
 /// in no word at all is left as it was named: nothing says it is a letter.
+///
+/// A mark INSIDE a word is a letter or a figure, since that is what the words of a page are
+/// set with — a BAR is not one of them, it is what a rule or a separator is drawn as — so an
+/// open reading there is read as the best letter or figure the mark's ink could be
+/// ([`glyphs::Named::letter`]). Only where that is itself one of the stems do the characters
+/// beside it settle which of them it is: a mark whose ink names a character of its own is
+/// that character, however nearly a stem the face draws it — the `t` of a face whose crossbar
+/// barely reaches past its own stem.
 fn settle_stems(marks: &[Settled], separated: &[(usize, Separation)]) -> Vec<(char, f32)> {
     let mut named: Vec<(char, f32)> = separated
         .iter()
         .filter_map(|(at, _)| marks[*at].named)
         .map(|found| (found.ch, found.score))
+        .collect();
+    let letters: Vec<Option<char>> = separated
+        .iter()
+        .filter_map(|(at, _)| marks[*at].named)
+        .map(|found| found.letter)
         .collect();
     let open: Vec<bool> = separated
         .iter()
@@ -2315,6 +2522,20 @@ fn settle_stems(marks: &[Settled], separated: &[(usize, Separation)]) -> Vec<(ch
             // Only a mark whose own shape left the reading open is read off its
             // neighbours: where the face told the stems apart, the shape decides.
             if !open[at] {
+                continue;
+            }
+            // A mark inside a word is a letter or a figure, so the reading is taken off the
+            // best of those the mark's ink could be. Where that is a character of its own
+            // rather than one of the stems, it IS the character: nothing about the
+            // neighbours says otherwise. Where it is a stem, the shape's own reading stands
+            // for the neighbours to settle below, since what the shape said about which
+            // stem — a tail on the l, a serif on the I, neither on the bar — is what the
+            // position is read against.
+            let Some(letter) = letters[at] else {
+                continue;
+            };
+            if !glyphs::STEMS.contains(&letter) {
+                named[at].0 = letter;
                 continue;
             }
             // What stands NEAREST it, either side, skipping the stems whose own reading is
@@ -2487,9 +2708,65 @@ impl Separated {
 }
 
 impl InkLine {
+    /// How many CELLS the rules `crossing` this line separate the mark ending at column
+    /// `before` from the mark starting at column `after` by.
+    ///
+    /// A ruling line drawn between two marks of a row is the boundary of the cells they
+    /// stand in, whatever the gap between them measures, and two rules with no mark between
+    /// them bound a cell nothing was drawn in — so the count is the number of rules crossed
+    /// rather than whether any was.
+    ///
+    /// `crossing` is in column order, so the rules standing in one gap are a RUN of it: the
+    /// run is found by a search and walked only as far as the gap reaches. Reading a line
+    /// therefore costs its own marks and the rules that really stand between them rather than
+    /// the product of the two counts.
+    ///
+    /// A cell at either END of a row is bounded by one rule and the table's own border
+    /// rather than by two marks, so the ends are counted on their own
+    /// ([`Self::outside`]).
+    fn divided(crossing: &[&Rule], before: usize, after: usize) -> usize {
+        let from = crossing.partition_point(|rule| rule.left() <= before);
+        crossing
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|rule| rule.left() < after)
+            .filter(|rule| rule.divides(before, after))
+            .count()
+    }
+
+    /// How many CELLS of a ruled row stand OUTSIDE its marks on one side: the rules standing
+    /// clear of them, less the outermost, which is the table's own border.
+    ///
+    /// A row whose first or last cell was left empty is bounded there by a rule and that
+    /// border rather than by two marks, so counting only the rules BETWEEN two marks would
+    /// report one cell too few and shift every `ColumnIndex` after it. `beyond` says which
+    /// side is meant: the rules that end before the row's first mark, or the ones that begin
+    /// after its last.
+    fn outside(crossing: &[&Rule], beyond: impl Fn(&Rule) -> bool) -> usize {
+        crossing
+            .iter()
+            .filter(|rule| beyond(rule))
+            .count()
+            .saturating_sub(1)
+    }
+
     /// Recognise this line: its characters, and the word and column breaks between them.
     /// `Ok(None)` when nothing in the line matched a glyph, so the line carries no text.
-    fn render(&self, ink: &Ink, budget: &mut Budget) -> Result<Option<RenderedLine>, Unreadable> {
+    ///
+    /// `ruled` are the rules drawn on the page, which delimit this line's cells.
+    fn render(
+        &self,
+        ink: &Ink,
+        ruled: &[Rule],
+        budget: &mut Budget,
+    ) -> Result<Option<RenderedLine>, Unreadable> {
+        // The rules that cross THIS line, in column order: taken once for the line rather
+        // than once per mark of it.
+        let crossing: Vec<&Rule> = ruled
+            .iter()
+            .filter(|rule| rule.crosses(self.top, self.bottom))
+            .collect();
         // Where this line sets its characters, which is the frame each of its marks is
         // measured and named in.
         let line = glyphs::line_of(&self.glyphs, self.top, self.bottom);
@@ -2520,18 +2797,36 @@ impl InkLine {
             let starts_word = if step == 0 {
                 let indent = ((glyph.x0 as f32 / cell).round() as usize).min(MAX_INDENT);
                 text.push_str(&" ".repeat(indent));
+                // The cells the row's ruling lines bound to the LEFT of its first mark, each
+                // one a cell nothing was drawn in.
+                let leading = Self::outside(&crossing, |rule| rule.right() < glyph.x0);
+                for _ in 0..leading.min(MAX_INDENT) {
+                    text.push('\t');
+                }
                 true
             } else {
-                match separation {
-                    Separation::Column => {
-                        text.push('\t');
+                // A rule drawn down the page between this mark and the one before it is the
+                // boundary of two CELLS of a ruled row, so it separates them into columns
+                // whatever their own gap measures.
+                let before = &marks[separated[step - 1].0].glyph;
+                match Self::divided(&crossing, before.x1, glyph.x0) {
+                    0 => match separation {
+                        Separation::Column => {
+                            text.push('\t');
+                            true
+                        }
+                        Separation::Word => {
+                            text.push(' ');
+                            true
+                        }
+                        Separation::None => false,
+                    },
+                    crossed => {
+                        for _ in 0..crossed.min(MAX_INDENT) {
+                            text.push('\t');
+                        }
                         true
                     }
-                    Separation::Word => {
-                        text.push(' ');
-                        true
-                    }
-                    Separation::None => false,
                 }
             };
             text.push(ch);
@@ -2545,6 +2840,14 @@ impl InkLine {
         }
         if score_count == 0 {
             return Ok(None);
+        }
+        // The cells the row's ruling lines bound to the RIGHT of its last mark, counted the
+        // same way as the ones to the left of its first.
+        if let Some(last) = separated.last().map(|(at, _)| marks[*at].glyph) {
+            let trailing = Self::outside(&crossing, |rule| rule.left() > last.x1);
+            for _ in 0..trailing.min(MAX_INDENT) {
+                text.push('\t');
+            }
         }
         Ok(Some(RenderedLine {
             text,
@@ -2614,7 +2917,10 @@ enum Separation {
 ///   bearings and a cluster of spaces, and the boundary between the two is where the line
 ///   separates its words ([`Separators::clustered_gap`]). A line that shows no such
 ///   boundary is separated at a fixed part of its pitch ([`WORD_GAP_PITCH`]), which is
-///   what a line of one word needs so that nothing inside it is read as a space. Its
+///   what a line of one word needs so that nothing inside it is read as a space; and
+///   either way the boundary stands clear of the line's own typical gap by the width of
+///   the narrowest space a face sets ([`MIN_SPACE_PITCH`]), since a space is a bearing and
+///   a space's own advance where a bearing is the bearing alone. Its
 ///   FIGURES are the exception, since a proportional face sets those on one advance all the
 ///   same: they are separated by their STEP past that advance
 ///   ([`Separators::between_set_on`]).
@@ -2648,9 +2954,44 @@ impl Separators {
             Some(cell) => Self::Monospaced { cell },
             None => Self::Proportional {
                 pitch,
-                word: Self::clustered_gap(gaps, pitch).unwrap_or(WORD_GAP_PITCH * pitch),
+                word: Self::word_gap(gaps, pitch),
             },
         }
+    }
+
+    /// The gap at which a PROPORTIONAL line separates its words: the boundary its own gaps
+    /// cluster at ([`clustered_gap`](Self::clustered_gap)), or a fixed part of its pitch
+    /// where they show none ([`WORD_GAP_PITCH`]), held clear of the BEARINGS it separates.
+    ///
+    /// A space's gap is a bearing AND a space's own advance, where a bearing is the bearing
+    /// alone, so the boundary is never below the typical bearing of this line plus the
+    /// narrowest space a face sets ([`MIN_SPACE_PITCH`]). Without that a line whose narrow
+    /// letters leave wide bearings — an `l`, an `i`, a point, each inking a sliver of its own
+    /// advance — has those bearings read as spaces, which breaks its words in two.
+    ///
+    /// Which gaps the bearings ARE is what the boundary says, so raising it takes more gaps
+    /// into them and the two are settled together: the boundary is raised until it stands
+    /// clear of the bearings below it, which is where it stops moving. A fixed few passes
+    /// ([`GAP_PASSES`]), since each one takes in more gaps than the last and a line has as
+    /// many distinct gaps as it has marks.
+    fn word_gap(gaps: &[usize], pitch: f32) -> f32 {
+        let mut word = Self::clustered_gap(gaps, pitch).unwrap_or(WORD_GAP_PITCH * pitch);
+        for _ in 0..GAP_PASSES {
+            let bearings: Vec<f32> = gaps
+                .iter()
+                .map(|gap| *gap as f32)
+                .filter(|gap| *gap < word)
+                .collect();
+            let Some(typical) = median_of(&bearings) else {
+                break;
+            };
+            let clear = typical + MIN_SPACE_PITCH * pitch;
+            if clear <= word {
+                break;
+            }
+            word = clear;
+        }
+        word
     }
 
     /// The gap at which a PROPORTIONAL line separates its words, read off the clusters its
