@@ -79,14 +79,16 @@ const REGISTRATION_ROLE: &str = "LakeFormationDataAccessRole";
 const LAKE_FORMATION_PRINCIPAL: &str = "lakeformation.amazonaws.com";
 
 /// The identity-based permissions a reader needs before Lake Formation decides anything: it
-/// has to be allowed to START a query and to READ the catalog's metadata, which is the pairing
-/// AWS's own `AmazonAthenaFullAccess` grants (`athena:*` beside `glue:Get*`).
+/// has to be allowed to START a query, to READ the catalog's metadata and to WRITE the
+/// query's results, which is the pairing AWS's own `AmazonAthenaFullAccess` grants (`athena:*`
+/// beside `glue:Get*` and the object write Athena saves a query's results with).
 fn reader_policy() -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [
             { "Effect": "Allow", "Action": "athena:*", "Resource": "*" },
             { "Effect": "Allow", "Action": "glue:Get*", "Resource": "*" },
+            { "Effect": "Allow", "Action": "s3:PutObject", "Resource": "*" },
         ],
     })
     .to_string()

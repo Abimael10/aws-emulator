@@ -100,6 +100,9 @@ impl Pairing {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
+        // Athena verifies the resolved output location before it accepts a submission, so
+        // the bucket this suite's location names is held before its first query runs.
+        crate::results_bucket::hold_results_bucket(&engine, OUTPUT_LOCATION);
         router.register_service(
             service_com_amazonaws_athena_amazonathena::EmulatedService::new(Arc::clone(&engine)),
         );

@@ -34,9 +34,12 @@
 //!    ([`::service_common::iam_authorization`]), so it is worded here exactly as every other
 //!    gate of this tree words the same decision.
 //!
-//! Only the account's own Glue Data Catalog is gated here. A catalog whose metadata an
-//! external metastore serves is not Glue's to authorize, and a catalog name this account
-//! registered nothing for fails to resolve on its own
+//! Only a GLUE Data Catalog's actions are Glue's to authorize, and the ACCOUNT whose catalog
+//! a statement reaches is the account the resources are named under: a registered `GLUE`
+//! catalog naming another account's catalog id is reached with the caller's own identity on
+//! THAT account's catalog, database and table ([`super::catalog_sql::glue_catalog_id`]). A
+//! catalog whose metadata an external metastore serves is not Glue's to authorize, and a
+//! catalog name this account registered nothing for fails to resolve on its own
 //! ([`super::catalog_sql::Failure::catalog_not_found`]).
 
 use ::service_common::iam_authorization as iam;
@@ -90,6 +93,14 @@ const TABLE_RESOURCE_TYPE: &str = "table";
 /// Call it from the handler, BEFORE the statement is run: the answer rests on the request's
 /// own credential, which the run itself has no context to read. A statement that reaches no
 /// catalog at all needs no decision and is never refused here.
+///
+/// TWO halves, in IAM's own order for a call on a resource of another account: the caller's
+/// identity-based documents, and — for a catalog that belongs to ANOTHER ACCOUNT — that
+/// account's own grant of the catalog, which it makes with a resource-based policy. A
+/// cross-account read needs both ("you must grant permissions in the resource policy of the
+/// account that owns the resource"), and this emulator holds no other account's Data Catalog
+/// and therefore no grant it could have made, so a statement that reaches one is refused in
+/// the second half ([`no_cross_account_grant`]).
 pub fn refusal<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -100,8 +111,23 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     if asked.is_empty() {
         return None;
     }
-    let refused = authorization::first_refusal(engine, ctx, &asked)?;
-    Some(insufficient_permissions(&refused))
+    if let Some(refused) = authorization::first_refusal(engine, ctx, &asked) {
+        return Some(insufficient_permissions(&refused));
+    }
+    // The FIRST action the statement performs on a resource of another account, which is
+    // where such a statement stops.
+    let (action, resource) = asked
+        .iter()
+        .find(|(_, resource)| names_another_account(resource))?;
+    let principal = authorization::caller_principal(engine, ctx);
+    Some(no_cross_account_grant(&principal, action, resource))
+}
+
+/// Whether `resource` is the ARN of a resource of an account OTHER than the one this emulator
+/// serves — the only account whose Data Catalog it holds, and so the only one that can have
+/// granted anything.
+fn names_another_account(resource: &str) -> bool {
+    !resource.contains(&format!(":{}:", ::engine::emulator_account_id()))
 }
 
 /// The `(action, resource)` pairs the statement `reading` planned performs against the Data
@@ -126,13 +152,22 @@ fn needed<Eng: Send + Sync + 'static>(
                 // The catalog's own reporting schema is not a catalog entry: a statement
                 // reads it to be told what the catalog holds, and what it is shown is each
                 // database and table the reads below are decided on.
-                if relation.is_information_schema() || !holds_metadata(engine, relation) {
+                if relation.is_information_schema() {
                     continue;
                 }
+                // WHOSE catalog the relation lives in: a statement over a catalog no Glue
+                // Data Catalog serves needs no Glue permission at all.
+                let Some(account) = catalog_account(engine, &relation.catalog) else {
+                    continue;
+                };
                 // Resolving a relation reads the database it names and then the table in it,
                 // which is the order the plan reaches them in.
-                push(&mut asked, GET_DATABASE, database_arns(region, &relation.database));
-                push(&mut asked, GET_TABLE, table_arns(region, relation));
+                push(
+                    &mut asked,
+                    GET_DATABASE,
+                    database_arns(&account, region, &relation.database),
+                );
+                push(&mut asked, GET_TABLE, table_arns(&account, region, relation));
             }
         }
         Plan::Catalog(statement) => {
@@ -155,28 +190,37 @@ fn catalog_statement_action(
     statement: &CatalogStatement,
     region: &str,
 ) -> (&'static str, Vec<String>) {
+    // A statement the CATALOG performs is performed on the catalog its target names, which
+    // for every such statement is one this account holds: a definition or a drop in another
+    // account's catalog is not something this service performs.
+    let account = ::engine::emulator_account_id();
     match statement {
         CatalogStatement::CreateDatabase(database) => (
             CREATE_DATABASE,
-            database_arns(region, &database.target.database),
+            database_arns(account, region, &database.target.database),
         ),
-        CatalogStatement::DropDatabase { target, .. } => {
-            (DELETE_DATABASE, database_arns(region, &target.database))
-        }
+        CatalogStatement::DropDatabase { target, .. } => (
+            DELETE_DATABASE,
+            database_arns(account, region, &target.database),
+        ),
         CatalogStatement::ShowDatabases { .. } => {
-            (GET_DATABASES, vec![catalog_arn(region)])
+            (GET_DATABASES, vec![catalog_arn(account, region)])
         }
         CatalogStatement::CreateExternalTable(table) => {
-            (CREATE_TABLE, table_arns(region, &table.target))
+            (CREATE_TABLE, table_arns(account, region, &table.target))
         }
-        CatalogStatement::CreateView(view) => (CREATE_TABLE, table_arns(region, &view.target)),
+        CatalogStatement::CreateView(view) => {
+            (CREATE_TABLE, table_arns(account, region, &view.target))
+        }
         CatalogStatement::DropTable { target, .. }
         | CatalogStatement::DropView { target, .. } => {
-            (DELETE_TABLE, table_arns(region, target))
+            (DELETE_TABLE, table_arns(account, region, target))
         }
-        CatalogStatement::ShowCreateView { target } => (GET_TABLE, table_arns(region, target)),
+        CatalogStatement::ShowCreateView { target } => {
+            (GET_TABLE, table_arns(account, region, target))
+        }
         CatalogStatement::ShowRelations { schema, .. } => {
-            (GET_TABLES, database_arns(region, &schema.database))
+            (GET_TABLES, database_arns(account, region, &schema.database))
         }
     }
 }
@@ -192,26 +236,38 @@ fn push(asked: &mut Vec<(String, String)>, action: &str, resources: Vec<String>)
     }
 }
 
-/// Whether this emulator serves the metadata of the data catalog `relation` lives in as the
-/// account's own Glue Data Catalog, which is the only catalog whose actions are Glue's.
-fn holds_metadata<Eng: Send + Sync + 'static>(engine: &Eng, relation: &Relation) -> bool {
-    super::catalog_sql::catalog_id(engine, &relation.catalog).is_some()
+/// The ACCOUNT whose Glue Data Catalog the data catalog `catalog` names, or `None` when it
+/// names no Glue Data Catalog at all — a catalog an external metastore serves, or a name
+/// nothing registered.
+///
+/// A Glue `CatalogId` IS an account id, so the catalog id the name resolves to is the account
+/// its resources are published under ([`super::catalog_sql::glue_catalog_id`]). That is what
+/// makes a CROSS-ACCOUNT catalog decided on the other account's resources: a caller holding
+/// `glue:Get*` on its own catalog holds nothing on another account's, which is the permission
+/// a cross-account read needs.
+fn catalog_account<Eng: Send + Sync + 'static>(engine: &Eng, catalog: &str) -> Option<String> {
+    super::catalog_sql::glue_catalog_id(engine, catalog)
 }
 
-/// The ARNs an action on the database `database` is performed on: the catalog, and the
-/// database itself.
-fn database_arns(region: &str, database: &str) -> Vec<String> {
+/// The ARNs an action on the database `database` of `account` is performed on: the catalog,
+/// and the database itself.
+fn database_arns(account: &str, region: &str, database: &str) -> Vec<String> {
     vec![
-        catalog_arn(region),
-        glue_arn(region, &format!("{DATABASE_RESOURCE_TYPE}/{database}")),
+        catalog_arn(account, region),
+        glue_arn(
+            account,
+            region,
+            &format!("{DATABASE_RESOURCE_TYPE}/{database}"),
+        ),
     ]
 }
 
 /// The ARNs an action on one table is performed on: the catalog, the database that holds it,
 /// and the table itself.
-fn table_arns(region: &str, relation: &Relation) -> Vec<String> {
-    let mut arns = database_arns(region, &relation.database);
+fn table_arns(account: &str, region: &str, relation: &Relation) -> Vec<String> {
+    let mut arns = database_arns(account, region, &relation.database);
     arns.push(glue_arn(
+        account,
         region,
         &format!(
             "{TABLE_RESOURCE_TYPE}/{}/{}",
@@ -221,15 +277,26 @@ fn table_arns(region: &str, relation: &Relation) -> Vec<String> {
     arns
 }
 
-/// The ARN of the account's own Glue Data Catalog in `region`.
-fn catalog_arn(region: &str) -> String {
-    glue_arn(region, CATALOG_RESOURCE)
+/// The ARN of `account`'s Glue Data Catalog in `region`.
+fn catalog_arn(account: &str, region: &str) -> String {
+    glue_arn(account, region, CATALOG_RESOURCE)
 }
 
-/// One Glue ARN, built through the one place this emulator forms an ARN, so the account
-/// segment is the canonical one every service of it presents.
-fn glue_arn(region: &str, resource: &str) -> String {
-    ::engine::emulator_arn(GLUE, region, resource)
+/// One Glue ARN of `account`.
+///
+/// Built through [`::engine::emulator_arn`] for this account's own resources, so the account
+/// segment is the canonical one every ARN of this emulator carries; a resource of ANOTHER
+/// account carries that account's id in the same form, which is the only thing that
+/// distinguishes the two.
+fn glue_arn(account: &str, region: &str, resource: &str) -> String {
+    let local = ::engine::emulator_arn(GLUE, region, resource);
+    if account == ::engine::emulator_account_id() {
+        return local;
+    }
+    local.replace(
+        &format!(":{}:", ::engine::emulator_account_id()),
+        &format!(":{account}:"),
+    )
 }
 
 /// What Athena says in front of IAM's own sentence when a query could not be planned
@@ -269,6 +336,20 @@ fn insufficient_permissions(refused: &authorization::Refusal) -> String {
     format!("{QUERY_NOT_EXECUTED} {refusal}{closing}")
 }
 
+/// The reason a query that reaches another ACCOUNT's Data Catalog settles FAILED with when
+/// that account has granted it nothing.
+///
+/// The same shape [`insufficient_permissions`] states, over the OTHER half of a cross-account
+/// decision: the sentence that says the query could not be executed, then IAM's own sentence
+/// for a resource whose owner grants the caller nothing — who asked, which action, which
+/// resource — which is the shared one ([`::service_common::iam_authorization`]) so every
+/// service that reaches this decision words it alike. It closes with the same separator a
+/// refusal no policy allowed carries ([`CONDITION_CLAUSE_SEPARATOR`]).
+fn no_cross_account_grant(principal: &str, action: &str, resource: &str) -> String {
+    let refusal = iam::not_authorized_by_resource_policy(principal, action, resource);
+    format!("{QUERY_NOT_EXECUTED} {refusal}{CONDITION_CLAUSE_SEPARATOR}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,8 +364,9 @@ mod tests {
     }
 
     /// The `(action, resource)` pairs the statement `sql` needs of the catalog, with the
-    /// catalog resolution left out — what the statement itself asks for.
-    fn asked(sql: &str) -> Vec<(String, String)> {
+    /// catalog resolution left out — what the statement itself asks for, in the account whose
+    /// catalog it reaches.
+    fn asked_of(account: &str, sql: &str) -> Vec<(String, String)> {
         let reading = statement::read(sql, &context());
         let region = "us-east-1";
         match &reading.plan {
@@ -298,9 +380,9 @@ mod tests {
                     push(
                         &mut asked,
                         GET_DATABASE,
-                        database_arns(region, &relation.database),
+                        database_arns(account, region, &relation.database),
                     );
-                    push(&mut asked, GET_TABLE, table_arns(region, relation));
+                    push(&mut asked, GET_TABLE, table_arns(account, region, relation));
                 }
                 asked
             }
@@ -311,6 +393,11 @@ mod tests {
                 asked
             }
         }
+    }
+
+    /// The same, for a statement over the catalog this account holds.
+    fn asked(sql: &str) -> Vec<(String, String)> {
+        asked_of(::engine::emulator_account_id(), sql)
     }
 
     /// The actions of `asked`, in order and without their resources.
@@ -468,6 +555,48 @@ mod tests {
         );
     }
 
+    /// RULE: the ACCOUNT an ARN names is the account whose Data Catalog the statement reaches,    /// so a statement over a catalog of another account is decided on THAT account's catalog,
+    /// database and table — which is what a caller holding grants on its own catalog alone
+    /// does not hold.
+    #[test]
+    fn the_account_asked_about_is_the_one_whose_catalog_the_statement_reaches() {
+        // The rows differ along whose catalog the statement reaches: this account's, and two
+        // other accounts'.
+        for account in [
+            ::engine::emulator_account_id(),
+            "100000000000",
+            "210987654321",
+        ] {
+            let actual = asked_of(account, "SELECT * FROM logs.events");
+            let expected: Vec<(String, String)> = vec![
+                (
+                    "glue:GetDatabase".to_string(),
+                    format!("arn:aws:glue:us-east-1:{account}:catalog"),
+                ),
+                (
+                    "glue:GetDatabase".to_string(),
+                    format!("arn:aws:glue:us-east-1:{account}:database/logs"),
+                ),
+                (
+                    "glue:GetTable".to_string(),
+                    format!("arn:aws:glue:us-east-1:{account}:catalog"),
+                ),
+                (
+                    "glue:GetTable".to_string(),
+                    format!("arn:aws:glue:us-east-1:{account}:database/logs"),
+                ),
+                (
+                    "glue:GetTable".to_string(),
+                    format!("arn:aws:glue:us-east-1:{account}:table/logs/events"),
+                ),
+            ];
+            assert_eq!(
+                actual, expected,
+                "case {account:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
     /// RULE: the reason names the caller, the action and the resource IAM refused, and which
     /// of IAM's two ways of reaching a deny refused it.
     #[test]
@@ -510,5 +639,46 @@ mod tests {
                 "case {case:?}: expected the reason {expected:?}, got {actual:?}"
             );
         }
+    }
+
+    /// RULE: a statement that reaches another ACCOUNT's Data Catalog is refused on that
+    /// account's own grant — the half of a cross-account decision the resource owner makes —
+    /// so the reason names the caller, the action and the resource of that account, in IAM's
+    /// own wording for a resource whose owner grants nothing. The rows differ along which
+    /// account's resource is addressed and which of it the statement reached.
+    #[test]
+    fn a_cross_account_catalog_is_refused_on_the_grant_its_owner_never_made() {
+        let principal =
+            "arn:aws:sts::000000000000:assumed-role/analyst/athena-session".to_string();
+        for (account, action, resource_type) in [
+            ("100000000000", "glue:GetDatabase", "catalog"),
+            ("100000000000", "glue:GetTable", "table/logs/events"),
+            ("210987654321", "glue:GetDatabase", "database/logs"),
+        ] {
+            let resource = format!("arn:aws:glue:us-east-1:{account}:{resource_type}");
+            assert!(
+                names_another_account(&resource),
+                "case {resource:?}: expected a resource of another account"
+            );
+            let actual = no_cross_account_grant(&principal, action, &resource);
+            let expected = format!(
+                "Insufficient permissions to execute the query. User: {principal} is not \
+                 authorized to perform: {action} on resource: {resource} because no \
+                 resource-based policy allows the {action} action "
+            );
+            assert_eq!(
+                actual, expected,
+                "case {resource:?}: expected the reason {expected:?}, got {actual:?}"
+            );
+        }
+        // This account's own resources are not cross-account, so nothing here decides them.
+        let own = format!(
+            "arn:aws:glue:us-east-1:{}:catalog",
+            ::engine::emulator_account_id()
+        );
+        assert!(
+            !names_another_account(&own),
+            "case {own:?}: this account's own catalog is not another account's"
+        );
     }
 }

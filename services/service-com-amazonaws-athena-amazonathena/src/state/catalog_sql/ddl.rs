@@ -708,26 +708,53 @@ fn view_columns(
 /// The type recorded for a view column whose type no source names.
 const UNKNOWN_COLUMN_TYPE: &str = "string";
 
-/// The columns a stored catalog entry holds.
+/// The columns a stored catalog entry holds in its STORAGE DESCRIPTOR — the columns whose
+/// values the objects at the table's location carry, without the partition keys declared
+/// beside them ([`partition_key_columns`]).
 pub fn table_columns(table: &glue_state::TableEntry) -> Vec<DeclaredColumn> {
     table
         .storage_descriptor
         .as_ref()
         .and_then(|storage| storage.columns.as_ref())
-        .map(|columns| {
-            columns
-                .iter()
-                .map(|column| DeclaredColumn {
-                    name: column.name.clone(),
-                    data_type: column
-                        .r#type
-                        .clone()
-                        .unwrap_or_else(|| UNKNOWN_COLUMN_TYPE.to_string()),
-                    comment: column.comment.clone(),
-                })
-                .collect()
-        })
+        .map(|columns| columns.iter().map(declared_column).collect())
         .unwrap_or_default()
+}
+
+/// The PARTITION KEY columns a stored catalog entry declares (`Table$PartitionKeys`), in
+/// the order they address a partition.
+///
+/// A Hive table's partition keys are columns of the table like any others — a statement
+/// projects them, filters on them and aggregates by them — and what distinguishes them is
+/// only where their values come from: the partition a row's object belongs to rather than
+/// the object's own records (see `super::data`).
+pub fn partition_key_columns(table: &glue_state::TableEntry) -> Vec<DeclaredColumn> {
+    table
+        .partition_keys
+        .iter()
+        .flatten()
+        .map(declared_column)
+        .collect()
+}
+
+/// Every column a statement addresses a stored catalog entry by: the storage descriptor's,
+/// and then the partition keys — the order Hive presents a partitioned table's columns in,
+/// which is also the order `SELECT *` expands to.
+pub fn relation_columns(table: &glue_state::TableEntry) -> Vec<DeclaredColumn> {
+    let mut columns = table_columns(table);
+    columns.extend(partition_key_columns(table));
+    columns
+}
+
+/// One stored catalog column as the declaration a read of the table is planned against.
+fn declared_column(column: &GlueColumn) -> DeclaredColumn {
+    DeclaredColumn {
+        name: column.name.clone(),
+        data_type: column
+            .r#type
+            .clone()
+            .unwrap_or_else(|| UNKNOWN_COLUMN_TYPE.to_string()),
+        comment: column.comment.clone(),
+    }
 }
 
 /// The catalog definition a `CREATE VIEW` writes.

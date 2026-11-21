@@ -99,6 +99,9 @@ fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
+    // Athena verifies the resolved output location before it accepts a submission, so the
+    // bucket this suite's results location names is held before its first query runs.
+    crate::athena_results_bucket::hold_results_bucket(&engine, RESULTS_LOCATION);
     router.register_service(service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(
         Arc::clone(&engine),
     ));

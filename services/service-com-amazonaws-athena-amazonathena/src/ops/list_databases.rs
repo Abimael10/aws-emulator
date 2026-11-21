@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatabases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatabases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatabases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: lists the databases of the data catalog the request addresses, out of the
+//! store that HOLDS them. Athena registers no databases of its own, so the catalog a
+//! metadata read resolves to — the account's Glue Data Catalog, or a registered `GLUE`
+//! catalog naming the same catalog id — IS the Glue Data Catalog, and every database this
+//! listing reports is one the catalog persisted ([`crate::state::to_database`]); a catalog
+//! whose metadata this emulator does not host is the metastore's answer, and a name nothing
+//! registered is a problem with the input. The page is the same deterministic one
+//! `crate::ops::list_table_metadata` pages its tables by: the stored order, resumed at the
+//! name the previous page ended on.
 //!
 //! ## Shape of an operation
 //!
@@ -89,6 +89,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use ::service_com_amazonaws_glue_awsglue::state as glue_state;
+
+/// The largest page this operation serves, and the page size it uses when the request
+/// names no `MaxResults`. Source: the model's `MaxResults` target `MaxDatabasesCount`,
+/// whose range is 1..50.
+const MAX_PAGE_SIZE: i32 = 50;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,20 +164,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatabases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatabasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatabases"))
+        // Where this read's metadata comes from is decided by the catalog the request
+        // names and the registry this account holds, not by this operation — the same
+        // resolution `crate::ops::list_table_metadata` takes, so one catalog name reads
+        // alike whichever metadata listing addresses it.
+        let catalog_id = {
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return Err(internal_server("Athena state is not reachable on this engine"));
+            };
+            // The registry's lock is taken and released here, before the catalog's own
+            // store is reached, so no two stores are ever held at once.
+            let store = state.lock();
+            match crate::state::metadata_source(&store.data_catalogs, &input.catalog_name) {
+                crate::state::MetadataSource::GlueDataCatalog(catalog_id) => catalog_id,
+                crate::state::MetadataSource::ExternalMetastore(catalog_type) => {
+                    return Err(metadata_exception(crate::state::metastore_unreachable(
+                        &input.catalog_name,
+                        &catalog_type,
+                    )));
+                }
+                crate::state::MetadataSource::ForeignGlueCatalog(catalog_id) => {
+                    return Err(metadata_exception(crate::state::foreign_glue_catalog(
+                        &input.catalog_name,
+                        &catalog_id,
+                    )));
+                }
+                crate::state::MetadataSource::Unregistered => {
+                    return Err(invalid_request(crate::state::data_catalog_not_found(
+                        &input.catalog_name,
+                    )));
+                }
+            }
+        };
+
+        // Absent `MaxResults`, page at the largest value the model accepts for it
+        // (`MaxDatabasesCount`, range 1..50). The clamp re-states that range in the
+        // handler so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let Some(catalog) = glue_state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the Glue Data Catalog store is not reachable on this engine",
+            ));
+        };
+        let catalog = catalog.lock();
+        // A catalog id the Glue store holds nothing under holds no database either, which
+        // is the metastore's answer rather than a bad request.
+        let Some(held) = catalog.catalogs.get(&catalog_id) else {
+            return Err(metadata_exception(crate::state::foreign_glue_catalog(
+                &input.catalog_name,
+                &catalog_id,
+            )));
+        };
+        let stored = held.databases_ordered();
+
+        // The token is the last name of the previous page, so the page resumes at the
+        // first stored name strictly after it — which stays correct across databases
+        // created or deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => stored.partition_point(|database| database.name.as_str() <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(stored.len());
+
+        let page = &stored[start..end];
+        let database_list: Vec<Database> = page
+            .iter()
+            .map(|held| crate::state::to_database(held))
+            .collect();
+        // The token names the last entry of the page, taken from the page itself so there
+        // is no index arithmetic to underflow on an empty page.
+        let next_token = if end < stored.len() {
+            page.last().map(|database| database.name.clone())
+        } else {
+            None
+        };
+
+        Ok(ListDatabasesOutput {
+            database_list: Some(database_list),
+            next_token,
+        })
     }
+}
+
+/// The operation's own client error (HTTP 400) for a request Athena itself refuses:
+/// "Indicates that something is wrong with the input to the request." The catalog this
+/// listing refuses on is the request's own member, so the refusal carries the code for a
+/// request at fault ([`crate::state::ERROR_CODE_INVALID_INPUT`]).
+fn invalid_request(message: impl Into<String>) -> ListDatabasesError {
+    ListDatabasesError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
+}
+
+/// The operation's own client error (HTTP 400) for what the METASTORE answered: "An
+/// exception that Athena received when it called a custom metastore. Occurs if the error
+/// is not caused by user input (InvalidRequestException) or from the Athena platform."
+fn metadata_exception(message: impl Into<String>) -> ListDatabasesError {
+    ListDatabasesErrorModeled::MetadataException(MetadataException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The operation's own server error (HTTP 500): "Indicates a platform issue, which may be
+/// due to a transient condition or outage."
+fn internal_server(message: &str) -> ListDatabasesError {
+    ListDatabasesErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

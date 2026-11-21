@@ -89,6 +89,9 @@ fn router() -> MultiServiceRouter {
     // Pinned off so the suite does not depend on how the emulator process was started;
     // these tests assert Athena's behaviour, not the emulator's SigV4 check.
     router.set_request_authentication(false);
+    // Athena verifies the resolved output location before it accepts a submission, so the
+    // bucket this suite's location names is held before its first query runs.
+    crate::results_bucket::hold_results_bucket(&engine, OUTPUT_LOCATION);
     router.register_service(EmulatedService::new(engine));
     router
 }

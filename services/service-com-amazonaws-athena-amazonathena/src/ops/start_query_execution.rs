@@ -358,14 +358,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = crate::state::new_query_execution_id();
         let submitted_at = SystemTime::now();
-        // Everything that reads or writes the registry happens here, and the lock is
-        // released before the engine is asked to run anything: a query running on one
-        // database must not serialise every other Athena request behind it. The
-        // execution and its token are RESERVED here too, before the SQL runs, so a
-        // concurrent call carrying the same token answers with this id rather than
-        // running the statement a second time.
-        let prepared = {
-            let mut store = state.lock();
+        // What this submission would RUN UNDER is judged first, out of the registry alone:
+        // the workgroup it names, whether that workgroup runs queries at all, and where the
+        // results it produces would be written. The guard is released before the object
+        // store is reached, so no two stores are ever held at once.
+        let (group, managed_query_results, result_configuration) = {
+            let store = state.lock();
 
             // A query cannot run in a workgroup that does not exist: its settings, its
             // results location and the history it belongs to are the workgroup's.
@@ -399,6 +397,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None if managed_query_results.is_some() => ResultConfiguration::default(),
                 None => return Err(invalid_request(crate::state::NO_OUTPUT_LOCATION)),
             };
+            (group, managed_query_results, result_configuration)
+        };
+
+        // The resolved results location is VERIFIED before the submission is accepted:
+        // Athena writes a query's results into a bucket of this account, and a location
+        // naming one this account does not hold is neither verifiable nor creatable — so
+        // such a submission is refused synchronously and mints no execution at all (see
+        // `crate::state::result_access`).
+        if let Some(bucket) = result_configuration
+            .output_location
+            .as_deref()
+            .and_then(crate::state::result_access::output_bucket)
+        {
+            if !crate::state::result_access::holds_bucket(&*self.engine, &bucket) {
+                return Err(invalid_request(
+                    crate::state::result_access::unverifiable_output_bucket(&bucket),
+                ));
+            }
+        }
+
+        // WHETHER THE CALLER MAY WRITE the results is decided here, for the same reason the
+        // catalog's permissions are: Athena saves a query's results with the CALLER's own
+        // identity, and the run itself carries no request context to evaluate the caller's
+        // policies from. The decision is taken on the object this submission resolved for
+        // the results, and it is APPLIED to the run's outcome below — a query whose results
+        // the caller may not persist settles FAILED carrying that refusal rather than
+        // reporting a success that saved nothing.
+        let result_write_refusal = crate::state::result_object_uri(
+            statement_type,
+            result_configuration.output_location.as_deref(),
+            &id,
+        )
+        .and_then(|uri| {
+            crate::state::result_access::write_refusal(&*self.engine, ctx, &uri)
+        });
+
+        // Everything that reads or writes the registry happens here, and the lock is
+        // released before the engine is asked to run anything: a query running on one
+        // database must not serialise every other Athena request behind it. The
+        // execution and its token are RESERVED here too, before the SQL runs, so a
+        // concurrent call carrying the same token answers with this id rather than
+        // running the statement a second time.
+        let prepared = {
+            let mut store = state.lock();
 
             // "If another StartQueryExecution request is received, the same response is
             // returned and another query is not created." The answer comes from the
@@ -543,6 +585,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     planning_time: Duration::ZERO,
                 },
             },
+        };
+
+        // The refusal of the result WRITE decides only a run that got as far as producing
+        // results: a statement that failed on its own wrote no result object, so what such
+        // an execution reports is its own failure and not a permission the write would have
+        // needed. The work the run did is still what the execution reports it took.
+        let completion = match result_write_refusal {
+            Some(reason)
+                if matches!(completion.outcome, query_engine::Outcome::Succeeded { .. }) =>
+            {
+                query_engine::Completion {
+                    outcome: catalog_sql::Failure::user(reason).outcome(),
+                    ..completion
+                }
+            }
+            _ => completion,
         };
 
         // What the run produced is first RECORDED on the execution, and then SAVED: Athena

@@ -257,6 +257,10 @@ fn given_reader(engine: &Arc<engine::InMemoryEngine>) {
                         "Statement": [
                             { "Effect": "Allow", "Action": "athena:*", "Resource": "*" },
                             { "Effect": "Allow", "Action": "glue:Get*", "Resource": "*" },
+                            // Athena saves a query's results with the CALLER's identity, so
+                            // a principal that runs queries holds the object write too —
+                            // the permission AWS's own Athena policy grants beside these.
+                            { "Effect": "Allow", "Action": "s3:PutObject", "Resource": "*" },
                         ],
                     })
                     .to_string(),

@@ -921,8 +921,14 @@ async fn a_query_reaches_the_catalog_only_with_the_callers_glue_permissions() {
                     tags: None,
                 },
             );
-            let mut statements =
-                vec![json!({ "Effect": "Allow", "Action": "athena:*", "Resource": "*" })];
+            let mut statements = vec![
+                json!({ "Effect": "Allow", "Action": "athena:*", "Resource": "*" }),
+                // Athena saves a query's results with the CALLER's identity, so a principal
+                // that runs queries holds the object write too — the permission AWS's own
+                // Athena policy grants beside the service's own actions. What this suite
+                // varies is the CATALOG half of the decision, below.
+                json!({ "Effect": "Allow", "Action": "s3:PutObject", "Resource": "*" }),
+            ];
             statements.extend(submitter.catalog_policy.iter().cloned());
             store.user_inline_policies.insert(
                 iam::name_key(submitter.name),

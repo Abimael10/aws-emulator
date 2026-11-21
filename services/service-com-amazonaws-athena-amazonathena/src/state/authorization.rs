@@ -247,6 +247,86 @@ fn refused(caller: &Caller, action: &str, resource: &str) -> Option<RefusedBy> {
     None
 }
 
+/// The principal a request speaks for, as `sts:GetCallerIdentity` reports it — which is what
+/// a refusal this service words names the caller by.
+///
+/// Resolved the same way every decision here resolves it ([`caller`]), so one request is one
+/// principal whichever refusal names it.
+pub fn caller_principal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> String {
+    caller(engine, ctx).arn
+}
+
+/// Whether the policies in force refuse the caller a call this service makes to ANOTHER
+/// service's resource FOR it — the object write a query's results are saved by
+/// ([`super::result_access`]) — or `false` when they permit it.
+///
+/// Such a call is made with the CALLER's permissions rather than with this service's own, so
+/// it is decided by exactly the two documents the other service would decide it by: the
+/// identity-based documents in force on the caller, and the resource-based `policy` the
+/// addressed resource carries (`None` for one carrying none). The rule is the module docs'
+/// rule over those two halves: an explicit `Deny` in either refuses the call whatever any
+/// grant says, and otherwise it needs an `Allow` — in the caller's own documents, or in the
+/// resource's policy naming the caller.
+///
+/// `action` is the IAM action of the OTHER service (`s3:PutObject`) and `resource` that
+/// service's own ARN for what the call addresses, since that is what a statement about it is
+/// written over.
+pub fn performed_for_caller_refused<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    policy: Option<&str>,
+    action: &str,
+    resource: &str,
+) -> bool {
+    let caller = caller(engine, ctx);
+    let request = iam::Request::new(action, resource, &caller.principals);
+    if let Some(policy) = policy {
+        // A resource statement that DENIES refuses each of the account's principals, so the
+        // deny is decided against the account's own spellings beside the principal's
+        // ([`iam::account_principals`]); a GRANT is read against the principal's alone.
+        let denied: Vec<String> = caller
+            .principals
+            .iter()
+            .cloned()
+            .chain(
+                caller
+                    .principals
+                    .iter()
+                    .flat_map(|principal| iam::account_principals(principal)),
+            )
+            .collect();
+        let denying = iam::Request::new(action, resource, &denied);
+        if iam::resource_decision(policy, &denying) == Decision::Denied {
+            return true;
+        }
+    }
+    let identity_said = iam::identity_decision(&caller.documents, &request);
+    if identity_said == Decision::Denied {
+        return true;
+    }
+    let resource_said = policy.map_or(Decision::NotStated, |policy| {
+        iam::resource_decision(policy, &request)
+    });
+    let granted = iam::is_allowed(identity_said, resource_said)
+        // The account's own credential, and a principal carrying a grant this emulator
+        // cannot read, are not bounded by the identity-based half (see the module docs).
+        || (resource_said != Decision::Denied && caller.identity_is_unbounded());
+    if !granted {
+        return true;
+    }
+    // "A permissions boundary sets the maximum permissions that an identity-based policy
+    // can grant": the same cap this gate's own decision applies.
+    if let Some(boundary) = &caller.boundary {
+        if iam::identity_decision(::std::slice::from_ref(boundary), &request) != Decision::Allowed {
+            return true;
+        }
+    }
+    false
+}
+
 /// The refusal Athena states an authorization failure with: the action the caller asked for,
 /// and what to do about it.
 ///

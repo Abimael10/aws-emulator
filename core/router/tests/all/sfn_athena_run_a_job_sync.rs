@@ -92,6 +92,9 @@ fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
+    // Athena verifies the resolved output location before it accepts a submission, so the
+    // bucket this suite's results location names is held before its first query runs.
+    crate::athena_results_bucket::hold_results_bucket(&engine, RESULTS_LOCATION);
     router.register_service(service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(
         Arc::clone(&engine),
     ));
@@ -313,7 +316,11 @@ async fn the_execution_role_decides_the_patterns_reporting_call() {
 
     for (index, row) in rows.into_iter().enumerate() {
         let case = row.case;
-        let mut statements = vec![logs_only()];
+        // Beside the row's own Athena grants: the object write Athena saves a query's
+        // results with, which it performs with the CALLER's identity — so an execution role
+        // that runs a query holds it, the way AWS's own Athena policy grants it. What each
+        // row varies is the ATHENA half of the decision.
+        let mut statements = vec![logs_only(), allow("s3:PutObject", "*")];
         statements.extend(row.statements);
         let role_arn = role(
             &router,

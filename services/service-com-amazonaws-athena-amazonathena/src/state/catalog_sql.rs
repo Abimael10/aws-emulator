@@ -955,6 +955,30 @@ pub fn catalog_id<Eng: Send + Sync + 'static>(engine: &Eng, catalog: &str) -> Op
     catalog_id_of(engine, catalog, Position::START).ok()
 }
 
+/// The Data Catalog id the data catalog `catalog` names, whichever ACCOUNT holds that
+/// catalog — this one, or another whose catalog a registered `GLUE` catalog points at — or
+/// `None` for a name that names no Glue Data Catalog at all.
+///
+/// A Glue `CatalogId` IS an account id ("If none is provided, the Amazon Web Services account
+/// ID is used by default"), so this is also WHOSE catalog a statement over that name reaches:
+/// what the caller needs permission on ([`crate::state::catalog_authorization`]) is the
+/// catalog, database and table of that account. Whether this emulator HOLDS the catalog is
+/// [`catalog_id`], which answers only for the one it serves.
+pub fn glue_catalog_id<Eng: Send + Sync + 'static>(engine: &Eng, catalog: &str) -> Option<String> {
+    let state = crate::state::service_state(engine)?;
+    // The registry's guard is taken and released here, like every other reading of it.
+    let source = {
+        let store = state.lock();
+        crate::state::metadata_source(&store.data_catalogs, catalog)
+    };
+    match source {
+        crate::state::MetadataSource::GlueDataCatalog(catalog_id)
+        | crate::state::MetadataSource::ForeignGlueCatalog(catalog_id) => Some(catalog_id),
+        crate::state::MetadataSource::ExternalMetastore(_)
+        | crate::state::MetadataSource::Unregistered => None,
+    }
+}
+
 /// The `CatalogId` the data catalog `catalog` names, or why its metadata cannot be read.
 ///
 /// The SAME resolution Athena's metadata reads use: `AwsDataCatalog` is the account's own
@@ -1208,10 +1232,10 @@ fn resolve<Eng: Send + Sync + 'static>(
                                     if narrowed.visible_columns().is_empty() {
                                         Held::Hidden
                                     } else {
-                                        Held::Table(narrowed)
+                                        Held::Table(Box::new(narrowed))
                                     }
                                 }
-                                _ => Held::Table(source),
+                                _ => Held::Table(Box::new(source)),
                             }
                         }
                     },
@@ -1225,7 +1249,7 @@ fn resolve<Eng: Send + Sync + 'static>(
                 resolved.rewrites.insert(relation.written.clone(), local);
             }
             Held::Table(source) => {
-                resolution.sources.push(source);
+                resolution.sources.push(*source);
                 resolution.resolved.insert(local.clone());
                 resolved.rewrites.insert(relation.written.clone(), local);
             }
@@ -1266,8 +1290,10 @@ fn resolve<Eng: Send + Sync + 'static>(
 
 /// What the catalog holds for one relation.
 enum Held {
-    /// A table whose data lives at a location.
-    Table(DataSource),
+    /// A table whose data lives at a location. BOXED: a data source carries the table's
+    /// whole definition — its columns, its partitions and how its objects decode — and is
+    /// much the largest thing this enum can hold.
+    Table(Box<DataSource>),
     /// One of the catalog's own reporting tables, already built.
     ReportingTable(LocalTable),
     /// A view, carrying the query it is defined by.
@@ -1384,7 +1410,7 @@ fn reporting_table(
         "columns" => {
             for database in &databases {
                 for table in database.tables_ordered() {
-                    for (position, column) in ddl::table_columns(table).iter().enumerate() {
+                    for (position, column) in ddl::relation_columns(table).iter().enumerate() {
                         budget.charge_row(relation, COLUMNS_COLUMNS)?;
                         rows.push(vec![
                             text(&catalog),

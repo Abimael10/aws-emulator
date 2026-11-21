@@ -42,6 +42,15 @@ pub fn router() -> MultiServiceRouter {
     engine_and_router().1
 }
 
+/// The buckets the suites that share this harness write their query results into.
+///
+/// Athena verifies the resolved output location before it accepts a submission — one naming
+/// a bucket the account does not hold is a location it can neither verify nor create — so
+/// the mounting below HOLDS them, exactly as a client creates its results bucket before it
+/// runs its first query. A suite with a results bucket of its own holds it itself
+/// (`crate::results_bucket::hold_results_bucket`).
+const RESULTS_BUCKETS: &[&str] = &["athena-results", "results", "somewhere-else", "later"];
+
 /// The same mounting, handing back the ENGINE as well, for an assertion whose reader is
 /// still a scaffold and that therefore has to be made against the store itself.
 pub fn engine_and_router() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
@@ -51,6 +60,9 @@ pub fn engine_and_router() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) 
     // these tests assert Athena's behaviour, not the emulator's SigV4 check.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    for bucket in RESULTS_BUCKETS {
+        crate::results_bucket::hold_bucket(&engine, bucket);
+    }
     (engine, router)
 }
 

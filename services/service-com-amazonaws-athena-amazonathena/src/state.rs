@@ -115,6 +115,9 @@ pub mod catalog_sql;
 /// The objects a completed run saves its results to, under the resolved output location.
 pub mod query_results;
 
+/// Whether the resolved output location is one the caller may write a query's results to.
+pub mod result_access;
+
 /// The runtime statistics of one query execution: its timeline, its counters and its stage.
 mod runtime_statistics;
 
@@ -201,7 +204,7 @@ use ::service_com_amazonaws_glue_awsglue::ops::types::Column as GlueColumn;
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 
 use crate::ops::types::{
-    Column, DataCatalog, DataCatalogSummary, EngineConfiguration, EngineVersion,
+    Column, DataCatalog, DataCatalogSummary, Database, EngineConfiguration, EngineVersion,
     ManagedQueryResultsConfiguration, ManagedQueryResultsTimeToLive, MonitoringConfiguration,
     QueryExecution, QueryExecutionContext, QueryExecutionDetail, QueryExecutionDetailStats,
     QueryExecutionDetailStatus, QueryExecutionStatistics, QueryExecutionStatus, ResultConfiguration,
@@ -733,6 +736,22 @@ pub fn to_table_metadata(table: &glue_state::TableEntry) -> TableMetadata {
             .as_ref()
             .map(|keys| keys.iter().map(to_column).collect()),
         parameters: Some(hive_table_properties(table)),
+    }
+}
+
+/// One stored Glue database as the `Database` Athena reports for it.
+///
+/// Every member is the catalog's, never the reading request's: the name the catalog holds
+/// the database under, the description a write of it recorded, and the database's own
+/// property set. A member the catalog does not determine for that database stays absent,
+/// so a client reads "unknown" only where the catalog knows nothing — a database stored
+/// with no properties has no property set to report, which is not the same as one whose
+/// property set is empty.
+pub fn to_database(database: &glue_state::DatabaseEntry) -> Database {
+    Database {
+        name: database.name.clone(),
+        description: database.description.clone(),
+        parameters: database.parameters.clone(),
     }
 }
 
@@ -1424,6 +1443,36 @@ pub const RESULT_OBJECT_ROWS_SUFFIX: &str = ".csv";
 /// [`RESULT_OBJECT_ROWS_SUFFIX`].
 pub const RESULT_OBJECT_TEXT_SUFFIX: &str = ".txt";
 
+/// The key of the result object the execution `id` writes, as the `s3://` URI of the
+/// resolved results directory with that object under it, or `None` when the submission
+/// addresses no such object: text that parses as no statement at all, and a submission that
+/// resolved no results location.
+///
+/// The ONE place that key is formed. `statement_type` decides the extension, because that is
+/// what decides whether the run's result is a result set or the engine's text output
+/// ([`RESULT_OBJECT_ROWS_SUFFIX`], [`RESULT_OBJECT_TEXT_SUFFIX`]), and `output_location` is
+/// the directory the submission resolved. So the object a submission is authorized to write
+/// ([`result_access::write_refusal`]), the object a completed run saves
+/// ([`query_results::result_objects`]) and the object a read of the execution names
+/// ([`QueryExecutionRecord::result_object_uri`]) can never be three different keys.
+pub fn result_object_uri(
+    statement_type: Option<&str>,
+    output_location: Option<&str>,
+    id: &str,
+) -> Option<String> {
+    let suffix = match statement_type? {
+        query_engine::STATEMENT_TYPE_DML => RESULT_OBJECT_ROWS_SUFFIX,
+        query_engine::STATEMENT_TYPE_DDL | query_engine::STATEMENT_TYPE_UTILITY => {
+            RESULT_OBJECT_TEXT_SUFFIX
+        }
+        _ => return None,
+    };
+    // The resolved location names a directory, whether or not it was written with the
+    // trailing separator, so the object is joined under it by exactly one.
+    let directory = output_location?.trim_end_matches('/');
+    Some(format!("{directory}/{id}{suffix}"))
+}
+
 /// How many query executions this emulator retains.
 ///
 /// The EMULATOR's own bound, with no counterpart in the model: each retained execution
@@ -1675,28 +1724,20 @@ impl QueryExecutionRecord {
     }
 
     /// The key of the result object this execution's statement writes, as the `s3://` URI
-    /// of the configured results directory with that object under it — the ONE place that
-    /// key is formed, so the object a read NAMES ([`Self::result_object_at`]) and the
-    /// object a completed run SAVES ([`query_results::result_objects`]) are the same key.
+    /// of the configured results directory with that object under it — read through
+    /// [`result_object_uri`], the ONE place that key is formed, so the object a read NAMES
+    /// ([`Self::result_object_at`]), the object the SUBMISSION is authorized to write
+    /// ([`result_access::write_refusal`]) and the object a completed run SAVES
+    /// ([`query_results::result_objects`]) are all the same key.
     ///
     /// `None` for text that parses as no statement at all, and for a submission that
     /// resolved no results location: neither addresses an object.
     pub(crate) fn result_object_uri(&self) -> Option<String> {
-        let suffix = match self.statement_type.as_deref()? {
-            query_engine::STATEMENT_TYPE_DML => RESULT_OBJECT_ROWS_SUFFIX,
-            query_engine::STATEMENT_TYPE_DDL | query_engine::STATEMENT_TYPE_UTILITY => {
-                RESULT_OBJECT_TEXT_SUFFIX
-            }
-            _ => return None,
-        };
-        // The configured location names a directory, whether or not it was written with
-        // the trailing separator, so the object is joined under it by exactly one.
-        let directory = self
-            .result_configuration
-            .output_location
-            .as_deref()?
-            .trim_end_matches('/');
-        Some(format!("{directory}/{}{suffix}", self.id))
+        result_object_uri(
+            self.statement_type.as_deref(),
+            self.result_configuration.output_location.as_deref(),
+            &self.id,
+        )
     }
 
     /// The `ResultConfiguration` a read of this execution reports at `now`: the one the

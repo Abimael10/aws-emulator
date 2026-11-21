@@ -183,8 +183,19 @@ pub struct DataSource {
     pub relation: Relation,
     /// The name the rows are materialised under in the engine database.
     pub local_name: String,
-    /// The table's columns, in order.
+    /// The table's columns, in order: the storage descriptor's, and then the partition keys
+    /// ([`ddl::relation_columns`]).
     pub columns: Vec<DeclaredColumn>,
+    /// How many of the LAST [`Self::columns`] are partition keys, whose values come from the
+    /// partition a row's object belongs to rather than from that object's own records; `0`
+    /// for a table that declares no partition keys.
+    partition_keys: usize,
+    /// The partitions the catalog holds for this table, each with the location its objects
+    /// live under and the values every row read there carries. EMPTY for a table that
+    /// declares no partition keys, and for a partitioned table whose partitions the catalog
+    /// does not hold — whose rows carry what their own object paths name instead
+    /// ([`Self::hive_partition_values`]).
+    partitions: Vec<PartitionSplit>,
     /// Where the data lives, as the catalog recorded it.
     location: Option<String>,
     /// How the objects there are decoded.
@@ -201,6 +212,31 @@ pub struct DataSource {
     /// Lake Formation grant carries one.
     row_predicate: Option<String>,
 }
+
+/// One PARTITION of a catalog table as a read of it addresses it: the values that address
+/// the partition, and where its objects live.
+#[derive(Debug, Clone)]
+struct PartitionSplit {
+    /// The partition's values, one per declared partition key and in key order — the
+    /// `PartitionInput$Values` the catalog stored it under.
+    values: Vec<String>,
+    /// The `s3://` location the partition's objects live under: the one its own storage
+    /// descriptor records, and otherwise the Hive directory of the table's location that
+    /// its values name ([`hive_partition_location`]).
+    location: String,
+}
+
+/// One DATA DIRECTORY a read of a table scans: where to list, and which partition the rows
+/// it finds there belong to.
+#[derive(Debug, Clone)]
+struct Scan {
+    /// The `s3://` location to list under.
+    location: String,
+    /// The partition values every row found there carries, or `None` when the partition a
+    /// row belongs to is the one its own object's path names.
+    values: Option<Vec<String>>,
+}
+
 
 /// What one query may read, which every read of a table charges against.
 ///
@@ -360,7 +396,7 @@ impl DataSource {
                     relation.database, relation.table
                 ))
             })?;
-        let columns = ddl::table_columns(table);
+        let columns = ddl::relation_columns(table);
         // What the entry DECLARES has to be readable as a table definition before a read of
         // it can be planned: the catalog stores a column's type as the text a client wrote
         // and never reads it, so a column whose type text names no type at all
@@ -372,14 +408,17 @@ impl DataSource {
         {
             return Err(Failure::invalid_column_type(&column.name, &column.data_type));
         }
+        let location = storage.and_then(|storage| storage.location.clone());
         Ok(Self {
             relation: relation.clone(),
             local_name: relation.local_name(),
             // Every column of the table reads, until a Lake Formation grant narrows it.
             visible: (0..columns.len()).collect(),
             row_predicate: None,
+            partition_keys: ddl::partition_key_columns(table).len(),
+            partitions: partition_splits(table, location.as_deref()),
             columns,
-            location: storage.and_then(|storage| storage.location.clone()),
+            location,
             decoder,
             skip_header_lines: table_parameters
                 .get(SKIP_HEADER_PROPERTY)
@@ -522,40 +561,132 @@ impl DataSource {
         let Some(location) = self.location.as_deref().filter(|at| !at.is_empty()) else {
             return Ok((rows, scanned));
         };
-        let Some((bucket_name, prefix)) = parse_s3_uri(location) else {
-            return Err(Failure::user(format!(
-                "Unable to read the location {location} of {}.{}: it is not an Amazon S3 \
-                 location",
-                self.relation.database, self.relation.table
-            )));
-        };
-        let Some(bucket) = objects.bucket(&bucket_name) else {
-            // The storage the entry names is not there at all, so no split of this table can
-            // be listed: a failure of the FILESYSTEM class, which is not an access decision
-            // about storage the reader may not read.
-            return Err(Failure::location_not_readable(location));
-        };
-        for (key, object) in bucket.objects() {
-            if !under_prefix(key, &prefix) || is_hidden(key) {
-                continue;
-            }
+        // A PARTITIONED table's data lives under its partitions, one data directory each; a
+        // table that declares no partition keys has exactly one, its own location.
+        for scan in self.scans(location) {
+            // One partition is one directory to list, and a partitioned table has as many as
+            // the catalog holds, so the time this statement may spend is charged before each
+            // of them as well as per object below.
             budget.charge_deadline()?;
-            if object.body.len() > budget.bytes_left {
-                return Err(Budget::too_many_bytes(&self.relation));
+            let Some((bucket_name, prefix)) = parse_s3_uri(&scan.location) else {
+                return Err(Failure::user(format!(
+                    "Unable to read the location {} of {}.{}: it is not an Amazon S3 \
+                     location",
+                    scan.location, self.relation.database, self.relation.table
+                )));
+            };
+            let Some(bucket) = objects.bucket(&bucket_name) else {
+                // The storage the entry names is not there at all, so no split of this table
+                // can be listed: a failure of the FILESYSTEM class, which is not an access
+                // decision about storage the reader may not read.
+                return Err(Failure::location_not_readable(&scan.location));
+            };
+            for (key, object) in bucket.objects() {
+                budget.charge_deadline()?;
+                if !under_prefix(key, &prefix) || is_hidden(key) {
+                    continue;
+                }
+                // WHICH PARTITION the rows of this object belong to: the one the scan is of,
+                // and otherwise the one the object's own Hive path names. An object under no
+                // partition of a partitioned table is no part of that table's data, so it is
+                // not read at all.
+                let partition = match &scan.values {
+                    Some(values) => Cow::Borrowed(values.as_slice()),
+                    None if self.partition_keys == 0 => Cow::Borrowed([].as_slice()),
+                    None => match self.hive_partition_values(key) {
+                        Some(values) => Cow::Owned(values),
+                        None => continue,
+                    },
+                };
+                if object.body.len() > budget.bytes_left {
+                    return Err(Budget::too_many_bytes(&self.relation));
+                }
+                budget.bytes_left -= object.body.len();
+                scanned = scanned.saturating_add(object.body.len());
+                let split = format!("s3://{bucket_name}/{key}");
+                // What the hidden metadata columns carry is a property of THIS object, so it
+                // is read once per object and held by every row that object holds.
+                let held: Vec<::rusqlite::types::Value> = metadata
+                    .iter()
+                    .map(|column| column.value(&split, object))
+                    .collect();
+                let body = self.uncompressed(key, &object.body, &split, budget)?;
+                self.decode(&body, &split, &held, &partition, &mut rows, budget)?;
             }
-            budget.bytes_left -= object.body.len();
-            scanned = scanned.saturating_add(object.body.len());
-            let split = format!("s3://{bucket_name}/{key}");
-            // What the hidden metadata columns carry is a property of THIS object, so it is
-            // read once per object and held by every row that object holds.
-            let held: Vec<::rusqlite::types::Value> = metadata
-                .iter()
-                .map(|column| column.value(&split, object))
-                .collect();
-            let body = self.uncompressed(key, &object.body, &split, budget)?;
-            self.decode(&body, &split, &held, &mut rows, budget)?;
         }
         Ok((rows, scanned))
+    }
+
+    /// The data directories a read of this table scans, and which partition the rows found
+    /// in each belong to.
+    ///
+    /// Three cases, and the rule is the same one in all three — a read scans the directories
+    /// the table's DATA lives under:
+    ///
+    /// * a table that declares no partition keys has one data directory, its own location,
+    ///   and its rows carry no partition values;
+    /// * a partitioned table whose partitions the catalog HOLDS is read partition by
+    ///   partition, each under the location that partition records and carrying that
+    ///   partition's own values;
+    /// * a partitioned table whose partitions the catalog holds none of — the table whose
+    ///   partitions Athena PROJECTS rather than registers — is read under its own location,
+    ///   and the partition a row belongs to is the one its object's path names.
+    fn scans(&self, location: &str) -> Vec<Scan> {
+        if self.partition_keys == 0 || self.partitions.is_empty() {
+            return vec![Scan {
+                location: location.to_string(),
+                values: None,
+            }];
+        }
+        self.partitions
+            .iter()
+            .map(|partition| Scan {
+                location: partition.location.clone(),
+                values: Some(partition.values.clone()),
+            })
+            .collect()
+    }
+
+    /// The partition values the object `key` names in its own path: for each declared
+    /// partition key in order, the value of the `<key>=<value>` path component naming it.
+    ///
+    /// `None` when the path names no value for one of the keys, which is what says the
+    /// object belongs to no partition of this table. The key names are matched FOLDED, the
+    /// way the catalog holds every name it stores.
+    fn hive_partition_values(&self, key: &str) -> Option<Vec<String>> {
+        let mut segments = key.split('/');
+        let mut values = Vec::with_capacity(self.partition_keys);
+        for column in self.columns.iter().skip(self.data_columns()) {
+            let wanted = glue_state::fold_name(&column.name);
+            let found = segments.by_ref().find_map(|segment| {
+                let (name, value) = segment.split_once('=')?;
+                (glue_state::fold_name(name) == wanted).then(|| value.to_string())
+            })?;
+            values.push(found);
+        }
+        Some(values)
+    }
+
+    /// How many of [`Self::columns`] the objects' own records carry values for: every column
+    /// the storage descriptor declares, which is all of them but the partition keys.
+    fn data_columns(&self) -> usize {
+        self.columns.len().saturating_sub(self.partition_keys)
+    }
+
+    /// Which of a partition's values the column at `position` holds, or `None` for a column
+    /// the objects' own records carry.
+    ///
+    /// A partition key is one of the columns AFTER the storage descriptor's, and the value it
+    /// holds is the one at that key's own place in the partition's value list — absent for a
+    /// partition naming fewer values than the table declares keys, which is NULL rather than
+    /// a value read out of a record.
+    fn partition_value<'v>(
+        &self,
+        position: usize,
+        partition: &'v [String],
+    ) -> Option<Option<&'v str>> {
+        let index = position.checked_sub(self.data_columns())?;
+        (index < self.partition_keys).then(|| partition.get(index).map(String::as_str))
     }
 
     /// One split's bytes as this table's SerDe reads them: the object's own bytes, with the
@@ -609,7 +740,9 @@ impl DataSource {
     /// — the unit of work Hive calls a split is one object of the table's location.
     ///
     /// `metadata` are the values the hidden metadata columns of this object carry, which
-    /// every row read out of it holds beside its own fields.
+    /// every row read out of it holds beside its own fields, and `partition` the partition
+    /// values the object's own partition carries, which every row read out of it holds for
+    /// the table's partition keys.
     ///
     /// STREAMING, and budget-charged BEFORE each row is built: one record is read, charged
     /// and converted at a time, so a read stops at the first row over budget instead of
@@ -619,6 +752,7 @@ impl DataSource {
         body: &[u8],
         split: &str,
         metadata: &[::rusqlite::types::Value],
+        partition: &[String],
         rows: &mut Vec<Vec<::rusqlite::types::Value>>,
         budget: &mut Budget,
     ) -> Result<(), Failure> {
@@ -653,7 +787,7 @@ impl DataSource {
                         continue;
                     }
                     budget.charge_row(&self.relation, width)?;
-                    rows.push(self.row(&materialised, metadata, |position| {
+                    rows.push(self.row(&materialised, metadata, partition, |position| {
                         record.get(position)
                     }));
                 }
@@ -684,7 +818,7 @@ impl DataSource {
                             members.and_then(|members| json_member(members, &column.name))
                         })
                         .collect();
-                    rows.push(self.row(&materialised, metadata, |position| {
+                    rows.push(self.row(&materialised, metadata, partition, |position| {
                         fields.get(position).and_then(Option::as_deref)
                     }));
                 }
@@ -717,7 +851,7 @@ impl DataSource {
                                 .map(parquet_objects::Cell::size)
                                 .fold(0usize, usize::saturating_add),
                         )?;
-                        rows.push(self.parquet_row(&materialised, metadata, &values));
+                        rows.push(self.parquet_row(&materialised, metadata, partition, &values));
                         Ok(())
                     },
                 )?;
@@ -733,12 +867,20 @@ impl DataSource {
         &self,
         materialised: &[usize],
         metadata: &[::rusqlite::types::Value],
+        partition: &[String],
         values: &HashMap<String, parquet_objects::Cell>,
     ) -> Vec<::rusqlite::types::Value> {
         materialised
             .iter()
-            .filter_map(|position| self.columns.get(*position))
-            .map(|column| {
+            .filter_map(|position| {
+                self.columns.get(*position).map(|column| (*position, column))
+            })
+            .map(|(position, column)| {
+                // A partition key's value is the partition's, not the object's: a Parquet
+                // file at a partition's location carries no leaf for it.
+                if let Some(value) = self.partition_value(position, partition) {
+                    return self.cell(column, value);
+                }
                 let held = values.get(&glue_state::fold_name(&column.name));
                 match held {
                     // Binary data is held as the bytes the object carries: a binary
@@ -764,14 +906,20 @@ impl DataSource {
         &self,
         materialised: &[usize],
         metadata: &[::rusqlite::types::Value],
+        partition: &[String],
         field: impl Fn(usize) -> Option<&'f str>,
     ) -> Vec<::rusqlite::types::Value> {
         materialised
             .iter()
             .filter_map(|position| {
-                self.columns
-                    .get(*position)
-                    .map(|column| self.cell(column, field(*position)))
+                self.columns.get(*position).map(|column| {
+                    // A partition key's value is the partition's, which the object's own
+                    // records carry no field for.
+                    match self.partition_value(*position, partition) {
+                        Some(value) => self.cell(column, value),
+                        None => self.cell(column, field(*position)),
+                    }
+                })
             })
             .chain(metadata.iter().cloned())
             .collect()
@@ -987,6 +1135,65 @@ fn decoder_of(
         });
     }
     None
+}
+
+/// The partitions the catalog holds for `table`, each with the location its objects live
+/// under, or an empty list for a table the catalog holds no partition of.
+///
+/// `table_location` is the table's own `StorageDescriptor$Location`, which a partition that
+/// records no location of its own sits under ([`hive_partition_location`]): the catalog's
+/// own partitions are read where the catalog says they are, and a partition registered with
+/// no location is where Hive puts it.
+fn partition_splits(
+    table: &glue_state::TableEntry,
+    table_location: Option<&str>,
+) -> Vec<PartitionSplit> {
+    let keys: Vec<String> = ddl::partition_key_columns(table)
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    table
+        .partitions
+        .values()
+        .filter_map(|partition| {
+            let location = partition
+                .storage_descriptor
+                .as_ref()
+                .and_then(|storage| storage.location.clone())
+                .filter(|location| !location.is_empty())
+                .or_else(|| {
+                    table_location
+                        .filter(|location| !location.is_empty())
+                        .map(|location| {
+                            hive_partition_location(location, &keys, &partition.values)
+                        })
+                })?;
+            Some(PartitionSplit {
+                values: partition.values.clone(),
+                location,
+            })
+        })
+        .collect()
+}
+
+/// Where Hive keeps the partition `values` of a table at `table_location`: one directory per
+/// partition key under it, each named `<key>=<value>`.
+///
+/// This is the layout Hive, Athena and every engine that writes a partitioned table use, and
+/// the one [`DataSource::hive_partition_values`] reads a partition's values back out of — so
+/// a partition registered with no location of its own is read where such a writer put it.
+fn hive_partition_location(table_location: &str, keys: &[String], values: &[String]) -> String {
+    let mut location = table_location.trim_end_matches('/').to_string();
+    for (key, value) in keys.iter().zip(values) {
+        location.push('/');
+        location.push_str(key);
+        location.push('=');
+        location.push_str(value);
+    }
+    location
 }
 
 /// The character a SerDe parameter names as the field separator.
