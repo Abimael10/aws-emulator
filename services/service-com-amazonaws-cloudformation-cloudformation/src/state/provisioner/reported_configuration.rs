@@ -628,6 +628,16 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 describe_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // AWS Direct Connect's own reads: the gateway out of the listing its
+            // `directConnectGatewayId` narrows, and the group through that service's own
+            // `GetResiliencyGroup`, each by the identifier the ARN the stack published
+            // carries.
+            Self::DirectConnectGateway => {
+                describe_direct_connect_gateway(ctx, region, physical_resource_id).await
+            }
+            Self::DirectConnectResiliencyGroup => {
+                describe_resiliency_group(ctx, region, physical_resource_id).await
+            }
             // That service's own read of the suite, by the id it drew for it.
             Self::IotCoreDeviceAdvisorSuiteDefinition => {
                 describe_suite_definition(ctx, region, physical_resource_id).await

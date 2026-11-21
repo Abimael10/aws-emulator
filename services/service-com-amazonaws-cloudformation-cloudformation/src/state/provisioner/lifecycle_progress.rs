@@ -298,6 +298,17 @@ impl Provisioner {
             Self::BedrockAgentCoreGatewayTarget => {
                 agentcore_gateway_target_readiness(ctx, region, physical_resource_id).await
             }
+            // `CreateDirectConnectGateway` answers the gateway `pending` — "the initial state
+            // after calling CreateDirectConnectGateway", in which it passes no traffic — and
+            // `CreateResiliencyGroup` answers the group `pending` the same way, so each
+            // resource is held open until AWS Direct Connect reports it `available`
+            // ([`directconnect_resources`]).
+            Self::DirectConnectGateway => {
+                direct_connect_gateway_readiness(ctx, region, physical_resource_id).await
+            }
+            Self::DirectConnectResiliencyGroup => {
+                resiliency_group_readiness(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Readiness::Ready),
         }
     }
@@ -586,6 +597,16 @@ impl Provisioner {
             }
             Self::BedrockAgentCoreSandbox(sandbox) => {
                 agentcore_sandbox_removal(ctx, region, sandbox, physical_resource_id).await
+            }
+            // Either AWS Direct Connect delete leaves the resource `deleting` — "the initial
+            // state after calling DeleteDirectConnectGateway" — so the resource is still
+            // reported when the delete answers, and the deletion is finished once that
+            // service reports the terminal `deleted` ([`directconnect_resources`]).
+            Self::DirectConnectGateway => {
+                direct_connect_gateway_removal(ctx, region, physical_resource_id).await
+            }
+            Self::DirectConnectResiliencyGroup => {
+                resiliency_group_removal(ctx, region, physical_resource_id).await
             }
             _ => Ok(Removal::Gone),
         }

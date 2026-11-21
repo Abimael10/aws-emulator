@@ -43,6 +43,12 @@
 //! Lists all your Direct Connect gateways or only the specified Direct Connect gateway.
 //! Deleted Direct Connect gateways are not returned.
 //!
+//! (That last sentence is the one piece of this contract the handler does NOT follow, and
+//! deliberately: a gateway in the terminal `deleted` state IS reported, in that state,
+//! which is what the recording of a torn-down gateway shows. The reason, and the recorded
+//! check it comes from, are stated where the selection is made — read that comment before
+//! "fixing" the handler back to this sentence.)
+//!
 //! ## Input
 //!
 //! * `directConnectGatewayId` (DirectConnectGatewayId) — The ID of the Direct Connect
@@ -167,24 +173,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions();
 
         // "Lists all your Direct Connect gateways or only the specified Direct
-        // Connect gateway. Deleted Direct Connect gateways are not returned."
+        // Connect gateway."
         //
         // `directConnectGatewayId` NARROWS that listing, so it SELECTS and is not a
-        // lookup that has to resolve: the same sentence has a gateway that was
-        // deleted simply absent from the answer rather than reported as a bad
-        // parameter, and a listing states "nothing matched" the one way a listing
-        // can — an empty page. A well-formed id selecting no gateway therefore falls
-        // through to the normal 200 path, exactly as the association, attachment and
-        // proposal listings of this same family already do.
+        // lookup that has to resolve: a listing states "nothing matched" the one way
+        // a listing can — an empty page. A well-formed id selecting no gateway
+        // therefore falls through to the normal 200 path, exactly as the
+        // association, attachment and proposal listings of this same family already
+        // do.
+        //
+        // A gateway in the TERMINAL `deleted` state is still reported, in that
+        // state, which is RECORDED behaviour: in the behavioral corpus
+        // `simparity-behavioral-aws-v1`, check
+        // `cloudformation__directconnect.deploy-directconnect-gateway-and-\
+        // resiliency-group-round-trip-and-delete` deletes the stack that created a
+        // gateway and then reads that gateway back through this operation, where it
+        // is reported with `directConnectGatewayState` `deleted` rather than being
+        // absent. `DirectConnectGatewayState` models that state as one a gateway is
+        // reported in ("the Direct Connect gateway is deleted and cannot pass
+        // traffic"), and the tombstone is what lets a client that deleted a gateway
+        // tell "it is gone" from "it was never there" — so the recording decides
+        // this over the operation's own summary sentence ("Deleted Direct Connect
+        // gateways are not returned"). The record is reclaimed only when the store
+        // needs the room.
         let selected: Vec<&crate::state::DirectConnectGateway> = store
             .gateways_in_order()
             .into_iter()
             .filter(|gateway| {
-                gateway.direct_connect_gateway_state != "deleted"
-                    && input
-                        .direct_connect_gateway_id
-                        .as_deref()
-                        .is_none_or(|id| gateway.direct_connect_gateway_id == id)
+                input
+                    .direct_connect_gateway_id
+                    .as_deref()
+                    .is_none_or(|id| gateway.direct_connect_gateway_id == id)
             })
             .collect();
 

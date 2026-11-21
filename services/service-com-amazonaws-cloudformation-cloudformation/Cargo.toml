@@ -334,6 +334,13 @@ service-com-amazonaws-iotdeviceadvisor-iotsenateservice = { workspace = true }
 # owning service mounted beside CloudFormation, or the create is refused and the stack fails —
 # and the entities the stack published are read back through that service's own wire.
 service-com-amazonaws-networksecuritymanager-piccolocustomerapiservice = { workspace = true }
+# AWS Direct Connect, for the `AWS::DirectConnect::DirectConnectGateway` and the
+# `AWS::DirectConnect::ResiliencyGroup` a stack really creates there
+# (`state::provisioner::directconnect_resources`): a suite that deploys one must have its
+# owning service mounted beside CloudFormation, or the create is refused and the stack fails —
+# and the gateway and the group the stack published are read back through that service's own
+# wire.
+service-com-amazonaws-directconnect-overtureservice = { workspace = true }
 
 [lints]
 workspace = true

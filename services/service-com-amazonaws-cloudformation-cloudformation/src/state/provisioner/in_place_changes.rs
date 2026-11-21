@@ -478,6 +478,17 @@ impl Provisioner {
             Self::BraketSpendingLimit => update_braket_spending_limit(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // Either `Update…` of AWS Direct Connect renames the resource the stack created,
+            // by the identifier that service minted for it — the one thing either call
+            // changes — so a declaration stating another name is applied to the gateway or
+            // the group rather than replacing it. Every other property of either type is
+            // fixed when the resource is made ([`super::template::replacement_properties`]).
+            Self::DirectConnectGateway => {
+                update_direct_connect_gateway(ctx, region, resource, declared).await
+            }
+            Self::DirectConnectResiliencyGroup => {
+                update_resiliency_group(ctx, region, resource, declared).await
+            }
             // Each `Update…` takes the resource's whole declared configuration by the ARN
             // that service minted for it, the name included — so a changed declaration is
             // applied to that dashboard or report rather than replacing it. Their tags travel

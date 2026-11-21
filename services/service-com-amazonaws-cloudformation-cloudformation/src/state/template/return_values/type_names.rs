@@ -276,6 +276,50 @@ pub const BRAKET_ARN_NAMESPACE: &str = "braket";
 /// for it, from that same pattern.
 pub(super) const BRAKET_SPENDING_LIMIT_PATH: &str = "spending-limit";
 
+/// The `AWS::<cloudFormationName>::<Resource>` types of the two AWS Direct Connect resources a
+/// template declares. The middle segment is that model's own `awsService.cloudFormationName`
+/// (`DirectConnect`).
+///
+/// * a DIRECT CONNECT GATEWAY — the "intermediate object that enables you to connect a set of
+///   virtual interfaces and virtual private gateways" that service's own
+///   `CreateDirectConnectGateway` makes. It MINTS the gateway's id (`directConnectGatewayId`,
+///   an opaque uuid), which every Direct Connect call on a gateway takes, and the type's `Ref`
+///   returns the gateway's ARN built around that id — so neither value can be computed from
+///   the template and [`identity_is_service_assigned`] names the type;
+/// * a RESILIENCY GROUP — the group `CreateResiliencyGroup` makes, which "lets you group
+///   Direct Connect connections together and manage them as a single unit to meet a target
+///   resiliency model". That service mints the group's id too (`ResiliencyGroupId`:
+///   `^(dxrg|DXRG)-[0-9a-zA-Z]{17}$`) and the ARN around it (`ResiliencyGroupArn`), and the
+///   type's `Ref` returns that ARN, so the same holds.
+pub const DIRECT_CONNECT_GATEWAY: &str = "AWS::DirectConnect::DirectConnectGateway";
+pub const DIRECT_CONNECT_RESILIENCY_GROUP: &str = "AWS::DirectConnect::ResiliencyGroup";
+
+/// AWS Direct Connect's ARN namespace (that model's `awsService.arnNamespace`), which is the
+/// namespace both ARNs carry — a resiliency group's from `ResiliencyGroupArn`'s own pattern
+/// (`^arn:(aws|aws-cn|aws-us-gov):directconnect::[0-9]{12}:dx-resiliency-group/\
+/// dxrg-[0-9a-z]{17}$`), which also shows that an ARN of this service carries NO Region.
+pub const DIRECT_CONNECT_ARN_NAMESPACE: &str = "directconnect";
+
+/// The resource paths the two ARNs carry before the identifier that service minted: the one
+/// `ResiliencyGroupArn`'s pattern states for a group, and the one a Direct Connect gateway is
+/// named under (`arn:<partition>:directconnect::<account>:dx-gateway/<id>`).
+pub const DIRECT_CONNECT_GATEWAY_PATH: &str = "dx-gateway";
+pub const DIRECT_CONNECT_RESILIENCY_GROUP_PATH: &str = "dx-resiliency-group";
+
+/// Every `Fn::GetAtt` attribute each of the two types publishes: the identifier AWS Direct
+/// Connect minted for the resource, which is what every call of that service on one takes and
+/// the value the ARN that type's `Ref` returns is built around.
+pub(super) const DIRECT_CONNECT_GATEWAY_ATTRIBUTES: &[&str] = &["DirectConnectGatewayId"];
+pub(super) const DIRECT_CONNECT_RESILIENCY_GROUP_ATTRIBUTES: &[&str] = &["ResiliencyGroupId"];
+
+/// How a resiliency group's identifier is SPELLED, from `ResiliencyGroupId`'s own pattern and
+/// length: the `dxrg` prefix, a hyphen and 17 more characters, drawn from the lowercase
+/// alphabet `ResiliencyGroupArn` admits. The salt keeps this label distinct from any other
+/// identifier derived for the same resource.
+pub(super) const DIRECT_CONNECT_RESILIENCY_GROUP_ID_PREFIX: &str = "dxrg";
+pub(super) const DIRECT_CONNECT_RESILIENCY_GROUP_ID_SALT: &str = "directconnect/resiliency-group";
+pub(super) const DIRECT_CONNECT_RESILIENCY_GROUP_ID_DIGITS: usize = 17;
+
 /// The `AWS::<cloudFormationName>::<Resource>` types of the two Directory Service directories
 /// a template declares: the AWS Managed Microsoft AD directory `CreateMicrosoftAD` makes, and
 /// the Simple AD directory `CreateDirectory` makes. The middle segment is that model's own

@@ -115,6 +115,25 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // A Direct Connect gateway keeps the Amazon-side ASN it was created with:
+        // `amazonSideAsn` is a member of `CreateDirectConnectGateway` and of no member of
+        // `UpdateDirectConnectGateway`, which "updates the NAME of a current Direct Connect
+        // gateway" and takes nothing else — so a declaration naming another ASN asks for a
+        // different gateway, which CloudFormation replaces.
+        //
+        // Its `Tags` are here for the reason a training dataset's are rather than as an
+        // exception: that service does change a gateway's tags in place, through its own
+        // `TagResource`/`UntagResource`, but no arm of [`crate::state::provisioner`] calls them
+        // for this type yet — so a changed tag set is applied by replacing the gateway, whose
+        // create carries the tags, rather than reported as applied by nothing. A tag arm
+        // retires this entry.
+        DIRECT_CONNECT_GATEWAY => &["AmazonSideAsn", "Tags"],
+        // A resiliency group keeps the resiliency model it was created to meet:
+        // `intendedResiliencyModel` is a member of `CreateResiliencyGroup` and of no member of
+        // `UpdateResiliencyGroup`, which takes the group's id and a new name alone — so a
+        // declaration naming another model asks for a different group. Its `Tags` are here for
+        // the same reason the gateway's are.
+        DIRECT_CONNECT_RESILIENCY_GROUP => &["IntendedResiliencyModel", "Tags"],
         // Everything about a Directory Service directory but its single sign-on flag is fixed
         // when that service makes it: the fully qualified name, the NetBIOS short name, the
         // administrator password, the placement and the edition or size are all members of

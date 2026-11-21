@@ -311,6 +311,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
+        // A Direct Connect gateway and a resiliency group each publish the identifier AWS
+        // Direct Connect minted for them, which is the one return value these naming rules
+        // compute a stand-in for before the resource exists.
+        DIRECT_CONNECT_GATEWAY => DIRECT_CONNECT_GATEWAY_ATTRIBUTES,
+        DIRECT_CONNECT_RESILIENCY_GROUP => DIRECT_CONNECT_RESILIENCY_GROUP_ATTRIBUTES,
         // Either Directory Service directory publishes the `Alias` that service answers its
         // access URL under — the directory id itself until an alias is assigned — and a
         // Simple AD the `DirectoryId` it minted beside it. Their `DnsIpAddresses` is a LIST,
@@ -945,6 +950,16 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // The two AWS DIRECT CONNECT types are two more: neither create takes an identifier
+        // for the resource — a template declares a gateway's name and Amazon-side ASN, and a
+        // group's name and intended resiliency model — and each answers the identifier that
+        // service drew (an opaque `directConnectGatewayId`, a `resiliencyGroupId` of the form
+        // `^(dxrg|DXRG)-[0-9a-zA-Z]{17}$`) with the ARN built around it. That ARN is what
+        // either type's `Ref` returns, and the id inside it is what every Direct Connect call
+        // on the resource takes, so no name CloudFormation decides is either and the identity
+        // in force is the one that service answered.
+        || resource_type == DIRECT_CONNECT_GATEWAY
+        || resource_type == DIRECT_CONNECT_RESILIENCY_GROUP
         // The two DIRECTORY SERVICE directory types are two more: neither `CreateMicrosoftAD`
         // nor `CreateDirectory` takes an identifier — a declaration states the directory's
         // fully qualified name, its administrator password and the subnets its servers go in —

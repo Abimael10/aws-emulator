@@ -97,7 +97,8 @@ use super::template::{
     CLEANROOMSML_TRAINING_DATASET,
     CLOUDFRONT_CONNECTION_FUNCTION, CLOUDFRONT_CONNECTION_GROUP, CLOUDFRONT_FUNCTION,
     CLOUDFRONT_KEY_VALUE_STORE, CLOUDFRONT_MONITORING_SUBSCRIPTION,
-    CUSTOMER_PROFILES_DOMAIN, DIRECTORY_SERVICE_MICROSOFT_AD, DIRECTORY_SERVICE_SIMPLE_AD,
+    CUSTOMER_PROFILES_DOMAIN, DIRECT_CONNECT_GATEWAY, DIRECT_CONNECT_RESILIENCY_GROUP,
+    DIRECTORY_SERVICE_MICROSOFT_AD, DIRECTORY_SERVICE_SIMPLE_AD,
     GLUE_TABLE_OPTIMIZER,
     IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION, MEDIACONVERT_CERTIFICATE_ASSOCIATION,
     MWAA_ENVIRONMENT, NEPTUNE_GRAPH_GRAPH,
@@ -492,6 +493,11 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // Amazon Detective
     "AWS::Detective::Graph",
     "AWS::Detective::MemberInvitation",
+    // AWS Direct Connect. The gateway that connects a set of virtual interfaces to virtual
+    // private gateways, and the resiliency group that manages a set of connections as one
+    // unit, are both created in the owning service (`super::provisioner`).
+    DIRECT_CONNECT_GATEWAY,
+    DIRECT_CONNECT_RESILIENCY_GROUP,
     // AWS Directory Service. Both directory types are created in the owning service
     // (`super::provisioner`): `CreateMicrosoftAD` makes an AWS Managed Microsoft AD directory
     // and `CreateDirectory` a Simple AD one.

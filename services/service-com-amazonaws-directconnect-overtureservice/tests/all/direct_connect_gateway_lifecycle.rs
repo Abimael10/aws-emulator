@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The Direct Connect gateway lifecycle, end to end over the wire.
+//! The Direct Connect gateway and resiliency group lifecycles, end to end over the
+//! wire.
+//!
+//! Both are the REGION-LESS resources of this service — a gateway "is global and
+//! visible in any Amazon Web Services Region after it is created" and a group's ARN
+//! carries no Region either — which is why their lifecycles are pinned together here.
 //!
 //! Every assertion goes through `POST /` with `X-Amz-Target: OvertureService.<Op>`
 //! (awsJson1_1), the same path a client takes, and every expectation is about what
 //! the SERVICE STORED: a `CreateDirectConnectGateway` is proved by reading the
-//! gateway back through `DescribeDirectConnectGateways`.
+//! gateway back through `DescribeDirectConnectGateways`, and a
+//! `CreateResiliencyGroup` by reading the group back through `GetResiliencyGroup`,
+//! `ListResiliencyGroups` and `DescribeTags`.
 //!
 //! The tables span the class each rule generalises over (ASN range and bound, tag
 //! count, name shape, page size, filter), and the ASN tables are BUILT from the
@@ -23,9 +30,16 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_directconnect_overtureservice::state::gateway_associations::MAX_ALLOWED_PREFIXES_PER_ASSOCIATION;
+use service_com_amazonaws_directconnect_overtureservice::state::resiliency_groups::{
+    ResiliencyGroup, MAX_RESILIENCY_GROUP_NAME_LEN, RESILIENCY_GROUP_ID_DIGITS,
+    RESILIENCY_GROUP_ID_PREFIX, RESILIENCY_GROUP_STATE_AVAILABLE,
+    RESILIENCY_GROUP_STATE_DELETED, RESILIENCY_GROUP_STATE_DELETING,
+    RESILIENCY_GROUP_STATE_PENDING, RESILIENCY_GROUP_TYPE_MANAGED,
+};
 use service_com_amazonaws_directconnect_overtureservice::state::{
-    ComAmazonawsDirectconnectOvertureserviceState, DEFAULT_AMAZON_SIDE_ASN, MAX_RESULT_SET_SIZE,
-    PRIVATE_AMAZON_SIDE_ASN_RANGES,
+    too_many_resources_message, ComAmazonawsDirectconnectOvertureserviceState,
+    DEFAULT_AMAZON_SIDE_ASN, MAX_RECORDS_PER_STORE, MAX_RESOURCES_PER_CALL, MAX_RESULT_SET_SIZE,
+    MAX_TAGS_PER_RESOURCE, PRIVATE_AMAZON_SIDE_ASN_RANGES,
 };
 
 use crate::connection_and_virtual_interface_lifecycle::{error_code, Emulator};
@@ -421,10 +435,12 @@ async fn a_gateway_id_filter_that_selects_nothing_answers_an_empty_page() {
     let stored = gateway(&dx, "selection-one").await;
     let other = gateway(&dx, "selection-two").await;
 
-    // And one the store holds in the `deleted` state: "Deleted Direct Connect
-    // gateways are not returned", which is that same empty selection rather than a
-    // bad parameter. No operation deletes a gateway yet, so the record is put in
-    // that state directly through the shared engine — the store the handler reads.
+    // And one the store holds in the TERMINAL `deleted` state, which
+    // `DirectConnectGatewayState` models as a state a gateway is reported in: such a
+    // tombstone is still selected by its own id, so a client that deleted a gateway
+    // can tell "it is gone" from "it was never there". The record is put in that
+    // state directly through the shared engine — the store the handler reads — so
+    // this row does not wait on the span `DeleteDirectConnectGateway` owes.
     let deleted = gateway(&dx, "selection-deleted").await;
     dx.engine()
         .state::<ComAmazonawsDirectconnectOvertureserviceState>()
@@ -454,7 +470,11 @@ async fn a_gateway_id_filter_that_selects_nothing_answers_an_empty_page() {
         ),
         ("a value carrying a space", "not a gateway".to_string(), vec![]),
         ("the empty string", String::new(), vec![]),
-        ("the id of a deleted gateway", deleted.clone(), vec![]),
+        (
+            "the id of a deleted gateway",
+            deleted.clone(),
+            vec![deleted.clone()],
+        ),
         (
             "the id of a stored gateway",
             stored.clone(),
@@ -503,7 +523,7 @@ async fn a_gateway_id_filter_that_selects_nothing_answers_an_empty_page() {
     }
 
     // The filter NARROWS the listing rather than replacing it: unfiltered, every
-    // gateway that is not deleted is still answered.
+    // gateway the store holds is still answered, the tombstone among them.
     let (all, _) = describe(&dx, json!({})).await;
     let listed: Vec<String> = all
         .iter()
@@ -516,8 +536,8 @@ async fn a_gateway_id_filter_that_selects_nothing_answers_an_empty_page() {
         .collect();
     assert_eq!(
         listed,
-        vec![stored, other],
-        "expected every gateway that is not deleted, got {listed:?}"
+        vec![stored, other, deleted],
+        "expected every gateway the store holds, got {listed:?}"
     );
 }
 
@@ -1070,6 +1090,1174 @@ async fn a_listing_of_associations_that_selects_by_nothing_is_refused_whatever_e
 }
 
 // ---------------------------------------------------------------------------
+// The resiliency group: the other Region-less resource of this service
+// ---------------------------------------------------------------------------
+
+/// How long this half of the suite is willing to wait for a state the CLOCK makes due,
+/// and how often it looks again.
+///
+/// Generous on purpose: what is waited FOR is the CONDITION — the state the service
+/// reports for the resource — rather than a span of wall clock, so a loaded or a faster
+/// host cannot decide the outcome, and the wait ends as soon as the state appears.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(30);
+/// See [`SETTLE_DEADLINE`].
+const LOOK_AGAIN_AFTER: Duration = Duration::from_millis(20);
+
+/// The ARN form every resource of this service publishes:
+/// `arn:aws:directconnect:<region>:<account>:<path>/<id>`, where `region` is EMPTY for a
+/// resource that is global (a Direct Connect gateway, a resiliency group) — which is what
+/// `ResiliencyGroupArn`'s own pattern states
+/// (`^arn:(aws|aws-cn|aws-us-gov):directconnect::[0-9]{12}:dx-resiliency-group/\
+/// dxrg-[0-9a-z]{17}$`). Written out here rather than taken from the service, so the
+/// FORM is what the test pins.
+fn direct_connect_arn(region: &str, path: &str, id: &str) -> String {
+    format!("arn:aws:directconnect:{region}:000000000000:{path}/{id}")
+}
+
+/// Read one resiliency group again until that service reports it in `state`, and answer the
+/// record it reported there.
+///
+/// The ONE wait of the group half of this suite: a state the clock owes is due at an
+/// INSTANT the service records, so what is waited for is that state appearing, under
+/// [`SETTLE_DEADLINE`]. A wait that runs out names the last read, so a group that settled
+/// somewhere else says where.
+///
+/// The pause between looks is `std::thread::sleep` rather than `tokio::time::sleep`: the
+/// workspace enables tokio's `macros`/`rt` features only, so `tokio::time` is not
+/// available here, and nothing else is pending on the test's runtime.
+async fn group_in_state(dx: &Emulator, case: &str, group_id: &str, state: &str) -> Value {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, held) = get_group(dx, group_id).await;
+        if status == 200 && held["state"] == json!(state) {
+            return held;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the group {group_id} to reach {state}, last read {status} \
+             with {held}"
+        );
+        std::thread::sleep(LOOK_AGAIN_AFTER);
+    }
+}
+
+/// The same wait for one Direct Connect gateway, read through the listing its own id
+/// narrows, and answered with the record that listing reported in `state`.
+async fn gateway_in_state(dx: &Emulator, case: &str, gateway_id: &str, state: &str) -> Value {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (listed, _) = describe(dx, json!({"directConnectGatewayId": gateway_id})).await;
+        let held = listed
+            .iter()
+            .find(|held| held["directConnectGatewayState"] == json!(state))
+            .cloned();
+        if let Some(held) = held {
+            return held;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the gateway {gateway_id} to reach {state}, last read \
+             {listed:?}"
+        );
+        std::thread::sleep(LOOK_AGAIN_AFTER);
+    }
+}
+
+/// One row of the resiliency-group create table: case, name, `intendedResiliencyModel`,
+/// tags.
+type GroupRow<'a> = (&'a str, String, &'a str, &'a [(&'a str, &'a str)]);
+
+/// One row of the tag-set refusal table: case, the tags the create carries, and the
+/// modelled error code it must be refused with — `None` for a set the service accepts.
+type TagSetRow<'a> = (&'a str, Vec<(&'a str, &'a str)>, Option<&'a str>);
+
+/// A `CreateResiliencyGroup` body.
+fn create_group_body(
+    name: &str,
+    model: &str,
+    tags: &[(&str, &str)],
+    client_token: Option<&str>,
+) -> Value {
+    let mut body = Map::new();
+    body.insert("resiliencyGroupName".to_string(), json!(name));
+    body.insert("intendedResiliencyModel".to_string(), json!(model));
+    if let Some(token) = client_token {
+        body.insert("clientToken".to_string(), json!(token));
+    }
+    if !tags.is_empty() {
+        body.insert(
+            "tags".to_string(),
+            Value::Array(
+                tags.iter()
+                    .map(|(key, value)| json!({"key": key, "value": value}))
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(body)
+}
+
+/// Create one resiliency group and return its id, failing the test if it was refused.
+async fn group(dx: &Emulator, name: &str, model: &str) -> String {
+    let (status, body) = dx
+        .call(
+            "CreateResiliencyGroup",
+            create_group_body(name, model, &[], None),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup {name:?}: expected CreateResiliencyGroup to succeed, got {status} with {body}"
+    );
+    body["resiliencyGroup"]["resiliencyGroupId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `GetResiliencyGroup`'s own record of one group.
+async fn get_group(dx: &Emulator, group_id: &str) -> (u16, Value) {
+    let (status, response) = dx
+        .call(
+            "GetResiliencyGroup",
+            json!({"resiliencyGroupId": group_id}),
+        )
+        .await;
+    (status, response["resiliencyGroup"].clone())
+}
+
+/// The groups `ListResiliencyGroups` answers for `body`, with the response's `nextToken`.
+async fn list_groups(dx: &Emulator, body: Value) -> (Vec<Value>, Value) {
+    let (status, response) = dx.call("ListResiliencyGroups", body.clone()).await;
+    assert_eq!(
+        status, 200,
+        "expected ListResiliencyGroups 200 for {body}, got {status} with {response}"
+    );
+    (
+        response["items"].as_array().cloned().unwrap_or_default(),
+        response["nextToken"].clone(),
+    )
+}
+
+/// Whether `id` is a server-minted resiliency group id: the `dxrg-` prefix and
+/// [`RESILIENCY_GROUP_ID_DIGITS`] characters of the lowercase alphabet
+/// `ResiliencyGroupArn`'s own pattern admits.
+fn is_minted_group_id(id: &Value) -> bool {
+    let Some(id) = id.as_str() else { return false };
+    let Some(label) = id.strip_prefix(&format!("{RESILIENCY_GROUP_ID_PREFIX}-")) else {
+        return false;
+    };
+    label.chars().count() == RESILIENCY_GROUP_ID_DIGITS
+        && label
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+}
+
+/// `tags` as the `TagList` a stored record reports them in.
+fn tag_list(tags: &[(&str, &str)]) -> Value {
+    Value::Array(
+        tags.iter()
+            .map(|(key, value)| json!({"key": key, "value": value}))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn a_created_resiliency_group_is_minted_stored_and_read_back_field_for_field() {
+    // RULE: the create MINTS the group's identity and stores the declaration, and every
+    // later read renders the SAME stored record — so a create followed by a read answers
+    // the same bytes, and the account's own listing reports the group too.
+    //
+    // The rows span what the rule generalises over: which of the three `ResiliencyModel`
+    // values the group is created to meet (the whole set
+    // `smithy_query(query="shape",shape="ResiliencyModel")` states), how many tags the
+    // declaration carries (none, one, two) and how long the name is (one character, a
+    // middling name, and the longest `ResiliencyGroupName`'s `@length 1..255` admits).
+    let rows: Vec<GroupRow> = vec![
+        (
+            "the maximum-resiliency model, no tags",
+            "a".to_string(),
+            "maximum-resiliency",
+            &[],
+        ),
+        (
+            "the high-resiliency model, one tag",
+            "group-high_1".to_string(),
+            "high-resiliency",
+            &[("tier", "high")],
+        ),
+        (
+            "the basic-resiliency model, two tags, the longest name admitted",
+            "b".repeat(MAX_RESILIENCY_GROUP_NAME_LEN),
+            "basic-resiliency",
+            &[("tier", "basic"), ("owner", "platform")],
+        ),
+    ];
+
+    for (case, name, model, tags) in rows {
+        let dx = Emulator::new();
+        let (status, created) = dx
+            .call(
+                "CreateResiliencyGroup",
+                create_group_body(&name, model, tags, None),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {created}"
+        );
+        let held_group = created["resiliencyGroup"].clone();
+        let group_id = held_group["resiliencyGroupId"].clone();
+        assert!(
+            is_minted_group_id(&group_id),
+            "case {case:?}: expected a minted {RESILIENCY_GROUP_ID_PREFIX}- id, got {group_id:?}"
+        );
+        let expected_arn = direct_connect_arn(
+            "",
+            "dx-resiliency-group",
+            group_id.as_str().unwrap_or_default(),
+        );
+        assert_eq!(
+            (
+                held_group["resiliencyGroupArn"].clone(),
+                held_group["resiliencyGroupName"].clone(),
+                held_group["resiliencyGroupType"].clone(),
+                held_group["ownerAccount"].clone(),
+                held_group["state"].clone(),
+            ),
+            (
+                json!(expected_arn),
+                json!(name),
+                json!(RESILIENCY_GROUP_TYPE_MANAGED),
+                json!(engine::emulator_account_id()),
+                json!(RESILIENCY_GROUP_STATE_PENDING),
+            ),
+            "case {case:?}: expected the declared group minted pending, got {held_group}"
+        );
+        // `TagList` is `@length 1..`, so a group nobody tagged publishes no list at all
+        // rather than an empty one.
+        if tags.is_empty() {
+            assert!(
+                held_group["tags"].is_null(),
+                "case {case:?}: a group with no tags publishes no list, got {:?}",
+                held_group["tags"]
+            );
+        } else {
+            assert_eq!(
+                held_group["tags"],
+                tag_list(tags),
+                "case {case:?}: expected the declared tags, got {:?}",
+                held_group["tags"]
+            );
+        }
+
+        // The READ renders the same record, and the listing carries its summary — which
+        // is the record LESS the tags, the one member `ResiliencyGroupSummary` does not
+        // publish.
+        let (status, held) = get_group(&dx, group_id.as_str().unwrap_or_default()).await;
+        assert_eq!(
+            (status, held.clone()),
+            (200, held_group.clone()),
+            "case {case:?}: expected the read to answer the stored group, got {status} with \
+             {held}"
+        );
+        let (listed, token) = list_groups(&dx, json!({})).await;
+        let mut summary = held_group.clone();
+        if let Some(object) = summary.as_object_mut() {
+            object.remove("tags");
+        }
+        assert_eq!(
+            (listed, token),
+            (vec![summary], Value::Null),
+            "case {case:?}: expected the account's listing to report the group's summary"
+        );
+
+        // `pending` is where the create leaves the group; `available` is what the clock
+        // owes from there, so the read is looked at again until that state appears.
+        let settled = group_in_state(
+            &dx,
+            case,
+            group_id.as_str().unwrap_or_default(),
+            RESILIENCY_GROUP_STATE_AVAILABLE,
+        )
+        .await;
+        assert_eq!(
+            settled["resiliencyGroupId"],
+            group_id,
+            "case {case:?}: expected the settled group to be the one created, got {settled}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_resiliency_group_create_is_refused_for_a_tag_set_no_resource_can_carry() {
+    // RULE: the tag set a create carries is held to the two things AWS states about one —
+    // at most `MAX_TAGS_PER_RESOURCE` tags per Direct Connect resource, and one value per
+    // key — and the modelled exception for each is its own.
+    //
+    // The rows differ along which bound is crossed and by how much: the count AT the
+    // ceiling (accepted), one past it, a key repeated twice, and a key repeated inside an
+    // otherwise legal set.
+    let at_the_ceiling: Vec<(String, String)> = (0..MAX_TAGS_PER_RESOURCE)
+        .map(|n| (format!("key-{n}"), format!("value-{n}")))
+        .collect();
+    let past_the_ceiling: Vec<(String, String)> = (0..=MAX_TAGS_PER_RESOURCE)
+        .map(|n| (format!("key-{n}"), format!("value-{n}")))
+        .collect();
+    fn borrowed(tags: &[(String, String)]) -> Vec<(&str, &str)> {
+        tags.iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
+    }
+
+    let rows: Vec<TagSetRow> = vec![
+        (
+            "a tag set exactly at the ceiling",
+            borrowed(&at_the_ceiling),
+            None,
+        ),
+        (
+            "one tag past the ceiling",
+            borrowed(&past_the_ceiling),
+            Some("TooManyTagsException"),
+        ),
+        (
+            "one key stated twice",
+            vec![("tier", "basic"), ("tier", "high")],
+            Some("DuplicateTagKeysException"),
+        ),
+        (
+            "a repeated key inside an otherwise legal set",
+            vec![("owner", "platform"), ("tier", "basic"), ("owner", "net")],
+            Some("DuplicateTagKeysException"),
+        ),
+    ];
+
+    for (case, tags, refused) in rows {
+        let dx = Emulator::new();
+        let (status, response) = dx
+            .call(
+                "CreateResiliencyGroup",
+                create_group_body("tagged-group", "basic-resiliency", &tags, None),
+            )
+            .await;
+        match refused {
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the set to be accepted, got {status} with {response}"
+                );
+                let (held, _) = list_groups(&dx, json!({})).await;
+                assert_eq!(
+                    held.len(),
+                    1,
+                    "case {case:?}: expected the accepted group to be held, got {held:?}"
+                );
+            }
+            Some(expected) => {
+                assert_eq!(
+                    (status, error_code(&response)),
+                    (400, expected.to_string()),
+                    "case {case:?}: expected {expected}, got {status} with {response}"
+                );
+                let (held, _) = list_groups(&dx, json!({})).await;
+                assert!(
+                    held.is_empty(),
+                    "case {case:?}: a refused create must store nothing, got {held:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_create_under_one_client_token_answers_the_group_it_already_minted() {
+    // `clientToken` is "a unique, case-sensitive identifier that you provide to ensure the
+    // idempotency of the request", so the same request repeated under it answers THAT
+    // group rather than minting a second one — while a create carrying no token, or
+    // another token, asks for a group of its own, the name being no identity.
+    let dx = Emulator::new();
+    let token = "11111111-2222-3333-4444-555555555555";
+    let (status, first) = dx
+        .call(
+            "CreateResiliencyGroup",
+            create_group_body("idempotent-group", "basic-resiliency", &[], Some(token)),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected the first create to succeed, got {status} with {first}"
+    );
+    let (status, again) = dx
+        .call(
+            "CreateResiliencyGroup",
+            create_group_body("idempotent-group", "basic-resiliency", &[], Some(token)),
+        )
+        .await;
+    assert_eq!(
+        (status, again.clone()),
+        (200, first.clone()),
+        "expected the repeat under one token to answer the same group, got {status} with {again}"
+    );
+    let (held, _) = list_groups(&dx, json!({})).await;
+    assert_eq!(
+        held.len(),
+        1,
+        "expected one group for one token, got {held:?}"
+    );
+
+    // Another token, and no token at all, each ask for a group of their own.
+    for (case, carried) in [
+        ("another token", Some("99999999-8888-7777-6666-555555555555")),
+        ("no token at all", None),
+    ] {
+        let (status, other) = dx
+            .call(
+                "CreateResiliencyGroup",
+                create_group_body("idempotent-group", "basic-resiliency", &[], carried),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected a group of its own, got {status} with {other}"
+        );
+        assert_ne!(
+            other["resiliencyGroup"]["resiliencyGroupId"],
+            first["resiliencyGroup"]["resiliencyGroupId"],
+            "case {case:?}: expected a second group, got the first one back"
+        );
+    }
+    let (held, _) = list_groups(&dx, json!({})).await;
+    assert_eq!(
+        held.len(),
+        3,
+        "expected one group per distinct request, got {held:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_resiliency_group_call_naming_an_id_the_account_holds_nothing_under_is_refused() {
+    // RULE: `GetResiliencyGroup`, `UpdateResiliencyGroup` and `DeleteResiliencyGroup` each
+    // RESOLVE their group rather than selecting one, so an id the account holds no group
+    // under is a client fault — this service's one client exception, worded the way this
+    // crate words every unresolved identifier.
+    //
+    // The rows differ along the operation and along the FORM of the id: a well-formed id
+    // naming no group, and one in the uppercase spelling `ResiliencyGroupId`'s pattern
+    // also admits.
+    let dx = Emulator::new();
+    let held = group(&dx, "resolved-group", "basic-resiliency").await;
+    for unknown in ["dxrg-00000000000000000", "DXRG-00000000000000000"] {
+        for operation in [
+            "GetResiliencyGroup",
+            "UpdateResiliencyGroup",
+            "DeleteResiliencyGroup",
+        ] {
+            let mut body = Map::new();
+            body.insert("resiliencyGroupId".to_string(), json!(unknown));
+            if operation == "UpdateResiliencyGroup" {
+                body.insert("resiliencyGroupName".to_string(), json!("renamed"));
+            }
+            let (status, response) = dx.call(operation, Value::Object(body)).await;
+            assert_eq!(
+                (status, error_code(&response), error_message(&response)),
+                (
+                    400,
+                    "DirectConnectClientException".to_string(),
+                    format!("Resiliency group ID {unknown} does not exist"),
+                ),
+                "case {operation} on {unknown:?}: expected the unresolved-id refusal, got \
+                 {status} with {response}"
+            );
+        }
+    }
+
+    // A pagination token naming nothing in the listing IS a refusal too, while the group
+    // the account does hold is still resolved.
+    let (status, response) = dx
+        .call(
+            "ListResiliencyGroups",
+            json!({"nextToken": "dxrg-00000000000000000"}),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&response)),
+        (400, "DirectConnectClientException".to_string()),
+        "case \"a pagination token naming nothing\": expected a refusal, got {status} with \
+         {response}"
+    );
+    let (status, resolved) = get_group(&dx, &held).await;
+    assert_eq!(
+        (status, resolved["resiliencyGroupId"].clone()),
+        (200, json!(held)),
+        "expected the group the account holds to resolve, got {status} with {resolved}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_resiliency_group_moves_it_through_deleting_to_a_readable_tombstone() {
+    // RULE: `deleting` is where a torn-down group starts and `deleted` is the terminal
+    // state the clock owes it, which `ResiliencyGroupState` models as a state a group is
+    // REPORTED in — so the tombstone stays readable under its own id, a repeated delete is
+    // the state it already asks for, and a group on its way out takes no rename.
+    let dx = Emulator::new();
+    let group_id = group(&dx, "torn-down-group", "basic-resiliency").await;
+
+    let (status, deleted) = dx
+        .call(
+            "DeleteResiliencyGroup",
+            json!({"resiliencyGroupId": &group_id}),
+        )
+        .await;
+    assert_eq!(
+        (status, deleted["resiliencyGroup"]["state"].clone()),
+        (200, json!(RESILIENCY_GROUP_STATE_DELETING)),
+        "expected the delete to answer the group deleting, got {status} with {deleted}"
+    );
+
+    // A group being torn down is not one a name can be changed on.
+    let (status, refused) = dx
+        .call(
+            "UpdateResiliencyGroup",
+            json!({"resiliencyGroupId": &group_id, "resiliencyGroupName": "renamed"}),
+        )
+        .await;
+    assert_eq!(
+        (status, error_message(&refused)),
+        (
+            400,
+            format!(
+                "Resiliency group {group_id} is in state {RESILIENCY_GROUP_STATE_DELETING}"
+            )
+        ),
+        "expected a rename of a group being torn down to be refused, got {status} with {refused}"
+    );
+
+    // `deleted` is what the clock owes a `deleting` group, so the read is looked at again
+    // until that state appears — and the tombstone is still READABLE there.
+    let tombstone = group_in_state(
+        &dx,
+        "a torn-down group",
+        &group_id,
+        RESILIENCY_GROUP_STATE_DELETED,
+    )
+    .await;
+    assert_eq!(
+        tombstone["resiliencyGroupId"],
+        json!(group_id),
+        "expected the tombstone to stay readable under its own id, got {tombstone}"
+    );
+    let (listed, _) = list_groups(&dx, json!({})).await;
+    assert_eq!(
+        listed
+            .iter()
+            .map(|summary| summary["state"].clone())
+            .collect::<Vec<Value>>(),
+        vec![json!(RESILIENCY_GROUP_STATE_DELETED)],
+        "expected the listing to report the tombstone too, got {listed:?}"
+    );
+
+    // The delete is idempotent: a group already gone is in the state the call asks for.
+    let (status, again) = dx
+        .call(
+            "DeleteResiliencyGroup",
+            json!({"resiliencyGroupId": &group_id}),
+        )
+        .await;
+    assert_eq!(
+        (status, again["resiliencyGroup"]["state"].clone()),
+        (200, json!(RESILIENCY_GROUP_STATE_DELETED)),
+        "expected a repeated delete to answer the state it already asks for, got {status} with \
+         {again}"
+    );
+}
+
+#[tokio::test]
+async fn renaming_a_resiliency_group_keeps_the_identity_the_service_minted() {
+    // `UpdateResiliencyGroup` takes the group's id and a new `resiliencyGroupName` and
+    // nothing else, so a rename is a modification of the group rather than a new one: the
+    // id, the ARN, the type and the tags all stay.
+    let dx = Emulator::new();
+    let (status, created) = dx
+        .call(
+            "CreateResiliencyGroup",
+            create_group_body(
+                "named-before",
+                "high-resiliency",
+                &[("tier", "high")],
+                None,
+            ),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected the create to succeed, got {status} with {created}"
+    );
+    let before = created["resiliencyGroup"].clone();
+    let group_id = before["resiliencyGroupId"].as_str().unwrap_or_default().to_string();
+
+    let (status, renamed) = dx
+        .call(
+            "UpdateResiliencyGroup",
+            json!({"resiliencyGroupId": &group_id, "resiliencyGroupName": "named-after"}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected the rename to succeed, got {status} with {renamed}"
+    );
+    let after = renamed["resiliencyGroup"].clone();
+    assert_eq!(
+        (
+            after["resiliencyGroupId"].clone(),
+            after["resiliencyGroupArn"].clone(),
+            after["resiliencyGroupType"].clone(),
+            after["tags"].clone(),
+            after["resiliencyGroupName"].clone(),
+        ),
+        (
+            before["resiliencyGroupId"].clone(),
+            before["resiliencyGroupArn"].clone(),
+            before["resiliencyGroupType"].clone(),
+            before["tags"].clone(),
+            json!("named-after"),
+        ),
+        "expected the rename to keep every other value, got {after}"
+    );
+    let (_, held) = get_group(&dx, &group_id).await;
+    assert_eq!(
+        held["resiliencyGroupName"],
+        json!("named-after"),
+        "expected the store to hold the new name, got {held}"
+    );
+}
+
+#[tokio::test]
+async fn resiliency_groups_page_with_max_results_and_next_token() {
+    // `maxResults` windows the listing and `nextToken` resumes it just past the page's
+    // last item, and "if MaxResults is given a value larger than 100, only 100 results
+    // are returned" — so a page size past that ceiling is the ceiling.
+    let dx = Emulator::new();
+    let mut ids = Vec::new();
+    for n in 0..5 {
+        ids.push(group(&dx, &format!("page-group-{n}"), "basic-resiliency").await);
+    }
+
+    let (page, token) = list_groups(&dx, json!({"maxResults": 2})).await;
+    assert_eq!(
+        page.iter()
+            .map(|summary| summary["resiliencyGroupId"].as_str().unwrap_or_default())
+            .collect::<Vec<&str>>(),
+        ids[..2].iter().map(String::as_str).collect::<Vec<&str>>(),
+        "expected the first two groups in creation order, got {page:?}"
+    );
+    assert_eq!(
+        token,
+        json!(ids[1]),
+        "expected the token to be the key of the page's last item, got {token:?}"
+    );
+
+    let (rest, token) = list_groups(&dx, json!({"nextToken": &ids[1]})).await;
+    assert_eq!(
+        (
+            rest.iter()
+                .map(|summary| summary["resiliencyGroupId"].as_str().unwrap_or_default())
+                .collect::<Vec<&str>>(),
+            token
+        ),
+        (
+            ids[2..].iter().map(String::as_str).collect::<Vec<&str>>(),
+            Value::Null
+        ),
+        "expected the rest of the listing and no further token, got {rest:?}"
+    );
+
+    // A window wider than the result set, and one past the published ceiling, both answer
+    // the whole set in one page.
+    for body in [
+        json!({"maxResults": ids.len()}),
+        json!({"maxResults": MAX_RESULT_SET_SIZE + 1}),
+    ] {
+        let (whole, token) = list_groups(&dx, body.clone()).await;
+        assert_eq!(
+            (whole.len(), token),
+            (ids.len(), Value::Null),
+            "case {body}: expected the whole set in one page"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_group_store_refuses_one_past_its_ceiling_and_reclaims_a_torn_down_one() {
+    // The emulator's own memory ceiling (not an AWS quota): at
+    // `MAX_RECORDS_PER_STORE` a create first reclaims what the clock has already torn
+    // down and, if that frees nothing, is refused with a modelled error naming the
+    // ceiling. The store is filled through the shared engine rather than through a
+    // thousand wire calls, which is what the handler then reads.
+    let dx = Emulator::new();
+    {
+        let state = dx
+            .engine()
+            .state::<ComAmazonawsDirectconnectOvertureserviceState>();
+        let mut store = state.lock();
+        for n in 0..MAX_RECORDS_PER_STORE {
+            let group_id = format!("dxrg-{n:017}");
+            store.resiliency_groups.insert(
+                group_id.clone(),
+                ResiliencyGroup {
+                    resiliency_group_id: group_id.clone(),
+                    resiliency_group_name: format!("seeded-{n}"),
+                    intended_resiliency_model: "basic-resiliency".to_string(),
+                    owner_account: engine::emulator_account_id().to_string(),
+                    state: RESILIENCY_GROUP_STATE_AVAILABLE.to_string(),
+                    tags: Vec::new(),
+                    client_token: None,
+                    due: None,
+                },
+            );
+            store.resiliency_group_order.push(group_id);
+        }
+    }
+
+    let (status, refused) = dx
+        .call(
+            "CreateResiliencyGroup",
+            create_group_body("one-too-many", "basic-resiliency", &[], None),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&refused)),
+        (400, "LimitExceededException".to_string()),
+        "expected the ceiling to refuse a further group, got {status} with {refused}"
+    );
+
+    // A record the clock has already torn down is reclaimed, which frees the room.
+    {
+        let state = dx
+            .engine()
+            .state::<ComAmazonawsDirectconnectOvertureserviceState>();
+        let mut store = state.lock();
+        let first = store.resiliency_group_order[0].clone();
+        if let Some(held) = store.resiliency_groups.get_mut(&first) {
+            held.state = RESILIENCY_GROUP_STATE_DELETED.to_string();
+        }
+    }
+    let (status, created) = dx
+        .call(
+            "CreateResiliencyGroup",
+            create_group_body("room-reclaimed", "basic-resiliency", &[], None),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected the reclaimed room to admit a further group, got {status} with {created}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_gateway_moves_it_to_a_tombstone_and_is_refused_while_it_carries_traffic() {
+    // RULE: "You must first delete all virtual interfaces that are attached to the Direct
+    // Connect gateway and disassociate all virtual private gateways associated with the
+    // Direct Connect gateway" — so a gateway something still terminates on is not
+    // deletable, and one nothing does walks `deleting` to the terminal `deleted` the clock
+    // owes it.
+    let dx = Emulator::new();
+    let gateway_id = gateway(&dx, "deletable-gateway").await;
+    let attached_to = gateway(&dx, "attached-gateway").await;
+
+    // A virtual interface terminating on the second gateway, created the way a client
+    // creates one: over a connection of this account, naming that gateway.
+    let (status, connection) = dx
+        .call(
+            "CreateConnection",
+            json!({
+                "connectionName": "gateway-delete-connection",
+                "location": "EqDC2-EQ",
+                "bandwidth": "1Gbps",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreateConnection to succeed, got {status} with {connection}"
+    );
+    let connection_id = connection["connectionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, interface) = dx
+        .call(
+            "CreatePrivateVirtualInterface",
+            json!({
+                "connectionId": &connection_id,
+                "newPrivateVirtualInterface": {
+                    "virtualInterfaceName": "gateway-delete-vif",
+                    "vlan": 101,
+                    "asn": 65000,
+                    "directConnectGatewayId": &attached_to,
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreatePrivateVirtualInterface to succeed, got {status} with {interface}"
+    );
+
+    let (status, refused) = dx
+        .call(
+            "DeleteDirectConnectGateway",
+            json!({"directConnectGatewayId": &attached_to}),
+        )
+        .await;
+    assert_eq!(
+        (status, error_message(&refused)),
+        (
+            400,
+            format!("Direct Connect gateway {attached_to} has virtual interfaces attached")
+        ),
+        "expected a gateway with an attachment to be undeletable, got {status} with {refused}"
+    );
+
+    // A gateway nothing terminates on is torn down: `deleting` first, then the terminal
+    // `deleted` the clock owes it, which stays selectable by its own id.
+    let (status, deleted) = dx
+        .call(
+            "DeleteDirectConnectGateway",
+            json!({"directConnectGatewayId": &gateway_id}),
+        )
+        .await;
+    assert_eq!(
+        (
+            status,
+            deleted["directConnectGateway"]["directConnectGatewayState"].clone()
+        ),
+        (200, json!("deleting")),
+        "expected the delete to answer the gateway deleting, got {status} with {deleted}"
+    );
+    // `deleted` is what the clock owes a `deleting` gateway, so the listing is looked at
+    // again until it reports that state — and the tombstone is still SELECTED by its own
+    // id there.
+    let tombstone = gateway_in_state(&dx, "a torn-down gateway", &gateway_id, "deleted").await;
+    assert_eq!(
+        tombstone["directConnectGatewayId"],
+        json!(gateway_id),
+        "expected the tombstone to stay describable under its own id, got {tombstone}"
+    );
+
+    // An id naming no gateway at all is the unresolved-id refusal, and a repeated delete
+    // answers the state it already asks for.
+    let (status, unknown) = dx
+        .call(
+            "DeleteDirectConnectGateway",
+            json!({"directConnectGatewayId": "00000000-0000-4000-8000-000000000000"}),
+        )
+        .await;
+    assert_eq!(
+        (status, error_message(&unknown)),
+        (
+            400,
+            "Direct Connect gateway ID 00000000-0000-4000-8000-000000000000 does not exist"
+                .to_string()
+        ),
+        "expected the unresolved-id refusal, got {status} with {unknown}"
+    );
+    let (status, again) = dx
+        .call(
+            "DeleteDirectConnectGateway",
+            json!({"directConnectGatewayId": &gateway_id}),
+        )
+        .await;
+    assert_eq!(
+        (
+            status,
+            again["directConnectGateway"]["directConnectGatewayState"].clone()
+        ),
+        (200, json!("deleted")),
+        "expected a repeated delete to answer the state it already asks for, got {status} with \
+         {again}"
+    );
+}
+
+#[tokio::test]
+async fn renaming_a_gateway_keeps_its_id_and_is_refused_once_it_is_torn_down() {
+    // `UpdateDirectConnectGateway` "updates the name of a CURRENT Direct Connect gateway"
+    // and takes nothing else, so a rename keeps the id that service minted and the ASN it
+    // was created with — and a gateway being torn down is not a current one.
+    let dx = Emulator::new();
+    let (status, created) = dx
+        .call(
+            "CreateDirectConnectGateway",
+            create_gateway_body("renamed-before", Some(PRIVATE_AMAZON_SIDE_ASN_RANGES[0].0), &[]),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected the create to succeed, got {status} with {created}"
+    );
+    let before = created["directConnectGateway"].clone();
+    let gateway_id = before["directConnectGatewayId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let (status, renamed) = dx
+        .call(
+            "UpdateDirectConnectGateway",
+            json!({
+                "directConnectGatewayId": &gateway_id,
+                "newDirectConnectGatewayName": "renamed-after",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected the rename to succeed, got {status} with {renamed}"
+    );
+    let after = renamed["directConnectGateway"].clone();
+    assert_eq!(
+        (
+            after["directConnectGatewayId"].clone(),
+            after["amazonSideAsn"].clone(),
+            after["ownerAccount"].clone(),
+            after["directConnectGatewayName"].clone(),
+        ),
+        (
+            before["directConnectGatewayId"].clone(),
+            before["amazonSideAsn"].clone(),
+            before["ownerAccount"].clone(),
+            json!("renamed-after"),
+        ),
+        "expected the rename to keep every other value, got {after}"
+    );
+    let (listed, _) = describe(&dx, json!({"directConnectGatewayId": &gateway_id})).await;
+    assert_eq!(
+        listed
+            .iter()
+            .map(|held| held["directConnectGatewayName"].clone())
+            .collect::<Vec<Value>>(),
+        vec![json!("renamed-after")],
+        "expected the store to hold the new name, got {listed:?}"
+    );
+
+    // A name made only of whitespace names nothing, and a gateway on its way out takes no
+    // name at all.
+    let (status, empty) = dx
+        .call(
+            "UpdateDirectConnectGateway",
+            json!({
+                "directConnectGatewayId": &gateway_id,
+                "newDirectConnectGatewayName": "   ",
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_message(&empty)),
+        (
+            400,
+            "newDirectConnectGatewayName must not be empty".to_string()
+        ),
+        "expected a whitespace-only name to be refused, got {status} with {empty}"
+    );
+    let (status, _) = dx
+        .call(
+            "DeleteDirectConnectGateway",
+            json!({"directConnectGatewayId": &gateway_id}),
+        )
+        .await;
+    assert_eq!(status, 200, "setup: expected the delete to succeed");
+    let (status, torn_down) = dx
+        .call(
+            "UpdateDirectConnectGateway",
+            json!({
+                "directConnectGatewayId": &gateway_id,
+                "newDirectConnectGatewayName": "renamed-again",
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_message(&torn_down)),
+        (
+            400,
+            format!("Direct Connect gateway {gateway_id} is in state deleting")
+        ),
+        "expected a rename of a gateway being torn down to be refused, got {status} with \
+         {torn_down}"
+    );
+}
+
+#[tokio::test]
+async fn describe_tags_reports_the_tags_of_each_kind_of_resource_by_its_arn() {
+    // RULE: "Describes the tags associated with the SPECIFIED Direct Connect resources" —
+    // one `ResourceTag` per ARN the request names that this account holds a resource
+    // under, in the order the request named them, with the tags that resource carries; an
+    // ARN naming no resource of this account contributes no element at all, there being no
+    // tags to describe for it.
+    //
+    // The rows span the four kinds of resource this service tags — a connection and a
+    // virtual interface, whose ARNs carry their Region, and a Direct Connect gateway and a
+    // resiliency group, whose ARNs carry none — plus a resource nobody tagged and an ARN
+    // naming nothing.
+    let dx = Emulator::new();
+    let (status, connection) = dx
+        .call(
+            "CreateConnection",
+            json!({
+                "connectionName": "tagged-connection",
+                "location": "EqDC2-EQ",
+                "bandwidth": "1Gbps",
+                "tags": tag_list(&[("kind", "connection")]),
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreateConnection to succeed, got {status} with {connection}"
+    );
+    let connection_id = connection["connectionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, interface) = dx
+        .call(
+            "CreatePrivateVirtualInterface",
+            json!({
+                "connectionId": &connection_id,
+                "newPrivateVirtualInterface": {
+                    "virtualInterfaceName": "tagged-vif",
+                    "vlan": 102,
+                    "asn": 65000,
+                    "virtualGatewayId": "vgw-0123456789abcdef0",
+                    "tags": tag_list(&[("kind", "virtual-interface")]),
+                },
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreatePrivateVirtualInterface to succeed, got {status} with {interface}"
+    );
+    let interface_id = interface["virtualInterfaceId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, created) = dx
+        .call(
+            "CreateDirectConnectGateway",
+            create_gateway_body("tagged-gateway", None, &[("kind", "gateway")]),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreateDirectConnectGateway to succeed, got {status} with {created}"
+    );
+    let gateway_id = created["directConnectGateway"]["directConnectGatewayId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, created_group) = dx
+        .call(
+            "CreateResiliencyGroup",
+            create_group_body("tagged-group", "basic-resiliency", &[("kind", "group")], None),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreateResiliencyGroup to succeed, got {status} with {created_group}"
+    );
+    let group_id = created_group["resiliencyGroup"]["resiliencyGroupId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let untagged = group(&dx, "untagged-group", "basic-resiliency").await;
+
+    let connection_arn = direct_connect_arn("us-east-1", "dxcon", &connection_id);
+    let interface_arn = direct_connect_arn("us-east-1", "dxvif", &interface_id);
+    let gateway_arn = direct_connect_arn("", "dx-gateway", &gateway_id);
+    let group_arn = direct_connect_arn("", "dx-resiliency-group", &group_id);
+    let untagged_arn = direct_connect_arn("", "dx-resiliency-group", &untagged);
+    let unknown_arn = direct_connect_arn("", "dx-resiliency-group", "dxrg-00000000000000000");
+
+    let (status, described) = dx
+        .call(
+            "DescribeTags",
+            json!({"resourceArns": [
+                &connection_arn,
+                &interface_arn,
+                &gateway_arn,
+                &group_arn,
+                &untagged_arn,
+                &unknown_arn,
+            ]}),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "expected DescribeTags 200, got {status} with {described}"
+    );
+    assert_eq!(
+        described["resourceTags"],
+        json!([
+            {"resourceArn": &connection_arn, "tags": tag_list(&[("kind", "connection")])},
+            {"resourceArn": &interface_arn, "tags": tag_list(&[("kind", "virtual-interface")])},
+            {"resourceArn": &gateway_arn, "tags": tag_list(&[("kind", "gateway")])},
+            {"resourceArn": &group_arn, "tags": tag_list(&[("kind", "group")])},
+            {"resourceArn": &untagged_arn},
+        ]),
+        "expected one element per ARN this account holds a resource under, in request order, \
+         got {described}"
+    );
+
+    // ...and a read of only the ARN that names nothing answers the one way a listing can.
+    let (status, nothing) = dx
+        .call("DescribeTags", json!({"resourceArns": [&unknown_arn]}))
+        .await;
+    assert_eq!(
+        (status, nothing["resourceTags"].clone()),
+        (200, json!([])),
+        "expected an empty list for an ARN naming no resource, got {status} with {nothing}"
+    );
+
+    // The caller-chosen BATCH is bounded: `ResourceArnList` carries no `@length`, so the
+    // ceiling is this emulator's own and it is enforced before any element is resolved.
+    // The rows sit AT it and one past it.
+    for (case, count, accepted) in [
+        ("a batch exactly at the ceiling", MAX_RESOURCES_PER_CALL, true),
+        ("one resource past the ceiling", MAX_RESOURCES_PER_CALL + 1, false),
+    ] {
+        let batch: Vec<String> = (0..count).map(|_| group_arn.clone()).collect();
+        let (status, response) = dx
+            .call("DescribeTags", json!({"resourceArns": batch}))
+            .await;
+        if accepted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the batch to be read, got {status} with {response}"
+            );
+            assert_eq!(
+                response["resourceTags"]
+                    .as_array()
+                    .map(Vec::len)
+                    .unwrap_or_default(),
+                count,
+                "case {case:?}: expected one element per ARN named, got {response}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&response), error_message(&response)),
+                (
+                    400,
+                    "DirectConnectClientException".to_string(),
+                    too_many_resources_message(count),
+                ),
+                "case {case:?}: expected the batch ceiling to refuse the read, got {status} \
+                 with {response}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Rule: the resource a create is refused ABOUT is the first identifier it resolves,
 // and this create resolves the gateway to associate — the account's own resource,
 // held by the service that owns gateways — before the Direct Connect gateway the
@@ -1192,3 +2380,4 @@ async fn an_association_is_refused_about_the_gateway_to_associate_before_the_dir
         }
     }
 }
+

@@ -498,6 +498,7 @@ use super::template::{
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
     CODEPIPELINE_ACTION_TYPE_IDENTITY, CODEPIPELINE_CUSTOM_ACTION_TYPE, CODEPIPELINE_PIPELINE,
     CODEPIPELINE_WEBHOOK,
+    DIRECT_CONNECT_GATEWAY, DIRECT_CONNECT_RESILIENCY_GROUP,
     AUTOSCALING_GROUP, CUSTOMER_PROFILES_DOMAIN,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_LAUNCH_TEMPLATE, EC2_SECURITY_GROUP,
     EC2_SUBNET,
@@ -1245,6 +1246,16 @@ pub(super) enum Provisioner {
     /// the `spendingLimitArn` the type publishes — the handle every spending-limit API takes
     /// — so it is read off that create's own answer and is the identity a `Ref` resolves to.
     BraketSpendingLimit,
+    /// `AWS::DirectConnect::DirectConnectGateway`: the "intermediate object that enables
+    /// you to connect a set of virtual interfaces and virtual private gateways" AWS Direct
+    /// Connect's own `CreateDirectConnectGateway` makes. Its arms are
+    /// [`directconnect_resources`]'.
+    DirectConnectGateway,
+    /// `AWS::DirectConnect::ResiliencyGroup`: the group that service's own
+    /// `CreateResiliencyGroup` makes, which "lets you group Direct Connect connections
+    /// together and manage them as a single unit to meet a target resiliency model". Its
+    /// arms are [`directconnect_resources`]' too.
+    DirectConnectResiliencyGroup,
     /// `AWS::IoTCoreDeviceAdvisor::SuiteDefinition`: the test suite AWS IoT Core Device
     /// Advisor's own `CreateSuiteDefinition` records, `UpdateSuiteDefinition` reconfigures and
     /// `DeleteSuiteDefinition` removes. That service DRAWS the `suiteDefinitionId` the type
@@ -1639,6 +1650,8 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         BRAKET_SPENDING_LIMIT => Some(Provisioner::BraketSpendingLimit),
+        DIRECT_CONNECT_GATEWAY => Some(Provisioner::DirectConnectGateway),
+        DIRECT_CONNECT_RESILIENCY_GROUP => Some(Provisioner::DirectConnectResiliencyGroup),
         IOT_CORE_DEVICE_ADVISOR_SUITE_DEFINITION => {
             Some(Provisioner::IotCoreDeviceAdvisorSuiteDefinition)
         }
@@ -2492,6 +2505,16 @@ impl Provisioner {
             // declaration asks for.
             Self::BraketSpendingLimit => {
                 create_braket_spending_limit(ctx, region, resource, propagated).await
+            }
+            // Both `AWS::DirectConnect::*` types publish `Tags`, and each of their creates
+            // takes a `TagList` of its own, so a gateway and a resiliency group a stack
+            // creates each carry the tags CloudFormation gives them beside the ones their
+            // declaration asks for.
+            Self::DirectConnectGateway => {
+                create_direct_connect_gateway(ctx, region, resource, propagated).await
+            }
+            Self::DirectConnectResiliencyGroup => {
+                create_resiliency_group(ctx, region, resource, propagated).await
             }
             // `AWS::IoTCoreDeviceAdvisor::SuiteDefinition` publishes `Tags` as a list of
             // pairs, which `CreateSuiteDefinition` takes as the `TagMap` of its own `tags`
@@ -3555,6 +3578,14 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 delete_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // Each delete addresses its resource by the identifier AWS Direct Connect minted
+            // for it, which the ARN that is this resource's physical id carries.
+            Self::DirectConnectGateway => {
+                delete_direct_connect_gateway(ctx, region, physical_resource_id).await
+            }
+            Self::DirectConnectResiliencyGroup => {
+                delete_resiliency_group(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the suite by the id AWS IoT Core Device Advisor drew for
             // it, which is this resource's physical id.
             Self::IotCoreDeviceAdvisorSuiteDefinition => {
@@ -3964,6 +3995,12 @@ use bedrock_data_sources::*;
 use bedrock_flows::*;
 use bedrock_sessions::*;
 use sagemaker_resources::*;
+/// The AWS Direct Connect arms: the gateway an `AWS::DirectConnect::DirectConnectGateway`
+/// declares and the group an `AWS::DirectConnect::ResiliencyGroup` declares, created in the
+/// service that owns them so a client's own `DescribeDirectConnectGateways`,
+/// `GetResiliencyGroup` and `ListResiliencyGroups` resolve the identities the stack publishes.
+mod directconnect_resources;
+use directconnect_resources::*;
 use braket_spending_limits::*;
 use iot_core_device_advisor_suite_definitions::*;
 use bcm_dashboards::*;

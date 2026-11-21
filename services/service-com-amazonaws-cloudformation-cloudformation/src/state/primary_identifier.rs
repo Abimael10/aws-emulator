@@ -137,6 +137,13 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // identifier it minted ("Ref returns the rule ARN") — the type declares no name a
         // client could name one by.
         RBIN_RULE => "Arn",
+        // A Direct Connect gateway and a resiliency group are each identified by the
+        // identifier AWS Direct Connect minted for them — the `directConnectGatewayId` and the
+        // `resiliencyGroupId` every call of that service on the resource takes — which is the
+        // value inside the ARN that type's `Ref` returns. The resource's own name is only what
+        // it is called, and two of them may share one.
+        DIRECT_CONNECT_GATEWAY => "DirectConnectGatewayId",
+        DIRECT_CONNECT_RESILIENCY_GROUP => "ResiliencyGroupId",
         // Each AWS Network Security Manager entity, identified by the ARN that service built
         // around the id it minted — the `…Identifier` every call on the entity takes, which is
         // what its ARN member's own `resourceIdentifier` declares. The entity's own name is

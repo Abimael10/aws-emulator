@@ -2855,6 +2855,14 @@ pub fn name_is_create_only(resource_type: &str) -> bool {
             | AMPLIFYUIBUILDER_COMPONENT
             | AMPLIFYUIBUILDER_FORM
             | AMPLIFYUIBUILDER_THEME
+            // The two AWS Direct Connect types are in that position too: each resource is
+            // identified by the id that service minted for it, and `UpdateDirectConnectGateway`
+            // takes that `directConnectGatewayId` with a new required
+            // `newDirectConnectGatewayName` while `UpdateResiliencyGroup` takes a
+            // `resiliencyGroupId` with a new required `resiliencyGroupName`. Renaming one is a
+            // modification of it, not a recreation.
+            | DIRECT_CONNECT_GATEWAY
+            | DIRECT_CONNECT_RESILIENCY_GROUP
             // An AppSync GraphQL API and a pipeline function of one are two more:
             // `UpdateGraphqlApi` takes an `apiId` together with a new required `name`, and
             // `UpdateFunction` a `functionId` together with a new required `name` — each
@@ -3056,6 +3064,10 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // The Recycle Bin retention rule, publishing the ARN and the identifier that service
     // mints for it and the lock state it keeps.
     RBIN_RULE,
+    // The AWS Direct Connect gateway and resiliency group, each publishing the identifier
+    // that service mints for it, inside the ARN its `Ref` returns.
+    DIRECT_CONNECT_GATEWAY,
+    DIRECT_CONNECT_RESILIENCY_GROUP,
     // The two Directory Service directory types, each publishing the alias that service
     // answers the directory's access URL under — the directory id itself until an alias is
     // assigned — with a Simple AD publishing the id beside it.

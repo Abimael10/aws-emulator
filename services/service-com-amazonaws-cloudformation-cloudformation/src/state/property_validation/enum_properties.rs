@@ -88,6 +88,22 @@ pub const LAKEFORMATION_PERMISSIONS_VALUES: &[&str] = &[
     "GRANT_WITH_LF_TAG_EXPRESSION",
 ];
 
+/// The `enum` the registry schema of `AWS::DirectConnect::ResiliencyGroup` states for the
+/// resiliency model the group is created to meet.
+///
+/// These are the values of AWS Direct Connect's own `ResiliencyModel`
+/// (`smithy_query(query="shape", shape="ResiliencyModel")` of the
+/// `com-amazonaws-directconnect-overtureservice` model), in that enum's declaration order,
+/// which is also what `CreateResiliencyGroup$intendedResiliencyModel` documents: "The valid
+/// values are maximum-resiliency, high-resiliency, and basic-resiliency." The order is the
+/// one a refusal lists them back in, since what the author has to act on is the set as the
+/// schema publishes it.
+pub const RESILIENCY_MODEL_VALUES: &[&str] = &[
+    "maximum-resiliency",
+    "high-resiliency",
+    "basic-resiliency",
+];
+
 /// The properties this stage knows a schema-stated value set of.
 ///
 /// Source for each row: the `enum` the resource type's REGISTRY SCHEMA states for the
@@ -101,10 +117,11 @@ pub const LAKEFORMATION_PERMISSIONS_VALUES: &[&str] = &[
 /// granted … on the resource", and `PermissionsWithGrantOption`, "indicates a list of the
 /// granted permissions that the principal may pass to other users" — each a `PermissionList`
 /// of Lake Formation's own `Permission` enum
-/// ([`LAKEFORMATION_PERMISSIONS_VALUES`]). The third is the `MergeType` of an
-/// `AWS::AppSync::SourceApiAssociation`'s merge configuration
-/// ([`APPSYNC_MERGE_TYPE_VALUES`]), a member nested one level down in that property's
-/// structure.
+/// ([`LAKEFORMATION_PERMISSIONS_VALUES`]). The third is the `IntendedResiliencyModel` an
+/// `AWS::DirectConnect::ResiliencyGroup` is created to meet ([`RESILIENCY_MODEL_VALUES`]).
+/// The fourth is the `MergeType` of an `AWS::AppSync::SourceApiAssociation`'s merge
+/// configuration ([`APPSYNC_MERGE_TYPE_VALUES`]), a member nested one level down in that
+/// property's structure.
 pub const ENUM_PROPERTIES: &[EnumProperty] = &[
     EnumProperty {
         resource_type:
@@ -117,6 +134,14 @@ pub const ENUM_PROPERTIES: &[EnumProperty] = &[
             crate::state::provisioner::lake_formation_permissions::LAKEFORMATION_PRINCIPAL_PERMISSIONS,
         property: &["PermissionsWithGrantOption"],
         values: LAKEFORMATION_PERMISSIONS_VALUES,
+    },
+    // The resiliency model an `AWS::DirectConnect::ResiliencyGroup` is created to meet: a
+    // value outside that enum is one no handler of the type could be given, so the schema
+    // validation refuses it — and the RESOURCE fails on it rather than the template.
+    EnumProperty {
+        resource_type: crate::state::template::DIRECT_CONNECT_RESILIENCY_GROUP,
+        property: &["IntendedResiliencyModel"],
+        values: RESILIENCY_MODEL_VALUES,
     },
     // `AWS::AppSync::SourceApiAssociation`'s merge configuration carries which merging option
     // the link is made under, and the schema states that member's `enum`: the value set is

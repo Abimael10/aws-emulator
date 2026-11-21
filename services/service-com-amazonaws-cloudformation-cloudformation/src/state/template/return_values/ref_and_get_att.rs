@@ -1947,6 +1947,46 @@ pub(crate) fn return_values(
             attributes.insert("SpendingLimitArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // AWS Direct Connect's own control plane: the gateway an
+        // `AWS::DirectConnect::DirectConnectGateway` declares and the group an
+        // `AWS::DirectConnect::ResiliencyGroup` declares. Either type's `Ref` returns the
+        // resource's ARN (its primary identifier) and `Fn::GetAtt` reads the identifier that
+        // service minted. Both identifiers are that service's own — `CreateDirectConnectGateway`
+        // answers a `directConnectGatewayId` it drew, and `CreateResiliencyGroup` a
+        // `resiliencyGroupId` of the form its own pattern states — so the values here are
+        // STAND-INS of those forms, which `super::provisioning` re-points at what each create
+        // really answered
+        // ([`super::provisioner::Provisioner::DirectConnectGateway`],
+        // [`super::provisioner::Provisioner::DirectConnectResiliencyGroup`]). An ARN of this
+        // service carries NO Region, which is what `ResiliencyGroupArn`'s pattern states, so the
+        // Region is not written into either.
+        DIRECT_CONNECT_GATEWAY => {
+            let gateway_id = generated_uuid(resource_type, name);
+            let arn = ::emulator_server::emulator_arn(
+                DIRECT_CONNECT_ARN_NAMESPACE,
+                "",
+                &format!("{DIRECT_CONNECT_GATEWAY_PATH}/{gateway_id}"),
+            );
+            attributes.insert("DirectConnectGatewayId".to_string(), gateway_id);
+            (arn, attributes)
+        }
+        DIRECT_CONNECT_RESILIENCY_GROUP => {
+            let group_id = format!(
+                "{DIRECT_CONNECT_RESILIENCY_GROUP_ID_PREFIX}-{}",
+                service_assigned_label(
+                    DIRECT_CONNECT_RESILIENCY_GROUP_ID_SALT,
+                    name,
+                    DIRECT_CONNECT_RESILIENCY_GROUP_ID_DIGITS,
+                )
+            );
+            let arn = ::emulator_server::emulator_arn(
+                DIRECT_CONNECT_ARN_NAMESPACE,
+                "",
+                &format!("{DIRECT_CONNECT_RESILIENCY_GROUP_PATH}/{group_id}"),
+            );
+            attributes.insert("ResiliencyGroupId".to_string(), group_id);
+            (arn, attributes)
+        }
         // CloudWatch Application Signals' own control plane: the service level objective an
         // `AWS::ApplicationSignals::ServiceLevelObjective` declares. "Ref returns the ARN",
         // which that service builds from its own namespace, the Region and the objective's

@@ -17,12 +17,85 @@ use crate::ops::types::{BGPPeer, RouteFilterPrefix, Tag};
 pub mod ec2_network;
 /// The associations between a Direct Connect gateway and those gateways.
 pub mod gateway_associations;
+/// The resiliency groups the ACCOUNT holds.
+pub mod resiliency_groups;
 /// The location catalog's stored record and the rendering of it.
 mod location_catalog;
 /// The locations the catalog publishes, one row per published `Location`.
 mod published_locations;
 pub use location_catalog::*;
 pub use published_locations::*;
+
+/// This service's ARN namespace, from its model (`awsService.arnNamespace:
+/// directconnect`) — the vendor field of every ARN it publishes, and the one the
+/// patterns of `ResiliencyGroupArn` and `ResourceArn` carry.
+pub const DIRECT_CONNECT_ARN_NAMESPACE: &str = "directconnect";
+
+/// The resource path a Direct Connect GATEWAY's ARN carries before the gateway's own
+/// id.
+///
+/// A `DirectConnectGateway` publishes no ARN member of its own, so an ARN naming one is
+/// only ever READ here ([`tags_of_resource`]): the resource type AWS Resource Groups
+/// Tagging and IAM name a Direct Connect gateway under is `dx-gateway`, which is the
+/// segment `arn:<partition>:directconnect::<account>:dx-gateway/<id>` carries. A
+/// gateway "is global and visible in any Amazon Web Services Region after it is
+/// created", so such an ARN carries no Region at all.
+pub const DIRECT_CONNECT_GATEWAY_ARN_PATH: &str = "dx-gateway";
+
+/// The resource paths a CONNECTION's and a VIRTUAL INTERFACE's ARN carry before the
+/// resource's own id (`arn:<partition>:directconnect:<region>:<account>:dxcon/<id>`
+/// and `…:dxvif/<id>`), which are the id prefixes those resources are minted under.
+/// Either resource is landed at one Direct Connect location, so its ARN carries that
+/// resource's own Region.
+pub const CONNECTION_ARN_PATH: &str = "dxcon";
+pub const VIRTUAL_INTERFACE_ARN_PATH: &str = "dxvif";
+
+/// The tags this account holds on the Direct Connect resource `resource_arn`, or
+/// `None` where it holds no resource under that ARN.
+///
+/// The ONE resolution of an ARN to a tagged resource of this service, so every caller
+/// that reads tags by ARN resolves the same four kinds — a connection, a virtual
+/// interface, a Direct Connect gateway and a resiliency group — and none of them
+/// resolves one kind differently.
+///
+/// The ARN is PARSED once ([`::service_common::arn::parse`], the one reading of an ARN
+/// this crate has) and its resource segment split into the resource PATH and the
+/// identifier, so a value that is not an ARN of this service resolves to nothing, the
+/// path alone says which store to look in, and the record is found by its own key
+/// rather than by rebuilding every candidate ARN. The Region the ARN carries is held to
+/// what the resource's own ARN carries: none for a gateway or a group (both are global),
+/// and the resource's own Region for a connection or a virtual interface.
+pub fn tags_of_resource(
+    store: &ComAmazonawsDirectconnectOvertureserviceState,
+    resource_arn: &str,
+) -> Option<Vec<Tag>> {
+    let arn = ::service_common::arn::parse(resource_arn)?;
+    if arn.vendor != DIRECT_CONNECT_ARN_NAMESPACE {
+        return None;
+    }
+    let (path, resource_id) = arn.resource.split_once('/')?;
+    match path {
+        CONNECTION_ARN_PATH => store
+            .connections
+            .get(resource_id)
+            .filter(|connection| connection.region == arn.region)
+            .map(|connection| connection.tags.clone()),
+        VIRTUAL_INTERFACE_ARN_PATH => store
+            .virtual_interfaces
+            .get(resource_id)
+            .filter(|interface| interface.region == arn.region)
+            .map(|interface| interface.tags.clone()),
+        DIRECT_CONNECT_GATEWAY_ARN_PATH if arn.region.is_empty() => store
+            .gateways
+            .get(resource_id)
+            .map(|gateway| gateway.tags.clone()),
+        resiliency_groups::RESILIENCY_GROUP_ARN_PATH if arn.region.is_empty() => store
+            .resiliency_groups
+            .get(resource_id)
+            .map(|group| group.tags.clone()),
+        _ => None,
+    }
+}
 
 /// The Region a request names in its SigV4 credential scope when it carries no
 /// `Authorization` header at all. Matches the Region the emulator's own generated
@@ -140,6 +213,28 @@ pub const MAX_RECORDS_PER_STORE: usize = 1_000;
 /// Direct Connect resource" service quota). A request carrying more is refused
 /// with the modelled `TooManyTagsException`.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// How many resources ONE tag read may name.
+///
+/// An EMULATOR bound, not an AWS quota: `ResourceArnList` carries no `@length`
+/// (`smithy_query(query="operation",operation="DescribeTags")`), so the list a request
+/// names is caller-sized and both the work that read does and the tag set it renders grow
+/// with it — the product of the batch and [`MAX_TAGS_PER_RESOURCE`]. Bounded here, beside
+/// the other bounds of this store, and enforced before any element is resolved, so one
+/// request cannot make the read cost — or answer — what that request chose. The ceiling is
+/// the one AWS publishes for the same input shape on the service whose own `DescribeTags`
+/// takes an ARN list ("you can specify up to 20 resources in a single call").
+pub const MAX_RESOURCES_PER_CALL: usize = 20;
+
+/// How a tag read STATES a refusal of a batch past [`MAX_RESOURCES_PER_CALL`]: the count
+/// the request named, then the fixed sentence naming the ceiling. Stated here beside the
+/// bound it reports, so the sentence and the number cannot drift apart.
+pub fn too_many_resources_message(named: usize) -> String {
+    format!(
+        "{named} resources were specified; you can specify up to {MAX_RESOURCES_PER_CALL} \
+         resources in a single call"
+    )
+}
 
 /// The first tag key that appears more than once in `tags`, which the modelled
 /// `DuplicateTagKeysException` ("A tag key was specified more than once") refuses.
@@ -303,6 +398,14 @@ pub struct ComAmazonawsDirectconnectOvertureserviceState {
     pub gateway_associations: BTreeMap<String, gateway_associations::GatewayAssociation>,
     /// The keys of [`Self::gateway_associations`] in creation order.
     pub association_order: Vec<String>,
+    /// Stored resiliency groups, keyed by `resiliencyGroupId`.
+    ///
+    /// A group id's 17 characters are derived rather than a zero-padded counter, so
+    /// key order is NOT creation order here: [`Self::resiliency_group_order`] carries
+    /// that, and `ListResiliencyGroups` answers through it.
+    pub resiliency_groups: BTreeMap<String, resiliency_groups::ResiliencyGroup>,
+    /// The keys of [`Self::resiliency_groups`] in creation order.
+    pub resiliency_group_order: Vec<String>,
 }
 
 impl Default for ComAmazonawsDirectconnectOvertureserviceState {
@@ -327,6 +430,8 @@ impl Default for ComAmazonawsDirectconnectOvertureserviceState {
                 .collect(),
             gateway_associations: BTreeMap::new(),
             association_order: Vec::new(),
+            resiliency_groups: BTreeMap::new(),
+            resiliency_group_order: Vec::new(),
         }
     }
 }
@@ -448,6 +553,7 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
             }
         }
         self.settle_due_associations();
+        self.settle_due_resiliency_groups();
     }
 
     /// Reclaim the records the clock has already torn down.
@@ -466,6 +572,10 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
             .retain(|_, gateway| gateway.direct_connect_gateway_state != "deleted");
         self.gateway_order
             .retain(|id| self.gateways.contains_key(id));
+        self.resiliency_groups
+            .retain(|_, group| group.state != resiliency_groups::RESILIENCY_GROUP_STATE_DELETED);
+        self.resiliency_group_order
+            .retain(|id| self.resiliency_groups.contains_key(id));
     }
 
     /// Whether `len` leaves room for one more record under

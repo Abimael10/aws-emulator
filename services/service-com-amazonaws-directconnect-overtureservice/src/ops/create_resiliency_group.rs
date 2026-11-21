@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateResiliencyGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateResiliencyGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateResiliencyGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +144,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateResiliencyGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateResiliencyGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateResiliencyGroup"))
+        // A resiliency group's ARN carries no Region, so nothing about the group
+        // comes from the request's endpoint.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateResiliencyGroupErrorModeled::DirectConnectServerException(
+                    DirectConnectServerException {
+                        message: Some(
+                            "the Direct Connect store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `resiliencyGroupName`'s `@length 1..255` and its `@pattern`
+        // (`^[a-zA-Z0-9_\-]+$`) are MODELLED, so a name that fails either is refused
+        // before this handler runs and is not checked again here.
+        let name = input.resiliency_group_name;
+
+        let tags = input.tags.unwrap_or_default();
+        // The tag-count ceiling is checked FIRST, so it bounds the per-tag work
+        // every later check does on a caller-chosen list length.
+        if tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(
+                CreateResiliencyGroupErrorModeled::TooManyTagsException(TooManyTagsException {
+                    message: Some(format!(
+                        "{} tags were supplied; a Direct Connect resource accepts at most {}",
+                        tags.len(),
+                        crate::state::MAX_TAGS_PER_RESOURCE
+                    )),
+                })
+                .into(),
+            );
+        }
+        if let Some(duplicate) = crate::state::first_duplicate_tag_key(&tags) {
+            return Err(CreateResiliencyGroupErrorModeled::DuplicateTagKeysException(
+                DuplicateTagKeysException {
+                    message: Some(format!(
+                        "Tag key {duplicate} was specified more than once"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // `clientToken` is "a unique, case-sensitive identifier that you provide to
+        // ensure the idempotency of the request", so a request repeated under the
+        // token a group was created with answers THAT group rather than creating a
+        // second one. A request carrying no token asks for a group of its own: the
+        // name is not an identity — nothing in the model makes it unique.
+        let client_token = input.client_token;
+        if let Some(token) = client_token.as_deref() {
+            if let Some(held) = store
+                .resiliency_groups_in_order()
+                .into_iter()
+                .find(|group| group.client_token.as_deref() == Some(token))
+            {
+                return Ok(CreateResiliencyGroupOutput {
+                    resiliency_group: Some(held.output()),
+                });
+            }
+        }
+
+        // The emulator's own memory ceiling for this store (not an AWS quota):
+        // reclaim what the clock has already torn down, and refuse rather than grow
+        // past the ceiling.
+        if !crate::state::ComAmazonawsDirectconnectOvertureserviceState::has_room(
+            store.resiliency_groups.len(),
+        ) {
+            store.reclaim_deleted();
+        }
+        if !crate::state::ComAmazonawsDirectconnectOvertureserviceState::has_room(
+            store.resiliency_groups.len(),
+        ) {
+            return Err(
+                CreateResiliencyGroupErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "this emulator holds at most {} resiliency groups; delete one \
+                             before creating another",
+                            crate::state::MAX_RECORDS_PER_STORE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let group_id = store.next_resiliency_group_id();
+        let group = crate::state::resiliency_groups::ResiliencyGroup {
+            resiliency_group_id: group_id.clone(),
+            resiliency_group_name: name,
+            intended_resiliency_model: input.intended_resiliency_model,
+            owner_account: ::engine::emulator_account_id().to_string(),
+            // `pending` is the state a group asked for is in; `available` — the
+            // state it groups connections in — is what the clock owes from here.
+            state: crate::state::resiliency_groups::RESILIENCY_GROUP_STATE_PENDING.to_string(),
+            tags,
+            client_token,
+            due: Some(crate::state::DueTransition {
+                at: std::time::Instant::now() + crate::state::TRANSITION_DELAY,
+                to: crate::state::resiliency_groups::RESILIENCY_GROUP_STATE_AVAILABLE.to_string(),
+            }),
+        };
+
+        let output = group.output();
+        store.resiliency_groups.insert(group_id.clone(), group);
+        store.resiliency_group_order.push(group_id);
+        Ok(CreateResiliencyGroupOutput {
+            resiliency_group: Some(output),
+        })
     }
 }
