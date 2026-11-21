@@ -403,7 +403,9 @@ async fn a_connection_updated_while_awaiting_acceptance_walks_on_from_where_it_c
 /// RULE: a bandwidth change accepts nothing, so the acceptance a connection still
 /// awaiting one is owed stays the caller's to make right after the change: it is
 /// answered, it applies the attach point it selects, and it is what puts the connection
-/// into the accepted state.
+/// into the accepted state — at the bandwidth the proposal captured, because the
+/// parameters chosen at the partner's portal "cannot be modified" by a change made while
+/// the proposal was still awaiting its acceptance.
 #[tokio::test]
 async fn a_change_leaves_an_unaccepted_proposal_acceptable() {
     let emulator = Emulator::new();
@@ -468,8 +470,8 @@ async fn a_change_leaves_an_unaccepted_proposal_acceptable() {
         );
         assert_eq!(
             text(&accepted, "bandwidth"),
-            row.asked_for,
-            "case {case:?}: expected the accepted connection to hold the changed bandwidth, got {:?}",
+            row.created_with,
+            "case {case:?}: expected the acceptance to produce the bandwidth the proposal captured, got {:?}",
             accepted["bandwidth"]
         );
     }

@@ -525,9 +525,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it carries are written onto the resulting Connection, the proposal is
         // recorded as accepted, and the connection enters the accepted state with the
         // rest of the documented progression owed by the clock from this instant. The
-        // Environment, the bandwidth and every server-owned member of the record are
-        // untouched, because the proposal's parameters cannot be modified by the
-        // acceptance.
+        // Environment and the bandwidth are the PROPOSAL's, read from the capture its
+        // activation key made rather than from the record, because the parameters
+        // chosen on the partner's portal cannot be modified — so an `UpdateConnection`
+        // made while the proposal was still awaiting acceptance does not decide what
+        // this acceptance provisions.
         crate::state::apply_acceptance(
             stored,
             &input.attach_point,

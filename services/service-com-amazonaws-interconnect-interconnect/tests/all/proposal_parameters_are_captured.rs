@@ -10,7 +10,8 @@
 //! "cannot be modified"), so a later write to the connection record — whose own
 //! `bandwidth` is "the specific selected bandwidth of this connection", the member
 //! `UpdateConnection` reassigns — changes what `GetConnection` reports for that
-//! connection and never what `DescribeConnectionProposal` reports for its key.
+//! connection and never what `DescribeConnectionProposal` reports for its key, nor what
+//! `AcceptConnectionProposal` provisions the connection at.
 //!
 //! Asserted over a TABLE built from the live seeded catalog, whose rows differ in the
 //! environment and so in the provider kind, in the bandwidth the connection was created
@@ -399,6 +400,169 @@ async fn updating_a_connection_leaves_the_proposal_its_key_captured() {
             case.environment_id(),
             "case {label:?}: expected the sibling proposal to report its own environment, got {:?}",
             sibling_proposal["environmentId"]
+        );
+    }
+}
+
+/// RULE: the parameters an activation key captured are what the ACCEPTANCE provisions
+/// the connection at — the proposal's Environment and bandwidth "cannot be modified", so
+/// a connection re-banded while its proposal was still awaiting acceptance comes up at
+/// the bandwidth the key offers, not at the one the record had drifted to.
+///
+/// The rows differ in the captured bandwidth, in the chain of bandwidths the updates
+/// asked for before the acceptance (upwards, downwards, across the `Mbps`/`Gbps` unit,
+/// and one chain that puts the captured value back so the acceptance has nothing to
+/// restore), in how many updates were made, in whether they were made while the
+/// connection was still awaiting the clock or once it had been provisioned, in the
+/// gateway the acceptance attaches to and in the Region every request of the row is
+/// signed for.
+#[tokio::test]
+async fn accepting_a_proposal_provisions_the_captured_bandwidth() {
+    let emulator = Emulator::new();
+    let gateways = emulator.ready_gateways(&GATEWAY_ROWS).await;
+    let table = capture_table(&emulator, &gateways).await;
+    assert!(
+        table.len() >= 4,
+        "the capture table must span several environments and bandwidths, got {} rows",
+        table.len()
+    );
+
+    for case in &table {
+        let label = format!("{} / updated before the acceptance", case.label());
+
+        let created = emulator
+            .ic_ok_in(
+                case.region,
+                "CreateConnection",
+                case.create_request(&case.created_with, "capture unaccepted"),
+            )
+            .await["connection"]
+            .clone();
+        let activation_key = text(&created, "activationKey");
+        let identifier = text(&created, "id");
+
+        // The proposal as the creation request captured it: this is what the acceptance
+        // below has to produce.
+        let baseline = describe(&emulator, case.region, &activation_key).await;
+        let captured = text(&baseline, "bandwidth");
+        assert_eq!(
+            captured, case.created_with,
+            "case {label:?}: expected the proposal to report the created bandwidth, got {captured:?}"
+        );
+
+        if case.update_once_provisioned {
+            wait_until_provisioned(&emulator, case.region, &identifier, &label).await;
+        }
+
+        // Every update of the row, made BEFORE anyone accepts the proposal: the record's
+        // own bandwidth is the member `UpdateConnection` reassigns, and an unredeemed
+        // activation key is still outstanding while it moves.
+        for (step, wanted) in case.updates.iter().enumerate() {
+            if step > 0 {
+                wait_until_updatable(&emulator, case.region, &identifier, &label).await;
+            }
+            let updated = update(
+                &emulator,
+                case.region,
+                &identifier,
+                Some(wanted),
+                None,
+                &label,
+            )
+            .await;
+            let reported = text(&updated, "bandwidth");
+            assert_eq!(
+                reported, *wanted,
+                "case {label:?}: expected update {step} to report the bandwidth it asked for, got {reported:?}"
+            );
+        }
+
+        // The record just before the acceptance, which is what the acceptance must NOT
+        // read the proposal's parameters off.
+        let drifted = text(&read_back(&emulator, case.region, &identifier).await, "bandwidth");
+        assert_eq!(
+            drifted,
+            case.final_bandwidth(),
+            "case {label:?}: expected the record to hold the last bandwidth asked for before the acceptance, got {drifted:?}"
+        );
+
+        let accepted = emulator
+            .ic_ok_in(
+                case.region,
+                "AcceptConnectionProposal",
+                json!({
+                    "activationKey": activation_key,
+                    "attachPoint": { "directConnectGateway": case.attach_point },
+                }),
+            )
+            .await["connection"]
+            .clone();
+        assert_eq!(
+            text(&accepted, "bandwidth"),
+            captured,
+            "case {label:?}: expected the acceptance to produce the proposal's captured bandwidth {captured:?} rather than the record's {drifted:?}, got {:?}",
+            accepted["bandwidth"]
+        );
+        assert_eq!(
+            text(&accepted, "environmentId"),
+            text(&baseline, "environmentId"),
+            "case {label:?}: expected the acceptance to produce the proposal's environment, got {:?}",
+            accepted["environmentId"]
+        );
+        if drifted != captured {
+            assert_ne!(
+                text(&accepted, "bandwidth"),
+                drifted,
+                "case {label:?}: expected the bandwidth the record had drifted to not to survive the acceptance, got {:?}",
+                accepted["bandwidth"]
+            );
+        }
+
+        // And it is the STORED record, not just the answer: the connection the
+        // acceptance made reads back at the captured bandwidth, keeps it while the clock
+        // carries it on along the documented progression, and the key still names the
+        // same proposal it always did.
+        let read = read_back(&emulator, case.region, &identifier).await;
+        assert_eq!(
+            text(&read, "bandwidth"),
+            captured,
+            "case {label:?}: expected the accepted connection to read back at the captured bandwidth, got {:?}",
+            read["bandwidth"]
+        );
+        let provisioned = {
+            wait_until_provisioned(&emulator, case.region, &identifier, &label).await;
+            read_back(&emulator, case.region, &identifier).await
+        };
+        assert_eq!(
+            text(&provisioned, "bandwidth"),
+            captured,
+            "case {label:?}: expected the provisioned connection to keep the captured bandwidth, got {:?}",
+            provisioned["bandwidth"]
+        );
+        let described = describe(&emulator, case.region, &activation_key).await;
+        assert_eq!(
+            described, baseline,
+            "case {label:?}: expected the proposal to survive the acceptance unchanged, got {described:?}"
+        );
+
+        // The repeat of an acceptance is that same acceptance reported again, so it
+        // answers the same connection at the same captured bandwidth.
+        let again = emulator
+            .ic_ok_in(
+                case.region,
+                "AcceptConnectionProposal",
+                json!({
+                    "activationKey": activation_key,
+                    "attachPoint": { "directConnectGateway": case.attach_point },
+                }),
+            )
+            .await["connection"]
+            .clone();
+        assert_eq!(
+            text(&again, "bandwidth"),
+            captured,
+            "case {label:?}: expected the repeated acceptance to answer the captured bandwidth, got {:?}",
+            again["bandwidth"]
         );
     }
 }

@@ -207,9 +207,10 @@ pub struct StoredConnection {
     /// The resource exactly as `GetConnection` returns it.
     pub connection: Connection,
     /// The parameters this connection's `activationKey` captured, which are what
-    /// `DescribeConnectionProposal` reports for that key: the proposal's Environment
-    /// and bandwidth "cannot be modified", so they are read from here and no later
-    /// write to the record changes them.
+    /// `DescribeConnectionProposal` reports for that key and what
+    /// [`apply_acceptance`] provisions the connection at: the proposal's Environment
+    /// and bandwidth "cannot be modified", so both readers take them from here and no
+    /// later write to the record changes them.
     pub proposal: CapturedProposal,
     /// The Region this connection belongs to: the one the `CreateConnection` that
     /// allocated it was signed for, which its ARN also carries. Only a request
@@ -1804,9 +1805,12 @@ pub fn acceptance_possible_in(state: &str) -> bool {
 /// associated with from now on, a `description` the request supplies distinguishes the
 /// resulting Connection (one it omits leaves the proposal's own alone), and the tags it
 /// carries are MERGED onto the ones the connection holds, the way every tag writer of
-/// this service writes them. The Environment and the bandwidth were chosen on the
-/// partner's portal and "cannot be modified", so nothing here touches them, nor any
-/// other server-owned member of the record.
+/// this service writes them. Nothing the REQUEST carries decides the Environment or the
+/// bandwidth, which were chosen on the partner's portal and "cannot be modified": the
+/// connection this acceptance brings up is provisioned at the parameters the activation
+/// key CAPTURED ([`StoredConnection::proposal`]) — the very ones
+/// `DescribeConnectionProposal` reports for that key — so what the acceptance produces
+/// is the proposal that was accepted, however the record has moved in the meantime.
 ///
 /// Making the connection onto the selected attach point is provisioning work, so the
 /// connection enters the accepted state ("pending: the connection has been accepted and
@@ -1823,6 +1827,17 @@ pub fn apply_acceptance(
     now: Instant,
 ) {
     stored.connection.attach_point = attach_point.clone();
+    // The bandwidth the proposal offers, read from the capture the activation key made
+    // and not from the record: `Connection$bandwidth` is "the specific selected
+    // bandwidth of this connection", which `UpdateConnection` reassigns while the
+    // proposal is still awaiting its acceptance, whereas the proposal's is "the
+    // bandwidth of the proposed Connection", which "cannot be modified". So the
+    // connection that comes up is the one that was proposed, and a record re-banded
+    // before the acceptance does not change what the key offers. The capture's
+    // Environment needs no such restoration: no writer of a connection reassigns
+    // `environmentId`, so the record still names the Environment the create resolved
+    // the capture against.
+    stored.connection.bandwidth = stored.proposal.bandwidth.clone();
     if let Some(description) = description {
         stored.connection.description = description.clone();
     }
