@@ -1921,6 +1921,11 @@ pub struct AwsAccess {
     /// built with one ([`ClientEndpoint`]) — `None` for a client built with none, whose calls
     /// are addressed at the called service's own regional endpoint.
     client_endpoint: Option<ClientEndpoint>,
+    /// The state of the EXECUTION ENVIRONMENT this run happens in, which the runtime API is
+    /// served from ([`super::runtime_api`]): the function the environment is running, and the
+    /// extensions registered in it. `None` for a seam built for no invocation of a function,
+    /// where that interface has no environment to answer from.
+    sandbox: Option<super::runtime_api::Sandbox>,
 }
 
 impl AwsAccess {
@@ -1940,7 +1945,20 @@ impl AwsAccess {
             attachment: None,
             endpoint: None,
             client_endpoint: None,
+            sandbox: None,
         })
+    }
+
+    /// The same access, inside the execution environment `sandbox` holds the state of — the
+    /// invocation's own, which is what the runtime API this run addresses answers from
+    /// ([`super::runtime_api`]).
+    ///
+    /// A seam with no sandbox is one built for no invocation of a function: the Extensions API
+    /// then has no environment to register an extension in, and says so.
+    #[must_use]
+    pub fn in_sandbox(mut self, sandbox: super::runtime_api::Sandbox) -> Self {
+        self.sandbox = Some(sandbox);
+        self
     }
 
     /// The same access, signing every call it makes as `identity` — the session of the
@@ -2311,6 +2329,7 @@ impl AwsAccess {
                 within,
                 identity: self.identity.as_ref(),
                 published: self.published.as_ref(),
+                sandbox: self.sandbox.as_ref(),
             },
         ))
     }

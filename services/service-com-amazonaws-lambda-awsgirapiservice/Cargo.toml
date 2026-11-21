@@ -26,6 +26,10 @@ tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# The Telemetry API READS a subscribe body into the members it publishes
+# (`state::execution::runtime_api::telemetry`), so the values each member admits and the
+# detail of a body that states something else are the deserializer's own.
+serde = { workspace = true }
 tracing = { workspace = true }
 # An event source mapping on a queue is accepted against the QUEUE's own configuration,
 # which lives in the Amazon SQS emulator's queue store: it is reached through the shared

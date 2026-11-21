@@ -16209,6 +16209,7 @@ dependencies = [
  "rustpython-ruff_text_size",
  "rustpython-stdlib",
  "rustpython-vm",
+ "serde",
  "serde_json",
  "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi",

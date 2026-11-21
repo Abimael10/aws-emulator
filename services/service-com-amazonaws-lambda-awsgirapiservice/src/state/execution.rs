@@ -526,6 +526,24 @@ pub fn mint_request_id() -> String {
     ::uuid::Uuid::new_v4().to_string()
 }
 
+/// The ACCOUNT an invoked function's ARN names, which is what the Extensions API reports as
+/// the account the execution environment is running in.
+///
+/// An ARN is `arn:<partition>:<service>:<region>:<account-id>:…`, so the account is its fifth
+/// field. A value that is not an ARN of that shape names no account, and the account is then
+/// this emulator's own — the one every ARN it mints carries.
+#[must_use]
+fn account_of(invoked_function_arn: &str) -> String {
+    invoked_function_arn
+        .split(':')
+        .nth(4)
+        .filter(|account| !account.is_empty())
+        .map_or_else(
+            || ::engine::emulator_account_id().to_string(),
+            str::to_string,
+        )
+}
+
 /// How many traced events one run may execute. Large enough for any handler a test or a
 /// client runs, small enough that a loop with no exit ends inside the caller's wait.
 const MAX_RUN_STEPS: u64 = 20_000_000;
@@ -818,6 +836,17 @@ pub async fn run_invocation(
     if let Some(header) = invocation.trace.as_ref().map(|trace| trace.header.clone()) {
         invocation.aws = invocation.aws.take().map(|aws| aws.tracing(header));
     }
+    // The RUNTIME API this run addresses is served from the EXECUTION ENVIRONMENT's own state
+    // ([`runtime_api`]): the extensions registered in it, against the function it is running.
+    // The environment is this invocation's, so the state is too, and the facts the Extensions
+    // API reports about the function are read off the invocation itself.
+    let sandbox = runtime_api::Sandbox::new(runtime_api::FunctionFacts {
+        function_name: invocation.function_name.clone(),
+        function_version: invocation.executed_version.clone(),
+        handler: handler.clone(),
+        account_id: account_of(&invocation.invoked_function_arn),
+    });
+    invocation.aws = invocation.aws.take().map(|aws| aws.in_sandbox(sandbox));
 
     // A host already holding as many runs past their budget as it keeps threads for starts
     // no further one, and is answered BEFORE a byte of the caller's archive is expanded: a

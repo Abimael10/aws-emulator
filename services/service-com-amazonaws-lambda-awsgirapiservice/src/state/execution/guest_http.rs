@@ -114,6 +114,11 @@ pub struct Sending<'a> {
     /// where this emulator vends no such records, and then only the two addressings that
     /// name a service in the URL itself resolve.
     pub published: Option<&'a ::service_common::published_data_planes::PublishedPlanes>,
+    /// The state of the EXECUTION ENVIRONMENT the request was made from, for a URL that
+    /// addresses the runtime API ([`super::runtime_api`]): the registrations of the
+    /// invocation whose sandbox the handler is running in. `None` for a run that was given
+    /// no sandbox, where that interface has no environment to answer from.
+    pub sandbox: Option<&'a super::runtime_api::Sandbox>,
 }
 
 /// Make ONE request, as `sending` states it.
@@ -131,8 +136,23 @@ pub async fn sent(sending: &Sending<'_>) -> Result<Answered, Refusal> {
     // `AWS_LAMBDA_RUNTIME_API` names: it is not a service of this emulator and no signature
     // is put on it, so it is answered before an address is read as one
     // ([`super::runtime_api`]).
-    if let Some(answered) = super::runtime_api::answered(&method, sending.url) {
-        return Ok(answered);
+    match super::runtime_api::answered(&super::runtime_api::Requested {
+        method: &method,
+        url: sending.url,
+        headers: sending.headers,
+        body: sending.body,
+        sandbox: sending.sandbox,
+    }) {
+        super::runtime_api::Reached::Answered(answered) => return Ok(answered),
+        // A request that interface never answers is a request that does not complete: it is
+        // held for as long as the caller gave it — which is what the run has left of its own
+        // deadline — and then reported as one that ran out of time, exactly as the long poll
+        // it is does inside an AWS sandbox.
+        super::runtime_api::Reached::NeverAnswered => {
+            ::tokio::time::sleep(sending.within).await;
+            return Err(Refusal::TimedOut);
+        }
+        super::runtime_api::Reached::Elsewhere => {}
     }
     let addressed = addressed(sending.url, sending.default_region)
         .or_else(|| {

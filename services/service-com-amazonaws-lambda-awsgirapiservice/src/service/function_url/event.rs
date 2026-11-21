@@ -311,11 +311,12 @@ fn request_context(request: &UrlRequest<'_>) -> Value {
 const HTTP_PROTOCOL: &str = "HTTP/1.1";
 
 /// The first value of the header `name`, when the request carried it.
+///
+/// The lookup itself is this crate's ONE reading of a header list
+/// (`crate::state::execution::runtime_api::header`), so which header a name names is decided
+/// in one place for every reader of one.
 fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(header, _)| header.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.clone())
+    crate::state::execution::runtime_api::header(headers, name).map(str::to_string)
 }
 
 /// The event's `body` and `isBase64Encoded`: the body as TEXT when it arrived under a media
