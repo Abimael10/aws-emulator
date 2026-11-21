@@ -655,8 +655,8 @@ impl ServerlessCacheRecord {
     ///
     /// Scaling a cache's capacity, and moving it onto another engine or engine
     /// version, is work ElastiCache carries out after the call answers, so the
-    /// cache is `MODIFYING` from here and a caller reading it straight after
-    /// still sees that status and the state errors that go with it.
+    /// call that asks for it answers with the cache `MODIFYING` and the clock owes
+    /// it `AVAILABLE` from that call.
     pub fn begin_modification(&mut self, now: SystemTime) {
         self.status = SERVERLESS_STATUS_MODIFYING.to_string();
         self.pending_status = Some(PendingTransition {
@@ -778,10 +778,9 @@ pub struct ServerlessCacheSnapshotRecord {
 impl ServerlessCacheSnapshotRecord {
     /// A snapshot of `cache` as it stands now.
     ///
-    /// A created snapshot is NOT ready: it answers [`STATUS_CREATING`], and the
-    /// clock owes it [`STATUS_AVAILABLE`] once [`SNAPSHOT_TRANSITION`] has
-    /// passed, so a caller reading it straight after the call still sees the
-    /// transient status.
+    /// A created snapshot is NOT ready: the call that took it answers
+    /// [`STATUS_CREATING`], and the clock owes it [`STATUS_AVAILABLE`] once
+    /// [`SNAPSHOT_TRANSITION`] — the span of that call — has passed.
     pub fn from_cache(cache: &ServerlessCacheRecord, new: NewServerlessCacheSnapshot) -> Self {
         Self {
             arn: serverless_cache_snapshot_arn(&cache.region, &new.name),

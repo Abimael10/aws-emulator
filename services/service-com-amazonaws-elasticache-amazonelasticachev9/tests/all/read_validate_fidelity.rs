@@ -36,7 +36,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::cache_cluster_lifecycle::{create_available_cluster, create_cluster, describe_cluster};
-use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION,
+};
 
 /// The form pairs of one request row, as a table writes them.
 type FormPairs = &'static [(&'static str, &'static str)];
@@ -1016,10 +1018,15 @@ async fn a_reboot_states_the_states_it_is_accepted_in() {
          the states the refusal names, got {}",
         while_snapshotting.body
     );
+    // That reboot leaves the cluster `rebooting cluster nodes`, which the row below is
+    // refused from: the clock owes it `available` from the call that started the reboot,
+    // so the phase is held out of reach rather than raced for.
+    hold_pending_changes(&emulator);
 
     // Refused: a state that is in none of them. The axis: which state the
     // cluster is in — still being created, and already rebooting.
     let created = create_cluster(&emulator, "reboot-creating", &[]).await;
+    hold_pending_changes(&emulator);
     assert_eq!(
         created.status, 200,
         "the cluster must be creatable, got {}",
@@ -1181,7 +1188,10 @@ async fn a_replication_group_modify_gate_states_the_state_it_requires() {
         "the replica increase must be accepted, got {}",
         started.body
     );
-
+    // That increase leaves the group `modifying`, which is the state the rows below run
+    // into: the clock owes it `available` from the call that started the work, so the
+    // phase is held out of reach rather than raced for.
+    hold_pending_changes(&emulator);
     // The axis: which modification runs into the gate.
     let rows: [ActionRow; 2] = [
         (

@@ -1168,9 +1168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A change the shapes above carry is work ElastiCache does
-        // asynchronously, so the group answers `modifying` until the clock owes
-        // it `available` again — a caller acting straight after the call still
-        // sees the transient status.
+        // asynchronously, so this call answers `modifying` and the clock owes the
+        // group `available` again from this call.
         if applies_async_change {
             group.begin_transition(crate::state::STATUS_MODIFYING, now);
         }

@@ -21,7 +21,9 @@
 //! mounts, with the shared `harness` request builder and XML reader; nothing reaches into
 //! the service's state struct.
 
-use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, Reply, REGION,
+};
 
 /// The transient status a resource whose creation is under way reports.
 const CREATING: &str = "creating";
@@ -113,14 +115,16 @@ async fn a_serverless_cache_reports_its_lifecycle_in_the_wire_spelling() {
         let created = create_cache(&emulator, case, name, engine).await;
         // The create's own answer is the transient status: the span is never zero.
         assert_status(case, "the create's answer", &created, CREATING);
-        // A read inside the span reports the cache as it stands, and the clock
-        // carries it to the value a waiter polls for.
+        // A read while the change the clock owes is held out of reach reports the cache
+        // as it stands, and the clock then carries it to the value a waiter polls for.
+        hold_pending_changes(&emulator);
         assert_status(
             case,
             "a read inside the create's span",
             &describe_cache(&emulator, name).await,
             CREATING,
         );
+        release_pending_changes(&emulator);
         assert_status(
             case,
             "a read once the clock has settled it",
@@ -181,14 +185,16 @@ async fn a_serverless_cache_reports_its_lifecycle_in_the_wire_spelling() {
             deleted.status, deleted.body
         );
         assert_status(case, "the delete's answer", &deleted, DELETING);
-        // A read inside the span still finds the cache, on its way out, and the
-        // clock then takes it away.
+        // A read while the removal is held out of reach still finds the cache, on its
+        // way out, and the clock then takes it away.
+        hold_pending_changes(&emulator);
         assert_status(
             case,
             "a read inside the delete's span",
             &describe_cache(&emulator, name).await,
             DELETING,
         );
+        release_pending_changes(&emulator);
         let gone = poll_read(
             &emulator,
             case,

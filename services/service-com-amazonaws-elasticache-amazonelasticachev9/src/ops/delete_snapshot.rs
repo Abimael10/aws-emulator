@@ -198,10 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The snapshot is leaving: it answers `deleting` now, and the clock owes
-        // its removal, so a caller reading it straight after this call still
-        // sees it going away and a later one sees it gone. The response is built
-        // from the record this call just wrote, so it reports persisted state.
+        // The snapshot is leaving: this call answers `deleting`, and the clock
+        // owes its removal from this call, so the read that follows finds it gone.
+        // The response is built from the record this call just wrote, so it
+        // reports persisted state.
         snapshot.begin_deletion(now);
         let deleted = snapshot.to_modeled(true);
         let source_cluster = snapshot.cache_cluster_id.clone();

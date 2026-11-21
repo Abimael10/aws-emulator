@@ -21,7 +21,9 @@
 //! written out here on purpose: a test that built it from the helper the handlers call
 //! would pass whatever that helper said.
 
-use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, Reply, REGION,
+};
 use crate::user_group_membership::{create_user, modify_user_group, poll_user_group_status};
 
 /// Assert `reply` is the refusal `status` / `code` carrying exactly `message`.
@@ -101,9 +103,8 @@ async fn a_user_group_that_is_not_active_refuses_a_change_with_its_status() {
     // its way out.
     //
     // The status each row drives is read off the answer of the call that PUT the group in
-    // it, and the gated call follows that answer straight away: the status a report
-    // carries is the one the record holds, so the row's call arrives while the group is
-    // still in it.
+    // it, and the change the clock owes the group is then held out of reach — the clock
+    // owes it from that very call, so the row holds the status rather than racing it.
     for (case, group) in [
         ("still creating", "creating-group"),
         ("already modifying", "modifying-group"),
@@ -135,6 +136,7 @@ async fn a_user_group_that_is_not_active_refuses_a_change_with_its_status() {
             status, "active",
             "case {case}: the row must drive a group that is not active, got {status:?}"
         );
+        hold_pending_changes(&emulator);
         let expected = expected_sentence(group, &status);
 
         let refused = modify_user_group(&emulator, group, &["joiner"], &[], None).await;
@@ -167,6 +169,7 @@ async fn a_user_group_that_is_not_active_refuses_a_change_with_its_status() {
             "InvalidUserGroupState",
             &expected,
         );
+        release_pending_changes(&emulator);
     }
 
     // The status the gate DOES admit: once the clock has settled the group `active` the
@@ -252,6 +255,9 @@ async fn attaching_a_user_group_that_is_not_active_states_the_same_sentence() {
         } else {
             reported_status(case, &created)
         };
+        // The clock owes the group its settled state from the call that put it in this
+        // one, so the row holds that change out of reach rather than racing it.
+        hold_pending_changes(&emulator);
         let refused = emulator
             .call(
                 "ModifyReplicationGroup",
@@ -268,5 +274,6 @@ async fn attaching_a_user_group_that_is_not_active_states_the_same_sentence() {
             "InvalidUserGroupState",
             &expected_sentence(group, &status),
         );
+        release_pending_changes(&emulator);
     }
 }

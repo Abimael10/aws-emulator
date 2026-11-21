@@ -35,8 +35,9 @@
 use std::time::Duration;
 
 use crate::cache_data_plane::{command, endpoint_of, open_tls, Resp};
-use crate::harness::{assert_own_endpoint, params, Emulator, Reply};
-use crate::lifecycle_convergence::{every_pending_change_due_in, HELD_OUT_OF_REACH};
+use crate::harness::{
+    assert_own_endpoint, every_pending_change_due_in, params, Emulator, Reply, HELD_OUT_OF_REACH,
+};
 
 /// The user group the flow revokes access through, and the replication group it is attached
 /// to. The built-in `default` user stays in the group throughout: a user group "needs to

@@ -4,14 +4,19 @@
 //! scheduled, and how a client reaches the settled state.
 //!
 //! The rule under test: the call that STARTS work answers with the transient status the
-//! service documents for that phase, and a REPORT issued inside that span answers from the
-//! record as it stands — the same transient status, and for a resource on its way out the
-//! resource itself, still there and `deleting`. No call of this service waits for a span it
-//! has scheduled, so the transient phase is observable to a client that reads straight
-//! after the call that started the work, which is exactly what makes the state gates
-//! observable (a mutation arriving inside the span is refused with the status the record
-//! carries). The clock then carries the record to its settled state — a status, or the
-//! resource's absence — which a client reaches by LOOKING AGAIN.
+//! service documents for that phase, and a REPORT issued while the change the clock owes is
+//! still outstanding answers from the record as it stands — the same transient status, and
+//! for a resource on its way out the resource itself, still there and `deleting`. No call of
+//! this service waits for a change it has scheduled, and none advances one either: a report
+//! materialises exactly what the clock had already made due. The clock then carries the
+//! record to its settled state — a status, or the resource's absence — which a client reads
+//! back.
+//!
+//! The span a transition is owed after is the CALL that started the work
+//! ([`state::CLUSTER_TRANSITION`]), so each row holds the change out of reach while it
+//! asserts the transient half: what a client's FIRST read after that call answers is the
+//! settled state, which is the rule
+//! [`crate::first_read_sees_the_settled_state`] is about.
 //!
 //! One resource has no such span to report: `DeleteCacheCluster` takes the cluster's record
 //! away at the call, so there is nothing left to report it `deleting` from, and its
@@ -30,19 +35,13 @@
 //! then makes every outstanding change due and polls for it. Both halves go over the wire
 //! through the same router the production emulator mounts.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, Reply, REGION};
-
-/// A span far longer than any transition this service schedules, for the half of a row
-/// that reads a record while the clock still owes it a change.
-///
-/// `pub(crate)` with [`every_pending_change_due_in`], for the reason the harness module
-/// gives: a second suite that has to hold a resource in its transient phase drives it
-/// through THESE rather than carrying a second copy of them.
-pub(crate) const HELD_OUT_OF_REACH: Duration = Duration::from_secs(60 * 60);
+use crate::harness::{
+    every_pending_change_due_in, params, poll_until, Emulator, Reply, HELD_OUT_OF_REACH, REGION,
+};
 
 /// What the report issued inside the span must show, and what the clock must then settle.
 #[derive(Debug, Clone, Copy)]
@@ -84,69 +83,7 @@ struct Phase {
     settled: Settled,
 }
 
-/// Move every change the clock owes this store to `due_in` from now.
-///
-/// Every record that carries a due instant is rewritten, so a row can hold its resource in
-/// the transient phase whatever it is (`HELD_OUT_OF_REACH`) and then make the whole
-/// outstanding set due at once (`Duration::ZERO`). Only the DUE INSTANT moves: the status
-/// the clock owes, and everything else the record carries, is the handler's own.
-pub(crate) fn every_pending_change_due_in(emulator: &Emulator, due_in: Duration) {
-    let due = SystemTime::now() + due_in;
-    emulator.with_state(|store| {
-        for cluster in store.cache_clusters.values_mut() {
-            if let Some(pending) = cluster.pending_status.as_mut() {
-                pending.due = due;
-            }
-        }
-        for group in store.replication_groups.values_mut() {
-            if let Some(pending) = group.pending_status.as_mut() {
-                pending.due = due;
-            }
-        }
-        for group in store.global_replication_groups.values_mut() {
-            if let Some(pending) = group.pending_status.as_mut() {
-                pending.due = due;
-            }
-        }
-        for snapshot in store.snapshots.values_mut() {
-            if let Some(pending) = snapshot.pending_status.as_mut() {
-                pending.due = due;
-            }
-            if snapshot.pending_removal.is_some() {
-                snapshot.pending_removal = Some(due);
-            }
-        }
-        for cache in store.serverless_caches.values_mut() {
-            if let Some(pending) = cache.pending_status.as_mut() {
-                pending.due = due;
-            }
-            if cache.pending_deletion.is_some() {
-                cache.pending_deletion = Some(due);
-            }
-        }
-        for snapshot in store.serverless_cache_snapshots.values_mut() {
-            if let Some(pending) = snapshot.pending_status.as_mut() {
-                pending.due = due;
-            }
-        }
-        for user in store.users.values_mut() {
-            if let Some(pending) = user.pending_status.as_mut() {
-                pending.due = due;
-            }
-            if user.pending_removal.is_some() {
-                user.pending_removal = Some(due);
-            }
-        }
-        for group in store.user_groups.values_mut() {
-            if let Some(pending) = group.pending_status.as_mut() {
-                pending.due = due;
-            }
-            if group.pending_removal.is_some() {
-                group.pending_removal = Some(due);
-            }
-        }
-    });
-}
+
 
 /// Drive one row: the starting call, a report inside the span, then the report a client
 /// polls until the clock has settled the record.

@@ -20,7 +20,10 @@
 //! holds, which shard is named, which part of the request is wrong), and the
 //! recorded two-node case is one row.
 
-use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, settle_pending_changes,
+    Emulator, Reply, PAST_TRANSITION, REGION,
+};
 
 /// Create one replication group and assert the create itself was accepted.
 async fn create_group(emulator: &Emulator, case: &str, id: &str, extra: &[(&str, &str)]) {
@@ -435,7 +438,9 @@ async fn a_call_this_service_cannot_satisfy_is_refused_with_its_modelled_error()
     .await;
 
     // "The requested replication group is not in the available state": the work
-    // the create started has to finish first.
+    // the create started has to finish first. The clock owes a just-created group
+    // `available` from the call that created it, so the phase is held out of reach
+    // rather than raced for.
     create_group(
         &emulator,
         "group still creating",
@@ -443,6 +448,7 @@ async fn a_call_this_service_cannot_satisfy_is_refused_with_its_modelled_error()
         &[("NumCacheClusters", "2"), ("AutomaticFailoverEnabled", "true")],
     )
     .await;
+    hold_pending_changes(&emulator);
     assert_refused(
         &emulator,
         "group still creating",
@@ -452,6 +458,7 @@ async fn a_call_this_service_cannot_satisfy_is_refused_with_its_modelled_error()
         "InvalidReplicationGroupState",
     )
     .await;
+    release_pending_changes(&emulator);
 
     // "If calling this operation multiple times on different shards in the same
     // … replication group, the first node replacement must complete before a
@@ -464,13 +471,14 @@ async fn a_call_this_service_cannot_satisfy_is_refused_with_its_modelled_error()
         &[("NumNodeGroups", "2"), ("ReplicasPerNodeGroup", "1")],
     )
     .await;
-    std::thread::sleep(PAST_TRANSITION);
+    settle_pending_changes(&emulator);
     let accepted = test_failover(&emulator, "already-failing", "0001").await;
     assert_eq!(
         accepted.status, 200,
         "the first TestFailover must answer 200, got {} {}",
         accepted.status, accepted.body
     );
+    hold_pending_changes(&emulator);
     assert_refused(
         &emulator,
         "a failover already running",
@@ -480,6 +488,7 @@ async fn a_call_this_service_cannot_satisfy_is_refused_with_its_modelled_error()
         "InvalidReplicationGroupState",
     )
     .await;
+    release_pending_changes(&emulator);
 
     // "Tests automatic failover on a specified node group": a group whose
     // `AutomaticFailover` is disabled has none to test, however many replicas
@@ -491,7 +500,7 @@ async fn a_call_this_service_cannot_satisfy_is_refused_with_its_modelled_error()
         &[("NumCacheClusters", "3")],
     )
     .await;
-    std::thread::sleep(PAST_TRANSITION);
+    settle_pending_changes(&emulator);
     let described = describe_group(&emulator, "automatic failover disabled", "no-auto-failover").await;
     assert_eq!(
         described.text("ReplicationGroup/AutomaticFailover"),
@@ -520,7 +529,7 @@ async fn a_call_this_service_cannot_satisfy_is_refused_with_its_modelled_error()
         &[("NumNodeGroups", "2"), ("ReplicasPerNodeGroup", "1")],
     )
     .await;
-    std::thread::sleep(PAST_TRANSITION);
+    settle_pending_changes(&emulator);
     let decreased = emulator
         .call(
             "DecreaseReplicaCount",
@@ -536,7 +545,7 @@ async fn a_call_this_service_cannot_satisfy_is_refused_with_its_modelled_error()
         "DecreaseReplicaCount must answer 200, got {} {}",
         decreased.status, decreased.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    settle_pending_changes(&emulator);
     assert_refused(
         &emulator,
         "no replica to promote",

@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, Reply, REGION,
+};
 
 /// One row of the create / round-trip table: the request, and the resource it
 /// must be stored and reported as.
@@ -478,9 +480,11 @@ async fn a_serverless_cache_reaches_available_on_the_clock_and_not_before() {
         "a created cache must answer the transient status, got {:?}",
         created.text("Status")
     );
-    // A read inside the span reports the cache as it stands — still `creating` —
-    // and the clock carries it to `available`, which a client learns by looking
-    // again.
+    // A read inside the span reports the cache as it stands — still `creating`.
+    // That span is the CALL that created it, so it is held out of reach here
+    // rather than raced for; the clock then carries the cache to `available`,
+    // which is what the first read after the create already answers.
+    hold_pending_changes(&emulator);
     let transient = describe_cache(&emulator, "timed-cache").await;
     assert_eq!(
         transient.text("Status"),
@@ -488,6 +492,7 @@ async fn a_serverless_cache_reaches_available_on_the_clock_and_not_before() {
         "a read inside the span reports the cache as it stands, got {:?}",
         transient.text("Status")
     );
+    release_pending_changes(&emulator);
     let settled = poll_until(
         &emulator,
         REGION,

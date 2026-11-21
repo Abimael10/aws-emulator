@@ -295,9 +295,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 member.automatic_failover = status.to_string();
             }
         }
-        // The change is applied at once, and the datastore answers `modifying`
-        // until the clock settles it, so a caller acting straight after sees the
-        // transient status.
+        // The change is applied at once, and this call answers `modifying` with
+        // the clock owing the datastore its settled status from this call.
         group.begin_transition(crate::state::STATUS_MODIFYING, now);
 
         Ok(ModifyGlobalReplicationGroupOutput {

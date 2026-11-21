@@ -388,10 +388,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(authentication) = authentication {
             user.authentication = authentication;
         }
-        // `User$Status` "can be \"active\", \"modifying\" or \"deleting\"": the
-        // user is modifying from here, and the clock owes it `active` a span
-        // later — so a caller acting straight after this call still observes the
-        // transient status and the state error that goes with it.
+        // `User$Status` "can be \"active\", \"modifying\" or \"deleting\"": this
+        // call answers `modifying`, and the clock owes the user `active` from this
+        // call.
         user.status = crate::state::STATUS_MODIFYING.to_string();
         user.pending_status = crate::state::user_transition(now);
 

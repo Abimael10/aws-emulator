@@ -214,10 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A report answers from the records as they stand at the instant it
         // answers: the one write it makes is materialising the changes the clock
-        // had already made due by then, and a transition still inside its span
-        // is reported as the transient status it is. The report never waits for
-        // one, so a client that reads straight after the call that started the
-        // work sees that status.
+        // had already made due by then, and a transition the clock has not made
+        // due yet is reported as the transient status it is. The report never
+        // waits for one, and never advances one: the span a transition is owed
+        // after is the CALL that started the work, so this read answers with the
+        // state the clock owed whether or not anybody had called.
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle_all(now);

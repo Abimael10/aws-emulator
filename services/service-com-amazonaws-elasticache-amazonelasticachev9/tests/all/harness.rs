@@ -36,6 +36,121 @@ pub const API_VERSION: &str = "2015-02-02";
 /// resource its next status; the handlers never sleep, so only the test waits.
 pub const PAST_TRANSITION: Duration = Duration::from_millis(750);
 
+/// A span far longer than any transition this service schedules, for a suite that
+/// reads a record while the clock still owes it a change.
+pub const HELD_OUT_OF_REACH: Duration = Duration::from_secs(60 * 60);
+
+/// Move every change the clock owes this store to `due_in` from now.
+///
+/// Every record that carries a due instant is rewritten, so a suite can hold its
+/// resource in the transient phase whatever that phase is
+/// ([`HELD_OUT_OF_REACH`]) and then make the whole outstanding set due at once
+/// ([`Duration::ZERO`]). Only the DUE INSTANT moves: the status the clock owes,
+/// and everything else the record carries, is the handler's own.
+///
+/// This is how a suite puts a resource in a transient phase at all. The span a
+/// transition is owed after is the CALL that scheduled it
+/// ([`state::CLUSTER_TRANSITION`]), so by the time a suite can make a SECOND
+/// request the clock has already carried the record to its settled state — which
+/// is the whole point of that span, because a client polling on an AWS-sized
+/// interval must not lose that interval to a resource the emulator has already
+/// finished. A suite about what the service answers WHILE a resource is being
+/// created, changed or removed therefore holds the change out of reach rather
+/// than racing the span, and what it asserts does not depend on how fast the
+/// host runs.
+pub fn every_pending_change_due_in(emulator: &Emulator, due_in: Duration) {
+    let due = ::std::time::SystemTime::now() + due_in;
+    emulator.with_state(|store| {
+        for cluster in store.cache_clusters.values_mut() {
+            if let Some(pending) = cluster.pending_status.as_mut() {
+                pending.due = due;
+            }
+        }
+        for group in store.replication_groups.values_mut() {
+            if let Some(pending) = group.pending_status.as_mut() {
+                pending.due = due;
+            }
+        }
+        for group in store.global_replication_groups.values_mut() {
+            if let Some(pending) = group.pending_status.as_mut() {
+                pending.due = due;
+            }
+        }
+        for snapshot in store.snapshots.values_mut() {
+            if let Some(pending) = snapshot.pending_status.as_mut() {
+                pending.due = due;
+            }
+            if snapshot.pending_removal.is_some() {
+                snapshot.pending_removal = Some(due);
+            }
+        }
+        for cache in store.serverless_caches.values_mut() {
+            if let Some(pending) = cache.pending_status.as_mut() {
+                pending.due = due;
+            }
+            if cache.pending_deletion.is_some() {
+                cache.pending_deletion = Some(due);
+            }
+        }
+        for snapshot in store.serverless_cache_snapshots.values_mut() {
+            if let Some(pending) = snapshot.pending_status.as_mut() {
+                pending.due = due;
+            }
+        }
+        for user in store.users.values_mut() {
+            if let Some(pending) = user.pending_status.as_mut() {
+                pending.due = due;
+            }
+            if user.pending_removal.is_some() {
+                user.pending_removal = Some(due);
+            }
+        }
+        for group in store.user_groups.values_mut() {
+            if let Some(pending) = group.pending_status.as_mut() {
+                pending.due = due;
+            }
+            if group.pending_removal.is_some() {
+                group.pending_removal = Some(due);
+            }
+        }
+        for reservation in store.reserved_cache_nodes.values_mut() {
+            if let Some(pending) = reservation.pending_state.as_mut() {
+                pending.due = due;
+            }
+        }
+    });
+}
+
+/// Hold every change the clock owes out of reach, leaving each resource in the
+/// transient phase the call that started its work put it in; see
+/// [`every_pending_change_due_in`].
+pub fn hold_pending_changes(emulator: &Emulator) {
+    every_pending_change_due_in(emulator, HELD_OUT_OF_REACH);
+}
+
+/// Materialise everything the clock owes this store at this instant, exactly as
+/// the next call of the service would.
+///
+/// For a suite that is about to put ONE resource in a transient phase and hold it
+/// there: a record whose due instant has already passed but which no call has
+/// read since is settled first, so [`hold_pending_changes`] holds only what the
+/// call that follows this one made transient.
+pub fn settle_pending_changes(emulator: &Emulator) {
+    let now = ::std::time::SystemTime::now();
+    emulator.with_state(|store| {
+        store.settle_all(now);
+        store.settle_user_groups(now);
+        store.settle_replication_groups(now);
+        store.settle_global_replication_groups(now);
+    });
+}
+
+/// Make every change the clock owes due now, so the next call materialises it;
+/// the other half of [`hold_pending_changes`].
+pub fn release_pending_changes(emulator: &Emulator) {
+    every_pending_change_due_in(emulator, Duration::ZERO);
+}
+
 /// How long a suite waits for a status change the CLOCK owes before it gives up,
 /// and how often it looks again while it waits.
 ///

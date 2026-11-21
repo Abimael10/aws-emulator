@@ -35,7 +35,9 @@
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::cache_cluster_lifecycle::{create_available_cluster, create_cluster};
-use crate::harness::{assert_refusal, params, poll_until, Emulator, REGION};
+use crate::harness::{
+    assert_refusal, hold_pending_changes, params, poll_until, Emulator, REGION,
+};
 
 /// The grammar sentence every identifier refusal of this service ends with, whichever
 /// lead-in it carries.
@@ -380,6 +382,7 @@ async fn a_snapshot_that_cannot_be_taken_states_its_own_reason() {
         "the cluster must be created, got {} {}",
         creating.status, creating.body
     );
+    hold_pending_changes(&emulator);
     let first = emulator
         .call(
             "CreateSnapshot",
@@ -394,6 +397,9 @@ async fn a_snapshot_that_cannot_be_taken_states_its_own_reason() {
         "the first snapshot must be taken, got {} {}",
         first.status, first.body
     );
+    // The clock owes both clusters `available` from the calls that put them in those
+    // statuses, so the two phases are held out of reach rather than raced for.
+    hold_pending_changes(&emulator);
     for (case, cluster) in [
         ("a cluster the clock has not settled", "snap-creating"),
         ("a cluster left snapshotting", "snap-redis"),

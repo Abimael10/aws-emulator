@@ -425,12 +425,13 @@ pub const RESERVATION_STATE_RETIRED: &str = "retired";
 /// How long a reservation stays `payment-pending` before the clock owes it
 /// `active`.
 ///
-/// The same reasoning as [`CLUSTER_TRANSITION`]: AWS takes as long as the
-/// payment takes, the emulator chooses a span, and it is deliberately NOT zero
-/// so the purchase itself answers with the transient state. The due instant is
-/// stored on the record and materialised by whichever later call reads it; a
-/// report issued inside the span is answered once it has fallen due.
-pub const RESERVATION_TRANSITION: Duration = Duration::from_millis(500);
+/// The same span, for the same reason, as [`CLUSTER_TRANSITION`]: AWS takes as
+/// long as the payment takes, the purchase itself answers with the transient
+/// state, and a client that reads the reservation back — on an interval sized
+/// for AWS — is answered with the state the clock already owes it. The due
+/// instant is stored on the record and materialised by whichever later call
+/// reads it.
+pub const RESERVATION_TRANSITION: Duration = CLUSTER_TRANSITION;
 
 /// How many reserved cache nodes the store holds before a purchase is refused
 /// with the modelled `ReservedCacheNodeQuotaExceededFault` — "the request

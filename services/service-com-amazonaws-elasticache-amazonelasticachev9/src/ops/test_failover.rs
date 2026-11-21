@@ -319,10 +319,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The failover itself: the shard's first replica takes the primary role
-        // and the primary it had becomes a replica, and the group answers
-        // `modifying` until the clock settles the node replacement — so a caller
-        // that polls straight after this call sees the work in progress, and a
-        // second call on the group is refused until it completes.
+        // and the primary it had becomes a replica, and this call answers
+        // `modifying` with the clock owing the node replacement from this call.
         let Some(group) = store.replication_groups.get_mut(&key) else {
             // Unreachable: resolved under this same lock above.
             return Err(crate::scaffolded::Scaffolded::validation(

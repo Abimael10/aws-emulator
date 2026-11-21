@@ -22,7 +22,10 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, Reply,
+    PAST_TRANSITION, REGION,
+};
 
 /// One access-string row: the case name, the `AccessString` the create sends, and the
 /// expanded form the service must store and report for it.
@@ -256,7 +259,9 @@ async fn a_deleted_user_is_reported_deleting_and_then_is_gone() {
 
         // A read inside the span still finds the user, on its way out; once the removal
         // the clock owed has happened the lookup is the modelled not-found — the answer a
-        // revoked credential must get.
+        // revoked credential must get. The removal is held out of reach for the first
+        // half, because the clock owes it from the call that asked for the delete.
+        hold_pending_changes(&emulator);
         let leaving = emulator.call("DescribeUsers", &params(&[("UserId", id)])).await;
         assert_eq!(
             leaving.text("Status"),
@@ -265,6 +270,7 @@ async fn a_deleted_user_is_reported_deleting_and_then_is_gone() {
             leaving.status,
             leaving.body
         );
+        release_pending_changes(&emulator);
         let gone = poll_until(
             &emulator,
             REGION,
@@ -340,7 +346,8 @@ async fn a_delete_the_service_refuses() {
     }
 
     // A user already on its way out is not in active state, which is the modelled state
-    // fault — and the second delete must not shorten or restart the first one.
+    // fault — and the second delete must not shorten or restart the first one. The removal
+    // is held out of reach, because the clock owes it from the first delete.
     let row = &DELETION_CASES[0];
     create_deletion_case(&emulator, row).await;
     let first = emulator
@@ -351,6 +358,7 @@ async fn a_delete_the_service_refuses() {
         "the first delete must answer 200, got {} {}",
         first.status, first.body
     );
+    hold_pending_changes(&emulator);
     let second = emulator
         .call("DeleteUser", &params(&[("UserId", row.1)]))
         .await;
@@ -362,7 +370,7 @@ async fn a_delete_the_service_refuses() {
         second.body
     );
     // Once the removal falls due the user is gone, so the delete is a not-found.
-    std::thread::sleep(PAST_TRANSITION);
+    release_pending_changes(&emulator);
     let third = emulator
         .call("DeleteUser", &params(&[("UserId", row.1)]))
         .await;

@@ -5,10 +5,11 @@
 //! The transient statuses this service reports — a cluster `creating`, a snapshot
 //! `copying`, a group `modifying` — are held for a span the EMULATOR chooses, not
 //! one AWS documents: [`CLUSTER_TRANSITION`] and its siblings compress what
-//! ElastiCache takes minutes over into half a second. No call waits for such a
-//! span: the due instant is stored on the record and whichever later call reads
-//! it materialises what the clock owed, so a read issued inside the span reports
-//! the transient status. The span is this emulator's deliberate choice, stated
+//! ElastiCache takes minutes over into the span of the CALL that starts the work,
+//! so the answer that call writes carries the transient status and the next
+//! request reads the resource settled. No call waits for such a span: the due
+//! instant is stored on the record and whichever later call reads it materialises
+//! what the clock owed. The span is this emulator's deliberate choice, stated
 //! here beside the durations it does take from AWS — a maintenance
 //! window's minimum, a snapshot's retention, a reservation's term — which are
 //! kept as the service publishes them.
@@ -441,24 +442,35 @@ pub fn maintenance_window_refusal(value: &str) -> Option<String> {
 /// `rebooting cluster nodes` after a reboot) before the clock owes it
 /// `available`.
 ///
-/// ElastiCache takes minutes; the emulator chooses a span, and it is
-/// deliberately NOT zero, so the call that starts the work answers with the
-/// transient status and a MUTATION arriving inside the span is still refused by
-/// the state gate that goes with it. The due instant is stored on the record and
-/// materialised by whichever later call reads it; a REPORT issued inside the
-/// span answers with the transient status, because nothing of this service
-/// sleeps for a transition it has scheduled.
-pub const CLUSTER_TRANSITION: Duration = Duration::from_millis(500);
+/// The span is that CALL, and nothing beyond it. ElastiCache takes minutes, and
+/// a client written against it polls a lifecycle status on an interval sized for
+/// minutes (tens of seconds); every poll answered with the transient status
+/// therefore costs that client its whole interval, so a span a client's FIRST
+/// poll lands inside makes each wait cost an interval and a flow that chains
+/// several waits never converge. This span is shorter than the gap between two
+/// requests: the answer the starting call writes is computed inside it, and the
+/// clock owes the settled status from the instant that call sampled, so the
+/// first read that FOLLOWS the call reads the resource settled.
+///
+/// It is deliberately NOT zero. A handler samples one instant and uses it for
+/// the whole call, so inside the call that schedules the transition the record
+/// still carries the transient status — which is what that call answers with,
+/// and what the status the response reports is taken from. The due instant is
+/// stored on the record and materialised by whichever later call reads it;
+/// nothing of this service sleeps for a transition it has scheduled, and a
+/// record whose due instant has been moved out (a test holding a resource in its
+/// transient phase) is still reported, and still gated, as the status it carries.
+pub const CLUSTER_TRANSITION: Duration = Duration::from_nanos(1);
 
 /// How long a snapshot stays in the status the call that started the work
 /// returned — `creating` after a create or a copy before the clock owes it
 /// `available`, and `deleting` after a delete before the clock owes its removal.
 ///
-/// The same reasoning as [`CLUSTER_TRANSITION`]: ElastiCache takes minutes, the
-/// emulator chooses a span, and it is deliberately NOT zero so `CreateSnapshot`
-/// / `CopySnapshot` / `DeleteSnapshot` answer with the transient status and a
-/// second change inside the span is still refused.
-pub const SNAPSHOT_TRANSITION: Duration = Duration::from_millis(500);
+/// The same span, for the same reason, as [`CLUSTER_TRANSITION`]: a client
+/// waiting for a snapshot to become available, or for a deleted one to go away,
+/// polls on an AWS-sized interval, and a snapshot the emulator has already taken
+/// is reported settled to the first read that follows the call that took it.
+pub const SNAPSHOT_TRANSITION: Duration = CLUSTER_TRANSITION;
 
 /// How many clusters, and how many subnet groups, the store holds before a
 /// create is refused with the modelled quota fault.
@@ -2666,12 +2678,11 @@ pub const USER_STATUS_DELETING: &str = "deleting";
 /// How long a user stays `deleting` before the clock owes its removal from the
 /// store.
 ///
-/// The same reasoning as [`CLUSTER_TRANSITION`]: ElastiCache takes its own time,
-/// the emulator chooses a span, and it is deliberately NOT zero so `DeleteUser`
-/// answers with the transient `deleting` status and a change arriving inside the
-/// span is still refused by the state error that goes with it. The due instant is
-/// stored on the record and materialised by whichever later call reads it; a
-/// report issued inside the span is answered once it has fallen due.
+/// The same span, for the same reason, as [`CLUSTER_TRANSITION`]: it is the CALL
+/// that asked for the removal, so `DeleteUser` answers with the transient
+/// `deleting` status and the read that follows it finds the user gone. The due
+/// instant is stored on the record and materialised by whichever later call reads
+/// it.
 pub const USER_DELETION_TRANSITION: Duration = CLUSTER_TRANSITION;
 
 /// How many passwords one user may hold, as `CreateUser$Passwords` documents it:

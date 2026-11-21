@@ -22,6 +22,18 @@
 
 use super::*;
 
+/// How long a shard reconfiguration of a replication group stays under way
+/// before the clock owes the group `available` again.
+///
+/// Unlike [`CLUSTER_TRANSITION`], which is the span of the CALL that started the
+/// work, this one out-lasts the call on purpose: ElastiCache carries out one
+/// shard reconfiguration of a group at a time and refuses a second while one is
+/// under way, and that refusal is observable only while the group is still
+/// `modifying` — which is what makes two reshards released together resolve to
+/// exactly one winner. It is the window that exclusion needs, and nothing more:
+/// a caller polling the group reaches `available` from the read that follows it.
+pub const RESHARD_WORK: Duration = Duration::from_millis(500);
+
 /// How ElastiCache refuses a shard-configuration change on a replication group
 /// whose keyspace is not partitioned: the operation configures the shards of a
 /// cluster mode ENABLED group, and a group that is not one has a single keyspace
@@ -119,10 +131,11 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     /// and partition the keyspace across the shards the group then has.
     ///
     /// The group is left `modifying` with the clock owing it `available`
-    /// ([`ReplicationGroupRecord::begin_transition`]), because resharding is work
-    /// ElastiCache carries out after the call returns — a caller reading the group straight
-    /// after this one still sees the transient status and the state refusals that go with
-    /// it, which is what makes two concurrent reshards resolve to exactly one winner.
+    /// ([`ReplicationGroupRecord::begin_transition_over`]) for [`RESHARD_WORK`], because
+    /// resharding is work ElastiCache carries out after the call returns and carries out
+    /// one of at a time — a caller that asks for a second reshard while one is under way
+    /// still sees the transient status and the state refusal that goes with it, which is
+    /// what makes two concurrent reshards resolve to exactly one winner.
     pub fn reshard_replication_group(
         &mut self,
         group_id: &str,
@@ -252,6 +265,6 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         for (index, shard) in group.node_groups.iter_mut().enumerate() {
             shard.slots = Some(default_slots(shards, i32::try_from(index).unwrap_or(0)));
         }
-        group.begin_transition(STATUS_MODIFYING, now);
+        group.begin_transition_over(STATUS_MODIFYING, now, RESHARD_WORK);
     }
 }

@@ -29,7 +29,10 @@ use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, settle_pending_changes,
+    Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION,
+};
 
 /// One row of the delete table: a cache to create, and the identity it is stored
 /// and reported under.
@@ -307,11 +310,14 @@ async fn a_delete_reports_the_cache_as_deleting_and_the_clock_removes_it() {
 async fn a_delete_this_emulator_cannot_honour_is_refused_and_changes_nothing() {
     let emulator = Emulator::new();
     create_cache(&emulator, "available", "available-cache", &[("Engine", "redis")]).await;
-    // Created first and waited out, so the cache the refusal rows name is in its
-    // settled, deletable status before the row that is about to be refused runs.
-    std::thread::sleep(PAST_TRANSITION);
-    // This one is still inside its create span while the table below runs.
+    // The cache the refusal rows name is in its settled, deletable status before the
+    // row that is about to be refused runs: the clock owes it that status from the
+    // call that created it, so nothing is waited for. The cache created next is held
+    // inside the phase the delete gate acts in, and carrying everything owed through
+    // first is what leaves the hold holding only that one cache.
+    settle_pending_changes(&emulator);
     create_cache(&emulator, "creating", "creating-cache", &[("Engine", "valkey")]).await;
+    hold_pending_changes(&emulator);
 
     // The axis: why the delete cannot be honoured — the name resolves no cache
     // (in three forms), the cache is not in a status it can be deleted from, or
@@ -385,6 +391,7 @@ async fn a_delete_this_emulator_cannot_honour_is_refused_and_changes_nothing() {
         "the first delete must answer 200, got {} {}",
         first.status, first.body
     );
+    hold_pending_changes(&emulator);
     let second = delete_cache(&emulator, &[("ServerlessCacheName", "available-cache")]).await;
     assert_refused(
         "a delete of a cache already deleting",
@@ -392,7 +399,7 @@ async fn a_delete_this_emulator_cannot_honour_is_refused_and_changes_nothing() {
         400,
         "InvalidServerlessCacheStateFault",
     );
-    std::thread::sleep(PAST_TRANSITION);
+    release_pending_changes(&emulator);
     let third = delete_cache(&emulator, &[("ServerlessCacheName", "available-cache")]).await;
     assert_refused(
         "a delete of a cache the clock has removed",

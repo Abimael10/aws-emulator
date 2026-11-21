@@ -13,8 +13,8 @@
 //! `CreateReplicationGroup` call is only one row.
 
 use crate::harness::{
-    assert_own_endpoint, is_own_host, params, poll_until, Emulator, RefusalCase, Reply,
-    PAST_TRANSITION, REGION,
+    assert_own_endpoint, hold_pending_changes, is_own_host, params, poll_until,
+    release_pending_changes, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION,
 };
 
 /// The ADDRESS and PORT one member cluster reports as its own node endpoint —
@@ -597,7 +597,10 @@ async fn a_group_built_on_an_existing_primary_cluster_adopts_it() {
     );
 
     // "This cluster must already exist and have a status of available": while
-    // the clock still owes it `available`, the create is refused.
+    // the clock still owes it `available`, the create is refused. The clock owes a
+    // just-created cluster that status from the call that created it, so the phase
+    // is held out of reach here rather than raced for.
+    hold_pending_changes(&emulator);
     let too_early = create_group(
         &emulator,
         "adopting-rg",
@@ -614,6 +617,7 @@ async fn a_group_built_on_an_existing_primary_cluster_adopts_it() {
 
     // Waited for by looking again at the CONDITION the create needs — the primary
     // reaching `available` — rather than by waiting a fixed time.
+    release_pending_changes(&emulator);
     poll_until(
         &emulator,
         REGION,

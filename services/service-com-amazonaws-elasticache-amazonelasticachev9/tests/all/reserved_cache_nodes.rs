@@ -22,7 +22,9 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, Reply};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, Reply,
+};
 
 /// The operations under test.
 const DESCRIBE: &str = "DescribeReservedCacheNodes";
@@ -368,8 +370,10 @@ async fn a_reservation_moves_from_payment_pending_to_active() {
         bought.body
     );
 
-    // A read inside the span reports the reservation as it stands, and the clock
-    // carries it to its next state, which a client learns by looking again.
+    // A read while the change the clock owes is held out of reach reports the
+    // reservation as it stands; the clock then carries it to its next state, which
+    // is what the first read after the purchase already answers.
+    hold_pending_changes(&emulator);
     let pending = describe(&emulator, &[("ReservedCacheNodeId", row.reservation_id)]).await;
     assert_eq!(
         pending.text("State"),
@@ -378,6 +382,7 @@ async fn a_reservation_moves_from_payment_pending_to_active() {
         state::RESERVATION_STATE_PAYMENT_PENDING,
         pending.body
     );
+    release_pending_changes(&emulator);
     let settled = poll_until(
         &emulator,
         REGION,

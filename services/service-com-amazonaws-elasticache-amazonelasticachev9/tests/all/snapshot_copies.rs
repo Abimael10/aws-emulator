@@ -18,7 +18,10 @@
 //! snapshot's content and the copy's own members, never a single case.
 
 use crate::cache_cluster_lifecycle::create_available_cluster;
-use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
+use crate::harness::{
+    hold_pending_changes, params, release_pending_changes, settle_pending_changes, Emulator,
+    RefusalCase, Reply, PAST_TRANSITION,
+};
 use crate::snapshots::{create_snapshot, describe_snapshots, reported_names};
 
 /// Every `Snapshot` member that describes WHAT the snapshot captured, so a copy
@@ -418,14 +421,18 @@ async fn a_copy_the_rule_forbids_is_refused_and_persists_nothing() {
         "the source snapshot must be created, got {}",
         created.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    // The clock owes the snapshot `available` from the call that took it, and the
+    // copy its own `available` from the call that copied it, so neither is waited
+    // for: the changes owed are carried through and the table runs against settled
+    // records.
+    settle_pending_changes(&emulator);
     let copied = copy_snapshot(&emulator, "held-snap", "taken-copy", &[]).await;
     assert_eq!(
         copied.status, 200,
         "the first copy must succeed, got {} {}",
         copied.status, copied.body
     );
-    std::thread::sleep(PAST_TRANSITION);
+    settle_pending_changes(&emulator);
 
     // Each row: the form pairs that make the request, and the modelled refusal.
     // The axis is the reason the copy cannot be made.
@@ -538,9 +545,9 @@ async fn a_copy_the_rule_forbids_is_refused_and_persists_nothing() {
         over_tagged.body
     );
 
-    // A source that is not settled yet has no finished snapshot to copy: this
-    // row is timed rather than tabled, because it has to run inside the
-    // transition span the create opened.
+    // A source that is not settled yet has no finished snapshot to copy: the clock
+    // owes a just-taken snapshot `available` from the call that took it, so this row
+    // holds that change out of reach rather than racing it.
     create_available_cluster(&emulator, "unsettled-source", &[]).await;
     let creating = create_snapshot(&emulator, "creating-snap", "unsettled-source", &[]).await;
     assert_eq!(
@@ -548,6 +555,7 @@ async fn a_copy_the_rule_forbids_is_refused_and_persists_nothing() {
         "case a source still creating: the create must succeed, got {}",
         creating.body
     );
+    hold_pending_changes(&emulator);
     let too_early = copy_snapshot(&emulator, "creating-snap", "early-copy", &[]).await;
     assert_eq!(
         too_early.status, 400,
@@ -561,7 +569,7 @@ async fn a_copy_the_rule_forbids_is_refused_and_persists_nothing() {
         too_early.body
     );
     // ... and once the clock owes it `available`, the same copy is accepted.
-    std::thread::sleep(PAST_TRANSITION);
+    release_pending_changes(&emulator);
     let in_time = copy_snapshot(&emulator, "creating-snap", "early-copy", &[]).await;
     assert_eq!(
         in_time.status, 200,

@@ -26,7 +26,10 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, settle_pending_changes,
+    Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION,
+};
 
 /// One row of the snapshot table: a serverless cache to create, and the snapshot
 /// taken of it.
@@ -361,8 +364,9 @@ async fn every_stored_cache_can_be_snapshotted_and_the_snapshot_is_read_back() {
         assert_snapshot(case, &created, state::STATUS_CREATING, version);
 
         // Read straight back: the stored record is the one the create answered
-        // with, and inside the span it is still the transient status the create
-        // reported.
+        // with, and while the change the clock owes it is held out of reach it is
+        // still the transient status the create reported.
+        hold_pending_changes(&emulator);
         let immediately =
             describe_snapshot(&emulator, case.case, case.snapshot_request_name).await;
         assert_snapshot(case, &immediately, state::STATUS_CREATING, version);
@@ -401,6 +405,7 @@ async fn every_stored_cache_can_be_snapshotted_and_the_snapshot_is_read_back() {
 
     // Every snapshot settles available on the clock, with the rest of what it
     // reports unchanged.
+    release_pending_changes(&emulator);
     for (case, version) in CASES.iter().zip(&versions) {
         poll_until(
             &emulator,
@@ -558,9 +563,10 @@ async fn a_source_cache_the_account_does_not_hold_is_refused_whatever_the_name()
 async fn a_snapshot_this_service_cannot_take_is_refused_and_stores_nothing() {
     let emulator = Emulator::new();
     create_cache(&emulator, "available", "available-cache", "redis", &[]).await;
-    // Created first and waited out, so the cache the rows name is in the settled
-    // status a snapshot is taken from before the table runs.
-    std::thread::sleep(PAST_TRANSITION);
+    // The cache the rows name is in the settled status a snapshot is taken from
+    // before the table runs: the clock owes it that status from the call that created
+    // it, so nothing is waited for here.
+    settle_pending_changes(&emulator);
     let taken = create_snapshot(
         &emulator,
         &[
@@ -574,9 +580,11 @@ async fn a_snapshot_this_service_cannot_take_is_refused_and_stores_nothing() {
         "the snapshot whose name the table reuses must be taken, got {}",
         taken.body
     );
-    // This one is still inside its create span while the table below runs, so it
-    // has no settled data set to copy.
+    // This one is held inside its create span while the table below runs, so it
+    // has no settled data set to copy: the clock owes a just-created cache
+    // `available` from the call that created it.
     create_cache(&emulator, "creating", "creating-cache", "valkey", &[]).await;
+    hold_pending_changes(&emulator);
 
     // The axis: why the snapshot cannot be taken — the name is not one a
     // snapshot can be stored under, the name is already another snapshot's, or
@@ -685,6 +693,7 @@ async fn a_snapshot_this_service_cannot_take_is_refused_and_stores_nothing() {
         "DeleteServerlessCache must answer 200, got {} {}",
         deleted.status, deleted.body
     );
+    hold_pending_changes(&emulator);
     let while_deleting = create_snapshot(
         &emulator,
         &[
@@ -700,7 +709,7 @@ async fn a_snapshot_this_service_cannot_take_is_refused_and_stores_nothing() {
         "InvalidServerlessCacheStateFault",
     );
     // And past the removal the cache is gone, so the same call is a not-found.
-    std::thread::sleep(PAST_TRANSITION);
+    release_pending_changes(&emulator);
     let when_gone = create_snapshot(
         &emulator,
         &[

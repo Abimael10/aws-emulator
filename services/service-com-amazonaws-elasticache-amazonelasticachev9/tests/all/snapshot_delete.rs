@@ -22,10 +22,11 @@
 //! cluster's configuration, how the snapshot came about (taken or copied), the
 //! case the name is sent in, and which snapshot of a set is the one deleted.
 
-use service_com_amazonaws_elasticache_amazonelasticachev9::state;
-
 use crate::cache_cluster_lifecycle::create_available_cluster;
-use crate::harness::{params, Emulator, RefusalCase, Reply, PAST_TRANSITION};
+use crate::harness::{
+    hold_pending_changes, params, release_pending_changes, settle_pending_changes, Emulator,
+    RefusalCase, Reply,
+};
 use crate::snapshots::{create_snapshot, describe_snapshots, reported_names};
 
 /// Every `Snapshot` member that describes WHAT the snapshot captured, so the
@@ -187,8 +188,9 @@ async fn a_deleted_snapshot_answers_deleting_and_the_clock_removes_it() {
                 case.case, created.status, created.body
             );
             // A cluster is `snapshotting` until the clock owes it `available`
-            // again, so the next take waits for it.
-            std::thread::sleep(PAST_TRANSITION);
+            // again, and it owes that from the call that took the snapshot, so the
+            // change is carried through rather than waited for.
+            settle_pending_changes(&emulator);
         }
         if let Some((source, target)) = case.copy {
             let copied = copy_snapshot(&emulator, source, target).await;
@@ -197,7 +199,7 @@ async fn a_deleted_snapshot_answers_deleting_and_the_clock_removes_it() {
                 "case {}: copying {source} to {target} must answer 200, got {} {}",
                 case.case, copied.status, copied.body
             );
-            std::thread::sleep(PAST_TRANSITION);
+            settle_pending_changes(&emulator);
         }
 
         // The stored snapshot as it stands before the delete: every value the
@@ -211,7 +213,6 @@ async fn a_deleted_snapshot_answers_deleting_and_the_clock_removes_it() {
             before.body
         );
 
-        let started = std::time::Instant::now();
         let deleted = delete_snapshot(&emulator, case.requested).await;
         assert_eq!(
             deleted.status, 200,
@@ -239,23 +240,22 @@ async fn a_deleted_snapshot_answers_deleting_and_the_clock_removes_it() {
             );
         }
 
-        // A read inside the span still finds it, going away. Guarded by the
-        // clock so a slow machine cannot turn the span into a failure: the read
-        // below happened no later than `started.elapsed()` after the delete.
+        // A read while the removal is still owed finds it, going away: the clock owes
+        // that removal from the call that asked for it, so it is held out of reach here
+        // rather than raced for.
+        hold_pending_changes(&emulator);
         let during = describe_snapshots(&emulator, &[("SnapshotName", case.stored)]).await;
-        if started.elapsed() < state::SNAPSHOT_TRANSITION {
-            assert_eq!(
-                during.text("Snapshot/SnapshotStatus"),
-                Some("deleting"),
-                "case {}: inside the removal span the snapshot must still be reported as \
-                 deleting, got {}",
-                case.case,
-                during.body
-            );
-        }
+        assert_eq!(
+            during.text("Snapshot/SnapshotStatus"),
+            Some("deleting"),
+            "case {}: while the removal is still owed the snapshot must be reported as \
+             deleting, got {}",
+            case.case,
+            during.body
+        );
 
-        // Past the span the clock has carried the removal through.
-        std::thread::sleep(PAST_TRANSITION);
+        // Once the removal is due the clock carries it through.
+        release_pending_changes(&emulator);
         let after = describe_snapshots(&emulator, &[("SnapshotName", case.stored)]).await;
         assert_eq!(
             after.status, 200,
@@ -308,7 +308,10 @@ async fn a_delete_the_rule_forbids_is_refused_and_persists_nothing() {
             "case {name}: the snapshot must be created, got {} {}",
             created.status, created.body
         );
-        std::thread::sleep(PAST_TRANSITION);
+        // The cluster is `snapshotting` until the clock owes it `available` again,
+        // which it owes from the call above, so the change is carried through rather
+        // than waited for.
+        settle_pending_changes(&emulator);
     }
 
     // Each row: the form pairs that make the request, and the modelled refusal.
@@ -376,15 +379,16 @@ async fn a_delete_the_rule_forbids_is_refused_and_persists_nothing() {
         all.body
     );
 
-    // A snapshot that is not settled yet is not deletable: this row is timed
-    // rather than tabled, because it has to run inside the span the create
-    // opened.
+    // A snapshot that is not settled yet is not deletable: the clock owes a
+    // just-taken snapshot `available` from the call that took it, so this row holds
+    // that change out of reach rather than racing it.
     let creating = create_snapshot(&emulator, "creating-snap", "refused-del", &[]).await;
     assert_eq!(
         creating.status, 200,
         "case a snapshot still creating: the create must succeed, got {}",
         creating.body
     );
+    hold_pending_changes(&emulator);
     let too_early = delete_snapshot(&emulator, "creating-snap").await;
     assert_eq!(
         too_early.status, 400,
@@ -399,8 +403,7 @@ async fn a_delete_the_rule_forbids_is_refused_and_persists_nothing() {
     );
 
     // ... and once the clock owes it `available`, the same delete is accepted.
-    std::thread::sleep(PAST_TRANSITION);
-    let started = std::time::Instant::now();
+    release_pending_changes(&emulator);
     let accepted = delete_snapshot(&emulator, "creating-snap").await;
     assert_eq!(
         accepted.status, 200,
@@ -408,26 +411,24 @@ async fn a_delete_the_rule_forbids_is_refused_and_persists_nothing() {
         accepted.status, accepted.body
     );
 
-    // A second delete inside the span is refused: a snapshot already going away
-    // is not deleted twice. Guarded by the clock, so a slow machine reads the
-    // removed-record row below instead of failing here.
+    // A second delete while the removal is still owed is refused: a snapshot already
+    // going away is not deleted twice.
+    hold_pending_changes(&emulator);
     let second = delete_snapshot(&emulator, "creating-snap").await;
-    if started.elapsed() < state::SNAPSHOT_TRANSITION {
-        assert_eq!(
-            second.status, 400,
-            "case a second delete inside the span: expected HTTP 400, got {} {}",
-            second.status, second.body
-        );
-        assert_eq!(
-            second.error_code(),
-            "InvalidSnapshotState",
-            "case a second delete inside the span: expected InvalidSnapshotState, got {}",
-            second.body
-        );
-    }
+    assert_eq!(
+        second.status, 400,
+        "case a second delete inside the span: expected HTTP 400, got {} {}",
+        second.status, second.body
+    );
+    assert_eq!(
+        second.error_code(),
+        "InvalidSnapshotState",
+        "case a second delete inside the span: expected InvalidSnapshotState, got {}",
+        second.body
+    );
 
-    // Past the span the record is gone, so the same call is a not-found.
-    std::thread::sleep(PAST_TRANSITION);
+    // Past the removal the record is gone, so the same call is a not-found.
+    release_pending_changes(&emulator);
     let gone = delete_snapshot(&emulator, "creating-snap").await;
     assert_eq!(
         gone.status, 404,
@@ -472,49 +473,41 @@ async fn a_removed_snapshots_name_is_free_again() {
             "case {case}: the first snapshot must be created, got {} {}",
             created.status, created.body
         );
-        std::thread::sleep(PAST_TRANSITION);
+        settle_pending_changes(&emulator);
         let before = describe_snapshots(&emulator, &[("SnapshotName", &stored)]).await;
         let first_taken_at = before
             .text("NodeSnapshot/SnapshotCreateTime")
             .unwrap_or_default()
             .to_string();
 
-        let started = std::time::Instant::now();
         let deleted = delete_snapshot(&emulator, first).await;
         assert_eq!(
             deleted.status, 200,
             "case {case}: the delete must answer 200, got {} {}",
             deleted.status, deleted.body
         );
-        // While it is still going away the name is taken: the record is there.
+        // While it is still going away the name is taken: the record is there. The
+        // clock owes that removal from the call that asked for it, so it is held out
+        // of reach here rather than raced for.
+        hold_pending_changes(&emulator);
         let too_early = create_snapshot(&emulator, second, "reuse-cluster", &[]).await;
-        if started.elapsed() < state::SNAPSHOT_TRANSITION {
-            assert_eq!(
-                too_early.error_code(),
-                "SnapshotAlreadyExistsFault",
-                "case {case}: a snapshot that is still deleting must keep its name, got {} {}",
-                too_early.status,
-                too_early.body
-            );
-        }
-        if too_early.status == 200 {
-            // Only reachable on a machine slower than the removal span: the
-            // clock had already carried the removal through, so this create took
-            // the freed name itself — which is what the rest of the row
-            // asserts, leaving nothing to repeat.
-            std::thread::sleep(PAST_TRANSITION);
-            continue;
-        }
+        assert_eq!(
+            too_early.error_code(),
+            "SnapshotAlreadyExistsFault",
+            "case {case}: a snapshot that is still deleting must keep its name, got {} {}",
+            too_early.status,
+            too_early.body
+        );
 
-        // Past the span the record is gone and the name is free.
-        std::thread::sleep(PAST_TRANSITION);
+        // Past the removal the record is gone and the name is free.
+        release_pending_changes(&emulator);
         let again = create_snapshot(&emulator, second, "reuse-cluster", &[]).await;
         assert_eq!(
             again.status, 200,
             "case {case}: the freed name must be usable again, got {} {}",
             again.status, again.body
         );
-        std::thread::sleep(PAST_TRANSITION);
+        settle_pending_changes(&emulator);
         let after = describe_snapshots(&emulator, &[("SnapshotName", &stored)]).await;
         assert_eq!(
             after.text("Snapshot/SnapshotStatus"),

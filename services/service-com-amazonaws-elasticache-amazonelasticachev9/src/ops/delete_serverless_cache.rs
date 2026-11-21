@@ -270,9 +270,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         });
 
-        // The cache is leaving: it answers `DELETING` now, and the clock owes its
-        // removal, so a caller reading it straight after this call still sees it
-        // going away and a later one sees it gone.
+        // The cache is leaving: this call answers `DELETING`, and the clock owes
+        // its removal from this call, so the read that follows finds it gone.
         let Some(cache) = store.serverless_caches.get_mut(&name) else {
             // Unreachable: resolved under this same lock above.
             return Err(crate::scaffolded::Scaffolded::validation(

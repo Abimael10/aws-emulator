@@ -17,7 +17,10 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, Reply,
+    PAST_TRANSITION, REGION,
+};
 
 /// The engine every group in this suite is created with, so a row that changes
 /// the engine changes it to the other member of the published set
@@ -645,7 +648,10 @@ async fn a_group_that_is_not_active_takes_no_change() {
     create_user(&emulator, "state gate", "member-one").await;
     create_user_group(&emulator, "state gate", "mod-group", &["default"]).await;
 
-    // A group that is still being created is not active yet.
+    // A group that is still being created is not active yet: the clock owes a
+    // just-created group `active` from the call that created it, so the phase is
+    // held out of reach rather than raced for.
+    hold_pending_changes(&emulator);
     let while_creating = modify_user_group(&emulator, "mod-group", &["member-one"], &[], None).await;
     assert_eq!(
         (while_creating.status, while_creating.error_code()),
@@ -655,6 +661,7 @@ async fn a_group_that_is_not_active_takes_no_change() {
         while_creating.body
     );
 
+    release_pending_changes(&emulator);
     wait_out_the_transition();
     let accepted = modify_user_group(&emulator, "mod-group", &["member-one"], &[], None).await;
     assert_eq!(
@@ -664,7 +671,8 @@ async fn a_group_that_is_not_active_takes_no_change() {
     );
 
     // And a group that is already carrying a change the clock has not applied is
-    // not active either.
+    // not active either — the same held phase, this time left by the modify.
+    hold_pending_changes(&emulator);
     let while_modifying = modify_user_group(&emulator, "mod-group", &[], &["member-one"], None).await;
     assert_eq!(
         (while_modifying.status, while_modifying.error_code()),
@@ -675,6 +683,7 @@ async fn a_group_that_is_not_active_takes_no_change() {
     );
 
     // The first change is still the one the clock applies.
+    release_pending_changes(&emulator);
     wait_out_the_transition();
     let settled = describe_user_group(&emulator, "state gate", "mod-group").await;
     assert_eq!(

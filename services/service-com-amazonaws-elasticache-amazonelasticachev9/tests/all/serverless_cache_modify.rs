@@ -23,7 +23,10 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, settle_pending_changes, Emulator, RefusalCase, Reply,
+    PAST_TRANSITION, REGION,
+};
 
 /// The configuration every row that does not create its own cache starts from,
 /// so one stored baseline is what each modify is measured against.
@@ -453,8 +456,10 @@ async fn a_refused_modify_leaves_the_live_cache_untouched() {
     // The row that moves a cache carrying a user group onto Memcached needs such
     // a cache, which only an accepted modify can make.
     create_cache(&emulator, "grouped", "grouped-cache", &[("Engine", "redis")]).await;
-    // Every cache above, and the group, is settled before the table runs.
-    std::thread::sleep(PAST_TRANSITION);
+    // Every cache above, and the group, is settled before the table runs: the clock
+    // owes each of them its settled state from the call that created it, so nothing
+    // is waited for here.
+    settle_pending_changes(&emulator);
     let attached = modify_cache(
         &emulator,
         "grouped-cache",
@@ -466,7 +471,22 @@ async fn a_refused_modify_leaves_the_live_cache_untouched() {
         "attaching a user group must answer 200, got {} {}",
         attached.status, attached.body
     );
-    // This one is still inside its create span while the table below runs.
+    // That attach leaves the cache `modifying`, and the rows below are about the
+    // request rather than the status, so it is polled back to `available` before
+    // they run.
+    poll_until(
+        &emulator,
+        REGION,
+        "grouped-cache",
+        "the grouped cache settling at available after the attach",
+        "DescribeServerlessCaches",
+        &params(&[("ServerlessCacheName", "grouped-cache")]),
+        |reply| reply.text("Status") == Some(state::SERVERLESS_STATUS_AVAILABLE),
+    )
+    .await;
+    // This one is held inside its create span while the table below runs: the clock
+    // owes a just-created cache `available` from the call that created it, so the
+    // phase the modify gate acts in is held rather than raced for.
     create_cache(
         &emulator,
         "creating",
@@ -474,6 +494,7 @@ async fn a_refused_modify_leaves_the_live_cache_untouched() {
         &[("Engine", "valkey")],
     )
     .await;
+    hold_pending_changes(&emulator);
 
     // The axis: why the modify cannot be honoured — a bound inverted in the
     // request, a bound inverted only against the limits the cache is running, a

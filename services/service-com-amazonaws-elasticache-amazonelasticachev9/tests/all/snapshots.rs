@@ -19,7 +19,10 @@ use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 use crate::cache_cluster_lifecycle::{
     create_available_cluster, create_cluster, describe_cluster, poll_cluster_status,
 };
-use crate::harness::{params, poll_until, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, RefusalCase,
+    Reply, PAST_TRANSITION, REGION,
+};
 
 /// One filter row: the case name, the filter's form pairs, and the snapshots it
 /// selects in the order the describe reports them.
@@ -604,13 +607,19 @@ async fn a_snapshot_of_what_cannot_be_snapshotted_is_refused() {
         "the first snapshot must be created: {}",
         taken.body
     );
-    // A cluster that is still `creating` has nothing settled to copy.
+    // That take leaves the cluster `snapshotting`, which one row below is refused
+    // from: the clock owes it `available` from the call that took the snapshot, so
+    // the phase is held out of reach rather than raced for.
+    hold_pending_changes(&emulator);
+    // A cluster that is still `creating` has nothing settled to copy — held the same
+    // way, for the row that names it.
     let creating = create_cluster(&emulator, "still-creating", &[]).await;
     assert_eq!(
         creating.status, 200,
         "the cluster must be created: {}",
         creating.body
     );
+    hold_pending_changes(&emulator);
 
     // Each row: the form pairs sent beside `SnapshotName`, and the modelled
     // refusal. The axis is the reason the snapshot cannot be taken.
@@ -681,7 +690,9 @@ async fn a_snapshot_of_what_cannot_be_snapshotted_is_refused() {
     }
 
     // A name already taken is refused rather than overwriting the snapshot
-    // under it.
+    // under it — about the NAME, so the clock is let carry every record to its
+    // settled state first.
+    release_pending_changes(&emulator);
     let duplicate = create_snapshot(&emulator, "Taken-Snap", "snapshottable", &[]).await;
     assert_eq!(
         duplicate.status, 400,
@@ -790,8 +801,10 @@ async fn a_snapshot_is_the_cluster_as_it_stood_when_it_was_taken() {
     // Taking a snapshot leaves the source cluster `snapshotting` for a span:
     // `CreateSnapshot` answers with the snapshot rather than the cluster, so
     // what shows the cluster is transient is the state gate — a second snapshot
-    // of it, straight after, is refused with the status it has. The read that
-    // follows is polled until the cluster is available again.
+    // of it, while the status change the clock owes it is held out of reach, is
+    // refused with the status it has. The read that follows is polled until the
+    // cluster is available again.
+    hold_pending_changes(&emulator);
     let while_snapshotting = create_snapshot(&emulator, "during", "copied", &[]).await;
     assert_eq!(
         while_snapshotting.error_code(),
@@ -805,6 +818,7 @@ async fn a_snapshot_is_the_cluster_as_it_stood_when_it_was_taken() {
         "case before-change: the refusal must state the status a snapshot admits, got {:?}",
         while_snapshotting.error_message()
     );
+    release_pending_changes(&emulator);
     let settled = poll_cluster_status(&emulator, "before-change", "copied", "available").await;
     assert_eq!(
         settled.text("CacheClusterStatus"),
@@ -1195,8 +1209,9 @@ async fn an_immediate_settings_modify_leaves_the_cluster_snapshotable() {
             "case {case}: node work answers with the cluster transient, got {:?}",
             modified.text("CacheCluster/CacheClusterStatus")
         );
-        // Straight after that call, inside the span: the state-gated call is
-        // refused with the status the cluster has.
+        // While the status change the clock owes is held out of reach: the
+        // state-gated call is refused with the status the cluster has.
+        hold_pending_changes(&emulator);
         let refused = create_snapshot(&emulator, &format!("{cluster}-snap"), cluster, &[]).await;
         assert_eq!(
             refused.error_code(),
@@ -1206,6 +1221,7 @@ async fn an_immediate_settings_modify_leaves_the_cluster_snapshotable() {
         );
         // A read reports the cluster as the record stands; once the node work the
         // clock owed is done the same call is accepted from then on.
+        release_pending_changes(&emulator);
         let described = poll_cluster_status(&emulator, case, cluster, "available").await;
         assert_eq!(
             described.text("CacheCluster/CacheClusterStatus"),

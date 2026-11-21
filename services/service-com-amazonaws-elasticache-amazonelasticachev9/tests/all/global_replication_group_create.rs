@@ -18,7 +18,7 @@
 //! is what decides the prefix the stored id carries. The axis of the third is
 //! the way a create is refused.
 
-use crate::harness::{params, Emulator, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{hold_pending_changes, params, Emulator, Reply, PAST_TRANSITION, REGION};
 
 /// One create / round-trip row: a primary replication group, and the Global
 /// datastore built around it.
@@ -688,9 +688,9 @@ async fn a_global_datastore_create_this_emulator_cannot_serve_is_refused_and_sto
     }
 
     // The state gate, which needs a primary that is still being created: the
-    // create of that group is followed straight away by the datastore create,
-    // because a report of the group is answered only once the clock has settled
-    // it, so a read between the two would wait it out of `creating`.
+    // change the clock owes that group is held out of reach, because the clock
+    // otherwise owes it `available` from the call that created it — which is what
+    // every read issued after that call is answered with.
     let creating = emulator
         .call(
             "CreateReplicationGroup",
@@ -701,6 +701,7 @@ async fn a_global_datastore_create_this_emulator_cannot_serve_is_refused_and_sto
             ]),
         )
         .await;
+    hold_pending_changes(&emulator);
     assert_eq!(
         creating.status, 200,
         "the creating primary must be creatable, got {}",

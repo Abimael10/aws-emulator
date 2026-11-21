@@ -31,7 +31,9 @@
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::describe_cache_parameters::create_group;
-use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, Reply, REGION,
+};
 use crate::modify_cache_parameter_group::modify;
 
 /// The sentence ElastiCache refuses a value that is not one of its identifiers with,
@@ -616,7 +618,9 @@ async fn a_user_group_is_deleted_and_read_back_as_gone() {
             created.status, created.body
         );
         // A group the clock has not finished creating is not in an active state, so it
-        // takes no change yet.
+        // takes no change yet. The clock owes a just-created group `active` from the call
+        // that created it, so that phase is held out of reach rather than raced for.
+        hold_pending_changes(&emulator);
         let too_early = delete(&emulator, id).await;
         assert_eq!(
             (too_early.status, too_early.error_code()),
@@ -628,6 +632,7 @@ async fn a_user_group_is_deleted_and_read_back_as_gone() {
         );
         // Polling the group until the create has settled it active, which is the
         // state a delete is accepted from.
+        release_pending_changes(&emulator);
         let active = poll_until(
             &emulator,
             REGION,
@@ -674,6 +679,7 @@ async fn a_user_group_is_deleted_and_read_back_as_gone() {
         // The read that follows the delete reports the group on its way out, and once the
         // removal the clock owed has been carried through every reader answers the
         // modelled not-found and the id is free again.
+        hold_pending_changes(&emulator);
         let leaving = describe(&emulator, id).await;
         assert_eq!(
             leaving.text("Status"),
@@ -682,6 +688,7 @@ async fn a_user_group_is_deleted_and_read_back_as_gone() {
             leaving.status,
             leaving.body
         );
+        release_pending_changes(&emulator);
         let after = poll_until(
             &emulator,
             REGION,

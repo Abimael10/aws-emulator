@@ -19,7 +19,10 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, Reply,
+    PAST_TRANSITION, REGION,
+};
 
 /// A password that satisfies the published length rule (`state::PASSWORD_MIN_LENGTH` to
 /// `state::PASSWORD_MAX_LENGTH` characters).
@@ -615,7 +618,9 @@ async fn a_modify_the_service_refuses() {
     );
 
     // A user still carrying a change the clock has not settled is not in active state,
-    // which is the modelled state fault — and so is one on its way out.
+    // which is the modelled state fault — and so is one on its way out. Both phases are
+    // held out of reach, because the clock owes a modified user `active`, and a deleted
+    // one its removal, from the call that asked for it.
     let first = emulator
         .call(
             "ModifyUser",
@@ -627,6 +632,7 @@ async fn a_modify_the_service_refuses() {
         "the first modify must answer 200, got {} {}",
         first.status, first.body
     );
+    hold_pending_changes(&emulator);
     let second = emulator
         .call(
             "ModifyUser",
@@ -642,7 +648,7 @@ async fn a_modify_the_service_refuses() {
     );
     // The refused second call did not take effect: the engine is the one the first call
     // asked for.
-    std::thread::sleep(PAST_TRANSITION);
+    release_pending_changes(&emulator);
     let settled = describe_user(&emulator, "state gate", "refusal-user").await;
     assert_eq!(
         (settled.text("Engine"), settled.text("Status")),
@@ -658,6 +664,7 @@ async fn a_modify_the_service_refuses() {
         "the settled user must be deletable, got {} {}",
         deleted.status, deleted.body
     );
+    hold_pending_changes(&emulator);
     let modified_while_deleting = emulator
         .call(
             "ModifyUser",
@@ -675,7 +682,7 @@ async fn a_modify_the_service_refuses() {
         modified_while_deleting.body
     );
     // Once the removal falls due the user is gone, so the modify is a not-found.
-    std::thread::sleep(PAST_TRANSITION);
+    release_pending_changes(&emulator);
     let gone = emulator
         .call(
             "ModifyUser",

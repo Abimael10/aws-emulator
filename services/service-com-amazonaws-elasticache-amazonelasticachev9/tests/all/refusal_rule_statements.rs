@@ -38,7 +38,7 @@
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::cache_cluster_lifecycle::create_available_cluster;
-use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+use crate::harness::{hold_pending_changes, params, poll_until, Emulator, Reply, REGION};
 use crate::resource_tags::{add_tags, list_tags, remove_tags};
 
 /// The account id every generated emulator presents, which every ARN it mints
@@ -716,6 +716,10 @@ async fn a_user_group_that_cannot_be_deleted_states_the_statuses_a_delete_admits
                 answered_status(case, &accepted)
             }
         };
+        // The clock owes the group its settled status from the call that put it in
+        // this one, so the phase the delete gate acts in is held out of reach rather
+        // than raced for.
+        hold_pending_changes(&emulator);
 
         let sentence = format!(
             "User group {group} has status {status}. Only active or create-failed user groups \

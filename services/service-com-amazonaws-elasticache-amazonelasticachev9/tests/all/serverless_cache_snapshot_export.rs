@@ -29,7 +29,9 @@
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, poll_until, Emulator, Reply, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, Emulator, Reply, REGION,
+};
 
 /// A second Region, for the row that runs the whole flow outside the Region every
 /// other row signs for, and for the bucket that lives outside the snapshot's.
@@ -450,8 +452,11 @@ async fn an_export_that_cannot_be_performed_is_refused_and_writes_nothing() {
     }
 
     // A snapshot that has not settled yet has no finished data set to export:
-    // the modelled snapshot-state fault, naming the state it is in.
+    // the modelled snapshot-state fault, naming the state it is in. The clock owes
+    // the snapshot `available` from the call that took it, so that state is held out
+    // of reach rather than raced for.
     create_snapshot(&emulator, case).await;
+    hold_pending_changes(&emulator);
     let unsettled = export(&emulator, case.region, case.snapshot_request_name, bucket).await;
     assert_eq!(
         unsettled.status, 400,
@@ -480,6 +485,7 @@ async fn an_export_that_cannot_be_performed_is_refused_and_writes_nothing() {
 
     // Once the snapshot has settled it is exportable, so the two bucket refusals
     // below are about the BUCKET and not about the snapshot.
+    release_pending_changes(&emulator);
     await_settled_snapshot(&emulator, case).await;
     let key = format!("{}.rdb", case.snapshot_stored_name);
 

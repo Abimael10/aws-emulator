@@ -344,9 +344,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The change is applied to the stored shards — each new replica is a
         // member CLUSTER of its own, minted into the same store
-        // `DescribeCacheClusters` reads — and the group answers `modifying`
-        // until the clock settles it, so a caller acting straight after the call
-        // still sees the transient status.
+        // `DescribeCacheClusters` reads — and this call answers `modifying` with
+        // the clock owing the group `available` again from this call.
         for (node_group_id, target) in &requested {
             store.set_shard_replica_count(&key, node_group_id, *target, &[], now);
         }

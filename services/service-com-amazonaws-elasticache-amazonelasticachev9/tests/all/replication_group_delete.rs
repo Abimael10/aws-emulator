@@ -32,8 +32,10 @@ use std::time::Duration;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::cache_data_plane::{command, endpoint_of, open, Resp};
-use crate::harness::{assert_refusal, params, poll_until, Emulator, Reply, REGION};
-use crate::lifecycle_convergence::{every_pending_change_due_in, HELD_OUT_OF_REACH};
+use crate::harness::{
+    assert_refusal, every_pending_change_due_in, params, poll_until, Emulator, Reply,
+    HELD_OUT_OF_REACH, REGION,
+};
 
 /// Create one replication group and answer the create's reply.
 async fn create_group(emulator: &Emulator, id: &str, extra: &[(&str, &str)]) -> Reply {

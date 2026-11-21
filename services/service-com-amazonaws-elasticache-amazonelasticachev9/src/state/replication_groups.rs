@@ -891,12 +891,19 @@ impl ReplicationGroupRecord {
 
     /// Start the span after which the clock owes this group `available`, leaving
     /// it and its shards in `status` until then — the same transition a create
-    /// gets, so a caller that polls straight after a change sees the transient
-    /// status.
+    /// gets, so the call that starts the work answers with the transient status.
     pub fn begin_transition(&mut self, status: &str, now: SystemTime) {
+        self.begin_transition_over(status, now, CLUSTER_TRANSITION);
+    }
+
+    /// [`Self::begin_transition`] over a span of its caller's choosing: for work
+    /// this service carries out one of at a time, whose window a second call is
+    /// refused in has to out-last the call that started it (see
+    /// [`RESHARD_WORK`]).
+    pub fn begin_transition_over(&mut self, status: &str, now: SystemTime, span: Duration) {
         self.status = status.to_string();
         self.pending_status = Some(PendingTransition {
-            due: now + CLUSTER_TRANSITION,
+            due: now + span,
             status: STATUS_AVAILABLE.to_string(),
         });
         for shard in &mut self.node_groups {

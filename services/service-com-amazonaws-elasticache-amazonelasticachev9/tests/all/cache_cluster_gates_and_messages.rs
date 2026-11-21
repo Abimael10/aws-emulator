@@ -34,7 +34,7 @@
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::cache_cluster_lifecycle::{create_available_cluster, create_cluster, describe_cluster};
-use crate::harness::{params, Emulator};
+use crate::harness::{hold_pending_changes, params, Emulator};
 
 /// The identifier rule this service states when a value cannot name a cache
 /// cluster, naming the member by the parameter label ElastiCache uses for it
@@ -453,9 +453,11 @@ async fn a_cluster_working_through_a_modification_still_accepts_the_next_one() {
 #[tokio::test]
 async fn an_unprovisioned_cluster_is_gated_but_only_after_its_input_is_read() {
     let emulator = Emulator::new();
-    // Created and NOT waited out, so it is still `creating`: the span the
-    // service publishes is never zero.
+    // Created and held in `creating`: the clock owes a just-created cluster its
+    // settled status from the call that created it, so the phase a gate acts in
+    // is held here rather than raced for.
     let created = create_cluster(&emulator, "unsettled", &[]).await;
+    hold_pending_changes(&emulator);
     assert_eq!(
         created.status, 200,
         "the cluster must be created, got {}",
@@ -509,7 +511,6 @@ async fn an_unprovisioned_cluster_is_gated_but_only_after_its_input_is_read() {
 
     // Neither refusal changed the cluster: it is still running the window it was
     // created with.
-    std::thread::sleep(crate::harness::PAST_TRANSITION);
     let described = describe_cluster(&emulator, "unsettled").await;
     assert_eq!(
         described.text("CacheCluster/PreferredMaintenanceWindow"),

@@ -25,8 +25,8 @@ use std::time::Duration;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
 use crate::harness::{
-    assert_own_endpoint, is_own_host, params, poll_until, Emulator, RefusalCase, Reply,
-    PAST_TRANSITION, REGION,
+    assert_own_endpoint, hold_pending_changes, is_own_host, params, poll_until,
+    release_pending_changes, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION,
 };
 
 
@@ -464,8 +464,11 @@ async fn a_cluster_reaches_available_on_the_clock_and_not_before() {
         );
 
         // A read issued inside the span reports the cluster as it stands — still
-        // `creating` — and the clock carries it to `available`, which the client
-        // learns by looking again.
+        // `creating`. That span is the CALL that started the work, so this half
+        // of the row holds the change the clock owes out of reach rather than
+        // racing it; the clock then carries the cluster to `available`, which is
+        // what the first read a client issues after the create already answers.
+        hold_pending_changes(&emulator);
         let transient = describe_cluster(&emulator, &id).await;
         assert_eq!(
             transient.text("CacheCluster/CacheClusterStatus"),
@@ -473,6 +476,7 @@ async fn a_cluster_reaches_available_on_the_clock_and_not_before() {
             "case {engine}: a read inside the span reports the cluster as it stands, got {:?}",
             transient.text("CacheCluster/CacheClusterStatus")
         );
+        release_pending_changes(&emulator);
         let settled = poll_cluster_status(&emulator, engine, &id, state::STATUS_AVAILABLE).await;
         assert_eq!(
             settled.text("CacheCluster/CacheClusterStatus"),
@@ -1992,9 +1996,11 @@ async fn an_unknown_or_unsettled_cluster_is_refused() {
     }
 
     // The state gate: a call that CHANGES a cluster still being created is
-    // refused with the status the cluster has. Each case creates a cluster of
-    // its own and calls straight after it, because the gate is what a mutation
-    // arriving INSIDE the transition span is answered with.
+    // refused with the status the cluster has. Each case creates a cluster of its
+    // own and holds the change the clock owes it out of reach, because the gate is
+    // what a mutation arriving while the cluster is still `creating` is answered
+    // with — and the clock otherwise owes that cluster `available` from the call
+    // that created it.
     let gated: [(&str, &str); 2] = [
         ("modify while creating", "ModifyCacheCluster"),
         ("delete while creating", "DeleteCacheCluster"),
@@ -2002,6 +2008,7 @@ async fn an_unknown_or_unsettled_cluster_is_refused() {
     for (index, (case, action)) in gated.into_iter().enumerate() {
         let id = format!("gated-{index}");
         create_cluster(&emulator, &id, &[]).await;
+        hold_pending_changes(&emulator);
         let reply = emulator
             .call(action, &params(&[("CacheClusterId", &id)]))
             .await;
@@ -2020,8 +2027,9 @@ async fn an_unknown_or_unsettled_cluster_is_refused() {
 
     // A describe is a read: it reports the cluster rather than refusing it, and
     // it answers with the status the record carries at that instant — `creating`
-    // inside the span the create started.
+    // while the clock still owes the cluster its settled status.
     create_cluster(&emulator, "fresh", &[]).await;
+    hold_pending_changes(&emulator);
     let described = emulator
         .call("DescribeCacheClusters", &params(&[("CacheClusterId", "fresh")]))
         .await;
@@ -2038,6 +2046,7 @@ async fn an_unknown_or_unsettled_cluster_is_refused() {
     );
     // And the clock carries it on from there, which the client learns by looking
     // again.
+    release_pending_changes(&emulator);
     poll_cluster_status(&emulator, "describe while creating", "fresh", state::STATUS_AVAILABLE)
         .await;
 }
@@ -2876,9 +2885,11 @@ async fn a_reboot_that_cannot_be_performed_is_refused() {
         &[("Engine", "memcached"), ("NumCacheNodes", "2")],
     )
     .await;
-    // Created last and not waited out, so it is still `creating`: the span is
-    // never zero.
+    // Created last and held in `creating`: the clock owes a just-created cluster
+    // its settled status from the call that created it, so the phase the gate acts
+    // in is held rather than raced for.
     create_cluster(&emulator, "reboot-fresh", &[]).await;
+    hold_pending_changes(&emulator);
 
     // `(case, cluster id, CacheNodeIdsToReboot, HTTP status, awsQuery code)`.
     let cases: [(&str, &str, &[&str], u16, &str); 5] = [
@@ -2953,13 +2964,15 @@ async fn a_reboot_that_cannot_be_performed_is_refused() {
     );
 
     // A cluster already rebooting "is not in the available state", so a second
-    // reboot inside the span is refused rather than restarting the first.
+    // reboot while the clock still owes it `available` is refused rather than
+    // restarting the first.
     let first = reboot_cluster(&emulator, "reboot-refusals", &["0001"]).await;
     assert_eq!(
         first.status, 200,
         "the first reboot must succeed, got {} {}",
         first.status, first.body
     );
+    hold_pending_changes(&emulator);
     let second = reboot_cluster(&emulator, "reboot-refusals", &["0002"]).await;
     assert_eq!(
         second.status, 400,

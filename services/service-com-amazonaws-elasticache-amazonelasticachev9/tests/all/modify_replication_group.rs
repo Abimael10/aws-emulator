@@ -23,7 +23,10 @@
 //! applied immediately or deferred, the shape of the group it is applied to),
 //! and a single `SnapshotRetentionLimit` change is only one row.
 
-use crate::harness::{params, poll_until, Emulator, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, params, poll_until, release_pending_changes, settle_pending_changes,
+    Emulator, Reply, PAST_TRANSITION, REGION,
+};
 
 /// An `AuthToken` that satisfies every documented constraint (16 to 128
 /// printable characters, only the permitted specials).
@@ -1228,7 +1231,11 @@ async fn a_resource_that_is_not_ready_takes_no_change() {
     // "The requested replication group is not in the available state": the work
     // the create started has to finish first, whatever the request asks for.
     let emulator = Emulator::new();
+    // The clock owes a just-created group its settled status from the call that
+    // created it, so the phase the gate acts in is held out of reach here rather
+    // than raced for.
     create_group(&emulator, "still creating", "creating-rg", &[]).await;
+    hold_pending_changes(&emulator);
     for (case, pairs) in [
         ("a description change", &[("ReplicationGroupDescription", "x")][..]),
         ("a retention change", &[("SnapshotRetentionLimit", "1")][..]),
@@ -1246,10 +1253,15 @@ async fn a_resource_that_is_not_ready_takes_no_change() {
     }
 
     // "The user group is not in an active state": a group still being created
-    // cannot be associated either.
+    // cannot be associated either — the same held phase, for the group this time.
+    release_pending_changes(&emulator);
     create_group(&emulator, "user group creating", "waiting-rg", &[]).await;
-    std::thread::sleep(PAST_TRANSITION);
+    // Everything the clock owes so far is carried through — nothing is waited for,
+    // because the clock owes it from the calls above — so what the next call makes
+    // transient, the user group, is the only thing the hold below holds.
+    settle_pending_changes(&emulator);
     create_user_group(&emulator, "user group creating", "fresh-rbac").await;
+    hold_pending_changes(&emulator);
     let refused = modify(
         &emulator,
         "waiting-rg",
@@ -1267,7 +1279,7 @@ async fn a_resource_that_is_not_ready_takes_no_change() {
 
     // Once the clock has settled the user group, the same call is accepted — the
     // refusal was about the state, not about the request.
-    std::thread::sleep(PAST_TRANSITION);
+    release_pending_changes(&emulator);
     let accepted = modify_accepted(
         &emulator,
         "user group settled",

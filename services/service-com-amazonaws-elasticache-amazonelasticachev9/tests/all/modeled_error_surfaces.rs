@@ -27,7 +27,10 @@ use std::time::SystemTime;
 
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{is_own_host, params, Emulator, RefusalCase, Reply, PAST_TRANSITION, REGION};
+use crate::harness::{
+    hold_pending_changes, is_own_host, params, release_pending_changes, Emulator, RefusalCase,
+    Reply, PAST_TRANSITION, REGION,
+};
 
 /// One table row that drives an operation and asserts a count: the case name,
 /// the form pairs the request carries, and what the answer must hold that many
@@ -2234,7 +2237,10 @@ async fn a_cluster_is_rebooted_only_from_a_status_the_service_reboots_from() {
         );
 
         // The gate: the identical call is refused while the cluster is still
-        // being created.
+        // being created. The clock owes a just-created cluster its settled status
+        // from the call that created it, so that phase is held out of reach here
+        // rather than raced for.
+        hold_pending_changes(&emulator);
         let mut reboot = params(&[("CacheClusterId", id)]);
         for (index, node) in nodes.iter().enumerate() {
             reboot.extend(params(&[(
@@ -2252,7 +2258,7 @@ async fn a_cluster_is_rebooted_only_from_a_status_the_service_reboots_from() {
 
         // And the same call succeeds once the clock owes the cluster
         // `available`.
-        std::thread::sleep(PAST_TRANSITION);
+        release_pending_changes(&emulator);
         let rebooted = emulator.call("RebootCacheCluster", &reboot).await;
         assert_eq!(
             rebooted.status, 200,
@@ -2281,11 +2287,13 @@ async fn a_cluster_is_rebooted_only_from_a_status_the_service_reboots_from() {
             rebooted.body
         );
 
-        // A reboot while the cluster is rebooting is refused by the same gate.
+        // A reboot while the cluster is rebooting is refused by the same gate,
+        // over the same held phase.
+        hold_pending_changes(&emulator);
         let during = emulator.call("RebootCacheCluster", &reboot).await;
         assert_refused(id, &during, 400, "InvalidCacheClusterState");
 
-        std::thread::sleep(PAST_TRANSITION);
+        release_pending_changes(&emulator);
         let settled = emulator
             .call(
                 "DescribeCacheClusters",
