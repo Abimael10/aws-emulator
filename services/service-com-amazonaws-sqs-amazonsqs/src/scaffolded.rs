@@ -327,10 +327,27 @@ impl SerializableStruct for InvalidParameterValue {
     }
 }
 
-/// The wire error code Amazon SQS answers a request the policies in force do not
-/// permit, and the one a client branches on. Owned here, beside the variant that carries
-/// it.
+/// The LEGACY QUERY code Amazon SQS answers a request the policies in force do not permit,
+/// which is the name a query-era client knows that class by and the one this service reports
+/// in the `x-amzn-query-error` header. Owned here, beside the variant that carries it.
+///
+/// It is NOT what the body's `__type` names — that is
+/// [`ACCESS_DENIED_SHAPE_ID`] — for the same reason the two parameter classes above name two
+/// things: `awsQueryCompatible` gives one class a shape id and a legacy code, and each has
+/// one place it is stated.
 pub const ACCESS_DENIED: &str = "AccessDenied";
+
+/// The error SHAPE an authorization refusal names — the shape id of the Coral service
+/// framework that fronts Amazon SQS, which is what the JSON envelope's `__type` discriminator
+/// carries and what an SDK resolves `AccessDeniedException` from.
+///
+/// An authorization denial is decided by that framework and not by this service's own model,
+/// which declares no shape for it (it is in neither the service's common errors nor any
+/// operation's error list), so the id it is named by is the framework's — the same reason
+/// [`MISSING_PARAMETER_SHAPE_ID`] is a `com.amazon.coral.service` id. A bare, unqualified
+/// token here would leave every awsJson client unable to resolve the refusal to a class at
+/// all.
+pub const ACCESS_DENIED_SHAPE_ID: &str = "com.amazon.coral.service#AccessDeniedException";
 
 /// The legacy query code of the class a rendered answer names in `__type`, for the classes
 /// this channel words OUTSIDE this service's model — and `None` for a name that is no class
@@ -348,7 +365,7 @@ pub fn legacy_query_code_of_shape(shape: &str) -> Option<&'static str> {
     match shape {
         MISSING_PARAMETER_SHAPE_ID => Some(MISSING_PARAMETER),
         INVALID_PARAMETER_VALUE_SHAPE_ID => Some(INVALID_PARAMETER_VALUE),
-        ACCESS_DENIED => Some(ACCESS_DENIED),
+        ACCESS_DENIED_SHAPE_ID => Some(ACCESS_DENIED),
         _ => None,
     }
 }
@@ -358,37 +375,45 @@ pub fn legacy_query_code_of_shape(shape: &str) -> Option<&'static str> {
 /// carry in this model.
 pub const ACCESS_DENIED_STATUS: u16 = 403;
 
-/// The `message` member of the synthetic `AccessDenied` error shape.
+/// The `Message` member of the synthetic `AccessDeniedException` error shape.
+///
+/// Spelled with a capital `M`, unlike the parameter refusals above: the awsJson codec takes
+/// the wire key from the member NAME, and the Coral service framework carries an
+/// authorization denial's sentence under `Message` — which is the member every SDK reads the
+/// denial text out of. A lowercase name would answer a refusal whose message a client cannot
+/// find.
 static ACCESS_DENIED_MESSAGE: Schema = Schema::new_member(
     ShapeId::from_static(
-        "smithy.framework#AccessDenied$message",
+        "smithy.framework#AccessDeniedException$Message",
         "smithy.framework",
-        "message",
+        "Message",
     ),
     ShapeType::String,
-    "message",
+    "Message",
     0,
 )
-.with_xml_name("Message");
+.with_xml_name("Message")
+.with_json_name("Message");
 
-/// Schema for the synthetic `AccessDenied` error shape.
+/// Schema for the synthetic `AccessDeniedException` error shape.
 ///
 /// In the `smithy.framework` namespace for the same reason as the others above: this
-/// service's model declares NO `AccessDenied` shape — the refusal is the AWS-common one
-/// every service answers for a request its policies do not permit — so the shape must be
-/// declared here and must not collide with a modeled one. The wire code and the status
-/// travel beside it, from [`ACCESS_DENIED`] and [`ACCESS_DENIED_STATUS`].
+/// service's model declares NO shape for an authorization denial — the refusal is the
+/// AWS-common one every service answers for a request its policies do not permit — so the
+/// shape must be declared here and must not collide with a modeled one. The wire names and
+/// the status travel beside it, from [`ACCESS_DENIED_SHAPE_ID`], [`ACCESS_DENIED`] and
+/// [`ACCESS_DENIED_STATUS`].
 pub static ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
     ShapeId::from_static(
-        "smithy.framework#AccessDenied",
+        "smithy.framework#AccessDeniedException",
         "smithy.framework",
-        "AccessDenied",
+        "AccessDeniedException",
     ),
     ShapeType::Structure,
     &[&ACCESS_DENIED_MESSAGE],
 );
 
-/// The payload of an `AccessDenied` failure: which principal was refused which action on
+/// The payload of an `AccessDeniedException`: which principal was refused which action on
 /// which resource, and why.
 #[derive(Debug, Clone)]
 pub struct AccessDenied {
@@ -396,7 +421,7 @@ pub struct AccessDenied {
 }
 
 impl AccessDenied {
-    /// An `AccessDenied` carrying `message`.
+    /// An `AccessDeniedException` carrying `message`.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -406,7 +431,7 @@ impl AccessDenied {
 
 impl std::fmt::Display for AccessDenied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{ACCESS_DENIED}: {}", self.message)
+        write!(f, "AccessDeniedException: {}", self.message)
     }
 }
 
@@ -446,8 +471,9 @@ pub enum Scaffolded<E> {
     /// model declares the shape for no operation, so this wrapper is the only channel
     /// that can carry it.
     InvalidParameterValue(InvalidParameterValue),
-    /// The policies in force do not permit this call. Renders as HTTP 403 with the error
-    /// code `AccessDenied`.
+    /// The policies in force do not permit this call. Renders as HTTP 403 naming the Coral
+    /// framework's `AccessDeniedException` shape in `__type`, with the denial sentence under
+    /// `Message`.
     ///
     /// Deliberately NOT a modeled variant: the authorization refusal is the AWS-common
     /// one, and this model declares no shape for it, so this wrapper is the only channel
@@ -499,7 +525,7 @@ impl<E> Scaffolded<E> {
         Self::InvalidParameterValue(InvalidParameterValue::new(message))
     }
 
-    /// Refuse the request with HTTP 403 `AccessDenied`, carrying the refusal the
+    /// Refuse the request with HTTP 403 `AccessDeniedException`, carrying the refusal the
     /// authorization gate built from the principal, the action and the resource the
     /// decision was made about (see [`Scaffolded::AccessDenied`]).
     pub fn access_denied(message: impl Into<String>) -> Self {
@@ -578,7 +604,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // entry reports it per entry, which is why both names exist.
             Self::MissingParameter(_) => MISSING_PARAMETER_SHAPE_ID,
             Self::InvalidParameterValue(_) => INVALID_PARAMETER_VALUE_SHAPE_ID,
-            Self::AccessDenied(_) => ACCESS_DENIED,
+            // An authorization denial is the Coral service framework's own refusal, so it
+            // names that framework's shape rather than any of this model's; its legacy query
+            // code travels in the `x-amzn-query-error` header ([`Self::query_error_code`]).
+            Self::AccessDenied(_) => ACCESS_DENIED_SHAPE_ID,
         }
     }
 

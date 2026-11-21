@@ -40,6 +40,11 @@ const OWNER_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 /// Long enough for the stack's clock-owed transition (500 ms) to come due.
 const PAST_THE_STACK_SPAN: Duration = Duration::from_millis(1_000);
 
+/// The error shape SQS's awsJson1_0 answer names an authorization refusal by: the shape id of
+/// the request framework that decides authorization, which is what a client resolves
+/// `AccessDeniedException` from, since SQS's own model declares no shape for that class.
+const SQS_ACCESS_DENIED_SHAPE_ID: &str = "com.amazon.coral.service#AccessDeniedException";
+
 /// The emulator with the four services this suite exercises, mounted on ONE engine exactly
 /// as `core/router/src/lib.rs` mounts them.
 fn build_router() -> MultiServiceRouter {
@@ -441,7 +446,7 @@ async fn a_deployed_queue_policy_grants_the_role_and_an_update_revokes_it() {
         let (status, body) = send(&router, &session, &queue_url(queue)).await;
         assert_eq!(
             (status, body["__type"].as_str()),
-            (403, Some("AccessDenied")),
+            (403, Some(SQS_ACCESS_DENIED_SHAPE_ID)),
             "case {case:?}: the revoked role's send to {queue} must be refused, got {status} \
              with {body}"
         );

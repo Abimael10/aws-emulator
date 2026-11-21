@@ -266,7 +266,7 @@ fn boundary_implicit_deny(named_action: &str) -> String {
 ///
 /// `resource_policy` is the queue's own `Policy` attribute, when it carries one.
 /// `Ok(())` when the request is allowed; `Err` is the message the operation answers with
-/// through its error channel (HTTP 403, error code `AccessDenied`).
+/// through its error channel (HTTP 403, the Coral framework's `AccessDeniedException`).
 pub fn authorize<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -348,8 +348,8 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 /// `None` when they do: the one call an implemented handler makes.
 ///
 /// Generic over the operation's own modelled error enum because the refusal is NOT one of
-/// them — Amazon SQS's model declares no `AccessDenied` shape — so it is carried by the
-/// error channel's own variant.
+/// them — Amazon SQS's model declares no shape for an authorization denial — so it is carried
+/// by the error channel's own variant.
 pub fn denied<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,

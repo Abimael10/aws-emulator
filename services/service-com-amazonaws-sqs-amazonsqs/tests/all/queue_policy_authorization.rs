@@ -8,10 +8,10 @@
 //! in the queue's own `Policy` or in one of the calling principal's identity-based policies
 //! — refuses it, whatever any grant says; otherwise the request needs a grant (an `Allow`
 //! about it in those identity-based policies, or one in the queue's policy that names the
-//! CALLER rather than its account), and anything else is refused `AccessDenied` at HTTP 403
-//! with no effect. The queue's owner — the account's own published credential — keeps full
-//! control of it, and only an explicit deny refuses that. A permissions boundary attached to
-//! the principal CAPS what its identity-based policies grant and grants nothing of its own,
+//! CALLER rather than its account), and anything else is refused `AccessDeniedException` at
+//! HTTP 403 with no effect. The queue's owner — the account's own published credential — keeps
+//! full control of it, and only an explicit deny refuses that. A permissions boundary attached
+//! to the principal CAPS what its identity-based policies grant and grants nothing of its own,
 //! so a refusal names the document the grant was missing from.
 //!
 //! Two rules ride on it, both about the document rather than the decision: a `Policy` is
@@ -39,7 +39,11 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::support::{account, error_code, expected_arn, form_encode, xml_element, REGION};
+use service_com_amazonaws_sqs_amazonsqs::scaffolded as refusals;
+
+use super::support::{
+    account, error_code, error_shape, expected_arn, form_encode, xml_element, REGION,
+};
 
 /// An access key id that names no IAM user and no STS session: the account's own published
 /// credential, which is the position AWS account root credentials are in.
@@ -414,17 +418,19 @@ pub(super) fn implicit_denial(principal: &str, action: &str, resource: &str) -> 
     )
 }
 
-/// Assert that `reply` is the `AccessDenied` refusal at HTTP 403, and answer its message.
+/// Assert that `reply` is the authorization refusal at HTTP 403 — the Coral framework's
+/// `AccessDeniedException`, which is the class this service's model declares no shape for —
+/// and answer the denial sentence it carries.
 pub(super) fn denial(case: &str, (status, body): (u16, Value)) -> String {
     assert_eq!(
-        (status, error_code(&body).as_str()),
-        (403, "AccessDenied"),
-        "case {case:?}: expected a 403 AccessDenied, got {status} with {body}"
+        (status, error_shape(&body).as_str()),
+        (403, refusals::ACCESS_DENIED_SHAPE_ID),
+        "case {case:?}: expected a 403 {}, got {status} with {body}",
+        refusals::ACCESS_DENIED_SHAPE_ID
     );
-    body["message"]
+    body["Message"]
         .as_str()
-        .or_else(|| body["Message"].as_str())
-        .unwrap_or_else(|| panic!("case {case:?}: a refusal must carry a message, got {body}"))
+        .unwrap_or_else(|| panic!("case {case:?}: a refusal must carry a Message, got {body}"))
         .to_string()
 }
 
@@ -443,8 +449,8 @@ struct GrantRow {
 }
 
 /// A send is allowed exactly when the policies in force allow `sqs:SendMessage` on that
-/// queue for the calling principal, and refused `AccessDenied` 403 — with nothing enqueued
-/// — otherwise.
+/// queue for the calling principal, and refused `AccessDeniedException` 403 — with nothing
+/// enqueued — otherwise.
 #[tokio::test]
 async fn a_send_is_allowed_only_where_the_policies_in_force_allow_it() {
     let rows: &[GrantRow] = &[
@@ -1568,4 +1574,144 @@ async fn a_refused_delete_leaves_the_queue() {
         Some("1"),
         "case 'the surviving queue': the queue and its message must survive, got {attributes:?}"
     );
+}
+
+/// One row of the denial-ENVELOPE table: the call that is refused, the action the refusal is
+/// decided under, and which document in force withheld the grant.
+struct EnvelopeRow {
+    case: &'static str,
+    operation: &'static str,
+    /// The action the sentence names, in the lower case this service words a refusal in.
+    action: &'static str,
+    /// The request body, built from the queue's url.
+    request: fn(&str) -> Value,
+    /// The caller's inline identity policy, built from the queue's ARN.
+    identity_policy: fn(&str) -> Option<Value>,
+    /// The queue's own `Policy`, built from the caller's ARN and the queue's ARN.
+    queue_policy: fn(&str, &str) -> Option<Value>,
+    /// The reason the sentence ends with, built from the action the refusal names.
+    reason: fn(&str) -> String,
+}
+
+/// However an authorization refusal is reached — whichever operation was called, whichever
+/// action it is decided under, and whichever document withheld the grant — the answer is the
+/// SAME wire envelope: HTTP 403 with a body of exactly two members, `__type` naming the error
+/// shape of the request framework that decides authorization in full
+/// (`com.amazon.coral.service#AccessDeniedException`, which is the class a client resolves
+/// `AccessDeniedException` from, since this service's own model declares no shape for it) and
+/// the denial sentence under the capitalised `Message` the awsJson codec reads it from.
+///
+/// Comparing the WHOLE body is the point: it pins the member name as well as the value, so a
+/// sentence carried under any other member — a lowercase `message` an SDK never reads — fails
+/// the case.
+#[tokio::test]
+async fn a_denial_names_the_framework_shape_in_full_and_carries_its_sentence_under_message() {
+    let rows: &[EnvelopeRow] = &[
+        EnvelopeRow {
+            case: "a send no policy allows",
+            operation: "SendMessage",
+            action: "sqs:sendmessage",
+            request: |url| json!({"QueueUrl": url, "MessageBody": "refused"}),
+            identity_policy: |_| None,
+            queue_policy: |_, _| None,
+            reason: |action| format!("because no identity-based policy allows the {action} action"),
+        },
+        EnvelopeRow {
+            case: "a batched send no policy allows",
+            operation: "SendMessageBatch",
+            action: "sqs:sendmessage",
+            request: |url| {
+                json!({"QueueUrl": url, "Entries": [{"Id": "one", "MessageBody": "refused"}]})
+            },
+            identity_policy: |_| None,
+            queue_policy: |_, _| None,
+            reason: |action| format!("because no identity-based policy allows the {action} action"),
+        },
+        EnvelopeRow {
+            case: "a receive the queue's policy denies outright",
+            operation: "ReceiveMessage",
+            action: "sqs:receivemessage",
+            request: |url| json!({"QueueUrl": url}),
+            identity_policy: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Allow",
+                    "Action": "sqs:ReceiveMessage",
+                    "Resource": queue,
+                }])))
+            },
+            queue_policy: |caller, queue| {
+                Some(policy(json!([{
+                    "Effect": "Deny",
+                    "Principal": {"AWS": caller},
+                    "Action": "sqs:ReceiveMessage",
+                    "Resource": queue,
+                }])))
+            },
+            reason: |_| "with an explicit deny in a resource-based policy".to_string(),
+        },
+        EnvelopeRow {
+            case: "an attribute read the caller's own policy denies outright",
+            operation: "GetQueueAttributes",
+            action: "sqs:getqueueattributes",
+            request: |url| json!({"QueueUrl": url, "AttributeNames": ["All"]}),
+            identity_policy: |queue| {
+                Some(policy(json!([{
+                    "Effect": "Deny",
+                    "Action": "sqs:GetQueueAttributes",
+                    "Resource": queue,
+                }])))
+            },
+            queue_policy: |_, _| None,
+            reason: |_| "with an explicit deny in an identity-based policy".to_string(),
+        },
+        EnvelopeRow {
+            case: "a tagging no policy allows",
+            operation: "TagQueue",
+            action: "sqs:tagqueue",
+            request: |url| json!({"QueueUrl": url, "Tags": {"owner": "payments"}}),
+            identity_policy: |_| None,
+            queue_policy: |_, _| None,
+            reason: |action| format!("because no identity-based policy allows the {action} action"),
+        },
+        EnvelopeRow {
+            case: "a delete of the queue no policy allows",
+            operation: "DeleteQueue",
+            action: "sqs:deletequeue",
+            request: |url| json!({"QueueUrl": url}),
+            identity_policy: |_| None,
+            queue_policy: |_, _| None,
+            reason: |action| format!("because no identity-based policy allows the {action} action"),
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for (index, row) in rows.iter().enumerate() {
+        let name = format!("denial-envelope-{index}");
+        let url = emulator.queue(row.case, &name).await;
+        let arn = expected_arn(&name);
+        let identity = (row.identity_policy)(&arn);
+        let (caller, key) = emulator
+            .user(
+                row.case,
+                &format!("denial-envelope-user-{index}"),
+                identity.as_ref(),
+                &[],
+            )
+            .await;
+        if let Some(document) = (row.queue_policy)(&caller, &arn) {
+            emulator.set_policy(row.case, &url, &document).await;
+        }
+
+        let (status, body) = emulator.sqs(&key, row.operation, &(row.request)(&url)).await;
+        let expected = json!({
+            "__type": refusals::ACCESS_DENIED_SHAPE_ID,
+            "Message": refusal_message(&caller, row.action, &arn, &(row.reason)(row.action)),
+        });
+        assert_eq!(
+            (status, &body),
+            (403, &expected),
+            "case {:?}: expected HTTP 403 with the body {expected}, got {status} with {body}",
+            row.case
+        );
+    }
 }

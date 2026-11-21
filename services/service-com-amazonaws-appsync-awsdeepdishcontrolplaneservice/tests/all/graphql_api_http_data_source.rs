@@ -151,11 +151,15 @@ const NO_SUCH_QUEUE_STATUS: i64 = 400;
 /// The members an AWS JSON refusal carries, the shape Amazon SQS names an absent queue by
 /// (`QueueDoesNotExist`, which its JSON refusal carries as its `__type`) and the class every AWS
 /// service refuses a call its policies do not permit with (the CALLED service's own: Amazon SQS
-/// answers `AccessDenied` at HTTP 403, `scaffolded::ACCESS_DENIED` of that crate).
+/// answers it as the request framework's `AccessDeniedException` at HTTP 403, naming that shape
+/// in full, `scaffolded::ACCESS_DENIED_SHAPE_ID` of that crate).
+///
+/// That refusal carries its sentence under the CAPITALISED member, which is where the framework
+/// errors of this wire carry one and where an SDK reads the denial text from.
 const REFUSAL_TYPE_MEMBER: &str = "__type";
-const REFUSAL_MESSAGE_MEMBER: &str = "message";
+const REFUSAL_MESSAGE_MEMBER: &str = "Message";
 const NO_SUCH_QUEUE: &str = "QueueDoesNotExist";
-const ACCESS_DENIED: &str = "AccessDenied";
+const ACCESS_DENIED: &str = "AccessDeniedException";
 
 /// A router with AppSync, Amazon SQS, IAM and the token service over ONE engine: the queue the
 /// data source's requests are sent to, the documents those calls are authorized against and the
