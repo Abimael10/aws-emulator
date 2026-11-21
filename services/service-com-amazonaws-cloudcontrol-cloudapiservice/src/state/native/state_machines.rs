@@ -198,7 +198,7 @@ impl NativeResourceProvider for StateMachineProvider {
         // (1..80), which no model-level walk reaches on this path.
         if !(1..=MAX_NAME_CHARACTERS).contains(&name.chars().count()) || !sfn::is_valid_name(&name)
         {
-            return Err(NativeRefusal::Invalid(sfn::resource_error_message(
+            return Err(NativeRefusal::Rejected(sfn::resource_error_message(
                 sfn::INVALID_NAME,
                 &name,
             )));
@@ -317,7 +317,7 @@ impl NativeResourceProvider for StateMachineProvider {
             .as_ref()
             .is_some_and(|wanted| *wanted != held_type)
         {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "{STATE_MACHINE_TYPE} of this resource is {held_type}"
             )));
         }
@@ -425,7 +425,7 @@ fn tag_write_refusal(rejection: sfn::TagWriteRejection) -> NativeRefusal {
     match rejection {
         sfn::TagWriteRejection::NotFound => NativeRefusal::NotFound,
         sfn::TagWriteRejection::TooManyTags(_) => {
-            NativeRefusal::Invalid(sfn::TOO_MANY_TAGS_MESSAGE.to_string())
+            NativeRefusal::Rejected(sfn::TOO_MANY_TAGS_MESSAGE.to_string())
         }
         sfn::TagWriteRejection::NoRoom => NativeRefusal::AtCapacity(sfn::store_bytes_exhausted()),
     }
@@ -549,7 +549,7 @@ impl DesiredModel {
         // own judgement, asked before anything is written.
         if let Some(definition) = &desired.definition {
             if let Err(diagnostic) = sfn::asl::validate(definition) {
-                return Err(NativeRefusal::Invalid(sfn::resource_error_message(
+                return Err(NativeRefusal::Rejected(sfn::resource_error_message(
                     sfn::INVALID_STATE_MACHINE_DEFINITION,
                     &diagnostic,
                 )));
@@ -557,7 +557,7 @@ impl DesiredModel {
         }
         if let Some(role_arn) = &desired.role_arn {
             if let Some(why) = sfn::invalid_role_arn_reason(role_arn) {
-                return Err(NativeRefusal::Invalid(why));
+                return Err(NativeRefusal::Rejected(why));
             }
         }
         if let Some(sm_type) = &desired.sm_type {

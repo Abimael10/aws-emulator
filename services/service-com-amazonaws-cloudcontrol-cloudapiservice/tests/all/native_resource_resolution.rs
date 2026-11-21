@@ -355,10 +355,10 @@ async fn a_create_of_a_resource_the_owning_service_already_holds_is_the_owning_v
 #[tokio::test]
 async fn a_model_the_owning_service_cannot_hold_is_refused_rather_than_dropped() {
     let emulator = Emulator::with_cloudwatch_logs();
-    // The rows differ along which rule of the OWNING service the model breaks: a name in the
-    // prefix it keeps for its own groups, a property of the type's schema this emulator's
-    // handler does not apply, a tag key it keeps for itself, and a property the type does not
-    // declare at all.
+    // The rows differ along which rule the model breaks, and so along WHICH handler verdict
+    // the refusal is reported under: a rule the OWNING service holds the value to is that
+    // service's own error (`GeneralServiceException`), while a fault in the model against the
+    // type's schema is the handler's own judgement (`InvalidRequest`).
     //
     // A value the TYPE'S REGISTRY SCHEMA itself excludes — a name outside the class that
     // schema states, a retention or a class outside a set it publishes — is not a row here:
@@ -369,18 +369,21 @@ async fn a_model_the_owning_service_cannot_hold_is_refused_rather_than_dropped()
             "a name in the prefix the owning service keeps",
             json!({ "LogGroupName": "aws/refused" }),
             "logGroupName must not start with the string 'aws/'",
+            "GeneralServiceException",
         ),
         (
             "a key whose grant only KMS can answer for",
             json!({ "LogGroupName": "refused-key", "KmsKeyId": "arn:aws:kms:us-east-1:111122223333:key/k" }),
             "KmsKeyId is a property of AWS::Logs::LogGroup this emulator's handler does not \
              apply",
+            "InvalidRequest",
         ),
         (
             "a document the owning service installs with a call of its own",
             json!({ "LogGroupName": "refused-document", "DataProtectionPolicy": {} }),
             "DataProtectionPolicy is a property of AWS::Logs::LogGroup this emulator's \
              handler does not apply",
+            "InvalidRequest",
         ),
         (
             "a tag key the owning service keeps for itself",
@@ -389,15 +392,17 @@ async fn a_model_the_owning_service_cannot_hold_is_refused_rather_than_dropped()
                 "Tags": [{ "Key": "aws:billing", "Value": "no" }],
             }),
             "Tags starting with 'AWS:' are reserved for AWS use.",
+            "GeneralServiceException",
         ),
         (
             "a property the type does not declare",
             json!({ "LogGroupName": "refused-property", "Flavour": "vanilla" }),
             "Flavour is not a property of AWS::Logs::LogGroup",
+            "InvalidRequest",
         ),
     ];
 
-    for (case, desired, expected) in rows {
+    for (case, desired, expected, expected_code) in rows {
         let identifier = text(&desired, "LogGroupName");
         let accepted = emulator.create_ok(LOG_GROUP, &desired, None).await;
         let settled = emulator.terminal(&text(&accepted, "RequestToken")).await;
@@ -409,7 +414,7 @@ async fn a_model_the_owning_service_cannot_hold_is_refused_rather_than_dropped()
         );
         assert_eq!(
             text(&settled, "ErrorCode"),
-            "InvalidRequest",
+            expected_code,
             "case {case:?}: unexpected handler error code, got {settled:?}"
         );
         assert!(
@@ -624,15 +629,20 @@ async fn a_second_type_of_the_same_owning_service_resolves_the_same_way() {
     );
 
     // A model the owning service will not take is refused rather than half-applied: a
-    // destination IS the pair of ARNs it parses together.
-    for (case, desired) in [
+    // destination IS the pair of ARNs it parses together. The verdict each row carries says
+    // who judged it: a required property the model names no value for is the handler's own
+    // judgement against the type's schema, while a value that service could not parse is an
+    // error it raised.
+    for (case, desired, expected_code) in [
         (
             "a model naming no target",
             json!({ "DestinationName": "incomplete", "RoleArn": role }),
+            "InvalidRequest",
         ),
         (
             "a target that is not an ARN",
             json!({ "DestinationName": "incomplete", "TargetArn": "feed", "RoleArn": role }),
+            "GeneralServiceException",
         ),
     ] {
         let accepted = emulator.create_ok(DESTINATION, &desired, None).await;
@@ -644,7 +654,7 @@ async fn a_second_type_of_the_same_owning_service_resolves_the_same_way() {
         );
         assert_eq!(
             text(&settled, "ErrorCode"),
-            "InvalidRequest",
+            expected_code,
             "case {case:?}: unexpected handler error code, got {settled:?}"
         );
         let (status, body) = emulator.get(DESTINATION, "incomplete").await;

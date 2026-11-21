@@ -400,8 +400,12 @@ async fn a_patch_naming_a_property_this_handler_does_not_apply_is_refused() {
 async fn work_the_owning_service_refuses_leaves_the_request_failed() {
     let emulator = Emulator::with_cloudwatch();
 
-    // (case, desired state, the diagnostic the handler reports)
-    let rows: [(&str, Value, &str); 4] = [
+    // (case, desired state, the diagnostic the handler reports, the verdict it carries)
+    //
+    // A value outside a set only the OWNING service publishes is that service's own error,
+    // while a property the type's schema declares required and a property it does not declare
+    // at all are faults the handler judges against that schema.
+    let rows: [(&str, Value, &str, &str); 4] = [
         (
             "a comparison operator outside the set the owning service admits",
             json!({
@@ -410,6 +414,7 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
                 "ComparisonOperator": "GreaterThanish",
             }),
             "ComparisonOperator must be one of",
+            "GeneralServiceException",
         ),
         (
             "a statistic outside the set it admits",
@@ -420,11 +425,13 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
                 "Statistic": "Median",
             }),
             "Statistic must be one of",
+            "GeneralServiceException",
         ),
         (
             "no comparison operator at all",
             json!({ "AlarmName": "incomplete-alarm", "EvaluationPeriods": 1 }),
             "ComparisonOperator is required of AWS::CloudWatch::Alarm",
+            "InvalidRequest",
         ),
         (
             "a property the type does not declare",
@@ -435,14 +442,15 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
                 "Secret": "s3cret",
             }),
             "Secret is not a property of AWS::CloudWatch::Alarm",
+            "InvalidRequest",
         ),
     ];
     let mut accepted = Vec::new();
-    for (_, desired, _) in &rows {
+    for (_, desired, _, _) in &rows {
         let event = emulator.create_ok(ALARM, desired, None).await;
         accepted.push(text(&event, "RequestToken"));
     }
-    for ((case, desired, detail), request_token) in rows.iter().zip(&accepted) {
+    for ((case, desired, detail, expected_code), request_token) in rows.iter().zip(&accepted) {
         let failed = emulator.terminal(request_token).await;
         assert_eq!(
             text(&failed, "OperationStatus"),
@@ -451,7 +459,7 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
         );
         assert_eq!(
             text(&failed, "ErrorCode"),
-            "InvalidRequest",
+            *expected_code,
             "case {case:?}: unexpected handler error code"
         );
         assert!(

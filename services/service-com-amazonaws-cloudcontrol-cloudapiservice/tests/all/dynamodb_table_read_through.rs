@@ -759,13 +759,14 @@ async fn a_patch_through_cloud_control_changes_the_table_dynamodb_holds() {
 #[tokio::test]
 async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdict() {
     let emulator = Emulator::with_dynamodb();
-    // The rows differ along WHICH rule the desired state breaks: the owning service's own
-    // rules for a declared table (a key attribute nothing defines, an attribute no key uses,
-    // a capacity stated for an on-demand table, a name outside the form a table name takes),
-    // a property this handler does not apply, and a property the type does not declare at
-    // all. Each expected sentence is the OWNING service's own, which is what a client of
-    // this API reads.
-    let rows: [(&str, &str, Value, String); 6] = [
+    // The rows differ along WHICH rule the desired state breaks, and so along which handler
+    // verdict the refusal carries: the owning service's own rules for a declared table (a key
+    // attribute nothing defines, an attribute no key uses, a capacity stated for an on-demand
+    // table, a name outside the form a table name takes) are that service's own error, while
+    // a property this handler does not apply and a property the type does not declare at all
+    // are faults the handler judges against the type's schema. Each expected sentence is the
+    // OWNING service's own, which is what a client of this API reads.
+    let rows: [(&str, &str, Value, String, &str); 6] = [
         (
             "a key attribute no AttributeDefinitions entry declares",
             "refused-undefined-key",
@@ -781,6 +782,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
             "One or more parameter values were invalid: Some index key attributes are not \
              defined in AttributeDefinitions. Keys: [id], AttributeDefinitions: [other]"
                 .to_string(),
+            "GeneralServiceException",
         ),
         (
             "an attribute no key schema uses",
@@ -795,6 +797,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
                 "BillingMode": "PAY_PER_REQUEST",
             }),
             "Some AttributeDefinitions are not used in any KeySchema: spare".to_string(),
+            "GeneralServiceException",
         ),
         (
             "a capacity stated for an on-demand table",
@@ -812,6 +815,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
             "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
              WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST"
                 .to_string(),
+            "GeneralServiceException",
         ),
         (
             "a name shorter than a table name may be",
@@ -825,6 +829,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
             "1 validation error detected: Value 'ab' at 'tableName' failed to satisfy \
              constraint: Member must have length greater than or equal to 3"
                 .to_string(),
+            "GeneralServiceException",
         ),
         (
             "a property of the type this handler does not apply",
@@ -840,6 +845,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
                 "SSESpecification is a property of {TABLE} this emulator's handler does not \
                  apply"
             ),
+            "InvalidRequest",
         ),
         (
             "a property the type does not declare",
@@ -852,10 +858,11 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
                 "Nope": "1",
             }),
             format!("Nope is not a property of {TABLE}"),
+            "InvalidRequest",
         ),
     ];
 
-    for (case, name, desired, expected_message) in rows {
+    for (case, name, desired, expected_message, expected_code) in rows {
         let (status, body) = emulator.create(TABLE, &desired, None).await;
         assert_eq!(
             status, 200,
@@ -871,7 +878,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
         );
         assert_eq!(
             text(&event, "ErrorCode"),
-            "InvalidRequest",
+            expected_code,
             "case {case:?}: expected the owning handler's verdict, got {event:?}"
         );
         assert_eq!(

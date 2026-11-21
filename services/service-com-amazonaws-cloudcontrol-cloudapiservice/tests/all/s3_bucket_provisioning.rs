@@ -483,7 +483,7 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
         );
         assert_eq!(
             text(&failed, "ErrorCode"),
-            "InvalidRequest",
+            "GeneralServiceException",
             "case {case:?}: unexpected handler error code"
         );
         assert_eq!(
@@ -524,8 +524,11 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
 
     // A name the owning store already holds is that service's own already-exists verdict,
     // and a property this handler does not apply is refused rather than accepted and
-    // dropped: a property a caller sets has to be one a later read reports. Every row below
-    // is started together with the duplicate create, for the same reason as above.
+    // dropped: a property a caller sets has to be one a later read reports. Each row carries
+    // the handler verdict its refusal is reported under: a rule the OWNING service holds the
+    // value to is that service's own error, a fault against the type's schema the handler's
+    // own judgement. Every row below is started together with the duplicate create, for the
+    // same reason as above.
     let duplicate_token = text(
         &emulator
             .create_ok(BUCKET, &json!({ "BucketName": "taken-bucket" }), None)
@@ -541,11 +544,13 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
             }),
             "LoggingConfiguration is a property of AWS::S3::Bucket this \
              emulator's handler does not apply",
+            "InvalidRequest",
         ),
         (
             "a property the type does not declare at all",
             json!({ "BucketName": "unknown-bucket", "Secret": "s3cret" }),
             "Secret is not a property of AWS::S3::Bucket",
+            "InvalidRequest",
         ),
         (
             "a versioning status outside the pair the owning service admits",
@@ -554,6 +559,7 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
                 "VersioningConfiguration": { "Status": "Paused" },
             }),
             "VersioningConfiguration.Status must be one of [\"Enabled\", \"Suspended\"]",
+            "InvalidRequest",
         ),
         (
             "a tag key in the namespace reserved for Amazon Web Services",
@@ -562,10 +568,11 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
                 "Tags": [tag("aws:created-by", "me")],
             }),
             "System tags cannot be added/updated by requester",
+            "GeneralServiceException",
         ),
     ];
     let mut accepted = Vec::new();
-    for (_, desired, _) in &rows {
+    for (_, desired, _, _) in &rows {
         let event = emulator.create_ok(BUCKET, desired, None).await;
         accepted.push(text(&event, "RequestToken"));
     }
@@ -580,7 +587,7 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
         "AlreadyExists",
         "a second create of the same bucket: unexpected handler error code"
     );
-    for ((case, desired, detail), request_token) in rows.iter().zip(&accepted) {
+    for ((case, desired, detail, expected_code), request_token) in rows.iter().zip(&accepted) {
         let name = text(desired, "BucketName");
         let failed = emulator.terminal(request_token).await;
         assert_eq!(
@@ -590,7 +597,7 @@ async fn work_the_owning_service_refuses_leaves_the_request_failed() {
         );
         assert_eq!(
             text(&failed, "ErrorCode"),
-            "InvalidRequest",
+            *expected_code,
             "case {case:?}: unexpected handler error code"
         );
         assert_eq!(

@@ -253,7 +253,7 @@ impl NativeResourceProvider for TopicProvider {
         // and the topic's KIND constrain each other there — so nothing is created here
         // under a name that service's own API would refuse.
         if !sns::create_topic_name_is_valid(&name, fifo) {
-            return Err(NativeRefusal::Invalid(sns::INVALID_TOPIC_NAME.to_string()));
+            return Err(NativeRefusal::Rejected(sns::INVALID_TOPIC_NAME.to_string()));
         }
         let attributes = desired.attributes(fifo, &[])?;
         let tags = desired.tag_map();
@@ -316,7 +316,7 @@ impl NativeResourceProvider for TopicProvider {
         // settled, so a model that designates the other one asks the owning service for a
         // change it does not make.
         if desired.designates_fifo() != was_fifo {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "{FIFO_TOPIC} of this resource is {was_fifo}"
             )));
         }
@@ -447,7 +447,7 @@ fn model(topic: &sns::TopicRecord) -> Value {
 /// keeps for Amazon Web Services' own tags.
 fn tags_accepted(tags: &HashMap<String, String>) -> Result<(), NativeRefusal> {
     if let Some(refusal) = sns::tag_map_refusal(tags) {
-        return Err(NativeRefusal::Invalid(match refusal {
+        return Err(NativeRefusal::Rejected(match refusal {
             sns::TagRefusal::TooMany(message) | sns::TagRefusal::TooLarge(message) => message,
         }));
     }
@@ -459,7 +459,7 @@ fn tags_accepted(tags: &HashMap<String, String>) -> Result<(), NativeRefusal> {
         tags.keys().map(String::as_str),
         sns::TagKeyOrigin::Caller,
     ) {
-        return Err(NativeRefusal::Invalid(message));
+        return Err(NativeRefusal::Rejected(message));
     }
     Ok(())
 }
@@ -468,7 +468,7 @@ fn tags_accepted(tags: &HashMap<String, String>) -> Result<(), NativeRefusal> {
 /// own per-record ceiling.
 fn record_fits(attributes: &HashMap<String, String>) -> Result<(), NativeRefusal> {
     match sns::attribute_bytes_refusal("a topic", attributes) {
-        Some(message) => Err(NativeRefusal::Invalid(message)),
+        Some(message) => Err(NativeRefusal::Rejected(message)),
         None => Ok(()),
     }
 }
@@ -569,7 +569,7 @@ impl DesiredModel {
         for (name, value) in judged {
             if let Some(refusal) = sns::topic_attributes::topic_attribute_refusal(name, value, subject)
             {
-                return Err(NativeRefusal::Invalid(refusal.message().to_string()));
+                return Err(NativeRefusal::Rejected(refusal.message().to_string()));
             }
         }
         let mut attributes = self.supplied.clone();

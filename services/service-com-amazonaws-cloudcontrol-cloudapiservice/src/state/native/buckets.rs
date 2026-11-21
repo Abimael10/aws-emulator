@@ -217,7 +217,7 @@ impl NativeResourceProvider for BucketProvider {
         // reading of them this workspace keeps, so nothing is created here under a name
         // that service's own API would refuse.
         if !::service_common::s3_bucket_name::is_well_formed(identifier) {
-            return Err(NativeRefusal::Invalid(
+            return Err(NativeRefusal::Rejected(
                 s3::INVALID_BUCKET_NAME_MESSAGE.to_string(),
             ));
         }
@@ -511,7 +511,7 @@ impl DesiredModel {
             s3::TagKeyOrigin::Caller,
             in_force,
         )
-        .map_err(|rejection| NativeRefusal::Invalid(rejection.to_string()))?;
+        .map_err(|rejection| NativeRefusal::Rejected(rejection.to_string()))?;
         Ok(desired)
     }
 
@@ -554,7 +554,7 @@ fn encryption_rules(
     // "A configuration associated with a bucket names at least one rule", which is what the
     // owning service's own writer refuses an empty list for.
     if entries.is_empty() {
-        return Err(NativeRefusal::Invalid(format!(
+        return Err(NativeRefusal::Rejected(format!(
             "{ENCRYPTION_RULES} must carry at least one rule"
         )));
     }
@@ -601,7 +601,7 @@ fn encryption_rules(
                 .as_deref()
                 .is_some_and(|algorithm| s3::KMS_SSE_ALGORITHMS.contains(&algorithm))
         {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "{KMS_MASTER_KEY_ID} is not applicable if {SSE_ALGORITHM} is not one of \
                  {:?}",
                 s3::KMS_SSE_ALGORITHMS

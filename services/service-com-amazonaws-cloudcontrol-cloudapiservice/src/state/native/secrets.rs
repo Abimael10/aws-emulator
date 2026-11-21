@@ -446,7 +446,7 @@ impl DesiredModel {
             .as_ref()
             .is_some_and(|text| text.chars().count() > MAX_DESCRIPTION_CHARACTERS)
         {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "{DESCRIPTION} must be at most {MAX_DESCRIPTION_CHARACTERS} characters"
             )));
         }
@@ -470,7 +470,7 @@ impl DesiredModel {
             return Ok(None);
         };
         if stated.is_empty() || stated.chars().count() > MAX_VALUE_CHARACTERS {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "{SECRET_STRING} must be 1 to {MAX_VALUE_CHARACTERS} characters"
             )));
         }
@@ -522,7 +522,7 @@ fn named(region: &str, identifier: &str) -> Result<String, NativeRefusal> {
         return Err(arn_requirement());
     }
     if !sm::is_valid_secret_name(name) || name.chars().count() > MAX_NAME_CHARACTERS {
-        return Err(NativeRefusal::Invalid(
+        return Err(NativeRefusal::Rejected(
             sm::INVALID_SECRET_NAME_MESSAGE.to_string(),
         ));
     }

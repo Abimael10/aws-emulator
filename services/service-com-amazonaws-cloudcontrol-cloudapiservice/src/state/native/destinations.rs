@@ -94,7 +94,7 @@ impl NativeResourceProvider for DestinationProvider {
         // exports for it, so nothing is created here under a name its own API would
         // refuse.
         if !logs::is_destination_name(identifier) {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "{IDENTIFIER_PROPERTY} {}",
                 logs::destination_name_requirement()
             )));
@@ -219,7 +219,7 @@ impl DesiredModel {
                     let document = text(property, value)?;
                     // The size the owning service holds an access policy document to.
                     if document.len() > logs::MAX_ACCESS_POLICY_BYTES {
-                        return Err(NativeRefusal::Invalid(format!(
+                        return Err(NativeRefusal::Rejected(format!(
                             "{DESTINATION_POLICY} must be at most {} bytes",
                             logs::MAX_ACCESS_POLICY_BYTES
                         )));
@@ -233,20 +233,23 @@ impl DesiredModel {
                 }
             }
         }
-        // A destination IS the pair of ARNs the owning service parses together — the target
-        // the events are delivered to and the role the delivery assumes — and that service
-        // reports the failure of either without naming which, which is also what a model
-        // that names neither leaves it nothing to parse for.
+        // The two ARNs a destination IS are the properties the type's schema declares
+        // required, so a model naming neither is a fault the handler judges against that
+        // schema — stated the way every other provider states an absent required property —
+        // rather than anything the owning service said.
         let (Some(target_arn), Some(role_arn)) = (target_arn, role_arn) else {
-            return Err(NativeRefusal::Invalid(
-                logs::DESTINATION_ARN_PARSE_FAILED.to_string(),
-            ));
+            return Err(NativeRefusal::Invalid(format!(
+                "{TYPE_NAME} requires {TARGET_ARN} and {ROLE_ARN}"
+            )));
         };
+        // A value that IS carried is the owning service's to parse: it parses the pair
+        // together and reports the failure of either without naming which, so that sentence
+        // is relayed under the handler code for an error that service raised.
         if [target_arn.as_str(), role_arn.as_str()]
             .iter()
             .any(|value| logs::arn_service_and_resource(value).is_none())
         {
-            return Err(NativeRefusal::Invalid(
+            return Err(NativeRefusal::Rejected(
                 logs::DESTINATION_ARN_PARSE_FAILED.to_string(),
             ));
         }

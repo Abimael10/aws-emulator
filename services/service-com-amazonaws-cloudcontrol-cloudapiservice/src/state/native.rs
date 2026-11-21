@@ -57,6 +57,16 @@ use ::std::time::{SystemTime, UNIX_EPOCH};
 /// refusal reports: the `HandlerErrorCode` it failed with
 /// ([`Self::handler_error_code`]) and, where the owning service states one in its own
 /// terms, its diagnostic ([`Self::detail`]).
+///
+/// WHICH verdict a refusal is reported under follows WHO judged the call, which is what
+/// the two catch-all codes of the model's own `HandlerErrorCode` enum say: a handler
+/// returns `InvalidRequest` when "invalid input from the user has generated a generic
+/// exception" — the handler itself judged the resource model against the type's schema —
+/// and `GeneralServiceException` when "the downstream service generated an error that
+/// doesn't map to any other handler error code". So a rule the OWNING service enforces,
+/// whose call its own API would have refused the same way, is that service's error rather
+/// than the handler's verdict about the model, whichever of them the break is spotted by
+/// here ([`Self::Rejected`] against [`Self::Invalid`]).
 #[derive(Debug, PartialEq, Eq)]
 pub enum NativeRefusal {
     /// The owning service holds no such resource.
@@ -66,13 +76,17 @@ pub enum NativeRefusal {
     /// The owning service holds as many resources of this type as it may, and states
     /// the quota in its own terms.
     AtCapacity(String),
-    /// The model names something this type's resource cannot carry — a fault in the
-    /// resource model, which the handler itself judges. Carries the owning service's own
-    /// diagnostic.
+    /// The resource MODEL is at fault against the type's registry schema, which the
+    /// handler itself judges: a property the schema does not declare, one it declares and
+    /// this path does not apply, a required property the model names no value for, a value
+    /// of a form or outside a value set that schema declares, or an identifier the resource
+    /// does not answer to. Nothing downstream was asked.
     Invalid(String),
-    /// The owning service would not carry out the operation on the resource AS IT IS: the
-    /// request is a well-formed one that service raised an error of its own about, and the
-    /// handler maps it to no other verdict. Carries that service's own diagnostic.
+    /// The OWNING service raised an error of its own that this type's handler maps to no
+    /// other verdict: a model well formed against that schema whose call that service's own
+    /// API would refuse — a rule only it holds the value to, a value set only it publishes, a
+    /// combination it will not take, the resource's own state. Carries that service's own
+    /// diagnostic.
     Rejected(String),
 }
 
@@ -93,7 +107,10 @@ impl NativeRefusal {
 /// The `HandlerErrorCode` for work an owning service has no room for.
 pub const HANDLER_ERROR_SERVICE_LIMIT_EXCEEDED: &str = "ServiceLimitExceeded";
 
-/// The `HandlerErrorCode` for a model the owning service will not take.
+/// The `HandlerErrorCode` for a fault the type's handler itself judges in the resource model
+/// against that type's registry schema, which is what this code is for: invalid input from
+/// the user, rather than anything the owning service was asked and answered
+/// ([`HANDLER_ERROR_GENERAL_SERVICE_EXCEPTION`]).
 pub const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
 
 /// The `HandlerErrorCode` for an error the OWNING SERVICE raised that the resource type's

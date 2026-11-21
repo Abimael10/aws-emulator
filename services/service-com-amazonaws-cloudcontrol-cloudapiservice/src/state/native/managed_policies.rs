@@ -204,7 +204,7 @@ impl NativeResourceProvider for ManagedPolicyProvider {
         // The account's own policies are the resources of this type: an ARN in AWS's managed
         // policy namespace names a policy AWS owns, which no account creates.
         if iam::is_aws_managed_policy_arn(identifier) {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "{identifier} is an AWS managed policy, which cannot be created."
             )));
         }
@@ -398,13 +398,13 @@ impl PolicyIdentity {
         // `policyNameType` (length 1..128, pattern `^[\w+=,.@-]+$`) or an IAM entity path
         // admits is one that service's own API would refuse.
         if !name_is_well_formed(&identity.name) {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "{MANAGED_POLICY_NAME} must be at most {MAX_NAME_CHARACTERS} of the \
                  characters a policy name admits"
             )));
         }
         if !::service_common::iam_entity_path::is_published_form(&identity.path) {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "{PATH} must begin and end with a forward slash"
             )));
         }
@@ -579,12 +579,12 @@ impl DesiredModel {
         // size.
         if let Some(document) = &desired.document {
             if let Some(defect) = iam::managed_policy_document_defect(document) {
-                return Err(NativeRefusal::Invalid(defect.message().to_string()));
+                return Err(NativeRefusal::Rejected(defect.message().to_string()));
             }
             if let Some(defect) =
                 ::service_common::iam_policy::identity_policy_value_defect(document)
             {
-                return Err(NativeRefusal::Invalid(defect.message()));
+                return Err(NativeRefusal::Rejected(defect.message()));
             }
             if iam::policy_document_characters(document) > iam::MAX_MANAGED_POLICY_CHARACTERS {
                 return Err(NativeRefusal::AtCapacity(iam::policy_size_quota_exceeded(

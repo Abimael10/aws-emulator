@@ -149,10 +149,10 @@ impl NativeResourceProvider for QueueProvider {
         let desired = DesiredModel::read(&name, &arn, &url, properties)?;
         let fifo = desired.designates_fifo();
         if let Some(why) = sqs::queue_name_refusal(&name, fifo) {
-            return Err(NativeRefusal::Invalid(why));
+            return Err(NativeRefusal::Rejected(why));
         }
         if let Some(why) = sqs::tag_refusal(&name, &BTreeMap::new(), &desired.tag_map()) {
-            return Err(NativeRefusal::Invalid(why));
+            return Err(NativeRefusal::Rejected(why));
         }
         let attributes = desired.attributes(fifo)?;
         redrive_documents_accepted(region, &desired)?;
@@ -167,7 +167,7 @@ impl NativeResourceProvider for QueueProvider {
         }
         store.forget_lapsed_deletions(at);
         if store.deleted_recently(region, &name, at).is_some() {
-            return Err(NativeRefusal::Invalid(
+            return Err(NativeRefusal::Rejected(
                 sqs::queue_deleted_recently_message(),
             ));
         }
@@ -175,7 +175,7 @@ impl NativeResourceProvider for QueueProvider {
             return Err(NativeRefusal::AtCapacity(sqs::queues_quota_message(&name)));
         }
         if let Some(why) = redrive_refusal(&store, region, &name, fifo, &desired) {
-            return Err(NativeRefusal::Invalid(why));
+            return Err(NativeRefusal::Rejected(why));
         }
         let queue = sqs::Queue::created(region, &name, attributes, desired.tags, at);
         let created = model(&queue);
@@ -204,12 +204,12 @@ impl NativeResourceProvider for QueueProvider {
         // for an existing queue": the queue's type is settled, so a model that designates
         // the other one asks the owning service for a change it does not make.
         if desired.designates_fifo() != was_fifo {
-            return Err(NativeRefusal::Invalid(
+            return Err(NativeRefusal::Rejected(
                 sqs::QUEUE_TYPE_NOT_MODIFIABLE.to_string(),
             ));
         }
         if let Some(why) = sqs::tag_refusal(&name, &held_tags, &desired.tag_map()) {
-            return Err(NativeRefusal::Invalid(why));
+            return Err(NativeRefusal::Rejected(why));
         }
         // A FIFO queue's own attributes stay applicable, and the model carries the queue's
         // settled type — held to the queue's own above — so the map is judged exactly as a
@@ -227,7 +227,7 @@ impl NativeResourceProvider for QueueProvider {
         }
         redrive_documents_accepted(region, &desired)?;
         if let Some(why) = redrive_refusal(&store, region, &name, was_fifo, &desired) {
-            return Err(NativeRefusal::Invalid(why));
+            return Err(NativeRefusal::Rejected(why));
         }
         let queue = store
             .queue_mut(region, &name)
@@ -275,7 +275,7 @@ fn redrive_documents_accepted(region: &str, desired: &DesiredModel) -> Result<()
         .get(sqs::REDRIVE_POLICY)
         .and_then(|value| sqs::redrive_policy_refusal(region, value))
     {
-        return Err(NativeRefusal::Invalid(why));
+        return Err(NativeRefusal::Rejected(why));
     }
     // The same boundary from the other end of the link, and the rest of the permission
     // document's own shape.
@@ -284,7 +284,7 @@ fn redrive_documents_accepted(region: &str, desired: &DesiredModel) -> Result<()
         .get(sqs::REDRIVE_ALLOW_POLICY)
         .and_then(|value| sqs::redrive_allow_policy_document_refusal(region, value))
     {
-        return Err(NativeRefusal::Invalid(match refusal {
+        return Err(NativeRefusal::Rejected(match refusal {
             sqs::RedriveAllowPolicyRefusal::Document(why) => why,
             sqs::RedriveAllowPolicyRefusal::Permission(error) => detail(error.message),
         }));
@@ -534,13 +534,13 @@ impl DesiredModel {
         // takes the queue off the other: a model naming BOTH asks for something no queue
         // can be.
         if let Some(error) = sqs::encryption::encryption_choice_refusal(&self.supplied) {
-            return Err(NativeRefusal::Invalid(detail(error.message)));
+            return Err(NativeRefusal::Rejected(detail(error.message)));
         }
         sqs::encryption::apply_encryption_choice(&mut attributes, &self.supplied);
         // Two attributes can each be valid and still not hold together, so the pair is
         // judged over the set the queue would CARRY.
         if let Some(error) = sqs::attribute_combination_refusal(&attributes) {
-            return Err(NativeRefusal::Invalid(detail(error.message)));
+            return Err(NativeRefusal::Rejected(detail(error.message)));
         }
         Ok(attributes)
     }
@@ -549,7 +549,7 @@ impl DesiredModel {
 /// The owning service's refusal of an attribute map, as this path reports it: that
 /// service's own diagnostic, whichever half of its attribute rules the map broke.
 fn refusal(refused: sqs::AttributeRefusal) -> NativeRefusal {
-    NativeRefusal::Invalid(match refused {
+    NativeRefusal::Rejected(match refused {
         sqs::AttributeRefusal::Name(error) => detail(error.message),
         sqs::AttributeRefusal::Value(error) => detail(error.message),
     })

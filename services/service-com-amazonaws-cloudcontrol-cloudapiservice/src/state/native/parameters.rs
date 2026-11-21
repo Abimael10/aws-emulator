@@ -307,13 +307,13 @@ fn window<'a>(
 /// naming constraints its `PutParameter` states — the character set, the hierarchy's leading
 /// separator, the prefixes it keeps for itself and the depth it allows.
 fn accepted_name(identifier: &str) -> Result<&str, NativeRefusal> {
-    let name = ssm::trimmed_name(identifier).map_err(NativeRefusal::Invalid)?;
+    let name = ssm::trimmed_name(identifier).map_err(NativeRefusal::Rejected)?;
     match ssm::name_rejection(name) {
         Some(
             ssm::NameRejection::Pattern(why)
             | ssm::NameRejection::Malformed(why)
             | ssm::NameRejection::Depth(why),
-        ) => Err(NativeRefusal::Invalid(why)),
+        ) => Err(NativeRefusal::Rejected(why)),
         None => Ok(name),
     }
 }
@@ -399,7 +399,7 @@ fn tag_map(value: &Value) -> Result<BTreeMap<String, String>, NativeRefusal> {
     }
     let maximum = ssm::tagging::max_tags_for(ssm::tagging::TAGGING_TYPE_PARAMETER);
     if tags.len() > maximum {
-        return Err(NativeRefusal::Invalid(format!(
+        return Err(NativeRefusal::Rejected(format!(
             "{TAGS} carries {} tags: a resource can have a maximum of {maximum} tags",
             tags.len()
         )));
@@ -640,14 +640,14 @@ impl DesiredModel {
         // "You can change a standard parameter to an advanced parameter any time. But you
         // can't revert an advanced parameter to a standard parameter."
         if held_tier == Some(ssm::TIER_ADVANCED) && tier != ssm::TIER_ADVANCED {
-            return Err(NativeRefusal::Invalid(format!(
+            return Err(NativeRefusal::Rejected(format!(
                 "this parameter is an {} parameter and can't be reverted to the {tier} tier",
                 ssm::TIER_ADVANCED
             )));
         }
         // The content size limit of the tier the write resolved to.
         if value.len() > ssm::value_limit(&tier) {
-            return Err(NativeRefusal::Invalid(ssm::value_limit_message(&tier)));
+            return Err(NativeRefusal::Rejected(ssm::value_limit_message(&tier)));
         }
         let data_type = self
             .data_type

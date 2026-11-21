@@ -138,7 +138,7 @@ impl NativeResourceProvider for LogGroupProvider {
             )));
         }
         if ::service_common::cloudwatch_logs::is_reserved_log_group_name(identifier) {
-            return Err(NativeRefusal::Invalid(
+            return Err(NativeRefusal::Rejected(
                 ::service_common::cloudwatch_logs::reserved_log_group_name_message(),
             ));
         }
@@ -374,7 +374,7 @@ fn tag_set(value: &Value) -> Result<BTreeMap<String, String>, NativeRefusal> {
     // folded together, so a list past the quota is refused however many keys it repeats.
     let entries = super::tag_entries(value)?;
     if entries.len() > logs::MAX_TAGS_PER_RESOURCE {
-        return Err(NativeRefusal::Invalid(logs::too_many_tags_message()));
+        return Err(NativeRefusal::Rejected(logs::too_many_tags_message()));
     }
     let tags: BTreeMap<String, String> = entries.into_iter().collect();
     // The tag-key namespace the owning service keeps for Amazon Web Services' own tags is
@@ -382,7 +382,7 @@ fn tag_set(value: &Value) -> Result<BTreeMap<String, String>, NativeRefusal> {
     // the same reason that service's own tagging operations refuse it, so nothing writes a
     // tag set into its store that its own API would not take.
     if logs::names_reserved_tag_key(tags.keys().map(String::as_str)) {
-        return Err(NativeRefusal::Invalid(
+        return Err(NativeRefusal::Rejected(
             logs::RESERVED_TAG_KEY_MESSAGE.to_string(),
         ));
     }

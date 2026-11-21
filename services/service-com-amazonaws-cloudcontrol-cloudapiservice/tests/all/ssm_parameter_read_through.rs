@@ -546,21 +546,24 @@ async fn a_patch_through_cloud_control_is_a_new_version_of_the_parameter_systems
 #[tokio::test]
 async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdict() {
     let emulator = Emulator::with_ssm();
-    // The rows differ along WHICH rule the desired state breaks: the naming rules the owning
-    // service holds every parameter name to (the hierarchy's leading separator, the prefixes
-    // it keeps for itself), the two properties the schema declares required, and a property
-    // the type does not declare at all.
+    // The rows differ along WHICH rule the desired state breaks, and so along which handler
+    // verdict the refusal carries: the naming rules the OWNING service holds every parameter
+    // name to (the hierarchy's leading separator, the prefixes it keeps for itself) are that
+    // service's own, so its error is reported as one; the two properties the schema declares
+    // required and a property the type does not declare at all are faults the handler judges
+    // against that schema.
     //
     // A value outside a set the TYPE'S REGISTRY SCHEMA publishes — a parameter type or tier
     // it does not carry — is not a row here: such a model never reaches a handler at all, the
     // front door refusing the call before a request is minted
     // (`front_door_model_validation`).
-    let rows: [(&str, &str, Value, String); 5] = [
+    let rows: [(&str, &str, Value, String, &str); 5] = [
         (
             "a hierarchical name with no leading separator",
             "Dev/DBServer",
             json!({ "Name": "Dev/DBServer", "Type": "String", "Value": "v" }),
             "Parameter name must be a fully qualified name.".to_string(),
+            "GeneralServiceException",
         ),
         (
             "a name in the hierarchy the owning service keeps for itself",
@@ -569,28 +572,32 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
             "Name '/aws/reserved' is prefixed with 'aws': a parameter name can't be \
              prefixed with aws or ssm (case-insensitive)"
                 .to_string(),
+            "GeneralServiceException",
         ),
         (
             "a model that names no value",
             "refused-valueless",
             json!({ "Name": "refused-valueless", "Type": "String" }),
             format!("Value is required by {PARAMETER}"),
+            "InvalidRequest",
         ),
         (
             "a model that names no type",
             "refused-typeless",
             json!({ "Name": "refused-typeless", "Value": "v" }),
             format!("Type is required by {PARAMETER}"),
+            "InvalidRequest",
         ),
         (
             "a property the type does not declare",
             "refused-stranger",
             json!({ "Name": "refused-stranger", "Type": "String", "Value": "v", "Nope": "1" }),
             format!("Nope is not a property of {PARAMETER}"),
+            "InvalidRequest",
         ),
     ];
 
-    for (case, name, desired, expected_message) in rows {
+    for (case, name, desired, expected_message, expected_code) in rows {
         let (status, body) = emulator.create(PARAMETER, &desired, None).await;
         assert_eq!(
             status, 200,
@@ -607,7 +614,7 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
         );
         assert_eq!(
             text(&event, "ErrorCode"),
-            "InvalidRequest",
+            expected_code,
             "case {case:?}: expected the owning handler's verdict, got {event:?}"
         );
         assert_eq!(

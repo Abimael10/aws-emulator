@@ -693,8 +693,13 @@ fn model(name: &str, stored: &cw::StoredAlarm) -> Value {
 
 /// The refusal for a property whose value is outside the domain the owning service's model
 /// gives it, naming that whole domain.
+///
+/// This type's registry schema declares each of those properties as plain text and publishes
+/// no set for it (`crate::state::registry_schema`), so the set is the OWNING service's own
+/// rule about the value and its break is that service's error rather than a fault in the
+/// model against the schema.
 fn one_of(property: &str, values: &[&str]) -> NativeRefusal {
-    NativeRefusal::Invalid(format!("{property} must be one of {values:?}"))
+    NativeRefusal::Rejected(format!("{property} must be one of {values:?}"))
 }
 
 /// The action ARNs `value` carries, or why the property is not a list of them.

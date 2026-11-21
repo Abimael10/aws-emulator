@@ -511,9 +511,10 @@ fn named(identifier: &str) -> Result<String, NativeRefusal> {
 }
 
 /// The owning service's refusal of a declared table, as this path reports it: that service's
-/// own diagnostic, which is what a client of this API reads.
+/// own diagnostic, which is what a client of this API reads, under the handler code for an
+/// error the downstream service raised.
 fn refusal(error: ddb::RequestError) -> NativeRefusal {
-    NativeRefusal::Invalid(error.message().to_string())
+    NativeRefusal::Rejected(error.message().to_string())
 }
 
 /// The resource model one table renders as — the schema's properties the owning record
@@ -823,7 +824,7 @@ impl DesiredModel {
     /// namespace that service keeps for itself.
     fn tag_set(&self) -> Result<ddb::TagSet, NativeRefusal> {
         if self.tags.len() > ddb::MAX_TAGS_PER_TABLE {
-            return Err(NativeRefusal::Invalid(
+            return Err(NativeRefusal::Rejected(
                 "Number of Tags exceed the current limit for the provided TableName".to_string(),
             ));
         }
@@ -848,8 +849,9 @@ fn key_schema_of(value: &Value) -> Result<Vec<KeySchemaElement>, NativeRefusal> 
                 "every {KEY_SCHEMA} element must carry {ATTRIBUTE_NAME} and {KEY_TYPE}"
             )));
         };
-        // The role an element gives its attribute is the owning service's own enum, which no
-        // model-level walk reaches on this path.
+        // The role an element gives its attribute is one of the values the type's registry
+        // schema publishes for it, so a value outside that set is a fault in the model
+        // against that schema rather than anything the owning service saw.
         if !KEY_TYPE_VALUES.contains(&key_type) {
             return Err(NativeRefusal::Invalid(format!(
                 "{KEY_TYPE} must be one of {KEY_TYPE_VALUES:?}"
@@ -882,8 +884,8 @@ fn attribute_definitions_of(value: &Value) -> Result<Vec<AttributeDefinition>, N
                  {ATTRIBUTE_TYPE}"
             )));
         };
-        // A key attribute's type is one of the owning service's scalar types, which is the
-        // enum that member targets.
+        // A key attribute's type is one of the scalar types the type's registry schema
+        // publishes for that member, so the same holds for it.
         if !SCALAR_ATTRIBUTE_TYPE_VALUES.contains(&attribute_type) {
             return Err(NativeRefusal::Invalid(format!(
                 "{ATTRIBUTE_TYPE} must be one of {SCALAR_ATTRIBUTE_TYPE_VALUES:?}"
@@ -897,8 +899,8 @@ fn attribute_definitions_of(value: &Value) -> Result<Vec<AttributeDefinition>, N
     Ok(definitions)
 }
 
-/// The capacity mode the `BillingMode` `value` names, which is one of the owning service's
-/// own `BillingMode` values.
+/// The capacity mode the `BillingMode` `value` names, which is one of the values the type's
+/// registry schema publishes for that property.
 fn billing_mode_of(value: &Value) -> Result<String, NativeRefusal> {
     match value.as_str() {
         Some(mode) if BILLING_MODE_VALUES.contains(&mode) => Ok(mode.to_string()),
@@ -908,8 +910,8 @@ fn billing_mode_of(value: &Value) -> Result<String, NativeRefusal> {
     }
 }
 
-/// The storage class the `TableClass` `value` names, which is one of the owning service's own
-/// `TableClass` values.
+/// The storage class the `TableClass` `value` names, which is one of the values that schema
+/// publishes for that property.
 fn table_class_of(value: &Value) -> Result<String, NativeRefusal> {
     match value.as_str() {
         Some(class) if TABLE_CLASS_VALUES.contains(&class) => Ok(class.to_string()),
