@@ -521,6 +521,74 @@ pub(super) const CLEANROOMSML_TRAINING_DATASET_PATH: &str = "training-dataset";
 /// `AWS::Braket::SpendingLimit`'s `CreatedAt` does.
 pub const CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE: &str = "TrainingDatasetArn";
 
+/// The `AWS::<Namespace>::<Resource>` type of a CLOUDHSM CLUSTER: the cluster of hardware
+/// security modules CloudHSM's own `CreateCluster` places in the caller's subnets, which HSMs
+/// are then added to and which is initialized before it serves any cryptographic operation.
+///
+/// The namespace is `CloudHSM`, as the "AWS resource and property types reference" publishes
+/// it — NOT that model's own `awsService.cloudFormationName` (`CloudHSMV2`): the type is what a
+/// template spells, the same position [`ECR_PUBLIC_REPOSITORY`] is in.
+///
+/// `Ref` returns the cluster's ARN — the type's primary identifier — and `Fn::GetAtt` reads
+/// [`CLOUDHSM_CLUSTER_ATTRIBUTES`]. CloudHSM MINTS the cluster's identity: `CreateCluster`
+/// takes no identifier at all — the declaration states the subnets, the HSM type and the mode
+/// — and answers the `ClusterId` it assigned (`^cluster-[2-7a-zA-Z]{11,16}$`), which is the
+/// handle every operation on a cluster takes and what the ARN below carries, so neither can be
+/// computed from the template — that is what [`identity_is_service_assigned`] names this type
+/// for.
+pub const CLOUDHSM_CLUSTER: &str = "AWS::CloudHSM::Cluster";
+
+/// CloudHSM's ARN namespace (that model's own `awsService.arnNamespace`, `cloudhsm`), and the
+/// resource path a cluster's ARN carries before the id that service minted —
+/// `arn:<partition>:cloudhsm:<region>:<account>:cluster/<clusterId>`.
+pub const CLOUDHSM_ARN_NAMESPACE: &str = "cloudhsm";
+pub const CLOUDHSM_CLUSTER_PATH: &str = "cluster";
+
+/// Every `Fn::GetAtt` attribute a [`CLOUDHSM_CLUSTER`] publishes, in the sorted order a
+/// resource's own attribute map holds them in: the ARN the type's `Ref` also returns, the
+/// backup policy the cluster's backups are kept under, the id CloudHSM minted, the security
+/// group it made for the cluster, the state it holds the cluster in and the VPC its subnets
+/// are in.
+///
+/// Only the first two are values these naming rules can compute a stand-in of the right FORM
+/// for; the rest are the owning service's own to report and reach the resource off its
+/// description of the created cluster
+/// ([`crate::state::provisioner::Provisioner::CloudHsmCluster`]), exactly as a Clean Rooms ML
+/// training dataset's `Status` does.
+pub const CLOUDHSM_CLUSTER_ATTRIBUTES: &[&str] = &[
+    CLOUDHSM_CLUSTER_ARN_ATTRIBUTE,
+    CLOUDHSM_CLUSTER_BACKUP_POLICY_ATTRIBUTE,
+    CLOUDHSM_CLUSTER_ID_ATTRIBUTE,
+    CLOUDHSM_CLUSTER_SECURITY_GROUP_ATTRIBUTE,
+    CLOUDHSM_CLUSTER_STATE_ATTRIBUTE,
+    CLOUDHSM_CLUSTER_VPC_ID_ATTRIBUTE,
+];
+
+/// The attributes above, each named where both the catalogue and the arms that provision the
+/// type read it: every one but the ARN is a member of that service's own `Cluster` shape,
+/// spelled the same way ([`crate::state::provisioner::cloudhsm_clusters`] reads them off a
+/// described cluster).
+pub const CLOUDHSM_CLUSTER_ARN_ATTRIBUTE: &str = "Arn";
+pub const CLOUDHSM_CLUSTER_BACKUP_POLICY_ATTRIBUTE: &str = "BackupPolicy";
+pub const CLOUDHSM_CLUSTER_ID_ATTRIBUTE: &str = "ClusterId";
+pub const CLOUDHSM_CLUSTER_SECURITY_GROUP_ATTRIBUTE: &str = "SecurityGroup";
+pub const CLOUDHSM_CLUSTER_STATE_ATTRIBUTE: &str = "State";
+pub const CLOUDHSM_CLUSTER_VPC_ID_ATTRIBUTE: &str = "VpcId";
+
+/// What a stand-in cluster id is built of: the prefix a `ClusterId` carries, the number of
+/// characters after it and the alphabet those characters are drawn from — the modelled
+/// `^cluster-[2-7a-zA-Z]{11,16}$`, which carries no `0`, `1`, `8` or `9` and so is not the
+/// hexadecimal most service-assigned identifiers are written over
+/// ([`derived_over`](super::super::naming_rules::derived_over) folds the digest into it).
+pub(super) const CLOUDHSM_CLUSTER_ID_PREFIX: &str = "cluster-";
+pub(super) const CLOUDHSM_CLUSTER_ID_CHARS: usize = 11;
+pub(super) const CLOUDHSM_CLUSTER_ID_ALPHABET: &[u8] =
+    b"234567abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// The salt that stand-in is derived under, so the cluster id of one resource is not the digits
+/// of anything else derived from the same name.
+pub(super) const CLOUDHSM_CLUSTER_ID_SALT: &str = "cloudhsm-cluster";
+
 /// The resource type of an IOT CORE DEVICE ADVISOR SUITE DEFINITION: the test suite AWS IoT
 /// Core Device Advisor's own `CreateSuiteDefinition` records, which a suite RUN is then started
 /// from.

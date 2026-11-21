@@ -340,6 +340,11 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // the created dataset rather than from here, exactly as a spending limit's `CreatedAt`
         // does.
         CLEANROOMSML_TRAINING_DATASET => &[CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE],
+        // A CloudHSM cluster publishes the ARN its `Ref` also returns and the five read-only
+        // values CloudHSM reports for it; only the ARN and the id inside it are values these
+        // naming rules compute a stand-in for, the rest reaching the resource off that
+        // service's own description of the created cluster.
+        CLOUDHSM_CLUSTER => CLOUDHSM_CLUSTER_ATTRIBUTES,
         // A hypervisor publishes the ARN Backup Gateway minted for it, which is the one return
         // value these naming rules compute a stand-in for before it exists.
         BACKUP_GATEWAY_HYPERVISOR => BACKUP_GATEWAY_HYPERVISOR_ATTRIBUTES,
@@ -1016,6 +1021,14 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // and `DeleteTrainingDataset` each address a dataset by, and no name CloudFormation
         // decides is such an ARN, so the identity in force is the one that service answered.
         || resource_type == CLEANROOMSML_TRAINING_DATASET
+        // A CLOUDHSM cluster is one more: `CreateCluster` takes no identifier for the cluster —
+        // the declaration states the subnets it goes in, the HSM type it will hold and the mode
+        // it runs in — and answers the `ClusterId` that service minted
+        // (`^cluster-[2-7a-zA-Z]{11,16}$`), which is the handle every operation on a cluster
+        // takes and what the ARN this type's `Ref` returns carries. No name CloudFormation
+        // decides satisfies that pattern, so the identity in force is the one that service
+        // answered.
+        || resource_type == CLOUDHSM_CLUSTER
         // A RECYCLE BIN retention rule is one more: `CreateRule` takes no identifier for the
         // rule — the declaration states what to retain and for how long — and answers the
         // `Identifier` that service minted (`^[0-9a-zA-Z]{11}$`) with the `RuleArn` built

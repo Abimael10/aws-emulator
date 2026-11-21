@@ -122,6 +122,10 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // ("Ref returns the training dataset ARN"), which is the `trainingDatasetArn` every
         // call on one takes; the type's own `Name` is only what the dataset is called.
         CLEANROOMSML_TRAINING_DATASET => CLEANROOMSML_TRAINING_DATASET_ARN_ATTRIBUTE,
+        // A CloudHSM cluster, identified by the ARN built around the `ClusterId` that service
+        // minted ("Ref returns the cluster ARN"), which the type publishes as its `Arn`; the
+        // type declares no name a client could name one by.
+        CLOUDHSM_CLUSTER => CLOUDHSM_CLUSTER_ARN_ATTRIBUTE,
         // A Backup Gateway hypervisor, identified by the ARN that service minted for it ("Ref
         // returns the hypervisor ARN") — the `ServerArn` every call on a hypervisor takes; the
         // type's own `Name` is only what the hypervisor is called.

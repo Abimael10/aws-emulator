@@ -671,6 +671,11 @@ impl Provisioner {
             Self::CleanRoomsMlTrainingDataset => {
                 describe_training_dataset(ctx, region, physical_resource_id).await
             }
+            // CloudHSM's own description of the cluster, by the id inside the ARN that is this
+            // resource's physical id.
+            Self::CloudHsmCluster => {
+                describe_cloudhsm_cluster(ctx, region, physical_resource_id).await
+            }
             // Amplify UI Builder's own read of the entity, by the id it minted, inside the app
             // environment the declaration names.
             Self::AmplifyUiBuilderComponent => {

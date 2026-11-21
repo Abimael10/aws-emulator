@@ -195,6 +195,13 @@ impl Provisioner {
             Self::DirectoryServiceDirectory(_) => {
                 ds_directory_readiness(ctx, region, physical_resource_id, declared).await
             }
+            // `CreateCluster` answers a cluster `CREATE_IN_PROGRESS` — CloudHSM is still placing
+            // its hardware, and the cluster takes no HSM and no initialization in that state —
+            // so the resource is held open until that service reports the cluster created
+            // ([`cloudhsm_clusters::cloudhsm_cluster_readiness`]).
+            Self::CloudHsmCluster => {
+                cloudhsm_cluster_readiness(ctx, region, physical_resource_id).await
+            }
             // `CreateCluster` answers a cluster `creating`, in which it serves no connection
             // and publishes no endpoint at all, so the resource's creation is finished once
             // Amazon Redshift reports it `available`.
@@ -389,6 +396,12 @@ impl Provisioner {
             Self::DirectoryServiceDirectory(kind) => {
                 ds_directory_ready_attributes(ctx, region, kind, physical_resource_id).await
             }
+            // A cluster's `State` is the one its create answered (`CREATE_IN_PROGRESS`) until
+            // CloudHSM has placed it, so the type's attributes are read off the cluster again
+            // once that service reports it created.
+            Self::CloudHsmCluster => {
+                cloudhsm_cluster_ready_attributes(ctx, region, physical_resource_id).await
+            }
             // A graph has no endpoint while it is `CREATING`: the address a client reaches it
             // at is one Neptune Analytics publishes once the graph is serving, so the type's
             // attributes are read off the graph again once it reports it `AVAILABLE`. (A
@@ -502,6 +515,14 @@ impl Provisioner {
             // holds it.
             Self::DirectoryServiceDirectory(_) => {
                 ds_directory_removal(ctx, region, physical_resource_id).await
+            }
+            // `DeleteCluster` leaves the cluster `DELETE_IN_PROGRESS` — the modelled state it is
+            // reported in while CloudHSM takes its hardware away — so it is still being removed
+            // when the delete answers, and the deletion is finished once that service reports it
+            // `DELETED` ([`cloudhsm_clusters::cloudhsm_cluster_removal`]). Which is what keeps a
+            // stack from deleting the subnets the cluster is still placed in.
+            Self::CloudHsmCluster => {
+                cloudhsm_cluster_removal(ctx, region, physical_resource_id).await
             }
             // "The `DeleteCacheCluster` operation deletes a previously provisioned cluster"
             // and leaves it `deleting` while it does, so the cluster is still there when the

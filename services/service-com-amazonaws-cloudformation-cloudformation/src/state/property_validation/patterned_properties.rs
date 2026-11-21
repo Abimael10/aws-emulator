@@ -93,6 +93,14 @@ pub const PATTERNED_PROPERTIES: &[PatternedProperty] = &[
         property: "RoleArn",
         pattern: r"^arn:(aws[a-zA-Z-]*)?:iam::\d{12}:role/?[a-zA-Z0-9+=,.@\-_/]+$",
     },
+    // `AWS::CloudHSM::Cluster`'s `HsmType` is `CreateCluster$HsmType`, "the type of HSM to use
+    // in the cluster" — the form CloudHSM publishes for that member, which this type's schema
+    // states verbatim, anchors and all.
+    PatternedProperty {
+        resource_type: crate::state::template::CLOUDHSM_CLUSTER,
+        property: "HsmType",
+        pattern: r"^((p|)hsm[0-9][a-z.]*\.[a-zA-Z]+)$",
+    },
 ];
 
 /// `Some(failure)` for a resource carrying a property value outside the pattern its type's
@@ -296,6 +304,30 @@ mod tests {
                 "a type this stage knows no pattern of",
                 "AWS::SNS::Topic",
                 json!({"TopicName": "not a topic name"}),
+                None,
+            ),
+            (
+                "a cluster whose HSM type is no HSM type at all",
+                crate::state::template::CLOUDHSM_CLUSTER,
+                json!({"HsmType": "not-a-valid-hsm-type", "SubnetIds": ["subnet-0a1b2c3d"]}),
+                Some(("HsmType", "not-a-valid-hsm-type")),
+            ),
+            (
+                "a cluster whose HSM type names the family without a size",
+                crate::state::template::CLOUDHSM_CLUSTER,
+                json!({"HsmType": "hsm2m", "SubnetIds": ["subnet-0a1b2c3d"]}),
+                Some(("HsmType", "hsm2m")),
+            ),
+            (
+                "a cluster whose HSM type is one the form admits",
+                crate::state::template::CLOUDHSM_CLUSTER,
+                json!({"HsmType": "hsm2m.medium", "SubnetIds": ["subnet-0a1b2c3d"]}),
+                None,
+            ),
+            (
+                "a cluster whose HSM type is the earlier generation, which the form admits too",
+                crate::state::template::CLOUDHSM_CLUSTER,
+                json!({"HsmType": "hsm1.medium", "SubnetIds": ["subnet-0a1b2c3d"]}),
                 None,
             ),
         ];

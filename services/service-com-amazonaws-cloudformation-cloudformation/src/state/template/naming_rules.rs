@@ -655,18 +655,46 @@ pub(super) enum Alphabet {
 /// two resources of one stack never collide. The `salt` keeps two identifiers OF ONE
 /// resource (its endpoint label and its resource id, say) from being the same digits.
 pub(super) fn derived_digits(salt: &str, name: &str, digits: usize, alphabet: Alphabet) -> String {
+    let finished = salted_digest(salt, name);
+    let digest = match alphabet {
+        Alphabet::Lower => ::hex::encode(finished),
+        Alphabet::Upper => ::hex::encode_upper(finished),
+    };
+    digest[..digits.min(digest.len())].to_string()
+}
+
+/// `digits` characters derived from `salt` and `name`, drawn from `alphabet`.
+///
+/// [`derived_digits`] renders the one digest as hexadecimal, which is the alphabet most
+/// service-assigned identifiers are written over. A few are written over another one — a
+/// CloudHSM cluster id is `cluster-` and eleven characters of `[2-7a-zA-Z]`, which carries no
+/// `0`, `1`, `8` or `9` — so each byte of the SAME digest ([`salted_digest`], which both
+/// derivations take it from) is folded into the alphabet that identifier's own pattern admits
+/// instead, which keeps the value inside the form the owning service assigns while staying as
+/// stable as every other derived identifier here.
+///
+/// An EMPTY alphabet draws nothing, which is the empty string rather than a division by zero.
+pub(super) fn derived_over(salt: &str, name: &str, digits: usize, alphabet: &[u8]) -> String {
+    if alphabet.is_empty() {
+        return String::new();
+    }
+    salted_digest(salt, name)
+        .into_iter()
+        .take(digits)
+        .map(|byte| char::from(alphabet[usize::from(byte) % alphabet.len()]))
+        .collect()
+}
+
+/// The digest both derivations above are built on: SHA-256 over `<salt>/<name>`, in ONE place
+/// so the two cannot come to hash different things.
+fn salted_digest(salt: &str, name: &str) -> [u8; 32] {
     use ::sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
     hasher.update(salt.as_bytes());
     hasher.update(b"/");
     hasher.update(name.as_bytes());
-    let finished = hasher.finalize();
-    let digest = match alphabet {
-        Alphabet::Lower => ::hex::encode(finished),
-        Alphabet::Upper => ::hex::encode_upper(finished),
-    };
-    digest[..digits.min(digest.len())].to_string()
+    hasher.finalize().into()
 }
 
 /// `digits` lowercase hexadecimal characters derived from `content` under `salt`.

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What an Amazon ECR-access diagnosis of a Fargate service reads out of the repository
-//! behind its image: a `repositoryUri` that ADDRESSES that repository in the account and the
-//! Region that hold it.
+//! behind its image: a `repositoryUri` that ADDRESSES that repository, and the account and
+//! Region reported beside it.
 //!
 //! RULE: `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
 //! container image `push` and `pull` operations") is an ADDRESS a container client DIALS, so

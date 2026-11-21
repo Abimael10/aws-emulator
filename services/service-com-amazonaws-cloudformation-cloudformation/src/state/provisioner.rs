@@ -492,6 +492,7 @@ use super::template::{
     BEDROCK_KNOWLEDGE_BASE,
     BEDROCK_SESSION,
     BRAKET_SPENDING_LIMIT, CLEANROOMSML_TRAINING_DATASET,
+    CLOUDHSM_CLUSTER,
     CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODEARTIFACT_DOMAIN, CODEARTIFACT_REPOSITORY,
     CODEBUILD_PROJECT,
@@ -1304,6 +1305,15 @@ pub(super) enum Provisioner {
     /// the `trainingDatasetArn` that service minted — the ARN this type's `Ref` returns and
     /// this resource's physical id ([`cleanrooms_ml_training_datasets`]).
     CleanRoomsMlTrainingDataset,
+    /// `AWS::CloudHSM::Cluster`: the cluster of hardware security modules CloudHSM's own
+    /// `CreateCluster` places in the subnets the declaration states, which `DeleteCluster`
+    /// removes by the `ClusterId` that service minted — the id inside the ARN this type's `Ref`
+    /// returns and this resource's physical id. That create is asynchronous and leaves the
+    /// cluster in a state that takes no HSM, so the resource's creation is held open until that
+    /// service reports the cluster created; its delete is asynchronous too, and ends in the
+    /// `DELETED` state that service goes on reporting the cluster in
+    /// ([`cloudhsm_clusters`]).
+    CloudHsmCluster,
     /// `AWS::AmplifyUIBuilder::Component`, `::Form` and `::Theme`: the three user-interface
     /// entities of an Amplify app environment, which Amplify UI Builder's own
     /// `CreateComponent`, `CreateForm` and `CreateTheme` make under the name the template
@@ -1684,6 +1694,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::ApplicationSignalsInstrumentationConfig)
         }
         CLEANROOMSML_TRAINING_DATASET => Some(Provisioner::CleanRoomsMlTrainingDataset),
+        CLOUDHSM_CLUSTER => Some(Provisioner::CloudHsmCluster),
         AMPLIFYUIBUILDER_COMPONENT => Some(Provisioner::AmplifyUiBuilderComponent),
         AMPLIFYUIBUILDER_FORM => Some(Provisioner::AmplifyUiBuilderForm),
         AMPLIFYUIBUILDER_THEME => Some(Provisioner::AmplifyUiBuilderTheme),
@@ -2579,6 +2590,12 @@ impl Provisioner {
             Self::CleanRoomsMlTrainingDataset => {
                 create_training_dataset(ctx, region, resource, propagated).await
             }
+            // `AWS::CloudHSM::Cluster` publishes `Tags`, which `CreateCluster` takes as its own
+            // `TagList` of pairs, so a cluster a stack creates carries the tags CloudFormation
+            // gives it beside the ones the declaration asks for.
+            Self::CloudHsmCluster => {
+                create_cloudhsm_cluster(ctx, region, resource, propagated).await
+            }
             // Each of the three `AWS::AmplifyUIBuilder::*` types publishes `Tags` as a MAP,
             // which is the shape its create's own `tags` member takes, so an entity a stack
             // creates carries the tags CloudFormation gives it beside the ones the declaration
@@ -2862,9 +2879,20 @@ impl Provisioner {
                 | Self::BcmDashboard
                 | Self::BcmScheduledReport
         );
+        // ...and a type whose registry SCHEMA states that it does not take CloudFormation's own
+        // system tags is in the same position for a different reason: a resource type's schema
+        // declares, beside whether the type is taggable at all, whether CloudFormation records
+        // the three tags that name the stack and the resource's place in it on a resource of
+        // that type — and for one whose schema says it does not, those three are not refused by
+        // the owning service but simply never recorded, so the resource carries the stack's own
+        // tags and the declaration's and nothing else. `AWS::CloudHSM::Cluster` is one: a
+        // cluster a stack creates carries exactly the tags a client can see it asked for.
+        let carries_no_system_tags = matches!(self, Self::CloudHsmCluster);
         propagated
             .iter()
-            .filter(|(key, _)| !(refuses_reserved_keys && is_reserved_tag_key(key)))
+            .filter(|(key, _)| {
+                !((refuses_reserved_keys || carries_no_system_tags) && is_reserved_tag_key(key))
+            })
             .cloned()
             .collect()
     }
@@ -3667,6 +3695,11 @@ impl Provisioner {
             Self::CleanRoomsMlTrainingDataset => {
                 delete_training_dataset(ctx, region, physical_resource_id).await
             }
+            // The delete addresses the cluster by the id CloudHSM minted for it, which is the id
+            // inside the ARN that is this resource's physical id.
+            Self::CloudHsmCluster => {
+                delete_cloudhsm_cluster(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the entity by the id Amplify UI Builder minted for it,
             // which is this resource's physical id, inside the app environment its declaration
             // names.
@@ -4067,6 +4100,11 @@ use iot_core_device_advisor_suite_definitions::*;
 use bcm_dashboards::*;
 use application_signals::*;
 use cleanrooms_ml_training_datasets::*;
+/// The CloudHSM cluster arms. Visible to the rest of this service's state because the
+/// catalogue of declarable types, the naming rules and the return-value catalogue each key an
+/// entry for the type these arms provision.
+pub(in crate::state) mod cloudhsm_clusters;
+use cloudhsm_clusters::*;
 use backup_gateway_hypervisors::*;
 use amplify_ui_builder::*;
 use amplify_apps::*;

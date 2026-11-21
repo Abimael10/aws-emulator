@@ -2160,6 +2160,47 @@ pub(crate) fn return_values(
             );
             (arn, attributes)
         }
+        // CloudHSM's own control plane: the cluster an `AWS::CloudHSM::Cluster` declares. "Ref
+        // returns the cluster ARN" (the type's primary identifier); Fn::GetAtt reads
+        // [`CLOUDHSM_CLUSTER_ATTRIBUTES`]. That service MINTS the identity — `CreateCluster`
+        // takes no identifier for the cluster and answers the `ClusterId` it assigned
+        // (`^cluster-[2-7a-zA-Z]{11,16}$`), which is what the ARN carries — so the id here is a
+        // STAND-IN over that pattern's own alphabet and the ARN is built around it, and
+        // `super::provisioning` re-points both at what the create really answered
+        // ([`super::provisioner::Provisioner::CloudHsmCluster`]). The cluster's STATE, the VPC
+        // its subnets are in, the security group that service made for it and the backup policy
+        // it keeps its backups under are values only CloudHSM can report, so each stands in
+        // until it has reported them.
+        CLOUDHSM_CLUSTER => {
+            let cluster_id = format!(
+                "{CLOUDHSM_CLUSTER_ID_PREFIX}{}",
+                derived_over(
+                    CLOUDHSM_CLUSTER_ID_SALT,
+                    name,
+                    CLOUDHSM_CLUSTER_ID_CHARS,
+                    CLOUDHSM_CLUSTER_ID_ALPHABET,
+                )
+            );
+            let arn = ::emulator_server::emulator_arn(
+                CLOUDHSM_ARN_NAMESPACE,
+                region,
+                &format!("{CLOUDHSM_CLUSTER_PATH}/{cluster_id}"),
+            );
+            attributes.insert(CLOUDHSM_CLUSTER_ARN_ATTRIBUTE.to_string(), arn.clone());
+            attributes.insert(CLOUDHSM_CLUSTER_ID_ATTRIBUTE.to_string(), cluster_id);
+            for attribute in [
+                CLOUDHSM_CLUSTER_BACKUP_POLICY_ATTRIBUTE,
+                CLOUDHSM_CLUSTER_SECURITY_GROUP_ATTRIBUTE,
+                CLOUDHSM_CLUSTER_STATE_ATTRIBUTE,
+                CLOUDHSM_CLUSTER_VPC_ID_ATTRIBUTE,
+            ] {
+                attributes.insert(
+                    attribute.to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (arn, attributes)
+        }
         // AWS IoT Core Device Advisor's own control plane: the test suite an
         // `AWS::IoTCoreDeviceAdvisor::SuiteDefinition` declares. "Ref returns the suite
         // definition id" (the type's primary identifier); Fn::GetAtt reads

@@ -194,6 +194,25 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // whose create carries the tags, rather than reported as applied by nothing. A tag arm
         // retires this entry.
         CLEANROOMSML_TRAINING_DATASET => &["Description", "RoleArn", "Tags", "TrainingData"],
+        // Everything a CloudHSM cluster is made with is fixed once that service has placed it:
+        // the subnets, the mode and the HSM type are all members of `CreateCluster`, and the one
+        // call that changes a cluster afterwards (`ModifyCluster`) takes the HSM type alone and
+        // no placement at all — so a declaration restating any of them asks for a DIFFERENT
+        // cluster, which CloudFormation replaces. Its `Tags` are here for the reason a training
+        // dataset's are: that service does change a cluster's tags in place, through its own
+        // `TagResource`/`UntagResource`, but no arm of [`crate::state::provisioner`] calls them
+        // for this type yet — so a changed tag set is applied by replacing the cluster, whose
+        // create carries the tags, rather than reported as applied by nothing. A tag arm retires
+        // that entry.
+        CLOUDHSM_CLUSTER => &[
+            "BackupRetentionPolicy",
+            "HsmType",
+            "Mode",
+            "NetworkType",
+            "SourceBackupId",
+            "SubnetIds",
+            "Tags",
+        ],
         // A hypervisor keeps the encryption key it was imported with: `KmsKeyArn` is a member
         // of `ImportHypervisorConfiguration` and of no member of `UpdateHypervisor` (which
         // takes the host, the credentials, the name and the log group), so a declaration
