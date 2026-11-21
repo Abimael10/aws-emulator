@@ -380,6 +380,49 @@ pub fn domain_controllers_limit_exceeded(limit: usize) -> String {
     )
 }
 
+/// The stages a resize of a directory's domain-controller set is served in:
+/// [`STAGE_ACTIVE`] alone.
+///
+/// `UpdateNumberOfDomainControllers` changes how many servers a directory that is already
+/// there runs, and Directory Service reads the directory's stage as a PRECONDITION of that
+/// call: it admits it only once the directory has finished being built, and refuses every
+/// other stage — including a degraded one — telling the caller to wait for `Active` and
+/// retry.
+pub const DOMAIN_CONTROLLER_RESIZE_SERVING_STAGES: [&str; 1] = [STAGE_ACTIVE];
+
+/// The sentence Directory Service states the domain-controller resize's stage
+/// precondition in: FIXED text, the requirement the call broke and nothing else.
+///
+/// Every part of it is the rule — nothing is read from the request or from the store, so
+/// neither the directory the request named nor the stage it is actually in appears, which
+/// is also what keeps the refusal from disclosing where in its build the directory is.
+/// That makes this sentence the handle a client has on THIS precondition: it is what tells
+/// the wait-for-`Active`-and-retry refusal apart from the other `InvalidParameterException`
+/// this operation answers, and a template with an id interpolated into it is one no such
+/// client can match. [`refusal`] appends the request id, the one variable part of the
+/// message.
+pub const DOMAIN_CONTROLLER_RESIZE_REQUIRES_AN_ACTIVE_DIRECTORY: &str =
+    "The directory is currently unavailable for updates. The directory status must be \
+     Active when making changes. Please try again in a few minutes.";
+
+/// Why the directory in `stage` cannot have its domain-controller set resized, or `None`
+/// when it can.
+///
+/// Stated in the sentence Directory Service words for THIS precondition
+/// ([`DOMAIN_CONTROLLER_RESIZE_REQUIRES_AN_ACTIVE_DIRECTORY`]), under the modelled
+/// `InvalidParameterException` — the class for a precondition of the call a caller
+/// satisfies by waiting — rather than in the family-neutral [`directory_unavailable`] one,
+/// which Directory Service reserves for a directory that has become unreachable while in
+/// service, a fault a caller alarms on rather than waits out. It is the same shape as the
+/// alias assignment's gate ([`alias_stage_defect`]), the other precondition this service
+/// words as fixed text.
+pub fn domain_controller_resize_stage_defect(stage: &str) -> Option<String> {
+    if DOMAIN_CONTROLLER_RESIZE_SERVING_STAGES.contains(&stage) {
+        return None;
+    }
+    Some(DOMAIN_CONTROLLER_RESIZE_REQUIRES_AN_ACTIVE_DIRECTORY.to_string())
+}
+
 /// The `NoAvailableCertificateException` message for enabling LDAPS on a directory holding
 /// no certificate that can secure its LDAP calls.
 ///

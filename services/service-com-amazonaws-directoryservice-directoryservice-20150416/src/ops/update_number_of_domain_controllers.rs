@@ -8,8 +8,10 @@
 //! per-directory quota is refused with the modelled
 //! `DomainControllerLimitExceededException` and leaves the set as it was, a directory
 //! whose type runs no domain controller of the caller's domain with
-//! `UnsupportedOperationException`, one not in service with
-//! `DirectoryUnavailableException`, and an id naming no stored directory with
+//! `UnsupportedOperationException`, one that has not finished being built with
+//! `InvalidParameterException` — the stage is a precondition of the call, and its
+//! sentence tells the caller to wait for the serving stage — one already applying a
+//! resize with `DirectoryUnavailableException`, and an id naming no stored directory with
 //! `EntityDoesNotExistException`.
 //!
 //! ## Shape of an operation
@@ -203,12 +205,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Resizing the set changes the directory's own servers, so it needs a directory
-        // that is in service: one still being built by the transition its create owes is
-        // unavailable, which is the modelled refusal for exactly that. The diagnostic is
-        // this service's shared one for a directory a call cannot reach.
-        if directory.stage != crate::state::STAGE_ACTIVE {
-            return Err(directory_unavailable(&input.directory_id));
+        // Resizing the set changes the directory's own servers, so the stage the directory
+        // is in is a PRECONDITION of this call: it is served only once the directory has
+        // finished being built, and any other stage is refused with the modelled
+        // `InvalidParameterException` in the FIXED sentence that states that precondition
+        // ([`crate::state::domain_controller_resize_stage_defect`]) — the class and the
+        // wording that tell the caller to wait for the serving stage and retry. Nothing is
+        // written before the check, so the refusal leaves the controller set and the
+        // directory's desired number exactly as they were.
+        if let Some(defect) = crate::state::domain_controller_resize_stage_defect(&directory.stage)
+        {
+            return Err(invalid_parameter(defect));
         }
 
         // The quota is checked BEFORE anything is written, so a number past it leaves the
@@ -221,7 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // domain controllers to become fully active once the requested number of domain
         // controllers is updated. During this time, you cannot make another update
         // request." A controller with a transition still owed is a resize still running,
-        // so a second request is refused rather than compounded onto the first.
+        // so a second request is refused rather than compounded onto the first. That is a
+        // directory which IS in its serving stage and has become unavailable for the
+        // duration of the change it is applying, which is the failure the modelled
+        // `DirectoryUnavailableException` reports — not the stage precondition above.
         if directory
             .domain_controllers
             .values()
@@ -260,8 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Refuse the request with the modelled `InvalidParameterException`, naming the member
-/// and the rule it broke so the caller can fix the request from the message alone.
+/// Refuse the request with the modelled `InvalidParameterException`, stating the rule the
+/// call broke so the caller can tell from the message alone what to do about it: fix the
+/// request, or wait for the stage the resize is served in.
 fn invalid_parameter(message: String) -> UpdateNumberOfDomainControllersError {
     UpdateNumberOfDomainControllersErrorModeled::InvalidParameterException(crate::state::refusal(
         message,
@@ -280,7 +291,9 @@ fn domain_controller_limit_exceeded(limit: usize) -> UpdateNumberOfDomainControl
 }
 
 /// Refuse the request with the modelled `DirectoryUnavailableException`, worded by this
-/// service's shared diagnostic for a directory a call cannot reach.
+/// service's shared diagnostic for a directory a call cannot reach: the directory is in
+/// its serving stage, and the resize it is already applying is what makes it unreachable
+/// for another one.
 fn directory_unavailable(directory_id: &str) -> UpdateNumberOfDomainControllersError {
     UpdateNumberOfDomainControllersErrorModeled::DirectoryUnavailableException(
         crate::state::refusal(crate::state::directory_unavailable(directory_id)),

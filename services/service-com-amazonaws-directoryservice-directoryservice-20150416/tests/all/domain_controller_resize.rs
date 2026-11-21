@@ -12,15 +12,21 @@
 //! The cases assert the RULE over sets of inputs rather than one recorded call: the
 //! accepted numbers over a table spanning the modelled lower bound, numbers between it
 //! and the published per-directory quota, and the quota itself; the refusal over a table
-//! of numbers past that quota; the retirement order over a resize down; and the
-//! directories a resize is served for over the two types this emulator can persist.
+//! of numbers past that quota; the retirement order over a resize down; the directories a
+//! resize is served for over the two types this emulator can persist; and the stage
+//! precondition over a table spanning both transient stages of the chain a create owes,
+//! both Managed Microsoft AD editions and the numbers above.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::directory_build_stages::refused_with;
 use crate::directory_lifecycle::{
     call, create_directory, describe_one, minimal_create, ok, refused, service, PASSWORD,
-    PAST_ONE_SPAN,
+    STAGE_ACTIVE, STAGE_CREATING,
+};
+use crate::harness::{
+    poll_until_in_service, poll_until_reported, poll_until_reported_stage, POLL_DEADLINE,
 };
 use crate::microsoft_ad::create_microsoft_ad;
 
@@ -34,6 +40,15 @@ const DOMAIN_CONTROLLER_QUOTA: i64 = 20;
 /// The smallest `DesiredNumber` the modelled `DesiredNumberOfDomainControllers` admits:
 /// `range { min: 2 }`, which is also what a fresh Managed Microsoft AD runs.
 const MODELLED_MINIMUM: i64 = 2;
+
+/// The FIXED sentence Directory Service refuses a resize of a directory that has not
+/// finished being built with: the whole message is the rule, and neither the directory the
+/// request named nor the stage it is in appears in it, so a client branching on the text
+/// can match it. The only variable part a caller reads is the request-id suffix every
+/// refusal of this service carries, which [`refused_with`] strips before comparing.
+const RESIZE_REQUIRES_AN_ACTIVE_DIRECTORY: &str =
+    "The directory is currently unavailable for updates. The directory status must be \
+     Active when making changes. Please try again in a few minutes.";
 
 /// The status a freshly placed controller carries, and the one a controller in service
 /// carries: the first two values of the modelled `DomainControllerStatus` enum
@@ -66,7 +81,7 @@ fn microsoft_ad(name: &str) -> Value {
 /// due, so it is in service and a resize is not refused for being unreachable.
 async fn directory_in_service(router: &MultiServiceRouter, name: &str, case: &str) -> String {
     let directory_id = create_microsoft_ad(router, microsoft_ad(name), case).await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    poll_until_in_service(router, &directory_id, case).await;
     directory_id
 }
 
@@ -84,6 +99,32 @@ async fn listed(router: &MultiServiceRouter, directory_id: &str, case: &str) -> 
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected DomainControllers, got {answer}"))
         .clone()
+}
+
+/// Wait until `DescribeDomainControllers` reports `expected` controllers for
+/// `directory_id` and every one of them in service, answering that settled listing.
+///
+/// The CONDITION is what is waited for rather than a span of time, so a case that needs a
+/// settled set does not depend on how fast the host runs.
+async fn poll_until_settled(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    expected: usize,
+    case: &str,
+) -> Vec<Value> {
+    poll_until_reported(
+        case,
+        &format!("{directory_id} to run {expected} controllers, all of them in service"),
+        POLL_DEADLINE,
+        || listed(router, directory_id, case),
+        |controllers: &Vec<Value>| {
+            controllers.len() == expected
+                && controllers
+                    .iter()
+                    .all(|controller| controller["Status"] == json!(STATUS_ACTIVE))
+        },
+    )
+    .await
 }
 
 /// The `DomainControllerId`s of a listing, in the order it reported them.
@@ -186,8 +227,7 @@ async fn an_accepted_resize_runs_exactly_the_number_of_controllers_asked_for() {
         );
 
         // Once the transition the resize owes falls due, every controller is in service.
-        tokio::time::sleep(PAST_ONE_SPAN).await;
-        let settled = listed(&router, &directory_id, case).await;
+        let settled = poll_until_settled(&router, &directory_id, after_ids.len(), case).await;
         assert_eq!(
             ids_of(&settled, case),
             after_ids,
@@ -312,8 +352,10 @@ async fn a_resize_down_retires_the_controllers_placed_last() {
     let directory_id = directory_in_service(&router, "down.example.com", case).await;
 
     resize(&router, &directory_id, MODELLED_MINIMUM + 3, case).await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
-    let grown = ids_of(&listed(&router, &directory_id, case).await, case);
+    let grown = ids_of(
+        &poll_until_settled(&router, &directory_id, 5, case).await,
+        case,
+    );
     assert_eq!(
         grown.len(),
         5,
@@ -346,8 +388,7 @@ async fn a_resize_down_retires_the_controllers_placed_last() {
 
     // Once the removal falls due the directory runs the number it was asked for, and the
     // ones it kept are the ones it placed FIRST.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
-    let kept = listed(&router, &directory_id, case).await;
+    let kept = poll_until_settled(&router, &directory_id, 3, case).await;
     assert_eq!(
         ids_of(&kept, case),
         grown[..3].to_vec(),
@@ -383,9 +424,9 @@ async fn only_a_reachable_directory_whose_controllers_this_service_runs_is_resiz
     .await;
 
     // A Simple AD directory runs no domain controller of the caller's domain, so it has
-    // no set to resize — the same refusal the listing answers for it.
+    // no set to resize — the same refusal the listing answers for it, and one the
+    // directory's TYPE decides, so it does not wait for the directory's build.
     let simple = create_directory(&router, minimal_create("simple.example.com"), "SimpleAD").await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
     refused(
         &router,
         "UpdateNumberOfDomainControllers",
@@ -395,22 +436,25 @@ async fn only_a_reachable_directory_whose_controllers_this_service_runs_is_resiz
     )
     .await;
 
-    // A directory still being built by the transition its create owes is not reachable
-    // for a resize.
-    let building = create_microsoft_ad(&router, microsoft_ad("building.example.com"), "building")
-        .await;
+    // A directory still being built by the chain its create owes does not serve a resize:
+    // the stage is a precondition of the call, refused as the invalid parameter it is. The
+    // sentence it is stated in, and what the refusal leaves behind, are asserted over a
+    // table of stages, editions and numbers in
+    // `a_resize_of_a_directory_that_is_not_in_service_is_refused_as_an_invalid_parameter`.
+    let building =
+        create_microsoft_ad(&router, microsoft_ad("building.example.com"), "building").await;
     refused(
         &router,
         "UpdateNumberOfDomainControllers",
         json!({ "DirectoryId": &building, "DesiredNumber": MODELLED_MINIMUM + 1 }),
-        "DirectoryUnavailableException",
+        "InvalidParameterException",
         "still being built",
     )
     .await;
 
     // Once it is in service the same request is accepted, so the refusal above is about
     // the stage and not about the operation.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    poll_until_in_service(&router, &building, "in service").await;
     resize(&router, &building, MODELLED_MINIMUM + 1, "in service").await;
 
     // A second resize while the first is still running is refused — "During this time,
@@ -432,7 +476,7 @@ async fn only_a_reachable_directory_whose_controllers_this_service_runs_is_resiz
     );
 
     // And once that resize's transition has fallen due, the next one is accepted.
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    poll_until_settled(&router, &building, 3, "after the first resize").await;
     resize(&router, &building, MODELLED_MINIMUM + 2, "after the first resize").await;
     let again = ids_of(
         &listed(&router, &building, "after the first resize").await,
@@ -444,4 +488,105 @@ async fn only_a_reachable_directory_whose_controllers_this_service_runs_is_resiz
         "case {:?}: expected the second resize's set, got {again:?}",
         "after the first resize"
     );
+}
+
+/// A `CreateMicrosoftAD` body for `name` in `edition`, across [`SUBNETS`].
+fn microsoft_ad_of_edition(name: &str, edition: &str) -> Value {
+    let mut body = microsoft_ad(name);
+    body["Edition"] = json!(edition);
+    body
+}
+
+#[tokio::test]
+async fn a_resize_of_a_directory_that_is_not_in_service_is_refused_as_an_invalid_parameter() {
+    let router = service();
+
+    // (the case, the directory's edition, the transient stage the refused call lands in,
+    // the number it asks for). The stage column spans BOTH transient stages of the chain a
+    // create owes — the one the create answers in and the one the servers come up in — and
+    // the number column the modelled minimum (which the directory already runs, so the
+    // difference is nothing), numbers above it and the published per-directory quota.
+    let cases: [(&str, &str, Option<&str>, i64); 4] = [
+        (
+            "as the create is accepted",
+            "Enterprise",
+            None,
+            MODELLED_MINIMUM,
+        ),
+        (
+            "while the servers come up",
+            "Standard",
+            Some(STAGE_CREATING),
+            MODELLED_MINIMUM + 1,
+        ),
+        (
+            "while the servers come up, asking for the quota",
+            "Enterprise",
+            Some(STAGE_CREATING),
+            DOMAIN_CONTROLLER_QUOTA,
+        ),
+        (
+            "while the servers come up, asking for three more",
+            "Standard",
+            Some(STAGE_CREATING),
+            MODELLED_MINIMUM + 3,
+        ),
+    ];
+
+    for (index, (case, edition, awaited, desired)) in cases.into_iter().enumerate() {
+        let name = format!("gate{index}.example.com");
+        let directory_id =
+            create_microsoft_ad(&router, microsoft_ad_of_edition(&name, edition), case).await;
+        if let Some(awaited) = awaited {
+            poll_until_reported_stage(&router, &directory_id, awaited, case).await;
+        }
+
+        let before = describe_one(&router, &directory_id, case).await;
+        let stage_before = before["Stage"].as_str().unwrap_or_default().to_string();
+        assert_ne!(
+            stage_before, STAGE_ACTIVE,
+            "case {case:?}: expected a directory that is still being built, got {before}"
+        );
+        let desired_before = before["DesiredNumberOfDomainControllers"].clone();
+        let running_before = ids_of(&listed(&router, &directory_id, case).await, case);
+
+        // The refusal: the modelled class for a precondition a caller satisfies by
+        // waiting, stated in the one fixed sentence — so a client reads the same text
+        // whichever stage, edition or number it asked with.
+        refused_with(
+            &router,
+            "UpdateNumberOfDomainControllers",
+            json!({ "DirectoryId": &directory_id, "DesiredNumber": desired }),
+            "InvalidParameterException",
+            RESIZE_REQUIRES_AN_ACTIVE_DIRECTORY,
+            case,
+        )
+        .await;
+
+        // The refused call wrote nothing: the number the directory desires is the one it
+        // desired, and it runs the controllers it was running.
+        let after = describe_one(&router, &directory_id, case).await;
+        assert_eq!(
+            after["DesiredNumberOfDomainControllers"], desired_before,
+            "case {case:?}: expected the desired number unchanged by the refusal, got {after}"
+        );
+        let running_after = ids_of(&listed(&router, &directory_id, case).await, case);
+        assert_eq!(
+            running_after, running_before,
+            "case {case:?}: expected the controller set unchanged by the refusal, got \
+             {running_after:?}"
+        );
+
+        // And the refusal did not derail the chain the create owes: the directory still
+        // reaches its serving stage, where the identical request is accepted — so the
+        // refusal is about the stage and not about the request.
+        poll_until_in_service(&router, &directory_id, case).await;
+        resize(&router, &directory_id, desired, case).await;
+        let settled = describe_one(&router, &directory_id, case).await;
+        assert_eq!(
+            settled["DesiredNumberOfDomainControllers"],
+            json!(desired),
+            "case {case:?}: expected the accepted resize to be stored, got {settled}"
+        );
+    }
 }

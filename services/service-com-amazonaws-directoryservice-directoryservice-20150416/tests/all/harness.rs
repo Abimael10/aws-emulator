@@ -78,10 +78,11 @@ pub(crate) async fn reported_stage(
 /// The stage a directory serves its callers in, as `DescribeDirectories` reports it.
 pub(crate) const STAGE_ACTIVE: &str = "Active";
 
-/// How long a polled stage may take to advance before a case fails: far longer than any
+/// How long a polled condition may take to hold before a case fails: far longer than any
 /// span this service publishes, and well inside what a client's waiter allows, so a loaded
-/// machine does not decide the outcome.
-const POLL_DEADLINE: Duration = Duration::from_secs(20);
+/// machine does not decide the outcome. Shared, so every suite that polls bounds its wait
+/// the one way.
+pub(crate) const POLL_DEADLINE: Duration = Duration::from_secs(20);
 
 /// How often a poll asks.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -118,6 +119,28 @@ pub(crate) async fn poll_until_absent(
     poll_until(router, directory_id, case, "leave the store", |observed| {
         observed.is_none()
     })
+    .await;
+}
+
+/// Wait until `directory_id` reports itself in `stage` — any stage of the chain a create
+/// owes, including a transient one — by polling the same reporting operation.
+///
+/// The generalisation of [`poll_until_in_service`], for a case whose subject is a stage
+/// the directory passes THROUGH: the CONDITION is what is waited for rather than a span of
+/// time, so the case does not depend on how fast the host runs.
+pub(crate) async fn poll_until_reported_stage(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    stage: &str,
+    case: &str,
+) {
+    poll_until(
+        router,
+        directory_id,
+        case,
+        &format!("report itself in {stage}"),
+        |observed| observed == Some(stage),
+    )
     .await;
 }
 
