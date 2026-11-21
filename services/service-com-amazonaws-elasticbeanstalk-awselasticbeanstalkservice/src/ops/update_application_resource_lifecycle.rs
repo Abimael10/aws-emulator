@@ -150,10 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .applications
             .get_mut(&input.application_name)
             .ok_or_else(|| {
-                UpdateApplicationResourceLifecycleError::invalid_parameter_value(format!(
-                    "No Application named '{}' found.",
-                    input.application_name
-                ))
+                UpdateApplicationResourceLifecycleError::invalid_parameter_value(
+                    crate::state::missing_application_message(&input.application_name),
+                )
             })?;
 
         // "ServiceRole: The ARN of an IAM service role that Elastic Beanstalk has

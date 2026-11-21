@@ -270,6 +270,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether or not anybody called.
         store.materialize_due_transitions();
 
+        // "ApplicationName: … only needed if you want to describe the
+        // configuration options associated with either the configuration
+        // template or environment": where the request names a set, the
+        // application is what that set is resolved INSIDE, so the application
+        // is resolved first and a name this account holds no application under
+        // is refused as such rather than reported as a missing set.
+        let named_application = match &configuration_set {
+            Some(
+                ConfigurationSet::Template {
+                    application_name, ..
+                }
+                | ConfigurationSet::Environment {
+                    application_name, ..
+                },
+            ) => Some(*application_name),
+            None => None,
+        };
+        match named_application {
+            Some(application_name) if !store.applications.contains_key(application_name) => {
+                return Err(
+                    DescribeConfigurationOptionsError::invalid_parameter_value(
+                        crate::state::missing_application_message(application_name),
+                    ),
+                );
+            }
+            _ => {}
+        }
+
         // The platform version whose options are reported: the one the
         // configuration set the request names is FOR, or the one the request
         // names itself, together with the tier that configuration is for.

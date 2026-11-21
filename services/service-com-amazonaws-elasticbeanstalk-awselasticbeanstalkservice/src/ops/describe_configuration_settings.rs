@@ -205,6 +205,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether or not anybody called.
         store.materialize_due_transitions();
 
+        // "ApplicationName: the application for the environment or
+        // configuration template" — the configuration set is resolved INSIDE
+        // it, so the application is resolved first and a name this account
+        // holds no application under is refused as such rather than reported as
+        // a missing set. The same order `ValidateConfigurationSettings`
+        // resolves the same required pair in.
+        if !store.applications.contains_key(&input.application_name) {
+            return Err(
+                DescribeConfigurationSettingsError::invalid_parameter_value(
+                    crate::state::missing_application_message(&input.application_name),
+                ),
+            );
+        }
+
         let settings: Vec<CreateConfigurationTemplateOutput> = match wanted {
             // "The name of the configuration template to describe." A template
             // name is unique per application, so the pair resolves one record.

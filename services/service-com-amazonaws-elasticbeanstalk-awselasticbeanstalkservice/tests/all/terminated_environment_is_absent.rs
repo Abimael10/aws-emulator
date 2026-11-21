@@ -6,14 +6,17 @@
 //! running", so an operation that acts on a running environment resolves its
 //! `EnvironmentId`/`EnvironmentName` pair among the environments that are still
 //! running — a terminated one is refused exactly as an environment that was
-//! never created is, in the shared not-found wording naming the member the
-//! caller used and reporting no status. An environment still `Terminating`
-//! EXISTS, so it is refused for its STATUS instead, and the READS of an
-//! environment still report a terminated one.
+//! never created is, in the not-found wording THAT operation answers in, naming
+//! the member the caller used and reporting no status. An environment still
+//! `Terminating` EXISTS, so it is refused for its STATUS instead, and the READS
+//! of an environment still report a terminated one.
 //!
 //! The table spans what the rule generalises over: which operation acts on the
-//! environment, which of the two members names it, and (for the swap, which
-//! names two environments) the operation's own not-found template. The
+//! environment, which of the two members names it, and the operation's own
+//! not-found template — the account-scoped one for the operations that act on an
+//! environment's own lifecycle (the update here, and the swap below, which names
+//! two environments and so also names the role of the missing one), the shared
+//! one for the rest. The
 //! operations-role pair and `ApplyEnvironmentManagedAction` resolve through the
 //! same shared rule and are pinned by `refusal_message_templates.rs` and
 //! `managed_action_refusal_messages.rs`; what is added here is every other
@@ -25,6 +28,7 @@
 //! The harness is the one `lifecycle.rs` owns in this same test binary.
 
 use crate::harness::{wait_for_status, Answer, Emulator, SOLUTION_STACK};
+use crate::lifecycle::account;
 
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
@@ -52,6 +56,10 @@ struct Row {
     case: &'static str,
     action: &'static str,
     by: By,
+    /// Whether this operation words its not-found refusal in the ACCOUNT-SCOPED
+    /// template (the operations that act on an environment's own lifecycle)
+    /// rather than in the shared one.
+    in_account: bool,
 }
 
 /// One row per operation that acts on a running environment, named by each
@@ -61,41 +69,51 @@ const ROWS: &[Row] = &[
         case: "RebuildEnvironment by name",
         action: "RebuildEnvironment",
         by: By::Name,
+        in_account: false,
     },
     Row {
         case: "RebuildEnvironment by id",
         action: "RebuildEnvironment",
         by: By::Id,
+        in_account: false,
     },
     Row {
         case: "RestartAppServer by name",
         action: "RestartAppServer",
         by: By::Name,
+        in_account: false,
     },
     Row {
         case: "RestartAppServer by id",
         action: "RestartAppServer",
         by: By::Id,
+        in_account: false,
     },
     Row {
         case: "AbortEnvironmentUpdate by name",
         action: "AbortEnvironmentUpdate",
         by: By::Name,
+        in_account: false,
     },
     Row {
         case: "AbortEnvironmentUpdate by id",
         action: "AbortEnvironmentUpdate",
         by: By::Id,
+        in_account: false,
     },
+    // The update changes the environment's own configuration, so it answers in
+    // the account-scoped template.
     Row {
         case: "UpdateEnvironment by name",
         action: "UpdateEnvironment",
         by: By::Name,
+        in_account: true,
     },
     Row {
         case: "UpdateEnvironment by id",
         action: "UpdateEnvironment",
         by: By::Id,
+        in_account: true,
     },
 ];
 
@@ -138,6 +156,23 @@ async fn given_environment(emulator: &Emulator, case: &str, name: &str) -> Strin
 /// absent environment with, built the way the service builds it.
 fn no_environment_found(member: &str, value: &str) -> String {
     format!("No Environment found for {member} = '{value}'.")
+}
+
+/// The message the operations that act on an environment's own LIFECYCLE refuse
+/// it with instead: the KIND of identifier the request used (`Id` or `Name`),
+/// its value and the account the lookup was made in, led by the role the
+/// request gave that environment where it named more than one. Written out here
+/// rather than imported from the service, so a change to the service's builder
+/// fails this suite instead of moving with it.
+fn missing_environment_in_account(role: Option<&str>, kind: &str, value: &str) -> String {
+    let subject = match role {
+        Some(role) => format!("{role} environment"),
+        None => "Environment".to_string(),
+    };
+    format!(
+        "{subject} not found with {kind}: {value} in account '{}'",
+        account()
+    )
 }
 
 /// Assert one refusal: the status, the code and the message.
@@ -202,8 +237,17 @@ async fn a_terminated_environment_is_absent_to_every_call_that_acts_on_one() {
             By::Name => ("EnvironmentName", TERMINATED),
             By::Id => ("EnvironmentId", environment_id.as_str()),
         };
+        let expected = if row.in_account {
+            let kind = match row.by {
+                By::Name => "Name",
+                By::Id => "Id",
+            };
+            missing_environment_in_account(None, kind, value)
+        } else {
+            no_environment_found(member, value)
+        };
         let refused = emulator.call(row.action, &[(member, value)]).await;
-        assert_absent(&refused, row.case, &no_environment_found(member, value));
+        assert_absent(&refused, row.case, &expected);
     }
 
     // The swap names TWO environments, so it answers in its own not-found
@@ -221,11 +265,7 @@ async fn a_terminated_environment_is_absent_to_every_call_that_acts_on_one() {
     assert_absent(
         &swapped,
         "SwapEnvironmentCNAMEs with a terminated source",
-        &eb::state::missing_environment_in_account_message(
-            Some(eb::state::ENVIRONMENT_ROLE_SOURCE),
-            None,
-            Some(TERMINATED),
-        ),
+        &missing_environment_in_account(Some("source"), "Name", TERMINATED),
     );
 
     // The reads of an environment still report the terminated record: the rule

@@ -362,13 +362,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateEnvironment
                         "Must specify either EnvironmentId or EnvironmentName.",
                     )
                 }
-                crate::state::EnvironmentRefusal::NotFound(message) => {
-                    UpdateEnvironmentError::invalid_parameter_value(message)
+                crate::state::EnvironmentRefusal::NotFound(_) => {
+                    // This operation words a not-found refusal in the template
+                    // the real service answers THIS operation in — the kind of
+                    // identifier the request used, its value and the account
+                    // the lookup was made in — rather than the one the shared
+                    // resolver composed, so it is built here from the request.
+                    UpdateEnvironmentError::invalid_parameter_value(
+                        crate::state::missing_environment_in_account_message(
+                            None,
+                            input.environment_id.as_deref(),
+                            environment_name.as_deref(),
+                        ),
+                    )
                 }
             })?;
         let environment = store.environments.get(&environment_id).ok_or_else(|| {
             UpdateEnvironmentError::invalid_parameter_value(
-                crate::state::missing_environment_message(Some(environment_id.as_str()), None),
+                crate::state::missing_environment_in_account_message(
+                    None,
+                    Some(environment_id.as_str()),
+                    None,
+                ),
             )
         })?;
 

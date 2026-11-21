@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // UpdateConfigurationTemplate returns an InvalidParameterValue error."
         if !store.applications.contains_key(&input.application_name) {
             return Err(UpdateConfigurationTemplateError::invalid_parameter_value(
-                format!("No Application named '{}' found.", input.application_name),
+                crate::state::missing_application_message(&input.application_name),
             ));
         }
 

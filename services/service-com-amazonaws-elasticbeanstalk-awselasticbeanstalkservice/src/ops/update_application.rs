@@ -153,10 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // found, UpdateApplication returns an InvalidParameterValue error." The
         // operation updates an application the store holds — it never creates one.
         let Some(application) = store.applications.get_mut(&input.application_name) else {
-            return Err(UpdateApplicationError::invalid_parameter_value(format!(
-                "No Application named '{}' found.",
-                input.application_name
-            )));
+            return Err(UpdateApplicationError::invalid_parameter_value(
+                crate::state::missing_application_message(&input.application_name),
+            ));
         };
 
         // "Updates the specified application to have the specified properties. If

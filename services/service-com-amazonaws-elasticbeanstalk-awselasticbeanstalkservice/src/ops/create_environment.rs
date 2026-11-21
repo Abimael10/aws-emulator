@@ -324,10 +324,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEnvironment
         store.materialize_due_transitions();
 
         if !store.applications.contains_key(&input.application_name) {
-            return Err(CreateEnvironmentError::invalid_parameter_value(format!(
-                "No Application named '{}' found.",
-                input.application_name
-            )));
+            return Err(CreateEnvironmentError::invalid_parameter_value(
+                crate::state::missing_application_message(&input.application_name),
+            ));
         }
 
         // `EnvironmentName` is how a request names the environment to launch,

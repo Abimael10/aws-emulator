@@ -171,11 +171,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // associated with" and "EnvironmentName: the name of the environment to
         // delete the draft configuration from" — both required, so the pair
         // names one environment: the stored record carrying that name under
-        // that application. A terminated environment runs nothing, so it is no
-        // "running environment" to delete a draft configuration from, and a
-        // request naming another application's environment names none of this
-        // one's — the resolution `DescribeConfigurationSettings` makes for the
-        // same pair.
+        // that application. The APPLICATION is what the environment is resolved
+        // inside, so it is resolved FIRST and a name this account holds no
+        // application under is refused as such — the same order
+        // `ValidateConfigurationSettings` resolves the same kind of pair in,
+        // and what keeps the refusal naming the resource the request got wrong.
+        if !store.applications.contains_key(&input.application_name) {
+            return Err(
+                DeleteEnvironmentConfigurationError::invalid_parameter_value(
+                    crate::state::missing_application_message(&input.application_name),
+                ),
+            );
+        }
+
+        // A terminated environment runs nothing, so it is no "running
+        // environment" to delete a draft configuration from, and a request
+        // naming another application's environment names none of this one's —
+        // the resolution `DescribeConfigurationSettings` makes for the same
+        // pair.
         let environment_id = store
             .environment_name_index
             .get(&input.environment_name)

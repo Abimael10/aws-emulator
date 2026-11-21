@@ -178,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // application name it cannot resolve.
         if !store.applications.contains_key(&input.application_name) {
             return Err(DeleteApplicationVersionError::invalid_parameter_value(
-                format!("No Application named '{}' found.", input.application_name),
+                crate::state::missing_application_message(&input.application_name),
             ));
         }
 

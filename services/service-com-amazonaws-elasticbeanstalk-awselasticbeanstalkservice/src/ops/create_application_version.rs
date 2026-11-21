@@ -266,7 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the specified name if it doesn't already exist."
             if input.auto_create_application != Some(true) {
                 return Err(CreateApplicationVersionError::invalid_parameter_value(
-                    format!("No Application named '{}' found.", input.application_name),
+                    crate::state::missing_application_message(&input.application_name),
                 ));
             }
             let created = crate::state::now();

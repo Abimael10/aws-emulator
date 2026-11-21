@@ -304,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Beanstalk application", so there has to be one to associate it with.
         if !store.applications.contains_key(&input.application_name) {
             return Err(CreateConfigurationTemplateError::invalid_parameter_value(
-                format!("No Application named '{}' found.", input.application_name),
+                crate::state::missing_application_message(&input.application_name),
             ));
         }
 

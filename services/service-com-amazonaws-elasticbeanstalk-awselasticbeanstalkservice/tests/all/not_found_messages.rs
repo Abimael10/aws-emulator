@@ -14,16 +14,21 @@
 //!   (`RestartAppServer`, `RebuildEnvironment`, `AbortEnvironmentUpdate`, the two
 //!   operations-role calls, `ApplyEnvironmentManagedAction` and the two health
 //!   reads);
-//! * the environment-lifecycle pair `TerminateEnvironment` and
-//!   `SwapEnvironmentCNAMEs`: `Environment not found with <Id|Name>: <value> in
-//!   account '<account>'`, naming the KIND of identifier, its value and the
-//!   account the lookup was made in — and, for the swap, leading with the role
-//!   the request gave that environment (`source` / `destination`) instead of
-//!   `Environment`;
+//! * the operations that act on an environment's own LIFECYCLE —
+//!   `UpdateEnvironment`, `TerminateEnvironment` and `SwapEnvironmentCNAMEs`:
+//!   `Environment not found with <Id|Name>: <value> in account '<account>'`,
+//!   naming the KIND of identifier, its value and the account the lookup was
+//!   made in — and, for the swap, leading with the role the request gave that
+//!   environment (`source` / `destination`) instead of `Environment`;
 //! * `DescribePlatformVersion`: `Platform '<PlatformArn>' does not exist.`
 //! * every configuration-template lookup: `No Configuration Template named
 //!   '<ApplicationName>/<TemplateName>' found.`, naming the template by the PAIR
 //!   that identifies one (a template name "must be unique per application").
+//! * an absent APPLICATION: `No Application named '<ApplicationName>' found.` —
+//!   and an operation whose request names an application together with a
+//!   resource resolved inside it (a saved configuration, an environment)
+//!   resolves the APPLICATION first, so an unknown application is reported as
+//!   such instead of being diagnosed as a missing template or environment.
 //!
 //! The templates are written out HERE rather than imported from the service, so
 //! a change to the service's builders that changes the wire wording fails these
@@ -37,7 +42,7 @@
 
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
-use crate::harness::{Emulator, PAST_DUE, SOLUTION_STACK};
+use crate::harness::{wait_for_status, Emulator, SOLUTION_STACK};
 use crate::lifecycle::{account, TEST_REGION};
 
 /// The template most of this service's environment lookups word a missing
@@ -72,6 +77,12 @@ fn missing_configuration_template(application_name: &str, template_name: &str) -
     format!("No Configuration Template named '{application_name}/{template_name}' found.")
 }
 
+/// The template every application lookup words a missing application with: the
+/// `ApplicationName` the request carried.
+fn missing_application(application_name: &str) -> String {
+    format!("No Application named '{application_name}' found.")
+}
+
 /// The modelled minimum length of `EnvironmentName` (`len 4..40`), from the
 /// member's own constraint in this service's Smithy model.
 const ENVIRONMENT_NAME_MIN: usize = 4;
@@ -81,6 +92,12 @@ const ENVIRONMENT_NAME_MAX: usize = 40;
 /// An operations role ARN, for the one operation that requires one beside the
 /// environment it names.
 const OPERATIONS_ROLE: &str = "arn:aws:iam::123456789012:role/beanstalk-ops";
+
+/// The modelled minimum length of `ApplicationName` (`len 1..100`), from the
+/// member's own constraint in this service's Smithy model.
+const APPLICATION_NAME_MIN: usize = 1;
+/// The modelled maximum length of `ApplicationName` (`len 1..100`).
+const APPLICATION_NAME_MAX: usize = 100;
 
 /// One row of an environment table: the request sent, which identifier member
 /// named the environment, and the value that member carried.
@@ -562,15 +579,66 @@ async fn every_configuration_template_lookup_names_the_application_and_the_templ
         200,
         "fixture \"template-msg-env\": expected 200 from CreateEnvironment"
     );
-    // The launch the clock owes, so the update below is refused by the template
-    // it names rather than by a status the launch left behind.
-    std::thread::sleep(PAST_DUE);
+    // Wait for the launch the clock owes to have COMPLETED, so the update below
+    // is refused by the template it names rather than by a status the launch
+    // left behind. Polled for the status itself, under the suite harness's
+    // generous deadline, so nothing here depends on how fast the host runs.
+    wait_for_status(
+        &emulator,
+        "template-msg-env",
+        "template-msg-env",
+        eb::state::STATUS_READY,
+    )
+    .await;
+
+    // A template that was created and then DELETED, so a row can read a name
+    // the application no longer holds: a deleted saved configuration is absent,
+    // and absent is what the read reports it as.
+    assert_eq!(
+        emulator
+            .call(
+                "CreateConfigurationTemplate",
+                &[
+                    ("ApplicationName", application),
+                    ("TemplateName", "deleted-later"),
+                    ("SolutionStackName", SOLUTION_STACK.as_str()),
+                ],
+            )
+            .await
+            .status,
+        200,
+        "fixture \"deleted-later\": expected 200 from CreateConfigurationTemplate"
+    );
+    assert_eq!(
+        emulator
+            .call(
+                "DeleteConfigurationTemplate",
+                &[
+                    ("ApplicationName", application),
+                    ("TemplateName", "deleted-later"),
+                ],
+            )
+            .await
+            .status,
+        200,
+        "fixture \"deleted-later\": expected 200 from DeleteConfigurationTemplate"
+    );
 
     // Rows differ along the operation that resolved the template and how the
     // pair misses: a template name no application holds, a template name its
-    // owner's SIBLING application does not hold, and a source template named by
-    // a create.
+    // owner's SIBLING application does not hold, one the application HELD until
+    // it was deleted, and a source template named by a create.
     let cases = vec![
+        TemplateCase {
+            case: "a read of a template the application no longer holds",
+            action: "DescribeConfigurationSettings",
+            params: vec![
+                ("ApplicationName", application.to_string()),
+                ("TemplateName", "deleted-later".to_string()),
+            ],
+            application_name: application.to_string(),
+            template_name: "deleted-later".to_string(),
+        },
         TemplateCase {
             case: "a launch from a template that does not exist",
             action: "CreateEnvironment",
@@ -667,6 +735,302 @@ async fn every_configuration_template_lookup_names_the_application_and_the_templ
         assert_eq!(
             refused.error_message(),
             expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            refused.error_message()
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_environment_names_the_identifier_and_the_account() {
+    let emulator = Emulator::new();
+    fixture(&emulator, "update-wording", "live-env").await;
+
+    let shortest_name = "g".repeat(ENVIRONMENT_NAME_MIN);
+    let longest_name = "g".repeat(ENVIRONMENT_NAME_MAX);
+    // Rows differ along which member named the environment, the form of the
+    // value it carried (shortest and longest the model allows, an id-shaped
+    // value and one that is not), and which other members the update carried
+    // beside the identifier — none of which changes the lookup, so none of them
+    // changes the template the refusal is worded in.
+    let cases = [
+        EnvironmentCase {
+            case: "UpdateEnvironment by a name nothing carries",
+            action: "UpdateEnvironment",
+            params: vec![
+                ("EnvironmentName", "ghost-env".to_string()),
+                ("Description", "changed".to_string()),
+            ],
+            member: "Name",
+            value: "ghost-env".to_string(),
+        },
+        EnvironmentCase {
+            case: "UpdateEnvironment by a name at the modelled minimum length",
+            action: "UpdateEnvironment",
+            params: vec![("EnvironmentName", shortest_name.clone())],
+            member: "Name",
+            value: shortest_name.clone(),
+        },
+        EnvironmentCase {
+            case: "UpdateEnvironment by a name at the modelled maximum length",
+            action: "UpdateEnvironment",
+            params: vec![("EnvironmentName", longest_name.clone())],
+            member: "Name",
+            value: longest_name.clone(),
+        },
+        EnvironmentCase {
+            case: "UpdateEnvironment by an id the service never issued",
+            action: "UpdateEnvironment",
+            params: vec![("EnvironmentId", "e-0123456789abc".to_string())],
+            member: "Id",
+            value: "e-0123456789abc".to_string(),
+        },
+        EnvironmentCase {
+            case: "UpdateEnvironment by an id that is not id-shaped at all",
+            action: "UpdateEnvironment",
+            params: vec![("EnvironmentId", "not-an-id".to_string())],
+            member: "Id",
+            value: "not-an-id".to_string(),
+        },
+        EnvironmentCase {
+            // Both members supplied: the id selects the environment, so the id
+            // is what the message reports even though the name resolves.
+            case: "UpdateEnvironment by an unknown id beside a live name",
+            action: "UpdateEnvironment",
+            params: vec![
+                ("EnvironmentId", "e-0000000000000".to_string()),
+                ("EnvironmentName", "live-env".to_string()),
+            ],
+            member: "Id",
+            value: "e-0000000000000".to_string(),
+        },
+        EnvironmentCase {
+            // An environment is addressed by its own identifier rather than
+            // inside an application, so naming the application the request's
+            // environment would belong to changes nothing about the lookup.
+            case: "UpdateEnvironment by a name nothing carries, under a live application",
+            action: "UpdateEnvironment",
+            params: vec![
+                ("ApplicationName", "update-wording".to_string()),
+                ("EnvironmentName", "ghost-env".to_string()),
+            ],
+            member: "Name",
+            value: "ghost-env".to_string(),
+        },
+        EnvironmentCase {
+            // An update that also asks for a configuration change is refused by
+            // the same lookup, before any of that change is looked at.
+            case: "UpdateEnvironment carrying an option setting",
+            action: "UpdateEnvironment",
+            params: vec![
+                ("EnvironmentName", "ghost-env".to_string()),
+                (
+                    "OptionSettings.member.1.Namespace",
+                    "aws:autoscaling:asg".to_string(),
+                ),
+                ("OptionSettings.member.1.OptionName", "MaxSize".to_string()),
+                ("OptionSettings.member.1.Value", "4".to_string()),
+            ],
+            member: "Name",
+            value: "ghost-env".to_string(),
+        },
+    ];
+
+    assert_refusals(&emulator, &cases, |row| {
+        missing_environment_in_account(None, row.member, &row.value)
+    })
+    .await;
+}
+
+/// One row of the application-order table: the operation, the request it is
+/// driven with, and the message the refusal has to carry.
+struct ApplicationOrderCase {
+    case: &'static str,
+    action: &'static str,
+    params: Vec<(&'static str, String)>,
+    expected: String,
+}
+
+/// An `OptionSettings` member, for the operation that requires one beside the
+/// configuration set it names.
+fn one_option_setting() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "OptionSettings.member.1.Namespace",
+            "aws:autoscaling:asg".to_string(),
+        ),
+        ("OptionSettings.member.1.OptionName", "MaxSize".to_string()),
+        ("OptionSettings.member.1.Value", "4".to_string()),
+    ]
+}
+
+#[tokio::test]
+async fn an_unknown_application_is_reported_before_the_resource_inside_it() {
+    let emulator = Emulator::new();
+    let application = "order-app";
+    fixture(&emulator, application, "order-env").await;
+    assert_eq!(
+        emulator
+            .call(
+                "CreateConfigurationTemplate",
+                &[
+                    ("ApplicationName", application),
+                    ("TemplateName", "order-template"),
+                    ("SolutionStackName", SOLUTION_STACK.as_str()),
+                ],
+            )
+            .await
+            .status,
+        200,
+        "fixture \"order-template\": expected 200 from CreateConfigurationTemplate"
+    );
+
+    let ghost = "order-ghost-app".to_string();
+    let shortest = "g".repeat(APPLICATION_NAME_MIN);
+    let longest = "g".repeat(APPLICATION_NAME_MAX);
+    // Rows differ along the operation that resolved the pair, which member
+    // named the resource inside the application (a saved configuration or an
+    // environment), whether that inner resource EXISTS under another
+    // application or not at all, and the form of the application name the
+    // request carried (shortest and longest the model allows).
+    let mut cases = vec![
+        ApplicationOrderCase {
+            case: "DeleteEnvironmentConfiguration under an application that does not exist",
+            action: "DeleteEnvironmentConfiguration",
+            params: vec![
+                ("ApplicationName", ghost.clone()),
+                ("EnvironmentName", "ghost-env".to_string()),
+            ],
+            expected: missing_application(&ghost),
+        },
+        ApplicationOrderCase {
+            // The environment EXISTS, under another application: the
+            // application is still what the request got wrong.
+            case: "DeleteEnvironmentConfiguration naming a live environment of another application",
+            action: "DeleteEnvironmentConfiguration",
+            params: vec![
+                ("ApplicationName", ghost.clone()),
+                ("EnvironmentName", "order-env".to_string()),
+            ],
+            expected: missing_application(&ghost),
+        },
+        ApplicationOrderCase {
+            case: "DeleteEnvironmentConfiguration under the shortest application name the model allows",
+            action: "DeleteEnvironmentConfiguration",
+            params: vec![
+                ("ApplicationName", shortest.clone()),
+                ("EnvironmentName", "order-env".to_string()),
+            ],
+            expected: missing_application(&shortest),
+        },
+        ApplicationOrderCase {
+            case: "DeleteEnvironmentConfiguration under the longest application name the model allows",
+            action: "DeleteEnvironmentConfiguration",
+            params: vec![
+                ("ApplicationName", longest.clone()),
+                ("EnvironmentName", "order-env".to_string()),
+            ],
+            expected: missing_application(&longest),
+        },
+        ApplicationOrderCase {
+            case: "DescribeConfigurationSettings for a template under an application that does not exist",
+            action: "DescribeConfigurationSettings",
+            params: vec![
+                ("ApplicationName", ghost.clone()),
+                ("TemplateName", "order-template".to_string()),
+            ],
+            expected: missing_application(&ghost),
+        },
+        ApplicationOrderCase {
+            case: "DescribeConfigurationSettings for an environment under an application that does not exist",
+            action: "DescribeConfigurationSettings",
+            params: vec![
+                ("ApplicationName", ghost.clone()),
+                ("EnvironmentName", "order-env".to_string()),
+            ],
+            expected: missing_application(&ghost),
+        },
+        ApplicationOrderCase {
+            case: "DescribeConfigurationOptions for a template under an application that does not exist",
+            action: "DescribeConfigurationOptions",
+            params: vec![
+                ("ApplicationName", ghost.clone()),
+                ("TemplateName", "order-template".to_string()),
+            ],
+            expected: missing_application(&ghost),
+        },
+        ApplicationOrderCase {
+            case: "UpdateConfigurationTemplate under an application that does not exist",
+            action: "UpdateConfigurationTemplate",
+            params: vec![
+                ("ApplicationName", ghost.clone()),
+                ("TemplateName", "order-template".to_string()),
+                ("Description", "changed".to_string()),
+            ],
+            expected: missing_application(&ghost),
+        },
+        // The complement of the rule: where the application DOES exist, the
+        // refusal names the resource inside it that does not — so what the
+        // rows above pin is the ORDER, not a blanket application message.
+        ApplicationOrderCase {
+            case: "DeleteEnvironmentConfiguration naming an environment nothing answers to",
+            action: "DeleteEnvironmentConfiguration",
+            params: vec![
+                ("ApplicationName", application.to_string()),
+                ("EnvironmentName", "ghost-env".to_string()),
+            ],
+            expected: no_environment_found("EnvironmentName", "ghost-env"),
+        },
+        ApplicationOrderCase {
+            case: "DescribeConfigurationSettings naming a template nothing answers to",
+            action: "DescribeConfigurationSettings",
+            params: vec![
+                ("ApplicationName", application.to_string()),
+                ("TemplateName", "never-created".to_string()),
+            ],
+            expected: missing_configuration_template(application, "never-created"),
+        },
+    ];
+    // The operation that requires an `OptionSettings` list beside the
+    // configuration set it names resolves the application in the same order.
+    let mut validate = vec![
+        ("ApplicationName", ghost.clone()),
+        ("TemplateName", "order-template".to_string()),
+    ];
+    validate.extend(one_option_setting());
+    cases.push(ApplicationOrderCase {
+        case: "ValidateConfigurationSettings under an application that does not exist",
+        action: "ValidateConfigurationSettings",
+        params: validate,
+        expected: missing_application(&ghost),
+    });
+
+    for ApplicationOrderCase {
+        case,
+        action,
+        params,
+        expected,
+    } in &cases
+    {
+        let params: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let refused = emulator.call(action, &params).await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400, got {} and body {}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidParameterValue",
+            "case {case:?}: expected InvalidParameterValue, got body {}",
+            refused.body
+        );
+        assert_eq!(
+            refused.error_message(),
+            *expected,
             "case {case:?}: expected {expected:?}, got {:?}",
             refused.error_message()
         );

@@ -4589,8 +4589,8 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
 /// This is the wording the real service answers MOST of its environment lookups
 /// in (`RestartAppServer`, `RebuildEnvironment`, `AbortEnvironmentUpdate`, the
 /// two operations-role calls, `ApplyEnvironmentManagedAction` and the two health
-/// reads, as their recorded transcripts show). The environment-lifecycle pair
-/// answers in a template of its own, which is
+/// reads, as their recorded transcripts show). The operations that act on an
+/// environment's own LIFECYCLE answer in a template of their own, which is
 /// [`missing_environment_in_account_message`]: an operation's not-found message
 /// is the one the real service words THAT operation's refusal with, so neither
 /// template is applied to an operation that does not answer in it.
@@ -4702,12 +4702,14 @@ pub const ENVIRONMENT_ROLE_SOURCE: &str = "source";
 /// The destination half of [`ENVIRONMENT_ROLE_SOURCE`].
 pub const ENVIRONMENT_ROLE_DESTINATION: &str = "destination";
 
-/// The message the ENVIRONMENT-LIFECYCLE pair — `TerminateEnvironment` and
-/// `SwapEnvironmentCNAMEs` — refuses a request with `InvalidParameterValue` for
-/// when the identifier it supplied names no stored environment.
+/// The message the operations that act on an environment's own LIFECYCLE —
+/// `UpdateEnvironment`, `TerminateEnvironment` and `SwapEnvironmentCNAMEs`,
+/// the ones that move an environment to a new configuration, end it, or move
+/// its address — refuse a request with `InvalidParameterValue` for when the
+/// identifier it supplied names no stored environment.
 ///
 /// Also built from the request alone, but in the real service's other template
-/// for these two: the kind of identifier the caller used (`Id` or `Name`), the
+/// for these: the kind of identifier the caller used (`Id` or `Name`), the
 /// value it carried, and the ACCOUNT the lookup was made in —
 /// `Environment not found with Name: <value> in account '<account>'`. `role`
 /// (`None` for an operation that names a single environment) replaces the
@@ -4784,6 +4786,21 @@ pub const RESOURCE_APPLICATION_VERSION: &str = "Application Version";
 pub const RESOURCE_CONFIGURATION_TEMPLATE: &str = "Configuration Template";
 
 /// The message this service refuses a request with `InvalidParameterValue` for
+/// when the `ApplicationName` it supplied names no application this account
+/// holds, built from the request: `No Application named '<name>' found.`
+///
+/// The application CONTAINS the versions, the saved configurations and the
+/// environments every other name in such a request is resolved inside, so an
+/// operation that names one resolves the application FIRST and answers in this
+/// sentence — a caller that got the application name wrong is told so, rather
+/// than told that the resource it was looking for inside it is missing. Read
+/// from the one place every caller reads it, so two operations cannot word one
+/// refusal two ways.
+pub fn missing_application_message(application_name: &str) -> String {
+    format!("No Application named '{application_name}' found.")
+}
+
+/// The message this service refuses a request with `InvalidParameterValue` for
 /// when the `(ApplicationName, TemplateName)` pair it supplied names no stored
 /// configuration template, built from the request: `No Configuration Template
 /// named '<application>/<template>' found.`
@@ -4792,10 +4809,9 @@ pub const RESOURCE_CONFIGURATION_TEMPLATE: &str = "Configuration Template";
 /// one: the sentence names the template the way the lookup did, the application
 /// and the template joined by `/`, which is what tells a caller that passed the
 /// right template name under the wrong application which half was wrong. The
-/// same shape as the not-found sentences the create operations answer a bad
-/// `ApplicationName` or `VersionLabel` with (`No Application named '<name>'
-/// found.`), read from the one place every caller reads it, so two operations
-/// cannot word one refusal two ways.
+/// same shape as the not-found sentence an absent application is answered with
+/// ([`missing_application_message`]), read from the one place every caller reads
+/// it, so two operations cannot word one refusal two ways.
 pub fn missing_configuration_template_message(
     application_name: &str,
     template_name: &str,
