@@ -5,13 +5,13 @@
 //! # The rule
 //!
 //! Two stacks front this service's operations, and a request refused before any handler ran
-//! is answered by the one that fronts the operation it addressed:
+//! is answered by the one that fronts the operation it addressed. Which stack that is
+//! follows from the RESOURCE TREE the operation's `@http` binding addresses:
 //!
-//! * a MULTICAST-GROUP operation — one addressed under the `/multicast-groups` resource path
-//!   ([`MULTICAST_GROUP_PATH`]) — is fronted by the multicast stack, which answers the
-//!   GENERIC constraint refusal: the code this protocol carries for one
-//!   (`ValidationException`) and the text in that envelope's own `message` member, quoting
-//!   the value it rejected;
+//! * an operation under one of the resource trees the LoRaWAN data-transfer plane owns
+//!   ([`TRANSFER_PLANE_PATHS`]) is fronted by that plane, which answers the GENERIC
+//!   constraint refusal: the code this protocol carries for one (`ValidationException`) and
+//!   the text in that envelope's own `message` member, quoting the value it rejected;
 //! * every other operation answers the MODELLED error shape, whose text travels in the
 //!   `Message` member every error shape of this model declares
 //!   (`smithy_query(query="shape",
@@ -22,10 +22,11 @@
 //! Both halves of that split — the member the text is in, and whether the value is quoted —
 //! are observable on each stack together, which is what makes it one boundary between two
 //! front doors rather than two coincidences. WHICH side an operation falls on is recorded
-//! for `CreateMulticastGroup` on the multicast side and for `CreateDestination`,
-//! `CreateDeviceProfile`, `CreateNetworkAnalyzerConfiguration` and `CreateWirelessGateway`
-//! on the other; every other operation follows the one property those two sets differ in —
-//! the resource path its `@http` binding addresses — rather than a row of its own.
+//! for `CreateMulticastGroup` and `CreateFuotaTask` on the transfer-plane side and for
+//! `CreateDestination`, `CreateDeviceProfile`, `CreateNetworkAnalyzerConfiguration` and
+//! `CreateWirelessGateway` on the other; every other operation follows the one property
+//! those two sets differ in — the resource tree its `@http` binding addresses — rather than
+//! a row of its own.
 //!
 //! The WORDS are not chosen here: [`super::refusal_wording`] composes both wordings over the
 //! same violations, because the refusal seam is handed the violations alone and cannot see
@@ -57,11 +58,12 @@ use service_common::error_detail_member::{
 };
 use service_common::restated_refusal::RestatedRefusalOperation;
 
-/// The resource path the multicast-group stack is addressed under, from those operations'
-/// own `@http` bindings (`smithy_query(query="operation",
-/// operation="CreateMulticastGroup,GetMulticastGroup,…")`: `/multicast-groups`,
-/// `/multicast-groups/{Id}` and the sub-resources below it).
-const MULTICAST_GROUP_PATH: &str = "/multicast-groups";
+/// The resource trees the LoRaWAN data-transfer plane — multicast distribution and the
+/// firmware-over-the-air tasks that ride it — is addressed under, from those operations' own
+/// `@http` bindings (`smithy_query(query="operation",
+/// operation="CreateMulticastGroup,GetMulticastGroup,CreateFuotaTask,GetFuotaTask,…")`: each
+/// collection, its `/{Id}` member and every sub-resource below it.
+const TRANSFER_PLANE_PATHS: [&str; 2] = ["/multicast-groups", "/fuota-tasks"];
 
 /// The member the framework's own refusal renderer writes an error's text in: the member of
 /// the synthetic shape it builds a pre-handler refusal from, which the multicast stack's
@@ -97,23 +99,23 @@ const MODELLED_ERROR_SHAPES: [&str; 7] = [
 pub static REFUSAL_ENVELOPE: RestatedRefusalOperation =
     RestatedRefusalOperation::new(with_refusal_envelope);
 
-/// Whether the multicast-group stack fronts the operation `uri` addresses, and so whether a
+/// Whether the data-transfer plane fronts the operation `uri` addresses, and so whether a
 /// refusal raised before its handler ran is answered in the generic envelope.
 #[must_use]
-pub fn multicast_group_stack_fronts(uri: &str) -> bool {
+pub fn transfer_plane_fronts(uri: &str) -> bool {
     let path = service_common::request_path(uri);
-    match path.strip_prefix(MULTICAST_GROUP_PATH) {
+    TRANSFER_PLANE_PATHS.iter().any(|tree| {
         // The collection itself, or a resource below it — never another path this one is
         // merely a textual prefix of.
-        Some(rest) => rest.is_empty() || rest.starts_with('/'),
-        None => false,
-    }
+        path.strip_prefix(tree)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
 }
 
 /// `resp` as this service answers it, for a response to `req`, with `withheld` the words
 /// `Service::override_refusal` stated for the stack that withholds the rejected value.
 ///
-/// A request the multicast stack fronts keeps the envelope the framework rendered, value and
+/// A request the transfer plane fronts keeps the envelope the framework rendered, value and
 /// `message` member together. Every other refusal the framework rendered reports its text in
 /// the `Message` member this model declares, in those withheld words — and in the words the
 /// body already carried for a refusal this service did not word (a body the codec could not
@@ -128,7 +130,7 @@ pub fn with_refusal_envelope(
     resp: RtResponse,
     withheld: Option<String>,
 ) -> RtResponse {
-    if multicast_group_stack_fronts(req.uri()) {
+    if transfer_plane_fronts(req.uri()) {
         return resp;
     }
     match withheld {
@@ -152,11 +154,12 @@ pub fn with_refusal_envelope(
 mod tests {
     use super::*;
 
-    /// RULE: the stack that fronts a request is the one owning the resource path it
-    /// addresses — every multicast-group path on one side, every other path on the other.
+    /// RULE: the stack that fronts a request is the one owning the resource tree it
+    /// addresses — every tree the transfer plane owns on one side, every other path on the
+    /// other.
     #[test]
     fn the_addressed_resource_path_decides_the_stack() {
-        // (case, the request target, whether the multicast stack fronts it)
+        // (case, the request target, whether the transfer plane fronts it)
         let rows: &[(&str, &str, bool)] = &[
             ("the multicast group collection", "/multicast-groups", true),
             ("one group", "/multicast-groups/id-1", true),
@@ -172,6 +175,23 @@ mod tests {
                 "https://api.iotwireless.us-west-2.amazonaws.com/multicast-groups",
                 true,
             ),
+            ("the FUOTA task collection", "/fuota-tasks", true),
+            ("one task", "/fuota-tasks/id-1", true),
+            (
+                "a task's groups, a sub-resource of the tree",
+                "/fuota-tasks/id-1/multicast-groups",
+                true,
+            ),
+            (
+                "a task's device association, a sub-resource of the tree",
+                "/fuota-tasks/id-1/wireless-device",
+                true,
+            ),
+            (
+                "a task listing with a query string",
+                "/fuota-tasks?maxResults=1",
+                true,
+            ),
             ("the destinations collection", "/destinations", false),
             ("one destination", "/destinations/dest-1", false),
             ("the device profiles", "/device-profiles", false),
@@ -181,23 +201,24 @@ mod tests {
                 false,
             ),
             ("the wireless gateways", "/wireless-gateways", false),
+            ("the wireless devices", "/wireless-devices", false),
             (
-                "a group listing under another resource",
-                "/fuota-tasks/id-1/multicast-groups",
+                "a path a group prefix is only textual in",
+                "/multicast-groups-elsewhere",
                 false,
             ),
             (
-                "a path the prefix is only textual in",
-                "/multicast-groups-elsewhere",
+                "a path a task prefix is only textual in",
+                "/fuota-tasks-elsewhere",
                 false,
             ),
         ];
 
         for (case, uri, fronted) in rows {
             assert_eq!(
-                multicast_group_stack_fronts(uri),
+                transfer_plane_fronts(uri),
                 *fronted,
-                "case {case:?}: expected the multicast stack to front {uri:?} = {fronted}"
+                "case {case:?}: expected the transfer plane to front {uri:?} = {fronted}"
             );
         }
     }

@@ -15,10 +15,10 @@
 //!   value; the requirement (the accepted value set and its order, the numeric limit, the
 //!   expression) is the service's own fixed text;
 //! * two stacks front this service, and a refusal is answered in the envelope of the one that
-//!   fronts the operation it addressed: a multicast-group operation in the generic envelope
-//!   (the value quoted, the text in `message`), every other operation in the modelled
-//!   `ValidationException` (the submitted value withheld, the text in the `Message` member the
-//!   model declares);
+//!   fronts the resource tree it addressed: an operation on the LoRaWAN data-transfer plane
+//!   (the multicast-group and FUOTA-task trees) in the generic envelope (the value quoted, the
+//!   text in `message`), every other operation in the modelled `ValidationException` (the
+//!   submitted value withheld, the text in the `Message` member the model declares);
 //! * an enumerated type's admissible values are listed in the order the service's own front
 //!   door lists them, which is neither the model's declaration order nor sorted;
 //! * only a refusal the framework rendered is restated: a success and an error a handler
@@ -79,6 +79,28 @@ const GATEWAY_MAX_EIRP: i64 = 30;
 /// 0..250.
 const LIST_MAX_RESULTS: i64 = 250;
 
+/// `CreateFuotaTask`'s two `@required` firmware members and their published length floors.
+/// Source: `smithy_query(query="operation", operation="CreateFuotaTask")` —
+/// `FirmwareUpdateRole` `@length` 1..2048 and `FirmwareUpdateImage` `@length` 1..4096.
+const FIRMWARE_MEMBER_MIN_LENGTH: i64 = 1;
+
+/// `RedundancyPercent`'s published ceiling on a FUOTA task.
+/// Source: `smithy_query(query="operation", operation="CreateFuotaTask")` — `@range` 0..100.
+const REDUNDANCY_PERCENT_MAX: i64 = 100;
+const REDUNDANCY_PERCENT_MIN: i64 = 0;
+
+/// `FileDescriptor`'s expression, as the model writes it.
+/// Source: `smithy_query(query="operation", operation="CreateFuotaTask")` — the `Descriptor`
+/// member's `@pattern`.
+const FILE_DESCRIPTOR_PATTERN: &str =
+    "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$";
+
+/// A firmware image URI the model's `FirmwareUpdateImage` accepts.
+const FIRMWARE_IMAGE: &str = "s3://iotwireless-firmware/image.bin";
+
+/// A firmware update role the model's `FirmwareUpdateRole` accepts.
+const FIRMWARE_ROLE: &str = "arn:aws:iam::000000000000:role/iotwireless-fuota";
+
 /// AWS's envelope over the one clause of a refusal that broke one constraint.
 fn envelope(clause: &str) -> String {
     format!("1 validation error detected: {clause}")
@@ -113,6 +135,11 @@ fn at_least(bound: i64) -> String {
     format!("Member must have value greater than or equal to {bound}")
 }
 
+/// The requirement a value shorter than a `@length` floor broke.
+fn at_least_length(bound: i64) -> String {
+    format!("Member must have length greater than or equal to {bound}")
+}
+
 /// The requirement a value outside an expression broke.
 fn matching(pattern: &str) -> String {
     format!("Member must satisfy regular expression pattern: {pattern}")
@@ -131,6 +158,16 @@ fn destination_body(expression_type: Value) -> Value {
         "Expression": "iot-rule",
         "RoleArn": "arn:aws:iam::000000000000:role/iotwireless-destination",
     })
+}
+
+/// A FUOTA task create body the model's shapes accept but for the member under test.
+fn fuota_task_body(member: &str, value: Value) -> Value {
+    let mut body = json!({
+        "FirmwareUpdateImage": FIRMWARE_IMAGE,
+        "FirmwareUpdateRole": FIRMWARE_ROLE,
+    });
+    body[member] = value;
+    body
 }
 
 /// One refused create per operation on the stack that answers the MODELLED shape: the text
@@ -230,10 +267,10 @@ async fn a_refusal_outside_the_multicast_stack_states_the_modelled_shape() {
     }
 }
 
-/// One refused call per member on the multicast-group stack: the generic envelope, the text
+/// One refused call per member on the data-transfer plane: the generic envelope, the text
 /// in its own member, and the value the request submitted quoted back.
 #[tokio::test]
-async fn a_refusal_on_the_multicast_stack_states_the_generic_envelope() {
+async fn a_refusal_on_the_transfer_plane_states_the_generic_envelope() {
     // (case, method, target, body, the expected message)
     let rows: Vec<(&str, Method, &str, Option<Value>, String)> = vec![
         (
@@ -280,6 +317,89 @@ async fn a_refusal_on_the_multicast_stack_states_the_generic_envelope() {
                 &at_most(LIST_MAX_RESULTS),
             ),
         ),
+        (
+            "an empty firmware update role, the recorded case",
+            Method::POST,
+            "/fuota-tasks",
+            Some(fuota_task_body("FirmwareUpdateRole", json!(""))),
+            quoted(
+                "",
+                "firmwareUpdateRole",
+                &at_least_length(FIRMWARE_MEMBER_MIN_LENGTH),
+            ),
+        ),
+        (
+            "an empty firmware update image, the sibling member under the same rule",
+            Method::POST,
+            "/fuota-tasks",
+            Some(fuota_task_body("FirmwareUpdateImage", json!(""))),
+            quoted(
+                "",
+                "firmwareUpdateImage",
+                &at_least_length(FIRMWARE_MEMBER_MIN_LENGTH),
+            ),
+        ),
+        (
+            "a redundancy percentage above its ceiling",
+            Method::POST,
+            "/fuota-tasks",
+            Some(fuota_task_body(
+                "RedundancyPercent",
+                json!(REDUNDANCY_PERCENT_MAX + 1),
+            )),
+            quoted(
+                &(REDUNDANCY_PERCENT_MAX + 1).to_string(),
+                "redundancyPercent",
+                &at_most(REDUNDANCY_PERCENT_MAX),
+            ),
+        ),
+        (
+            "a redundancy percentage below its floor",
+            Method::POST,
+            "/fuota-tasks",
+            Some(fuota_task_body(
+                "RedundancyPercent",
+                json!(REDUNDANCY_PERCENT_MIN - 1),
+            )),
+            quoted(
+                &(REDUNDANCY_PERCENT_MIN - 1).to_string(),
+                "redundancyPercent",
+                &at_least(REDUNDANCY_PERCENT_MIN),
+            ),
+        ),
+        (
+            "a file descriptor outside its expression",
+            Method::POST,
+            "/fuota-tasks",
+            Some(fuota_task_body("Descriptor", json!("not base64!"))),
+            quoted(
+                "not base64!",
+                "descriptor",
+                &matching(FILE_DESCRIPTOR_PATTERN),
+            ),
+        ),
+        (
+            "a task page size above its ceiling",
+            Method::GET,
+            "/fuota-tasks?maxResults=251",
+            None,
+            quoted(
+                &(LIST_MAX_RESULTS + 1).to_string(),
+                "maxResults",
+                &at_most(LIST_MAX_RESULTS),
+            ),
+        ),
+        (
+            "a page size above its ceiling on a sub-resource of the task tree",
+            Method::GET,
+            "/fuota-tasks/id-1/multicast-groups?maxResults=251",
+            None,
+            quoted(
+                &(LIST_MAX_RESULTS + 1).to_string(),
+                "maxResults",
+                &at_most(LIST_MAX_RESULTS),
+            ),
+        ),
     ];
 
     for (case, method, target, body, expected) in rows {
@@ -313,8 +433,8 @@ async fn a_refusal_on_the_multicast_stack_states_the_generic_envelope() {
 async fn an_absent_required_member_states_the_null_the_walk_reports() {
     let router = router();
 
-    // (case, target, body, the member the request left out)
-    let rows: Vec<(&str, &str, Value, &str)> = vec![
+    // (case, target, body, the member the request left out, the member the text lands in)
+    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
         (
             "a destination with no name",
             "/destinations",
@@ -324,16 +444,32 @@ async fn an_absent_required_member_states_the_null_the_walk_reports() {
                 "RoleArn": "arn:aws:iam::000000000000:role/iotwireless-destination",
             }),
             "name",
+            MODELLED_MEMBER,
         ),
         (
             "a wireless gateway with no LoRaWAN block",
             "/wireless-gateways",
             json!({ "Name": "RefusalGateway" }),
             "loRaWAN",
+            MODELLED_MEMBER,
+        ),
+        (
+            "a FUOTA task with no firmware update role",
+            "/fuota-tasks",
+            json!({ "FirmwareUpdateImage": FIRMWARE_IMAGE }),
+            "firmwareUpdateRole",
+            RENDERED_MEMBER,
+        ),
+        (
+            "a multicast group with no LoRaWAN block",
+            "/multicast-groups",
+            json!({ "Name": "RefusalGroup" }),
+            "loRaWAN",
+            RENDERED_MEMBER,
         ),
     ];
 
-    for (case, target, body, member) in rows {
+    for (case, target, body, member, carried_in) in rows {
         let (status, answered) = call(&router, Method::POST, target, Some(body)).await;
         let expected = envelope(&format!(
             "Value null at '{member}' failed to satisfy constraint: Member must not be null"
@@ -344,9 +480,10 @@ async fn an_absent_required_member_states_the_null_the_walk_reports() {
             "case {case:?}: expected 400, got {status} {answered}"
         );
         assert_eq!(
-            text_under(&answered, MODELLED_MEMBER).as_deref(),
+            text_under(&answered, carried_in).as_deref(),
             Some(expected.as_str()),
-            "case {case:?}: expected the absent member stated with its null, got {answered}"
+            "case {case:?}: expected the absent member stated with its null under \
+             {carried_in:?}, got {answered}"
         );
     }
 }
@@ -415,6 +552,53 @@ async fn a_response_the_refusal_layer_does_not_own_is_answered_unchanged() {
         status,
         StatusCode::OK,
         "expected the group to read back, got {status} {fetched}"
+    );
+
+    // A create on the FUOTA-task tree, the other resource tree the transfer plane owns.
+    let (status, task) = call(
+        &router,
+        Method::POST,
+        "/fuota-tasks",
+        Some(fuota_task_body("Name", json!("KeptTask"))),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "expected 201 from CreateFuotaTask, got {status} {task}"
+    );
+    let id = task["Id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the created task must carry an Id: {task}"))
+        .to_string();
+    let (status, fetched) = call(&router, Method::GET, &format!("/fuota-tasks/{id}"), None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "expected the task to read back, got {status} {fetched}"
+    );
+    assert_eq!(
+        fetched["FirmwareUpdateRole"],
+        json!(FIRMWARE_ROLE),
+        "expected the stored firmware update role, got {fetched}"
+    );
+
+    // An error a HANDLER returned on the transfer plane keeps the modelled member it was
+    // serialized with: only a refusal the framework rendered is answered in the generic
+    // envelope.
+    let (status, missing) = call(&router, Method::GET, "/fuota-tasks/NoSuchTask", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "expected 404 for an unknown FUOTA task, got {status} {missing}"
+    );
+    assert!(
+        text_under(&missing, MODELLED_MEMBER).is_some(),
+        "expected the handler's own sentence under {MODELLED_MEMBER:?}, got {missing}"
+    );
+    assert!(
+        missing.get(RENDERED_MEMBER).is_none(),
+        "expected the handler's error to carry its text under ONE member, got {missing}"
     );
 
     // An error a handler returned: the modelled 404, serialized from the model's own shape.

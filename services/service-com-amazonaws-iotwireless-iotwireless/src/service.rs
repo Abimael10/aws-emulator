@@ -45,8 +45,8 @@
 //! ([`refusal_wording`]) and notes, for the request being served, the words the stack that
 //! withholds the rejected value states; `override_operation` serves every routable request
 //! through `service_common::restated_refusal`'s wrapper, which answers that refusal in the
-//! envelope of the stack fronting the operation it addressed ([`refusal_envelope`]). Routing,
-//! status and the error code all stay with the framework.
+//! envelope of the stack fronting the resource tree it addressed ([`refusal_envelope`]).
+//! Routing, status and the error code all stay with the framework.
 
 pub mod refusal_envelope;
 pub mod refusal_wording;
@@ -101,7 +101,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Every request the generated routing table can serve is served through the shared
         // wrapper (`service_common::restated_refusal`), which delegates to that same table
         // entry and then answers a refusal the framework rendered for it in the envelope of
-        // the stack fronting the operation it addressed (see [`refusal_envelope`]). The
+        // the stack fronting the resource tree it addressed (see [`refusal_envelope`]). The
         // routing stays the model's: a request the table cannot serve is declined here, so
         // the framework answers it as the unroutable request it is.
         service_common::restated_refusal::routes(&self.entry, req)
