@@ -1057,3 +1057,148 @@ async fn a_completed_delete_leaves_the_listing_without_that_entity() {
         "case \"the delete\": the read agrees with the listing, got {status} with {gone:?}"
     );
 }
+
+/// One row of the refused-submission table: the case, the submission body, the `libraryArn`
+/// it was addressed to, and the (entity type, entity id) pair the read then probes in the
+/// library that exists.
+type RefusedSubmissionRow<'a> = (&'a str, Value, String, &'a str, String);
+
+/// RULE: a read of a (library, entity type, entity id) triple answers from what the
+/// COMPLETED ingestions of that library left under the pair, so a submission the service
+/// REFUSED stands nothing up: every well-formed read of an id only such a submission named
+/// resolves to nothing, and is answered with the operation's modelled
+/// `ResourceNotFoundException` (HTTP 404) carrying this service's fixed sentence for an
+/// unresolved entity — never with an outcome the operation does not model.
+///
+/// The rows differ along HOW the submission was refused (an `entityType` outside the modelled
+/// enum, an `operationType` outside it, a `libraryArn` naming another resource type, and a
+/// submission naming no input source), along the modelled entity type the read then probes
+/// (`smithy_query(query="shape",shape="EntityType")` -> `["VOCABULARY",
+/// "RECOGNIZED_PERSON"]`, so both are covered) and along the `entityId` form it names —
+/// hyphens, underscores, digits and the longest id the modelled `@length(min: 1, max: 128)`
+/// admits.
+#[tokio::test]
+async fn an_id_only_a_refused_ingestion_named_is_refused_by_the_read() {
+    let router = emulator();
+    let library = create_library(&router, "refused-ingestion-library").await;
+    // The longest `entityId` the modelled length admits: 128 characters of the modelled
+    // `^[a-zA-Z0-9-_]+$`.
+    let longest_id = format!("probe_{}", "a".repeat(122));
+    assert_eq!(
+        longest_id.chars().count(),
+        128,
+        "the longest-id row must name the modelled maximum, got {longest_id:?}"
+    );
+    /// A `libraryArn`-shaped value of ANOTHER resource type, which the modelled
+    /// `DataAutomationLibraryArn` pattern does not admit.
+    const WRONG_ARN_TYPE: &str =
+        "arn:aws:bedrock:us-east-1:000000000000:data-automation-project/abcdefghijkl";
+
+    // The sentence this error class carries, spelled out once here so the wording itself is
+    // pinned and not merely compared with whatever the service happens to hold: it is fixed
+    // text naming the two input members that address an entity, with neither of their values
+    // interpolated.
+    assert_eq!(
+        state::library_entities::ENTITY_NOT_FOUND_MESSAGE,
+        "The specified entity ID and entity type is not found.",
+        "the sentence an unresolved entity is refused with must read as the service words it"
+    );
+
+    let upsert_of = |entity_id: &str| {
+        json!({
+            "upsertEntitiesInfo": [{
+                "vocabulary": {
+                    "entityId": entity_id,
+                    "language": "EN",
+                    "phrases": [{ "text": "kingfisher" }],
+                },
+            }],
+        })
+    };
+
+    let rows: Vec<RefusedSubmissionRow<'_>> = vec![
+        (
+            "an entityType outside the modelled enum",
+            submission("SPEAKER", "UPSERT", upsert_of("probe-unmodelled-type")),
+            library.clone(),
+            "VOCABULARY",
+            "probe-unmodelled-type".to_string(),
+        ),
+        (
+            "an operationType outside the modelled enum",
+            submission("VOCABULARY", "REPLACE", upsert_of("probe_unmodelled_operation")),
+            library.clone(),
+            "VOCABULARY",
+            "probe_unmodelled_operation".to_string(),
+        ),
+        (
+            "a libraryArn naming another resource type",
+            submission("VOCABULARY", "UPSERT", upsert_of("0123456789")),
+            WRONG_ARN_TYPE.to_string(),
+            "VOCABULARY",
+            "0123456789".to_string(),
+        ),
+        (
+            "a submission naming no input source",
+            json!({
+                "entityType": "RECOGNIZED_PERSON",
+                "operationType": "UPSERT",
+                "inputConfiguration": {},
+                "outputConfiguration": { "s3Uri": "s3://bda-ingestion/output/" },
+            }),
+            library.clone(),
+            "RECOGNIZED_PERSON",
+            longest_id.clone(),
+        ),
+    ];
+
+    for (case, body, submitted_to, entity_type, entity_id) in rows {
+        let (status, refused) = call(&router, "PUT", &jobs_uri(&submitted_to), &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the submission refused with 400, got {status} with \
+             {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ValidationException",
+            "case {case:?}: expected a ValidationException, got {refused:?}"
+        );
+        assert!(
+            refused.get("jobArn").is_none(),
+            "case {case:?}: a refused submission mints no job, got {refused:?}"
+        );
+
+        // The read of the id that submission named: it resolves to nothing, because nothing
+        // was ever ingested under it.
+        let (status, absent) = get_entity(&router, &library, entity_type, &entity_id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 for the never-ingested id, got {status} with {absent:?}"
+        );
+        assert_eq!(
+            error_code(&absent),
+            "ResourceNotFoundException",
+            "case {case:?}: expected the modelled refusal, got {absent:?}"
+        );
+        assert_eq!(
+            absent.get("message").and_then(Value::as_str),
+            Some(state::library_entities::ENTITY_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected this service's sentence for an unresolved entity, got \
+             {absent:?}"
+        );
+        assert!(
+            absent.get("entity").is_none(),
+            "case {case:?}: a refusal carries no entity, got {absent:?}"
+        );
+
+        // The read writes nothing, so asking again answers exactly the same refusal.
+        let (again_status, again) = get_entity(&router, &library, entity_type, &entity_id).await;
+        assert_eq!(
+            (again_status, &again),
+            (status, &absent),
+            "case {case:?}: two reads must answer the same refusal, got {again_status} with \
+             {again:?}"
+        );
+    }
+}
