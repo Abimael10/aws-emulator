@@ -6,9 +6,11 @@
 //! RULE: `DeleteCustomLineItem` removes the stored custom line item its `Arn` names (in
 //! either form the `CustomLineItemArn` pattern admits) from the billing periods the
 //! request names, so a later read reports it only for the periods the delete did not
-//! cover: a request carrying no `BillingPeriodRange` deletes the item itself (no read of
-//! any billing period reports it again, and the associations other custom line items
-//! held to it go with it), and a request carrying one deletes it only from the half-open
+//! cover: a request carrying no `BillingPeriodRange` ends the item FROM the billing
+//! period the call is made in and never earlier (the periods before it are closed bills
+//! the item really carried its charge in, so they go on reporting it, and the
+//! associations other custom line items held to it lose exactly the same periods), and a
+//! request carrying one deletes it only from the half-open
 //! span that range covers, so the item keeps every OTHER period it applied in: the
 //! periods before the range's inclusive start and the periods from its exclusive end on,
 //! both of them when the range falls strictly inside the periods the item applied in. It
@@ -321,29 +323,50 @@ fn assert_refused(
     );
 }
 
-/// The billing periods every row reads the item back at: two years of quarters around
-/// the spans the rows use, plus the current billing period (the one a read with no
-/// `BillingPeriod` uses).
-const PROBE_PERIODS: &[&str] = &[
-    "2025-01", "2026-01", "2026-02", "2026-03", "2026-05", "2026-06", "2026-07", "2026-08",
-    "2026-09", "2026-12", "2027-06",
-];
+/// The billing periods every row reads the item back at, as offsets from the CURRENT
+/// billing period: a year and a couple of months before the period the delete lands in,
+/// that period itself, and the months and the year after it.
+const PROBE_OFFSETS: &[i64] = &[-13, -2, -1, 0, 1, 6, 13];
 
-/// THE RULE for a request that names no billing periods: the item itself is deleted, so
-/// no read of any billing period reports it again, whatever span it was created with and
-/// whichever form of its ARN the request used.
+/// One row of the unbounded-delete table: the case, the create members beyond the ones
+/// every create needs, whether the request addresses the item by its bare id, the probed
+/// offsets a read reports the item for BEFORE the delete, and the ones it reports it for
+/// AFTER it.
+type UnboundedRow = (&'static str, Value, bool, Vec<i64>, Vec<i64>);
+
+/// THE RULE for a request that names no billing periods: the delete ends the item FROM
+/// the billing period the call is made in and never earlier, so no read of that period or
+/// of a later one reports it while every EARLIER period it applied in — a closed bill it
+/// really carried its charge in — goes on reporting it, whatever span the item was
+/// created with and whichever form of its ARN the request used. The record itself goes
+/// only once nothing of it is left, which is when a second such delete has no item to
+/// address.
 #[tokio::test]
-async fn a_delete_naming_no_billing_period_range_removes_the_item_from_every_period() {
+async fn a_delete_naming_no_billing_period_range_ends_the_item_from_the_current_period() {
     // (case, the create members beyond the ones every create needs, whether the request
-    // addresses the item by its bare id, a billing period the item is readable at)
-    let rows: Vec<(&str, Value, bool, Option<String>)> = vec![
-        ("a flat item with no span, by full ARN", json!({}), false, None),
-        ("a flat item with no span, by bare id", json!({}), true, None),
+    // addresses the item by its bare id, the probed offsets a read reports the item for
+    // BEFORE the delete, the ones it reports it for AFTER it)
+    let rows: Vec<UnboundedRow> = vec![
+        (
+            "a flat item with no span, by full ARN",
+            json!({}),
+            false,
+            vec![0, 1, 6, 13],
+            vec![],
+        ),
+        (
+            "a flat item with no span, by bare id",
+            json!({}),
+            true,
+            vec![0, 1, 6, 13],
+            vec![],
+        ),
         (
             "a percentage item with no span",
             json!({ "ChargeDetails": { "Type": "CREDIT", "Percentage": { "PercentageValue": 12.5 } } }),
             false,
-            None,
+            vec![0, 1, 6, 13],
+            vec![],
         ),
         (
             "an item with a bounded span, by full ARN",
@@ -354,13 +377,15 @@ async fn a_delete_naming_no_billing_period_range_removes_the_item_from_every_per
                 },
             }),
             false,
-            Some(period(0)),
+            vec![-1, 0, 1],
+            vec![-1],
         ),
         (
             "an item with an open-ended span, by bare id",
             json!({ "BillingPeriodRange": { "InclusiveStartBillingPeriod": period(-1) } }),
             true,
-            Some(period(3)),
+            vec![-1, 0, 1, 6, 13],
+            vec![-1],
         ),
         (
             "an item whose span is spelled with a one-digit month",
@@ -370,18 +395,41 @@ async fn a_delete_naming_no_billing_period_range_removes_the_item_from_every_per
                 },
             }),
             false,
-            Some(period(2)),
+            vec![0, 1, 6, 13],
+            vec![],
+        ),
+        (
+            // An item that had already stopped applying before the call: there is no
+            // period from this one on for the delete to end it in, and the closed period
+            // it did charge in is not one it may reach back into.
+            "an item applying only in the previous billing period",
+            json!({
+                "BillingPeriodRange": {
+                    "InclusiveStartBillingPeriod": period(-1),
+                    "ExclusiveEndBillingPeriod": period(0),
+                },
+            }),
+            false,
+            vec![-1],
+            vec![-1],
         ),
     ];
 
-    for (case, create, by_bare_id, readable_at) in rows {
+    for (case, create, by_bare_id, reported_before, reported_after) in rows {
         let emulator = Emulator::new();
         let group = emulator.billing_group("payer").await;
         let item = emulator.custom_line_item(&group, "deleted", create).await;
-        assert!(
-            emulator.reports(case, &item, readable_at.as_deref()).await,
-            "case {case:?}: expected the created item to be readable before the delete"
-        );
+        for offset in PROBE_OFFSETS {
+            let probe = period(*offset);
+            let reports = emulator.reports(case, &item, Some(&probe)).await;
+            assert_eq!(
+                reports,
+                reported_before.contains(offset),
+                "case {case:?}: before the delete, expected the read for {probe:?} to report \
+                 the item: {}, got {reports}",
+                reported_before.contains(offset)
+            );
+        }
 
         let addressed = if by_bare_id {
             bare_id(&item)
@@ -395,23 +443,47 @@ async fn a_delete_naming_no_billing_period_range_removes_the_item_from_every_per
             "case {case:?}: expected the deleted item's full ARN, got {answered}"
         );
 
-        for period in PROBE_PERIODS.iter().copied().map(Some).chain([None]) {
-            assert!(
-                !emulator.reports(case, &item, period).await,
-                "case {case:?}: expected no read to report the deleted item, but the read \
-                 for {period:?} did"
+        for offset in PROBE_OFFSETS {
+            let probe = period(*offset);
+            let reports = emulator.reports(case, &item, Some(&probe)).await;
+            assert_eq!(
+                reports,
+                reported_after.contains(offset),
+                "case {case:?}: after the delete, expected the read for {probe:?} to report \
+                 the item: {}, got {reports}",
+                reported_after.contains(offset)
             );
         }
-
-        // The item is gone, so a second delete has no item to address.
-        let (status, body) = emulator.delete(&addressed, &Value::Null).await;
-        assert_refused(
-            &format!("{case}, deleted twice"),
-            status,
-            &body,
-            "MISSING_CUSTOMLINEITEM",
-            "Arn",
+        // A read that names no billing period asks about the CURRENT one, which the
+        // delete took.
+        assert!(
+            !emulator.reports(case, &item, None).await,
+            "case {case:?}: expected the read of the current billing period not to report \
+             the item the delete ended there"
         );
+
+        // A second such delete: nothing is left of an item that applied in no period
+        // before the call, so that one has no item to address — while an item an earlier
+        // period still reports is still there, and the delete that already ended it has
+        // nothing more to end.
+        let (status, body) = emulator.delete(&addressed, &Value::Null).await;
+        let twice = format!("{case}, deleted twice");
+        if reported_after.is_empty() {
+            assert_refused(&twice, status, &body, "MISSING_CUSTOMLINEITEM", "Arn");
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {twice:?}: expected HTTP 200 for an item the earlier periods still \
+                 report, got {status} with {body}"
+            );
+            for offset in &reported_after {
+                let probe = period(*offset);
+                assert!(
+                    emulator.reports(&twice, &item, Some(&probe)).await,
+                    "case {twice:?}: expected the read for {probe:?} to still report the item"
+                );
+            }
+        }
     }
 }
 

@@ -48,11 +48,16 @@ const MANAGED_PRICING_PLAN: &str = "arn:aws:billingconductor::aws:pricingplan/Ba
 
 /// How close two reported amounts count as equal: the wire carries a cost report's amounts
 /// as decimal strings, and the amounts here are sums of them.
-const TOLERANCE: f64 = 1e-9;
+///
+/// `pub(crate)` with the harness below, so the sibling suite about the same rule for the
+/// delete of the ITEM reads the store through these helpers rather than standing up a
+/// second harness of its own
+/// (`tests/all/deleted_custom_line_item_keeps_its_period_charges.rs`).
+pub(crate) const TOLERANCE: f64 = 1e-9;
 
 /// A live emulator holding only this service, with the engine kept so a row can backdate
 /// the creation the wire could only make now.
-struct Emulator {
+pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
     router: MultiServiceRouter,
 }
@@ -62,7 +67,7 @@ impl Emulator {
     /// organization's PAYER account — the world in which this payer-account-only control
     /// plane is reachable at all (`tests/all/payer_account_gate.rs` owns the denial every
     /// other caller gets).
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         engine
             .state::<BillingConductorState>()
@@ -106,14 +111,14 @@ impl Emulator {
     }
 
     /// POST a JSON body to one of this service's routes.
-    async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
         self.send("POST", path, body).await
     }
 
     /// Create a billing group and backdate its stored instants to `created`, as if the
     /// creating call had been made in that billing period, so the periods before the
     /// delete are periods the group really was billing in.
-    async fn group_created_in(&self, case: &str, name: &str, created: &str) -> String {
+    pub(crate) async fn group_created_in(&self, case: &str, name: &str, created: &str) -> String {
         let (status, body) = self
             .post(
                 "/create-billing-group",
@@ -143,7 +148,7 @@ impl Emulator {
 
     /// `CreateCustomLineItem` carrying `charge`, applying over the billing periods
     /// `applied` names (every period from the current one on when it names none).
-    async fn item(
+    pub(crate) async fn item(
         &self,
         case: &str,
         group: &str,
@@ -171,7 +176,7 @@ impl Emulator {
 
     /// `BatchAssociateResourcesToCustomLineItem`: put `resource` in effect under the
     /// percentage item `target` from the billing period `from` on.
-    async fn associate(&self, case: &str, target: &str, resource: &str, from: &str) {
+    pub(crate) async fn associate(&self, case: &str, target: &str, resource: &str, from: &str) {
         let (status, body) = self
             .send(
                 "PUT",
@@ -208,7 +213,7 @@ impl Emulator {
 
     /// `GetBillingGroupCostReport` over the single billing period `months` from the
     /// current one, as the half-open range that covers exactly it.
-    async fn cost_report(&self, group: &str, months: i64) -> (u16, Value) {
+    pub(crate) async fn cost_report(&self, group: &str, months: i64) -> (u16, Value) {
         self.post(
             "/get-billing-group-cost-report",
             &json!({
@@ -226,7 +231,7 @@ impl Emulator {
     ///
     /// The report is also held to the rest of its money side: this emulator records no
     /// metered usage, so the margin over the period is the whole pro forma amount.
-    async fn proforma_in(&self, case: &str, group: &str, months: i64) -> f64 {
+    pub(crate) async fn proforma_in(&self, case: &str, group: &str, months: i64) -> f64 {
         let (status, body) = self.cost_report(group, months).await;
         assert_eq!(
             status, 200,
@@ -258,7 +263,7 @@ impl Emulator {
     /// The `ProformaCost` `ListBillingGroupCostReports` reports for ONE group in the
     /// billing period `months` from the current one, or `None` when that period reports no
     /// such group.
-    async fn listed_proforma(&self, case: &str, group: &str, months: i64) -> Option<f64> {
+    pub(crate) async fn listed_proforma(&self, case: &str, group: &str, months: i64) -> Option<f64> {
         let (status, body) = self
             .post(
                 "/list-billing-group-cost-reports",
@@ -284,7 +289,7 @@ impl Emulator {
 
     /// The ARNs `ListCustomLineItems` reports for one billing group in the billing period
     /// `months` from the current one.
-    async fn items_in(&self, case: &str, group: &str, months: i64) -> Vec<String> {
+    pub(crate) async fn items_in(&self, case: &str, group: &str, months: i64) -> Vec<String> {
         let (status, body) = self
             .post(
                 "/list-custom-line-items",
@@ -310,7 +315,7 @@ impl Emulator {
 
     /// The resource ARNs `ListResourcesAssociatedToCustomLineItem` reports for one
     /// percentage item in the billing period `months` from the current one.
-    async fn associated_in(&self, case: &str, item: &str, months: i64) -> Vec<String> {
+    pub(crate) async fn associated_in(&self, case: &str, item: &str, months: i64) -> Vec<String> {
         let (status, body) = self
             .post(
                 "/list-resources-associated-to-custom-line-item",
@@ -354,19 +359,19 @@ fn amount(case: &str, element: &Value, member: &str) -> f64 {
 
 /// A FLAT charge of `value` that ADDS to the bill (`CustomLineItemType` has exactly `FEE`
 /// and `CREDIT`; `smithy_query(query="shape",shape="CustomLineItemType")`).
-fn fee_flat(value: f64) -> Value {
+pub(crate) fn fee_flat(value: f64) -> Value {
     json!({ "Type": "FEE", "Flat": { "ChargeValue": value } })
 }
 
 /// A FLAT charge of `value` that comes OFF the bill.
-fn credit_flat(value: f64) -> Value {
+pub(crate) fn credit_flat(value: f64) -> Value {
     json!({ "Type": "CREDIT", "Flat": { "ChargeValue": value } })
 }
 
 /// A PERCENTAGE charge: `value` per cent "multiplied against the combined value of its
 /// associated resources" (`smithy_query(query="shape",
 /// shape="CustomLineItemPercentageChargeDetails")`).
-fn fee_percentage(value: f64) -> Value {
+pub(crate) fn fee_percentage(value: f64) -> Value {
     json!({ "Type": "FEE", "Percentage": { "PercentageValue": value } })
 }
 

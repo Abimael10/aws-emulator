@@ -19,8 +19,10 @@
 //! The rows span the writes the rule generalises over rather than one call: an association
 //! added after the freeze (reaching back over the frozen generation's periods, and from
 //! the current period on only), a disassociation (bounded to the frozen generation's
-//! period, and unbounded), the outright delete of an associated resource and a delete
-//! bounded to the frozen generation's period — plus the control row that writes nothing.
+//! period, and unbounded), the delete of an associated resource naming no range — which
+//! ends it from the period the call lands in, exactly as the unbounded disassociation
+//! does — and a delete bounded to the frozen generation's period — plus the control row
+//! that writes nothing.
 //! `tests/all/association_size_is_billing_period_scoped.rs` owns the same count for writes
 //! made BEFORE any generation was frozen — and the harness this suite drives rather than
 //! copying — and `tests/all/membership_writes_keep_superseded_generations.rs` the sibling
@@ -97,10 +99,14 @@ async fn association_writes_are_visible_through_a_superseded_generation() {
             expected: vec![(period(-1), 1), (period(0), 0)],
         },
         Row {
-            case: "the associated resource deleted outright",
+            // A delete naming no range ends the resource FROM the period the call lands
+            // in, so the frozen generation's period keeps the association to it and the
+            // current one does not — the same bound the unbounded disassociation above
+            // takes effect at.
+            case: "the associated resource deleted with no billing period range",
             associated: 2,
             write: Write::DeleteResource(None),
-            expected: vec![(period(-1), 1), (period(0), 1)],
+            expected: vec![(period(-1), 2), (period(0), 1)],
         },
         Row {
             case: "a delete bounded to the frozen generation's period",

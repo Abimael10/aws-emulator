@@ -402,34 +402,52 @@ async fn a_bounded_delete_takes_the_deleted_periods_out_of_every_association_key
     }
 }
 
-/// THE RULE where the two deletes meet: a bounded delete covering every billing period
-/// the item applied in leaves exactly what a delete naming no range leaves, since both
-/// leave no period reporting a version of the item.
+/// THE RULE where the two deletes meet: a delete covering every billing period the item
+/// applied in leaves nothing of it, whether the request bounds itself to those periods or
+/// names no range at all and so ends the item from the period the call lands in — both
+/// leave no period reporting a version of the item, and so none reporting an association
+/// keyed on it.
 #[tokio::test]
 async fn a_bounded_delete_that_empties_the_item_leaves_what_the_unbounded_delete_leaves() {
-    // (case, the range the narrowed item is created with, the `BillingPeriodRange` the
-    // delete names) — `Value::Null` for the request that names none.
-    let deletes: [(&str, Value, Value); 3] = [
-        ("no range at all", range(&period(-1), None), Value::Null),
+    // (case, the range the narrowed item is created with, the range the association is
+    // held over, the `BillingPeriodRange` the delete names) — `Value::Null` for the
+    // request that names none, which empties an item that applied in no period before
+    // the call.
+    let deletes: [(&str, Value, Value, Value); 3] = [
+        (
+            "no range at all, an item applying from the current period on",
+            range(&period(0), None),
+            range(&period(0), None),
+            Value::Null,
+        ),
         (
             "a range covering every period the item applied in",
+            range(&period(-1), None),
             range(&period(-1), None),
             range(&period(-1), None),
         ),
         (
             "a range bounded exactly at the item's own end",
             range(&period(-1), Some(&period(9))),
+            range(&period(-1), None),
             range(&period(-1), Some(&period(9))),
         ),
     ];
 
-    for (case, item_range, deleted) in deletes {
+    for (case, item_range, association_range, deleted) in deletes {
         let emulator = Emulator::new();
         let group = emulator.billing_group("payer").await;
         let open = range(&period(-1), None);
         let narrowed = percentage_item_over(&emulator, case, &group, "narrowed", &item_range).await;
         let holder = percentage_item_over(&emulator, case, &group, "holder", &open).await;
-        associate_ok(&emulator, case, &holder, &narrowed, Some(open.clone())).await;
+        associate_ok(
+            &emulator,
+            case,
+            &holder,
+            &narrowed,
+            Some(association_range.clone()),
+        )
+        .await;
 
         let (status, answered) = delete(&emulator, &narrowed, &deleted).await;
         assert_eq!(

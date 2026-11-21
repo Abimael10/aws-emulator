@@ -1257,9 +1257,19 @@ async fn a_request_the_store_or_the_model_cannot_serve_is_refused() {
     }
 
     // A deleted item has no history to report, so the read is refused exactly as it is
-    // for an item that never existed.
+    // for an item that never existed. The delete names every billing period the item
+    // applied in (it applies from the previous one on), which is what leaves nothing of
+    // the record: a delete naming no range would end it from the current period only and
+    // the earlier one would go on reporting its generation.
     let (status, body) = emulator
-        .send("POST", "/delete-custom-line-item", &json!({ "Arn": item }))
+        .send(
+            "POST",
+            "/delete-custom-line-item",
+            &json!({
+                "Arn": item,
+                "BillingPeriodRange": period_range(&period(-1), None),
+            }),
+        )
         .await;
     assert_eq!(
         status, 200,
