@@ -8,11 +8,24 @@
 //! Whether a report exists at all is the store's one rule
 //! ([`crate::state::ComAmazonawsIotdeviceadvisorIotsenateserviceState::qualification_report`]):
 //! the run belongs to the definition the caller named, that definition is intended for
-//! qualification, and the run SUCCEEDED. Anything else names no report (an id pair the
-//! store does not hold, a run of a suite that is not a qualification suite, a run still in
-//! progress, a run a caller stopped, or one that failed or errored) and is refused with the
-//! modelled `ResourceNotFoundException`, worded with the one not-found template this
-//! service answers a missing resource with ([`crate::state::not_found_message`]).
+//! qualification, and the run SUCCEEDED.
+//!
+//! A refusal says WHICH of those failed, because the class of a refusal follows from
+//! whether the request named a resource this service holds:
+//!
+//! * an id pair the store holds no run for — an unknown or aged-out run id, or a run id
+//!   crossed with another definition — names no resource, so it is the modelled
+//!   `ResourceNotFoundException` (404), worded with the one not-found template this service
+//!   answers a missing resource with ([`crate::state::not_found_message`]);
+//! * a run the store DOES hold, whose definition is not intended for qualification, is a
+//!   request this service cannot serve about a resource that exists: the modelled
+//!   `ValidationException` (400) stating that the suite definition is not intended for
+//!   qualification ([`crate::state::not_intended_for_qualification_message`]). The
+//!   refusal is structural — it depends on the definition, not on the run's progress — so
+//!   it is the same answer while the run is in progress and after it finishes;
+//! * a run of a qualification suite that has not succeeded has produced no report yet, so
+//!   it too is the modelled `ValidationException` (400), naming the status the run carries
+//!   ([`crate::state::report_not_available_message`]).
 //!
 //! No run of this emulator succeeds: nothing executes the suite against the device under
 //! test, so a run ends in `ERROR` carrying [`crate::state::NO_TEST_RUNNER_REASON`] (see
@@ -165,18 +178,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it would have carried had nobody called at all.
         let _ = store.run_mut(&input.suite_definition_id, &input.suite_run_id, now);
 
-        let Some((definition, run)) =
-            store.qualification_report(&input.suite_definition_id, &input.suite_run_id)
-        else {
-            return Err(GetSuiteRunReportErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::not_found_message(
-                        "suiteRunId",
-                        &input.suite_run_id,
-                    )),
-                },
-            )
-            .into());
+        // Which fact is missing decides the refusal: a pair of ids naming no run of this
+        // store is a missing resource, while a run it holds that has no report is an
+        // invalid request about a resource that exists.
+        let (definition, run) = match store
+            .qualification_report(&input.suite_definition_id, &input.suite_run_id)
+        {
+            crate::state::QualificationReport::Available { definition, run } => (definition, run),
+            crate::state::QualificationReport::NoSuchRun => {
+                return Err(GetSuiteRunReportErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::not_found_message(
+                            "suiteRunId",
+                            &input.suite_run_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::QualificationReport::NotQualificationSuite => {
+                return Err(GetSuiteRunReportErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::not_intended_for_qualification_message(
+                            &input.suite_definition_id,
+                        )),
+                    },
+                )
+                .into());
+            }
+            crate::state::QualificationReport::RunNotSuccessful { status } => {
+                return Err(GetSuiteRunReportErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::report_not_available_message(
+                            &input.suite_run_id,
+                            status,
+                        )),
+                    },
+                )
+                .into());
+            }
         };
 
         Ok(GetSuiteRunReportOutput {

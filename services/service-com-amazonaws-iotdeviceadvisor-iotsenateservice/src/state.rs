@@ -810,24 +810,31 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
     }
 
     /// The QUALIFICATION REPORT of the suite run `(suite_definition_id, suite_run_id)`
-    /// names, when that run has one: its definition and the run itself.
+    /// names — or WHICH of the report's three conditions the request fails.
     ///
     /// The ONE rule for whether a report exists, and the only place it is stated. A
     /// qualification report is the report of a SUCCESSFUL qualifying test suite run, so
     /// all three of these hold for a run that has one:
     ///
     /// * the run belongs to the definition the caller named, since crossing one
-    ///   definition's id with another's run names no report, just as it names no run;
+    ///   definition's id with another's run names no run at all — that is an IDENTITY
+    ///   miss, [`QualificationReport::NoSuchRun`];
     /// * the definition it ran is INTENDED FOR QUALIFICATION, since the report is the
-    ///   qualification report of a qualifying suite; and
+    ///   qualification report of a qualifying suite — a run of any other definition is
+    ///   [`QualificationReport::NotQualificationSuite`], a property of the definition
+    ///   the request named and not of the run's progress; and
     /// * the run SUCCEEDED ([`is_successful`]), so a run still in progress, one a caller
-    ///   stopped, and one that failed or errored have none.
+    ///   stopped, and one that failed or errored is
+    ///   [`QualificationReport::RunNotSuccessful`].
+    ///
+    /// Telling the three apart is what lets the reader refuse each with the class the
+    /// request earned: a pair of ids this store holds nothing for is not found, while a
+    /// run it DOES hold is refused as an invalid request stating which condition failed.
     ///
     /// No run of THIS emulator reaches a successful status: nothing executes the suite
-    /// (see [`NO_TEST_RUNNER_REASON`]), so a run ends in `ERROR`, and the operation that
-    /// reads this therefore answers its modelled not-found refusal for every run the
-    /// emulator can produce. The rule is the SERVICE's, not the lifecycle's: a report
-    /// appears the moment a run can succeed, with nothing here to change.
+    /// (see [`NO_TEST_RUNNER_REASON`]), so a run ends in `ERROR`. The rule is the
+    /// SERVICE's, not the lifecycle's: a report appears the moment a run can succeed,
+    /// with nothing here to change.
     ///
     /// A pure read: the clock-owed transitions are NOT materialised here, so a caller that
     /// wants the report of a run whose next transition has just become due materialises it
@@ -836,17 +843,53 @@ impl ComAmazonawsIotdeviceadvisorIotsenateserviceState {
         &self,
         suite_definition_id: &str,
         suite_run_id: &str,
-    ) -> Option<(&SuiteDefinition, &SuiteRun)> {
-        let run = self.runs.get(suite_run_id)?;
+    ) -> QualificationReport<'_> {
+        let Some(run) = self.runs.get(suite_run_id) else {
+            return QualificationReport::NoSuchRun;
+        };
         if run.suite_definition_id != suite_definition_id {
-            return None;
+            return QualificationReport::NoSuchRun;
         }
-        let definition = self.definitions.get(suite_definition_id)?;
+        // A definition the store no longer holds leaves the request naming no resource of
+        // this store at all, so it is the same identity miss as an unknown run id.
+        let Some(definition) = self.definitions.get(suite_definition_id) else {
+            return QualificationReport::NoSuchRun;
+        };
         if definition.configuration.intended_for_qualification != Some(true) {
-            return None;
+            return QualificationReport::NotQualificationSuite;
         }
-        is_successful(&run.status).then_some((definition, run))
+        if !is_successful(&run.status) {
+            return QualificationReport::RunNotSuccessful {
+                status: &run.status,
+            };
+        }
+        QualificationReport::Available { definition, run }
     }
+}
+
+/// What [`ComAmazonawsIotdeviceadvisorIotsenateserviceState::qualification_report`] found:
+/// the report, or the one condition of it the request failed.
+///
+/// A lookup answers WHICH fact is missing, not merely that something is, because the two
+/// kinds of miss are different answers to the caller: the ids naming no run of this store
+/// is a missing RESOURCE, while an existing run whose definition is not a qualification
+/// suite, or which has not succeeded, is a request this service cannot serve ABOUT a
+/// resource it holds.
+#[derive(Debug)]
+pub enum QualificationReport<'a> {
+    /// The run has a report: the definition that was run, and the run that produced it.
+    Available {
+        definition: &'a SuiteDefinition,
+        run: &'a SuiteRun,
+    },
+    /// This store holds no suite run under the pair of ids the request named.
+    NoSuchRun,
+    /// The run exists, but the definition it ran is not intended for qualification, so no
+    /// run of that definition can ever have a qualification report.
+    NotQualificationSuite,
+    /// The run exists under a qualification suite but has not succeeded, carrying the
+    /// status given here, so it has produced no report.
+    RunNotSuccessful { status: &'a str },
 }
 
 /// The longest `message` any error this service answers with may carry.
@@ -948,6 +991,36 @@ pub fn not_found_message(member: &str, value: &str) -> String {
     bounded_message(format!(
         "Unable to find resource with {member}: {}",
         echoed_value(value)
+    ))
+}
+
+/// The message a request for the qualification report of a run of a suite definition that
+/// is NOT intended for qualification is refused with.
+///
+/// The refusal is structural — a property of the definition the request named, which no
+/// progress of the run can change — so it states that property, with its `Invalid Request: `
+/// prefix and the `suiteDefinitionId` the caller sent, rather than reporting the run as
+/// missing. The fixed phrase is "not intended for qualification"; the only variable part is
+/// the request's own id.
+pub fn not_intended_for_qualification_message(suite_definition_id: &str) -> String {
+    bounded_message(format!(
+        "Invalid Request: suite definition {} is not intended for qualification",
+        echoed_value(suite_definition_id)
+    ))
+}
+
+/// The message a request for the qualification report of a run that exists under a
+/// qualification suite but has not SUCCEEDED is refused with.
+///
+/// The run is one this store holds, so the refusal is about the report the caller asked
+/// for and not about the run: it names the run the request named and the status it carries,
+/// built the same way as [`not_intended_for_qualification_message`].
+pub fn report_not_available_message(suite_run_id: &str, status: &str) -> String {
+    bounded_message(format!(
+        "Invalid Request: a qualification report is available only for a successful suite \
+         run; suite run {} is in status {}",
+        echoed_value(suite_run_id),
+        echoed_value(status)
     ))
 }
 

@@ -6,9 +6,14 @@
 //! belongs to the suite definition the caller named, that definition is intended for
 //! qualification, and the run SUCCEEDED (the report AWS documents for "a successful
 //! Device Advisor qualifying test suite run"). The operation reports that report's
-//! download URL, derived from the stored run so repeated reads announce the same one, and
-//! refuses every run without one with the modelled `ResourceNotFoundException` and this
-//! service's single not-found message template.
+//! download URL, derived from the stored run so repeated reads announce the same one.
+//!
+//! A refusal carries the class the request earned: ids naming no run of the store are the
+//! modelled `ResourceNotFoundException` (404) with this service's single not-found message
+//! template, while a run the store DOES hold but that has no report is the modelled
+//! `ValidationException` (400) — stating that the suite definition is not intended for
+//! qualification, which is structural and so the same answer at every point of the run's
+//! life, or that the run has not succeeded, naming the status it carries.
 //!
 //! The tables below span what the rule generalises over rather than one request: EVERY
 //! `SuiteRunStatus` the model enumerates, against all three wire forms of
@@ -39,10 +44,35 @@ pub(crate) const REGION: &str = "us-east-1";
 /// report URL has to resolve back to.
 const REQUEST_HOST: &str = "api.iotdeviceadvisor.us-east-1.amazonaws.com";
 
-/// Two transition spans and a margin: long enough for `PENDING` -> `RUNNING` -> terminal,
-/// the lifecycle this emulator's runs finish through, to have become due.
-fn past_completion() -> Duration {
-    iotdeviceadvisor::state::STATUS_TRANSITION * 5 / 2
+/// How long a case waits for a status the clock owes a run before giving up.
+///
+/// Generous on purpose: the transitions are spans apart and the wait below polls for the
+/// CONDITION, so this bound is only what keeps a status that never becomes due from
+/// hanging the suite rather than a claim about how fast the host runs.
+const STATUS_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long one turn of a poll loop pauses before looking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Read the run at `run_path` until it carries `wanted`, and hand back that answer.
+///
+/// The clock, not the poll, moves a run's status, so the loop looks again until the status
+/// holds instead of waiting a fixed time: a loaded host only takes more turns.
+async fn await_status(emulator: &Emulator, run_path: &str, wanted: &str) -> Answer {
+    let deadline = std::time::Instant::now() + STATUS_DEADLINE;
+    loop {
+        let answer = emulator.call("GET", run_path, REGION, None).await;
+        if answer.status == 200 && answer.member("status").as_str() == Some(wanted) {
+            return answer;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run at {run_path:?} never reached {wanted}: last answer {} {}",
+            answer.status,
+            answer.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Create one suite definition, with `intendedForQualification` in the wire form the row
@@ -125,13 +155,13 @@ async fn report(emulator: &Emulator, definition_id: &str, run_id: &str) -> Answe
         .await
 }
 
-/// Assert one answer is the modelled not-found refusal for `run_id`.
-fn assert_no_report(case: &str, answer: &Answer, run_id: &str) {
+/// Assert one answer is the modelled not-found refusal: the ids named no run of the store.
+fn assert_not_found(case: &str, answer: &Answer, run_id: &str) {
     assert_eq!(
         (answer.status, answer.error_code.as_deref()),
         (404, Some("ResourceNotFoundException")),
-        "case {case:?}: a run with no qualification report must be refused as not found, \
-         got {} {}",
+        "case {case:?}: a pair of ids the store holds no run for must be refused as not \
+         found, got {} {}",
         answer.status,
         answer.body
     );
@@ -142,6 +172,94 @@ fn assert_no_report(case: &str, answer: &Answer, run_id: &str) {
         "case {case:?}: expected the message {expected:?}, got {}",
         answer.body
     );
+}
+
+/// Assert one answer is the modelled validation refusal stating that the suite definition
+/// the request named is not intended for qualification.
+fn assert_not_intended_for_qualification(case: &str, answer: &Answer, definition_id: &str) {
+    assert_eq!(
+        (answer.status, answer.error_code.as_deref()),
+        (400, Some("ValidationException")),
+        "case {case:?}: a run of a suite that is not intended for qualification must be \
+         refused as an invalid request, got {} {}",
+        answer.status,
+        answer.body
+    );
+    let message = answer.member("message").as_str().unwrap_or_default();
+    // The expected text, written out here rather than taken from the crate, so the case
+    // pins the wording instead of mirroring whatever the handler renders: the fixed part
+    // is "not intended for qualification" and the only variable part is the request's id.
+    let expected =
+        format!("Invalid Request: suite definition {definition_id} is not intended for qualification");
+    assert!(
+        message.contains("not intended for qualification"),
+        "case {case:?}: the message must state that the suite is not intended for \
+         qualification, got {message:?}"
+    );
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected the message {expected:?}, got {message:?}"
+    );
+}
+
+/// Assert one answer is the modelled validation refusal stating that the run has not
+/// succeeded, naming the status it carries.
+///
+/// `status` is the status the run demonstrably carries; `None` where the clock could move
+/// it between the read and this call, and the case then only asserts the message is the
+/// one this refusal renders for SOME status the model enumerates.
+fn assert_no_report_yet(case: &str, answer: &Answer, run_id: &str, status: Option<&str>) {
+    assert_eq!(
+        (answer.status, answer.error_code.as_deref()),
+        (400, Some("ValidationException")),
+        "case {case:?}: a run that exists but has not succeeded must be refused as an \
+         invalid request, got {} {}",
+        answer.status,
+        answer.body
+    );
+    let message = answer.member("message").as_str().unwrap_or_default();
+    // Again written out in the case rather than taken from the crate.
+    let rendered = |status: &str| {
+        format!(
+            "Invalid Request: a qualification report is available only for a successful \
+             suite run; suite run {run_id} is in status {status}"
+        )
+    };
+    match status {
+        Some(status) => {
+            let expected = rendered(status);
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the message {expected:?}, got {message:?}"
+            );
+        }
+        None => {
+            // Source for the statuses: the model's `SuiteRunStatus` enum.
+            let statuses = iotdeviceadvisor::ops::types::SUITE_RUN_STATUS_VALUES;
+            assert!(
+                statuses.iter().any(|status| message == rendered(status)),
+                "case {case:?}: the message must name the run and the status it carries, \
+                 got {message:?}"
+            );
+        }
+    }
+}
+
+/// Assert one answer is the refusal a run with no report earns: which one depends on the
+/// definition the request named, not on the run.
+fn assert_no_report(
+    case: &str,
+    answer: &Answer,
+    definition_id: &str,
+    run_id: &str,
+    qualification: Option<bool>,
+    status: Option<&str>,
+) {
+    if qualification == Some(true) {
+        assert_no_report_yet(case, answer, run_id, status);
+    } else {
+        assert_not_intended_for_qualification(case, answer, definition_id);
+    }
 }
 
 /// Assert one answer reports the report of `(definition_id, run_id)`.
@@ -203,7 +321,16 @@ async fn a_report_exists_exactly_for_a_successful_run_of_a_qualification_suite()
                     again.body
                 );
             } else {
-                assert_no_report(&case, &answer, &run_id);
+                // The seeded run owes no transition, so the status the refusal names is
+                // the one the row asked for.
+                assert_no_report(
+                    &case,
+                    &answer,
+                    &definition_id,
+                    &run_id,
+                    qualification,
+                    Some(status),
+                );
             }
         }
     }
@@ -237,10 +364,16 @@ async fn a_run_this_emulator_drives_never_has_a_report() {
     let run_path = format!("/suiteDefinitions/{definition_id}/suiteRuns/{run_id}");
 
     let in_progress = report(&emulator, &definition_id, &run_id).await;
-    assert_no_report("the run is still in progress", &in_progress, &run_id);
+    // The clock can move PENDING -> RUNNING between the two calls, so the case pins
+    // everything about the refusal except which non-successful status it names.
+    assert_no_report_yet(
+        "the run is still in progress",
+        &in_progress,
+        &run_id,
+        None,
+    );
 
-    tokio::time::sleep(past_completion()).await;
-    let finished = emulator.call("GET", &run_path, REGION, None).await;
+    let finished = await_status(&emulator, &run_path, "ERROR").await;
     assert_eq!(
         finished.string("status"),
         "ERROR",
@@ -248,7 +381,12 @@ async fn a_run_this_emulator_drives_never_has_a_report() {
         finished.body
     );
     let after = report(&emulator, &definition_id, &run_id).await;
-    assert_no_report("the run finished unsuccessfully", &after, &run_id);
+    assert_no_report_yet(
+        "the run finished unsuccessfully",
+        &after,
+        &run_id,
+        Some("ERROR"),
+    );
 
     // And a run a caller stops: STOPPING, then STOPPED, which is not a success either.
     let second = emulator
@@ -276,8 +414,7 @@ async fn a_run_this_emulator_drives_never_has_a_report() {
         "setup: stopping the run failed with {} {}",
         stop.status, stop.body
     );
-    tokio::time::sleep(past_completion()).await;
-    let read_back = emulator.call("GET", &stopped_path, REGION, None).await;
+    let read_back = await_status(&emulator, &stopped_path, "STOPPED").await;
     assert_eq!(
         read_back.string("status"),
         "STOPPED",
@@ -285,13 +422,91 @@ async fn a_run_this_emulator_drives_never_has_a_report() {
         read_back.body
     );
     let stopped_report = report(&emulator, &definition_id, &stopped_id).await;
-    assert_no_report("the run was stopped", &stopped_report, &stopped_id);
+    assert_no_report_yet(
+        "the run was stopped",
+        &stopped_report,
+        &stopped_id,
+        Some("STOPPED"),
+    );
 }
 
-/// An id pair the store does not hold names no report, whichever half of it is unknown —
-/// including a run of ANOTHER definition, which the pair is what rules out.
+/// A run of a suite definition that is NOT intended for qualification is refused the same
+/// way at every point of that run's life: the refusal is a property of the definition the
+/// request named, so it is neither "not found" (the run demonstrably exists, and reads back
+/// 200) nor "not ready yet" (it does not change when the run finishes).
 #[tokio::test]
-async fn an_id_pair_the_store_does_not_hold_names_no_report() {
+async fn a_non_qualification_suite_is_refused_the_same_before_and_after_a_run_finishes() {
+    // Both wire forms of a suite that is not intended for qualification: the member sent
+    // as `false`, and the member left out altogether (it defaults to `false`).
+    for qualification in [Some(false), None] {
+        let emulator = Emulator::new();
+        let definition_id = definition(
+            &emulator,
+            &format!("driven-plain-suite-{qualification:?}"),
+            qualification,
+        )
+        .await;
+        let started = emulator
+            .call(
+                "POST",
+                &format!("/suiteDefinitions/{definition_id}/suiteRuns"),
+                REGION,
+                Some(json!({
+                    "suiteRunConfiguration": run_configuration(&thing_arn(4), None, None)
+                })),
+            )
+            .await;
+        assert_eq!(
+            started.status, 200,
+            "setup: starting a run of {qualification:?} failed with {} {}",
+            started.status, started.body
+        );
+        let run_id = started.string("suiteRunId");
+        let run_path = format!("/suiteDefinitions/{definition_id}/suiteRuns/{run_id}");
+
+        // The run exists: the very pair of ids the report call is about reads back.
+        let read = emulator.call("GET", &run_path, REGION, None).await;
+        assert_eq!(
+            read.status, 200,
+            "setup: the run must read back while in progress, got {} {}",
+            read.status, read.body
+        );
+        let before = report(&emulator, &definition_id, &run_id).await;
+        assert_not_intended_for_qualification(
+            &format!("intendedForQualification={qualification:?}, run in progress"),
+            &before,
+            &definition_id,
+        );
+
+        let finished = await_status(&emulator, &run_path, "ERROR").await;
+        assert_eq!(
+            finished.string("status"),
+            "ERROR",
+            "setup: the run must reach a terminal status, got {}",
+            finished.body
+        );
+        let after = report(&emulator, &definition_id, &run_id).await;
+        assert_not_intended_for_qualification(
+            &format!("intendedForQualification={qualification:?}, run finished"),
+            &after,
+            &definition_id,
+        );
+        assert_eq!(
+            (after.status, after.error_code.as_deref(), &after.body),
+            (before.status, before.error_code.as_deref(), &before.body),
+            "intendedForQualification={qualification:?}: the refusal must not change when \
+             the run finishes, got {} and {}",
+            before.body,
+            after.body
+        );
+    }
+}
+
+/// An id pair the store does not hold names no RESOURCE, whichever half of it is unknown —
+/// including a run of ANOTHER definition, which the pair is what rules out — so each is
+/// refused as not found, the class a run the store does hold never earns.
+#[tokio::test]
+async fn an_id_pair_the_store_does_not_hold_is_not_found() {
     let emulator = Emulator::new();
     let known = definition(&emulator, "known-qualification-suite", Some(true)).await;
     let other = definition(&emulator, "other-qualification-suite", Some(true)).await;
@@ -328,8 +543,16 @@ async fn an_id_pair_the_store_does_not_hold_names_no_report() {
 
     for (case, definition_id, run_id) in rows {
         let answer = report(&emulator, definition_id, run_id).await;
-        assert_no_report(case, &answer, run_id);
+        assert_not_found(case, &answer, run_id);
     }
+
+    // The contrast the class turns on: a run of a definition that is not intended for
+    // qualification is a resource the store HOLDS, so it earns the validation refusal and
+    // not this one.
+    let plain = definition(&emulator, "plain-suite", Some(false)).await;
+    let run_of_plain = seed_run(&emulator, &plain, "PASS");
+    let answer = report(&emulator, &plain, &run_of_plain).await;
+    assert_not_intended_for_qualification("a run of a non-qualification suite", &answer, &plain);
 }
 
 /// Reporting a report changes nothing a later caller sees: the run reads back exactly as
