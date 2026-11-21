@@ -180,7 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let cluster = store.resolve_db_cluster(&region, named).ok_or_else(|| {
                     DescribeDBClusterEndpointsErrorModeled::DBClusterNotFoundFault(
                         DBClusterNotFoundFault {
-                            message: Some(crate::state::db_cluster_not_found_message(named)),
+                            // The cluster is named here as the one the endpoints this report
+                            // describes stand in FRONT of, which is the wording RDS gives
+                            // the fault across the custom-endpoint API
+                            // ([`crate::state::db_cluster_cannot_be_accessed_message`]).
+                            message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                                named,
+                            )),
                         },
                     )
                 })?;

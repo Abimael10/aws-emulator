@@ -227,9 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 ModifyDBClusterEndpointErrorModeled::DBClusterEndpointNotFoundFault(
                     DBClusterEndpointNotFoundFault {
-                        message: Some(
-                            crate::state::DB_CLUSTER_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
-                        ),
+                        message: Some(crate::state::db_cluster_endpoint_not_found_message(
+                            &named,
+                        )),
                     },
                 )
                 .into(),
@@ -317,9 +317,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     ModifyDBClusterEndpointErrorModeled::DBClusterEndpointNotFoundFault(
                         DBClusterEndpointNotFoundFault {
-                            message: Some(
-                                crate::state::DB_CLUSTER_ENDPOINT_NOT_FOUND_MESSAGE.to_string(),
-                            ),
+                            message: Some(crate::state::db_cluster_endpoint_not_found_message(
+                                &named,
+                            )),
                         },
                     )
                     .into(),

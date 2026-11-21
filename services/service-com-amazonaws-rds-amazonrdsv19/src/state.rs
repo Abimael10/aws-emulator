@@ -2246,8 +2246,13 @@ pub const DB_SHARD_GROUP_NOT_ACCESSIBLE_MESSAGE: &str =
 /// the request is interpolated into it.
 pub const DB_CLUSTER_DOES_NOT_EXIST_MESSAGE: &str = "The DB cluster doesn't exist.";
 
-/// The message a `DBClusterNotFoundFault` carries where the call LOOKS a DB cluster UP —
-/// it reports the cluster or resolves one it reads something else out of.
+/// The message a `DBClusterNotFoundFault` carries where the call LOOKS a DB cluster UP for
+/// its own sake — it reports the cluster, or resolves one it reads something else out of —
+/// as the API that call belongs to words the fault.
+///
+/// A call that resolves the cluster as the SOURCE another resource stands on names it the
+/// other way ([`db_cluster_cannot_be_accessed_message`]), so the wording follows the API
+/// the call belongs to rather than whether it reads or writes.
 ///
 /// `named` is the value the REQUEST carried, not the key the store folded it to: the
 /// members that name a DB cluster accept "the user-supplied DB cluster identifier or the
@@ -2270,9 +2275,12 @@ pub fn db_cluster_not_found_message(named: &str) -> String {
 /// identifier.
 pub const MODIFY_DB_CLUSTER_NOT_FOUND_MESSAGE: &str = "DBCluster not found";
 
-/// The message a `DBClusterNotFoundFault` carries where the DB cluster is the SUBJECT of
-/// the call and the call acts on the cluster itself — the delete that removes it, and the
-/// failover that moves its primary.
+/// The message a `DBClusterNotFoundFault` carries where the call acts on the cluster itself
+/// — the delete that removes it, and the failover that moves its primary — and where it
+/// resolves the cluster as the SOURCE another resource stands on: the cluster a DB instance
+/// joins, a global cluster or a point-in-time restore is built from, an export is taken of,
+/// or a CUSTOM ENDPOINT hangs off, whether that call creates the dependent resource or only
+/// reports it.
 ///
 /// This front door words the one fault by the ROLE the cluster plays in the call, the same
 /// way it words a DB subnet group's ([`db_subnet_group_not_found_message`] beside

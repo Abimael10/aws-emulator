@@ -635,7 +635,7 @@ async fn the_report_carries_the_clusters_own_endpoints_and_every_published_filte
     );
     assert_eq!(
         text(&missing, "Message"),
-        "DBCluster emu-ce-nothing not found.",
+        "The source cluster could not be found or cannot be accessed: emu-ce-nothing",
         "the not-found fault names the cluster the request asked for, got {missing}"
     );
 }
@@ -1051,8 +1051,9 @@ async fn a_modification_and_a_delete_act_on_the_stored_endpoint() {
         );
         assert_eq!(
             text(&refused, "Message"),
-            "The specified custom endpoint doesn't exist.",
-            "case {action:?}: expected the fixed not-found sentence, got {refused}"
+            "DBClusterEndpoint emu-ce-nothing not found",
+            "case {action:?}: expected the endpoint the request named in the sentence, \
+             got {refused}"
         );
     }
 

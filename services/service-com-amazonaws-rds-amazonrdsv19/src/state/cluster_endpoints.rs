@@ -163,11 +163,20 @@ pub const DB_CLUSTER_ENDPOINT_ALREADY_EXISTS_MESSAGE: &str =
 pub const DB_CLUSTER_ENDPOINT_QUOTA_MESSAGE: &str =
     "The cluster already has the maximum number of custom endpoints.";
 
-/// The sentence a `DBClusterEndpointNotFoundFault` carries, as the model publishes it for
-/// the error class: "The specified custom endpoint doesn't exist." The identifier the
-/// request named is not in it, so it is a constant for every call that addresses an
-/// endpoint — the modification and the delete alike, which cannot drift from each other.
-pub const DB_CLUSTER_ENDPOINT_NOT_FOUND_MESSAGE: &str = "The specified custom endpoint doesn't exist.";
+/// The message a `DBClusterEndpointNotFoundFault` carries: the
+/// `<resource type> <identifier> not found` form Amazon RDS words this fault in, naming the
+/// endpoint the request addressed. The error shape's documentation ("The specified custom
+/// endpoint doesn't exist.") describes the error CLASS and is not what goes on the wire, so
+/// the sentence is formatted from the request instead of taken from the model.
+///
+/// `named` is the value the REQUEST carried, not the key the store folded it to, so a
+/// caller matching the message against the identifier it sent finds it there — the same
+/// reason [`crate::state::db_cluster_not_found_message`] names the request's spelling. RDS
+/// writes this one with no terminal period. One function for every call that ADDRESSES an
+/// endpoint — the modification and the delete alike — so the two cannot drift apart.
+pub fn db_cluster_endpoint_not_found_message(named: &str) -> String {
+    format!("DBClusterEndpoint {named} not found")
+}
 
 /// The sentence an `InvalidDBClusterEndpointStateFault` carries, as the model publishes it
 /// for the error class: "The requested operation can't be performed on the endpoint while
