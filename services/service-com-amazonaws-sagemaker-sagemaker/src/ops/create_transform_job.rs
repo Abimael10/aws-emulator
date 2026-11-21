@@ -5,8 +5,10 @@
 //! Starts a batch transform job: validates the sizing rules the service documents but
 //! does not model, refuses a duplicate name (`ResourceInUse`) or a `ModelName` no stored
 //! model answers to (400 `ValidationException`, the class SageMaker refuses a dangling
-//! reference to another resource with), refuses an input location the model's execution
-//! role cannot read (400 `ValidationException`, see [`crate::state::s3_access`]), then
+//! reference to another resource with), LISTS the Amazon S3 location its `TransformInput`
+//! names and refuses a location that holds no object — or one the documents in force deny
+//! the read of — before the job exists (400 `ValidationException`, see
+//! [`crate::state::s3_access`]), then
 //! persists the job as `InProgress` with the instant the clock owes it a terminal status,
 //! and answers its ARN.
 //!
@@ -294,30 +296,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
         // The transform reads the dataset the input names ("TransformInput - Describes the
-        // dataset to be transformed and the Amazon S3 location where it is stored"), so a
-        // location that holds no object, or one the role is denied the read of, backs no
-        // transform at all and the job is refused for it rather than admitted with no input
-        // (see `crate::state::s3_access`). A model that assumes no role has none to read as.
+        // dataset to be transformed and the Amazon S3 location where it is stored"), so the
+        // location is LISTED before anything is stored: one that holds no object, and one the
+        // documents in force deny the read of, each back no transform at all, and the job is
+        // refused for it rather than admitted with no input (see `crate::state::s3_access`). A
+        // model that assumes no role has none to read as.
         //
-        // BOTH conditions are worded with the one sentence this family states, deliberately:
-        // `crate::state::no_s3_objects_found` is written for exactly that — "one sentence for
-        // one condition: whether the bucket is in another Region, holds nothing under that
-        // prefix, or is one the role may not list, what the caller is told is that the data
-        // source names no object". The hosting creates are the family that words the two
-        // apart (`create_model`).
+        // Two conditions, two sentences, because they are different facts and a caller acts on
+        // them differently: a location Amazon S3 ANSWERED holds nothing has no permission to
+        // name (`crate::state::s3_location_holds_no_objects`), while a read a document
+        // withholds is the one the listing permission is named for
+        // (`crate::state::no_s3_objects_found`). The hosting creates word the same pair apart
+        // the same way (`create_model`).
         let input_uri = input.transform_input.data_source.s3_data_source.s3_uri.clone();
         if let Some(role_arn) = execution_role_arn.as_deref() {
             if let Some(unreadable) =
                 crate::state::first_unreadable_location(ctx, &region, role_arn, [input_uri.as_str()])
                     .await
             {
-                let uri = unreadable.uri();
-                let bucket = crate::state::S3Location::parse(uri)
-                    .map(|location| location.bucket)
-                    .unwrap_or_default();
-                return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::state::no_s3_objects_found(uri, &region, role_arn, &bucket, None),
-                ));
+                let refusal = match unreadable {
+                    crate::state::UnreadableLocation::NoObject(uri) => {
+                        crate::state::s3_location_holds_no_objects(uri)
+                    }
+                    crate::state::UnreadableLocation::Denied(uri) => {
+                        let bucket = crate::state::S3Location::parse(uri)
+                            .map(|location| location.bucket)
+                            .unwrap_or_default();
+                        crate::state::no_s3_objects_found(uri, &region, role_arn, &bucket, None)
+                    }
+                };
+                return Err(crate::scaffolded::Scaffolded::validation(refusal));
             }
         }
 

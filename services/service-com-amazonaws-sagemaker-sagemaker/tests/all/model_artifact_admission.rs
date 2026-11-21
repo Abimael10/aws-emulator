@@ -676,8 +676,8 @@ async fn a_bucket_policy_that_withholds_the_read_refuses_the_model() {
 }
 
 /// RULE: `CreateTransformJob` is refused, with nothing stored, when the input location its
-/// `TransformInput` names holds no object — the job would have nothing to transform — and
-/// accepted when it holds one.
+/// `TransformInput` names holds no object — the job would have nothing to transform, which is
+/// what the refusal states about that location — and accepted when it holds one.
 #[tokio::test]
 async fn a_transform_job_whose_input_holds_no_object_is_refused() {
     let emulator = Emulator::new();
@@ -743,7 +743,7 @@ async fn a_transform_job_whose_input_holds_no_object_is_refused() {
             "TransformJobName": name,
             "ModelName": "transformmodel",
             "TransformInput": {
-                "DataSource": { "S3DataSource": { "S3DataType": data_type, "S3Uri": uri } },
+                "DataSource": { "S3DataSource": { "S3DataType": data_type, "S3Uri": uri.clone() } },
             },
             "TransformOutput": { "S3OutputPath": format!("s3://{BUCKET}/out/") },
             "TransformResources": { "InstanceType": "ml.m5.large", "InstanceCount": 1 },
@@ -772,10 +772,10 @@ async fn a_transform_job_whose_input_holds_no_object_is_refused() {
             "case {case:?}: an input holding no object must be refused, got {status} with \
              {answered}"
         );
-        assert!(
-            message(&answered).starts_with("No S3 objects found under S3 URL")
-                && message(&answered).contains(&role),
-            "case {case:?}: the refusal must name the location and the role, got {:?}",
+        assert_eq!(
+            message(&answered),
+            format!("The S3 location \"{uri}\" does not exist or has no objects."),
+            "case {case:?}: the refusal must state that the location holds no object, got {:?}",
             message(&answered)
         );
         assert_eq!(

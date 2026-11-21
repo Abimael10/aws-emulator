@@ -115,6 +115,21 @@ pub fn could_not_access_model_data(s3_url: &str, role_arn: &str, region: &str) -
     )
 }
 
+/// How a create whose resource's work would READ an Amazon S3 location words one that holds
+/// no object at all: the location AS THE CALLER SENT IT, and the two facts that make it name
+/// nothing — there is no such location, or there is nothing under it.
+///
+/// A DIFFERENT fact from a location whose listing was withheld from the role
+/// ([`no_s3_objects_found`], whose sentence names the permission the listing needs): here
+/// Amazon S3 ANSWERED, and what it answered is that the location holds nothing, so there is no
+/// permission to name. `CreateTransformJob` tells its caller the two apart, the way the hosting
+/// creates tell "could not find" and "could not access" apart
+/// ([`could_not_find_model_data`], [`could_not_access_model_data`]).
+#[must_use]
+pub fn s3_location_holds_no_objects(s3_url: &str) -> String {
+    format!("The S3 location \"{s3_url}\" does not exist or has no objects.")
+}
+
 /// How `CreateTrainingJob` words an input data source it found no object under: the S3 URL AS
 /// THE CALLER SENT IT, the Region the request addressed, the role it supplied and the bucket
 /// that role has to be allowed to list — the three things that can make the location answer
