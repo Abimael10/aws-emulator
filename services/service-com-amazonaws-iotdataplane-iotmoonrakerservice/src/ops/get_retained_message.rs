@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::broker(&*self.engine).ok_or_else(|| {
             GetRetainedMessageErrorModeled::InternalFailureException(
                 InternalFailureException::new("An unexpected error has occurred."),
             )
@@ -199,8 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             topic: Some(retained.topic.clone()),
             payload: Some(retained.payload.clone()),
             qos: retained.qos,
-            last_modified_time: retained.last_modified_time_millis,
-            user_properties: retained.user_properties.clone(),
+            // The retained message was stored when it was published, which is the instant
+            // the broker took it.
+            last_modified_time: retained.delivered_at_millis,
+            user_properties: retained
+                .user_properties
+                .as_ref()
+                .map(|properties| properties.as_bytes().to_vec()),
         })
     }
 }

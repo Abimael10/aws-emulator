@@ -9,11 +9,15 @@
 //! endpoint host.
 //!
 //! The MQTT half is a BROKER, not a transcript: a CONNECT opens or resumes the client's
-//! session in the shared store, a SUBSCRIBE records its topic filters, a PUBLISH is handed
-//! to every session subscribed to that topic, a PINGREQ is answered, and the connection
-//! closing marks the session disconnected with the reason it closed for. Every fact the
-//! IoT data plane then reports about that client — connected, since when, which filters,
-//! what is queued — is read from the session this wire wrote.
+//! session in the shared store, a SUBSCRIBE records its topic filters and is answered with
+//! what the topics they cover have retained, a PUBLISH is handed to every session
+//! subscribed to that topic (and becomes that topic's retained message when it carried the
+//! RETAIN flag), a PINGREQ is answered, and the connection closing marks the session
+//! disconnected with the reason it closed for. The broker PUBLISHES about the session as
+//! well — its presence events, and the will the client left for a termination that was not
+//! its own DISCONNECT ([`super::lifecycle`]). Every fact the IoT data plane then reports
+//! about that client — connected, since when, which filters, what is queued — is read from
+//! the session this wire wrote.
 //!
 //! The protocol itself is read and written with the maintained MQTT codec
 //! ([`::mqttbytes`]): this module decides what the broker DOES with each packet, not how a
@@ -43,7 +47,7 @@ use ::tokio::sync::mpsc::Receiver;
 use ::tokio::sync::Notify;
 
 use super::{
-    endpoint, now_millis, Delivery, DirectMessage, LiveConnection, MqttBrokerState,
+    endpoint, lifecycle, now_millis, Delivery, DirectMessage, LiveConnection, MqttBrokerState,
     MAX_PENDING_DELIVERIES,
 };
 
@@ -149,12 +153,30 @@ impl NativeHandler for MqttEndpoint {
     }
 }
 
-/// The reason a session carries once its client's own DISCONNECT closed the connection.
-/// One of the AWS IoT Core lifecycle-event `disconnectReason` values.
-pub const CLIENT_INITIATED_DISCONNECT: &str = "CLIENT_INITIATED_DISCONNECT";
+/// The reasons a session carries once it has ended — the client's own DISCONNECT, a
+/// connection that ended without one, and a client id another connection took over. One
+/// vocabulary for the session record and for the disconnect event that reports it, so both
+/// are read from [`lifecycle`].
+pub use lifecycle::{CLIENT_INITIATED_DISCONNECT, CONNECTION_LOST, DUPLICATE_CLIENTID};
 
-/// The reason a session carries when the connection ended without a DISCONNECT.
-pub const CONNECTION_LOST: &str = "CONNECTION_LOST";
+/// What opening one session left for the connection to do once the store is released: the
+/// connection it is, what its CONNACK says, and what the broker publishes about it.
+struct SessionOpened {
+    /// Which connection of this broker opened it — see [`LiveConnection::id`].
+    connection_id: u64,
+    /// Whether the session continues a stored one, which is what `sessionPresent` says.
+    session_present: bool,
+    /// The session's own identifier, which its lifecycle events are about.
+    identifier: String,
+    /// The address the client connected from, where this emulator knows it: the connect
+    /// event's `ipAddress`.
+    source_ip: Option<String>,
+    /// The `versionNumber` the connect event carries.
+    version_number: i64,
+    /// The session this CONNECT took the client id over from, when it displaced a live one:
+    /// its end is published before this session's connect event.
+    displaced: Option<lifecycle::EndedSession>,
+}
 
 /// Serve one MQTT connection: open its session, then answer its packets until it closes.
 async fn serve_mqtt(
@@ -191,6 +213,17 @@ async fn serve_mqtt(
         let _ = write_connack(version, &mut writer, protocol::Connack::ClientIdNotValid).await;
         return;
     }
+    if connect
+        .last_will
+        .as_ref()
+        .is_some_and(|will| will.payload.len() > MAX_PAYLOAD_BYTES)
+    {
+        // A will larger than the broker's own message quota is a publication the broker
+        // could never make, so there is no session to open holding it — and MQTT 3.1.1
+        // gives a server no CONNACK code for it, exactly as it gives none for the
+        // over-size PUBLISH this ends the connection like.
+        return;
+    }
 
     let deliveries = ::tokio::sync::mpsc::channel::<Delivery>(MAX_PENDING_DELIVERIES);
     let (handed, mut arriving) = deliveries;
@@ -222,12 +255,21 @@ async fn serve_mqtt(
             // live connection for TAKES OVER: MQTT requires the existing connection to be
             // closed, and the session it leaves behind is the one this connection
             // continues.
-            let resumed = held.sessions.remove(&client_id);
-            if let Some(displaced) = resumed
-                .as_ref()
-                .and_then(|session| session.connection.clone())
-            {
-                displaced.close();
+            let mut resumed = held.sessions.remove(&client_id);
+            // What the displaced session's own end publishes: its disconnect event names
+            // the takeover, and the will it left is published for it, because a client id
+            // taken over is not the client saying goodbye. Read here, under the guard, and
+            // published once it is released; the connection it held is closed with it.
+            let mut displaced = None;
+            if let Some(session) = resumed.as_mut().filter(|session| session.connected) {
+                displaced = Some(lifecycle::EndedSession::of(
+                    session,
+                    DUPLICATE_CLIENTID,
+                    true,
+                ));
+                if let Some(live) = session.disconnect(DUPLICATE_CLIENTID, opened_at) {
+                    live.close();
+                }
             }
             // `cleanSession` decides whether the stored session is continued or
             // discarded: a clean session starts with no subscriptions and nothing queued,
@@ -244,6 +286,13 @@ async fn serve_mqtt(
             session.connected = true;
             session.clean_session = connect.clean_session;
             session.keep_alive_seconds = connect.keep_alive_seconds;
+            // This CONNECTION's own session identifier, which its lifecycle events are
+            // about: a client id a second connection takes over is a second session, and
+            // the identifier is what tells them apart.
+            session.session_identifier = lifecycle::new_session_identifier();
+            // The will this CONNECT configured, which replaces whatever the session it
+            // continues configured: a will belongs to the connection that left it.
+            session.will = connect.last_will.clone().map(|will| *will);
             // The Session Expiry Interval an MQTT 5 CONNECT configured, which is a fact
             // about this connection; a 3.1.1 client's protocol carries none, so it
             // configures none.
@@ -278,27 +327,54 @@ async fn serve_mqtt(
             }
             session.connection = Some(connection);
             let queued = std::mem::take(&mut session.queued_messages);
+            let opening = SessionOpened {
+                connection_id: id,
+                session_present,
+                identifier: session.session_identifier.clone(),
+                source_ip: session.source_ip.clone(),
+                version_number: session.lifecycle_version,
+                displaced,
+            };
+            session.lifecycle_version = session.lifecycle_version.saturating_add(1);
             held.sessions.insert(client_id.clone(), session);
-            Some((id, session_present, queued))
+            Some((opening, queued))
         }
     };
-    let Some((connection_id, session_present, queued)) = opened else {
+    let Some((opening, queued)) = opened else {
         // The protocol's own "server unavailable" — what a broker at its connection quota
         // answers — and no session was opened.
         let _ = write_connack(version, &mut writer, protocol::Connack::ServerUnavailable).await;
         return;
     };
+    let connection_id = opening.connection_id;
 
     if !write_connack(
         version,
         &mut writer,
-        protocol::Connack::Accepted { session_present },
+        protocol::Connack::Accepted {
+            session_present: opening.session_present,
+        },
     )
     .await
     {
         close_session(&state, &client_id, connection_id, CONNECTION_LOST);
         return;
     }
+
+    // What the broker PUBLISHES about this connection, now that the store is no longer
+    // held: the displaced session's own end (its takeover event and the will it left),
+    // then this session's connect event.
+    if let Some(displaced) = &opening.displaced {
+        lifecycle::publish_session_ended(&state, displaced, opened_at);
+    }
+    lifecycle::publish_connected(
+        &state,
+        &client_id,
+        &opening.identifier,
+        opening.source_ip.as_deref(),
+        opening.version_number,
+        opened_at,
+    );
 
     // What the session was holding for this client while it was away is written to it now,
     // which is what a persistent session is FOR — each under its own packet identifier,
@@ -307,7 +383,9 @@ async fn serve_mqtt(
     for message in queued {
         let packet_id = next_packet_id;
         next_packet_id = next_packet_id.checked_add(1).unwrap_or(1);
-        if !write_publish(version, &mut writer, &message, packet_id).await {
+        // A redelivery is a message forwarded by ordinary publishing, so its RETAIN flag
+        // is clear: only the push that answers a new subscription carries one.
+        if !write_publish(version, &mut writer, &message, packet_id, false).await {
             close_session(&state, &client_id, connection_id, CONNECTION_LOST);
             return;
         }
@@ -384,7 +462,7 @@ where
                 if let Some(acknowledged) = delivery.acknowledged.filter(|_| confirmed) {
                     awaiting.insert(packet_id, acknowledged);
                 }
-                if !write_publish(version, writer, &delivery.message, packet_id).await {
+                if !write_publish(version, writer, &delivery.message, packet_id, false).await {
                     return Some(CONNECTION_LOST);
                 }
                 continue;
@@ -423,7 +501,10 @@ where
                 }
                 let at_least_once = message.qos >= MAX_GRANTED_QOS;
                 message.delivered_at_millis = now_millis();
-                super::publish_to_subscribers(state, &message);
+                // The whole publication: the RETAIN flag the client set makes this the
+                // topic's retained message (and an empty retained payload clears it),
+                // and the message goes to the topic's subscribers either way.
+                super::publish(state, &message);
                 if at_least_once
                     && !write_packet(writer, |buffer| {
                         protocol::render_puback(version, buffer, packet_id)
@@ -443,6 +524,12 @@ where
             }
             protocol::ClientPacket::Subscribe { packet_id, filters } => {
                 let mut granted = Vec::with_capacity(filters.len());
+                // The DISTINCT filters this SUBSCRIBE subscribed, each with the QoS it was
+                // granted: at most [`MAX_SUBSCRIPTIONS_PER_SESSION`] of them, however many
+                // entries the packet repeated, which is what bounds the retained-message
+                // matching below.
+                let mut subscribed: ::std::collections::BTreeMap<String, i32> =
+                    ::std::collections::BTreeMap::new();
                 {
                     let mut held = state.lock();
                     // The session this connection opened, while it is still this
@@ -477,6 +564,8 @@ where
                         let qos = filter.qos.clamp(0, MAX_GRANTED_QOS);
                         session.subscriptions.insert(filter.path.clone(), qos);
                         granted.push(protocol::Grant::Qos(qos));
+                        let subscribed_qos = subscribed.entry(filter.path.clone()).or_insert(qos);
+                        *subscribed_qos = (*subscribed_qos).max(qos);
                     }
                 }
                 if !write_packet(writer, |buffer| {
@@ -485,6 +574,36 @@ where
                 .await
                 {
                     return Some(CONNECTION_LOST);
+                }
+                // What the new subscriptions are answered with out of the retain store: the
+                // topics they cover, matched OFF the store's lock over the bounded list of
+                // retained topics ([`MqttBrokerState::retained_topics`]) and over the
+                // DISTINCT filters above — so one packet cannot make the broker walk the
+                // store once per entry it repeated, and no caller-chosen batch of filters is
+                // walked with the store held.
+                let answered = if subscribed.is_empty() {
+                    Vec::new()
+                } else {
+                    retained_topics_answering(state.lock().retained_topics(), &subscribed)
+                };
+                // Each retained message is read on its own and written with the RETAIN flag
+                // SET: that is what tells the client the message was retained for it rather
+                // than published while it was listening (MQTT 3.1.1 section 3.3.1.3), and
+                // reading one at a time is what keeps one packet from making the broker hold
+                // a copy of the whole store.
+                for (topic, qos) in answered {
+                    let Some(mut message) = state.lock().retained_messages.get(&topic).cloned()
+                    else {
+                        // The topic was cleared between the SUBACK and this write, so there
+                        // is no retained message for it any more.
+                        continue;
+                    };
+                    message.qos = message.qos.min(qos);
+                    let delivered_id = next_packet_id;
+                    next_packet_id = next_packet_id.checked_add(1).unwrap_or(1);
+                    if !write_publish(version, writer, &message, delivered_id, true).await {
+                        return Some(CONNECTION_LOST);
+                    }
                 }
             }
             protocol::ClientPacket::Unsubscribe { packet_id, filters } => {
@@ -521,7 +640,36 @@ where
     }
 }
 
-/// Record that this connection's client is gone, with the reason it went.
+/// Which of `topics` a SUBSCRIBE that subscribed `subscribed` (each distinct filter with the
+/// QoS it was granted) is answered with, and the QoS each is sent at: the highest QoS a
+/// covering filter was granted, so a topic several filters of one packet cover is answered
+/// ONCE.
+///
+/// What one SUBSCRIBE costs is the product of two bounds and nothing else: the retained
+/// topics the store holds ([`super::MAX_RETAINED_TOPICS`]) and the DISTINCT filters a session
+/// may subscribe ([`MAX_SUBSCRIPTIONS_PER_SESSION`]) — not the filter entries the packet
+/// carried, which a client chooses. It runs off the store's lock, on the connection's own
+/// task, over the topic list copied out of it.
+fn retained_topics_answering(
+    topics: Vec<String>,
+    subscribed: &::std::collections::BTreeMap<String, i32>,
+) -> Vec<(String, i32)> {
+    topics
+        .into_iter()
+        .filter_map(|topic| {
+            subscribed
+                .iter()
+                .filter(|(filter, _qos)| super::topic_filter_covers(filter, &topic))
+                .map(|(_filter, qos)| *qos)
+                .max()
+                .map(|qos| (topic, qos))
+        })
+        .collect()
+}
+
+/// Record that this connection's client is gone, with the reason it went, and publish what
+/// the end of that session publishes: its disconnect event, and the will the client left
+/// for any termination but its own DISCONNECT.
 ///
 /// Only the session this connection still owns is written: a client id another connection
 /// has taken over belongs to that connection, and a session the service disconnected
@@ -532,23 +680,32 @@ fn close_session(
     connection_id: u64,
     reason: &str,
 ) {
-    let mut held = state.lock();
-    let Some(session) = held.sessions.get_mut(client_id) else {
-        return;
+    let at_millis = now_millis();
+    // The record is written under the guard and what it publishes is read off it there;
+    // the publication itself is made once the guard is gone, because a delivery is never
+    // handed out with the store held.
+    let ended = {
+        let mut held = state.lock();
+        let Some(session) = held.sessions.get_mut(client_id) else {
+            return;
+        };
+        if !session
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.id == connection_id)
+        {
+            return;
+        }
+        let ended = lifecycle::EndedSession::of(session, reason, true);
+        session.disconnect(reason, at_millis);
+        // A client that connected with a clean session keeps no state past its connection.
+        if session.clean_session {
+            session.subscriptions.clear();
+            session.queued_messages.clear();
+        }
+        ended
     };
-    if !session
-        .connection
-        .as_ref()
-        .is_some_and(|connection| connection.id == connection_id)
-    {
-        return;
-    }
-    session.disconnect(reason, now_millis());
-    // A client that connected with a clean session keeps no state past its connection.
-    if session.clean_session {
-        session.subscriptions.clear();
-        session.queued_messages.clear();
-    }
+    lifecycle::publish_session_ended(state, &ended, at_millis);
 }
 
 /// Read the opening CONNECT: the MQTT version it announces, and what it asks for.
@@ -651,15 +808,19 @@ async fn write_connack<W: AsyncWrite + Unpin>(
 
 /// Write one delivery to the client as a PUBLISH, at the QoS the delivery was made at and
 /// with the message properties the client's own version can carry.
+///
+/// `retain` is this DELIVERY's RETAIN flag: set on the push that answers a new subscription
+/// with what its topics retained, and clear on a message forwarded by ordinary publishing.
 async fn write_publish<W: AsyncWrite + Unpin>(
     version: protocol::Version,
     writer: &mut W,
     message: &DirectMessage,
     packet_id: u16,
+    retain: bool,
 ) -> bool {
     let now = now_millis();
     write_packet(writer, |buffer| {
-        protocol::render_publish(version, buffer, message, packet_id, now)
+        protocol::render_publish(version, buffer, message, packet_id, retain, now)
     })
     .await
 }
@@ -681,5 +842,79 @@ pub fn qos_of(number: i32) -> QoS {
         QoS::AtLeastOnce
     } else {
         QoS::AtMostOnce
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The filters a SUBSCRIBE subscribed, as the broker holds them: distinct, each with the
+    /// QoS it was granted.
+    fn subscribed(
+        filters: &[(&str, i32)],
+    ) -> ::std::collections::BTreeMap<String, i32> {
+        filters
+            .iter()
+            .map(|(filter, qos)| ((*filter).to_string(), *qos))
+            .collect()
+    }
+
+    /// One row of the retained-answer cases: what it is, the filters the SUBSCRIBE
+    /// subscribed with the QoS each was granted, and the topics it is answered with.
+    type RetainedAnswerRow = (
+        &'static str,
+        &'static [(&'static str, i32)],
+        &'static [(&'static str, i32)],
+    );
+
+    /// RULE: a new subscription is answered with the retained message of every topic its
+    /// filters cover, ONCE per topic and at the highest QoS a covering filter was granted —
+    /// and the matching is over the DISTINCT filters the session subscribed, so what one
+    /// SUBSCRIBE costs does not grow with the entries its packet repeated.
+    #[test]
+    fn a_subscription_is_answered_with_each_covered_retained_topic_once() {
+        let topics: Vec<String> = ["devices/sensor-1/state", "devices/sensor-2/state", "fleet/state"]
+            .iter()
+            .map(|topic| (*topic).to_string())
+            .collect();
+        // The rows span what the matching generalises over: one filter covering a subset, a
+        // filter covering a topic another filter covers too (answered once, at the higher
+        // granted QoS), the whole-tree filter, a filter covering nothing retained, and a
+        // SUBSCRIBE that subscribed nothing at all.
+        let rows: &[RetainedAnswerRow] = &[
+            (
+                "one wildcard filter",
+                &[("devices/#", 1)],
+                &[("devices/sensor-1/state", 1), ("devices/sensor-2/state", 1)],
+            ),
+            (
+                "two filters covering one topic",
+                &[("devices/#", 0), ("devices/sensor-1/state", 1)],
+                &[("devices/sensor-1/state", 1), ("devices/sensor-2/state", 0)],
+            ),
+            (
+                "the whole-tree filter",
+                &[("#", 1)],
+                &[
+                    ("devices/sensor-1/state", 1),
+                    ("devices/sensor-2/state", 1),
+                    ("fleet/state", 1),
+                ],
+            ),
+            ("a filter covering nothing retained", &[("orders/+", 1)], &[]),
+            ("nothing subscribed", &[], &[]),
+        ];
+        for (case, filters, expected) in rows {
+            let answered = retained_topics_answering(topics.clone(), &subscribed(filters));
+            let expected: Vec<(String, i32)> = expected
+                .iter()
+                .map(|(topic, qos)| ((*topic).to_string(), *qos))
+                .collect();
+            assert_eq!(
+                answered, expected,
+                "case {case:?}: expected {expected:?}, got {answered:?}"
+            );
+        }
     }
 }

@@ -6,8 +6,11 @@
 //! (`service_common::iot_mqtt_broker::publish_to_subscribers`), and a publish to a topic
 //! nobody is subscribed to leaves no trace of its own — exactly what a broker does with
 //! one. A publish with `retain=true` IS persistent state: it stores the message as the
-//! topic's retained message, and an empty retained payload clears it, which is how MQTT
-//! deletes a retained message.
+//! topic's retained message in the BROKER's own retain store
+//! (`service_common::iot_mqtt_broker::MqttBrokerState::apply_retain`), and an empty
+//! retained payload clears it, which is how MQTT deletes a retained message. That is the
+//! same store an MQTT SUBSCRIBE is answered from, so a message retained here is pushed to
+//! every later subscriber of a filter that covers the topic.
 //!
 //! The message the broker forwards carries the MQTT5 PROPERTIES this request set — the
 //! payload format indicator, the content type, the response topic, the correlation data,
@@ -307,7 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+        let state = crate::state::broker(&*self.engine).ok_or_else(|| {
             PublishErrorModeled::InternalFailureException(InternalFailureException::new(
                 "An unexpected error has occurred.",
             ))
@@ -347,69 +350,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if input.retain {
-            let mut guard = state.lock();
-            if payload.is_empty() {
-                // A retained publish with an empty payload is how MQTT clears a
-                // topic's retained message.
-                guard.retained_messages.remove(&input.topic);
-            } else {
-                // This cap is the emulator's own, not a quota the service publishes,
-                // so its message says so rather than borrowing service text.
-                if !guard.retained_messages.contains_key(&input.topic)
-                    && guard.retained_messages.len() >= crate::state::MAX_RETAINED_TOPICS
-                {
-                    return Err(PublishErrorModeled::InvalidRequestException(
-                        InvalidRequestException::new(format!(
-                            "this emulator retains messages for at most {} topics; clear a \
-                             retained message before retaining another",
-                            crate::state::MAX_RETAINED_TOPICS
-                        )),
-                    )
-                    .into());
-                }
-                guard.retained_messages.insert(
-                    input.topic.clone(),
-                    crate::state::RetainedMessage {
-                        topic: input.topic.clone(),
-                        payload: payload.clone(),
-                        qos: input.qos,
-                        last_modified_time_millis: crate::state::now_millis(),
-                        user_properties: input
-                            .user_properties
-                            .as_ref()
-                            .map(|properties| properties.as_bytes().to_vec()),
-                    },
-                );
-            }
-        }
-
         // The broker took the message, so it goes to the SUBSCRIBERS of the topic: every
         // MQTT session whose subscription covers it is handed the message over its own
         // connection, and an offline client's persistent session holds it for its return.
         // A topic nobody subscribes to reaches nobody, which is what a broker does with
         // one, and none of it changes this response.
         //
+        // A publication carrying `retain` is also the topic's RETAINED message, which the
+        // broker keeps for every later subscriber of a filter covering that topic — and a
+        // retained publication with an empty payload CLEARS it, which is how MQTT deletes
+        // a retained message. The store is the broker's, so a message retained here is the
+        // one an MQTT SUBSCRIBE is answered with and one retained over the MQTT wire is the
+        // one `GetRetainedMessage` reports.
+        //
         // The message carries the MQTT5 PROPERTIES this request set, each as the member
         // that set it: a subscriber whose own connection can carry them (an MQTT 5 client)
         // is handed every one, and a publication that set none arrives carrying none.
-        if let Some(broker) = crate::state::broker(&*self.engine) {
-            ::service_common::iot_mqtt_broker::publish_to_subscribers(
-                &broker,
-                &::service_common::iot_mqtt_broker::DirectMessage {
-                    topic: input.topic.clone(),
-                    payload: payload.clone(),
-                    qos: input.qos,
-                    content_type: input.content_type.clone(),
-                    response_topic: input.response_topic.clone(),
-                    user_properties: input.user_properties.clone(),
-                    payload_format_indicator: input.payload_format_indicator.clone(),
-                    correlation_data: input.correlation_data.clone(),
-                    message_expiry_seconds: message_expiry_interval(input.message_expiry),
-                    delivered_at_millis: crate::state::now_millis(),
-                },
-            );
+        let message = ::service_common::iot_mqtt_broker::DirectMessage {
+            topic: input.topic.clone(),
+            payload: payload.clone(),
+            qos: input.qos,
+            retain: input.retain,
+            content_type: input.content_type.clone(),
+            response_topic: input.response_topic.clone(),
+            user_properties: input.user_properties.clone(),
+            payload_format_indicator: input.payload_format_indicator.clone(),
+            correlation_data: input.correlation_data.clone(),
+            message_expiry_seconds: message_expiry_interval(input.message_expiry),
+            delivered_at_millis: crate::state::now_millis(),
+        };
+        if let Err(ceiling) = state.lock().apply_retain(&message) {
+            // This cap is the emulator's own, not a quota the service publishes,
+            // so its message says so rather than borrowing service text.
+            return Err(PublishErrorModeled::InvalidRequestException(
+                InvalidRequestException::new(format!(
+                    "this emulator retains messages for at most {ceiling} topics; clear a \
+                     retained message before retaining another"
+                )),
+            )
+            .into());
         }
+        ::service_common::iot_mqtt_broker::publish_to_subscribers(&state, &message);
 
         // The broker took the message, so the RULES ENGINE evaluates it: every enabled
         // topic rule whose SQL statement selects this topic runs its actions for this

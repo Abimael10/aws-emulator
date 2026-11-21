@@ -17,12 +17,15 @@
 //! What it is made of:
 //!
 //! * [`MqttSession`] — one client's session, which is what the connection operations
-//!   answer from, and [`MqttBrokerState`] — the sessions by client id, plus the endpoint
-//!   the broker answers at.
+//!   answer from, and [`MqttBrokerState`] — the sessions by client id, the retained message
+//!   of each topic, plus the endpoint the broker answers at.
 //! * [`wire`] — the protocol: a connection's CONNECT opens or resumes a session, its
-//!   SUBSCRIBE records topic filters on it, its PUBLISH is handed to the sessions
-//!   subscribed to that topic, and its close (or a `DeleteConnection`) marks the session
-//!   disconnected.
+//!   SUBSCRIBE records topic filters on it (and is answered with what is retained on the
+//!   topics they cover), its PUBLISH is handed to the sessions subscribed to that topic, and
+//!   its close (or a `DeleteConnection`) marks the session disconnected.
+//! * [`lifecycle`] — what the broker itself PUBLISHES about a session: the presence events a
+//!   connect and a disconnect make, and the client's own last will on a termination that was
+//!   not its own DISCONNECT.
 //! * [`endpoint`] — the socket the core opens for it and the `host:port` that socket is
 //!   published at, which is the address `DescribeEndpoint` answers with.
 //!
@@ -33,6 +36,7 @@
 
 pub mod endpoint;
 pub mod https_plane;
+pub mod lifecycle;
 pub mod wire;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -93,6 +97,16 @@ pub struct DirectMessage {
     /// The QoS the delivery used: 1 when the sender asked for confirmation, else 0 —
     /// what `SendDirectMessageRequest$confirmation` documents.
     pub qos: i32,
+    /// Whether the publication that made this message carried the MQTT RETAIN flag, which
+    /// is what makes it the TOPIC's retained message: the broker keeps it
+    /// ([`MqttBrokerState::retained_messages`]) and hands it to every later subscription
+    /// whose filter covers that topic.
+    ///
+    /// A fact about the PUBLICATION, not about one delivery: the RETAIN flag a delivered
+    /// packet carries is set on the push that answers a new subscription and clear on a
+    /// message forwarded by normal publishing (MQTT 3.1.1 section 3.3.1.3), which is what
+    /// the delivery itself decides.
+    pub retain: bool,
     pub content_type: Option<String>,
     pub response_topic: Option<String>,
     pub user_properties: Option<String>,
@@ -208,6 +222,18 @@ impl LiveConnection {
 pub struct MqttSession {
     /// The client id the session was opened under, which `GetConnection` reports back.
     pub client_id: String,
+    /// The session's own identifier, minted when the connection that opened it was
+    /// accepted: the `sessionIdentifier` every lifecycle event of this session carries, so
+    /// a subscriber of the presence topics can tell two connections of one client id apart.
+    pub session_identifier: String,
+    /// How many lifecycle events this session has had published for it, which is the
+    /// `versionNumber` the next one carries: the events of one session are delivered over
+    /// the ordinary subscription paths, so the number is what orders them.
+    pub lifecycle_version: i64,
+    /// The client's Last Will and Testament, as its own CONNECT configured one: the
+    /// publication the broker makes when the session ends any way but the client's own
+    /// DISCONNECT — see [`MqttSession::will_published_on`].
+    pub will: Option<DirectMessage>,
     /// Whether the client's network connection is open. A session outlives it when the
     /// client asked for a persistent session.
     pub connected: bool,
@@ -274,7 +300,15 @@ impl MqttSession {
     /// Queue `message` for this offline session, dropping the oldest once the queue is at
     /// one of its bounds: [`MAX_QUEUED_SESSION_MESSAGES`] messages or
     /// [`MAX_QUEUED_SESSION_BYTES`] of payload.
+    ///
+    /// Only a message published at QoS 1 is kept. AWS IoT Core's persistent session queue
+    /// holds the QoS 1 messages addressed to a disconnected session; a QoS 0 message
+    /// addressed to one is DISCARDED, because QoS 0 promises no delivery at all — so it is
+    /// never handed to the client when the session resumes.
     pub fn queue(&mut self, message: DirectMessage) {
+        if message.qos < QOS_AT_LEAST_ONCE {
+            return;
+        }
         self.queued_messages.push_back(message);
         while self.queued_messages.len() > MAX_QUEUED_SESSION_MESSAGES
             || self.queued_bytes() > MAX_QUEUED_SESSION_BYTES
@@ -332,7 +366,26 @@ impl MqttSession {
             .keys()
             .any(|filter| topic_filter_covers(filter, topic))
     }
+
+    /// The will this session publishes when it ends for `reason`, and `None` when that
+    /// termination publishes none.
+    ///
+    /// A will is the publication the broker makes FOR a client that did not say goodbye, so
+    /// a session whose client sent its own DISCONNECT publishes none — every other way a
+    /// session ends (the connection lost, the client id taken over, the service
+    /// disconnecting it) publishes the stored will.
+    #[must_use]
+    pub fn will_published_on(&self, reason: &str) -> Option<DirectMessage> {
+        self.will
+            .clone()
+            .filter(|_| reason != lifecycle::CLIENT_INITIATED_DISCONNECT)
+    }
 }
+
+/// The QoS of a publication the broker promises to deliver — "at least once", MQTT's QoS 1,
+/// which is the highest AWS IoT Core's message broker serves. A publication below it (QoS
+/// 0) is promised no delivery, which is what decides whether an OFFLINE session keeps one.
+pub const QOS_AT_LEAST_ONCE: i32 = 1;
 
 /// The level separator of a topic and of a filter, and the prefix of the topic space the
 /// broker reserves for its own system topics.
@@ -347,19 +400,24 @@ const MULTI_LEVEL_WILDCARD: &str = "#";
 
 /// Whether the topic FILTER `filter` covers the topic NAME `topic`.
 ///
-/// The rule is MQTT's own topic matching (MQTT 3.1.1 section 4.7): a filter and a topic are
-/// compared level by level, `+` matches exactly one level, `#` matches the remaining levels
-/// and its own (so `a/#` covers `a`), and a filter carrying no wildcard covers only its own
-/// topic. Section 4.7.2 adds the reserved space: a filter that BEGINS with a wildcard
-/// covers no topic under [`RESERVED_TOPIC_PREFIX`], which is what keeps a `#` subscription
-/// from receiving the broker's own system topics.
+/// The rule is AWS IoT Core's reading of MQTT topic matching (MQTT 3.1.1 section 4.7): a
+/// filter and a topic are compared level by level, `+` matches exactly one level, `#`
+/// matches ONE OR MORE remaining levels, and a filter carrying no wildcard covers only its
+/// own topic. The multi-level wildcard is where AWS IoT Core departs from the plain MQTT
+/// rule: it stands for levels BELOW the filter's literal prefix, so `a/#` covers `a/b` and
+/// `a/b/c` and does not cover the parent topic `a` itself, while the whole-tree filter `#`
+/// covers every topic (each has a level for it to stand for). Section 4.7.2 adds the
+/// reserved space: a filter that BEGINS with a wildcard covers no topic under
+/// [`RESERVED_TOPIC_PREFIX`], which is what keeps a `#` subscription from receiving the
+/// broker's own system topics.
 ///
-/// Read here rather than through the codec's own matcher, which indexes the topic's first
-/// BYTE for that reserved-space rule: a topic whose first character is multi-byte is a
-/// topic MQTT allows — a topic is any UTF-8 string — and byte 1 is no character boundary
-/// in it. Whether a string is a topic name or a filter at all is still the codec's reading
-/// ([`::mqttbytes::valid_topic`] and [`::mqttbytes::valid_filter`]), so a topic carrying a
-/// wildcard (a filter, not a name) and a filter that is none are covered by nothing.
+/// Read here rather than through the codec's own matcher, which applies the plain MQTT rule
+/// and indexes the topic's first BYTE for that reserved-space rule: a topic whose first
+/// character is multi-byte is a topic MQTT allows — a topic is any UTF-8 string — and byte 1
+/// is no character boundary in it. Whether a string is a topic name or a filter at all is
+/// still the codec's reading ([`::mqttbytes::valid_topic`] and [`::mqttbytes::valid_filter`]),
+/// so a topic carrying a wildcard (a filter, not a name) and a filter that is none are
+/// covered by nothing.
 #[must_use]
 pub fn topic_filter_covers(filter: &str, topic: &str) -> bool {
     if !::mqttbytes::valid_topic(topic) || !::mqttbytes::valid_filter(filter) {
@@ -373,9 +431,10 @@ pub fn topic_filter_covers(filter: &str, topic: &str) -> bool {
     let mut topic_levels = topic.split(TOPIC_LEVEL_SEPARATOR);
     for level in filter.split(TOPIC_LEVEL_SEPARATOR) {
         match level {
-            // The multi-level wildcard is a filter's last level and covers every level of
-            // the topic left, including none at all.
-            MULTI_LEVEL_WILDCARD => return true,
+            // The multi-level wildcard is a filter's last level and stands for the levels
+            // below the prefix before it — at least one of them, so the prefix's own topic
+            // is not covered.
+            MULTI_LEVEL_WILDCARD => return topic_levels.next().is_some(),
             // The single-level wildcard covers exactly one level, so a topic that has no
             // level left is not covered by it.
             SINGLE_LEVEL_WILDCARD => {
@@ -394,11 +453,17 @@ pub fn topic_filter_covers(filter: &str, topic: &str) -> bool {
     topic_levels.next().is_none()
 }
 
-/// The broker's state: the sessions it holds, and the endpoint it answers at.
+/// The broker's state: the sessions it holds, the retained message of each topic, and the
+/// endpoint it answers at.
 #[derive(Default)]
 pub struct MqttBrokerState {
     /// The session the broker holds per client id — see [`MqttSession`].
     pub sessions: BTreeMap<String, MqttSession>,
+    /// The RETAINED message of each topic: the last publication on that topic that carried
+    /// the RETAIN flag, kept until it is overwritten or cleared, and handed to every later
+    /// subscription whose filter covers the topic. In stable topic order, which is the order
+    /// an account's retained messages are listed in.
+    pub retained_messages: BTreeMap<String, DirectMessage>,
     /// The broker's endpoint, once a call has opened it — see [`endpoint`].
     pub(crate) endpoint: Option<endpoint::BrokerEndpoint>,
     /// How many connections this broker has accepted, which is what the next one is
@@ -414,6 +479,7 @@ impl std::fmt::Debug for MqttBrokerState {
         formatter
             .debug_struct("MqttBrokerState")
             .field("sessions", &self.sessions.len())
+            .field("retained_messages", &self.retained_messages.len())
             .field("endpoint", &self.authority())
             .finish()
     }
@@ -451,7 +517,53 @@ impl MqttBrokerState {
         self.connections_accepted = self.connections_accepted.saturating_add(1);
         self.connections_accepted
     }
+
+    /// Apply `message`'s RETAIN flag to the retained-message store: the message becomes its
+    /// topic's retained message, and a retained publication with an EMPTY payload clears
+    /// the topic instead — which is how MQTT deletes a retained message. A publication that
+    /// carried no RETAIN flag changes nothing here.
+    ///
+    /// `Err(MAX_RETAINED_TOPICS)` when the store already holds as many topics as it will and
+    /// this message would add another: the caller decides what to answer, and clearing a
+    /// retained message always frees a slot.
+    pub fn apply_retain(&mut self, message: &DirectMessage) -> Result<(), usize> {
+        if !message.retain {
+            return Ok(());
+        }
+        if message.payload.is_empty() {
+            self.retained_messages.remove(&message.topic);
+            return Ok(());
+        }
+        if !self.retained_messages.contains_key(&message.topic)
+            && self.retained_messages.len() >= MAX_RETAINED_TOPICS
+        {
+            return Err(MAX_RETAINED_TOPICS);
+        }
+        self.retained_messages
+            .insert(message.topic.clone(), message.clone());
+        Ok(())
+    }
+
+    /// The topics that hold a retained message, in stable topic order.
+    ///
+    /// The KEYS, copied out of the store: a new subscription is answered with the retained
+    /// message of every topic its filters cover, and the matching runs OFF this store's
+    /// lock over this bounded list — at most [`MAX_RETAINED_TOPICS`] topics, each no longer
+    /// than a topic may be — rather than with the store held while a caller-chosen batch of
+    /// filters is walked.
+    #[must_use]
+    pub fn retained_topics(&self) -> Vec<String> {
+        self.retained_messages.keys().cloned().collect()
+    }
 }
+
+/// How many topics may hold a retained message at once.
+///
+/// CHOSEN as a process bound, not an IoT Core quota: a publisher decides how many topics it
+/// retains a message on, and a retained message is kept until it is overwritten or cleared,
+/// so without a ceiling one publisher would size this process's memory. Clearing a retained
+/// message (a retained publication with an empty payload) always frees a slot.
+pub const MAX_RETAINED_TOPICS: usize = 1024;
 
 /// Now, in epoch MILLISECONDS — the unit every instant a session reports is carried in
 /// (`connectedSince`, `disconnectedSince`).
@@ -504,20 +616,41 @@ pub fn publish_to_subscribers(
     subscribers
 }
 
+/// One whole publication IN the broker: its topic's retained message is set or cleared when
+/// the publication carried the RETAIN flag, and then every subscribed session is handed it.
+///
+/// The two halves are what a retained publication is: a message for the subscribers there
+/// are NOW, and the message a subscriber that arrives LATER is handed. A publication the
+/// retained store could not take (its topic ceiling, [`MAX_RETAINED_TOPICS`]) is still
+/// delivered to the subscribers it has; the caller that can report the refusal checks
+/// [`MqttBrokerState::apply_retain`] itself.
+pub fn publish(state: &::engine::ServiceState<MqttBrokerState>, message: &DirectMessage) -> usize {
+    if let Err(ceiling) = state.lock().apply_retain(message) {
+        ::tracing::debug!(
+            ceiling,
+            "the broker holds retained messages for as many topics as it will, so this \
+             publication was delivered without being retained"
+        );
+    }
+    publish_to_subscribers(state, message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// RULE: a filter covers a topic by MQTT's own topic matching — exact levels, `+` for
-    /// one level and `#` for the rest, and no wildcard-leading filter over the reserved
-    /// space — which is what decides a publication's recipients.
+    /// RULE: a filter covers a topic by AWS IoT Core's reading of MQTT topic matching —
+    /// exact levels, `+` for one level and `#` for one or more levels BELOW the filter's
+    /// prefix, and no wildcard-leading filter over the reserved space — which is what
+    /// decides a publication's recipients.
     ///
     /// The rows span what the rule generalises over: a filter with no wildcard, a
     /// single-level wildcard at the front, in the middle and at the end, a multi-level
-    /// wildcard (including over the parent level it also covers), the whole-tree filter,
-    /// the level counts that make a filter miss, a topic in the broker's reserved `$`
-    /// space, a topic whose first character is MULTI-BYTE (any UTF-8 string is a topic), a
-    /// trailing empty level, and the strings that are no topic name or no filter at all.
+    /// wildcard (over a deeper topic, over one level, and over the parent level it does NOT
+    /// cover), the whole-tree filter, the level counts that make a filter miss, a topic in
+    /// the broker's reserved `$` space, a topic whose first character is MULTI-BYTE (any
+    /// UTF-8 string is a topic), a trailing empty level, and the strings that are no topic
+    /// name or no filter at all.
     #[test]
     fn a_filter_covers_the_topics_mqtt_matching_gives_it() {
         let rows: &[(&str, &str, bool)] = &[
@@ -528,10 +661,16 @@ mod tests {
             ("+/sensor-1/telemetry", "devices/sensor-1/telemetry", true),
             ("devices/sensor-1/+", "devices/sensor-1/telemetry", true),
             ("devices/#", "devices/sensor-1/telemetry/raw", true),
+            ("devices/#", "devices/sensor-1", true),
             ("devices/#", "fleet/sensor-1", false),
-            // `a/#` covers the parent level itself (MQTT 3.1.1 section 4.7.1.2).
-            ("devices/#", "devices", true),
+            // `<prefix>/#` stands for the levels BELOW the prefix, so the prefix's own
+            // topic is not one of them.
+            ("devices/#", "devices", false),
+            ("devices/sensor-1/#", "devices/sensor-1", false),
+            // ... while the whole-tree filter covers every topic: each has a level for the
+            // wildcard to stand for.
             ("#", "devices/sensor-1", true),
+            ("#", "devices", true),
             ("devices/sensor-1", "devices/sensor-1/telemetry", false),
             // A topic in the broker's reserved space is covered by a filter that names it
             // and by none that begins with a wildcard (section 4.7.2).
@@ -566,7 +705,8 @@ mod tests {
     }
 
     /// RULE: a session hands a delivery to the client's live connection when it has one,
-    /// and queues it on the session when it has none — bounded, so the oldest goes first.
+    /// and queues it on the session when it has none — bounded, so the oldest goes first,
+    /// and only for a message published at QoS 1, since QoS 0 promises no delivery.
     #[tokio::test]
     async fn a_delivery_reaches_a_live_connection_and_queues_without_one() {
         let (deliveries, mut arriving) = ::tokio::sync::mpsc::channel(MAX_PENDING_DELIVERIES);
@@ -583,6 +723,7 @@ mod tests {
         let message = DirectMessage {
             topic: "devices/sensor-1/commands".to_string(),
             payload: b"run".to_vec(),
+            qos: QOS_AT_LEAST_ONCE,
             ..DirectMessage::default()
         };
         assert!(
@@ -601,7 +742,7 @@ mod tests {
         );
 
         // The same session once its client is gone: the delivery is kept for its return.
-        session.disconnect("CLIENT_INITIATED_DISCONNECT", 10);
+        session.disconnect(lifecycle::CLIENT_INITIATED_DISCONNECT, 10);
         assert!(
             !session.deliver(message.clone(), None),
             "case \"no connection\": expected no live connection to take it"
@@ -612,10 +753,29 @@ mod tests {
             "case \"no connection\": expected the message queued on the session"
         );
 
+        // A QoS 0 message addressed to the same offline session is discarded: nothing is
+        // kept for a client that was promised no delivery.
+        session.deliver(
+            DirectMessage {
+                topic: "devices/sensor-1/commands".to_string(),
+                payload: b"at-most-once".to_vec(),
+                qos: 0,
+                ..DirectMessage::default()
+            },
+            None,
+        );
+        assert_eq!(
+            session.queued_messages.len(),
+            1,
+            "case \"a QoS 0 message to an offline session\": expected it discarded, got {:?}",
+            session.queued_messages
+        );
+
         // And the queue is bounded: the oldest leaves rather than the session growing.
         for index in 0..MAX_QUEUED_SESSION_MESSAGES {
             session.queue(DirectMessage {
                 topic: format!("devices/sensor-1/commands/{index}"),
+                qos: QOS_AT_LEAST_ONCE,
                 ..DirectMessage::default()
             });
         }
@@ -625,5 +785,113 @@ mod tests {
             "case \"a full queue\": expected the queue to hold at most its bound, got {}",
             session.queued_messages.len()
         );
+    }
+
+    /// RULE: a retained publication is the topic's retained message until it is overwritten
+    /// or cleared by a retained publication with an empty payload, and a subscription is
+    /// answered with what is retained on every topic its filter covers.
+    #[test]
+    fn a_retained_publication_is_kept_per_topic_until_it_is_cleared() {
+        let mut broker = MqttBrokerState::default();
+        let retained = |topic: &str, payload: &[u8]| DirectMessage {
+            topic: topic.to_string(),
+            payload: payload.to_vec(),
+            qos: QOS_AT_LEAST_ONCE,
+            retain: true,
+            ..DirectMessage::default()
+        };
+
+        // A publication that carried no RETAIN flag is kept nowhere.
+        broker
+            .apply_retain(&DirectMessage {
+                topic: "devices/sensor-1/state".to_string(),
+                payload: b"transient".to_vec(),
+                ..DirectMessage::default()
+            })
+            .expect("an unretained publication takes no slot");
+        assert!(
+            broker.retained_messages.is_empty(),
+            "case \"no RETAIN flag\": expected nothing retained, got {:?}",
+            broker.retained_messages.keys().collect::<Vec<_>>()
+        );
+
+        for (topic, payload) in [
+            ("devices/sensor-1/state", &b"first"[..]),
+            ("devices/sensor-1/state", &b"second"[..]),
+            ("devices/sensor-2/state", &b"other"[..]),
+            ("fleet/state", &b"fleet"[..]),
+        ] {
+            broker
+                .apply_retain(&retained(topic, payload))
+                .expect("the store takes it");
+        }
+        assert_eq!(
+            broker
+                .retained_messages
+                .get("devices/sensor-1/state")
+                .map(|message| message.payload.clone()),
+            Some(b"second".to_vec()),
+            "case \"a second retained publication\": expected the newer payload, got {:?}",
+            broker.retained_messages.get("devices/sensor-1/state")
+        );
+
+        // The topics the store holds, in stable topic order: the bounded list a new
+        // subscription is matched against.
+        let covered = broker.retained_topics();
+        assert_eq!(
+            covered,
+            vec![
+                "devices/sensor-1/state".to_string(),
+                "devices/sensor-2/state".to_string(),
+                "fleet/state".to_string()
+            ],
+            "case \"the retained topics\": expected every retained topic once, got {covered:?}"
+        );
+
+        // A retained publication with an empty payload clears the topic.
+        broker
+            .apply_retain(&retained("devices/sensor-1/state", b""))
+            .expect("clearing takes no slot");
+        assert!(
+            !broker
+                .retained_messages
+                .contains_key("devices/sensor-1/state"),
+            "case \"an empty retained payload\": expected the topic cleared, got {:?}",
+            broker.retained_messages.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// RULE: a session's will is published on every termination but the client's own
+    /// DISCONNECT, and a session that configured none publishes nothing either way.
+    #[test]
+    fn a_will_is_published_on_every_termination_but_the_clients_own_disconnect() {
+        let will = DirectMessage {
+            topic: "devices/sensor-1/status".to_string(),
+            payload: b"offline".to_vec(),
+            qos: QOS_AT_LEAST_ONCE,
+            ..DirectMessage::default()
+        };
+        let with_will = MqttSession {
+            will: Some(will.clone()),
+            ..MqttSession::default()
+        };
+        let without_will = MqttSession::default();
+        let rows: &[(&str, bool)] = &[
+            (lifecycle::CLIENT_INITIATED_DISCONNECT, false),
+            (lifecycle::CONNECTION_LOST, true),
+            (lifecycle::DUPLICATE_CLIENTID, true),
+            (lifecycle::SERVER_INITIATED_DISCONNECT, true),
+        ];
+        for (reason, published) in rows {
+            assert_eq!(
+                with_will.will_published_on(reason).is_some(),
+                *published,
+                "case {reason:?}: expected the will published {published}"
+            );
+            assert!(
+                without_will.will_published_on(reason).is_none(),
+                "case {reason:?}: a session that configured no will publishes none"
+            );
+        }
     }
 }

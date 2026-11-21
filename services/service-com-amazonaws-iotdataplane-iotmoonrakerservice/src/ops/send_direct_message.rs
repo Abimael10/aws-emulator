@@ -283,6 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `SendDirectMessage` models no message expiry, so a direct message
                 // carries none and never expires on its way to the client.
                 message_expiry_seconds: None,
+                // A direct message is addressed to ONE client, so it is no topic's
+                // retained message: `SendDirectMessage` models no retain flag.
+                retain: false,
                 delivered_at_millis: now_millis,
             };
             // A connected client is handed the message over its own connection; an

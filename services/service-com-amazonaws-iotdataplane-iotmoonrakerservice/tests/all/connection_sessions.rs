@@ -655,10 +655,12 @@ async fn send_direct_message_delivers_into_the_session() {
     harness.connect(offline_session("queued-client", 10_000));
 
     // A message to a CONNECTED client goes over its connection and queues nothing; a
-    // message to an offline client is queued on its persistent session, verbatim.
-    for (case, client_id, queues) in [
-        ("a connected client", "online-client", false),
-        ("an offline persistent session", "queued-client", true),
+    // message to an OFFLINE client is kept on its persistent session only when it was
+    // delivered at QoS 1, and a send that asks for no confirmation is made at QoS 0 —
+    // which promises no delivery, so an offline session discards it.
+    for (case, client_id) in [
+        ("a connected client", "online-client"),
+        ("an offline persistent session", "queued-client"),
     ] {
         let payload = format!("payload for {case}").into_bytes();
         let answer = harness
@@ -691,31 +693,50 @@ async fn send_direct_message_delivers_into_the_session() {
             .stored_session(client_id)
             .expect("the session is still held")
             .queued_messages;
-        if !queues {
-            assert!(
-                queue.is_empty(),
-                "case {case:?}: a message to a connected client queues nothing, got {} entries",
-                queue.len()
-            );
-            continue;
-        }
-        assert_eq!(
-            queue.len(),
-            1,
-            "case {case:?}: expected the message to be queued, got {} entries",
+        assert!(
+            queue.is_empty(),
+            "case {case:?}: a QoS 0 delivery leaves nothing on a session, got {} entries",
             queue.len()
-        );
-        let queued = &queue[0];
-        assert_eq!(
-            (queued.topic.as_str(), queued.payload.as_slice(), queued.qos),
-            ("orders/new", payload.as_slice(), 0),
-            "case {case:?}: expected the message queued verbatim, got {queued:?}"
         );
     }
 
+    // The same message asked to be CONFIRMED is delivered at QoS 1, which an offline
+    // session DOES keep for the client's return — verbatim.
+    let confirmed = b"payload for a confirmed delivery".to_vec();
+    let answer = harness
+        .send_direct_message("queued-client", "orders/new", true, confirmed.clone())
+        .await;
+    assert_eq!(
+        answer.status,
+        504,
+        "case \"a confirmed delivery to an offline session\": expected the modelled gateway \
+         timeout, got {} with body {}",
+        answer.status,
+        answer.text()
+    );
+    let queue = harness
+        .stored_session("queued-client")
+        .expect("the session is still held")
+        .queued_messages;
+    assert_eq!(
+        queue.len(),
+        1,
+        "case \"a confirmed delivery to an offline session\": expected the message to be \
+         queued, got {} entries",
+        queue.len()
+    );
+    let queued = &queue[0];
+    assert_eq!(
+        (queued.topic.as_str(), queued.payload.as_slice(), queued.qos),
+        ("orders/new", confirmed.as_slice(), 1),
+        "case \"a confirmed delivery to an offline session\": expected the message queued \
+         verbatim, got {queued:?}"
+    );
+
     // The payload quota bounds a direct message as it bounds a publish: the bound itself
     // is delivered, one byte more is an entity too large, and a refused send queues
-    // nothing.
+    // nothing. Each is asked to be confirmed, so the delivery is made at the QoS an
+    // offline session keeps and the queue shows which sends reached it.
     for (case, size) in [
         ("exactly at the quota", MAX_PUBLISH_PAYLOAD_BYTES),
         ("one byte past the quota", MAX_PUBLISH_PAYLOAD_BYTES + 1),
@@ -727,7 +748,7 @@ async fn send_direct_message_delivers_into_the_session() {
             .queued_messages
             .len();
         let answer = harness
-            .send_direct_message("queued-client", "orders/big", false, vec![3u8; size])
+            .send_direct_message("queued-client", "orders/big", true, vec![3u8; size])
             .await;
         let after = harness
             .stored_session("queued-client")
@@ -737,8 +758,9 @@ async fn send_direct_message_delivers_into_the_session() {
         if size <= MAX_PUBLISH_PAYLOAD_BYTES {
             assert_eq!(
                 answer.status,
-                200,
-                "case {case:?}: expected {size} bytes to be delivered, got {} with body {}",
+                504,
+                "case {case:?}: expected {size} bytes to be delivered to the offline session, \
+                 got {} with body {}",
                 answer.status,
                 answer.text()
             );
@@ -897,18 +919,21 @@ async fn a_sessions_offline_queue_is_bounded_and_keeps_the_newest() {
 
     let overflow = 5;
     for index in 0..MAX_QUEUED_SESSION_MESSAGES + overflow {
+        // Asked to be confirmed, so the delivery is made at QoS 1 — the QoS an offline
+        // session keeps — and answered with the modelled gateway timeout, because an
+        // offline client has no connection to acknowledge over.
         let answer = harness
             .send_direct_message(
                 "bounded-client",
                 "orders/bulk",
-                false,
+                true,
                 format!("message {index}").into_bytes(),
             )
             .await;
         assert_eq!(
             answer.status,
-            200,
-            "message {index}: expected 200, got {} with body {}",
+            504,
+            "message {index}: expected 504, got {} with body {}",
             answer.status,
             answer.text()
         );

@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-iotdataplane-iotmoonrakerservice service.
 //!
-//! Two stores, and every handler computes its whole response from them:
+//! One store, and every handler computes its whole response from it:
 //!
 //! * `shadows` — one [`ShadowSlot`] per `(thingName, shadowName)`, with the empty
 //!   shadow name standing for the unnamed ("classic") shadow. The slot holds the
@@ -10,17 +10,18 @@
 //!   `UpdateThingShadow` that has been applied to it; `state.delta` is NOT stored, it is
 //!   derived from `desired` vs `reported` whenever a document is rendered. The counter
 //!   is the slot's, not the document's, so it survives the document's deletion.
-//! * `retained_messages` — the MQTT retained message of each topic, as the last
-//!   `Publish` with `retain=true` left it.
 //!
 //! The MQTT SESSIONS the connection operations (`GetConnection`, `ListSubscriptions`,
-//! `SendDirectMessage`, `DeleteConnection`) report on are not here: they belong to the
-//! BROKER a device connects to, which is neither this service nor the control plane, and
-//! live in the shared store both reach ([`::service_common::iot_mqtt_broker`], reached
-//! through [`broker`]). A client id the broker holds no session for is those operations'
-//! shared not-found condition.
+//! `SendDirectMessage`, `DeleteConnection`) report on are not here, and neither are the
+//! RETAINED MESSAGES `Publish`, `GetRetainedMessage` and `ListRetainedMessages` read and
+//! write: both belong to the BROKER a device connects to, which is neither this service nor
+//! the control plane, and live in the shared store both reach
+//! ([`::service_common::iot_mqtt_broker`], reached through [`broker`]) — so a message
+//! retained over the MQTT wire is the one this plane reports, and one retained here is the
+//! one an MQTT SUBSCRIBE is answered with. A client id the broker holds no session for is
+//! the connection operations' shared not-found condition.
 //!
-//! Both are `BTreeMap`s so a list operation walks them in a stable key order and an
+//! The store is a `BTreeMap` so a list operation walks it in a stable key order and an
 //! offset-style `nextToken` keeps meaning across calls.
 //!
 //! Beside the two stores, this module holds the service's RESPONSE TEXT: the fixed
@@ -357,11 +358,9 @@ pub fn payload_too_large(max_allowed: usize) -> String {
     format!("payload larger than {max_allowed} bytes")
 }
 
-/// How many topics may hold a retained message at once. Emulator-chosen: the real
-/// service's quota is far larger than an in-memory emulator should be asked to hold,
-/// and a bound is what keeps `Publish` from growing the store without limit. Clearing
-/// a retained message (an empty retained payload) always frees a slot.
-pub const MAX_RETAINED_TOPICS: usize = 1024;
+/// How many topics may hold a retained message at once, re-exported from the BROKER's own
+/// retain store, which is where a retained message lives.
+pub use ::service_common::iot_mqtt_broker::MAX_RETAINED_TOPICS;
 
 /// The page size `ListSubscriptions` uses when the caller names no `maxResults`.
 ///
@@ -662,22 +661,6 @@ fn metadata_for(value: &Value, timestamp_secs: i64) -> Value {
     }
 }
 
-/// The retained message of one topic, as the last `Publish` with `retain=true` left
-/// it. The payload is kept verbatim: `GetRetainedMessage` hands back exactly the bytes
-/// that were published.
-#[derive(Debug, Clone)]
-pub struct RetainedMessage {
-    pub topic: String,
-    pub payload: Vec<u8>,
-    pub qos: i32,
-    /// When the message was stored, in epoch MILLISECONDS — the unit
-    /// `GetRetainedMessageResponse$lastModifiedTime` documents.
-    pub last_modified_time_millis: i64,
-    /// The publisher's `userProperties` JSON string, as bytes, or `None` when the
-    /// message carried none.
-    pub user_properties: Option<Vec<u8>>,
-}
-
 /// The service's fixed answer when the addressed MQTT client has no session the broker
 /// holds — the one condition every connection operation shares. The requirement is the
 /// 404 and the `ResourceNotFoundException` identity; this is the service's constant
@@ -760,8 +743,9 @@ pub const DEFAULT_CONFIRMATION_TIMEOUT_SECONDS: i32 = 5;
 /// The lifecycle disconnect reason a disconnect the SERVICE performed carries — which is
 /// what `DeleteConnection` is, as against a client closing its own connection
 /// (`CLIENT_INITIATED_DISCONNECT`). One of the reasons AWS IoT Core's lifecycle-event
-/// `disconnectReason` takes.
-pub const SERVER_INITIATED_DISCONNECT: &str = "SERVER_INITIATED_DISCONNECT";
+/// `disconnectReason` takes, read from the broker's own vocabulary so the record and the
+/// disconnect event report the same reason.
+pub use ::service_common::iot_mqtt_broker::lifecycle::SERVER_INITIATED_DISCONNECT;
 
 /// The MQTT session a client id is held under, the message one carries and the live
 /// connection one holds, together with how long a disconnected client's connection
@@ -784,8 +768,6 @@ pub struct ComAmazonawsIotdataplaneIotmoonrakerserviceState {
     /// Shadow slots keyed by `(thingName, shadowName)`; [`CLASSIC_SHADOW`] is the
     /// unnamed shadow's key.
     pub shadows: BTreeMap<(String, String), ShadowSlot>,
-    /// Retained messages keyed by topic.
-    pub retained_messages: BTreeMap<String, RetainedMessage>,
 }
 
 impl ComAmazonawsIotdataplaneIotmoonrakerserviceState {

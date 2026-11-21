@@ -117,6 +117,14 @@ pub struct Connect {
     /// The Session Expiry Interval an MQTT 5 CONNECT configured, in SECONDS; 0 for a 3.1.1
     /// client, whose protocol carries no such property.
     pub session_expiry_seconds: i64,
+    /// The client's Last Will and Testament, as this CONNECT configured one: the
+    /// publication the broker is to make for the client when its session ends without the
+    /// client's own DISCONNECT. `None` for a CONNECT that configured none.
+    ///
+    /// BOXED, like the message of a [`ClientPacket::Publish`]: a message is the largest
+    /// thing a packet carries, so the reading of a packet stays small whichever packet it
+    /// is.
+    pub last_will: Option<Box<DirectMessage>>,
 }
 
 /// One topic filter a SUBSCRIBE asks for.
@@ -131,9 +139,11 @@ pub struct Filter {
 #[derive(Debug)]
 pub enum ClientPacket {
     Connect(Connect),
-    /// A publication, with the packet identifier its acknowledgement answers.
+    /// A publication, with the packet identifier its acknowledgement answers. The message
+    /// travels BOXED: it is the largest thing any packet carries, so every other reading of
+    /// a packet stays small.
     Publish {
-        message: DirectMessage,
+        message: Box<DirectMessage>,
         packet_id: u16,
     },
     /// The client acknowledged a delivery made at QoS 1.
@@ -187,6 +197,17 @@ pub fn frame(version: Version, buffer: &mut BytesMut, max_bytes: usize) -> Frami
 fn of_v4(packet: v4::Packet) -> ClientPacket {
     match packet {
         v4::Packet::Connect(connect) => ClientPacket::Connect(Connect {
+            // A 3.1.1 will carries its topic, payload, QoS and RETAIN flag: the protocol
+            // has no field for a message property.
+            last_will: connect.last_will.map(|will| {
+                Box::new(DirectMessage {
+                    topic: will.topic,
+                    payload: will.message.to_vec(),
+                    qos: qos_number(will.qos),
+                    retain: will.retain,
+                    ..DirectMessage::default()
+                })
+            }),
             client_id: connect.client_id,
             clean_session: connect.clean_session,
             keep_alive_seconds: i32::from(connect.keep_alive),
@@ -194,14 +215,15 @@ fn of_v4(packet: v4::Packet) -> ClientPacket {
         }),
         v4::Packet::Publish(publish) => ClientPacket::Publish {
             packet_id: publish.pkid,
-            // A 3.1.1 publication carries its topic, payload and QoS and nothing else:
-            // the protocol has no field for a message property.
-            message: DirectMessage {
+            // A 3.1.1 publication carries its topic, payload, QoS and RETAIN flag and
+            // nothing else: the protocol has no field for a message property.
+            message: Box::new(DirectMessage {
                 topic: publish.topic,
                 payload: publish.payload.to_vec(),
                 qos: qos_number(publish.qos),
+                retain: publish.retain,
                 ..DirectMessage::default()
-            },
+            }),
         },
         v4::Packet::PubAck(acknowledged) => ClientPacket::PubAck {
             packet_id: acknowledged.pkid,
@@ -239,18 +261,16 @@ fn of_v5(packet: v5::Packet) -> ClientPacket {
                 .as_ref()
                 .and_then(|properties| properties.session_expiry_interval)
                 .map_or(0, i64::from),
-            client_id: connect.client_id,
-            clean_session: connect.clean_session,
-            keep_alive_seconds: i32::from(connect.keep_alive),
-        }),
-        v5::Packet::Publish(publish) => {
-            let properties = publish.properties;
-            ClientPacket::Publish {
-                packet_id: publish.pkid,
-                message: DirectMessage {
-                    topic: publish.topic,
-                    payload: publish.payload.to_vec(),
-                    qos: qos_number(publish.qos),
+            // An MQTT 5 will carries the message properties of its own property section,
+            // which is what makes them forwardable to another MQTT 5 subscriber when the
+            // broker publishes the will.
+            last_will: connect.last_will.map(|will| {
+                let properties = will.properties;
+                Box::new(DirectMessage {
+                    topic: will.topic,
+                    payload: will.message.to_vec(),
+                    qos: qos_number(will.qos),
+                    retain: will.retain,
                     content_type: properties
                         .as_ref()
                         .and_then(|properties| properties.content_type.clone()),
@@ -274,7 +294,45 @@ fn of_v5(packet: v5::Packet) -> ClientPacket {
                         .as_ref()
                         .and_then(|properties| properties.message_expiry_interval),
                     ..DirectMessage::default()
-                },
+                })
+            }),
+            client_id: connect.client_id,
+            clean_session: connect.clean_session,
+            keep_alive_seconds: i32::from(connect.keep_alive),
+        }),
+        v5::Packet::Publish(publish) => {
+            let properties = publish.properties;
+            ClientPacket::Publish {
+                packet_id: publish.pkid,
+                message: Box::new(DirectMessage {
+                    topic: publish.topic,
+                    payload: publish.payload.to_vec(),
+                    qos: qos_number(publish.qos),
+                    retain: publish.retain,
+                    content_type: properties
+                        .as_ref()
+                        .and_then(|properties| properties.content_type.clone()),
+                    response_topic: properties
+                        .as_ref()
+                        .and_then(|properties| properties.response_topic.clone()),
+                    user_properties: properties
+                        .as_ref()
+                        .and_then(|properties| {
+                            user_properties_document(&properties.user_properties)
+                        }),
+                    payload_format_indicator: properties
+                        .as_ref()
+                        .and_then(|properties| properties.payload_format_indicator)
+                        .map(payload_format_token),
+                    correlation_data: properties
+                        .as_ref()
+                        .and_then(|properties| properties.correlation_data.as_ref())
+                        .map(|data| encode_correlation_data(data)),
+                    message_expiry_seconds: properties
+                        .as_ref()
+                        .and_then(|properties| properties.message_expiry_interval),
+                    ..DirectMessage::default()
+                }),
             }
         }
         v5::Packet::PubAck(acknowledged) => ClientPacket::PubAck {
@@ -472,6 +530,11 @@ pub fn render_pingresp(
 /// Render one delivery as a PUBLISH to a client of `version`, at the QoS the delivery was
 /// made at and with the message properties that version can carry.
 ///
+/// `retain` is the RETAIN flag of THIS delivery, which is a fact about the delivery and not
+/// about the message: MQTT 3.1.1 section 3.3.1.3 sets it on the PUBLISH that answers a new
+/// subscription with what the topic retained, and clears it on a message forwarded by
+/// ordinary publishing, so a subscriber can tell the two apart.
+///
 /// `now_millis` is what the forwarded message expiry is computed against — see
 /// [`DirectMessage::forwarded_message_expiry`]. A message carrying no property at all is
 /// written with no property section, so a publication made without properties arrives
@@ -481,12 +544,14 @@ pub fn render_publish(
     buffer: &mut BytesMut,
     message: &DirectMessage,
     packet_id: u16,
+    retain: bool,
     now_millis: i64,
 ) -> Result<usize, ::mqttbytes::Error> {
     let qos = qos_of(message.qos.clamp(0, MAX_GRANTED_QOS));
     match version {
         Version::V311 => {
             let mut publish = v4::Publish::new(&message.topic, qos, message.payload.clone());
+            publish.retain = retain;
             if qos != QoS::AtMostOnce {
                 publish.pkid = packet_id;
             }
@@ -494,6 +559,7 @@ pub fn render_publish(
         }
         Version::V5 => {
             let mut publish = v5::Publish::new(&message.topic, qos, message.payload.clone());
+            publish.retain = retain;
             if qos != QoS::AtMostOnce {
                 publish.pkid = packet_id;
             }
@@ -828,6 +894,132 @@ mod tests {
         );
     }
 
+    /// RULE: a CONNECT's Last Will and Testament and a PUBLISH's RETAIN flag are read off
+    /// the packet, in both versions the broker serves — the will is what the broker
+    /// publishes for a session that ended without a DISCONNECT, and the RETAIN flag is what
+    /// makes a publication its topic's retained message.
+    #[test]
+    fn a_connects_will_and_a_publishs_retain_flag_are_read_off_the_packet() {
+        // MQTT 3.1.1: a will with its own topic, payload, QoS and RETAIN flag.
+        let mut buffer = BytesMut::new();
+        let mut connect = v4::Connect::new("will-v4");
+        connect.last_will = Some(v4::LastWill::new(
+            "devices/will-v4/status",
+            b"offline".to_vec(),
+            QoS::AtLeastOnce,
+            true,
+        ));
+        connect.write(&mut buffer).expect("the CONNECT renders");
+        let framed = frame(Version::V311, &mut buffer, 4096);
+        let Framing::Packet(ClientPacket::Connect(read)) = framed else {
+            panic!("case \"MQTT 3.1.1 will\": expected a CONNECT, got {framed:?}");
+        };
+        let will = read
+            .last_will
+            .clone()
+            .unwrap_or_else(|| panic!("case \"MQTT 3.1.1 will\": expected the will, got {read:?}"));
+        assert_eq!(
+            (
+                will.topic.as_str(),
+                will.payload.as_slice(),
+                will.qos,
+                will.retain
+            ),
+            ("devices/will-v4/status", &b"offline"[..], 1, true),
+            "case \"MQTT 3.1.1 will\": expected what the CONNECT configured, got {will:?}"
+        );
+
+        // MQTT 5: the same will, carried with its own (empty) property section.
+        let mut buffer = BytesMut::new();
+        let mut connect = v5::Connect::new("will-v5");
+        connect.last_will = Some(v5::LastWill::new(
+            "devices/will-v5/status",
+            b"gone".to_vec(),
+            QoS::AtMostOnce,
+            false,
+        ));
+        connect.write(&mut buffer).expect("the CONNECT renders");
+        let framed = frame(Version::V5, &mut buffer, 4096);
+        let Framing::Packet(ClientPacket::Connect(read)) = framed else {
+            panic!("case \"MQTT 5 will\": expected a CONNECT, got {framed:?}");
+        };
+        let will = read
+            .last_will
+            .clone()
+            .unwrap_or_else(|| panic!("case \"MQTT 5 will\": expected the will, got {read:?}"));
+        assert_eq!(
+            (
+                will.topic.as_str(),
+                will.payload.as_slice(),
+                will.qos,
+                will.retain
+            ),
+            ("devices/will-v5/status", &b"gone"[..], 0, false),
+            "case \"MQTT 5 will\": expected what the CONNECT configured, got {will:?}"
+        );
+
+        // A CONNECT that configured no will carries none, in either version.
+        for (case, version, rendered) in [
+            ("MQTT 3.1.1, no will", Version::V311, {
+                let mut buffer = BytesMut::new();
+                v4::Connect::new("bare-v4")
+                    .write(&mut buffer)
+                    .expect("the CONNECT renders");
+                buffer
+            }),
+            ("MQTT 5, no will", Version::V5, {
+                let mut buffer = BytesMut::new();
+                v5::Connect::new("bare-v5")
+                    .write(&mut buffer)
+                    .expect("the CONNECT renders");
+                buffer
+            }),
+        ] {
+            let mut buffer = rendered;
+            let framed = frame(version, &mut buffer, 4096);
+            let Framing::Packet(ClientPacket::Connect(read)) = framed else {
+                panic!("case {case:?}: expected a CONNECT, got {framed:?}");
+            };
+            assert!(
+                read.last_will.is_none(),
+                "case {case:?}: expected no will, got {:?}",
+                read.last_will
+            );
+        }
+
+        // The RETAIN flag of a publication, in both versions.
+        for (case, version, rendered) in [
+            ("MQTT 3.1.1 retained publish", Version::V311, {
+                let mut buffer = BytesMut::new();
+                let mut publish =
+                    v4::Publish::new("devices/sensor-1/config", QoS::AtLeastOnce, b"keep".to_vec());
+                publish.retain = true;
+                publish.pkid = 3;
+                publish.write(&mut buffer).expect("the PUBLISH renders");
+                buffer
+            }),
+            ("MQTT 5 retained publish", Version::V5, {
+                let mut buffer = BytesMut::new();
+                let mut publish =
+                    v5::Publish::new("devices/sensor-1/config", QoS::AtLeastOnce, b"keep".to_vec());
+                publish.retain = true;
+                publish.pkid = 4;
+                publish.write(&mut buffer).expect("the PUBLISH renders");
+                buffer
+            }),
+        ] {
+            let mut buffer = rendered;
+            let framed = frame(version, &mut buffer, 4096);
+            let Framing::Packet(ClientPacket::Publish { message, .. }) = framed else {
+                panic!("case {case:?}: expected a PUBLISH, got {framed:?}");
+            };
+            assert!(
+                message.retain,
+                "case {case:?}: expected the RETAIN flag read off the packet, got {message:?}"
+            );
+        }
+    }
+
     /// RULE: every packet the broker writes to a client is one that client's own codec
     /// reads back — the acknowledgements and the forwarded publication alike, in both
     /// versions. A packet a client cannot read is a session that hangs rather than fails.
@@ -849,6 +1041,7 @@ mod tests {
             correlation_data: Some(encode_correlation_data(b"corr-1")),
             message_expiry_seconds: Some(300),
             delivered_at_millis: 1_700_000_000_000,
+            retain: false,
         };
         let bare = DirectMessage {
             topic: "devices/sensor-2/telemetry".to_string(),
@@ -876,10 +1069,13 @@ mod tests {
                     render_pingresp(version, buffer)
                 }),
                 ("a publication carrying every property", &|buffer: &mut BytesMut| {
-                    render_publish(version, buffer, &loaded, 10, loaded.delivered_at_millis)
+                    render_publish(version, buffer, &loaded, 10, false, loaded.delivered_at_millis)
                 }),
                 ("a publication carrying none", &|buffer: &mut BytesMut| {
-                    render_publish(version, buffer, &bare, 0, 1_700_000_000_000)
+                    render_publish(version, buffer, &bare, 0, false, 1_700_000_000_000)
+                }),
+                ("a retained publication answering a subscription", &|buffer: &mut BytesMut| {
+                    render_publish(version, buffer, &loaded, 11, true, loaded.delivered_at_millis)
                 }),
             ];
             for (case, render) in packets {
@@ -920,6 +1116,7 @@ mod tests {
             correlation_data: Some(encode_correlation_data(&[0x00, 0xff])),
             message_expiry_seconds: Some(300),
             delivered_at_millis: published_at,
+            retain: false,
         };
         // The rows span the wait the message had before it was forwarded: none, part of the
         // interval, and longer than the interval, which spends it.
@@ -930,7 +1127,7 @@ mod tests {
         ];
         for (case, now_millis, expected) in rows {
             let mut buffer = BytesMut::new();
-            render_publish(Version::V5, &mut buffer, &message, 4, *now_millis)
+            render_publish(Version::V5, &mut buffer, &message, 4, false, *now_millis)
                 .expect("the publication renders");
             let read = v5::read(&mut buffer, 4096).expect("an MQTT 5 client reads it");
             let v5::Packet::Publish(publish) = read else {
@@ -974,7 +1171,7 @@ mod tests {
             ..DirectMessage::default()
         };
         let mut buffer = BytesMut::new();
-        render_publish(Version::V5, &mut buffer, &bare, 0, published_at)
+        render_publish(Version::V5, &mut buffer, &bare, 0, false, published_at)
             .expect("the publication renders");
         let read = v5::read(&mut buffer, 4096).expect("an MQTT 5 client reads it");
         let v5::Packet::Publish(publish) = read else {

@@ -19,8 +19,11 @@
 //! `GetConnection` report `connected: false` with the disconnect reason afterwards.
 //!
 //! `preventWillMessage` controls whether the client's Last Will and Testament is
-//! published on disconnect. The broker records no LWT for a session it holds, so there is
-//! never a will message to publish or to suppress and neither value publishes anything.
+//! published on disconnect: `false` publishes the will the client's own CONNECT left
+//! (`service_common::iot_mqtt_broker::lifecycle`), because a connection the SERVICE closed
+//! is not the client saying goodbye, and `true` suppresses it. Either way the session's own
+//! disconnect event is published on the reserved presence topic, carrying
+//! `SERVER_INITIATED_DISCONNECT` as the reason it ended.
 //!
 //! ## Shape of an operation
 //!
@@ -212,6 +215,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The connection closes, and the record says the SERVICE closed it — this call is
         // not the client hanging up. The client's own network connection is handed back so
         // it can be closed too: this call disconnects the CLIENT, not only the record.
+        //
+        // What the end of that session publishes is read off it here, under the guard, and
+        // published once the guard is gone: its disconnect event, and the will the client
+        // left unless this caller asked for the will NOT to be published.
+        let ended = ::service_common::iot_mqtt_broker::lifecycle::EndedSession::of(
+            session,
+            crate::state::SERVER_INITIATED_DISCONNECT,
+            !input.prevent_will_message,
+        );
         let live = session.disconnect(crate::state::SERVER_INITIATED_DISCONNECT, now_millis);
         // The session state goes when the caller asks for it, and for a client that
         // connected with a clean session there is no persistent state to preserve, so
@@ -224,6 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(connection) = live {
             connection.close();
         }
+        ::service_common::iot_mqtt_broker::lifecycle::publish_session_ended(
+            &state, &ended, now_millis,
+        );
 
         Ok(DeleteConnectionOutput)
     }
