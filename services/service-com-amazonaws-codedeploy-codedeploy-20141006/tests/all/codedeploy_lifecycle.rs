@@ -637,6 +637,40 @@ pub(crate) fn s3_revision(bucket: &str, key: &str) -> Value {
     json!({"revisionType": "S3", "s3Location": {"bucket": bucket, "key": key, "bundleType": "zip"}})
 }
 
+/// The members a deployment group on the Amazon ECS compute platform has to carry
+/// for CodeDeploy to accept it at all: the blue/green, traffic-controlled style
+/// that platform runs its deployments by, and the load balancer that style routes
+/// the traffic behind.
+///
+/// A fixture that seeds an ECS group merges these in through
+/// [`require_platform_members`], so a suite about something else does not have to
+/// restate the platform's own preconditions.
+pub(crate) fn ecs_group_members() -> Value {
+    json!({
+        "deploymentStyle": {
+            "deploymentType": "BLUE_GREEN",
+            "deploymentOption": "WITH_TRAFFIC_CONTROL",
+        },
+        "loadBalancerInfo": {"targetGroupInfoList": [{"name": "tg-blue"}]},
+    })
+}
+
+/// Fill into a `CreateDeploymentGroup` request the members `platform` requires and
+/// the request does not already name.
+///
+/// A member the caller stated is left exactly as it is, so a case about one of
+/// these members still drives its own value.
+pub(crate) fn require_platform_members(platform: &str, request: &mut Value) {
+    if platform != "ECS" {
+        return;
+    }
+    for (member, value) in ecs_group_members().as_object().cloned().unwrap_or_default() {
+        if request.get(&member).is_none() {
+            request[member] = value;
+        }
+    }
+}
+
 /// Create an application and a deployment group on it, answering the group name.
 pub(crate) async fn seeded_group(
     emulator: &Emulator,
@@ -650,16 +684,13 @@ pub(crate) async fn seeded_group(
         )
         .await;
     let group = format!("{application}-dg");
-    emulator
-        .ok(
-            "CreateDeploymentGroup",
-            json!({
-                "applicationName": application,
-                "deploymentGroupName": group,
-                "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
-            }),
-        )
-        .await;
+    let mut request = json!({
+        "applicationName": application,
+        "deploymentGroupName": group,
+        "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
+    });
+    require_platform_members(platform, &mut request);
+    emulator.ok("CreateDeploymentGroup", request).await;
     group
 }
 
@@ -1329,6 +1360,7 @@ async fn a_deployment_group_reads_back_as_it_was_created() {
         for (member, value) in extras.as_object().cloned().unwrap_or_default() {
             request[member] = value;
         }
+        require_platform_members(platform, &mut request);
 
         let created = emulator.ok("CreateDeploymentGroup", request.clone()).await;
         let group_id = created["deploymentGroupId"]

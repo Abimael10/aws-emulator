@@ -138,10 +138,14 @@ async fn a_deployment_group_reports_the_style_and_strategy_it_runs_by() {
             (DEFAULT_TYPE, DEFAULT_OPTION, DEFAULT_STRATEGY),
         ),
         (
+            // The Amazon ECS compute platform admits only the blue/green,
+            // traffic-controlled style, so this row names it (and the load
+            // balancer that style routes traffic behind) and reads it back; the
+            // strategy is still the service's default.
             "an ECS application",
             "ECS",
-            json!({}),
-            (DEFAULT_TYPE, DEFAULT_OPTION, DEFAULT_STRATEGY),
+            crate::codedeploy_lifecycle::ecs_group_members(),
+            ("BLUE_GREEN", "WITH_TRAFFIC_CONTROL", DEFAULT_STRATEGY),
         ),
     ];
 

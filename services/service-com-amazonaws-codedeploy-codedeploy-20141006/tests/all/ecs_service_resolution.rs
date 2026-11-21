@@ -106,13 +106,20 @@ fn pair(cluster: &str, service: &str) -> Value {
 }
 
 /// A `CreateDeploymentGroup` request naming `ecs_services`.
+///
+/// Every group here belongs to an application on the Amazon ECS compute platform,
+/// so the request carries that platform's own preconditions — the blue/green,
+/// traffic-controlled style and the load balancer it routes traffic behind —
+/// leaving the pair the row names as the only thing under test.
 fn create_request(application: &str, group: &str, ecs_services: Value) -> Value {
-    json!({
+    let mut request = json!({
         "applicationName": application,
         "deploymentGroupName": group,
         "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
         "ecsServices": ecs_services,
-    })
+    });
+    crate::codedeploy_lifecycle::require_platform_members("ECS", &mut request);
+    request
 }
 
 /// The `ecsServices` `GetDeploymentGroup` reports for `group`.

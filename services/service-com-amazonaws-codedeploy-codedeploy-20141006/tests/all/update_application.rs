@@ -51,16 +51,13 @@ async fn seed(emulator: &Emulator, application: &str, platform: &str) -> Seeded 
         "case {application}: expected a minted applicationId, got {created:?}"
     );
 
-    let group = emulator
-        .ok(
-            "CreateDeploymentGroup",
-            json!({
-                "applicationName": application,
-                "deploymentGroupName": GROUP,
-                "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
-            }),
-        )
-        .await;
+    let mut group_request = json!({
+        "applicationName": application,
+        "deploymentGroupName": GROUP,
+        "serviceRoleArn": "arn:aws:iam::123456789012:role/CodeDeployRole",
+    });
+    crate::codedeploy_lifecycle::require_platform_members(platform, &mut group_request);
+    let group = emulator.ok("CreateDeploymentGroup", group_request).await;
     let deployment = emulator
         .ok(
             "CreateDeployment",

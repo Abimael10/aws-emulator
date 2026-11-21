@@ -226,6 +226,7 @@ async fn group_on(
             request[member] = value.clone();
         }
     }
+    crate::codedeploy_lifecycle::require_platform_members(platform, &mut request);
     emulator.ok("CreateDeploymentGroup", request).await;
     group
 }

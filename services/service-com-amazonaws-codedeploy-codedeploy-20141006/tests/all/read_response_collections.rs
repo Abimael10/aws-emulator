@@ -433,6 +433,7 @@ async fn a_deployment_group_reports_every_selector_list_it_holds() {
         for (member, value) in extra.as_object().into_iter().flatten() {
             request[member] = value.clone();
         }
+        crate::codedeploy_lifecycle::require_platform_members(platform, &mut request);
         emulator.ok("CreateDeploymentGroup", request).await;
 
         let info = emulator

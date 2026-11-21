@@ -29,6 +29,13 @@
 //! group, the Amazon ECS target-group pair, an all-empty configuration, the member
 //! omitted), whether the group is being created or updated, and whether the Amazon
 //! ECS pair the group targets exists.
+//!
+//! The Amazon ECS rows all run the blue/green, traffic-controlled style, because
+//! that is the only style an application on that compute platform admits at all —
+//! a separate precondition, with its own error and its own suite
+//! (`services/service-com-amazonaws-codedeploy-codedeploy-20141006/tests/all/deployment_style_precondition.rs`),
+//! judged ahead of this one — so the style variations of this table are carried by
+//! its rows on the other platforms.
 
 use std::sync::Arc;
 
@@ -239,20 +246,6 @@ async fn an_ecs_group_that_routes_traffic_is_created_only_with_load_balancer_inf
             refused: true,
         },
         Row {
-            case: "an ECS in-place group with traffic control and no loadBalancerInfo",
-            platform: "ECS",
-            style: Some(style("IN_PLACE", "WITH_TRAFFIC_CONTROL")),
-            load_balancer_info: None,
-            refused: true,
-        },
-        Row {
-            case: "an ECS group naming only the traffic option, so the type defaults",
-            platform: "ECS",
-            style: Some(json!({"deploymentOption": "WITH_TRAFFIC_CONTROL"})),
-            load_balancer_info: None,
-            refused: true,
-        },
-        Row {
             case: "an ECS group with traffic control and an empty loadBalancerInfo",
             platform: "ECS",
             style: Some(style("BLUE_GREEN", "WITH_TRAFFIC_CONTROL")),
@@ -292,16 +285,23 @@ async fn an_ecs_group_that_routes_traffic_is_created_only_with_load_balancer_inf
             refused: false,
         },
         Row {
-            case: "an ECS group that routes no traffic behind a load balancer",
-            platform: "ECS",
+            case: "a Server group that routes no traffic behind a load balancer",
+            platform: "Server",
             style: Some(style("BLUE_GREEN", "WITHOUT_TRAFFIC_CONTROL")),
             load_balancer_info: None,
             refused: false,
         },
         Row {
-            case: "an ECS group naming no deploymentStyle at all",
-            platform: "ECS",
+            case: "a Server group naming no deploymentStyle at all",
+            platform: "Server",
             style: None,
+            load_balancer_info: None,
+            refused: false,
+        },
+        Row {
+            case: "a Server group naming only the traffic option, so the type defaults",
+            platform: "Server",
+            style: Some(json!({"deploymentOption": "WITH_TRAFFIC_CONTROL"})),
             load_balancer_info: None,
             refused: false,
         },
@@ -389,10 +389,14 @@ async fn an_ecs_group_that_routes_traffic_is_created_only_with_load_balancer_inf
 }
 
 /// RULE applied to an UPDATE: the configuration the group would END UP with is what
-/// the precondition is judged on, so an update that moves an Amazon ECS group onto
-/// a traffic-controlling style without ever naming a load balancer is refused and
-/// changes nothing, while one that names the load balancer with it is served — and
-/// an update of a group that already carries one needs to name nothing.
+/// the precondition is judged on, so an update that would leave an Amazon ECS group
+/// routing traffic with no load balancer at all is refused and changes nothing,
+/// while one that names a load balancer with it is served — and an update of a group
+/// that already carries one needs to name nothing.
+///
+/// A group on this compute platform always routes its traffic behind a load
+/// balancer, because the style it runs by is fixed by the platform's own
+/// precondition, so what an update can take away here is the load balancer itself.
 #[tokio::test]
 async fn an_update_may_not_leave_an_ecs_group_routing_traffic_with_no_load_balancer() {
     let router = build_router();
@@ -404,8 +408,8 @@ async fn an_update_may_not_leave_an_ecs_group_routing_traffic_with_no_load_balan
         &json!({"applicationName": APPLICATION, "computePlatform": "ECS"}),
     )
     .await;
-    // A group that routes no traffic behind a load balancer, and so legitimately
-    // carries none.
+    // A group wired with the target-group pair its deployments move traffic
+    // between.
     codedeploy_ok(
         &router,
         "CreateDeploymentGroup",
@@ -413,20 +417,22 @@ async fn an_update_may_not_leave_an_ecs_group_routing_traffic_with_no_load_balan
             "applicationName": APPLICATION,
             "deploymentGroupName": GROUP,
             "serviceRoleArn": SERVICE_ROLE_ARN,
+            "deploymentStyle": style("BLUE_GREEN", "WITH_TRAFFIC_CONTROL"),
+            "loadBalancerInfo": target_group_pair(),
         }),
     )
     .await;
 
-    // Moving it onto traffic control alone is refused: it would describe a traffic
+    // Clearing the load balancer is refused: the group would describe a traffic
     // move it could never perform.
-    let case = "the style alone, onto traffic control";
+    let case = "an all-empty loadBalancerInfo, clearing the one it carries";
     let (status, body) = codedeploy(
         &router,
         "UpdateDeploymentGroup",
         &json!({
             "applicationName": APPLICATION,
             "currentDeploymentGroupName": GROUP,
-            "deploymentStyle": style("BLUE_GREEN", "WITH_TRAFFIC_CONTROL"),
+            "loadBalancerInfo": {},
         }),
     )
     .await;
@@ -442,11 +448,11 @@ async fn an_update_may_not_leave_an_ecs_group_routing_traffic_with_no_load_balan
             info["deploymentStyle"]["deploymentOption"].as_str(),
             &info["loadBalancerInfo"],
         ),
-        (Some("WITHOUT_TRAFFIC_CONTROL"), &Value::Null),
+        (Some("WITH_TRAFFIC_CONTROL"), &target_group_pair()),
         "case {case:?}: expected the refused update to change nothing, got {info}"
     );
 
-    // The same move WITH the load balancer is served.
+    // Naming the style again, WITH a load balancer, is served.
     let case = "the style and the load balancer together";
     codedeploy_ok(
         &router,

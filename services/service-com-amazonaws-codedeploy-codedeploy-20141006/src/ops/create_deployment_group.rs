@@ -484,6 +484,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 ));
             }
+            // The deployment the group's style DESCRIBES, now that the
+            // application whose compute platform decides which deployments can be
+            // run has been resolved ([`crate::state::deployment_style_gate`]).
+            // Ordered AHEAD of the load balancer gate below: a style the platform
+            // cannot run at all is refused for itself, before anything asks what
+            // that style requires.
+            if let Some(message) = crate::state::deployment_style_gate::deployment_style_refusal(
+                &application.compute_platform,
+                deployment_style.as_ref(),
+            ) {
+                return Err(
+                    CreateDeploymentGroupErrorModeled::InvalidDeploymentStyleException(
+                        InvalidDeploymentStyleException {
+                            message: Some(message.to_string()),
+                        },
+                    ),
+                );
+            }
             // The load balancer the group would route its traffic through, now
             // that the application whose compute platform decides whether it needs
             // one has been resolved. Ordered AHEAD of the `ecsServices` verdict

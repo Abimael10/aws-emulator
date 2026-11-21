@@ -180,6 +180,17 @@ async fn given_group(
     if let Some(config) = deployment_config {
         request["deploymentConfigName"] = json!(config);
     }
+    if platform == "ECS" {
+        // An application on the Amazon ECS compute platform admits only the
+        // blue/green, traffic-controlled style, and that style has to name the
+        // load balancer it routes traffic behind: this suite is about the stop, so
+        // the group carries both of the platform's own preconditions.
+        request["deploymentStyle"] = json!({
+            "deploymentType": "BLUE_GREEN",
+            "deploymentOption": "WITH_TRAFFIC_CONTROL",
+        });
+        request["loadBalancerInfo"] = json!({"targetGroupInfoList": [{"name": "tg-blue"}]});
+    }
     codedeploy_ok(router, "CreateDeploymentGroup", &request).await;
     group
 }

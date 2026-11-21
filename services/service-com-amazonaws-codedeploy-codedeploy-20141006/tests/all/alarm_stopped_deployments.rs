@@ -77,6 +77,7 @@ async fn group_with(
     for (member, value) in extras.as_object().cloned().unwrap_or_default() {
         request[member] = value;
     }
+    crate::codedeploy_lifecycle::require_platform_members(platform, &mut request);
     emulator.ok("CreateDeploymentGroup", request).await;
     group
 }

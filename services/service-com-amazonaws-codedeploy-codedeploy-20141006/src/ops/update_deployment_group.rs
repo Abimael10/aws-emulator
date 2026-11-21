@@ -533,6 +533,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(style) => crate::state::effective_deployment_style(Some(style)),
                 None => stored.deployment_style.clone(),
             };
+            // The deployment the group's style would DESCRIBE after this update:
+            // the same precondition `CreateDeploymentGroup` applies
+            // ([`crate::state::deployment_style_gate`]), so an update may not
+            // leave a group running a deployment its compute platform cannot
+            // perform either. Ordered ahead of the load balancer gate for the
+            // reason the created group's is.
+            if let Some(message) = crate::state::deployment_style_gate::deployment_style_refusal(
+                &stored.compute_platform,
+                style_after_update.as_ref(),
+            ) {
+                return Err(
+                    UpdateDeploymentGroupErrorModeled::InvalidDeploymentStyleException(
+                        InvalidDeploymentStyleException {
+                            message: Some(message.to_string()),
+                        },
+                    ),
+                );
+            }
             if let Some(message) = crate::state::load_balancer_gate::load_balancer_refusal(
                 &stored.compute_platform,
                 style_after_update.as_ref(),

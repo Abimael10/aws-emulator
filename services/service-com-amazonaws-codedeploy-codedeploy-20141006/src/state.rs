@@ -89,6 +89,11 @@ pub mod ecs_services;
 /// group would run.
 pub mod load_balancer_gate;
 
+/// The deployment style a deployment group runs by: the one place a group's
+/// `deploymentStyle` is asked whether its compute platform can run deployments of
+/// that kind.
+pub mod deployment_style_gate;
+
 /// The SHA256 digest of a revision that carries its content inline: the one place
 /// that digest is computed, where such a revision is recorded.
 pub mod revision_digest;
