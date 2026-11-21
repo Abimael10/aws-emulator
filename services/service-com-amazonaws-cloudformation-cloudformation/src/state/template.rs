@@ -2827,6 +2827,14 @@ pub fn conditionally_replacing_paths(resource_type: &str) -> &'static [&'static 
 /// what that type's `Ref` returns ([`identity_is_service_assigned`]), so the `Name` a
 /// declaration states is only what the resource is called.
 ///
+/// A REST API is in exactly that position: `UpdateRestApi` takes a `restApiId` together with
+/// the patch that writes the api's `/name`, the api being identified by the id API Gateway
+/// minted for it ([`identity_is_service_assigned`] says so of this type as well), so renaming
+/// one is a modification of the api rather than another api. (The API Gateway types that
+/// govern ACCESS to one are NOT here: each is renamed by a patch of its own in that service,
+/// but nothing in this emulator applies one yet, so a declaration that renames one asks for a
+/// resource this stack can only make by creating it.)
+///
 /// Read in the two places one rule governs: [`replacing_properties`], which is what a change
 /// set's preview and the deployment's own replacement decision share, and
 /// [`crate::state::stack`]'s reading of WHICH resource a re-deploy of a service-assigned
@@ -2846,6 +2854,7 @@ pub fn name_is_create_only(resource_type: &str) -> bool {
             | BEDROCK_FLOW
             | APIGATEWAYV2_API
             | APIGATEWAYV2_AUTHORIZER
+            | APIGATEWAY_REST_API
             // An AWS Amplify app and the three Amplify UI Builder entities of an app
             // environment are in that same position: each is identified by the id that service
             // minted for it, and `UpdateApp`, `UpdateComponent`, `UpdateForm` and `UpdateTheme`
