@@ -331,6 +331,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A restore CREATES a table, so it is held to the same quotas a create is, plus
         // the one restores have of their own.
+        if let Some(refusal) = crate::state::check_table_capacity_quota(
+            &region,
+            provisioned_throughput.iter().chain(
+                global_secondary_indexes
+                    .iter()
+                    .filter_map(|index| index.provisioned_throughput.as_ref()),
+            ),
+        ) {
+            return Err(limit_exceeded(refusal));
+        }
         if store.table_count_in(&region) >= crate::state::MAX_TABLES {
             return Err(limit_exceeded(format!(
                 "Subscriber limit exceeded: this account already holds the maximum of {} \

@@ -273,11 +273,13 @@ async fn every_other_absent_required_member_keeps_the_walks_clause() {
         // minimum rather than `@required`
         // (`smithy_query(query="operation", operation="CreateTable")`). The absence is
         // found by the service's own request code and stated as the SAME clause, so a
-        // client reads one sentence for a member it left out whichever code found it.
+        // client reads one sentence for a member it left out whichever code found it. The
+        // declaration states a capacity mode that needs no capacity figures, because the
+        // create settles its CAPACITY before its key schema.
         (
             "a table create with no key schema",
             "CreateTable",
-            json!({"TableName": "Declared",
+            json!({"TableName": "Declared", "BillingMode": "PAY_PER_REQUEST",
                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]}),
             "keySchema",
         ),

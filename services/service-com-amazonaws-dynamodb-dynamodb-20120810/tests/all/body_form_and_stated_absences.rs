@@ -29,13 +29,14 @@
 //! unknown members beside it, which the protocol ignores the same way.
 //!
 //! RULE 3 — the one `null` that is not an absence a caller may send is one standing for a
-//! member the input REQUIRES: there is no value to build the input from, so the body fails to
-//! deserialize and is refused as that body-level failure with the reader's own diagnosis of
-//! it — the class found, the value expected and the position in the body the read stopped at,
-//! which is read from the bytes the caller sent rather than fixed. The rows span the modelled
-//! type of the required member, the operation, the depth the `null` stands at, what else is
-//! wrong with the same request, and the length of the body before the `null`, which is what
-//! the position is read from.
+//! member the input REQUIRES. On the VECTOR-SEARCH surface there is then no value to build the
+//! input from, so the body fails to deserialize and is refused as that body-level failure with
+//! the reader's own diagnosis of it — the class found, the value expected and the position in
+//! the body the read stopped at, which is read from the bytes the caller sent rather than
+//! fixed. The rows span the modelled type of the required member, the depth the `null` stands
+//! at, what else is wrong with the same request, and the length of the body before the `null`,
+//! which is what the position is read from. Every OTHER operation answers such a `null` as the
+//! CONSTRAINT report it is, which is `required_null_member_reports`'s rule.
 //!
 //! RULE 4 — how many absences a body states is the caller's choice, so asking what each one
 //! earns is bounded by how much JSON that costs to read, while APPLYING them is not: a body
@@ -408,12 +409,13 @@ async fn a_null_a_required_member_stands_for_is_refused_with_the_readers_diagnos
 
     // (case, operation, the bytes the request carries, what the reader expected there)
     //
-    // The expectation is the reader's own for the Rust type the generated input reads that
-    // member into (`src/ops/types`: `SearchVectorsInput.table_name: String`,
-    // `.search_vector: Vec<AttributeValue>`, `.top_k: i32`, `GetItemInput.key:
-    // HashMap<String, AttributeValue>`, `TimeToLiveSpecification.enabled: bool`) — named in
-    // words for a kind of value and by the type itself for a numeric primitive, which is that
-    // reader's vocabulary rather than a choice made here.
+    // Every row is the one surface observed to answer such a `null` this way
+    // (`src/service/request_layer.rs`'s reader-diagnosis operations). The expectation is the
+    // reader's own for the Rust type the generated input reads that member into
+    // (`src/ops/types`: `SearchVectorsInput.table_name: String`, `.search_vector:
+    // Vec<AttributeValue>`, `.top_k: i32`) — named in words for a kind of value and by the
+    // type itself for a numeric primitive, which is that reader's vocabulary rather than a
+    // choice made here.
     let rows: Vec<(&str, &str, String, &str)> = vec![
         (
             "a required string, on a read of a vector index",
@@ -438,53 +440,6 @@ async fn a_null_a_required_member_stands_for_is_refused_with_the_readers_diagnos
             "SearchVectors",
             search_vectors("TopK", 4),
             "i32",
-        ),
-        (
-            "a required map, on a read",
-            "GetItem",
-            json!({"TableName": TABLE, "Key": null}).to_string(),
-            "a map",
-        ),
-        (
-            "a required map, on a write",
-            "PutItem",
-            json!({"TableName": TABLE, "Item": null}).to_string(),
-            "a map",
-        ),
-        (
-            "a required string, on a tag read",
-            "ListTagsOfResource",
-            json!({"ResourceArn": null}).to_string(),
-            "a string",
-        ),
-        (
-            "a required list, on a tag write",
-            "TagResource",
-            json!({"ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Absences",
-                   "Tags": null})
-            .to_string(),
-            "a sequence",
-        ),
-        (
-            // Nested inside a list's element structure: `Tag$Key` is a required string
-            // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#Tag")`).
-            "a required string inside a list element",
-            "TagResource",
-            json!({"ResourceArn": "arn:aws:dynamodb:us-east-1:000000000000:table/Absences",
-                   "Tags": [{"Key": null, "Value": "v"}]})
-            .to_string(),
-            "a string",
-        ),
-        (
-            // Nested inside a structure: `TimeToLiveSpecification$Enabled` is a required
-            // boolean (`smithy_query(query="shape",
-            // shape="com.amazonaws.dynamodb#TimeToLiveSpecification")`).
-            "a required boolean inside a structure",
-            "UpdateTimeToLive",
-            json!({"TableName": TABLE,
-                   "TimeToLiveSpecification": {"Enabled": null, "AttributeName": "ttl"}})
-            .to_string(),
-            "a boolean",
         ),
         (
             // The same absence in a request that ALSO omits a required member: the read
@@ -536,24 +491,18 @@ async fn a_null_a_required_member_stands_for_is_refused_with_the_readers_diagnos
         );
     }
 
-    // Nothing of a refused request was read, so nothing of it was applied: the tag write
-    // above named a real table, whose tag set is still empty, and the TTL update left the
-    // table's TTL alone.
-    let arn = ok(&router, "DescribeTable", json!({"TableName": TABLE})).await["Table"]["TableArn"]
-        .as_str()
-        .expect("the table reports its ARN")
-        .to_string();
-    let tags = ok(&router, "ListTagsOfResource", json!({"ResourceArn": arn})).await;
-    assert_eq!(
-        tags["Tags"].as_array().map(Vec::len).unwrap_or(0),
-        0,
-        "case \"after the refusals\": a refused tag write applied nothing, got {tags}"
+    // Nothing of a refused request was read, so nothing of it was applied: the table the rows
+    // addressed through its name is still exactly as it was, and the vector read the rows
+    // carried created no index on it.
+    let described = ok(&router, "DescribeTable", json!({"TableName": TABLE})).await;
+    assert!(
+        described["Table"].get("VectorIndexes").is_none(),
+        "case \"after the refusals\": a refused vector read created nothing, got {described}"
     );
-    let ttl = ok(&router, "DescribeTimeToLive", json!({"TableName": TABLE})).await;
     assert_eq!(
-        ttl["TimeToLiveDescription"]["TimeToLiveStatus"],
-        json!("DISABLED"),
-        "case \"after the refusals\": a refused TTL update applied nothing, got {ttl}"
+        described["Table"]["TableStatus"],
+        json!("ACTIVE"),
+        "case \"after the refusals\": a refused request left the table as it was, got {described}"
     );
 }
 

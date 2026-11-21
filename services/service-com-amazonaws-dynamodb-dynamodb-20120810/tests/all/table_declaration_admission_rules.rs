@@ -28,7 +28,9 @@
 //! recorded wording, and the bounds are tested AT the published value and one past it.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_dynamodb_dynamodb_20120810::state::MAX_PROVISIONED_CAPACITY_UNITS;
+use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{
+    DEFAULT_TABLE_MAX_READ_CAPACITY_UNITS, MAX_PROVISIONED_CAPACITY_UNITS,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::emulator::{call, describe_when_active, emulator, error_code, index_named, message, ok};
@@ -344,20 +346,45 @@ async fn a_capacity_figure_past_what_the_service_holds_is_refused_as_it_is_read(
         );
     }
 
-    // AT the published bound the figure is held, so the bound is a ceiling and not an
-    // approximation: the table is created and reports the pair it was created with.
+    // AT the published bound the figure is READ rather than refused as out of bounds, so the
+    // bound is a ceiling on what the service can HOLD and not an approximation. What such a
+    // create is refused by instead is the per-table throughput QUOTA, which is a different
+    // rule, a different error class and a different sentence
+    // (`crate::table_capacity_quota_refusals`).
     let at_bound = "bounded-at-the-ceiling";
-    ok(
+    let (status, body) = call(
         &router,
         "CreateTable",
         provisioned_request(at_bound, MAX_PROVISIONED_CAPACITY_UNITS, 5),
     )
     .await;
-    let described = describe_when_active(&router, "at the published bound", at_bound).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "LimitExceededException"),
+        "case at the published bound: a figure the service can hold is past the quota rather \
+         than out of bounds, got {status} with {body}"
+    );
+    assert!(
+        !message(&body).contains("is out of bounds"),
+        "case at the published bound: the figure is inside what the service holds, got {}",
+        message(&body)
+    );
+
+    // And a pair AT the per-table quota is created and reports the capacity it was created
+    // with, which is what makes that quota a ceiling too.
+    let at_quota = "bounded-at-the-quota";
+    ok(
+        &router,
+        "CreateTable",
+        provisioned_request(at_quota, DEFAULT_TABLE_MAX_READ_CAPACITY_UNITS, 5),
+    )
+    .await;
+    let described = describe_when_active(&router, "at the per-table quota", at_quota).await;
     assert_eq!(
         described["ProvisionedThroughput"]["ReadCapacityUnits"],
-        json!(MAX_PROVISIONED_CAPACITY_UNITS),
-        "case at the published bound: expected the capacity it was created with, got {described}"
+        json!(DEFAULT_TABLE_MAX_READ_CAPACITY_UNITS),
+        "case at the per-table quota: expected the capacity it was created with, got \
+         {described}"
     );
 }
 

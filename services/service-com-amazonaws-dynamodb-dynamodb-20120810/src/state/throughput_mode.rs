@@ -76,6 +76,63 @@ pub fn check_capacity_bounds<'t>(
     Ok(())
 }
 
+/// AWS's refusal of provisioned capacity past the per-table throughput quota, or `None` for
+/// a declaration inside it.
+///
+/// The quota bounds "the sum of the provisioned capacity of the new table itself and all
+/// its global secondary indexes" (the `DescribeLimits` doc) in each dimension, at the
+/// documented default an account holds before it asks for an increase
+/// ([`super::DEFAULT_TABLE_MAX_READ_CAPACITY_UNITS`] and its write sibling) — so it is a
+/// fact of the FIGURES one request states about one table, and the same rule holds wherever
+/// a table's capacity is declared or moved.
+///
+/// The DEFAULT is the figure enforced, rather than the one
+/// [`super::ComAmazonawsDynamodbDynamodb20120810State::capacity_quotas_in`] reports: that
+/// report raises the pair to what the Region has ALREADY provisioned, which is a fact about
+/// the account's tables rather than the quota a new declaration is admitted under, and with
+/// this check in force no table can hold more than the default anyway, so the two figures
+/// cannot disagree. A raised quota has no request that states it, so there is nothing else
+/// here to read it from.
+///
+/// The sentence is AWS's fixed text, with the capacity MEMBER whose total is past the
+/// quota, the total the request asks for, the Region the account is addressed in and the
+/// quota itself taken from the request and from the quota in force. The caller turns it
+/// into the modelled `LimitExceededException` its own operation declares.
+///
+/// Both dimensions are read in the order the model declares them, so a declaration past
+/// both is told about the first.
+pub fn check_table_capacity_quota<'t>(
+    region: &str,
+    requested: impl IntoIterator<Item = &'t crate::ops::types::ProvisionedThroughput>,
+) -> Option<String> {
+    let (mut read, mut write) = (0i64, 0i64);
+    for throughput in requested {
+        read = read.saturating_add(throughput.read_capacity_units);
+        write = write.saturating_add(throughput.write_capacity_units);
+    }
+    for (member, total, quota) in [
+        (
+            "ReadCapacityUnits",
+            read,
+            super::DEFAULT_TABLE_MAX_READ_CAPACITY_UNITS,
+        ),
+        (
+            "WriteCapacityUnits",
+            write,
+            super::DEFAULT_TABLE_MAX_WRITE_CAPACITY_UNITS,
+        ),
+    ] {
+        if total > quota {
+            return Some(format!(
+                "The requested {member}, {total}, is above the per table maximum for the \
+                 account in {region}. Per table maximum: {quota}. Refer to the Amazon DynamoDB \
+                 Developer Guide for current limits and how to request higher limits."
+            ));
+        }
+    }
+    None
+}
+
 /// AWS's fixed text for a VECTOR index asked for on a table that is not in the on-demand
 /// capacity mode: the sentence states the capacity mode a vector index needs and nothing of
 /// the table or of the index that asked for one.

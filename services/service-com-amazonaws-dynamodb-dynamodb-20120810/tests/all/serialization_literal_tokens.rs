@@ -36,7 +36,9 @@
 //! whole number it truncates to, which is then held to the model's own range like any other.
 //! The rows read the value back through what the operation DOES with it — the page a `Limit`
 //! bounds, the condition an `Exists` states — rather than through the status alone, and the
-//! boundary rows are the texts that spell no flag at all.
+//! boundary rows are the texts that spell no flag at all. An explicit `null` is no value of
+//! another form at all: it states that its member is ABSENT, so the request is answered
+//! exactly as the same request without that member (`required_null_member_reports`).
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -490,9 +492,13 @@ async fn a_literal_the_member_can_be_read_from_is_read_rather_than_refused() {
     }
 
     // And what a body states is a fact of the body as the protocol READS it: an explicit
-    // `null` standing for a member the input REQUIRES earns the reader's own diagnosis of it
-    // — in the lowercase member that diagnosis is stated in — whether or not a value the
-    // protocol reads in another form stands before it in the body.
+    // `null` standing for a member the input REQUIRES states that member's ABSENCE, so the
+    // request is refused exactly as the same request without the member is — whether or not
+    // a value the protocol reads in another form stands before it in the body. The member
+    // here is the table name, which this service's own request code requires, so the
+    // sentence is that check's (`crate::state::missing_parameter_message`).
+    let absent_table_name = "The parameter 'TableName' is required but was not present in the \
+                             request";
     for (case, body) in [
         (
             "a null required member on its own",
@@ -504,21 +510,31 @@ async fn a_literal_the_member_can_be_read_from_is_read_rather_than_refused() {
                    "ConsistentRead": "true"}),
         ),
     ] {
-        let (status, answered) = call(&router, "GetItem", body).await;
-        let diagnosed = answered
+        let (status, answered) = call(&router, "GetItem", body.clone()).await;
+        let stated = answered
             .get("message")
+            .or_else(|| answered.get("Message"))
             .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+            .unwrap_or_default();
         assert_eq!(
-            (
-                status,
-                answered.get("__type").and_then(Value::as_str),
-                diagnosed.contains("expected a string"),
-            ),
-            (400, Some(SERIALIZATION_EXCEPTION), true),
-            "case {case:?}: expected the reader's own diagnosis of the absence, got {status} \
-             with {answered}"
+            (status, error_code(&answered).as_str(), stated),
+            (400, "ValidationException", absent_table_name),
+            "case {case:?}: a member stated null is the member the body does not state, got \
+             {status} with {answered}"
+        );
+        // The same request with the member left out states the same refusal, which is what
+        // makes the `null` an absence rather than a value.
+        let mut without = body;
+        if let Some(members) = without.as_object_mut() {
+            members.remove("TableName");
+        }
+        let (plain_status, plain) = call(&router, "GetItem", without).await;
+        assert_eq!(
+            (status, &answered),
+            (plain_status, &plain),
+            "case {case:?}: the body stating the absence is answered exactly as the body \
+             without the member, got {status} with {answered} against {plain_status} with \
+             {plain}"
         );
     }
 }

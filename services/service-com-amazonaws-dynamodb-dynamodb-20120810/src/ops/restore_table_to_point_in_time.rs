@@ -334,6 +334,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`$VectorIndexOverride`), and an override that names any is refused above, so
         // the restored table carries the source's as they stand.
         let vector_indexes = restored_vector_indexes(source, &region, &target, now);
+        // A restore CREATES a table, so the capacity it reinstates is held to the per-table
+        // throughput quota a create is held to
+        // ([`crate::state::check_table_capacity_quota`]).
+        if let Some(refusal) = crate::state::check_table_capacity_quota(
+            &region,
+            provisioned_throughput.iter().chain(
+                global_secondary_indexes
+                    .iter()
+                    .filter_map(|index| index.provisioned_throughput.as_ref()),
+            ),
+        ) {
+            return Err(limit_exceeded(refusal));
+        }
         let key_schema = source.key_schema.clone();
         let attribute_definitions = source.attribute_definitions.clone();
         let table_class = source.table_class.clone();

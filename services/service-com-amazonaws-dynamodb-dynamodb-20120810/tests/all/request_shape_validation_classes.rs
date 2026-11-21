@@ -447,8 +447,8 @@ async fn a_capacity_mode_outside_the_declared_set_is_refused_as_the_member_it_is
             "a provisioned create with no capacity at all",
             "CreateTable",
             create_body("capacity-1", json!({"TableThroughputMode": "PROVISIONED"})),
-            "One or more parameter values were invalid: ProvisionedThroughput must be specified \
-             when BillingMode is PROVISIONED",
+            "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits \
+             must both be specified when BillingMode is PROVISIONED",
         ),
         (
             "an on-demand create that names capacity anyway",
@@ -541,8 +541,8 @@ async fn a_capacity_mode_outside_the_declared_set_is_refused_as_the_member_it_is
         (status, said.as_str()),
         (
             400,
-            "One or more parameter values were invalid: ProvisionedThroughput must be specified \
-             when BillingMode is PROVISIONED"
+            "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits \
+             must both be specified when BillingMode is PROVISIONED"
         ),
         "case \"a provisioned update with no capacity\": got {status} with {body}"
     );

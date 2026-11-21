@@ -251,6 +251,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 parameters.provisioned_throughput.as_ref(),
             )
             .map_err(bad_request)?;
+        // And the per-table throughput quota the capacity this declaration asks for is held
+        // to, exactly as a create is: an import creates a table
+        // ([`crate::state::check_table_capacity_quota`]).
+        if let Some(refusal) = crate::state::check_table_capacity_quota(
+            &region,
+            parameters.provisioned_throughput.iter().chain(
+                declared
+                    .global_secondary_indexes
+                    .iter()
+                    .filter_map(|index| index.provisioned_throughput.as_ref()),
+            ),
+        ) {
+            return Err(limit_exceeded(refusal));
+        }
         // An on-demand capacity ceiling cannot hold on a table created in the
         // PROVISIONED capacity mode, whichever resource it was named for, and each
         // ceiling is held to the values the member takes — the same two checks a create

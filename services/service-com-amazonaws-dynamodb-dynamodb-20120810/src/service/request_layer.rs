@@ -47,20 +47,29 @@
 //! ABSENCE: a member a body carries as `null` is a member that body does not state, so the
 //! request is served exactly as the same request without it — which is what lets a client
 //! marshal an unset optional as `null`, and is the same forward-compatibility the codec
-//! already gives an UNKNOWN member by skipping it. The one `null` that is not an absence a
-//! caller may send is one standing for a member the input REQUIRES: there is then no value to
-//! build the input from, so the body fails to deserialize and is refused as the body-level
-//! failure it is, with the reader's own diagnosis of it ([`BodyReading`], [`Prose`]).
+//! already gives an UNKNOWN member by skipping it.
+//!
+//! A member the input REQUIRES is the one such member a request cannot be served without, and
+//! stating it `null` is the same as leaving it out: either way the body states no value for a
+//! member the model requires, which is a violation of the model's OWN `@required` rule. So
+//! that is how it is refused — the CONSTRAINT report, counted in the same envelope and worded
+//! by the same renderer as every other bound the same body breaks, over every one of them
+//! rather than over the first member the read stopped at ([`BodyReading::Invalid`],
+//! [`StatedAbsences::violations`]). The ONE exception is the surface observed to answer such a
+//! `null` with the reader's own diagnosis of the body instead — the body-level failure, naming
+//! the position in the request the read stopped at ([`READER_DIAGNOSIS_OPERATIONS`],
+//! [`Prose`]).
 //!
 //! Nothing about the model is written down here. WHETHER a body can be read, which members
-//! the input REQUIRES and what type each member is read as are all decided by running the
-//! framework's OWN deserializer over the body ([`probe`], [`absent_member`]): the same
-//! protocol, the same input schema and the same generated `DeserializableStruct` the dispatch
-//! sequence uses, so this layer cannot disagree with the walk that follows it. [`Probe`]
-//! wraps that deserializer only to learn WHICH read failed — the modelled type that read was
-//! for, which the codec's error does not carry — and leaves the error itself untouched.
-//! Because the real codec descends the whole body, a value nested in a structure, a list or a
-//! map is reached exactly as a top-level member is.
+//! the input REQUIRES, what type each member is read as and which bounds the values it carries
+//! break are all decided by running the framework's OWN deserializer and its OWN validating
+//! walk over the body ([`probe`], [`absent_member`], [`input_violations`]): the same protocol,
+//! the same input schema and the same generated `DeserializableStruct` the dispatch sequence
+//! uses, so this layer cannot disagree with the walk that follows it. [`Probe`] wraps that
+//! deserializer only to learn WHICH read failed — the modelled type that read was for, which
+//! the codec's error does not carry — and leaves the error itself untouched. Because the real
+//! codec descends the whole body, a value nested in a structure, a list or a map is reached
+//! exactly as a top-level member is.
 //!
 //! # What a value of another FORM states
 //!
@@ -74,8 +83,8 @@
 //! constraints like any other, which is where a page size read as zero earns the range clause.
 //!
 //! It is read BEFORE the absences above, because what a body states is a fact of the body as
-//! the protocol READS it: a `null` standing for a required member earns the reader's own
-//! diagnosis whether or not a value the protocol reads in another form stands before it.
+//! the protocol READS it: what a member with no value earns is settled over the body whose
+//! values have already been read in the form the protocol reads them in.
 //!
 //! # What is left to another layer, deliberately
 //!
@@ -95,7 +104,7 @@ use std::cell::RefCell;
 use aws_smithy_runtime_api::http::Request as RtRequest;
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
-use aws_smithy_schema_server::constraints::path;
+use aws_smithy_schema_server::constraints::{path, Violation, ViolationKind};
 use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::{BigDecimal, BigInteger, Blob, DateTime, Document};
 use serde::de::{Deserialize, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess};
@@ -510,7 +519,8 @@ fn absent_member<Eng: Send + Sync + 'static>(
 
 /// The modelled type the read that one explicit `null` in `req`'s body answered was FOR, as
 /// the framework's own deserializer reports it — the half of a diagnosis that says what was
-/// expected where the body stated an absence.
+/// expected where the body stated an absence, and the type a value standing in for that member
+/// is built from ([`stands_in`]).
 ///
 /// A scalar read ANSWERS that question by failing, naming the type it read for; a structure,
 /// a list and a map each read a `null` without failing, because they already take one as
@@ -534,6 +544,37 @@ fn declared_input_members<Eng: Send + Sync + 'static>(
     req: &RtRequest,
 ) -> Option<Vec<DeclaredMember>> {
     for_served_input!(input_members, key, protocol, req)
+}
+
+/// Every bound the model declares that `req`'s body breaks, as the framework's OWN
+/// validating walk over the input of the operation `key` names reports them.
+///
+/// The same walk the dispatch that follows runs, over the same input schema, so no bound is
+/// transcribed here and no clause is worded here: what comes back is the violations, which
+/// this service words exactly as it words that walk's own
+/// (`super::EmulatedService::override_refusal`).
+///
+/// `None` for a body no input can be read from, which is a refusal of its own.
+fn input_violations<Eng: Send + Sync + 'static>(
+    key: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<Vec<Violation>> {
+    for_served_input!(walked_violations, key, protocol, req)
+}
+
+/// Read `req`'s body into `O`'s input with the framework's own deserializer and walk that
+/// input for every bound the model declares — the one walk, over the one schema.
+fn walked_violations<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<Vec<Violation>> {
+    let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
+    let input = <O::Input as DeserializableStruct>::deserialize(&mut *deserializer).ok()?;
+    Some(::aws_smithy_schema_server::constraints::validate(
+        &input,
+        O::INPUT_SCHEMA,
+    ))
 }
 
 /// One member of an operation's input, as its schema declares it.
@@ -611,6 +652,36 @@ pub enum BodyReading {
     /// The body is not one an input of this protocol can be read from, with the prose this
     /// service states for that defect where it states any.
     Unreadable(Option<Prose>),
+    /// The body READS as a document and breaks the model's own rules: a member the input
+    /// REQUIRES has no value in it — stated `null`, or left out of a structure the body does
+    /// carry — and the refusal is the CONSTRAINT report over that member and every other bound
+    /// the same body breaks ([`StatedAbsences::violations`]).
+    Invalid(Vec<Violation>),
+}
+
+/// The operations observed to answer a `null` standing for a member their input REQUIRES
+/// with the READER's own diagnosis of the body ([`Prose::Diagnosis`]) rather than with the
+/// constraint report every other operation of this service answers it with
+/// ([`BodyReading::Invalid`]).
+///
+/// The two answers are both observed, for the same defect, on the same protocol: a `null`
+/// standing for this surface's required string is answered `SerializationException` with the
+/// reader's sentence and a position in the request, while a `null` standing for a required
+/// capacity member of a table update is answered `ValidationException` with one clause per
+/// violated member. Nothing about the model distinguishes them — the member is `@required`
+/// either way — so this list is the only place the difference is recorded, and an operation
+/// later found to answer with the reader's diagnosis needs its own entry here.
+/// `tests/all/body_form_and_stated_absences.rs` and
+/// `tests/all/required_null_member_reports.rs` pin the two groups side by side so the
+/// difference is visible rather than silent.
+///
+/// Read by MEMBERSHIP rather than by a sorted lookup, so the list carries no order invariant
+/// for a later entry to break silently.
+const READER_DIAGNOSIS_OPERATIONS: &[&str] = &["SearchVectors"];
+
+/// Whether the operation `key` names answers such a `null` with the reader's own diagnosis.
+fn states_reader_diagnosis(key: &str) -> bool {
+    READER_DIAGNOSIS_OPERATIONS.contains(&key)
 }
 
 /// The prose a protocol-level refusal of this service states, and which body member it
@@ -825,9 +896,14 @@ impl<'r> StatedAbsences<'r> {
     ) -> Self {
         let stated = absences_stated(&document);
         let declared = declared_input_members::<Eng>(key, protocol, req).unwrap_or_default();
-        // The reads one absence costs: one for the type its member is read as, one per round
-        // that isolates it, and one for the diagnosis it may earn.
-        let each = declared.len().saturating_add(2);
+        // The reads one absence costs: one for the type its member is read as, one more for
+        // that same question asked beside the absences next to it, one per round that
+        // isolates it, and up to three per round that completes the walk over the body
+        // ([`Self::violations`]).
+        let each = declared
+            .len()
+            .saturating_mul(4)
+            .saturating_add(3);
         let asking = stated
             .saturating_mul(each)
             .saturating_mul(body.len())
@@ -851,6 +927,17 @@ impl<'r> StatedAbsences<'r> {
         held.targets = (0..held.at.len())
             .map(|which| held.target::<Eng>(which))
             .collect();
+        // A `null` whose read was stopped by ANOTHER absence beside it — a second member of
+        // the same structure the body also states as absent — is asked again, now that the
+        // types of those absences are known and a value of each can stand in for them, so the
+        // read reaches this one.
+        let beside: Vec<Option<ShapeType>> = (0..held.at.len())
+            .map(|which| match held.targets[which] {
+                Some(target) => Some(target),
+                None => held.target_beside_filled::<Eng>(which),
+            })
+            .collect();
+        held.targets = beside;
         held
     }
 
@@ -859,17 +946,32 @@ impl<'r> StatedAbsences<'r> {
         if self.stated == 0 {
             return BodyReading::AsSent;
         }
-        // In the order the BODY carries them, which is the order the deserializer reads them
-        // in: the first `null` the input cannot do without is the one the caller has to fix.
-        for which in 0..self.at.len() {
-            let Some(expected) = self.targets[which].and_then(Expected::of) else {
-                continue;
-            };
-            if !self.required::<Eng>(which) {
-                continue;
+        // The `null`s standing for a member the input REQUIRES, each beside the member path
+        // the reader names it by, in the order the BODY carries them — which is the order
+        // the deserializer reads them in.
+        let required: Vec<(usize, String)> = (0..self.at.len())
+            .filter_map(|which| {
+                self.required_path::<Eng>(which)
+                    .map(|path| (which, path))
+            })
+            .collect();
+        if !required.is_empty() {
+            // A member stated `null` is a member with no value, which the model's own
+            // `@required` rule is about: the refusal is the constraint report over it and
+            // over every other bound the same body breaks — except on the surface observed
+            // to answer the reader's own diagnosis of the body instead
+            // ([`READER_DIAGNOSIS_OPERATIONS`]), where the first such `null` the reader
+            // stopped at is what the sentence is about.
+            if !states_reader_diagnosis(self.key) {
+                return BodyReading::Invalid(self.violations::<Eng>(&required));
             }
-            if let Some(diagnosis) = expected.diagnosis(self.body, &self.at[which]) {
-                return BodyReading::Unreadable(Some(Prose::Diagnosis(diagnosis)));
+            for (which, _) in &required {
+                let Some(expected) = self.targets[*which].and_then(Expected::of) else {
+                    continue;
+                };
+                if let Some(diagnosis) = expected.diagnosis(self.body, &self.at[*which]) {
+                    return BodyReading::Unreadable(Some(Prose::Diagnosis(diagnosis)));
+                }
             }
         }
         match rebuilt(self.req, &self.without_absences()) {
@@ -878,6 +980,125 @@ impl<'r> StatedAbsences<'r> {
             // framework's own answer to the `null` it then reads.
             None => BodyReading::AsSent,
         }
+    }
+
+    /// Every bound the model declares that this body breaks, with each member the body does
+    /// not state a value for reported as the absence it is.
+    ///
+    /// The walk that finds the others is the framework's OWN — the same validating walk the
+    /// dispatch runs over a body that reads — so this layer transcribes no bound and words no
+    /// clause. To reach it the body has to BUILD, which a member the input requires and the
+    /// body does not state stops, so each such member is given a value of its own modelled
+    /// type for the walk's sake ([`stands_in`]): a value that stands in a document this layer
+    /// builds, reads once and drops, and reaches no handler, no response and no store.
+    ///
+    /// Two kinds of member are given one. A member stated `null` is the caller's own absence,
+    /// and the type it is read as is already known ([`Self::target`]). A member the body
+    /// leaves out ENTIRELY is reported by the reader as the walk runs, and its type is learned
+    /// the same way every type here is — by stating it `null` and reading what the codec
+    /// expected there ([`Self::target_at`]) — so the walk can go on past it. Each round either
+    /// completes the walk or fills one more member, which is why the rounds are bounded by the
+    /// input's own member count.
+    ///
+    /// What is REPORTED is the caller's defects only: the absence of each member the CALLER
+    /// did not state, and every bound the walk found broken by a value the caller DID state.
+    /// A bound broken by a value this layer stood in is nobody's defect, so the clause at such
+    /// a member is the absence clause and a clause inside one of those values is dropped
+    /// altogether — the caller stated nothing in there to be wrong.
+    ///
+    /// A body the walk cannot be reached over at all is reported by those absences alone,
+    /// which is the half of the report this layer is sure of.
+    ///
+    /// WHAT IT COSTS: each round is one copy of the body, one read of it for the type the
+    /// member is read as and one for the walk, so the work is the product of the number of
+    /// members with no value, the input's own member count and the body's size — the three
+    /// factors the bound on how much JSON one request may have read here is applied to
+    /// ([`MOST_JSON_READ_FOR_ABSENCES`], whose per-absence factor counts these rounds). A body
+    /// past that bound states no absence this layer asks about at all, so none of this runs
+    /// for it.
+    fn violations<Eng: Send + Sync + 'static>(
+        &self,
+        required: &[(usize, String)],
+    ) -> Vec<Violation> {
+        // The caller's own absences, in the order the body carries them.
+        let mut absences: Vec<String> = required.iter().map(|(_, path)| path.clone()).collect();
+        // Every position this layer put a value at, which is every absence above plus each
+        // member filled in a round below.
+        let mut invented: Vec<String> = absences.clone();
+        let stands = |which: usize| {
+            self.targets
+                .get(which)
+                .copied()
+                .flatten()
+                .and_then(stands_in)
+        };
+        if !required.iter().all(|(which, _)| stands(*which).is_some()) {
+            return as_absences(&absences);
+        }
+        let mut document = self.rewritten(&|held| {
+            match required
+                .iter()
+                .any(|(which, _)| *which == held)
+                .then(|| stands(held))
+                .flatten()
+            {
+                Some(value) => Applied::StoodIn(value),
+                None => Applied::Dropped,
+            }
+        });
+        // Bounded by the input's own member count: each round fills one member the round
+        // before reported absent, and a filled member is never reported absent again. That
+        // count is a factor of the bound on how much JSON one request may have read here
+        // ([`MOST_JSON_READ_FOR_ABSENCES`]).
+        for _ in 0..=self.declared.len() {
+            let Some(probe) = rebuilt(self.req, &document) else {
+                return as_absences(&absences);
+            };
+            if let Some(found) = input_violations::<Eng>(self.key, self.protocol, &probe) {
+                return merged(found, &absences, &invented);
+            }
+            let Some(unstated) = absent_member::<Eng>(self.key, self.protocol, &probe) else {
+                return as_absences(&absences);
+            };
+            // The same member reported absent twice is a member the round before did not
+            // actually fill — the name this protocol carries it under was not recovered
+            // ([`wire_spelling`]) — so there is no progress to be made and the report is the
+            // absences this layer is sure of.
+            if invented.iter().any(|at| at == &unstated) {
+                return as_absences(&absences);
+            }
+            // A member absent from a value this layer stood in is absent from THAT value
+            // rather than from the body, so it is filled and not reported.
+            if !invented.iter().any(|at| inside(&unstated, at)) {
+                absences.push(unstated.clone());
+            }
+            let filled = self
+                .target_at::<Eng>(&document, &unstated)
+                .and_then(stands_in)
+                .is_some_and(|value| put_at(&mut document, &unstated, value));
+            if !filled {
+                return as_absences(&absences);
+            }
+            invented.push(unstated);
+        }
+        as_absences(&absences)
+    }
+
+    /// The modelled type the member `path` names is read as, learned the way every other type
+    /// here is: the member is stated `null` in `document` and the codec names the type that
+    /// read was for ([`null_target`]). `None` when the position cannot be reached or the
+    /// reader names no type for it.
+    fn target_at<Eng: Send + Sync + 'static>(
+        &self,
+        document: &Value,
+        path: &str,
+    ) -> Option<ShapeType> {
+        let mut stating = document.clone();
+        if !put_at(&mut stating, path, Value::Null) {
+            return None;
+        }
+        let probe = rebuilt(self.req, &stating)?;
+        null_target::<Eng>(self.key, self.protocol, &probe)
     }
 
     /// The modelled type the member whose absence the `which`th `null` states is read as, as
@@ -892,11 +1113,26 @@ impl<'r> StatedAbsences<'r> {
         null_target::<Eng>(self.key, self.protocol, &probe)
     }
 
-    /// Whether the input REQUIRES the member whose absence the `which`th `null` states.
+    /// The same question, asked of a body in which every other stated absence CARRIES a value
+    /// of its own modelled type instead of being gone ([`Self::only_beside_filled`]).
+    ///
+    /// For the `null` whose read the absence of a member BESIDE it stopped first: two members
+    /// of one structure both stated absent leave the reader reporting the other one's absence,
+    /// which names no type at all, while a value standing in for it lets the read reach this
+    /// one. Asked only where the first question had no answer, so a body whose absences do not
+    /// stand beside each other pays nothing for it.
+    fn target_beside_filled<Eng: Send + Sync + 'static>(&self, which: usize) -> Option<ShapeType> {
+        let probe = rebuilt(self.req, &self.only_beside_filled(which))?;
+        null_target::<Eng>(self.key, self.protocol, &probe)
+    }
+
+    /// The member path the input REQUIRES and the `which`th `null` states the absence of, or
+    /// `None` when the input does not require that member.
     ///
     /// Asked of the generated deserializer, which is the only thing that knows: the member is
     /// dropped from a document in which every OTHER stated absence carries a value the codec
-    /// reads, so the member that reader then reports absent is this one.
+    /// reads, so the member that reader then reports absent is this one — and the path it
+    /// reports is the one every clause about that member names it by ([`path`]).
     ///
     /// A member the body never carried AT ALL is a different defect, and one the reader may
     /// report first because it reports the absences of a body in the order the input declares
@@ -904,36 +1140,28 @@ impl<'r> StatedAbsences<'r> {
     /// member the input requires stops the read before any member's absence is noticed at all.
     /// So a member reported absent that this `null` does not stand for is filled in turn and
     /// the reader asked again, until it reports this one or reports one that cannot be filled.
-    fn required<Eng: Send + Sync + 'static>(&self, which: usize) -> bool {
+    fn required_path<Eng: Send + Sync + 'static>(&self, which: usize) -> Option<String> {
         let mut document = self.filled(which);
         // Bounded by the input's own member count: each round fills a member the round before
         // reported absent, and a filled member is never reported absent again. That count is
         // also a factor of the bound on how much JSON one request may have read here
         // ([`MOST_JSON_READ_FOR_ABSENCES`]).
         for _ in 0..=self.declared.len() {
-            let Some(probe) = rebuilt(self.req, &document) else {
-                return false;
-            };
-            let Some(absent) = absent_member::<Eng>(self.key, self.protocol, &probe) else {
-                return false;
-            };
+            let probe = rebuilt(self.req, &document)?;
+            let absent = absent_member::<Eng>(self.key, self.protocol, &probe)?;
             if names(&self.at[which], &absent) {
-                return true;
+                return Some(absent);
             }
             let filled = self
                 .declared
                 .iter()
                 .find(|member| path::member(member.name) == absent)
                 .and_then(|member| stands_in(member.target).map(|value| (member.wire, value)));
-            let Some((wire, value)) = filled else {
-                return false;
-            };
-            match document.as_object_mut() {
-                Some(members) => members.insert(wire.to_string(), value),
-                None => return false,
-            };
+            let (wire, value) = filled?;
+            let members = document.as_object_mut()?;
+            members.insert(wire.to_string(), value);
         }
-        false
+        None
     }
 
     /// The document with every member a `null` states the absence of gone — the body the
@@ -968,6 +1196,28 @@ impl<'r> StatedAbsences<'r> {
         })
     }
 
+    /// The document with the `which`th absence still STATED and every other one carrying a
+    /// value of its own modelled type where that type is known: the body the type of this
+    /// absence is asked of once the absences beside it have answered
+    /// ([`Self::target_beside_filled`]).
+    fn only_beside_filled(&self, which: usize) -> Value {
+        self.rewritten(&|held| {
+            if held == which {
+                return Applied::Stated;
+            }
+            match self
+                .targets
+                .get(held)
+                .copied()
+                .flatten()
+                .and_then(stands_in)
+            {
+                Some(value) => Applied::StoodIn(value),
+                None => Applied::Dropped,
+            }
+        })
+    }
+
     /// The document with each absence rewritten as `how` says, in ONE pass over it: the
     /// absences are visited in the order the body carries them, which is the order they were
     /// counted and recorded in, so `how` is handed the same index everything else here uses.
@@ -977,6 +1227,149 @@ impl<'r> StatedAbsences<'r> {
     fn rewritten(&self, how: &dyn Fn(usize) -> Applied) -> Value {
         let mut visited = 0;
         rewrite(&self.document, &mut visited, how)
+    }
+}
+
+/// One violation for each member `absences` names, stating the absence it is: the clause the
+/// framework words for a member the request carries no value for.
+fn as_absences(absences: &[String]) -> Vec<Violation> {
+    absences.iter().map(|path| absent_violation(path)).collect()
+}
+
+/// The violation a member the request states no value for earns.
+fn absent_violation(path: &str) -> Violation {
+    Violation {
+        path: path.to_string(),
+        kind: ViolationKind::MissingRequiredMember,
+        value: None,
+        sensitive: false,
+    }
+}
+
+/// The violations the walk `found` over a body this layer completed, reduced to the CALLER's
+/// own defects: `absences` are the members the caller stated no value for and `invented` the
+/// positions this layer put a value at.
+///
+/// Each clause at an absence becomes that member's absence clause, however many bounds the
+/// stood-in value broke there, so the member earns one clause and it is the one the caller's
+/// defect calls for; an absence the walk reported nothing at is stated after the clauses the
+/// walk found. A clause INSIDE a value this layer stood in is dropped: the caller stated
+/// nothing in there for a bound to be broken by.
+fn merged(found: Vec<Violation>, absences: &[String], invented: &[String]) -> Vec<Violation> {
+    let mut reported: Vec<Violation> = Vec::with_capacity(found.len() + absences.len());
+    let mut restated: Vec<bool> = vec![false; absences.len()];
+    for violation in found {
+        match absences.iter().position(|path| *path == violation.path) {
+            Some(at) => {
+                if !restated[at] {
+                    restated[at] = true;
+                    reported.push(absent_violation(&absences[at]));
+                }
+            }
+            None => {
+                if !invented.iter().any(|at| inside(&violation.path, at)) {
+                    reported.push(violation);
+                }
+            }
+        }
+    }
+    for (at, path) in absences.iter().enumerate() {
+        if !restated[at] {
+            reported.push(absent_violation(path));
+        }
+    }
+    reported
+}
+
+/// Whether the member `path` names stands INSIDE the value at `at` — a member of it, or a
+/// member of something it holds — rather than being that value itself.
+fn inside(path: &str, at: &str) -> bool {
+    path.len() > at.len()
+        && path.starts_with(at)
+        && path[at.len()..].starts_with('.')
+}
+
+/// Put `value` at the position the member path `path` names in `document`, answering whether
+/// that position was reached.
+///
+/// The path is the one the framework's own deserializer and its validating walk both spell
+/// ([`path`]): a member of a structure names itself in lowerCamel, while an element of a list
+/// and an entry of a map name the 1-based position or the key and then the collection step. A
+/// JSON object member can be either of the first two, because the document alone does not say
+/// whether an object is a structure or a map, so the step is read as the collection step only
+/// where the path spells one.
+///
+/// The member a path names may be one the document does not carry at all, which is the case
+/// this is for: the name it is then inserted under is the name this protocol carries that
+/// member as — the model's own member name, which the path spells with its first character
+/// lowercased ([`wire_spelling`]). A spelling that turns out not to be the one the codec
+/// looks the member up by makes no progress, which the caller of this treats as a body it
+/// cannot complete rather than guessing again ([`StatedAbsences::violations`]).
+fn put_at(document: &mut Value, path: &str, value: Value) -> bool {
+    let segments: Vec<&str> = path.split('.').collect();
+    put_at_segments(document, &segments, value)
+}
+
+/// [`put_at`], over the remaining segments.
+fn put_at_segments(document: &mut Value, segments: &[&str], value: Value) -> bool {
+    let Some((first, rest)) = segments.split_first() else {
+        return false;
+    };
+    // A step from a collection into one of its children: the two segments the framework
+    // spells such a step with, read through that spelling rather than a second copy of it.
+    let steps_in = rest
+        .first()
+        .is_some_and(|next| format!("{first}.{next}") == path::entry(first));
+    if steps_in {
+        let inner = &rest[1..];
+        let held = match document {
+            Value::Array(elements) => first
+                .parse::<usize>()
+                .ok()
+                .and_then(|position| position.checked_sub(1))
+                .and_then(|index| elements.get_mut(index)),
+            Value::Object(members) => members.get_mut(*first),
+            _ => None,
+        };
+        let Some(held) = held else {
+            return false;
+        };
+        if inner.is_empty() {
+            *held = value;
+            return true;
+        }
+        return put_at_segments(held, inner, value);
+    }
+    let Value::Object(members) = document else {
+        return false;
+    };
+    let carried = members
+        .keys()
+        .find(|name| path::member(name) == *first)
+        .cloned();
+    if rest.is_empty() {
+        members.insert(carried.unwrap_or_else(|| wire_spelling(first)), value);
+        return true;
+    }
+    let Some(carried) = carried else {
+        return false;
+    };
+    match members.get_mut(&carried) {
+        Some(held) => put_at_segments(held, rest, value),
+        None => false,
+    }
+}
+
+/// The name this protocol carries the member a validation path spells as `segment` under.
+///
+/// `awsJson` reads a struct member by its MODEL name, and a validation path spells that name
+/// with its first character lowercased ([`path::member`]), so the wire spelling is that one
+/// character restored. Nothing else about the name changes.
+fn wire_spelling(segment: &str) -> String {
+    let mut characters = segment.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
     }
 }
 

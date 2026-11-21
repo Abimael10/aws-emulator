@@ -809,6 +809,12 @@ async fn a_table_arn_that_addresses_no_table_of_this_endpoint_is_refused() {
     }
 }
 
+/// The set this service STATES for `ExportFormat` when a value falls outside it, in the
+/// order it states it — which is not the model's declaration order
+/// (`ops::types::EXPORT_FORMAT_VALUES` gives `DYNAMODB_JSON ION`). The rule, and the enums
+/// stated in the model's own order beside it, live in `crate::enum_value_set_order`.
+const STATED_EXPORT_FORMAT_VALUES: &[&str] = &["ION", "DYNAMODB_JSON"];
+
 #[tokio::test]
 async fn a_value_outside_an_enumerated_members_set_is_refused() {
     let router = emulator_with_destination().await;
@@ -817,14 +823,16 @@ async fn a_value_outside_an_enumerated_members_set_is_refused() {
     let table_arn = state::table_arn(REGION, "Enumerated");
 
     // Rows differ in which enumerated member carries a value outside its set, and the
-    // set it is held to is the model's own (the `ExportFormat`, `ExportType` and
-    // `S3SseAlgorithm` value tables this service publishes).
+    // set it is held to is the one this service STATES for that member: the model's own
+    // declaration order for `ExportType` and `S3SseAlgorithm`, and the order this service
+    // publishes for `ExportFormat` ([`STATED_EXPORT_FORMAT_VALUES`], where
+    // `crate::enum_value_set_order` owns the rule and both groups).
     let cases: [(&str, &str, &str, &[&str]); 3] = [
         (
             "a format no export takes",
             "ExportFormat",
             "PARQUET",
-            service_com_amazonaws_dynamodb_dynamodb_20120810::ops::types::EXPORT_FORMAT_VALUES,
+            STATED_EXPORT_FORMAT_VALUES,
         ),
         (
             "an export type that is neither",

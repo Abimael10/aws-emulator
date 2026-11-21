@@ -522,6 +522,16 @@ const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
     // `NEW_IMAGE NEW_AND_OLD_IMAGES`
     // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ExportViewType")`).
     &["NEW_AND_OLD_IMAGES", "NEW_IMAGE"],
+    // `ExportTableToPointInTime$ExportFormat`, which the model declares as
+    // `DYNAMODB_JSON ION`
+    // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ExportFormat")`), while
+    // the service's refusals state the two in this one.
+    &["ION", "DYNAMODB_JSON"],
+    // `AttributeDefinition$AttributeType`, the scalar type a key attribute is defined with,
+    // which the model declares as `S N B`
+    // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ScalarAttributeType")`),
+    // while the service's refusals state the same three in this one.
+    &["B", "N", "S"],
     // `ReturnValue`, whose set the service is observed to state in THIS order; the model's
     // own declaration order is a different one
     // (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ReturnValue")`), and what
@@ -915,6 +925,18 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                     }
                     req
                 }
+                // A body that breaks the model's own rules before it can be built into an
+                // input: a member the input REQUIRES stated `null`, beside every other bound
+                // the same body breaks. They are this request's violations, so they are
+                // worded and counted exactly as the validating walk's own are
+                // ([`validation_envelope`]) — in the form the operation being served states
+                // its clauses in, which the scope below is not entered for yet.
+                request_layer::BodyReading::Invalid(violations) => {
+                    if let Some(message) = body_violation_refusal(operation, req, violations) {
+                        return front_door::announced(req, reported(validation_refusal(message)));
+                    }
+                    req
+                }
             };
             // And the DATATYPE of one value the body carries, for the members that state a
             // defect of it behind a sentence of their own: such a value never becomes an
@@ -1006,6 +1028,44 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
         // this wrapper cannot weaken them.
         None
     }
+}
+
+/// The `ValidationException` message the violations of a body read BEFORE any operation ran
+/// earn ([`request_layer::BodyReading::Invalid`]), worded exactly as the operation being
+/// served words the validating WALK's own violations.
+///
+/// The scopes entered here are the ones that walk's refusal is answered inside
+/// ([`OperationScopedClauseForm::run`] sets the same ones around the operation's run), so a
+/// body refused before it could be built into an input is refused in the same words as one
+/// refused after — the clause form, the members the service checks itself, and the sentences
+/// those checks state for them.
+///
+/// [`SERVED_READABLE_BODY`] is deliberately left unset: what it carries is the bounds read off
+/// a body whose walk never ran ([`request_constraints::readable_body`]), and these violations
+/// already ARE that whole reading, over every member of the body rather than its top-level
+/// strings.
+fn body_violation_refusal(
+    operation: &str,
+    req: &aws_smithy_runtime_api::http::Request,
+    violations: &[Violation],
+) -> Option<String> {
+    SERVED_CLAUSE_FORM.sync_scope(clause_form(operation), || {
+        SERVED_BARE_CLAUSE.sync_scope(states_service_checked_clause_bare(operation), || {
+            SERVED_NULL_CLAUSE.sync_scope(states_absent_member_as_clause(operation), || {
+                SERVED_MEMBER_CHECK.sync_scope(checks_its_own_members(operation), || {
+                    SERVED_TABLE_NAME_CLAUSES.sync_scope(
+                        request_constraints::table_name_form_clauses(operation, req),
+                        || {
+                            SERVED_SERVICE_CHECKED_CLAUSES.sync_scope(
+                                request_constraints::service_checked_clauses(operation, req),
+                                || validation_envelope(violations),
+                            )
+                        },
+                    )
+                })
+            })
+        })
+    })
 }
 
 /// `message` as this service's own `ValidationException` (HTTP 400), rendered in the
@@ -1371,14 +1431,6 @@ const STATED_MEMBER_ORDERS: &[&[&str]] = &[
     // their elements is ordered by the list it belongs to whichever position and member
     // inside the element it is about.
     &["globalSecondaryIndexes", "localSecondaryIndexes"],
-    // The capacity pair a table declaration or an update carries, which the model declares
-    // as `ReadCapacityUnits` then `WriteCapacityUnits` (`smithy_query(query="shape",
-    // shape="com.amazonaws.dynamodb#ProvisionedThroughput")`): the service states the
-    // WRITE dimension's clause first.
-    &[
-        "provisionedThroughput.writeCapacityUnits",
-        "provisionedThroughput.readCapacityUnits",
-    ],
     // The members of a KEYED ITEM request, which the model declares as `TableName`, `Key`,
     // then (far later) `ReturnValues` and `ReturnConsumedCapacity`
     // (`smithy_query(query="operation", operation="UpdateItem")`): the service states the
@@ -1396,11 +1448,20 @@ const STATED_MEMBER_ORDERS: &[&[&str]] = &[
     // schema's LIST member, so a clause about one of its elements is ordered by the list it
     // belongs to whichever position and member inside the element it is about.
     &["billingMode", "keySchema"],
+    // The key schema of a table declaration and the attribute definitions it draws its
+    // elements from, which the model declares as `AttributeDefinitions` then `KeySchema`
+    // (`smithy_query(query="operation", operation="CreateTable")`): the service states the
+    // SCHEMA's clauses first — so one over-long attribute name, which breaks a bound in both
+    // lists, is reported under the key schema before the definitions. Named by the two LIST
+    // members, so a clause about one of their elements is ordered by the list it belongs to
+    // whichever position and member inside the element it is about.
+    &["keySchema", "attributeDefinitions"],
 ];
 
 /// `violations` in the order their clauses are stated: the order
 /// [`STATED_MEMBER_ORDERS`] publishes for the input they are all members of, and
-/// otherwise the order the walk reported.
+/// otherwise the order the walk reported — and then, among the clauses about members of ONE
+/// structure, the order [`PUBLISHED_SIBLING_ORDERS`] publishes for that structure.
 ///
 /// An entry applies only when it names EVERY violated member, so a refusal that mixes a
 /// member the entry knows with one it does not keeps the walk's order rather than
@@ -1411,10 +1472,73 @@ fn in_stated_member_order<'v>(violations: &[&'v Violation]) -> Vec<&'v Violation
         .iter()
         .find(|order| violations.iter().all(|violation| at_in(order, violation).is_some()))
     else {
-        return stated;
+        return in_published_sibling_order(stated);
     };
     stated.sort_by_key(|violation| at_in(order, violation).unwrap_or(order.len()));
+    in_published_sibling_order(stated)
+}
+
+/// The members of ONE STRUCTURE whose clauses this service states in an order of its own,
+/// each written in the order it states them, by the member names the validating walk reports
+/// them under.
+///
+/// The capacity pair is the one such structure: `ProvisionedThroughput` declares
+/// `ReadCapacityUnits` then `WriteCapacityUnits` (`smithy_query(query="shape",
+/// shape="com.amazonaws.dynamodb#ProvisionedThroughput")`), while the service is observed to
+/// state the WRITE dimension's clause first. It is a property of that STRUCTURE rather than
+/// of the input that carries it, so it holds wherever the structure stands — the table's own
+/// capacity, and the capacity of an index inside a list of index updates.
+///
+/// Nothing about the model distinguishes such a structure from one stated in the declared
+/// order, so this is the only place the difference is recorded.
+/// `tests/all/required_null_member_reports.rs` reads it back over a nested capacity pair.
+const PUBLISHED_SIBLING_ORDERS: &[&[&str]] = &[&["writeCapacityUnits", "readCapacityUnits"]];
+
+/// `stated` with the clauses about members of one structure in the order
+/// [`PUBLISHED_SIBLING_ORDERS`] publishes for it.
+///
+/// The clauses keep the POSITIONS they already hold and are permuted among themselves, so
+/// nothing about where a structure's clauses sit relative to any other member's changes: the
+/// only thing decided here is which of the structure's own members is stated first. A
+/// structure only one of whose members is reported has nothing to reorder.
+fn in_published_sibling_order(mut stated: Vec<&Violation>) -> Vec<&Violation> {
+    for order in PUBLISHED_SIBLING_ORDERS {
+        let mut parents: Vec<String> = Vec::new();
+        for violation in &stated {
+            if let Some((parent, _)) = sibling_in(order, violation) {
+                if !parents.contains(&parent) {
+                    parents.push(parent);
+                }
+            }
+        }
+        for parent in parents {
+            let slots: Vec<usize> = (0..stated.len())
+                .filter(|at| {
+                    sibling_in(order, stated[*at])
+                        .is_some_and(|(named, _)| named == parent)
+                })
+                .collect();
+            if slots.len() < 2 {
+                continue;
+            }
+            let mut held: Vec<&Violation> = slots.iter().map(|at| stated[*at]).collect();
+            held.sort_by_key(|violation| {
+                sibling_in(order, violation).map_or(order.len(), |(_, at)| at)
+            });
+            for (slot, violation) in slots.iter().zip(held) {
+                stated[*slot] = violation;
+            }
+        }
+    }
     stated
+}
+
+/// The structure `violation`'s member belongs to and where that member sits in `order`, or
+/// `None` for a clause about a member the order does not name.
+fn sibling_in(order: &[&str], violation: &Violation) -> Option<(String, usize)> {
+    let (parent, member) = violation.path.rsplit_once('.')?;
+    let at = order.iter().position(|named| *named == member)?;
+    Some((parent.to_string(), at))
 }
 
 /// Where `violation`'s member sits in `order`, or `None` for a member it does not name.

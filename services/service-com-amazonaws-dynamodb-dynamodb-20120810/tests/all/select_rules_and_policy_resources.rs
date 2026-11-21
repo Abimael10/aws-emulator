@@ -973,8 +973,8 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
                 "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
                 "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             }),
-            "One or more parameter values were invalid: ProvisionedThroughput must be specified \
-             when BillingMode is PROVISIONED"
+            "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits \
+             must both be specified when BillingMode is PROVISIONED"
                 .to_string(),
         ),
         (

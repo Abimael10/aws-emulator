@@ -625,6 +625,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         )
         .map_err(lift)?;
+        // The capacity the table would be provisioned for after this update is held to the
+        // per-table throughput quota, exactly as a declaration of a NEW table's capacity is:
+        // the quota bounds the sum of the table's own capacity and its indexes', whichever
+        // call asks for it ([`crate::state::check_table_capacity_quota`]).
+        if let Some(refusal) = crate::state::check_table_capacity_quota(
+            &region,
+            table_throughput.iter().chain(
+                indexes
+                    .iter()
+                    .filter_map(|index| index.provisioned_throughput.as_ref()),
+            ),
+        ) {
+            return Err(UpdateTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(refusal),
+                },
+            )
+            .into());
+        }
         // The projection budget is summed across EVERY index the table would carry after
         // this update, the table's local and VECTOR indexes included: "the total count of
         // NonKeyAttributes summed across all of the secondary indexes, must not exceed 100"
@@ -1670,6 +1689,10 @@ fn clamped_definitions(
             declared.len()
         )));
     }
+    // One attribute defined twice states two types for one attribute of the item, which is
+    // the same defect of the same declared list whichever call carries it
+    // ([`super::create_table::check_distinct_definitions`]).
+    super::create_table::check_distinct_definitions(&declared)?;
     Ok(declared)
 }
 

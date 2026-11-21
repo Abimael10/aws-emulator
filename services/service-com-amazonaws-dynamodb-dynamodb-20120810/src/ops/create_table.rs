@@ -336,6 +336,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => crate::state::ResourcePolicySlot::default(),
         };
 
+        // The capacity the table is created with, settled BEFORE the key schema it is
+        // created on: the two are independent declarations, and a request that gets both
+        // wrong is told about the CAPACITY first ([`validated_declared_throughput`]) — so a
+        // caller repairing it follows the same sequence against this service as against
+        // AWS.
+        let (billing_mode, provisioned_throughput) = validated_declared_throughput(
+            input.billing_mode.as_deref(),
+            input.table_throughput_mode.as_deref(),
+            input.provisioned_throughput.as_ref(),
+        )
+        .map_err(lift)?;
+        // And the per-table throughput quota the capacity it asks for is held to, which is
+        // a fact of the figures the request states ([`crate::state::check_table_capacity_quota`]).
+        if let Some(refusal) =
+            crate::state::check_table_capacity_quota(&region, requested_capacities(&input))
+        {
+            return Err(CreateTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(refusal),
+                },
+            )
+            .into());
+        }
         // A request that carries NO key schema at all states no primary key, which the
         // create requires: the member is absent rather than wrong, so what it earns is the
         // validating walk's own absent-member clause over it
@@ -360,12 +383,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(str::to_string),
             None => None,
         };
-        let (billing_mode, provisioned_throughput) = validated_declared_throughput(
-            input.billing_mode.as_deref(),
-            input.table_throughput_mode.as_deref(),
-            input.provisioned_throughput.as_ref(),
-        )
-        .map_err(lift)?;
         // An on-demand capacity ceiling cannot hold on a table created in the
         // PROVISIONED capacity mode, whichever resource it was named for
         // ([`crate::state::check_on_demand_ceilings`]). That contradiction is in the
@@ -947,6 +964,32 @@ fn check_distinct_key_attributes(
     Ok(())
 }
 
+/// Refuse an `AttributeDefinitions` list that defines one attribute name more than once.
+///
+/// "An array of attributes that describe the key schema for the table and indexes"
+/// (`CreateTable$AttributeDefinitions`) declares the TYPE of each key attribute, and an
+/// item has one attribute per name: a list naming one attribute twice states two
+/// declarations for the one attribute, so there is no single type a key could be built on,
+/// and the whole call is refused before any table is created or changed.
+///
+/// The fact is a duplicated NAME in a declared list, stated in AWS's own fixed text for it
+/// over the name the list repeated. The TYPES the two entries state do not enter it: one
+/// name is one attribute whether or not the entries agree about its type.
+pub(crate) fn check_distinct_definitions(
+    definitions: &[AttributeDefinition],
+) -> Result<(), crate::state::RequestError> {
+    let mut named: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
+    for definition in definitions {
+        if !named.insert(definition.attribute_name.as_str()) {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Attribute Name is duplicated: {}",
+                definition.attribute_name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// AWS's fixed text for a TABLE's own primary key whose partition key and sort key are
 /// one attribute: the sentence names the two key ROLES the one attribute was given, and
 /// nothing of the attribute or of the table.
@@ -1064,6 +1107,10 @@ pub fn validated_key_schema(
         ));
     }
     let definitions = declared.attribute_definitions.to_vec();
+    // Two entries defining the same attribute state two types for one attribute of the
+    // item, which is a defect of the DECLARED list itself rather than of any schema that
+    // draws on it ([`check_distinct_definitions`]).
+    check_distinct_definitions(&definitions)?;
     if key_schema.len() > crate::state::MAX_TABLE_KEY_ELEMENTS {
         // The LIST itself is what broke a bound here — a primary key may carry one
         // partition key and at most one sort key, so a longer list is outside the length
@@ -1771,9 +1818,14 @@ pub(crate) const CAPACITY_WITH_PAY_PER_REQUEST_MESSAGE: &str =
 /// AWS's fixed text for a `PROVISIONED` table that states no `ProvisionedThroughput`:
 /// "If you set BillingMode as PROVISIONED, you must specify this property"
 /// (`CreateTable$ProvisionedThroughput`).
+///
+/// The sentence names the two CAPACITY members the block carries rather than the block
+/// itself, exactly as the on-demand half of the same rule does
+/// ([`CAPACITY_WITH_PAY_PER_REQUEST_MESSAGE`]): those are the members a `PROVISIONED` table
+/// has no setting for unless the request states them.
 pub(crate) const THROUGHPUT_WITHOUT_PROVISIONED_MESSAGE: &str =
-    "One or more parameter values were invalid: ProvisionedThroughput must be specified when \
-     BillingMode is PROVISIONED";
+    "One or more parameter values were invalid: ReadCapacityUnits and WriteCapacityUnits must \
+     both be specified when BillingMode is PROVISIONED";
 
 /// AWS's fixed text for a key schema the request declared fewer attribute definitions
 /// than it has elements for: a schema that names one attribute in two of its elements,

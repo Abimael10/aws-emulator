@@ -78,8 +78,10 @@ struct Row {
 /// The sets stated for the members below, each named where it comes from.
 /// `ReturnConsumedCapacity` (`INDEXES TOTAL NONE`), `ProjectionType` (`ALL KEYS_ONLY
 /// INCLUDE`) and `TableClass` (`STANDARD STANDARD_INFREQUENT_ACCESS`) are stated in their
-/// model-declared order (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#…")`);
-/// `StreamViewType` is stated in [`STREAM_VIEW_TYPE_SET`] and `Select` in [`SELECT_SET`].
+/// model-declared order (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#…")`) —
+/// the BOUNDARY for the rule, since an enum the service is not observed to reorder keeps the
+/// order the model declares; `StreamViewType` is stated in [`STREAM_VIEW_TYPE_SET`] and
+/// `Select` in [`SELECT_SET`].
 const CONSUMED_CAPACITY_SET: &[&str] = &["INDEXES", "TOTAL", "NONE"];
 
 /// The order DynamoDB states `Select`'s admissible set in — the SERVICE's order again: the
@@ -106,11 +108,17 @@ const TABLE_CLASS_SET: &[&str] = &["STANDARD", "STANDARD_INFREQUENT_ACCESS"];
 /// the service's refusals state them in this one.
 const EXPORT_VIEW_TYPE_SET: &[&str] = &["NEW_AND_OLD_IMAGES", "NEW_IMAGE"];
 
-/// `ExportTableToPointInTime$ExportFormat`, stated in its model-declared order
-/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ExportFormat")` gives
-/// `DYNAMODB_JSON ION`) — the boundary for the rule: an enum the service is not observed
-/// to reorder keeps the order the model declares.
-const EXPORT_FORMAT_SET: &[&str] = &["DYNAMODB_JSON", "ION"];
+/// The order DynamoDB states `ExportTableToPointInTime$ExportFormat`'s admissible set in —
+/// the SERVICE's order again: the model declares the two values as `DYNAMODB_JSON ION`
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ExportFormat")`), while the
+/// service's refusals state them in this one.
+const EXPORT_FORMAT_SET: &[&str] = &["ION", "DYNAMODB_JSON"];
+
+/// The order DynamoDB states `AttributeDefinition$AttributeType`'s admissible set in — the
+/// SERVICE's order again: the model declares the three scalar types as `S N B`
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ScalarAttributeType")`), while
+/// the service's refusals state them in this one.
+const SCALAR_ATTRIBUTE_TYPE_SET: &[&str] = &["B", "N", "S"];
 
 /// The order DynamoDB states `Condition$ComparisonOperator`'s admissible set in — the
 /// SERVICE's order again: the model declares the same thirteen values as `EQ NE IN LE LT GE
@@ -306,12 +314,42 @@ const ROWS: &[Row] = &[
         set: EXPORT_VIEW_TYPE_SET,
     },
     Row {
-        case: "an enumerated member the service states in the model's own order",
+        case: "an enumerated member the service states in an order of its own",
         operation: "ExportTableToPointInTime",
         request: || export_body(json!({"ExportFormat": "PARQUET"})),
         value: "PARQUET",
         path: "exportFormat",
         set: EXPORT_FORMAT_SET,
+    },
+    Row {
+        case: "the scalar type of a key attribute, misspelled, on a create",
+        operation: "CreateTable",
+        request: || {
+            create_body(
+                "typed",
+                json!({"AttributeDefinitions": [{"AttributeName": "Pk",
+                                                "AttributeType": "STRING"}]}),
+            )
+        },
+        value: "STRING",
+        path: "attributeDefinitions.1.member.attributeType",
+        set: SCALAR_ATTRIBUTE_TYPE_SET,
+    },
+    Row {
+        case: "the same scalar type in the wrong case, on a second definition",
+        operation: "CreateTable",
+        request: || {
+            create_body(
+                "typed-again",
+                json!({"AttributeDefinitions": [{"AttributeName": "Pk",
+                                                "AttributeType": "S"},
+                                               {"AttributeName": "Sk",
+                                                "AttributeType": "n"}]}),
+            )
+        },
+        value: "n",
+        path: "attributeDefinitions.2.member.attributeType",
+        set: SCALAR_ATTRIBUTE_TYPE_SET,
     },
     Row {
         case: "the comparator of a legacy filter entry, in the wrong case",

@@ -38,9 +38,14 @@ const _: () = assert!(
 
 /// AWS's sentence for a request that declares a stream ON a new table and names no
 /// view type to capture in: the member is required as soon as the stream is enabled.
+///
+/// Worded over what the request is doing to the table and over the view-type member AWS's
+/// refusals name (`UpdateViewType`) — the mirror image of
+/// [`STREAM_VIEW_TYPE_FORBIDDEN_ON_CREATE`], which states the other half of the same pair
+/// for a create in the same words.
 pub const STREAM_VIEW_TYPE_REQUIRED: &str =
-    "One or more parameter values were invalid: StreamViewType is required when StreamEnabled \
-     is true";
+    "One or more parameter values were invalid: Table is being created with a stream enabled, \
+     UpdateViewType is required";
 
 /// The same requirement where an EXISTING table's stream is being turned on, which is
 /// how AWS words it for a request that changes a table rather than creating one.
