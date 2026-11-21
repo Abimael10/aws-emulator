@@ -1893,10 +1893,34 @@ pub fn invalid_data_quality_run_id() -> String {
 /// the stated grammar and the minted one cannot disagree. It echoes nothing of the request,
 /// so one wording answers every value outside the grammar.
 pub fn invalid_data_quality_profile_id() -> String {
-    format!(
-        "Invalid profileId format. Valid identifiers begin with {}",
-        crate::state::DATA_QUALITY_PROFILE_ID_PREFIX
+    invalid_data_quality_identifier("profileId", crate::state::DATA_QUALITY_PROFILE_ID_PREFIX)
+}
+
+/// A `StatisticId` that is no data quality statistic id at all — one outside the grammar the
+/// service mints a statistic id with ([`super::is_data_quality_statistic_id`]) — on an
+/// operation that addresses a statistic.
+///
+/// The SAME sentence class as the profile id's above, over the other minted id of this
+/// surface: the refusal names the member that was validated and the prefix that member's
+/// identifiers begin with, so a caller is told which of the request's ids is malformed
+/// instead of a constraint on a member it sent correctly.
+pub fn invalid_data_quality_statistic_id() -> String {
+    invalid_data_quality_identifier(
+        "statisticId",
+        crate::state::DATA_QUALITY_STATISTIC_ID_PREFIX,
     )
+}
+
+/// The one sentence this surface refuses a malformed identifier with, over the member it
+/// validated and that member's identifier prefix.
+///
+/// RECORDED template: two fixed sentences, the second quoting the prefix the store MINTS that
+/// id with rather than a second spelling of it, so the stated grammar and the minted one
+/// cannot disagree. The member name is the one the request spells, so the refusal describes
+/// the constraint on the value that failed it and on no other member. It echoes nothing of the
+/// request, so one wording answers every value outside the grammar.
+fn invalid_data_quality_identifier(member: &str, prefix: &str) -> String {
+    format!("Invalid {member} format. Valid identifiers begin with {prefix}")
 }
 
 /// A machine learning transform lookup (`GetMLTransform`, `UpdateMLTransform`,

@@ -168,6 +168,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // A `StatisticId` the request states is read against the statistic id's own grammar
+        // and refused naming THAT member, exactly as the result read of the same statistic
+        // reads it: a value outside the grammar names no statistic that could ever exist, and
+        // the member it is a constraint on is the one the refusal states. Read before the
+        // profile, which is the order the input lists the two members in.
+        if let Some(statistic_id) = input.statistic_id.as_deref() {
+            if !crate::state::is_data_quality_statistic_id(statistic_id) {
+                return Err(GetDataQualityModelErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::invalid_data_quality_statistic_id()),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
         // A `ProfileId` outside the grammar the service mints one with names no profile that
         // could ever exist, so it is a malformed request rather than a miss — decided before
         // anything is looked up, as the data quality run surface decides its own id.

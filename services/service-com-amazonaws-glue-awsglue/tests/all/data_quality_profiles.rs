@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     messages, ComAmazonawsGlueAwsglueState, DATA_QUALITY_MODEL_STATUS_RUNNING,
     DATA_QUALITY_MODEL_STATUS_SUCCEEDED, DATA_QUALITY_PROFILE_ID_PREFIX,
+    DATA_QUALITY_STATISTIC_ID_PREFIX,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -618,7 +619,10 @@ async fn a_profile_id_no_run_minted_is_the_modelled_miss() {
 
 /// A `StatisticId` the addressed profile holds no datapoint of resolves to no model result
 /// either: the rows span an id nothing minted, the id of a statistic of ANOTHER dataset, and
-/// the profile's own id offered as a statistic id.
+/// the profile's own id spelled as a statistic id.
+///
+/// Every row is INSIDE the statistic id grammar, because a value outside it is the malformed
+/// request of `tests/all/data_quality_identifier_grammar.rs` rather than this miss.
 #[tokio::test]
 async fn a_statistic_the_profile_does_not_hold_is_the_modelled_miss() {
     let (router, engine) = emulator_with_s3();
@@ -644,7 +648,11 @@ async fn a_statistic_the_profile_does_not_hold_is_the_modelled_miss() {
             &schema_only,
             other_statistic.clone(),
         ),
-        ("the profile's own id", &other, other.clone()),
+        (
+            "the profile's own id spelled as a statistic id",
+            &other,
+            format!("{DATA_QUALITY_STATISTIC_ID_PREFIX}{other}"),
+        ),
     ] {
         for operation in ["GetDataQualityModel", "GetDataQualityModelResult"] {
             let (status, answer) = call(

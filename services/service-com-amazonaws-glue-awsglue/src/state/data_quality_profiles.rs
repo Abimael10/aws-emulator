@@ -78,6 +78,21 @@ pub(super) static MINTED_DATA_QUALITY_STATISTIC_IDS: AtomicU64 = AtomicU64::new(
 /// The prefix a `StatisticId` carries, as the service spells one.
 pub const DATA_QUALITY_STATISTIC_ID_PREFIX: &str = "st-";
 
+/// Whether `statistic_id` has the grammar a data quality statistic id has
+/// ([`DATA_QUALITY_STATISTIC_ID_PREFIX`]).
+///
+/// The same question [`is_data_quality_profile_id`] asks of the profile id, asked of the OTHER
+/// minted id this surface addresses things by: a value outside the grammar names no statistic
+/// that could ever exist, so it is a malformed request
+/// ([`messages::invalid_data_quality_statistic_id`]) rather than a miss, and it is the
+/// STATISTIC that is reported malformed — never the other id of the same request. One prefix,
+/// read by the mint ([`new_data_quality_statistic_id`]) and by every read, so a minted id can
+/// never be one the reads reject.
+#[must_use]
+pub fn is_data_quality_statistic_id(statistic_id: &str) -> bool {
+    statistic_id.starts_with(DATA_QUALITY_STATISTIC_ID_PREFIX)
+}
+
 /// A fresh `StatisticId`: the id the service assigns ONE measurement of one dataset the first
 /// time a run measures it.
 ///

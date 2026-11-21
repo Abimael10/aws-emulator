@@ -168,6 +168,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // Each of the two `@required` ids is read against ITS OWN grammar and refused naming
+        // the member that failed, so a caller is never told about a constraint on the member
+        // it sent correctly. The `StatisticId` is read first because the model this call
+        // reports is the STATISTIC's — that id is this read's address, and the `ProfileId` is
+        // the datapoint's — which is the order the input lists the two members in.
+        if !crate::state::is_data_quality_statistic_id(&input.statistic_id) {
+            return Err(
+                GetDataQualityModelResultErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::invalid_data_quality_statistic_id()),
+                        from_federation_source: None,
+                    },
+                )
+                .into(),
+            );
+        }
         // A `ProfileId` outside the grammar the service mints one with names no profile that
         // could ever exist, so it is a malformed request rather than a miss — the same
         // reading the status read above takes of that member.
