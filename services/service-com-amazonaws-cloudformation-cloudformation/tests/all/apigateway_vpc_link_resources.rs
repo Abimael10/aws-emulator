@@ -70,7 +70,11 @@ const REMOVAL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// One SUBNET of this account, created through Amazon EC2's own API: a load balancer is
 /// placed in subnets Elastic Load Balancing resolves against that service, so the ones the
 /// load balancers below are attached to are real.
-async fn subnet(router: &MultiServiceRouter) -> String {
+///
+/// `pub(crate)` because another suite needs a target a VPC link CAN be provisioned over too
+/// (`apigateway_vpc_link_failed_stabilisation_reason.rs`): the network a real load balancer
+/// stands in is set up once here.
+pub(crate) async fn subnet(router: &MultiServiceRouter) -> String {
     let (status, body) = ec2(router, "CreateVpc", &[("CidrBlock", "10.91.0.0/16")]).await;
     assert_eq!(
         status, 200,
@@ -94,7 +98,10 @@ async fn subnet(router: &MultiServiceRouter) -> String {
 /// `CreateLoadBalancer` over the same router, answering the ARN that service assigned it —
 /// which is what `VpcLink$targetArns` names, "the ARN of the network load balancer of the VPC
 /// targeted by the VPC link", and what API Gateway resolves a link's targets against.
-async fn network_load_balancer(
+///
+/// `pub(crate)` beside [`subnet`], and for the same reason: a suite asserting what a link whose
+/// targets are only PARTLY resolvable reports needs a target that really resolves.
+pub(crate) async fn network_load_balancer(
     router: &MultiServiceRouter,
     subnet_id: &str,
     name: &str,
