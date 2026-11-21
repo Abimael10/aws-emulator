@@ -24,7 +24,7 @@
 //! owed on). [`StoredTrustStore::settle`] applies it, and nothing ever sleeps for it.
 
 use super::*;
-use crate::ops::types::{CaCertificatesBundleSource, TrustStore};
+use crate::ops::types::{CaCertificatesBundleSource, TrustStore, TrustStoreSummary};
 
 /// The prefix every trust store id this service mints carries.
 ///
@@ -36,6 +36,24 @@ use crate::ops::types::{CaCertificatesBundleSource, TrustStore};
 /// group's ([`CONNECTION_GROUP_ID_PREFIX`]) do. The model states no id pattern, so the
 /// prefix is this emulator's choice.
 pub const TRUST_STORE_ID_PREFIX: &str = "ts_";
+
+/// Whether `value` has the shape of a trust store id this service MINTS
+/// ([`TRUST_STORE_ID_PREFIX`] followed by a token body, [`is_token_body`]).
+///
+/// `ListTrustStores`'s `Marker` is where a previous page of trust stores ended, which is a
+/// value this service handed out, and the model constrains it no further than `string` — so
+/// this is what tells a resume point the service issued from a value a client made up, as
+/// [`is_connection_group_id`] tells one for the neighbouring listing.
+///
+/// NOT what an operation that ADDRESSES a trust store reads its `Identifier` with: an
+/// identifier resolves an id, a name or an ARN ([`ComAmazonawsCloudfrontCloudfront20200531State::trust_store`]),
+/// so refusing one on this shape would answer an argument failure for a trust store that is
+/// merely absent.
+pub fn is_trust_store_id(value: &str) -> bool {
+    value
+        .strip_prefix(TRUST_STORE_ID_PREFIX)
+        .is_some_and(is_token_body)
+}
 
 /// `TrustStore$Status` while the trust store's CA certificates bundle is still propagating
 /// to the edge locations (`smithy_query(query="shape",shape="TrustStoreStatus")`, whose
@@ -251,6 +269,27 @@ impl StoredTrustStore {
             use_client_certificate_ocsp_endpoint: Some(self.use_client_certificate_ocsp_endpoint),
         }
     }
+
+    /// The `TrustStoreSummary` a listing of trust stores reports this record as.
+    ///
+    /// Read from the very fields [`Self::to_trust_store`] projects, plus the stored version
+    /// token the summary carries of its own (`TrustStoreSummary$ETag`, "The version
+    /// identifier for the current version of the trust store") — so a listing and a
+    /// `GetTrustStore` can never disagree about one trust store, down to the token an
+    /// `If-Match` against it is checked against. `Reason` is absent for the reason it is
+    /// absent from the full projection.
+    pub fn to_summary(&self) -> TrustStoreSummary {
+        TrustStoreSummary {
+            id: self.id.clone(),
+            arn: self.arn.clone(),
+            name: self.name.clone(),
+            status: self.status.clone(),
+            number_of_ca_certificates: self.number_of_ca_certificates,
+            last_modified_time: ::aws_smithy_types::DateTime::from(self.last_modified_time),
+            reason: None,
+            e_tag: self.etag.clone(),
+        }
+    }
 }
 
 impl ComAmazonawsCloudfrontCloudfront20200531State {
@@ -301,6 +340,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .values()
             .find(|stored| references_trust_store(&stored.config, id))
             .map(|stored| stored.id.as_str())
+    }
+
+    /// Whether the store holds a trust store under exactly the ID `id` — what tells a
+    /// `Marker` this service handed out from one shaped like an id that names no trust
+    /// store, which is a resume point that resumes nothing rather than a bad argument.
+    ///
+    /// By KEY rather than through [`Self::trust_store`]: a resume point is the id the
+    /// previous page ended at, never a name or an ARN.
+    pub fn holds_trust_store(&self, id: &str) -> bool {
+        self.trust_stores.contains_key(id)
     }
 
     /// Whether the account already holds a trust store called `name` — what makes a

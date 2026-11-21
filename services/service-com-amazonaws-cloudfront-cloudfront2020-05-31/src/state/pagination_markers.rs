@@ -59,6 +59,10 @@ pub const ORIGIN_REQUEST_POLICY_MARKER_KIND: &str = "CF origin request policy Id
 /// The kind a CONTINUOUS DEPLOYMENT POLICY listing's marker names.
 pub const CONTINUOUS_DEPLOYMENT_POLICY_MARKER_KIND: &str = "CF continuous deployment policy Id";
 
+/// The kind a TRUST STORE listing's marker names, worded as the sibling listings of the
+/// namespace-prefixed resource kinds word theirs ([`CONNECTION_GROUP_MARKER_KIND`]).
+pub const TRUST_STORE_MARKER_KIND: &str = "CF trust store Id";
+
 /// The sentence this service refuses a `Marker` that is no resume point with, for a listing
 /// whose marker names `kind`.
 ///
