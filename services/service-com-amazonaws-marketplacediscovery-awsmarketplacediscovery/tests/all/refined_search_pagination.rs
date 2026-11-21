@@ -97,7 +97,10 @@ async fn search(
 
 /// One facet type's values over the whole catalog, as `(value, count)` pairs, most listings
 /// first — the refinements `SearchFacets` offers a client.
-async fn facet_values(router: &MultiServiceRouter, facet_type: &str) -> Vec<(String, u64)> {
+pub(crate) async fn facet_values(
+    router: &MultiServiceRouter,
+    facet_type: &str,
+) -> Vec<(String, u64)> {
     let body = ok(
         router,
         "searchFacets",

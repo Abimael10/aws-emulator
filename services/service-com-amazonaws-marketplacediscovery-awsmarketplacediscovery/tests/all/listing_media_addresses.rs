@@ -44,7 +44,7 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// at, plus the base of an emulator served on no port at all (embedded in another process, or
 /// a test). One row each, because an address a record publishes has to follow whichever one the
 /// request that read it reached this emulator at.
-const ENDPOINT_BASES: [&str; 4] = [
+pub(crate) const ENDPOINT_BASES: [&str; 4] = [
     "https://127.0.0.1:9297",
     "https://localhost:39355",
     "https://[::1]:8443",
@@ -54,11 +54,12 @@ const ENDPOINT_BASES: [&str; 4] = [
 /// Hosts this emulator does not answer on: the zones AWS publishes its own endpoints in, and
 /// the domain reserved for documentation examples. A published address may name none of them,
 /// because nothing serves a fetch of one.
-const UNSERVED_HOSTS: [&str; 4] = ["example.com", ".amazonaws.com", ".api.aws", ".on.aws"];
+pub(crate) const UNSERVED_HOSTS: [&str; 4] =
+    ["example.com", ".amazonaws.com", ".api.aws", ".on.aws"];
 
 /// The first eight bytes of every PNG file (the PNG signature), which is what the logo address
 /// has to serve for a client that renders the image to get one.
-const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+pub(crate) const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// How many listings the per-record round trips below are run over.
 ///
@@ -79,7 +80,7 @@ fn router() -> MultiServiceRouter {
 
 /// A router whose `OperationContext::endpoint` is `base`, which is the address the media a
 /// record publishes has to be announced on.
-fn router_served_at(base: &str) -> MultiServiceRouter {
+pub(crate) fn router_served_at(base: &str) -> MultiServiceRouter {
     let mut router = router();
     router.set_url_base(
         smithy_server_runtime::EndpointUrl::parse(base).expect("a base URL the router accepts"),
@@ -132,22 +133,22 @@ fn text(value: &Value, member: &str) -> String {
 }
 
 /// One document a client FETCHES: the status, the content type and the bytes.
-struct Fetched {
-    status: u16,
-    content_type: String,
-    body: Vec<u8>,
+pub(crate) struct Fetched {
+    pub(crate) status: u16,
+    pub(crate) content_type: String,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Fetched {
     /// The document as text, for a page.
-    fn as_text(&self) -> String {
+    pub(crate) fn as_text(&self) -> String {
         String::from_utf8_lossy(&self.body).into_owned()
     }
 }
 
 /// Fetch `url` the way a browser holding a published address does: no credential and no target
 /// header, just the address the record announced.
-async fn fetch(router: &MultiServiceRouter, method: &str, url: &str) -> Fetched {
+pub(crate) async fn fetch(router: &MultiServiceRouter, method: &str, url: &str) -> Fetched {
     let (host, path) = split_url(url);
     let request = http::Request::builder()
         .method(method)
@@ -209,7 +210,7 @@ async fn catalog_page(router: &MultiServiceRouter) -> Vec<Value> {
 
 /// The one review source summary of a listing's review summary, with the `sourceUrl` it
 /// carries, if any.
-fn review_source(body: &Value) -> Option<(Value, Option<String>)> {
+pub(crate) fn review_source(body: &Value) -> Option<(Value, Option<String>)> {
     let summary = body.get("reviewSummary")?;
     let sources = array(summary, "reviewSourceSummaries");
     let source = sources.first()?.clone();
