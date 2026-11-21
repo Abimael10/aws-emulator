@@ -196,6 +196,11 @@ pub struct GuestMachine {
     /// ([`GuestIdentity`]); a guest reached with none published for it publishes no role,
     /// rather than a name nothing resolved.
     pub instance_profile: Option<GuestInstanceProfile>,
+    /// The BLOCK DEVICES this machine's guest sees: one per volume attached to the instance,
+    /// under the name the kernel inside it gives that volume
+    /// ([`super::guest_block_devices`]). Empty for a machine with nothing attached, which is a
+    /// guest with no device to list.
+    pub block_devices: Vec<super::guest_block_devices::GuestBlockDevice>,
 }
 
 /// The IAM instance profile one machine runs as, as its guest's metadata service publishes
@@ -257,6 +262,11 @@ impl GuestMachine {
     }
 }
 
+/// One attachment of an instance, as the ORDER of its guest's devices is read off it: when the
+/// volume was attached, the device the attachment names and the volume on it
+/// ([`ComAmazonawsEc2Amazonec2State::guest_block_devices`]).
+type AttachedDevice = (Option<(i64, u32)>, String, String);
+
 impl ComAmazonawsEc2Amazonec2State {
     /// What the guest of `instance` knows about the machine it runs on — every value read
     /// off the stored instance, the account's image catalog and the published instance-type
@@ -310,7 +320,85 @@ impl ComAmazonawsEc2Amazonec2State {
                     role_name: None,
                     role_credentials: None,
                 }),
+            // The volumes attached to this instance, as its guest's kernel presents them: read
+            // off the one record of an attachment this store holds, so the guest's own `lsblk`
+            // and `DescribeVolumes` cannot disagree about what it holds.
+            block_devices: self.guest_block_devices(instance, ::std::time::Instant::now()),
         }
+    }
+
+    /// The BLOCK DEVICES the guest of `instance` sees at `now`: one per EBS volume whose
+    /// attachment to it the clock has made `attached`, the device carrying the root filesystem
+    /// first and the rest in the order they were ATTACHED — which is the order the names the
+    /// guest's kernel gives them are allocated in.
+    ///
+    /// Read off [`Self::instance_block_device_mappings`] — the one reading of which volumes an
+    /// instance holds — and the volume store's own size for each of them, so nothing here is a
+    /// second notion of the machine's storage. A volume whose attachment is still `attaching`
+    /// is not a device of the guest yet, and neither is one whose record this store no longer
+    /// holds.
+    pub fn guest_block_devices(
+        &self,
+        instance: &InstanceRecord,
+        now: ::std::time::Instant,
+    ) -> Vec<super::guest_block_devices::GuestBlockDevice> {
+        let root_device_name = self
+            .launched_root_device(instance.image_id.as_deref())
+            .map(|(device, _ebs)| device);
+        // Which NAMES the guest's kernel gives its devices is the instance type's own
+        // question ([`super::guest_block_devices::guest_device_node`]).
+        let nitro = super::instance_type_record(&instance.instance_type)
+            .is_some_and(|record| record.nitro);
+        let mut attached: Vec<AttachedDevice> = Vec::new();
+        for mapping in self.instance_block_device_mappings(&instance.instance_id, now) {
+            let Some(ebs) = mapping.ebs else {
+                continue;
+            };
+            if ebs.status.as_deref() != Some(super::VOLUME_ATTACHMENT_STATE_ATTACHED) {
+                continue;
+            }
+            let (Some(device_name), Some(volume_id)) = (mapping.device_name, ebs.volume_id) else {
+                continue;
+            };
+            // WHEN the volume was attached, which is the order the machine's kernel enumerates
+            // its devices in ([`super::guest_block_devices::guest_device_node`]), read off the
+            // attachment's own `AttachTime`.
+            let attached_at = ebs
+                .attach_time
+                .map(|instant| (instant.secs(), instant.subsec_nanos()));
+            attached.push((attached_at, device_name, volume_id));
+        }
+        // The device carrying the root filesystem is the machine's FIRST device — the root
+        // volume is attached by the launch, before anything else can be — and the rest follow in
+        // the order they were ATTACHED, which is the order their names are allocated in, with
+        // the device the attachment names breaking a tie.
+        attached.sort_by_key(|(attached_at, device_name, _)| {
+            let root = root_device_name
+                .as_deref()
+                .is_some_and(|root| root == device_name);
+            (!root, *attached_at, device_name.clone())
+        });
+        attached
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, (_attached_at, device_name, volume_id))| {
+                let size_gib = self.volumes.get(&volume_id)?.view.size?;
+                let node =
+                    super::guest_block_devices::guest_device_node(&device_name, index, nitro);
+                Some(super::guest_block_devices::GuestBlockDevice {
+                    major_minor: super::guest_block_devices::guest_device_numbers(
+                        &node, index, nitro,
+                    ),
+                    node,
+                    root: root_device_name
+                        .as_deref()
+                        .is_some_and(|root| root == device_name),
+                    device_name,
+                    volume_id,
+                    size_gib,
+                })
+            })
+            .collect()
     }
 
     /// The kernel release a guest launched from `image_id` runs.
@@ -828,8 +916,10 @@ fn directories_above(path: &str) -> Vec<String> {
 /// boot's own identity, the machine's identity, its host name, the command line it was booted
 /// with, the instance id cloud-init published to it — and, for a machine whose CPU layout this
 /// emulator knows, everything the kernel publishes about its processors
-/// ([`super::guest_cpu::published_cpu_files`]). A machine with no known layout gets none of
-/// the latter rather than a layout nothing derived.
+/// ([`super::guest_cpu::published_cpu_files`]), beside what it publishes about each of the
+/// machine's block devices ([`super::guest_block_devices::published_block_device_files`]). A
+/// machine with no known layout gets none of the former rather than a layout nothing derived,
+/// and one with nothing attached none of the latter.
 ///
 /// The ONE listing of that seed, so every program a guest runs reads the same published
 /// values and the budget above is computed from exactly what is seeded.
@@ -856,6 +946,11 @@ fn guest_published_files(machine: &GuestMachine, boot_id: &str) -> Vec<(String, 
     if let Some(cpu) = machine.cpu {
         published.extend(super::guest_cpu::published_cpu_files(cpu));
     }
+    // What the kernel publishes about this machine's block devices, for a guest that has any
+    // ([`super::guest_block_devices`]).
+    published.extend(super::guest_block_devices::published_block_device_files(
+        &machine.block_devices,
+    ));
     published
 }
 
@@ -912,6 +1007,16 @@ mod tests {
             // A machine that runs as no instance profile, which is what a launch that names
             // none stores.
             instance_profile: None,
+            // The root volume the machine booted from, as its guest's kernel presents it on a
+            // machine of this type.
+            block_devices: vec![super::super::guest_block_devices::GuestBlockDevice {
+                node: "nvme0n1".to_string(),
+                device_name: "/dev/xvda".to_string(),
+                volume_id: "vol-0123456789abcdef0".to_string(),
+                size_gib: 8,
+                root: true,
+                major_minor: (259, 0),
+            }],
         }
     }
 

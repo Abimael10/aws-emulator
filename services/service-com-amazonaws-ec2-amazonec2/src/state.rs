@@ -2756,6 +2756,12 @@ pub use instance_role_credentials::*;
 pub mod guest_cpu;
 pub use guest_cpu::*;
 
+/// What one instance's GUEST sees of its own BLOCK DEVICES: the volumes attached to it, under
+/// the names the kernel inside it gives them, and the program it lists them with. A SUBMODULE
+/// for the same reason [`image_usage_reports`] is one.
+pub mod guest_block_devices;
+pub use guest_block_devices::*;
+
 /// The SERVICES one instance's guest runs — the web server its own program installed and
 /// started — and what such a server answers for a request to the port it listens on. A
 /// SUBMODULE for the same reason [`image_usage_reports`] is one.

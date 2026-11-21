@@ -342,6 +342,7 @@ mod tests {
             metadata_endpoint_enabled: true,
             metadata_token_required: false,
             instance_profile: None,
+            block_devices: Vec::new(),
         }
     }
 

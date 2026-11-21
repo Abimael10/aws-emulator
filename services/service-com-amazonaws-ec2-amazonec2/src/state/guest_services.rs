@@ -549,8 +549,9 @@ impl GuestServices {
 }
 
 /// The programs the GUEST of `machine` has installed in it: the metadata client
-/// ([`super::guest_metadata`]) and the programs that install, start and run its services,
-/// which change `services`.
+/// ([`super::guest_metadata`]), the programs that install, start and run its services, which
+/// change `services`, the ones that report its CPU layout ([`super::guest_cpu`]) and the one
+/// that lists its block devices ([`super::guest_block_devices`]).
 ///
 /// The ONE construction of them, so the boot's own user-data program and a command something
 /// later sends the guest have the same programs over the same machine.
@@ -566,8 +567,14 @@ pub fn installed_programs(
     // The programs that report the machine's own CPU layout ([`super::guest_cpu`]), for a
     // machine whose layout this emulator knows: asked AFTER the programs above, so nothing
     // here can shadow one of them.
-    match super::guest_cpu::cpu_programs(machine) {
+    let own = match super::guest_cpu::cpu_programs(machine) {
         Some(cpu) => ::service_common::posix_shell_session::layered(own, cpu),
+        None => own,
+    };
+    // ... and the one that lists its block devices ([`super::guest_block_devices`]), for a
+    // machine with any attached, asked after both for the same reason.
+    match super::guest_block_devices::block_device_programs(machine) {
+        Some(devices) => ::service_common::posix_shell_session::layered(own, devices),
         None => own,
     }
 }

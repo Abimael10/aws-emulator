@@ -61,3 +61,14 @@ Cause 4: `Error: Check timed out after 60.0s` for both ec2.delete-on-termination
 
 ## Steps to Reproduce
 Replay the behavioral suite and re-run the twelve checks listed in trace_ids. Minimal repro per cause: (1) RunInstances with the AL2023 AMI and an instance profile holding arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore, then poll ssm DescribeInstanceInformation for PingStatus=='Online' and call ssm SendCommand against the instance id; (2) RunInstances with UserData that echoes a marker to the console, then poll ec2 GetConsoleOutput for the marker; (3) RunInstances into a subnet with MapPublicIpOnLaunch=true and poll DescribeInstances for PublicIpAddress; (4) attach two volumes with DeleteOnTermination true/false, TerminateInstances, then DescribeVolumes/CreateSnapshot on each, and separately ModifyVolume a gp3 volume to size*500+1 IOPS and then to a legal target.
+
+## What was done, and what each remaining key now waits on
+Cause 1 is served: an instance launched with the SSM core policy registers as a managed node, so DescribeInstanceInformation reports it `Online` and SendCommand is accepted. Cause 3's assignment is served: an instance in a public subnet is reported with a public IPv4 address and its public DNS name. Cause 4's terminate half is served: a terminate honours each attachment's DeleteOnTermination. Cause 2's channel is served: GetConsoleOutput carries exactly what the guest's own program wrote, and a guest now also SEES the volumes attached to its instance as block devices (`lsblk`, `/sys/block/<device>/size`), which is where every one of the remaining checks starts.
+
+Three NET-NEW capabilities are still missing, and each remaining trace waits on one of them:
+
+* a VOLUME DATA PLANE the guest can write and read — bytes written through a block device, held by the volume, measured by a snapshot of it: `ec2.ebsio-online-volume-grow-…`, `ec2.ebsio-multi-attach-…`, `ec2.ec2-attach-volume-to-a-device-name-already-in-use-rejected` (its nonce round-trip), `ec2.dsnapinc-…`, `ec2.dvolgrow-shrink-…`;
+* `awk`, performed from a maintained parser of that language rather than hand-written, which the guest scripts of `ec2.diops-gp3-…`, `ec2.dsnapinc-…` and `ec2.dvolgrow-shrink-…` pipe `lsblk` into;
+* a DIALABLE per-instance address — a core listener for the server a guest runs, published as the address the control plane reports — for `ec2.ec2-elastic-ip-association-moves-which-address-serves-the-instance`, whose check opens a socket to the instance's public address.
+
+`ec2.idvdoc-document-reminted-and-resigned-after-a-stop-start` and `ec2.placement-cluster-group-members-…` read the instance's own identity inside the guest and are the remaining guest-side readings beside those three.
