@@ -14,40 +14,53 @@
 //! owes — has to be materialised and published by this service itself.
 //!
 //! The operations that REPORT a stack's progress materialise exactly that work
-//! ([`super::provisioning::advance_stabilisations_in`]), because they are handlers and a handler
-//! is the one place an in-process call to another service can be made from. This module is how
-//! the part of it that needs NO such call happens with nobody reading: the call that STARTS a
-//! stack operation hands the stack over here, and a task of this service's own materialises what
-//! the clock has made due ([`super::ComAmazonawsCloudformationCloudformationState::settle`]) and
-//! publishes what that owes, pass after pass, until the stack has settled.
+//! ([`super::provisioning::advance_stabilisations_in`]). This module is how the same thing
+//! happens with NOBODY reading: the call that STARTS a stack operation hands the stack over
+//! here, and a task of this service's own materialises what the clock has made due
+//! ([`super::ComAmazonawsCloudformationCloudformationState::settle`]) and publishes what that
+//! owes, pass after pass, until the stack has settled.
 //!
-//! A pass asks no other service anything, and that is deliberate. The deeper work a reporting
-//! operation does — asking the service that owns a resource whether it has it ready, performing
-//! the removal or the revert a failure owes those services — is TAKEN from this store under its
-//! lock for the caller that is about to make those calls, and the stack's own terminal status
+//! A pass does the WHOLE of what it can of that work, the readiness questions another service
+//! answers included: how far a deployment has got is never the READER's doing. A resource whose
+//! owning service accepted the create without reporting it ready holds its stack's operation
+//! open, and only that service's own answer ends the wait — so each pass asks it, exactly as a
+//! reporting operation does. Were that left to the handlers a client calls, a deployment would
+//! advance one step per read and a stack with a chain of dependencies would settle only for a
+//! client that polls it often enough — which is the reader deciding when the deployment finishes.
+//!
+//! What a pass does NOT do is the work that is CLAIMED from this store before it is carried out:
+//! the rollback a failure owes the services that own the stack's resources is taken under the
+//! store's lock for the caller that is about to make those calls, and the stack's terminal status
 //! stays held back until that caller has reported what they answered
-//! ([`super::ComAmazonawsCloudformationCloudformationState::take_due_rollbacks`]). Only a
-//! handler can be relied on to get that far, because the request it serves is what drives it to
-//! completion; work taken by a task could be held by a task nothing drives. So a stack waiting
-//! for an answer from another service is left to the handlers a client calls and to the plane
-//! such an answer arrives at ([`super::provider_driver`]), and a pass that finds one waiting does
-//! nothing at all ([`carries_an_open_wait`]).
+//! ([`super::ComAmazonawsCloudformationCloudformationState::take_due_rollbacks`]). A task that is
+//! cut short between the claim and the answer would hold that work for good, and a detached task
+//! can be cut short — a host that drives this emulator in process drops the runtime its request
+//! ran on. So that half stays with the handlers a client calls
+//! ([`super::settle_due_rollbacks`]), and the asymmetry is deliberate rather than tidy: a FAILED
+//! deployment nobody reads waits for a reader to carry its rollback out, which
+//! `core/router/tests/all/cfn_redeploy_reaches_a_terminal_status.rs` pins. Everything a pass here
+//! does leaves the store ready for the next pass to do it again, so being cut short costs it
+//! nothing. The task a landed provider answer starts drives this same advance — and, because the
+//! answer it carries IS the claim it was started for, the rollback half as well
+//! ([`super::provider_driver::drive_landed_answer`]).
 //!
 //! Nothing here decides an outcome. Each pass materialises what the CLOCK had already made due
 //! at the instant it runs — the same thing a reporting operation materialises, and nothing a
 //! reporting operation would not — so a client reading the stack afterwards sees exactly what
-//! it would have seen had it done the reading itself.
+//! it would have seen had it done the reading itself, and a client that never reads it at all
+//! leaves it in the same place.
 //!
 //! ## Bounds
 //!
 //! One task per started operation, which STOPS as soon as the stack carries a status no longer
-//! in flight and owes the bus nothing — one or two passes for the ordinary deployment. A stack
-//! whose progress waits on something further out (a wait condition's own timeout, a provider
-//! that has not answered) is looked at again on a widening interval ([`pass_interval`]) for at
-//! most [`MAX_PASSES`] passes, and then left to the next read of it; and the tasks this service
-//! has outstanding at once are capped ([`super::stack_set_events::TaskSlot`], the same ceiling
-//! every other event task of this service takes its slot from), so a stream of stack
-//! operations cannot leave unbounded work behind.
+//! in flight and owes the bus nothing — a pass per level of the stack's own dependency chain for
+//! the ordinary deployment. A stack whose progress waits on something further out (a wait
+//! condition's own timeout, a provider that has not answered) is looked at again on a widening
+//! interval ([`pass_interval`]) for at most [`MAX_PASSES`] passes, and then left to the next read
+//! of it; and the tasks this service has outstanding at once are capped
+//! ([`super::stack_set_events::TaskSlot`], the same ceiling every other event task of this
+//! service takes its slot from), so a stream of stack operations cannot leave unbounded work
+//! behind.
 
 use ::std::sync::Arc;
 use ::std::time::Duration;
@@ -169,14 +182,15 @@ fn drive<Eng: Send + Sync + 'static>(
             // emulator's own credentials exactly as a handler's are.
             let parts = ::http::Request::new(()).into_parts().0;
             let ctx = OperationContext::new(&parts, reach.identity(), reach.callback().clone());
-            if carries_an_open_wait(&state, &region, target.as_deref()) {
-                // The stack is waiting for an answer from another service, and carrying such a
-                // stack is not this task's: the work that answers it is taken from this store
-                // for the caller that makes those calls, which is a handler. So this pass does
-                // nothing at all and the next one looks again, by which time a client's own
-                // read, or the plane a provider answers at, may have released it.
-                continue;
-            }
+            // The waits the stack's resources are held at: the owning services are asked whether
+            // they have them ready, and the answers are recorded — the work a reporting operation
+            // does, done here because a deployment's progress is this emulator's and not its
+            // reader's. Nothing of it is CLAIMED from the store before it is carried out, so a
+            // pass that is cut short leaves the work for the next one. The rollback a failure owes
+            // those services is NOT driven here for that very reason: it is taken from the store
+            // for the caller that performs it, so it belongs to a handler
+            // ([`super::settle_due_rollbacks`]).
+            super::provisioning::advance_stabilisations_in(&ctx, &state, &region).await;
             // What the clock owes the stack, and the two fan-outs each transition it recorded
             // owes: the notifications the stack's `NotificationARNs` are owed
             // ([`super::stack_notifications`]) and the status-change events the account's
@@ -188,40 +202,22 @@ fn drive<Eng: Send + Sync + 'static>(
                 return;
             }
         }
+        // The window is over and the operation is still in flight: this task carries it no
+        // further, exactly as a task that could claim no slot does not start, so the hand-off is
+        // reported the same way — what is left is materialised by the next read of the stack.
+        //
+        // Both values are recorded as DEBUG rather than as display text, so the identifier a
+        // request chose is quoted and escaped in the record instead of being written into it
+        // verbatim; the stack field is left off altogether for the Region-wide carrier, which
+        // names no one stack.
+        ::tracing::warn!(
+            region = ?region,
+            stack = ?target,
+            passes = MAX_PASSES,
+            "this stack operation was still in flight after the window this service carries one \
+             for; its remaining transitions will be materialised by the next read of it"
+        );
     });
-}
-
-/// Whether a stack this task is carrying is waiting for an answer from another service: one of
-/// its resources is held for the service that owns it to report ([`super::stabilising`]), or one
-/// of them is short of the success signals its declaration asks for
-/// ([`super::wait_conditions`]).
-///
-/// Both are answered by work that is TAKEN from this store for the caller that performs it — the
-/// readiness calls, and the removal or revert the failure of an expired wait owes the services
-/// that own the stack's resources — so both belong to a handler and not to a task. A pass that
-/// finds one open therefore leaves the stack to the client's own reads and to the plane a
-/// provider's answer arrives at ([`super::provider_driver`]), and looks again later.
-fn carries_an_open_wait(
-    state: &::engine::ServiceState<super::ComAmazonawsCloudformationCloudformationState>,
-    region: &str,
-    target: Option<&str>,
-) -> bool {
-    let store = state.lock();
-    let waiting = |stack: &super::StoredStack| {
-        !stack.open_stabilisations().is_empty()
-            || stack
-                .wait_conditions
-                .iter()
-                .any(|barrier| !stack.barrier_satisfied(barrier))
-    };
-    match target {
-        Some(stack_id) => store.resolve_any(region, stack_id).is_some_and(waiting),
-        None => store
-            .stacks
-            .iter()
-            .filter(|stack| stack.region == region)
-            .any(waiting),
-    }
 }
 
 /// Whether the stacks this task is carrying have nothing left for it: no operation of theirs is
