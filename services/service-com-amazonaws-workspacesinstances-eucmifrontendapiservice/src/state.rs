@@ -1403,13 +1403,24 @@ impl VolumeTypeSpec {
     /// resolved target for a modification, whose unnamed members are retained or
     /// defaulted.
     ///
+    /// `outside_window` renders the ONE refusal whose wording is the CALLING
+    /// operation's rather than this rule's: a provisioned-performance value outside the
+    /// window the type publishes is a value the backing Amazon EBS volume service
+    /// itself refuses, and this service surfaces that refusal wrapped in the sentence
+    /// for the call it was made for ([`performance_refused_by_backing_service`] for a
+    /// create), so the two operations state one rule in each one's own voice. Pass
+    /// [`performance_outside_published_window`] to state the member constraint instead.
+    ///
     /// Returns the modelled `ValidationException` naming the ONE member the request is
-    /// refused for, echoing no submitted value ([`field_validation_failed`]).
+    /// refused for, echoing no submitted value ([`field_validation_failed`]) except in
+    /// the refusal `outside_window` renders, which reports the value the backing service
+    /// rejected.
     pub fn require_accepted_configuration(
         &self,
         size: Option<i32>,
         iops: VolumeMemberValue,
         throughput: VolumeMemberValue,
+        outside_window: impl Fn(OutOfWindow<'_>) -> ValidationException,
     ) -> Result<(), ValidationException> {
         let volume_type = self.volume_type;
 
@@ -1426,20 +1437,23 @@ impl VolumeTypeSpec {
             }
         }
 
+        // A value outside the window the type publishes is a value the BACKING Amazon
+        // EBS volume service refuses, so the caller renders it: checked first for each
+        // member, which changes nothing — a type that publishes no window takes no
+        // value for the member at all, which is the refusal below.
+        if let Some(window) = self.iops {
+            if let Some(out) = iops.outside(IOPS_MEMBER, None, volume_type, window) {
+                return Err(outside_window(out));
+            }
+        }
         match (iops.named, self.iops) {
             (Some(_), None) => {
                 return Err(field_validation_failed(
-                    "Iops",
+                    IOPS_MEMBER,
                     format!(
                         "Iops must be omitted for a {volume_type} volume, which does not \
                          provision IOPS"
                     ),
-                ));
-            }
-            (_, Some((min, max))) if iops.resulting.is_some_and(|iops| iops < min || iops > max) => {
-                return Err(field_validation_failed(
-                    "Iops",
-                    format!("Iops must be from {min} to {max} for a {volume_type} volume"),
                 ));
             }
             // A type that requires IOPS must end up with some: a create names them,
@@ -1448,40 +1462,110 @@ impl VolumeTypeSpec {
             // where neither is available.
             (None, _) if self.iops_required && iops.resulting.is_none() => {
                 return Err(field_validation_failed(
-                    "Iops",
+                    IOPS_MEMBER,
                     format!("Iops is required for a {volume_type} volume"),
                 ));
             }
-            (_, Some(_)) | (None, None) => {}
+            (Some(_), Some(_)) | (None, _) => {}
         }
 
-        match (throughput.named, self.throughput_mib) {
-            (Some(_), None) => {
-                return Err(field_validation_failed(
-                    "Throughput",
-                    format!(
-                        "Throughput must be omitted for a {volume_type} volume, whose \
-                         throughput is not configurable"
-                    ),
-                ));
-            }
-            (_, Some((min, max)))
-                if throughput
-                    .resulting
-                    .is_some_and(|throughput| throughput < min || throughput > max) =>
+        if let Some(window) = self.throughput_mib {
+            if let Some(out) =
+                throughput.outside(THROUGHPUT_MEMBER, Some(THROUGHPUT_UNIT), volume_type, window)
             {
-                return Err(field_validation_failed(
-                    "Throughput",
-                    format!(
-                        "Throughput must be from {min} to {max} MiB/s for a {volume_type} volume"
-                    ),
-                ));
+                return Err(outside_window(out));
             }
-            (_, Some(_)) | (None, None) => {}
+        }
+        if throughput.named.is_some() && self.throughput_mib.is_none() {
+            return Err(field_validation_failed(
+                THROUGHPUT_MEMBER,
+                format!(
+                    "Throughput must be omitted for a {volume_type} volume, whose \
+                     throughput is not configurable"
+                ),
+            ));
         }
 
         Ok(())
     }
+}
+
+/// The input member provisioned IOPS arrive in, spelled once so the rule above, the
+/// refusals it builds and the operations that read it cannot disagree about it.
+pub const IOPS_MEMBER: &str = "Iops";
+
+/// The input member a volume's throughput arrives in (see [`IOPS_MEMBER`]).
+pub const THROUGHPUT_MEMBER: &str = "Throughput";
+
+/// The unit the throughput window is published in: "Valid Range: 125 - 2000 MiB/s"
+/// (Amazon EBS `CreateVolume$Throughput`). Provisioned IOPS are a count, published
+/// without a unit, so [`IOPS_MEMBER`] has none.
+pub const THROUGHPUT_UNIT: &str = "MiB/s";
+
+/// Which side of a published window a value falls outside it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowSide {
+    /// Below the window's floor.
+    Below,
+    /// Above the window's ceiling.
+    Above,
+}
+
+/// One provisioned-performance value a volume type does not accept: everything the
+/// operation that refuses it needs to word the refusal, and nothing about HOW it words
+/// it.
+///
+/// Built by [`VolumeMemberValue::outside`] — the one place a value is compared against
+/// a published window — so every operation that refuses such a value is refusing it for
+/// the same reading of the same catalog, and each renders the refusal in the voice of
+/// the call it was made for.
+#[derive(Debug, Clone, Copy)]
+pub struct OutOfWindow<'a> {
+    /// The input member the value arrived in ([`IOPS_MEMBER`], [`THROUGHPUT_MEMBER`]).
+    pub member: &'a str,
+    /// The value the request named for it.
+    pub value: i32,
+    /// The window the volume type publishes for the member, as `(min, max)`.
+    pub window: (i32, i32),
+    /// Which side of that window the value falls on.
+    pub side: WindowSide,
+    /// The unit the window is published in ([`THROUGHPUT_UNIT`]), or `None` for a
+    /// member published as a bare count.
+    pub unit: Option<&'a str>,
+    /// The volume type the window is published for.
+    pub volume_type: &'a str,
+}
+
+impl OutOfWindow<'_> {
+    /// The bound the value passed: the window's ceiling for a value above it, its
+    /// floor for one below.
+    pub fn bound(&self) -> i32 {
+        match self.side {
+            WindowSide::Below => self.window.0,
+            WindowSide::Above => self.window.1,
+        }
+    }
+}
+
+/// The modelled `ValidationException` (HTTP 400) that states the WINDOW a volume type
+/// publishes for a performance member, for an operation whose refusals name the member
+/// and the constraint it violated rather than the value the request sent
+/// ([`field_validation_failed`]).
+pub fn performance_outside_published_window(out: OutOfWindow<'_>) -> ValidationException {
+    let OutOfWindow {
+        member,
+        window: (min, max),
+        volume_type,
+        ..
+    } = out;
+    let window = match out.unit {
+        Some(unit) => format!("{min} to {max} {unit}"),
+        None => format!("{min} to {max}"),
+    };
+    field_validation_failed(
+        member,
+        format!("{member} must be from {window} for a {volume_type} volume"),
+    )
 }
 
 /// What one request says about a configurable performance member of a volume, as
@@ -1515,6 +1599,40 @@ impl VolumeMemberValue {
     /// whose unnamed members are retained or defaulted.
     pub fn resolved(named: Option<i32>, resulting: Option<i32>) -> Self {
         Self { named, resulting }
+    }
+
+    /// Whether the value the volume ENDS UP with falls outside `window`, and on which
+    /// side — `None` for a value inside it, and for a member the volume ends up with no
+    /// value for.
+    ///
+    /// The ONE place a performance value is compared against a published window, so
+    /// every operation that judges a configuration admits the same values and refuses
+    /// the same ones. The published range is a question about the value the volume is
+    /// left with, which is why `resulting` is what is compared.
+    pub fn outside<'a>(
+        &self,
+        member: &'a str,
+        unit: Option<&'a str>,
+        volume_type: &'a str,
+        window: (i32, i32),
+    ) -> Option<OutOfWindow<'a>> {
+        let value = self.resulting?;
+        let (min, max) = window;
+        let side = if value < min {
+            WindowSide::Below
+        } else if value > max {
+            WindowSide::Above
+        } else {
+            return None;
+        };
+        Some(OutOfWindow {
+            member,
+            value,
+            window,
+            side,
+            unit,
+            volume_type,
+        })
     }
 }
 
@@ -2734,10 +2852,10 @@ pub fn volume_not_found_error<E>(
 /// [`client_token_mismatch`] for the token case, so every such refusal fills
 /// the same members: `ResourceId` names the resource whose state conflicts and
 /// `ResourceType` its kind ([`WORKSPACE_INSTANCE_RESOURCE_TYPE`] /
-/// [`VOLUME_RESOURCE_TYPE`]), and `Message` states the conflict in a FIXED sentence —
-/// the identity travels in `ResourceId`, as it does for
-/// [`INSTANCE_NOT_FOUND_MESSAGE`], so the prose does not vary per request and echoes
-/// nothing the caller sent.
+/// [`VOLUME_RESOURCE_TYPE`]), and `Message` states the conflict — a FIXED sentence for
+/// a state THIS service reads, the identity travelling in `ResourceId` as it does for
+/// [`INSTANCE_NOT_FOUND_MESSAGE`], and the BACKING service's own sentence where the
+/// conflict is one that service reports ([`volume_not_available_message`]).
 pub fn resource_conflict(
     resource_id: &str,
     resource_type: &str,
@@ -2759,8 +2877,14 @@ pub fn resource_conflict(
 pub const VOLUME_ALREADY_ATTACHED_MESSAGE: &str =
     "Workspace managed EBS volume is already attached to a workspace instance";
 
-/// The `Message` for an attach at a device path that another volume already occupies
-/// on that WorkSpace Instance. `ResourceId` names that other volume.
+/// The `Message` for an attach at a device path another volume already occupies on a
+/// WorkSpace Instance that reports NO managed EC2 instance — one whose launch is still
+/// being made or failed. `ResourceId` names that other volume.
+///
+/// An attach is performed by the service that owns the instance, so where there IS a
+/// managed instance the refusal is that service's own
+/// ([`device_already_in_use`]); an instance it never created has no attach for that
+/// service to have refused, and this service reports the state it reads itself.
 pub const DEVICE_ALREADY_IN_USE_MESSAGE: &str =
     "the device is already in use by another volume on the workspace instance";
 
@@ -2821,13 +2945,6 @@ pub fn volume_zone_mismatch() -> ValidationException {
     field_validation_failed(VOLUME_ID_MEMBER, VOLUME_ZONE_MISMATCH_MESSAGE)
 }
 
-/// The `Message` for a delete of a volume that is still attached.
-///
-/// From the backing Amazon EBS `DeleteVolume` reference: "The volume must be in the
-/// `available` state (not attached to an instance)."
-pub const VOLUME_IN_USE_MESSAGE: &str =
-    "Workspace managed EBS volume is attached to a workspace instance and must be \
-     detached before it is deleted";
 
 /// The `Message` for a `ModifyVolume` of a volume whose previous modification has not
 /// finished.
@@ -2835,8 +2952,8 @@ pub const VOLUME_IN_USE_MESSAGE: &str =
 /// The condition is the one the operation documents — "You can modify a volume only
 /// after any previous modification for that volume has finished" — and the model's own
 /// doc for `VolumeModificationRateExceededException` states it as "The volume has a
-/// previous modification that is still in progress". A FIXED sentence, like
-/// [`VOLUME_IN_USE_MESSAGE`]: the identity of the volume travels in `ResourceId`.
+/// previous modification that is still in progress". A FIXED sentence: the identity of
+/// the volume travels in `ResourceId`.
 pub const VOLUME_MODIFICATION_IN_PROGRESS_MESSAGE: &str =
     "Workspace managed EBS volume has a previous modification that is still in progress";
 

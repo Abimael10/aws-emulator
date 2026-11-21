@@ -148,7 +148,12 @@ impl From<CreateVolumeErrorModeled> for CreateVolumeError {
 ///
 /// Returns the modelled `ValidationException` naming the ONE member the request is
 /// refused for; the member is named in `FieldList` as well as the wording, and no
-/// submitted value is echoed ([`crate::state::field_validation_failed`]).
+/// submitted value is echoed ([`crate::state::field_validation_failed`]) — except where
+/// the refusal is the BACKING service's own answer to this create rather than a
+/// constraint of the request shape (a `SnapshotId` it cannot resolve, a
+/// provisioned-performance value outside the window the volume type publishes), which
+/// carries that service's code and sentence and the value it rejected
+/// ([`crate::state::performance_refused_by_backing_service`]).
 fn validate_configuration(
     input: &CreateVolumeInput,
     region: &str,
@@ -191,11 +196,16 @@ fn validate_configuration(
 
     // The per-type size, IOPS and throughput rules, applied through the one helper the
     // modification path applies them through too. A create provisions exactly what it
-    // names, so each performance member's named value IS the resulting one.
+    // names, so each performance member's named value IS the resulting one. A
+    // performance value outside the window the type publishes is the BACKING service's
+    // refusal of this create, so it is surfaced as that service worded it
+    // (`crate::state::performance_refused_by_backing_service`) rather than as a
+    // constraint of this request's shape.
     spec.require_accepted_configuration(
         input.size_in_gb,
         VolumeMemberValue::named(input.iops),
         VolumeMemberValue::named(input.throughput),
+        crate::state::performance_refused_by_backing_service,
     )?;
 
     if let Some(kms_key_id) = input.kms_key_id.as_deref() {

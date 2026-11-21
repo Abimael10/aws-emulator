@@ -56,6 +56,37 @@ pub(crate) fn attach_body(instance: &str, volume: &str, device: &str) -> Value {
     json!({ "WorkspaceInstanceId": instance, "VolumeId": volume, "Device": device })
 }
 
+/// The `EC2ManagedInstance.InstanceId` `GetWorkspaceInstance` reports for `instance` in
+/// `region`.
+///
+/// That managed Amazon EC2 instance is the instance an attach is performed against, so it
+/// is the one the backing service names when it refuses one — read back through this
+/// service's own report of it rather than assumed.
+pub(crate) async fn managed_instance_id(
+    router: &MultiServiceRouter,
+    region: &str,
+    instance: &str,
+) -> String {
+    let (status, payload) = call_in_region(
+        router,
+        region,
+        "GetWorkspaceInstance",
+        json!({ "WorkspaceInstanceId": instance }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {instance:?}: GetWorkspaceInstance must report the instance, got {status} with \
+         {payload}"
+    );
+    payload["EC2ManagedInstance"]["InstanceId"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("case {instance:?}: expected an EC2ManagedInstance.InstanceId, got {payload}")
+        })
+        .to_string()
+}
+
 /// A `DisassociateVolume` body: `Device` and `DisassociateMode` are optional, so each
 /// is sent only when the case asks for it.
 fn detach_body(
@@ -152,8 +183,9 @@ async fn assert_not_found(
     );
 }
 
-/// Assert the volume still holds an attachment: `DeleteVolume` refuses it as in use,
-/// which is the only read of the stored relation this service's surface offers.
+/// Assert the volume still holds an attachment: `DeleteVolume` refuses it as not being in
+/// the `available` state, which is the only read of the stored relation this service's
+/// surface offers.
 async fn assert_attached(router: &MultiServiceRouter, case: &str, volume: &str) {
     assert_conflict(
         router,
@@ -162,7 +194,7 @@ async fn assert_attached(router: &MultiServiceRouter, case: &str, volume: &str) 
         json!({ "VolumeId": volume }),
         volume,
         wsinst::state::VOLUME_RESOURCE_TYPE,
-        wsinst::state::VOLUME_IN_USE_MESSAGE,
+        &wsinst::state::volume_not_available_message(volume),
     )
     .await;
 }
@@ -282,18 +314,23 @@ async fn a_detach_removes_the_attachment_and_frees_the_volume_and_its_device() {
         )
         .await;
 
-        // The device path is occupied by that volume, so another volume cannot take it.
+        // The device path is occupied by that volume, so another volume cannot take it:
+        // the attach is performed against the managed EC2 instance, so what comes back is
+        // that service's refusal of the `Device` sent (HTTP 400 ValidationException),
+        // which the `volume_refusal_wording` suite asserts the whole wording of.
         let other_volume = create_volume(&router, simple_create("us-east-1b")).await;
-        assert_conflict(
+        let (status, payload) = call(
             &router,
-            case,
             "AssociateVolume",
             attach_body(&instance, &other_volume, &row.device),
-            &volume,
-            wsinst::state::VOLUME_RESOURCE_TYPE,
-            wsinst::state::DEVICE_ALREADY_IN_USE_MESSAGE,
         )
         .await;
+        assert_eq!(
+            (status, error_code(&payload).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected the occupied device path to be refused as a bad Device, \
+             got {status} with {payload}"
+        );
 
         let detach = detach_body(
             &instance,

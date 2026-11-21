@@ -276,11 +276,15 @@ fn validate_target(
     // The per-type size, IOPS and throughput rules, applied through the one helper the
     // create path applies them through too. A member this call does not name was
     // resolved against the volume and the target type above, so each performance member
-    // carries both what the call named and what the volume ends up with.
+    // carries both what the call named and what the volume ends up with. The window a
+    // type publishes is stated as the member constraint it is
+    // (`crate::state::performance_outside_published_window`), the create path being the
+    // one whose refusal of such a value AWS words as the backing service's own.
     spec.require_accepted_configuration(
         target.size_in_gb,
         VolumeMemberValue::resolved(input.iops, target.iops),
         VolumeMemberValue::resolved(input.throughput, target.throughput),
+        crate::state::performance_outside_published_window,
     )
 }
 

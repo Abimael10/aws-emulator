@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::volume_attachment::{attach_body, message};
+use crate::volume_attachment::{attach_body, managed_instance_id, message};
 use crate::volume_lifecycle::{create_volume, simple_create};
 use crate::volume_modification::stored_volume_in;
 use crate::volume_zone_affinity::create_instance;
@@ -297,8 +297,8 @@ async fn an_accepted_attach_persists_exactly_the_instance_and_the_device_it_name
         );
         assert_eq!(
             message(&payload),
-            Some(wsinst::state::VOLUME_IN_USE_MESSAGE),
-            "case {case:?}: expected the service's own in-use wording, got {payload}"
+            Some(wsinst::state::volume_not_available_message(&volume).as_str()),
+            "case {case:?}: expected the backing service's not-available wording, got {payload}"
         );
 
         // The detach removes that one attachment, leaving the record exactly as the create
@@ -356,8 +356,8 @@ struct RefusalRow {
     body: Value,
     status: u16,
     code: &'static str,
-    /// The service's fixed wording for the refusal, where it publishes one.
-    message: Option<&'static str>,
+    /// The wording the refusal carries, where the service publishes one for it.
+    message: Option<String>,
     /// The input member a `ValidationException` row names in its `FieldList`.
     field: Option<&'static str>,
     /// The conflicting or missing resource the refusal names, where the shape carries
@@ -384,6 +384,9 @@ async fn a_refused_attach_persists_nothing() {
     );
 
     let instance = create_instance(&router, region, "fixture", Some(&home)).await;
+    // The managed EC2 instance the attach is performed against, read back through this
+    // service's own report of the instance.
+    let managed_instance = managed_instance_id(&router, region, &instance).await;
     let attached = create_volume(&router, simple_create(&home)).await;
     let free = create_volume(&router, simple_create(&home)).await;
     let elsewhere = create_volume(&router, simple_create(&other_zone)).await;
@@ -407,7 +410,7 @@ async fn a_refused_attach_persists_nothing() {
             body: attach_body(&unknown_instance, &free, spare_device),
             status: wsinst::state::RESOURCE_NOT_FOUND_STATUS,
             code: "ResourceNotFoundException",
-            message: Some(wsinst::state::INSTANCE_NOT_FOUND_MESSAGE),
+            message: Some(wsinst::state::INSTANCE_NOT_FOUND_MESSAGE.to_string()),
             field: None,
             resource_id: Some(unknown_instance.clone()),
         },
@@ -417,7 +420,7 @@ async fn a_refused_attach_persists_nothing() {
             body: attach_body(&instance, &unknown_volume, spare_device),
             status: wsinst::state::RESOURCE_NOT_FOUND_STATUS,
             code: "ResourceNotFoundException",
-            message: Some(wsinst::state::VOLUME_NOT_FOUND_MESSAGE),
+            message: Some(wsinst::state::VOLUME_NOT_FOUND_MESSAGE.to_string()),
             field: None,
             resource_id: Some(unknown_volume.clone()),
         },
@@ -427,7 +430,7 @@ async fn a_refused_attach_persists_nothing() {
             body: attach_body(&instance, &elsewhere, spare_device),
             status: 400,
             code: "ValidationException",
-            message: Some(wsinst::state::VOLUME_ZONE_MISMATCH_MESSAGE),
+            message: Some(wsinst::state::VOLUME_ZONE_MISMATCH_MESSAGE.to_string()),
             field: Some(wsinst::state::VOLUME_ID_MEMBER),
             resource_id: None,
         },
@@ -437,19 +440,27 @@ async fn a_refused_attach_persists_nothing() {
             body: attach_body(&instance, &attached, spare_device),
             status: 409,
             code: "ConflictException",
-            message: Some(wsinst::state::VOLUME_ALREADY_ATTACHED_MESSAGE),
+            message: Some(wsinst::state::VOLUME_ALREADY_ATTACHED_MESSAGE.to_string()),
             field: None,
             resource_id: Some(attached.clone()),
         },
         RefusalRow {
+            // The attach is made by the service that owns the instance, so a device path
+            // already in use is ITS refusal of the `Device` sent: the modelled
+            // `ValidationException`, carrying that service's code and sentence and naming
+            // no conflicting resource of this one.
             case: "a device path another volume occupies",
             region: region.to_string(),
             body: attach_body(&instance, &free, device),
-            status: 409,
-            code: "ConflictException",
-            message: Some(wsinst::state::DEVICE_ALREADY_IN_USE_MESSAGE),
+            status: 400,
+            code: "ValidationException",
+            message: Some(format!(
+                "Ec2 can't associate volume {free} to instance {managed_instance} \
+                 (InvalidParameterValue: Invalid value '{device}' for unixDevice. \
+                 Attachment point {device} is already in use)"
+            )),
             field: None,
-            resource_id: Some(attached.clone()),
+            resource_id: None,
         },
         RefusalRow {
             // `DeviceName`'s `len 0..32` admits the empty string, so this one reaches the
@@ -470,7 +481,7 @@ async fn a_refused_attach_persists_nothing() {
             body: attach_body(&instance, &free, spare_device),
             status: wsinst::state::RESOURCE_NOT_FOUND_STATUS,
             code: "ResourceNotFoundException",
-            message: Some(wsinst::state::INSTANCE_NOT_FOUND_MESSAGE),
+            message: Some(wsinst::state::INSTANCE_NOT_FOUND_MESSAGE.to_string()),
             field: None,
             resource_id: Some(instance.clone()),
         },
@@ -493,11 +504,11 @@ async fn a_refused_attach_persists_nothing() {
             "case {case:?}: expected {}, got {payload}",
             row.code
         );
-        if let Some(expected) = row.message {
+        if let Some(expected) = row.message.as_deref() {
             assert_eq!(
                 message(&payload),
                 Some(expected),
-                "case {case:?}: expected the service's own wording, got {payload}"
+                "case {case:?}: expected the wording {expected:?}, got {payload}"
             );
         }
         if let Some(expected) = row.field {

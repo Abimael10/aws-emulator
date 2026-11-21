@@ -194,6 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let instance_zone = instance
             .placement_availability_zone()
             .map(ToString::to_string);
+        // The managed Amazon EC2 instance this WorkSpace Instance IS — the instance the
+        // attach is performed against, and the one EC2 names when it refuses the attach.
+        // `None` while its launch is still being made or after it failed: there is then no
+        // managed instance for EC2 to have refused anything about.
+        let ec2_instance_id = instance.ec2_instance_id.clone();
 
         // Which volume already holds the device path asked for, read before the volume
         // being attached is borrowed mutably. One device path on an instance carries one
@@ -256,17 +261,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The device path is taken: the conflicting resource is the volume occupying it,
-        // so that is the id the refusal names.
+        // The device path is taken. The attach itself is performed by the service that
+        // owns the instance, against the managed EC2 instance above, so an attachment
+        // point already in use is THAT service's refusal of the `Device` this request
+        // names — surfaced with its code and sentence as the modelled
+        // `ValidationException` (HTTP 400), because no later call makes this `Device`
+        // attachable: the request itself is what is wrong, not a state that clears.
         if let Some(occupant) = occupant {
-            return Err(AssociateVolumeErrorModeled::ConflictException(
-                crate::state::resource_conflict(
-                    &occupant,
-                    crate::state::VOLUME_RESOURCE_TYPE,
-                    crate::state::DEVICE_ALREADY_IN_USE_MESSAGE,
-                ),
-            )
-            .into());
+            return match ec2_instance_id {
+                Some(ec2_instance_id) => {
+                    Err(AssociateVolumeErrorModeled::ValidationException(
+                        crate::state::device_already_in_use(
+                            &input.volume_id,
+                            &ec2_instance_id,
+                            &input.device,
+                        ),
+                    )
+                    .into())
+                }
+                // An instance whose launch produced no managed EC2 instance has no
+                // attach for that service to have refused, so this service reports the
+                // state it reads itself: the conflicting resource is the volume holding
+                // the device path.
+                None => Err(AssociateVolumeErrorModeled::ConflictException(
+                    crate::state::resource_conflict(
+                        &occupant,
+                        crate::state::VOLUME_RESOURCE_TYPE,
+                        crate::state::DEVICE_ALREADY_IN_USE_MESSAGE,
+                    ),
+                )
+                .into()),
+            };
         }
 
         // Nothing has been written until every refusal above is past: the attachment is

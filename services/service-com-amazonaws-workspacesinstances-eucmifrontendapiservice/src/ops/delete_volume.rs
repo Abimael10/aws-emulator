@@ -178,17 +178,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The modelled `ConflictException` covers the real service's refusal to delete a
-        // volume that is in use: a volume still attached to a WorkSpace Instance is not
-        // deletable ("The volume must be in the `available` state (not attached to an
-        // instance)" — the backing Amazon EBS `DeleteVolume`), so the caller detaches it
-        // with `DisassociateVolume` first. Nothing is written for the refusal: the volume
-        // and its attachment are left exactly as they were.
+        // volume that is in use: a volume still attached to a WorkSpace Instance is not in
+        // the `available` state the backing Amazon EBS `DeleteVolume` requires ("The volume
+        // must be in the `available` state (not attached to an instance)"), so the caller
+        // detaches it with `DisassociateVolume` first. The refusal carries that service's
+        // own sentence, which names the volume it is about
+        // (`crate::state::volume_not_available_message`). Nothing is written for the
+        // refusal: the volume and its attachment are left exactly as they were.
         if volume.attachment.is_some() {
             return Err(DeleteVolumeErrorModeled::ConflictException(
                 crate::state::resource_conflict(
                     &input.volume_id,
                     crate::state::VOLUME_RESOURCE_TYPE,
-                    crate::state::VOLUME_IN_USE_MESSAGE,
+                    &crate::state::volume_not_available_message(&input.volume_id),
                 ),
             )
             .into());

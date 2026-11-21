@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use ::service_com_amazonaws_ec2_amazonec2::state::{self as ec2_store, VolumeSpec};
 
 use crate::ops::types::{CreateVolumeInput, ValidationException};
+use crate::state::{OutOfWindow, WindowSide};
 
 /// Amazon EBS's error code for a `SnapshotId` its `CreateVolume` cannot read as a snapshot
 /// of the account.
@@ -74,8 +75,20 @@ fn create_volume_failed(code: &str, message: &str) -> String {
 /// sentence — which quote the snapshot id the request named, because that is how EBS words
 /// a bad value for the parameter.
 pub fn unresolvable_snapshot(snapshot_id: &str) -> ValidationException {
+    backing_service_refusal(unresolvable_snapshot_message(snapshot_id))
+}
+
+/// The modelled `ValidationException` (HTTP 400) for a refusal the BACKING service made,
+/// carrying what that service answered as `message`.
+///
+/// The ONE place such a refusal is shaped, so every one of them reads alike to a client:
+/// `Reason` is [`crate::state::VALIDATION_REASON_DEPENDENCY_FAILURE`] — the call was
+/// refused by the service this one depends on, not by a constraint of this service's own
+/// request shape — and there is no `FieldList`, there being no member of THIS request the
+/// dependency faulted.
+fn backing_service_refusal(message: String) -> ValidationException {
     ValidationException {
-        message: unresolvable_snapshot_message(snapshot_id),
+        message,
         reason: crate::state::VALIDATION_REASON_DEPENDENCY_FAILURE.to_string(),
         field_list: None,
     }
@@ -88,6 +101,107 @@ pub fn unresolvable_snapshot_message(snapshot_id: &str) -> String {
         INVALID_SNAPSHOT_ID_CODE,
         &invalid_snapshot_parameter(snapshot_id),
     )
+}
+
+/// The code the backing Amazon EBS/EC2 service classifies a parameter value it will not
+/// take under, read from the crate that owns those APIs so one code is spelled once.
+const INVALID_PARAMETER_VALUE_CODE: &str = ec2_store::INVALID_PARAMETER_VALUE;
+
+/// What the backing Amazon EBS service answers for a provisioned-performance value outside
+/// the window the requested volume type publishes: the fixed `Volume `, the member as that
+/// service names it, ` of `, the value the request sent, and whether it is `too high` with
+/// the window's maximum or `too low` with its minimum.
+///
+/// RECORDED: the sentence AWS answered for a create whose `Iops` was above the window its
+/// volume type publishes. The member and the value are the request's, the bound is read off
+/// this service's own published catalog ([`crate::state::VOLUME_TYPE_SPECS`]), and the
+/// member is lower case here because that is how the backing service names a volume's
+/// performance members in this sentence.
+fn volume_performance_out_of_window(out: OutOfWindow<'_>) -> String {
+    let member = out.member.to_ascii_lowercase();
+    let value = out.value;
+    let bound = out.bound();
+    match out.side {
+        WindowSide::Above => format!("Volume {member} of {value} is too high; maximum is {bound}."),
+        WindowSide::Below => format!("Volume {member} of {value} is too low; minimum is {bound}."),
+    }
+}
+
+/// The modelled `ValidationException` (HTTP 400) for a create the backing Amazon EBS
+/// service refuses for a provisioned-performance value outside the window the volume type
+/// publishes.
+///
+/// The window is enforced by that service's own create, so what this service answers is its
+/// refusal — the wrapper naming the call that failed ([`create_volume_failed`]) around the
+/// code and sentence EBS worded for it — rather than a constraint of this service's request
+/// shape ([`backing_service_refusal`]). Passed to
+/// [`crate::state::VolumeTypeSpec::require_accepted_configuration`] by the create path, so
+/// the rule stays shared and only its wording is this call's.
+pub fn performance_refused_by_backing_service(out: OutOfWindow<'_>) -> ValidationException {
+    backing_service_refusal(create_volume_failed(
+        INVALID_PARAMETER_VALUE_CODE,
+        &volume_performance_out_of_window(out),
+    ))
+}
+
+/// How this service reports an attach the backing Amazon EC2 service refused: the fixed
+/// `Ec2 can't associate volume `, the volume the request named, ` to instance `, the managed
+/// EC2 instance the WorkSpace Instance IS, then the code EC2 classified the refusal as and
+/// the sentence it worded for it in parentheses.
+///
+/// RECORDED: the message AWS answered for an attach EC2 refused. The wrapper is this
+/// service's own and the code and sentence inside it are the dependency's, exactly as
+/// [`create_volume_failed`] wraps a refused create.
+fn associate_volume_failed(
+    volume_id: &str,
+    ec2_instance_id: &str,
+    code: &str,
+    message: &str,
+) -> String {
+    format!("Ec2 can't associate volume {volume_id} to instance {ec2_instance_id} ({code}: {message})")
+}
+
+/// What the backing Amazon EC2 service answers for an attach at a device path a volume
+/// already occupies on the instance: the fixed text it words for a `unixDevice` value it
+/// will not take, carrying the device path the request named in both of its places.
+fn attachment_point_in_use(device: &str) -> String {
+    format!(
+        "Invalid value '{device}' for unixDevice. Attachment point {device} is already in use"
+    )
+}
+
+/// The modelled `ValidationException` (HTTP 400) for an attach at a device path the
+/// instance already carries a volume at.
+///
+/// The attach is performed by the service that owns the instance, against the managed EC2
+/// instance this WorkSpace Instance IS, so an attachment point already in use is THAT
+/// service's refusal of the `Device` the request named — a value no later call makes
+/// attachable, which is why it is the modelled `ValidationException` (HTTP 400) and not the
+/// state conflict a wait could clear.
+pub fn device_already_in_use(
+    volume_id: &str,
+    ec2_instance_id: &str,
+    device: &str,
+) -> ValidationException {
+    backing_service_refusal(associate_volume_failed(
+        volume_id,
+        ec2_instance_id,
+        INVALID_PARAMETER_VALUE_CODE,
+        &attachment_point_in_use(device),
+    ))
+}
+
+/// The `Message` this service answers a call the backing Amazon EBS service will not make
+/// because the volume is not in the `available` state — a volume still attached to a
+/// WorkSpace Instance ("The volume must be in the `available` state (not attached to an
+/// instance)", the backing EBS `DeleteVolume`).
+///
+/// RECORDED: the sentence AWS answered for a delete of an attached volume. The fixed text is
+/// `EBS Volume is not in available state for volume `, and the volume id the request named
+/// is its only variable part — so a caller deleting several volumes at once reads which one
+/// the refusal is about.
+pub fn volume_not_available_message(volume_id: &str) -> String {
+    format!("EBS Volume is not in available state for volume {volume_id}")
 }
 
 /// Whether the account holds an EBS snapshot under `snapshot_id`.

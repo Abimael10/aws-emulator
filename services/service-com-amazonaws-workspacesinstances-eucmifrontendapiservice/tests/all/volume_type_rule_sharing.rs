@@ -10,9 +10,12 @@
 //! > the type publishes, provisioned IOPS and a throughput inside theirs, and a
 //! > performance member the type takes no value for omitted — is ONE rule of the type,
 //! > not of the call: the configuration a create is refused for is the configuration a
-//! > modification is refused for, with the same status, the same modelled code, the
-//! > same named member and the same wording, and a configuration the type accepts is
-//! > accepted by both.
+//! > modification is refused for, with the same status and the same modelled code, and
+//! > a configuration the type accepts is accepted by both. Where the refusal is this
+//! > service's own reading of the request, both operations name the same member and
+//! > word it alike; where it is the BACKING service's refusal of a value (a performance
+//! > value outside a published window, which that service's create enforces), each
+//! > operation carries the answer for the call it made.
 //!
 //! The rows differ along what that rule generalises over: the volume type (every one
 //! the service publishes, read off its own catalog), the member (`SizeInGB`, `Iops`,
@@ -36,10 +39,13 @@ use crate::workspace_instance_lifecycle::{call, error_code, harness, DEFAULT_TES
 /// modelled enum value (`smithy_query(query="shape",shape="ValidationExceptionReason")`).
 const FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
 
+/// The `ValidationExceptionReason` a refusal the BACKING service made is reported with,
+/// from the same modelled enum.
+const DEPENDENCY_FAILURE: &str = "DEPENDENCY_FAILURE";
+
 /// What a refusal of the per-type rule says, as a client reads it: the status, the
-/// modelled error code, the members `FieldList` names and the wording. Compared whole,
-/// so the two operations cannot answer the same bad configuration differently in any
-/// of them.
+/// modelled error code, the members `FieldList` names (none, where the answer is a
+/// dependency's refusal) and the wording.
 #[derive(Debug, PartialEq, Eq)]
 struct Refusal {
     status: u16,
@@ -50,28 +56,47 @@ struct Refusal {
 
 /// Read a [`Refusal`] out of one answer, failing the case when the answer is not a
 /// refusal of the shape this service's validation refusals have.
+///
+/// A refusal of a member of THIS request names it in `FieldList` under the
+/// single-member reason; one the backing service made names no member of this request
+/// and carries the dependency-failure reason instead.
 fn refusal(case: &str, operation: &str, status: u16, payload: &Value) -> Refusal {
-    let members = payload["FieldList"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case {case:?} on {operation}: no FieldList in {payload}"))
-        .iter()
-        .map(|field| {
-            field["Name"]
-                .as_str()
-                .unwrap_or_else(|| panic!("case {case:?} on {operation}: no Name in {payload}"))
-                .to_string()
-        })
-        .collect();
+    let reason = payload["Reason"].as_str();
+    let members = match payload["FieldList"].as_array() {
+        Some(fields) => {
+            assert_eq!(
+                reason,
+                Some(FIELD_VALIDATION_FAILED),
+                "case {case:?} on {operation}: a refusal naming a member must carry the \
+                 field-validation reason, got {payload}"
+            );
+            fields
+                .iter()
+                .map(|field| {
+                    field["Name"]
+                        .as_str()
+                        .unwrap_or_else(|| {
+                            panic!("case {case:?} on {operation}: no Name in {payload}")
+                        })
+                        .to_string()
+                })
+                .collect()
+        }
+        None => {
+            assert_eq!(
+                reason,
+                Some(DEPENDENCY_FAILURE),
+                "case {case:?} on {operation}: a refusal naming no member must carry the \
+                 dependency-failure reason, got {payload}"
+            );
+            Vec::new()
+        }
+    };
     let message = payload["Message"]
         .as_str()
         .or_else(|| payload["message"].as_str())
         .unwrap_or_else(|| panic!("case {case:?} on {operation}: no Message in {payload}"))
         .to_string();
-    assert_eq!(
-        payload["Reason"].as_str(),
-        Some(FIELD_VALIDATION_FAILED),
-        "case {case:?} on {operation}: expected the field-validation reason, got {payload}"
-    );
     Refusal {
         status,
         code: error_code(payload),
@@ -102,8 +127,13 @@ fn accepted_body(spec: &VolumeTypeSpec, zone: &str) -> Value {
 /// operations that judge it.
 struct SharedRow {
     case: String,
-    /// The member both refusals must name.
+    /// The member a refusal of this request's own shape names.
     member: &'static str,
+    /// The value the row sends and the published bound it passes, for a row whose value
+    /// falls outside a window the BACKING service enforces — the one refusal each
+    /// operation words for its own call. `None` for a row refused as a member of this
+    /// request, which both operations word alike.
+    outside_window: Option<(i32, i32)>,
     /// The `CreateVolume` body whose configuration is the bad one.
     create: Value,
     /// The volume the modification starts from — a configuration the service accepts.
@@ -111,6 +141,12 @@ struct SharedRow {
     /// The modification whose TARGET is the same bad configuration.
     modify: Value,
 }
+
+/// One bad value for a performance member of a row set: the case name, the value the
+/// row sends, and — where that value falls outside a window the BACKING service
+/// enforces — the value and the published bound it passed, as
+/// [`SharedRow::outside_window`] carries them.
+type BadValue = (String, i32, Option<(i32, i32)>);
 
 /// The rows the shared rule is asserted over, generated from the service's own
 /// published catalog (`wsinst::state::VOLUME_TYPE_SPECS`) so no type the modelled
@@ -137,6 +173,7 @@ fn shared_rows(zone: &str) -> Vec<SharedRow> {
             rows.push(SharedRow {
                 case: format!("{volume_type} one above the ceiling it publishes"),
                 member: "SizeInGB",
+                outside_window: None,
                 create,
                 modify_from: accepted_body(spec, zone),
                 modify: json!({ "SizeInGB": size_max + 1 }),
@@ -156,6 +193,7 @@ fn shared_rows(zone: &str) -> Vec<SharedRow> {
             rows.push(SharedRow {
                 case: format!("{volume_type} one below the floor it publishes"),
                 member: "SizeInGB",
+                outside_window: None,
                 create,
                 modify_from: json!({ "AvailabilityZone": zone, "SizeInGB": below_floor }),
                 modify: json!({ "VolumeType": volume_type }),
@@ -164,27 +202,46 @@ fn shared_rows(zone: &str) -> Vec<SharedRow> {
 
         // `Iops`: outside the range a type that provisions them publishes, or named at
         // all for a type that provisions none. `0`, which the modelled `range 0..`
-        // admits, is below every published floor.
-        let bad_iops: Vec<(String, i32)> = match spec.iops {
+        // admits, is below every published floor. A value outside a published window is
+        // the backing service's refusal, so each row carries the bound it passed.
+        let bad_iops: Vec<BadValue> = match spec.iops {
             Some((min, max)) => vec![
-                (format!("{volume_type} one below the Iops floor it publishes"), min - 1),
-                (format!("{volume_type} one above the Iops ceiling it publishes"), max + 1),
-                (format!("{volume_type} with Iops 0, below every published floor"), 0),
+                (
+                    format!("{volume_type} one below the Iops floor it publishes"),
+                    min - 1,
+                    Some((min - 1, min)),
+                ),
+                (
+                    format!("{volume_type} one above the Iops ceiling it publishes"),
+                    max + 1,
+                    Some((max + 1, max)),
+                ),
+                (
+                    format!("{volume_type} with Iops 0, below every published floor"),
+                    0,
+                    Some((0, min)),
+                ),
             ],
             None => vec![
-                (format!("{volume_type} with Iops 0, which it does not provision"), 0),
+                (
+                    format!("{volume_type} with Iops 0, which it does not provision"),
+                    0,
+                    None,
+                ),
                 (
                     format!("{volume_type} with Iops 3000, which it does not provision"),
                     3_000,
+                    None,
                 ),
             ],
         };
-        for (case, iops) in bad_iops {
+        for (case, iops, outside_window) in bad_iops {
             let mut create = accepted_body(spec, zone);
             create["Iops"] = json!(iops);
             rows.push(SharedRow {
                 case,
                 member: "Iops",
+                outside_window,
                 create,
                 modify_from: accepted_body(spec, zone),
                 modify: json!({ "Iops": iops }),
@@ -193,34 +250,39 @@ fn shared_rows(zone: &str) -> Vec<SharedRow> {
 
         // `Throughput`, the same two shapes: outside the published range, or named for
         // a type whose throughput is not configurable.
-        let bad_throughput: Vec<(String, i32)> = match spec.throughput_mib {
+        let bad_throughput: Vec<BadValue> = match spec.throughput_mib {
             Some((min, max)) => vec![
                 (
                     format!("{volume_type} one below the Throughput floor it publishes"),
                     min - 1,
+                    Some((min - 1, min)),
                 ),
                 (
                     format!("{volume_type} one above the Throughput ceiling it publishes"),
                     max + 1,
+                    Some((max + 1, max)),
                 ),
             ],
             None => vec![
                 (
                     format!("{volume_type} with Throughput 0, which it does not take"),
                     0,
+                    None,
                 ),
                 (
                     format!("{volume_type} with Throughput 125, which it does not take"),
                     125,
+                    None,
                 ),
             ],
         };
-        for (case, throughput) in bad_throughput {
+        for (case, throughput, outside_window) in bad_throughput {
             let mut create = accepted_body(spec, zone);
             create["Throughput"] = json!(throughput);
             rows.push(SharedRow {
                 case,
                 member: "Throughput",
+                outside_window,
                 create,
                 modify_from: accepted_body(spec, zone),
                 modify: json!({ "Throughput": throughput }),
@@ -265,37 +327,86 @@ async fn one_rule_refuses_the_same_configuration_on_create_and_on_modify() {
         let modified = refusal(case, "ModifyVolume", modify_status, &modify_payload);
 
         assert_eq!(
-            (created.status, created.code.as_str(), &created.members),
-            (
-                400,
-                "ValidationException",
-                &vec![row.member.to_string()]
-            ),
-            "case {case:?}: expected the modelled validation refusal naming {:?}, got \
-             {create_payload}",
-            row.member
+            (created.status, created.code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected the modelled validation refusal, got {create_payload}"
         );
         assert_eq!(
-            modified, created,
-            "case {case:?}: ModifyVolume must refuse the configuration exactly as \
-             CreateVolume does, got {modify_payload:?} against {create_payload:?}"
+            (modified.status, modified.code.as_str()),
+            (created.status, created.code.as_str()),
+            "case {case:?}: both operations must refuse the configuration with the same \
+             status and code, got {modify_payload:?} against {create_payload:?}"
         );
-        assert!(
-            created.message.contains(row.member),
-            "case {case:?}: expected the wording to name {:?}, got {:?}",
-            row.member,
-            created.message
-        );
-        assert!(
-            created.message.contains(
-                row.create["VolumeType"]
-                    .as_str()
-                    .unwrap_or(wsinst::state::DEFAULT_VOLUME_TYPE)
-            ),
-            "case {case:?}: expected the wording to name the volume type it is read for, \
-             got {:?}",
-            created.message
-        );
+
+        match row.outside_window {
+            // A value outside the window the type publishes is the BACKING service's
+            // refusal of that value: the create carries that service's answer, which
+            // reports the value and the bound it passed and faults no member of this
+            // request, while the modification states the window as the member
+            // constraint it is.
+            Some((value, bound)) => {
+                assert!(
+                    created.members.is_empty(),
+                    "case {case:?}: a dependency's refusal faults no member of this \
+                     request, got {:?}",
+                    created.members
+                );
+                for expected in [value.to_string(), bound.to_string()] {
+                    assert!(
+                        created.message.contains(&expected),
+                        "case {case:?}: expected the create's wording to report \
+                         {expected:?}, got {:?}",
+                        created.message
+                    );
+                }
+                assert_eq!(
+                    modified.members,
+                    vec![row.member.to_string()],
+                    "case {case:?}: expected the modification to name {:?}, got \
+                     {modify_payload}",
+                    row.member
+                );
+                assert!(
+                    modified.message.contains(row.member),
+                    "case {case:?}: expected the modification's wording to name {:?}, got \
+                     {:?}",
+                    row.member,
+                    modified.message
+                );
+            }
+            // A refusal of this request's own shape: one member, one wording, both
+            // operations alike.
+            None => {
+                assert_eq!(
+                    &created.members,
+                    &vec![row.member.to_string()],
+                    "case {case:?}: expected the refusal to name {:?}, got \
+                     {create_payload}",
+                    row.member
+                );
+                assert_eq!(
+                    modified, created,
+                    "case {case:?}: ModifyVolume must refuse the configuration exactly as \
+                     CreateVolume does, got {modify_payload:?} against {create_payload:?}"
+                );
+                assert!(
+                    created.message.contains(row.member),
+                    "case {case:?}: expected the wording to name {:?}, got {:?}",
+                    row.member,
+                    created.message
+                );
+                assert!(
+                    created.message.contains(
+                        row.create["VolumeType"]
+                            .as_str()
+                            .unwrap_or(wsinst::state::DEFAULT_VOLUME_TYPE)
+                    ),
+                    "case {case:?}: expected the wording to name the volume type it is \
+                     read for, got {:?}",
+                    created.message
+                );
+            }
+        }
     }
 }
 

@@ -13,8 +13,10 @@
 //! > `SizeInGB` nor `SnapshotId`), a `SizeInGB`, `Iops` or `Throughput` outside the
 //! > range the named `VolumeType` publishes or not taken by that type at all, or a
 //! > `KmsKeyId` without `Encrypted` true — is refused with the modelled
-//! > `ValidationException` (HTTP 400) naming the offending member, and stores nothing;
-//! > every other configuration is created.
+//! > `ValidationException` (HTTP 400) and stores nothing; a refusal of this service's
+//! > own request shape names the offending member, while one the backing service makes
+//! > (a performance value outside a published window) carries that service's answer,
+//! > reporting the value it rejected; every other configuration is created.
 //!
 //! The rows below differ along what that rule generalises over: the member, the
 //! Region, the zone, the volume type (every published one, not only the cited `st1`),
@@ -38,6 +40,11 @@ use crate::workspace_instance_lifecycle::{
 /// The `ValidationExceptionReason` a single bad member is reported with, as the
 /// modelled enum value (`smithy_query(query="shape",shape="ValidationExceptionReason")`).
 const FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
+
+/// The `ValidationExceptionReason` a refusal the BACKING Amazon EBS volume service made
+/// is reported with, from the same modelled enum: the create was refused by the service
+/// this one provisions the volume through, not by a constraint of this request's shape.
+const DEPENDENCY_FAILURE: &str = "DEPENDENCY_FAILURE";
 
 /// How many volumes the service's own store holds — the engine the router was built
 /// from, read the one legal way.
@@ -95,6 +102,59 @@ async fn assert_refused(
         message.contains(member),
         "case {case:?} in {region}: expected the wording to name {member:?}, got {message:?}"
     );
+    assert_eq!(
+        stored_volumes(engine),
+        held,
+        "case {case:?} in {region}: a refused create must store nothing"
+    );
+}
+
+/// Assert `body` is refused with the BACKING service's own answer to the create: the
+/// modelled `ValidationException` (HTTP 400) whose message reports `value` as the value
+/// that service rejected and `bound` as the published bound it passed, carrying no
+/// `FieldList` of this service's making, and that the store is untouched.
+///
+/// The whole wording of that refusal is pinned by the `volume_refusal_wording` suite;
+/// what matters here is that a performance value outside a published window is answered
+/// as the dependency's refusal of THAT value rather than as a constraint of the request.
+async fn assert_refused_by_the_backing_service(
+    router: &MultiServiceRouter,
+    engine: &engine::InMemoryEngine,
+    region: &str,
+    case: &str,
+    value: i32,
+    bound: i32,
+    body: Value,
+) {
+    let held = stored_volumes(engine);
+    let (status, payload) = call_in_region(router, region, "CreateVolume", body).await;
+    assert_eq!(
+        (status, error_code(&payload).as_str()),
+        (400, "ValidationException"),
+        "case {case:?} in {region}: expected the modelled validation refusal, got {status} \
+         with {payload}"
+    );
+    assert_eq!(
+        payload["Reason"].as_str(),
+        Some(DEPENDENCY_FAILURE),
+        "case {case:?} in {region}: expected the dependency-failure reason, got {payload}"
+    );
+    assert!(
+        payload["FieldList"].is_null(),
+        "case {case:?} in {region}: a dependency's refusal faults no member of this \
+         request, got {payload}"
+    );
+    let message = payload["Message"]
+        .as_str()
+        .or_else(|| payload["message"].as_str())
+        .unwrap_or_else(|| panic!("case {case:?} in {region}: no Message in {payload}"));
+    for expected in [value.to_string(), bound.to_string()] {
+        assert!(
+            message.contains(&expected),
+            "case {case:?} in {region}: expected the wording to report {expected:?}, got \
+             {message:?}"
+        );
+    }
     assert_eq!(
         stored_volumes(engine),
         held,
@@ -382,14 +442,28 @@ async fn size_iops_and_throughput_must_be_ones_the_named_volume_type_takes() {
                     body["Iops"] = json!(iops);
                     assert_created(&router, &engine, region, &case, body).await;
                 }
-                for (case, iops) in [
-                    (format!("{volume_type} one below its minimum Iops"), iops_min - 1),
-                    (format!("{volume_type} one above its maximum Iops"), iops_max + 1),
-                    (format!("{volume_type} with Iops 0"), 0),
+                // A value outside the window the type publishes is the backing
+                // service's refusal of that value, which reports it and the bound it
+                // passed.
+                for (case, iops, bound) in [
+                    (
+                        format!("{volume_type} one below its minimum Iops"),
+                        iops_min - 1,
+                        iops_min,
+                    ),
+                    (
+                        format!("{volume_type} one above its maximum Iops"),
+                        iops_max + 1,
+                        iops_max,
+                    ),
+                    (format!("{volume_type} with Iops 0"), 0, iops_min),
                 ] {
                     let mut body = minimal_body(spec, &zone);
                     body["Iops"] = json!(iops);
-                    assert_refused(&router, &engine, region, &case, "Iops", body).await;
+                    assert_refused_by_the_backing_service(
+                        &router, &engine, region, &case, iops, bound, body,
+                    )
+                    .await;
                 }
                 // A type that REQUIRES IOPS is refused when the request names none.
                 if spec.iops_required {
@@ -436,14 +510,25 @@ async fn size_iops_and_throughput_must_be_ones_the_named_volume_type_takes() {
                     body["Throughput"] = json!(throughput);
                     assert_created(&router, &engine, region, &case, body).await;
                 }
-                for (case, throughput) in [
-                    (format!("{volume_type} one below its minimum Throughput"), min - 1),
-                    (format!("{volume_type} one above its maximum Throughput"), max + 1),
-                    (format!("{volume_type} with Throughput 0"), 0),
+                for (case, throughput, bound) in [
+                    (
+                        format!("{volume_type} one below its minimum Throughput"),
+                        min - 1,
+                        min,
+                    ),
+                    (
+                        format!("{volume_type} one above its maximum Throughput"),
+                        max + 1,
+                        max,
+                    ),
+                    (format!("{volume_type} with Throughput 0"), 0, min),
                 ] {
                     let mut body = minimal_body(spec, &zone);
                     body["Throughput"] = json!(throughput);
-                    assert_refused(&router, &engine, region, &case, "Throughput", body).await;
+                    assert_refused_by_the_backing_service(
+                        &router, &engine, region, &case, throughput, bound, body,
+                    )
+                    .await;
                 }
             }
             None => {

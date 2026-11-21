@@ -39,6 +39,8 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a new suite is a new file.
+automod = { workspace = true }
 hex = { workspace = true }
 aws-sdk-ec2 = { version = "1", default-features = false, features = ["behavior-version-latest"] }
 
