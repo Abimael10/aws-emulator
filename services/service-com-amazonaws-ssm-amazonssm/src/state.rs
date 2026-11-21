@@ -397,6 +397,11 @@ pub mod ops_metadata;
 /// managed nodes, and the node record that registration writes.
 pub mod node_registration;
 
+/// The SSM Agent builds this emulator publishes, and which of them the guest of a managed
+/// node holds — the pair `InstanceInformation$AgentVersion` and
+/// `InstanceInformation$IsLatestVersion` are answered from.
+pub mod agent_releases;
+
 /// The node listing of the Systems Manager integrated experience: whether an account has it
 /// at all, which Regions' nodes one listing reports, and the `Node` a stored managed node is
 /// projected as.
@@ -451,6 +456,10 @@ pub mod guest_execution;
 /// The RESOLVER CLIENTS a script delivered to a node's guest resolves a name with, answered by
 /// the DNS of the VPC that node is in.
 pub mod guest_resolver;
+
+/// The PACKAGE QUERY client a script delivered to a node's guest reads its installed SSM Agent
+/// package out of, answered from the build that node reports.
+pub mod guest_packages;
 
 /// Where this service's EC2-facing work lives: the registration half and the delivery half,
 /// and why they are separate.

@@ -53,6 +53,10 @@
 //! [`super::identity_authorization`] takes of such an attachment for the caller's own
 //! grants. A role whose documents ARE readable and allow nothing registers no node.
 //!
+//! What the node then reports about the AGENT in its guest — the build it is running and
+//! whether that is the current release — is the build the AMI it was launched from bundles,
+//! which is [`super::agent_releases`]'s own reading of the image's publication instants.
+//!
 //! ## What is written, and why a report may write it
 //!
 //! Registration takes a while after the launch — the agent has to come up and reach the
@@ -96,6 +100,16 @@ pub const REGISTRATION_DELAY: Duration = Duration::from_secs(3);
 /// `AmazonSSMManagedInstanceCore` policy exists to grant.
 pub const REGISTRATION_ACTION: &str = "ssm:UpdateInstanceInformation";
 
+/// The current agent build, named where this module's callers reach for it
+/// (`InstanceInformation$AgentVersion`, pattern `^[0-9]{1,6}(\.[0-9]{1,6}){2,3}$`): the build a
+/// node whose guest is up to date runs, and the one every node's build is compared against to
+/// answer `InstanceInformation$IsLatestVersion`.
+///
+/// Which build a node actually reports is a fact of its GUEST — the release the image it was
+/// launched from bundles ([`super::agent_releases`]) — so this is the newest of that series
+/// rather than the version every node reports.
+pub const SSM_AGENT_VERSION: &str = super::agent_releases::LATEST_AGENT_VERSION;
+
 /// The service principal an instance profile's role has to trust for Amazon EC2 to act as
 /// it on an instance's behalf, so that the agent on the instance has credentials at all.
 pub const EC2_SERVICE_PRINCIPAL: &str = "ec2.amazonaws.com";
@@ -107,15 +121,6 @@ pub const AGENT_PROTOCOL: &str = "tcp";
 /// Manager endpoints" (AWS Systems Manager User Guide) — the agent's calls are HTTPS, so
 /// what the instance's groups have to let out is HTTPS.
 pub const AGENT_ENDPOINT_PORT: u16 = 443;
-
-/// The SSM Agent build the managed nodes of this emulator report
-/// (`InstanceInformation$AgentVersion`, pattern `^[0-9]{1,6}(\.[0-9]{1,6}){2,3}$`).
-///
-/// One build for the whole emulator, so every node reports the agent this emulator
-/// emulates rather than a per-node guess — and the version it reports is the latest one
-/// this emulator publishes, which is why a node also reports
-/// `InstanceInformation$IsLatestVersion`.
-pub const SSM_AGENT_VERSION: &str = "3.3.2746.0";
 
 /// The node status a registered node whose instance is running reports
 /// (`InstanceProperty$InstanceState`, the `InstanceStatus` attribute of the
@@ -275,6 +280,10 @@ struct ManagedInstance {
     registered_at: SystemTime,
     /// `InstanceInformation$PlatformType`, from the AMI the instance was launched from.
     platform_type: &'static str,
+    /// `InstanceInformation$AgentVersion`: the SSM Agent build this instance's guest holds,
+    /// which is the release the AMI it was launched from bundles
+    /// ([`super::agent_releases`]).
+    agent_version: &'static str,
     /// `InstanceInformation$IPAddress`: the instance's private address.
     ip_address: String,
     /// `InstanceInformation$ComputerName`: "the fully qualified host name of the managed
@@ -316,6 +325,7 @@ impl ManagedInstance {
             profile_arn,
             registered_at: registered_at(instance),
             platform_type: platform_type(store, instance),
+            agent_version: bundled_agent_version(store, instance, registered_at(instance)),
             ip_address: instance.private_ip.clone(),
             computer_name: instance.private_dns_name.clone(),
             instance_type: instance.instance_type.clone(),
@@ -349,15 +359,17 @@ impl ManagedInstance {
         let mut node =
             ManagedNodeRecord::registering(self.id, RESOURCE_TYPE_EC2_INSTANCE, self.registered_at);
         node.registered_from_instance = true;
-        // The node runs the one agent build this emulator publishes, which is therefore the
-        // latest one it knows of.
-        node.is_latest_version = Some(true);
+        // "Indicates whether the latest version of SSM Agent is running on your Linux managed
+        // node": the comparison of the build this node's guest holds with the newest release
+        // this emulator publishes, so a node launched from an image that bundles an earlier
+        // build reports that it is not running the latest one.
+        node.is_latest_version = Some(super::agent_releases::is_latest(self.agent_version));
         // The tags of the node are the INSTANCE's own tags: it is the same resource, which
         // is why a tag target selects it and why Patch Manager reads a node's patch group
         // off them ([`super::patch_runs::PATCH_GROUP_TAG_KEYS`]).
         node.tags = self.tags;
         let reported = &mut node.properties;
-        reported.agent_version = Some(SSM_AGENT_VERSION.to_string());
+        reported.agent_version = Some(self.agent_version.to_string());
         reported.iam_role = iam_role;
         reported.platform_type = Some(self.platform_type.to_string());
         reported.ip_address = Some(self.ip_address);
@@ -427,6 +439,35 @@ fn is_running(instance: &ec2::InstanceRecord, settled: Instant) -> bool {
         _ => instance.state,
     };
     state == ec2::InstanceStateName::Running
+}
+
+/// The SSM Agent build the guest of `instance` holds, for a node registering at
+/// `registered_at`: the release bundled in the AMI it was launched from, which is the build
+/// that was current when Amazon last published that image
+/// ([`super::agent_releases::last_published_at`]).
+///
+/// An instance whose image this emulator no longer holds reports the CURRENT build: the image
+/// record is the only place the publication instants live, and an image can be deregistered
+/// after an instance was launched from it, so nothing is left to say the guest is behind — the
+/// same reading [`platform_type`] takes of an absent image.
+fn bundled_agent_version(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    instance: &ec2::InstanceRecord,
+    registered_at: SystemTime,
+) -> &'static str {
+    let Some(image) = instance
+        .image_id
+        .as_deref()
+        .and_then(|image_id| store.images.get(image_id))
+    else {
+        return super::agent_releases::LATEST_AGENT_VERSION;
+    };
+    let published_at = super::agent_releases::last_published_at(
+        image.creation_date.as_deref(),
+        image.deprecation_time.as_deref(),
+        registered_at,
+    );
+    super::agent_releases::version_current_at(published_at, registered_at)
 }
 
 /// The `PlatformType` of the node `instance` registers: the platform of the AMI it was

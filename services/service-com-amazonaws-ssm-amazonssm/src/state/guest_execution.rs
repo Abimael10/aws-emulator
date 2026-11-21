@@ -219,7 +219,10 @@ fn resolved_line(text: &str, values: &BTreeMap<String, Vec<String>>) -> String {
 /// The session is given the resolver clients of the guest besides
 /// ([`super::guest_resolver`]): a script that resolves a name is answered by the DNS of the
 /// VPC the node is in, which is read ONCE here — before the store that owns the guest is
-/// taken — because answering a query reads three stores and running the script holds one.
+/// taken — because answering a query reads three stores and running the script holds one. The
+/// guest's package-query client travels the same way ([`super::guest_packages`]): which build
+/// of the agent its package database holds is a fact of the NODE, which this service holds and
+/// the service that owns the guest cannot read.
 ///
 /// The machine's own IDENTITY travels the same way: which role the instance's instance
 /// profile carries is a fact IAM holds, so that service's own records answer it
@@ -233,6 +236,7 @@ fn resolved_line(text: &str, values: &BTreeMap<String, Vec<String>>) -> String {
 pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     engine: &Eng,
     credentials: &::emulator_server::CredentialStore,
+    region: &str,
     instance_id: &str,
     commands: &[String],
     now: SystemTime,
@@ -241,6 +245,16 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
         engine, instance_id,
     )
     .map(super::guest_resolver::resolver_programs);
+    // ... and the package-query client ([`super::guest_packages`]), answered out of the AGENT
+    // BUILD this service holds for the node — read here, before the store that owns the guest
+    // is taken, because it is a read of this service's own node store.
+    let packages = agent_package_programs(engine, region, instance_id);
+    let supplied = match (resolver, packages) {
+        (Some(resolver), Some(packages)) => Some(::service_common::posix_shell_session::layered(
+            resolver, packages,
+        )),
+        (resolver, packages) => resolver.or(packages),
+    };
     let identity = ec2_store::GuestIdentity {
         iam_role_name: ec2_store::instance_profile_role_name(engine, instance_id),
         iam_role_credentials: ec2_store::instance_role_credentials(
@@ -257,5 +271,28 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     // and a script runs in the guest that boot brought up. Materialising them is EC2's own
     // write, through its own one-stop materialiser.
     store.materialize_due_transitions();
-    store.run_in_instance_guest_with(instance_id, commands, resolver, &identity)
+    store.run_in_instance_guest_with(instance_id, commands, supplied, &identity)
+}
+
+/// The package-query client for the guest of the node `instance_id` names in `region`, or
+/// `None` when this endpoint holds no such node — an instance that is no managed node has no
+/// agent this service reported a build for, and nothing here invents one.
+///
+/// The build and the machine's architecture are the NODE's own
+/// (`InstanceInformation$AgentVersion`, `InstanceProperty$Architecture`), so what the guest's
+/// package database answers and what this service reports for the node are one fact.
+fn agent_package_programs<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    instance_id: &str,
+) -> Option<Box<dyn ::service_common::posix_shell_session::EnvironmentPrograms>> {
+    let state = super::service_state(engine)?;
+    let store = state.lock();
+    let node = store.managed_node(region, instance_id)?;
+    let version = node.properties.agent_version.clone()?;
+    let architecture = node.properties.architecture.clone().unwrap_or_default();
+    Some(super::guest_packages::agent_package_programs(
+        &version,
+        &architecture,
+    ))
 }
