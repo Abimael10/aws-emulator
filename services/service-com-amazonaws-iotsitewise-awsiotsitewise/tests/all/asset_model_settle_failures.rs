@@ -753,3 +753,373 @@ async fn a_delete_is_refused_while_the_model_has_not_settled() {
         );
     }
 }
+
+/// The `externalId` the stranger model's metric carries, so a row can name that
+/// property by the second spelling `VariableValue.propertyId` documents ("If the
+/// property has an external ID, you can specify `externalId:` followed by the
+/// external ID") as well as by its server-assigned id.
+const STRANGER_METRIC_EXTERNAL_ID: &str = "stranger_average";
+
+/// A model the subject's declared hierarchy does NOT lead to, shaped exactly like
+/// the hierarchy's own child — a raw measurement and a metric over it — and
+/// settled before any row reads it.
+///
+/// This is what makes a row's reference well formed and leaves exactly one thing
+/// wrong with it: the property it names exists, carries the right kind, and is
+/// spelled as an identifier; it simply belongs to another model.
+///
+/// Answers `(the model's id, its metric's id, its measurement's id)`.
+async fn stranger_model(router: &MultiServiceRouter) -> (String, String, String) {
+    let (status, created) = create(
+        router,
+        json!({
+            "assetModelName": "Stranger",
+            "assetModelProperties": [
+                measurement("Power"),
+                {
+                    "name": "StrangerAverage",
+                    "dataType": "DOUBLE",
+                    "externalId": STRANGER_METRIC_EXTERNAL_ID,
+                    "type": {"metric": {
+                        "expression": "avg(v)",
+                        "variables": [{"name": "v", "value": {"propertyId": "Power"}}],
+                        "window": {"tumbling": {"interval": "1h"}},
+                    }},
+                },
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, 202, "the stranger model: got {status} {created}");
+    let model_id = created["assetModelId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no assetModelId in {created}"))
+        .to_string();
+    let settled = settled_asset_model_status(router, &model_id).await;
+    assert_eq!(
+        settled["state"].as_str(),
+        Some("ACTIVE"),
+        "the stranger model must settle ACTIVE before a row reads it, got {settled}"
+    );
+    let (status, described) = describe(router, &model_id).await;
+    assert_eq!(
+        status, 200,
+        "describing the stranger model: got {status} {described}"
+    );
+    let properties = &described["assetModelProperties"];
+    (
+        model_id,
+        property_id(properties, "StrangerAverage"),
+        property_id(properties, "Power"),
+    )
+}
+
+/// Which property a row's hierarchy-scoped variable aims its `propertyId` at.
+#[derive(Debug, Clone, Copy)]
+enum Aimed {
+    /// The METRIC of a model the declared hierarchy does not lead to, by its id.
+    StrangerMetric,
+    /// That same metric, by its `externalId:` alias.
+    StrangerMetricByExternalId,
+    /// The RAW measurement of that same outside model.
+    StrangerMeasurement,
+    /// The id of that model ITSELF rather than of a property: a well-formed
+    /// identifier that names no property in any scope.
+    StrangerModelItself,
+    /// The metric of the hierarchy's OWN child model: the control, which the graph
+    /// accepts.
+    OwnChildMetric,
+}
+
+#[tokio::test]
+async fn a_hierarchy_scoped_variable_aimed_outside_the_hierarchy_settles_failed() {
+    // Rows: which property of a model OUTSIDE the declared hierarchy the variable
+    // names, and in which of the spellings a reference into another model may use —
+    // beside the same definition aimed at the hierarchy's own child, which the
+    // graph accepts, so the suite cannot pass by failing everything.
+    let rows: Vec<(&str, Aimed, Option<&str>)> = vec![
+        (
+            "the metric of a model outside the hierarchy, by id",
+            Aimed::StrangerMetric,
+            Some(MISSING_CHILD_PROPERTY),
+        ),
+        (
+            "that same metric by its externalId alias",
+            Aimed::StrangerMetricByExternalId,
+            Some(MISSING_CHILD_PROPERTY),
+        ),
+        (
+            "the raw measurement of a model outside the hierarchy",
+            Aimed::StrangerMeasurement,
+            Some(MISSING_CHILD_PROPERTY),
+        ),
+        (
+            "the id of that outside model itself rather than of a property",
+            Aimed::StrangerModelItself,
+            Some(MISSING_CHILD_PROPERTY),
+        ),
+        (
+            "the metric of the hierarchy's own child",
+            Aimed::OwnChildMetric,
+            None,
+        ),
+    ];
+
+    for (case, aimed, expected) in rows {
+        // Each row stands on its own store, so the graph the rule is asked about
+        // holds only the two models the row put in it.
+        let router = router();
+        let (child, child_metric, _) = child_model(&router).await;
+        let (stranger, stranger_metric, stranger_measurement) = stranger_model(&router).await;
+        let label = match aimed {
+            Aimed::StrangerMetric => stranger_metric.clone(),
+            Aimed::StrangerMetricByExternalId => {
+                format!("externalId:{STRANGER_METRIC_EXTERNAL_ID}")
+            }
+            Aimed::StrangerMeasurement => stranger_measurement.clone(),
+            Aimed::StrangerModelItself => stranger.clone(),
+            Aimed::OwnChildMetric => child_metric.clone(),
+        };
+
+        let (status, answered) = create(
+            &router,
+            json!({
+                "assetModelName": "Fleet",
+                "assetModelProperties": [metric_property(
+                    "FleetAverage",
+                    json!({"propertyId": &label, "hierarchyId": HIERARCHY}),
+                )],
+                "assetModelHierarchies": [{"name": HIERARCHY, "childAssetModelId": &child}],
+            }),
+        )
+        .await;
+
+        // A reference the declared hierarchy SCOPES is never answered by the
+        // synchronous plane: whatever the child model turns out to expose, the
+        // create is accepted and nothing in its answer tells the rows apart.
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected the create to be accepted, got {status} {answered}"
+        );
+        assert_eq!(
+            answered["assetModelStatus"]["state"].as_str(),
+            Some("CREATING"),
+            "case {case:?}: expected the accepted create to report CREATING, got {answered}"
+        );
+        assert_eq!(
+            answered["assetModelStatus"]["error"],
+            Value::Null,
+            "case {case:?}: the accepted create carries no diagnosis yet, got {answered}"
+        );
+        let model_id = answered["assetModelId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no assetModelId in {answered}"))
+            .to_string();
+
+        let settled = settled_asset_model_status(&router, &model_id).await;
+        match expected {
+            None => {
+                assert_eq!(
+                    settled["state"].as_str(),
+                    Some("ACTIVE"),
+                    "case {case:?}: a reference the child model exposes settles ACTIVE, \
+                     got {settled}"
+                );
+                assert_eq!(
+                    settled["error"],
+                    Value::Null,
+                    "case {case:?}: a model that settled ACTIVE carries no error, got {settled}"
+                );
+            }
+            Some(diagnosis) => {
+                assert_eq!(
+                    settled["state"].as_str(),
+                    Some("FAILED"),
+                    "case {case:?}: expected the model to settle FAILED, got {settled}"
+                );
+                assert_eq!(
+                    settled["error"]["code"].as_str(),
+                    Some(VALIDATION_ERROR),
+                    "case {case:?}: expected a {VALIDATION_ERROR} diagnosis, got {settled}"
+                );
+                assert_eq!(
+                    settled["error"]["message"].as_str(),
+                    Some(diagnosis),
+                    "case {case:?}: expected {diagnosis:?}, got {settled}"
+                );
+                let listed = listed_status(&router, &model_id).await;
+                assert_eq!(
+                    listed.as_ref().and_then(|status| status["state"].as_str()),
+                    Some("FAILED"),
+                    "case {case:?}: a FAILED model stays in the listing, got {listed:?}"
+                );
+            }
+        }
+
+        // Either way the model is a stored model, describable with the definition
+        // the accepted write stated: the variable reports the label it named and
+        // the identifier of the hierarchy it was scoped to.
+        let (status, described) = describe(&router, &model_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the model stays describable, got {status} {described}"
+        );
+        let stored = &described["assetModelProperties"][0]["type"]["metric"]["variables"][0]
+            ["value"];
+        assert_eq!(
+            stored["propertyId"].as_str(),
+            Some(label.as_str()),
+            "case {case:?}: expected the stored variable to name {label:?}, got {described}"
+        );
+        let hierarchy_id = described["assetModelHierarchies"][0]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            stored["hierarchyId"].as_str(),
+            Some(hierarchy_id.as_str()),
+            "case {case:?}: expected the stored variable to name the declared hierarchy \
+             {hierarchy_id:?}, got {described}"
+        );
+    }
+}
+
+/// The `hierarchyId` label a row of the scoping table carries when it names no
+/// hierarchy the definition declares.
+const UNDECLARED_HIERARCHY: &str = "Absent";
+
+/// How a row of the scoping table scopes its variable — the ONE thing that differs
+/// between its rows, the `propertyId` being the same out-of-reach property
+/// throughout.
+#[derive(Debug, Clone, Copy)]
+enum Scoped {
+    /// No `hierarchyId` at all, so the reference resolves in the model being
+    /// written.
+    Unscoped,
+    /// A `hierarchyId` the definition declares no hierarchy for.
+    Undeclared,
+    /// The hierarchy the definition declares.
+    Declared,
+}
+
+#[tokio::test]
+async fn the_synchronous_variable_refusal_is_scoped_to_a_reference_the_request_puts_out_of_reach() {
+    // Rows: ONE propertyId — a metric of a model the subject's hierarchy does not
+    // lead to — scoped every way a variable can scope it. The request's OWN faults
+    // (a property the model being written does not hold, a hierarchy it does not
+    // declare) are answered synchronously; a reference a DECLARED hierarchy scopes
+    // is accepted and settled.
+    let rows: Vec<(&str, Scoped)> = vec![
+        ("no hierarchyId at all", Scoped::Unscoped),
+        (
+            "a hierarchyId naming no declared hierarchy",
+            Scoped::Undeclared,
+        ),
+        (
+            "a hierarchyId naming the declared hierarchy",
+            Scoped::Declared,
+        ),
+    ];
+
+    for (case, scoped) in rows {
+        let router = router();
+        let (child, child_metric, _) = child_model(&router).await;
+        let (_, stranger_metric, _) = stranger_model(&router).await;
+        let value = match scoped {
+            Scoped::Unscoped => json!({"propertyId": &stranger_metric}),
+            Scoped::Undeclared => json!({
+                "propertyId": &stranger_metric,
+                "hierarchyId": UNDECLARED_HIERARCHY,
+            }),
+            Scoped::Declared => json!({
+                "propertyId": &stranger_metric,
+                "hierarchyId": HIERARCHY,
+            }),
+        };
+        let body = json!({
+            "assetModelName": "Fleet",
+            "assetModelProperties": [metric_property("FleetAverage", value)],
+            "assetModelHierarchies": [{"name": HIERARCHY, "childAssetModelId": &child}],
+        });
+        let (status, answered) = create(&router, body).await;
+
+        let expected_refusal = match scoped {
+            Scoped::Unscoped => Some(format!("Property {stranger_metric} does not exist.")),
+            Scoped::Undeclared => Some(format!(
+                "AssetModelHierarchy {UNDECLARED_HIERARCHY} does not exist."
+            )),
+            Scoped::Declared => None,
+        };
+
+        let Some(refusal) = expected_refusal else {
+            assert_eq!(
+                status, 202,
+                "case {case:?}: a reference a declared hierarchy scopes is accepted, \
+                 got {status} {answered}"
+            );
+            assert_eq!(
+                answered["assetModelStatus"]["state"].as_str(),
+                Some("CREATING"),
+                "case {case:?}: expected the accepted create to report CREATING, got {answered}"
+            );
+            let model_id = answered["assetModelId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no assetModelId in {answered}"))
+                .to_string();
+            let settled = settled_asset_model_status(&router, &model_id).await;
+            assert_eq!(
+                settled["state"].as_str(),
+                Some("FAILED"),
+                "case {case:?}: expected the model to settle FAILED, got {settled}"
+            );
+            assert_eq!(
+                settled["error"]["code"].as_str(),
+                Some(VALIDATION_ERROR),
+                "case {case:?}: expected a {VALIDATION_ERROR} diagnosis, got {settled}"
+            );
+            assert_eq!(
+                settled["error"]["message"].as_str(),
+                Some(MISSING_CHILD_PROPERTY),
+                "case {case:?}: expected {MISSING_CHILD_PROPERTY:?}, got {settled}"
+            );
+            continue;
+        };
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the request's own fault to be refused, \
+             got {status} {answered}"
+        );
+        assert_eq!(
+            error_code(&answered),
+            "InvalidRequestException",
+            "case {case:?}: unexpected error code in {answered}"
+        );
+        assert_eq!(
+            answered["message"].as_str(),
+            Some(refusal.as_str()),
+            "case {case:?}: expected {refusal:?}, got {answered}"
+        );
+
+        // A refused create stored no asset model, so the name it asked for is still
+        // free: the identical definition with the variable inside its scope takes
+        // it.
+        let (status, created) = create(
+            &router,
+            json!({
+                "assetModelName": "Fleet",
+                "assetModelProperties": [metric_property(
+                    "FleetAverage",
+                    json!({"propertyId": &child_metric, "hierarchyId": HIERARCHY}),
+                )],
+                "assetModelHierarchies": [{"name": HIERARCHY, "childAssetModelId": &child}],
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: the refused create must leave no asset model behind, \
+             got {status} {created}"
+        );
+    }
+}
