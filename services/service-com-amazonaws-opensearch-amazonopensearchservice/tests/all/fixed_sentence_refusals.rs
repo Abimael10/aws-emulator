@@ -19,25 +19,29 @@
 //! * a grant or a withdrawal of VPC endpoint access to a domain the service cannot serve
 //!   one for is refused with the deliberately NON-COMMITTAL sentence, which does not
 //!   disclose whether a domain of that name exists — asserted over a table of names, on
-//!   both operations, with the sentence checked to carry no part of the name;
+//!   both operations, with the sentence checked to carry no part of the name; and, because
+//!   that sentence has NO variable part at all, asserted to be the same refusal whatever
+//!   principal the request names, and to be a different sentence from the service's
+//!   ordinary domain-lookup refusal, which does name the domain it could not resolve;
 //! * an upgrade the published relation does not offer states each version in the service's
 //!   LEGACY engine-version form: an Elasticsearch version by its bare release, with the
 //!   engine name the `VersionString` carries dropped, and an OpenSearch version with that
 //!   name kept, while the version the domain runs is stated as its record declares it —
 //!   asserted over targets of both engine lines.
 
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::control_plane_refusal_wording::message;
 use super::domain_lifecycle::{
-    create_baseline, error_code, Emulator, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
+    create_baseline, error_code, Answer, Emulator, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
 };
+use super::missing_resource_status::absent_domains;
 use super::package_associations::available_packages;
 use super::package_dissociation::{associate, dissociate_many};
 use super::scheduled_action_updates::{body as reschedule_body, update as reschedule};
 use super::scheduled_actions::{base_instant, seed};
 use super::upgrade_history::{settled_domain, upgrade};
-use super::vpc_endpoint_access::{authorize, created_domain};
+use super::vpc_endpoint_access::{authorize, created_domain, service_principal};
 use super::vpc_endpoint_access_revocation::revoke;
 
 /// The sentences under test, spelled out here rather than read from the implementation:
@@ -296,6 +300,194 @@ async fn vpc_endpoint_access_on_a_domain_it_cannot_serve_states_the_non_committa
          with {:?}",
         withdrawn.status, withdrawn.body
     );
+}
+
+/// One row per form the `Account`/`Service` pair of a VPC endpoint access call can take,
+/// with the identity that row names.
+///
+/// `Account` is `AWSAccount`, `pattern ^[0-9]+$` with no length bound, so the rows differ
+/// in the digits and the length of the id; `Service` is `AWSServicePrincipal`, whose only
+/// declared value [`service_principal`] states, and `ServiceOptions` may ride along with
+/// it. The refusal below is the same for every one of these, so none of these values may
+/// appear in it.
+fn vpc_access_principals() -> Vec<(&'static str, Value, &'static str)> {
+    vec![
+        (
+            "a 12-digit account",
+            json!({ "Account": "123456789012" }),
+            "123456789012",
+        ),
+        ("a one-digit account", json!({ "Account": "7" }), "7"),
+        (
+            "an account id longer than twelve digits",
+            json!({ "Account": "98765432109876543210" }),
+            "98765432109876543210",
+        ),
+        (
+            "the service principal",
+            json!({ "Service": service_principal() }),
+            service_principal(),
+        ),
+        (
+            "the service principal with its service options",
+            json!({
+                "Service": service_principal(),
+                "ServiceOptions": { "SupportedRegions": ["eu-west-1"] },
+            }),
+            service_principal(),
+        ),
+    ]
+}
+
+/// Assert `answer` is the non-committal refusal of a VPC endpoint access call: the status
+/// and the error code this service answers a missing resource on, the fixed sentence as the
+/// WHOLE message, and nothing of the request in it — neither the domain the call addressed
+/// (`name`) nor the principal it named (`identity`).
+///
+/// The ONE statement of those assertions for the rows below, so the two rules asserted over
+/// them cannot drift apart on what the refusal is.
+fn assert_non_committal_refusal(answer: &Answer, case: &str, name: &str, identity: &str) {
+    assert_eq!(
+        (answer.status, error_code(answer).as_str()),
+        (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+        "case {case}: expected the recorded missing-resource refusal, got {} / {} with {:?}",
+        answer.status,
+        error_code(answer),
+        answer.body
+    );
+    assert_eq!(
+        message(answer),
+        DOMAIN_UNAVAILABLE_FOR_VPC_ENDPOINT,
+        "case {case}: expected {DOMAIN_UNAVAILABLE_FOR_VPC_ENDPOINT:?}, got {:?}",
+        answer.body
+    );
+    for value in [name, identity] {
+        assert!(
+            !message(answer).contains(value),
+            "case {case}: expected the refusal to carry no {value:?}, got {:?}",
+            answer.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_vpc_endpoint_access_refusal_is_the_same_whatever_the_request_names() {
+    let emulator = Emulator::new();
+    // A domain this account DOES hold, so what the rows below exercise is the name each
+    // one names rather than an empty store.
+    let served = "vpc-access-served";
+    created_domain(&emulator, served).await;
+
+    // The refusal the first row was answered with, which every later row has to be
+    // answered with too. The sentence itself is asserted against its own text on every
+    // row, so this comparison pins the request-independence ON TOP of the wording rather
+    // than standing in for it: the message has no variable part, so two requests that
+    // differ in the domain they address and in the principal they name are refused
+    // identically.
+    let mut first: Option<(String, Value)> = None;
+
+    // The names come from the crate's one table of names no domain of this account
+    // answers to, so this suite states no table of its own.
+    for name in absent_domains() {
+        for (principal, body, identity) in vpc_access_principals() {
+            // Both calls that CHANGE a domain's access set resolve the domain first, so
+            // both state the one refusal.
+            for (operation, answer) in [
+                (
+                    "AuthorizeVpcEndpointAccess",
+                    authorize(&emulator, name, body.clone()).await,
+                ),
+                (
+                    "RevokeVpcEndpointAccess",
+                    revoke(&emulator, name, body.clone()).await,
+                ),
+            ] {
+                let case = format!("{operation}({name:?}) naming {principal}");
+                assert_non_committal_refusal(&answer, &case, name, identity);
+                match &first {
+                    None => first = Some((case.clone(), answer.body.clone())),
+                    Some((earlier, expected)) => assert_eq!(
+                        &answer.body, expected,
+                        "case {case}: expected the refusal {earlier} was answered with \
+                         ({expected:?}), got {:?}",
+                        answer.body
+                    ),
+                }
+            }
+        }
+    }
+
+    // The boundary of the same rule: a domain the service DOES hold is served through both
+    // calls, so what the rows above state is about the name and not about the operation.
+    for (operation, answer) in [
+        (
+            "AuthorizeVpcEndpointAccess",
+            authorize(&emulator, served, json!({ "Account": "123456789012" })).await,
+        ),
+        (
+            "RevokeVpcEndpointAccess",
+            revoke(&emulator, served, json!({ "Account": "123456789012" })).await,
+        ),
+    ] {
+        assert_eq!(
+            answer.status, 200,
+            "case {operation}({served:?}): expected the served domain to be accepted, got {} \
+             with {:?}",
+            answer.status, answer.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_vpc_endpoint_access_refusal_is_not_the_ordinary_domain_lookup_sentence() {
+    let emulator = Emulator::new();
+
+    for name in absent_domains() {
+        // The operation that resolves a domain for its OWN sake says which name it could
+        // not resolve: that is the service's ordinary domain-lookup refusal, and it names
+        // the domain.
+        let described = emulator.describe(name).await;
+        let lookup = format!("Domain not found: {name}");
+        let case = format!("DescribeDomain({name:?})");
+        assert_eq!(
+            (described.status, error_code(&described).as_str()),
+            (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+            "case {case}: expected the recorded missing-resource refusal, got {} / {} with {:?}",
+            described.status,
+            error_code(&described),
+            described.body
+        );
+        assert_eq!(
+            message(&described),
+            lookup,
+            "case {case}: expected {lookup:?}, got {:?}",
+            described.body
+        );
+        assert!(
+            message(&described).contains(name),
+            "case {case}: expected the domain lookup to name {name:?}, so the two refusals are \
+             told apart by their text, got {:?}",
+            described.body
+        );
+
+        // The VPC endpoint access calls refuse the SAME name with the non-committal
+        // sentence instead, so neither of them is the domain lookup above — a client
+        // matching on the text can tell "the domain is gone" from "this domain cannot be
+        // served an endpoint, or you may not act on it".
+        for (operation, answer) in [
+            (
+                "AuthorizeVpcEndpointAccess",
+                authorize(&emulator, name, json!({ "Account": "123456789012" })).await,
+            ),
+            (
+                "RevokeVpcEndpointAccess",
+                revoke(&emulator, name, json!({ "Account": "123456789012" })).await,
+            ),
+        ] {
+            let case = format!("{operation}({name:?})");
+            assert_non_committal_refusal(&answer, &case, name, "123456789012");
+        }
+    }
 }
 
 #[tokio::test]
