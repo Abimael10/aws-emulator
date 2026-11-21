@@ -225,6 +225,11 @@ pub use sessions::*;
 mod session_endpoint;
 pub use session_endpoint::*;
 
+/// The IDLE TIMER a session's own `SessionIdleTimeoutInMinutes` is — when a session nobody
+/// touches ends itself — split out and re-exported the same way.
+mod session_idle_timeout;
+pub use session_idle_timeout::*;
+
 /// The bootstrap actions a cluster was launched with — what `ListBootstrapActions`
 /// reports, and the page token it pages on — split out and re-exported the same way.
 mod bootstrap_actions;

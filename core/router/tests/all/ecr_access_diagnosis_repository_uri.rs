@@ -5,18 +5,25 @@
 //! Region that hold it.
 //!
 //! RULE: `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
-//! container image `push` and `pull` operations") is the URI of the repository in the registry
-//! that HOLDS it — the host of that registry, `<registryId>.dkr.ecr.<region>.<the DNS suffix
-//! that Region's partition is served under>`, followed by `/` and the repository's own name.
-//! `registryId` is "the Amazon Web Services account ID associated with the registry that
-//! contains the repository", the Region label is the Region of the registry the repository
-//! lives in, `dkr` and `ecr` and their ordering are fixed text (the registry URL format the
-//! model states for a registry — `AuthorizationData$proxyEndpoint`: "The Amazon ECR registry
-//! URL format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`"), and the path is
-//! exactly `repositoryName`. That is what makes the value self-describing: whoever reads it
-//! — here a diagnosis walking from a service to the repository behind its image — recovers
-//! the owning account, the Region and the repository name back out of it, and composes a
-//! `docker` reference on it.
+//! container image `push` and `pull` operations") is an ADDRESS a container client DIALS, so
+//! its authority is one this emulator answers registry requests on — never a name under a
+//! zone AWS publishes its own endpoints in, which resolves nowhere near this process and
+//! would send a push or a pull out of the emulated environment with the credential the client
+//! holds — followed by `/` and the repository's own name, which is exactly `repositoryName`.
+//! WHICH registry holds the repository is reported beside the URI on the very response that
+//! carries it, as labels built from the stored record: `registryId` is "the Amazon Web
+//! Services account ID associated with the registry that contains the repository" and
+//! `repositoryArn` names the Region. That is what makes the read self-describing: whoever
+//! reads it — here a diagnosis walking from a service to the repository behind its image —
+//! recovers the owning account, the Region and the repository name, and composes a `docker`
+//! reference on an address it can actually reach.
+//!
+//! The owning service states that rule once, with the reasoning behind it, in
+//! `service-com-amazonaws-ecr-amazonec2containerregistry-v20150921/src/state/registry_address.rs`,
+//! and the sibling suites beside this one read the same one
+//! (`cloudformation_registry_backed_task_definition.rs`'s `announced_repository_path`, which
+//! `cloudformation_published_repository_uri_agrees_with_ecr.rs` reads the stack properties
+//! through).
 //!
 //! Three services have to agree for a diagnosis to reach that conclusion, which is why this
 //! suite lives beside the router: Amazon ECS holds the service and the revision whose
@@ -30,21 +37,17 @@
 //!
 //! The rows differ along what the rule generalises over: which Region's registry holds the
 //! repository (the service's own Region, another Region of the same partition, a Region of
-//! another partition whose registries carry that partition's own DNS suffix, and a GovCloud
-//! Region, which publishes the commercial one), the form of the repository's name
+//! another partition, and a GovCloud Region), the form of the repository's name
 //! (namespaced, flat, the shortest the pattern allows, and one carrying the punctuation it
 //! allows), and how the revision's image addresses it (a tag, a digest, and no tag at all).
 //! Every service is created wanting no task, because what is under test is the read path a
 //! diagnosis takes and not a placement.
 //!
-//! The expected composition — the fixed labels and the partition DNS suffixes — is written
-//! out below rather than taken from a sibling suite's helper
-//! (`cloudformation_published_repository_uri_agrees_with_ecr.rs` keeps one for the stack
-//! properties it checks, and the owning crate's `repository_registry_uri.rs` one for the
-//! registry's own reads), for the reason each of those states too: the expectation is spelled
-//! from the documented source named on it, so a value composed with the wrong label or suffix
-//! fails the suite instead of agreeing with another suite's copy of the same mistake. No
-//! suite here depends on another suite's expectations.
+//! The expectation — the zones an announced address must stay out of — is written out below
+//! rather than taken from a sibling suite's helper, for the reason each of those states too:
+//! it is spelled from the documented source named on it, so an address that slips into a zone
+//! AWS serves fails this suite instead of agreeing with another suite's copy of the same
+//! mistake. No suite here depends on another suite's expectations.
 
 use std::sync::Arc;
 
@@ -97,28 +100,14 @@ const MANIFEST: &str = concat!(
     r#""layers":[]}"#
 );
 
-/// The two fixed labels every Amazon ECR registry host carries between the owning account's
-/// id and the registry's Region, spelled out here rather than imported so a value that loses
-/// them fails this suite.
+/// The DNS suffixes AWS publishes its OWN endpoints under, spelled out here rather than
+/// imported so that an address a service of this emulator announces slipping into one of them
+/// fails this suite.
 ///
-/// Source: the registry URL format `AuthorizationData$proxyEndpoint` documents,
-/// `https://aws_account_id.dkr.ecr.region.amazonaws.com`.
-const REGISTRY_HOST_LABELS: [&str; 2] = ["dkr", "ecr"];
-
-/// The DNS suffix the registries of each Region below are served under: the `dnsSuffix` that
-/// Region's partition publishes in the AWS SDK partition metadata (`endpoints.json`) — the
-/// commercial partition's being the one the registry URL format above spells out, and
-/// GovCloud publishing that same suffix.
-///
-/// Spelled out here rather than imported, and listing a Region of a partition the issue's
-/// recording never named (`cn-north-1`, served under `amazonaws.com.cn`), so a URI built on
-/// one hard-wired suffix fails this suite.
-const REGION_DNS_SUFFIXES: [(&str, &str); 4] = [
-    ("us-west-2", "amazonaws.com"),
-    ("ap-southeast-2", "amazonaws.com"),
-    ("us-gov-east-1", "amazonaws.com"),
-    ("cn-north-1", "amazonaws.com.cn"),
-];
+/// Source: `service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`, the tree's one
+/// list of them.
+const AWS_ENDPOINT_DNS_SUFFIXES: [&str; 4] =
+    [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"];
 
 /// How a row's revision addresses the image in the repository behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,61 +315,26 @@ fn string(case: &str, body: &Value, pointer: &str) -> String {
         .to_string()
 }
 
-/// The DNS suffix [`REGION_DNS_SUFFIXES`] records for `region`, or a panic: a row naming a
-/// Region this suite did not write the suffix of would otherwise assert nothing.
-fn dns_suffix(region: &str) -> &'static str {
-    REGION_DNS_SUFFIXES
+/// The authority of an announced repository URI, panicking with the case and the value when
+/// it is not one a client of this emulator can dial: an authority followed by a path, whose
+/// host is NOT under a zone AWS publishes its own endpoints in
+/// ([`AWS_ENDPOINT_DNS_SUFFIXES`]) — such a name resolves nowhere near this process, or at
+/// genuine AWS infrastructure, which is the one thing the announced address must never be.
+fn announced_authority(case: &str, authority: &str) -> String {
+    assert!(
+        !authority.is_empty(),
+        "case {case:?}: expected an announced registry authority, got {authority:?}"
+    );
+    let host = authority.to_ascii_lowercase();
+    let names_aws = AWS_ENDPOINT_DNS_SUFFIXES
         .iter()
-        .find(|(named, _)| *named == region)
-        .map(|(_, suffix)| *suffix)
-        .unwrap_or_else(|| panic!("this suite holds no DNS suffix for the Region {region:?}"))
-}
-
-/// What a registry host NAMES, read off an image reference's authority the way a client that
-/// parses `repositoryUri` reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RegistryHost {
-    /// The first label: the account whose registry the host names.
-    registry_id: String,
-    /// The Region that registry serves.
-    region: String,
-    /// The zone the registry is served under, which is the partition's own DNS suffix.
-    suffix: String,
-}
-
-/// Read `authority` as an Amazon ECR registry host, panicking with the case and the value
-/// when it is not one: the account label, the two fixed labels, the Region label, and the
-/// partition's DNS suffix — and no port, because a registry host is a NAME a reader resolves
-/// rather than a socket one run of a process happened to be bound to.
-fn registry_host_parts(case: &str, authority: &str) -> RegistryHost {
+        .any(|suffix| host.ends_with(suffix));
     assert!(
-        !authority.contains(':'),
-        "case {case:?}: expected a registry host with no port, got {authority:?}"
+        !names_aws,
+        "case {case:?}: expected an authority this emulator answers on, got the AWS-served \
+         name {authority:?}"
     );
-    let labels: Vec<&str> = authority.splitn(5, '.').collect();
-    assert_eq!(
-        labels.len(),
-        5,
-        "case {case:?}: expected a registry host of the form \
-         <registryId>.dkr.ecr.<region>.<dnsSuffix>, got {authority:?}"
-    );
-    assert_eq!(
-        [labels[1], labels[2]],
-        REGISTRY_HOST_LABELS,
-        "case {case:?}: expected the fixed registry labels {REGISTRY_HOST_LABELS:?} in \
-         {authority:?}"
-    );
-    assert!(
-        labels[0].len() == 12 && labels[0].bytes().all(|byte| byte.is_ascii_digit()),
-        "case {case:?}: expected a 12-digit account id as the first label of {authority:?}, \
-         got {:?}",
-        labels[0]
-    );
-    RegistryHost {
-        registry_id: labels[0].to_string(),
-        region: labels[3].to_string(),
-        suffix: labels[4].to_string(),
-    }
+    authority.to_string()
 }
 
 /// Split a container image reference the way a reader of the revision's `image` does: the
@@ -660,10 +614,11 @@ async fn the_ecr_access_diagnosis_reads_a_uri_that_addresses_the_repository_it_n
              got {inline_names:?}"
         );
 
-        // Step six: the repository behind the image, read in the Region its own reference
-        // names — which is the first thing the URI has to give back.
+        // Step six: the repository behind the image, read in the Region whose registry holds
+        // it — the Region the row's create was made in, and the one the repository's own ARN
+        // must then name.
         let (reference_authority, reference_name) = reference_parts(case, &image);
-        let reference_host = registry_host_parts(case, &reference_authority);
+        let reference_host = announced_authority(case, &reference_authority);
         assert_eq!(
             reference_name, row.repository,
             "case {case:?}: expected the reference's path to be the repository name, got \
@@ -671,7 +626,7 @@ async fn the_ecr_access_diagnosis_reads_a_uri_that_addresses_the_repository_it_n
         );
         let answered = ecr(
             &router,
-            &reference_host.region,
+            row.region,
             "DescribeRepositories",
             json!({ "repositoryNames": [reference_name] }),
             case,
@@ -680,48 +635,46 @@ async fn the_ecr_access_diagnosis_reads_a_uri_that_addresses_the_repository_it_n
         let reported_name = string(case, &answered, "/repositories/0/repositoryName");
         let reported_registry = string(case, &answered, "/repositories/0/registryId");
         let reported_uri = string(case, &answered, "/repositories/0/repositoryUri");
+        let reported_arn = string(case, &answered, "/repositories/0/repositoryArn");
 
-        // What the read has to establish: the URI addresses THIS repository, in the caller's
-        // account, in the Region that holds it — every label composed from the record.
-        let expected = format!(
-            "{reported_registry}.{}.{}.{}.{}/{reported_name}",
-            REGISTRY_HOST_LABELS[0],
-            REGISTRY_HOST_LABELS[1],
-            row.region,
-            dns_suffix(row.region)
-        );
+        // What the read has to establish: the URI ADDRESSES this repository — an authority a
+        // client of this emulator can dial, carrying the repository's own name as its path —
+        // and the labels reported beside it name the account and the Region that hold it.
         assert_eq!(
-            reported_uri, expected,
-            "case {case:?}: expected DescribeRepositories to report the URI {expected:?}, got \
-             {reported_uri:?}"
+            reported_name, row.repository,
+            "case {case:?}: expected the read to report the repository it was asked for, got \
+             {answered}"
         );
         let (authority, name) = reference_parts(case, &reported_uri);
-        let host = registry_host_parts(case, &authority);
+        let host = announced_authority(case, &authority);
         assert_eq!(
-            host.registry_id, caller_account,
-            "case {case:?}: expected the URI to name the caller's account {caller_account:?}, \
-             got {reported_uri:?}"
+            name, row.repository,
+            "case {case:?}: expected the URI's path to be the repository name, got \
+             {reported_uri:?}"
         );
         assert_eq!(
             reported_registry, caller_account,
             "case {case:?}: expected the repository's registryId to be the caller's account \
              {caller_account:?}, got {reported_registry:?}"
         );
+        // The ARN is the label that says WHICH registry holds it: the account whose registry
+        // it is, the Region that registry serves, and the repository's own name.
+        let arn_fields: Vec<&str> = reported_arn.split(':').collect();
         assert_eq!(
-            host.region, row.region,
-            "case {case:?}: expected the URI to name the Region holding the repository, got \
-             {reported_uri:?}"
+            arn_fields.get(3).copied(),
+            Some(row.region),
+            "case {case:?}: expected the ARN to name the Region holding the repository, got \
+             {reported_arn:?}"
         );
         assert_eq!(
-            host.suffix,
-            dns_suffix(row.region),
-            "case {case:?}: expected the URI to carry the DNS suffix of the Region's \
-             partition, got {reported_uri:?}"
+            arn_fields.get(4).copied(),
+            Some(caller_account.as_str()),
+            "case {case:?}: expected the ARN to name the caller's account \
+             {caller_account:?}, got {reported_arn:?}"
         );
-        assert_eq!(
-            name, row.repository,
-            "case {case:?}: expected the URI's path to be the repository name, got \
-             {reported_uri:?}"
+        assert!(
+            reported_arn.ends_with(&format!("repository/{}", row.repository)),
+            "case {case:?}: expected the ARN to name the repository, got {reported_arn:?}"
         );
 
         // And it is the same URI whichever path reported it: the one the create announced,
@@ -739,8 +692,8 @@ async fn the_ecr_access_diagnosis_reads_a_uri_that_addresses_the_repository_it_n
         );
         assert_eq!(
             reference_host, host,
-            "case {case:?}: expected the reference and the reported URI to name one registry, \
-             got {image:?} and {reported_uri:?}"
+            "case {case:?}: expected the reference and the reported URI to be addressed to one \
+             registry, got {image:?} and {reported_uri:?}"
         );
     }
 }

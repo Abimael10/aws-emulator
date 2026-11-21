@@ -9,7 +9,8 @@
 //! On a cluster that does carry it, `StartSession` records a session — "when a session is
 //! first created, it enters the `SUBMITTED` state" (`StartSessionOutput$State` doc, Smithy
 //! model) — which `GetSession` and `ListSessions` then report, newest first, and which the
-//! clock walks on to `STARTING` and `STARTED`.
+//! clock walks on to `STARTING`, `STARTED` and then `IDLE` — a session that is up and
+//! running no work.
 //!
 //! THE IDENTITY HALF of that rule: each accepted `StartSession` records a session of its
 //! OWN — its own minted id and its own ARN — and answers that recorded session, except
@@ -482,15 +483,16 @@ async fn a_session_enabled_cluster_starts_sessions_and_reports_them() {
         "a repeated ClientRequestToken starts no second session, got {listed}"
     );
 
-    // The clock walks a session on: `STARTING` after one span, `STARTED` after two —
-    // polled for rather than waited out. The state filter then partitions the sessions by
-    // the state they have reached.
+    // The clock walks a session on: `STARTING` after one span, `STARTED` after two, and
+    // `IDLE` — up and running no work, where the walk settles — after three, polled for
+    // rather than waited out. The state filter then partitions the sessions by the state
+    // they have reached.
     for (label, id) in &started {
-        let session = await_session_state(&emr, &cluster_id, id, label, "STARTED").await;
+        let session = await_session_state(&emr, &cluster_id, id, label, "IDLE").await;
         let started_at = session["StartedAt"].as_f64().unwrap_or_else(|| {
             panic!(
-                "case {label:?}: a STARTED session reports when it entered that state, got \
-                 {session}"
+                "case {label:?}: a session that has started reports when it entered that \
+                 state, got {session}"
             )
         });
         // "The date and time that the session entered the STARTED state"
@@ -506,9 +508,10 @@ async fn a_session_enabled_cluster_starts_sessions_and_reports_them() {
         );
     }
     for (states, expected) in [
-        (json!(["STARTED"]), started.len()),
+        (json!(["IDLE"]), started.len()),
         (json!(["SUBMITTED"]), 0),
-        (json!(["SUBMITTED", "STARTED"]), started.len()),
+        (json!(["STARTED"]), 0),
+        (json!(["SUBMITTED", "IDLE"]), started.len()),
         (json!(["TERMINATED"]), 0),
         // A filter that names no state narrows nothing, the way an absent one does.
         (json!([]), started.len()),
@@ -616,13 +619,79 @@ async fn a_cluster_launches_on_an_amazon_emr_spark_release() {
     );
 }
 
+/// The sentence Amazon EMR refuses a start on a cluster that is not up with: fixed text
+/// around two variable parts, the cluster the request named and the state that cluster is in
+/// at the call.
+fn not_running_sentence(cluster_id: &str, state: &str) -> String {
+    format!(
+        "StartSession is not supported for cluster '{cluster_id}' in state {state}. \
+         The cluster must be in RUNNING or WAITING state."
+    )
+}
+
 /// A cluster that carries the surface but is not up: "the cluster must be in the RUNNING or
-/// WAITING state" (`StartSession` doc), so a session cannot be started on one that is
-/// shutting down — and the refusal names the state it is in.
+/// WAITING state" (`StartSession` doc), so a session cannot be started on one that has not
+/// come up yet or that is shutting down — and the refusal names the cluster and the state it
+/// is in.
+///
+/// The rows span the sides of the cluster's own walk a start can land on: one that has not
+/// reached a state accepting sessions yet, and one that is on its way out — each held to the
+/// sentence for every state it could be in when the call arrived, since a row's cluster is
+/// walked by the clock and not by the case.
 #[tokio::test]
 async fn a_session_is_not_started_on_a_cluster_that_is_not_running() {
+    /// Hold a start on `cluster_id` to the refusal, naming the cluster and whichever of
+    /// `states` the cluster is in when the call arrives — a row's cluster is walked by the
+    /// clock, not by the case, so every state it could be in is a sentence the row accepts.
+    async fn assert_start_refused(emr: &Emr, case: &str, cluster_id: &str, states: &[&str]) {
+        let (status, payload) = emr
+            .call("StartSession", json!({ "ClusterId": cluster_id }))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a cluster that is not up starts no session, got {status} with \
+             {payload}"
+        );
+        let said = message(case, &payload);
+        let wanted: Vec<String> = states
+            .iter()
+            .map(|state| not_running_sentence(cluster_id, state))
+            .collect();
+        assert!(
+            wanted.contains(&said),
+            "case {case:?}: expected one of {wanted:?}, got {said:?}"
+        );
+
+        // The listing still answers for that cluster: its sessions are a list, and it has
+        // none.
+        let listed = emr
+            .ok("ListSessions", json!({ "ClusterId": cluster_id }))
+            .await;
+        assert_eq!(
+            at(&listed, &["Sessions"]).as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: a session-enabled cluster with no sessions lists none, got \
+             {listed}"
+        );
+    }
+
     let emr = Emr::new();
-    let cluster_id = ready_cluster(
+
+    // Coming up: the launch has been accepted and nothing has waited for it, so the cluster
+    // is in one of the phases it passes through on the way to a state that accepts sessions.
+    let coming_up = emr
+        .run_job_flow(launch_request("coming up", Some(true)))
+        .await;
+    assert_start_refused(
+        &emr,
+        "a cluster still coming up",
+        &coming_up,
+        &["STARTING", "BOOTSTRAPPING"],
+    )
+    .await;
+
+    // On its way out: a cluster that came up and was then terminated.
+    let going_down = ready_cluster(
         &emr,
         "terminating",
         launch_request("terminating", Some(true)),
@@ -630,32 +699,16 @@ async fn a_session_is_not_started_on_a_cluster_that_is_not_running() {
     .await;
     emr.ok(
         "TerminateJobFlows",
-        json!({ "JobFlowIds": [cluster_id.clone()] }),
+        json!({ "JobFlowIds": [going_down.clone()] }),
     )
     .await;
-
-    let (status, payload) = emr
-        .call("StartSession", json!({ "ClusterId": cluster_id.clone() }))
-        .await;
-    assert_eq!(
-        status, 400,
-        "a cluster that is not up starts no session, got {status} with {payload}"
-    );
-    let said = message("a terminating cluster", &payload);
-    assert!(
-        said.contains(&cluster_id) && said.contains("RUNNING") && said.contains("WAITING"),
-        "the refusal names the cluster and the states a session needs, got {said:?}"
-    );
-
-    // The listing still answers for that cluster: its sessions are a list, and it has none.
-    let listed = emr
-        .ok("ListSessions", json!({ "ClusterId": cluster_id.clone() }))
-        .await;
-    assert_eq!(
-        at(&listed, &["Sessions"]).as_array().map(Vec::len),
-        Some(0),
-        "a session-enabled cluster with no sessions lists none, got {listed}"
-    );
+    assert_start_refused(
+        &emr,
+        "a cluster on its way out",
+        &going_down,
+        &["TERMINATING", "TERMINATED"],
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------

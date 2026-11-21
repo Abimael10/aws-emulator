@@ -82,16 +82,24 @@ pub fn is_terminal_session_state(state: &str) -> bool {
 }
 
 /// The states a session passes through, in order, from the request that created it to the
-/// state it is started in.
+/// state it settles in once it is up.
 ///
 /// The first is the one the model fixes ("when a session is first created, it enters the
 /// SUBMITTED state", `StartSessionOutput$State` doc); each move after it is owed
 /// [`SESSION_PHASE_SPAN`] after the one before, so a caller that reads the session right
 /// after `StartSession` sees the state the call answered rather than the end of the walk.
+///
+/// The walk ends in `IDLE` rather than `STARTED`: `BUSY` is a session that is running work,
+/// and no statement is ever submitted to a session of this emulator (see the module docs),
+/// so a session that has started is running nothing — which is what `IDLE` is, and what
+/// `Session$IdleSince` ("the date and time that the session last entered the IDLE state")
+/// is reported from. Both of the last two are ready states
+/// ([`is_ready_session_state`]), so the session accepts a client throughout.
 pub const SESSION_START_PROGRESSION: &[&str] = &[
     session_state::SUBMITTED,
     session_state::STARTING,
     session_state::STARTED,
+    session_state::IDLE,
 ];
 
 /// How long each phase of a session's start lasts.
@@ -159,14 +167,14 @@ pub fn sessions_not_enabled(cluster_id: &str) -> InvalidRequestException {
 
 /// How `StartSession` refuses a cluster that is not up.
 ///
-/// AWS publishes no wording for it, so the text is built the way this service words its
-/// other state refusals: the cluster the request named, the state it is actually in, and
-/// the states the operation accepts ("the cluster must be in the RUNNING or WAITING
-/// state", `StartSession` doc).
+/// Recorded behavior for the text: the whole sentence pair is fixed, around two variable
+/// parts — the cluster the request named, quoted, and the state that cluster is actually in
+/// — and the states the sentence then names are the ones the operation accepts ("the
+/// cluster must be in the RUNNING or WAITING state", `StartSession` doc).
 pub fn cluster_not_running_for_session_message(cluster_id: &str, state: &str) -> String {
     format!(
-        "Cluster '{cluster_id}' is in state {state}; a session can only be started on a \
-         cluster in the {} or {} state.",
+        "StartSession is not supported for cluster '{cluster_id}' in state {state}. \
+         The cluster must be in {} or {} state.",
         cluster_state::RUNNING,
         cluster_state::WAITING
     )
@@ -210,6 +218,12 @@ pub struct PendingSessionState {
 pub struct SessionRecord {
     pub session: Session,
     pub pending_state: Option<PendingSessionState>,
+    /// The instant this session last entered `IDLE`, which `Session$IdleSince` reports as a
+    /// timestamp and the idle timer counts from ([`super::session_idle_termination_due`]).
+    ///
+    /// Held as an instant beside the wire member because it is arithmetic this service
+    /// performs, the way a cluster's `ready_date_time` is.
+    pub idle_since: Option<SystemTime>,
     /// "A unique, case-sensitive identifier that you provide to ensure the idempotency of
     /// the request. If you retry a request that completed successfully using the same
     /// client request token, the service returns the original response without performing
@@ -226,6 +240,19 @@ impl SessionRecord {
     /// the session was last updated" (`Session$UpdatedAt` doc), which is the instant the
     /// move was owed at rather than the instant somebody read it.
     pub fn advance_to(&mut self, now: SystemTime) {
+        self.apply_due_states(now);
+        // "If the session is idle for this duration, Amazon EMR automatically terminates it"
+        // (`StartSessionInput$SessionIdleTimeoutInMinutes` doc): the end that timer owes is
+        // armed once the session has been idle for its whole timeout, and is then itself a
+        // state the clock has made due — so the states are applied again.
+        if self.stop_once_idle_timeout_elapsed(now) {
+            self.apply_due_states(now);
+        }
+    }
+
+    /// Materialise the states the clock owes, without the idle timer around them
+    /// ([`Self::advance_to`] is the one entry point).
+    fn apply_due_states(&mut self, now: SystemTime) {
         while let Some(pending) = self.pending_state.clone() {
             if now < pending.due {
                 return;
@@ -235,6 +262,13 @@ impl SessionRecord {
             self.session.updated_at = Some(timestamp(pending.due));
             if pending.state == session_state::STARTED {
                 self.session.started_at = Some(timestamp(pending.due));
+            }
+            // "The date and time that the session last entered the IDLE state"
+            // (`Session$IdleSince` doc): the instant the move was owed at, which is what the
+            // idle timer counts from.
+            if pending.state == session_state::IDLE {
+                self.idle_since = Some(pending.due);
+                self.session.idle_since = Some(timestamp(pending.due));
             }
             // "The date and time that the session was terminated or failed"
             // (`Session$EndedAt` doc): the instant the end was owed at, so a session that
@@ -417,6 +451,9 @@ impl ClusterRecord {
                     state: next.to_string(),
                 }
             }),
+            // The session has entered none of the states above, so it has not begun to be
+            // idle either.
+            idle_since: None,
             client_request_token: input.client_request_token,
         };
         self.sessions.push(record);

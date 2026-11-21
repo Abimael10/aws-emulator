@@ -167,7 +167,7 @@ async fn terminating_a_session_settles_it_terminated_and_leaves_the_others_alone
     for (case, session_id) in &sessions {
         let label = case.label;
         if case.started_first {
-            await_session_state(&emr, &cluster_id, session_id, label, "STARTED").await;
+            await_session_state(&emr, &cluster_id, session_id, label, "IDLE").await;
         }
         for attempt in 1..=case.terminates {
             let answer = emr
@@ -293,7 +293,7 @@ async fn a_terminated_cluster_leaves_none_of_its_sessions_live() {
     // both sides of the start walk.
     let coming_up = start_session(&emr, &cluster_id, "still coming up").await;
     let started = start_session(&emr, &cluster_id, "already started").await;
-    await_session_state(&emr, &cluster_id, &started, case, "STARTED").await;
+    await_session_state(&emr, &cluster_id, &started, case, "IDLE").await;
 
     emr.ok(
         "TerminateJobFlows",
@@ -355,7 +355,7 @@ async fn the_session_endpoint_is_reported_for_a_ready_session_and_refused_otherw
     );
 
     // Ready: the endpoint and the token.
-    await_session_state(&emr, &cluster_id, &session_id, case, "STARTED").await;
+    await_session_state(&emr, &cluster_id, &session_id, case, "IDLE").await;
     let before = epoch_secs(SystemTime::now());
     let first = emr
         .ok(
