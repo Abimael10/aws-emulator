@@ -165,11 +165,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(token) => Some(
                 crate::state::decode_page_token(TOKEN_MARKER, token).ok_or_else(|| {
                 ListBrandProfilesErrorModeled::ValidationException(ValidationException {
-                    message: format!("nextToken {token} is not a pagination token this service issued."),
+                    message: crate::state::INVALID_PAGE_TOKEN.to_string(),
                     field_list: Some(vec![ValidationExceptionField {
                         path: "nextToken".to_string(),
-                        message: "The token is not one a previous ListBrandProfiles response returned."
-                            .to_string(),
+                        message: crate::state::INVALID_PAGE_TOKEN.to_string(),
                     }]),
                 })
                 })?,

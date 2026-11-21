@@ -12,6 +12,14 @@
 
 use std::sync::Arc;
 
+// The asynchronous-job half of the same contract, driven over the wire: a child module
+// of this suite, in `tests/all/state_roundtrip/`. This crate's one test target declares
+// each suite DIRECTLY under `tests/all/` from `tests/all.rs`; a child module of an
+// already-declared suite is declared by its parent, here. The `#[path]` is relative to
+// this file's own directory, as it is in `all.rs`.
+#[path = "state_roundtrip/job_listing.rs"]
+mod job_listing;
+
 /// A probe type owned by this test. `state::<T>()` is keyed by TYPE, so a test can use
 /// its own without touching `ComAmazonawsEndusermessagingEndusermessagingState`.
 #[derive(Default)]

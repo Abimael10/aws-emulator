@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages the stored asynchronous jobs in id order, filtered by `status`,
+//! `brandProfileId` and `operationType`, honouring `maxResults` and resuming from
+//! `nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +153,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListJobs"))
+        // `@readonly`: paging a list never changes what a later caller sees. The one
+        // write below materialises the terminal statuses the clock had already made
+        // due, each of which was owed at its own instant whether or not anybody
+        // called.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListJobsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `operationType` is modelled as a plain string, so the boundary validator
+        // admits any value of the modelled length: a value that names no operation of
+        // this service can match no job in any state, and is a refusal about the input
+        // rather than an empty page.
+        let operation_type = match input.operation_type.as_deref() {
+            None => None,
+            Some(operation_type) => {
+                if !crate::state::is_job_operation_type(operation_type) {
+                    return Err(ListJobsErrorModeled::ValidationException(
+                        crate::state::invalid_job_operation_type(operation_type),
+                    )
+                    .into());
+                }
+                Some(operation_type.to_string())
+            }
+        };
+
+        // `brandProfileId` takes an identifier or an ARN; a value that is neither can
+        // name no profile in any state, so it too is refused as invalid input. A
+        // well-formed identifier no stored profile carries is a filter that matches
+        // nothing rather than a missing resource: this operation models no
+        // `ResourceNotFoundException`.
+        let brand_profile_id = match input.brand_profile_id.as_deref() {
+            None => None,
+            Some(id_or_arn) => Some(
+                crate::state::brand_profile_id_of(id_or_arn)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        ListJobsErrorModeled::ValidationException(
+                            crate::state::invalid_brand_profile_id(id_or_arn),
+                        )
+                    })?,
+            ),
+        };
+
+        // No token starts at the beginning; a token resumes strictly after the last
+        // job the page that produced it returned. A value this service never issued
+        // decodes to no resume point, and the token is opaque, so the refusal states
+        // the one sentence this API words that refusal with and echoes nothing of it.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(TOKEN_MARKER, token).ok_or_else(|| {
+                    ListJobsErrorModeled::ValidationException(ValidationException {
+                        message: crate::state::INVALID_PAGE_TOKEN.to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "nextToken".to_string(),
+                            message: crate::state::INVALID_PAGE_TOKEN.to_string(),
+                        }]),
+                    })
+                })?,
+            ),
+        };
+
+        // `maxResults` is modelled `range 1..100`, so the boundary validator has
+        // already refused anything outside it; an absent one pages at the maximum the
+        // output list itself allows.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(MAX_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Materialise the terminal status the clock has made due for each job, so a
+        // page reports the status every job had reached at this instant rather than
+        // the one it was accepted in.
+        store.settle_jobs(now);
+
+        // A range query, not a scan: resuming costs O(log n) + O(page) rather than
+        // walking every stored job on each page.
+        let start = match resume_after.as_deref() {
+            Some(after) => ::std::ops::Bound::Excluded(after),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = store
+            .jobs
+            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
+            .map(|(_, job)| job)
+            // Every filter the request carries holds together: a job is reported only
+            // when it matches all of them, and a filter the request omits selects
+            // every job.
+            .filter(|job| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|status| job.status == status)
+                    && operation_type
+                        .as_deref()
+                        .is_none_or(|requested| job.operation_type == requested)
+                    && brand_profile_id
+                        .as_deref()
+                        .is_none_or(|requested| job.brand_profile_id.as_deref() == Some(requested))
+            });
+
+        let jobs: Vec<JobSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::job_summary)
+            .collect();
+
+        // A token is emitted only when something is actually left to return.
+        let next_token = match jobs.last() {
+            Some(last) if remaining.next().is_some() => {
+                Some(crate::state::encode_page_token(TOKEN_MARKER, &last.job_id))
+            }
+            _ => None,
+        };
+
+        Ok(ListJobsOutput { jobs, next_token })
     }
 }
+
+/// The largest page this operation returns: the modelled `@length` ceiling of the
+/// `jobs` output list, which is also `maxResults`' modelled maximum.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The marker every token this operation issues carries, so a token the service did
+/// not issue is recognisable rather than being read as some other resume point.
+/// Without it any hex-decodable string would be accepted as a continuation. The
+/// token itself is built and read by [`crate::state::encode_page_token`] /
+/// [`crate::state::decode_page_token`], which every paginated operation of this
+/// service shares.
+const TOKEN_MARKER: &str = "ListJobs/1/";

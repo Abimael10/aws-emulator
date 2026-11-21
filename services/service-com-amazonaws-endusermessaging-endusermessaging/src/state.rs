@@ -18,6 +18,11 @@ pub use brand_profile_attributes::*;
 mod tags;
 pub use tags::*;
 
+/// The asynchronous jobs the registration-import operations start, and the terminal
+/// status the clock owes each one.
+mod jobs;
+pub use jobs::*;
+
 /// The service's own ARN namespace / sigv4 signing name, as the Smithy model's
 /// `aws.api#service` trait declares it (`arnNamespace`/`endpointPrefix`
 /// `end-user-messaging`).
@@ -158,6 +163,11 @@ pub struct ComAmazonawsEndusermessagingEndusermessagingState {
     /// `BTreeMap` so `ListNotifyCodeConfigurations` pages in a stable, resumable
     /// order. Bounded by [`MAX_NOTIFY_CODE_CONFIGURATIONS`].
     pub notify_code_configurations: BTreeMap<String, NotifyCodeConfigurationRecord>,
+    /// Every asynchronous job, keyed by `jobId`. A `BTreeMap` so `ListJobs` pages in
+    /// a stable, resumable order — and, since a minted id counts up within one state,
+    /// that order is also the order the jobs were started in. Bounded by
+    /// [`MAX_JOBS`].
+    pub jobs: BTreeMap<String, Job>,
     /// Every one-time passcode verification in flight, keyed by
     /// `verificationId`. A `BTreeMap` so a scan over the verifications of one
     /// recipient is in a stable order. Bounded by [`MAX_VERIFICATIONS`], and
@@ -392,7 +402,7 @@ const BRAND_PROFILE_ID_MEMBER: &str = "brandProfileId";
 /// variable part is the value the request gave, and `fieldList` names the member it came
 /// in on and states that one sentence about it: the gate has one thing to say about the
 /// member it refused, so the entry says it rather than a second sentence of its own.
-fn invalid_brand_profile_id(id_or_arn: &str) -> crate::ops::types::ValidationException {
+pub fn invalid_brand_profile_id(id_or_arn: &str) -> crate::ops::types::ValidationException {
     let stated = format!("invalid brand profile ID format: {id_or_arn}");
     crate::ops::types::ValidationException {
         message: stated.clone(),
@@ -633,6 +643,14 @@ pub fn notify_code_configuration_view(
         updated_at: timestamp(record.updated_at),
     }
 }
+
+/// The sentence this API refuses a pagination token it did not issue with.
+///
+/// Fixed text: the token is opaque, so the refusal states neither the value the
+/// request gave nor which page it was offered for. Every paginated operation of this
+/// service refuses such a token through this one sentence, beside the token format
+/// they already share, so one refusal class is not worded two ways.
+pub const INVALID_PAGE_TOKEN: &str = "Invalid or expired pagination token";
 
 /// An opaque pagination continuation token for a page that ended at
 /// `last_returned_key`.
