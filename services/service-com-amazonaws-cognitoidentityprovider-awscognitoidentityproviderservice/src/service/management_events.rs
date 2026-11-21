@@ -312,15 +312,21 @@ fn read_only(kind: CallKind) -> bool {
 /// that user's attributes.
 ///
 /// WHERE it sits: INSIDE the audited call, so the lookup happens while the request can
-/// still be read and the user can be resolved as the operation itself resolved it — after
-/// the handler has run, so a call that CREATED the user names the user it created. The
-/// facts are reported through the shared slot the audited wrapper takes them from
-/// ([`report_additional_event_data`]), as the LAST thing this handler does.
+/// still be read and the user can be resolved as the operation itself resolved it. The user
+/// is resolved on BOTH sides of the handler, because which side holds it depends on what
+/// the call DID: a call that created the user is resolvable only after it ran, and a call
+/// that REMOVED the user only before — a record of a delete names the user it deleted, a
+/// user the pool no longer holds. The state after the call is preferred where it resolves,
+/// so a create names the user it just made; otherwise the id the pool held for that user
+/// when the call arrived is what names it, and a `sub` is the pool's immutable id for a
+/// user either way. The facts are reported through the shared slot the audited wrapper
+/// takes them from ([`report_additional_event_data`]), as the LAST thing this handler does.
 ///
 /// WHICH calls carry one: those whose request names a pool AND a user, which is every
 /// `Admin*` operation on one user of a pool and nothing else — a request naming no user
-/// addresses none, and a user name that resolves to no stored user identifies none, so
-/// neither reports anything rather than reporting an id nothing resolves.
+/// addresses none, and a user name that resolves to no stored user on either side of the
+/// call identifies none, so neither reports anything rather than reporting an id nothing
+/// resolves.
 ///
 /// WHAT it reports, and nothing else: the `sub` the POOL minted for that user, read from
 /// this service's own store. It is an identifier of a resource and not credential material —
@@ -365,15 +371,22 @@ impl<O: Operation, Eng: Send + Sync + 'static> Operation for ReportingTheAddress
             O::INPUT_SCHEMA,
             WITHHELD_FROM_THE_USER_LOOKUP,
         ));
+        // Resolved BEFORE the handler as well, against the state the call arrived at: a
+        // call that REMOVES the user it addresses leaves nothing to resolve afterwards, and
+        // the record of such a call still names the user it acted on.
+        let resolve = |(user_pool_id, username): &(String, String)| {
+            stored_sub(&*self.engine, user_pool_id, username)
+        };
+        let held_before = addressed.as_ref().and_then(resolve);
         let outcome = self.operation.handle(input, ctx).await;
-        // Resolved AFTER it, against the state the call leaves behind: the user a create
-        // just made is a user the pool holds, and the name a request used resolves the same
-        // way the operation itself resolves it (by username, by `sub` or by a sign-in name
-        // of the pool).
-        if let Some((user_pool_id, username)) = addressed {
-            if let Some(sub) = stored_sub(&*self.engine, &user_pool_id, &username) {
-                report_additional_event_data(::serde_json::json!({ RECORDED_SUB: sub }));
-            }
+        // And AFTER it, against the state the call leaves behind: the user a create just
+        // made is a user the pool holds, and the name a request used resolves the same way
+        // the operation itself resolves it (by username, by `sub` or by a sign-in name of
+        // the pool). The state after the call wins where it resolves the user, so the id
+        // reported is the one the pool answers its readers with now.
+        let held_after = addressed.as_ref().and_then(resolve);
+        if let Some(sub) = held_after.or(held_before) {
+            report_additional_event_data(::serde_json::json!({ RECORDED_SUB: sub }));
         }
         outcome
     }
