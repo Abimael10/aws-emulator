@@ -1791,6 +1791,80 @@ fn a_session_over_a_tree_performs_the_grammars_control_flow() {
     }
 }
 
+/// RULE: the standard output of a whole COMPOUND command is redirected where the
+/// compound command carries such a redirection, so what every command inside it wrote is
+/// ONE write of that file — and a compound command redirecting any other descriptor is a
+/// form this session does not perform.
+///
+/// The rows differ along what the rule generalises over: the compound form, whether the
+/// write replaces the file or adds to it, how many commands inside wrote, and which
+/// descriptor the redirection names.
+#[test]
+fn a_redirected_compound_command_writes_one_file() {
+    let statuses = Statuses::default();
+    // (case, the program, the status it answers, what the tree holds at `out.txt`)
+    let rows: [(&str, &str, i32, Option<&str>); 6] = [
+        (
+            "a brace group of two commands",
+            "{ echo one; echo two; } > out.txt",
+            statuses.success,
+            Some("one\ntwo\n"),
+        ),
+        (
+            "a brace group that ADDS to the file",
+            "echo kept > out.txt; { echo added; } >> out.txt",
+            statuses.success,
+            Some("kept\nadded\n"),
+        ),
+        (
+            "a for loop over its words",
+            "for WORD in a b; do echo $WORD; done > out.txt",
+            statuses.success,
+            Some("a\nb\n"),
+        ),
+        (
+            "an if whose branch wrote",
+            "if true; then echo branch; fi > out.txt",
+            statuses.success,
+            Some("branch\n"),
+        ),
+        (
+            "a brace group whose last command failed",
+            "{ echo written; false; } > out.txt",
+            statuses.failure,
+            Some("written\n"),
+        ),
+        (
+            "a brace group redirecting another descriptor",
+            "{ echo one; } 2> out.txt",
+            statuses.could_not_run,
+            None,
+        ),
+    ];
+    for (case, program, expected, held_at) in rows {
+        let mut held = working_tree_session();
+        let status = held.run(program);
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected the status {expected}, got {status}"
+        );
+        let files = held.tree_files();
+        let written = files
+            .iter()
+            .find(|(path, _)| *path == "out.txt")
+            .map(|(_, contents)| *contents);
+        assert_eq!(
+            written, held_at,
+            "case {case:?}: expected the file to hold {held_at:?}, got {written:?}"
+        );
+        // The program writes nothing anywhere else: one redirection is one write.
+        assert!(
+            files.iter().all(|(path, _)| *path == "out.txt"),
+            "case {case:?}: expected only the redirected file, got {files:?}"
+        );
+    }
+}
+
 /// RULE: the status an `exit` ended a program with is what the session reports until the
 /// caller that hands this session SEVERAL programs over one tree says the next one
 /// starts, and the commands of that next program are then performed.

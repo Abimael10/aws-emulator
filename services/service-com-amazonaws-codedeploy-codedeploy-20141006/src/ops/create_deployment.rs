@@ -601,6 +601,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A Lambda deployment's one target IS the function its revision names,
             // so the snapshot is named from the shift that revision declared.
             crate::state::name_lambda_targets(&mut targets, lambda_traffic_shift.as_ref());
+            // What this deployment owes its FLEET: a deployment of the
+            // EC2/on-premises platform is performed by an agent on each instance
+            // its group selects, so it owes that run — of the revision its AppSpec
+            // declares (`state::agent_deployment`).
+            let agent = crate::state::agent_deployment::AgentDeployment::of_revision(
+                &compute_platform,
+                Some(&used_revision),
+            );
             // `record_deployment` indexes it as the newest and drops the oldest
             // history past the store's retention bound.
             state.record_deployment(crate::state::Deployment {
@@ -675,6 +683,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ecs_original_target_group: None,
                 ecs_replacement_target_group: None,
                 ecs_original_task_set: None,
+                agent,
             });
             // Deploying a revision is also how CodeDeploy learns it: the
             // application's registry records this use, registering the revision

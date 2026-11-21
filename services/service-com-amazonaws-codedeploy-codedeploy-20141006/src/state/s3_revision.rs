@@ -25,15 +25,22 @@
 //! What a located object DECIDES is what its bytes declare: the traffic shift and
 //! the lifecycle event hooks [`super::appspec`] reads out of an AppSpec document,
 //! exactly as they are read out of a revision that carries that document inline.
+//! For an EC2/on-premises deployment the object is a BUNDLE
+//! ([`super::revision_bundle`]) whose AppSpec file says what the agent installs and
+//! runs on each host, so one this emulator cannot read that AppSpec out of — an
+//! object it cannot unpack, a bundle whose root holds no AppSpec file, an AppSpec
+//! that is no document it reads — FAILS the deployment under the same error code
+//! rather than letting it report success for a revision that would install nothing.
 //! The revision itself is still held verbatim; nothing fetched is written into it.
 //!
 //! Nothing is refused on evidence this emulator does not have. A bucket the object
 //! store holds no record of shows nothing about the object — it may belong to
 //! another account, or to a client that never told this emulator about it — so such
 //! a deployment goes ahead, the same reading [`super::service_role_permissions`]
-//! applies to a role IAM does not hold. A bucket this emulator DOES hold is the
-//! authority on what is in it, so a key it has nothing at, or an object whose
-//! entity tag is not the one the revision names, is a revision that cannot be
+//! applies to a role IAM does not hold; what it can then DO on a host is what a
+//! deployment whose AppSpec declares nothing can do. A bucket this emulator DOES
+//! hold is the authority on what is in it, so a key it has nothing at, or an object
+//! whose entity tag is not the one the revision names, is a revision that cannot be
 //! located.
 //!
 //! Like [`super::alarm_gate`], it runs with THIS store unlocked while the object
@@ -44,8 +51,8 @@ use ::service_com_amazonaws_s3_amazons3::state as objects;
 use crate::ops::types::{ErrorInformation, RevisionLocation};
 
 use super::{
-    appspec, deployment_is_terminal, lifecycle_hook, name_lambda_targets, rollback,
-    service_state, ComAmazonawsCodedeployCodedeploy20141006State, Deployment,
+    appspec, deployment_is_terminal, lifecycle_hook, name_lambda_targets, revision_bundle,
+    rollback, service_state, ComAmazonawsCodedeployCodedeploy20141006State, Deployment,
     DEPLOYMENT_STATUS_FAILED, DEPLOYMENT_STATUS_IN_PROGRESS,
 };
 
@@ -124,6 +131,9 @@ struct Fetch {
     version: Option<String>,
     /// See [`Fetch::version`].
     e_tag: Option<String>,
+    /// The `bundleType` the revision states for the object, which is the format
+    /// its bundle is unpacked as ([`revision_bundle`]).
+    bundle_type: Option<String>,
 }
 
 /// What the object store answered about one revision.
@@ -136,8 +146,15 @@ enum Located {
     Unlocatable,
     /// The object is there. Its bytes, as a document, when they are one this
     /// emulator can read as text — a bundle of another form (a `zip` or `tar`
-    /// artifact) declares nothing this emulator reads.
-    Fetched(Option<String>),
+    /// artifact) declares nothing this emulator reads — and, for a deployment of
+    /// the compute platform whose revision IS such an artifact, the bundle those
+    /// bytes unpack to ([`revision_bundle`]).
+    Fetched {
+        /// The object's own bytes as an AppSpec document, where they are text.
+        document: Option<String>,
+        /// The unpacked bundle, for an EC2/on-premises deployment.
+        bundle: Option<revision_bundle::RevisionBundle>,
+    },
 }
 
 /// The fetch every deployment that owes one at `now_ms` owes.
@@ -181,6 +198,7 @@ fn fetch_of(deployment: &Deployment) -> Option<Fetch> {
         key: location.key.clone()?,
         version: location.version.clone(),
         e_tag: location.e_tag.clone(),
+        bundle_type: location.bundle_type.clone(),
     })
 }
 
@@ -204,7 +222,10 @@ fn locate(store: &objects::ComAmazonawsS3Amazons3State, fetch: &Fetch) -> Locate
             return Located::Unlocatable;
         }
     }
-    Located::Fetched(document_in(object))
+    Located::Fetched {
+        document: document_in(object),
+        bundle: bundle_in(&fetch.compute_platform, fetch.bundle_type.as_deref(), object),
+    }
 }
 
 /// The object's bytes as a document, when they are one this emulator reads as an
@@ -220,6 +241,23 @@ fn document_in(object: &objects::Object) -> Option<String> {
         return None;
     }
     String::from_utf8(object.body.clone()).ok()
+}
+
+/// The object's bytes as a BUNDLE, for a deployment of the compute platform whose
+/// revision is one: the archive unpacked into the AppSpec file and the files and
+/// scripts it names ([`revision_bundle::RevisionBundle::unpack`], which states the
+/// bounds it is read within and the formats it reads). `None` for every other
+/// platform — whose revision IS the AppSpec document — and for bytes that unpack
+/// to no bundle at all.
+fn bundle_in(
+    compute_platform: &str,
+    bundle_type: Option<&str>,
+    object: &objects::Object,
+) -> Option<revision_bundle::RevisionBundle> {
+    if compute_platform != super::agent_deployment::COMPUTE_PLATFORM_SERVER {
+        return None;
+    }
+    revision_bundle::RevisionBundle::unpack(bundle_type, &object.body)
 }
 
 /// `errorInformation.message` as CodeDeploy words a revision it could not locate.
@@ -261,12 +299,56 @@ fn record(
     match outcome {
         Located::NoEvidence => {}
         Located::Unlocatable => fail_deployment(state, fetch, now_ms),
-        Located::Fetched(document) => {
+        Located::Fetched { document, bundle } => {
+            // An EC2/on-premises revision is a BUNDLE whose AppSpec file says what
+            // the agent does with the rest of it, so a revision this emulator
+            // cannot read that AppSpec out of is one CodeDeploy cannot deploy —
+            // which is exactly what the sentence above says, and the deployment
+            // FAILS with it rather than reporting success for a revision that would
+            // install nothing. Three readings fail it: an object that unpacks to no
+            // bundle at all (one past the bounds [`revision_bundle`] reads within,
+            // and one that is no archive of a form it reads), a bundle whose root
+            // holds no AppSpec file, and an AppSpec that is no document this
+            // emulator can read.
+            if fetch.compute_platform == super::agent_deployment::COMPUTE_PLATFORM_SERVER {
+                let declared = bundle.as_ref().and_then(|bundle| {
+                    let document = bundle.app_spec()?;
+                    appspec::declared_server_in_app_spec(document)
+                        .map(|declaration| (bundle, declaration))
+                });
+                match declared {
+                    Some((bundle, declaration)) => {
+                        deploy_what_the_bundle_declares(state, fetch, bundle, declaration);
+                    }
+                    None => fail_deployment(state, fetch, now_ms),
+                }
+                return;
+            }
             if let Some(document) = document.as_deref() {
                 deploy_what_the_document_declares(state, fetch, document);
             }
         }
     }
+}
+
+/// Let `fetch`'s deployment deploy what the fetched BUNDLE declares: the files its
+/// AppSpec installs and the scripts it runs on each host
+/// ([`appspec::declared_server_in_app_spec`]).
+///
+/// Read ONCE where the revision is resolved, so no later pass re-parses the archive
+/// or the document inside it; the pass that goes round the fleet performs what this
+/// wrote ([`super::agent_deployment`]).
+fn deploy_what_the_bundle_declares(
+    state: &mut ComAmazonawsCodedeployCodedeploy20141006State,
+    fetch: &Fetch,
+    bundle: &revision_bundle::RevisionBundle,
+    declaration: appspec::ServerDeclaration,
+) {
+    let Some(deployment) = state.deployments.get_mut(&fetch.deployment_id) else {
+        return;
+    };
+    deployment.agent.bundle = Some(bundle.clone());
+    deployment.agent.declaration = Some(declaration);
 }
 
 /// Let `fetch`'s deployment deploy what the fetched `document` declares.

@@ -33,6 +33,15 @@
 //! ([`ComAmazonawsEc2Amazonec2State::boot_due_instance_guests`] is what brings one up), so
 //! each of those answers `None` — "there was no guest to run this in" — rather than an
 //! outcome nothing produced.
+//!
+//! # An agent's own files
+//!
+//! Not everything such an agent does is a program: it also PUTS files on the machine — the
+//! artifact it fetched for the work it was sent, and the files that work installs — and reads
+//! back what an earlier run left there. Those writes go through the same tree and the same
+//! bounds as a program's ([`ComAmazonawsEc2Amazonec2State::put_in_instance_guest`],
+//! [`ComAmazonawsEc2Amazonec2State::read_in_instance_guest`]), so the agent and the guest's
+//! own programs read and write one machine's storage rather than two notions of it.
 
 use ::service_common::posix_shell_session::{
     layered, Bounds, EnvironmentPrograms, OutputLimits, SessionConfig, ShellSession,
@@ -174,6 +183,132 @@ impl ComAmazonawsEc2Amazonec2State {
             instance.guest_runtime = services.taken();
         }
         Some(GuestRun { output, status })
+    }
+
+    /// What the guest of the instance `instance_id` names holds at `path`, or `None` when it
+    /// holds nothing there.
+    ///
+    /// The counterpart of [`Self::put_in_instance_guest`] for an agent that READS the
+    /// machine's storage — the artifact it put there on an earlier run — rather than
+    /// performing a program in it. The path is resolved the way the tree a program runs in
+    /// resolves one ([`::service_common::posix_shell_volume::resolved_path`]), so the agent and
+    /// the guest's own programs name one file by one key.
+    pub fn read_in_instance_guest(&self, instance_id: &str, path: &str) -> Option<String> {
+        let resolved = ::service_common::posix_shell_volume::resolved_path(path)?;
+        self.instances
+            .get(instance_id)?
+            .guest_files
+            .get(&resolved)
+            .cloned()
+    }
+
+    /// Whether that guest holds anything at `path`: a file, or a directory something under
+    /// it makes.
+    ///
+    /// What an agent asks before it writes, because a path the machine already holds is the
+    /// difference between replacing a file and creating one.
+    pub fn instance_guest_holds(&self, instance_id: &str, path: &str) -> bool {
+        let Some(resolved) = ::service_common::posix_shell_volume::resolved_path(path) else {
+            return false;
+        };
+        let under = format!("{}/", resolved.trim_end_matches('/'));
+        self.instances.get(instance_id).is_some_and(|instance| {
+            instance.guest_files.contains_key(&resolved)
+                || instance
+                    .guest_files
+                    .keys()
+                    .any(|held| held.starts_with(&under))
+        })
+    }
+
+    /// Put `files` on the storage of that guest, as `(path, contents)` — what an AGENT
+    /// inside it writes: the artifact it fetched for the work it was sent, and the files that
+    /// work installs.
+    ///
+    /// Answering the paths the guest holds afterwards, or `None` when there is no running,
+    /// booted guest to write to ([`Self::run_in_instance_guest_with`] states what a guest has
+    /// to be). The writes go through the SAME tree a program of this guest runs in
+    /// ([`super::guest_console::guest_volume`]), so one path is resolved one way, the
+    /// directories above a file are made the way a machine that holds it has them, a write to
+    /// a path the kernel publishes is refused as it is for the guest's own program, and every
+    /// write is held to that tree's bounds: a write past them does not happen and its path is
+    /// left out of the answer.
+    pub fn put_in_instance_guest(
+        &mut self,
+        instance_id: &str,
+        files: &[(String, String)],
+    ) -> Option<Vec<String>> {
+        self.in_instance_guest_volume(instance_id, |volume| {
+            let mut written: Vec<String> = Vec::new();
+            for (path, contents) in files {
+                if volume.put_file(path, contents) {
+                    if let Some(resolved) = volume.resolve(path) {
+                        written.push(resolved);
+                    }
+                }
+            }
+            written
+        })
+    }
+
+    /// Remove what `paths` names from the storage of that guest, as an AGENT inside it
+    /// does: the files of an earlier run of its work, taken off before the next run puts
+    /// its own there.
+    ///
+    /// Answering the paths the guest held and no longer holds, or `None` when there is no
+    /// running, booted guest. The removals go through the SAME tree
+    /// ([`Self::put_in_instance_guest`] states why), so a path the kernel publishes is not
+    /// one an agent can take away and a path the guest does not hold is simply not in the
+    /// answer.
+    pub fn remove_in_instance_guest(
+        &mut self,
+        instance_id: &str,
+        paths: &[String],
+    ) -> Option<Vec<String>> {
+        self.in_instance_guest_volume(instance_id, |volume| {
+            let mut removed: Vec<String> = Vec::new();
+            for path in paths {
+                if let Some(resolved) = volume.resolve(path) {
+                    if volume.remove_file(&resolved) {
+                        removed.push(resolved);
+                    }
+                }
+            }
+            removed
+        })
+    }
+
+    /// Let `change` change the TREE of that guest's storage, and keep what it left there.
+    ///
+    /// The one place an agent's own write of a machine reaches that tree, so the two seams
+    /// above cannot differ about which guest has one, which tree it is
+    /// ([`super::guest_console::guest_volume`]) or what the machine holds afterwards:
+    /// `None` for an instance that is not running or whose operating system has not come up,
+    /// and otherwise what `change` answered, with the files it left behind kept as that
+    /// machine's storage — the same write a program of this guest's own makes
+    /// ([`Self::run_in_instance_guest_with`]).
+    fn in_instance_guest_volume<T>(
+        &mut self,
+        instance_id: &str,
+        change: impl FnOnce(&mut ::service_common::posix_shell_volume::ShellVolume) -> T,
+    ) -> Option<T> {
+        let instance = self.instances.get(instance_id)?;
+        if instance.state != InstanceStateName::Running {
+            return None;
+        }
+        let boot_id = instance.boots.last()?.boot_id.clone();
+        let held = instance.guest_files.clone();
+        let machine = self.guest_machine(instance);
+        let mut volume = guest_volume(&machine, &boot_id, &held);
+        let answered = change(&mut volume);
+        let stored: ::std::collections::BTreeMap<String, String> = volume
+            .stored_files()
+            .map(|(path, contents)| (path.to_string(), contents.to_string()))
+            .collect();
+        if let Some(instance) = self.instances.get_mut(instance_id) {
+            instance.guest_files = stored;
+        }
+        Some(answered)
     }
 
     /// Whether the instance `instance_id` names has a guest a program can run in now: it is

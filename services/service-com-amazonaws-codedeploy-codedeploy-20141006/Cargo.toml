@@ -84,11 +84,29 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # crate depends on this one.
 service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
+# An EC2/on-premises (`Server`) deployment deploys to Amazon EC2 INSTANCES: which
+# instances a deployment group selects is read from that service's own instance
+# records (`state::instance_targets`), and the agent's work — the bundle it puts on
+# the host and the AppSpec hooks it runs there — is performed in that instance's own
+# guest, through the seam the service that owns the instance exposes
+# (`state::instance_lifecycle`). No cycle: that crate does not depend on this one.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# A `Server` revision is a BUNDLE — "tar: A tar archive file. tgz: A compressed tar
+# archive file. zip: A zip archive file" (`S3Location$bundleType`) — holding the
+# AppSpec file and the files and scripts it names, so the fetched object is unpacked
+# with a maintained implementation of each of those formats
+# (`state::revision_bundle`).
+zip = { version = "9", default-features = false, features = ["deflate"] }
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod` declares one
+# module per suite file in `tests/all/`, so adding a suite is adding a file.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # Writes the .zip deployment package the lifecycle-hook suite uploads for its

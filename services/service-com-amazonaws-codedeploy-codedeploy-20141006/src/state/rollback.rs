@@ -158,8 +158,10 @@ pub fn record_rollback(
     let region = deployment.region.clone();
     // A rollback goes to the SAME deployment group, so it resolves the same
     // deployment targets as the deployment it rolls back, and its terminal status
-    // follows from them the same way.
-    let mut targets = deployment.targets.clone();
+    // follows from them the same way — with what each host came to on that
+    // deployment cleared, because the rollback's own agent goes round them again
+    // ([`super::agent_deployment::fleet_to_resolve_again`]).
+    let mut targets = super::agent_deployment::fleet_to_resolve_again(&deployment.targets);
 
     // The id of the rollback deployment, minted only when this deployment group
     // has a revision to go back to. A group whose first deployment is being
@@ -256,6 +258,10 @@ pub fn record_rollback(
         // A rollback redeploys a revision of its own, so it reaches for that
         // revision's object exactly as a client's own deployment of it would.
         let awaits_revision_fetch = super::s3_revision::awaits_fetch(&revision);
+        // The revision the rollback puts back and the platform it runs on, kept for
+        // the agent plane below, which is written from the record as it is built.
+        let compute_platform_for_agent = compute_platform.clone();
+        let revision_for_agent = Some(revision.clone());
         // The rollback deploys the revision it redeploys, so its Lambda target is
         // the function THAT revision names.
         super::name_lambda_targets(&mut targets, declared_shift.as_ref());
@@ -336,6 +342,12 @@ pub fn record_rollback(
             ecs_original_target_group: None,
             ecs_replacement_target_group: None,
             ecs_original_task_set: None,
+            // A rollback to an EC2/on-premises deployment group owes its own run
+            // on that group's fleet, of the revision it redeploys.
+            agent: super::agent_deployment::AgentDeployment::of_revision(
+                &compute_platform_for_agent,
+                revision_for_agent.as_ref(),
+            ),
         });
     }
 

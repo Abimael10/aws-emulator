@@ -568,6 +568,224 @@ fn text_list(node: &Yaml, key: &str) -> Vec<String> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// What an EC2/on-premises (`Server`) revision's AppSpec declares
+// ---------------------------------------------------------------------------
+//
+// A revision of that platform is a BUNDLE rather than one document
+// ([`super::revision_bundle`]), and the AppSpec file inside it says what the
+// CodeDeploy agent on each instance does with the rest of the bundle: which files
+// it installs where (`files`), and which script of the bundle it runs for each
+// lifecycle event (`hooks`). Both are read here, with the one traversal and the
+// one set of bounds every other platform's declaration is read with, so the
+// document is parsed once — when the deployment resolves its revision — and no
+// later request re-parses caller-supplied content.
+
+/// The AppSpec section listing what the agent installs: "the `files` section
+/// specifies the names of files that should be copied … during the deployment"
+/// (the AWS CodeDeploy User Guide's AppSpec `files` section).
+const FILES_KEY: &str = "files";
+/// The members of one `files` entry: "`source` … identifies a file or directory
+/// … `destination` … identifies the location on the instance where the file …
+/// should be copied".
+const SOURCE_KEY: &str = "source";
+/// See [`SOURCE_KEY`].
+const DESTINATION_KEY: &str = "destination";
+/// The member of one `hooks` entry naming the script the agent runs: "`location`
+/// … the location of the script file".
+const LOCATION_KEY: &str = "location";
+/// The member stating "the number of seconds to allow the script to execute
+/// before it is considered to have failed".
+const TIMEOUT_KEY: &str = "timeout";
+/// The member stating "the user to impersonate when running the script".
+const RUNAS_KEY: &str = "runas";
+/// The member naming the operating system the revision is written for: "`os` …
+/// the operating system version you are using".
+const OS_KEY: &str = "os";
+/// The member stating the AppSpec's own version: "`version` … reserved for future
+/// use. The only allowed value is 0.0" (the AWS CodeDeploy User Guide's AppSpec
+/// `version` section).
+const VERSION_KEY: &str = "version";
+
+/// How many `files` entries and how many scripts one AppSpec is read for.
+///
+/// The document is caller-supplied and the AppSpec reference states no length for
+/// either section, so both bounds are EMULATOR-CHOSEN — an order of magnitude
+/// above the handful of mappings and the one or two scripts per lifecycle event a
+/// revision declares, and far below what would cost this process anything
+/// noticeable.
+const MAX_DECLARED_FILES: usize = 64;
+/// See [`MAX_DECLARED_FILES`].
+const MAX_DECLARED_SCRIPTS: usize = 32;
+
+/// What an EC2/on-premises revision's AppSpec declares: the files the agent
+/// installs and the scripts it runs.
+///
+/// Read when the deployment resolves its revision and then held, so what a
+/// deployment does on its instances is fixed by the revision it was created with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServerDeclaration {
+    /// The operating system the revision is written for, which an AppSpec of this
+    /// platform states.
+    pub os: String,
+    /// The `files` section, in document order.
+    pub files: Vec<DeclaredFile>,
+    /// The `hooks` section, in document order: one entry per script, carrying the
+    /// lifecycle event it runs for.
+    pub scripts: Vec<DeclaredScript>,
+}
+
+/// One entry of the `files` section: a path INSIDE the revision's bundle, and the
+/// directory on the instance it is copied to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredFile {
+    /// "A file or directory in the application revision", as the document wrote
+    /// it.
+    pub source: String,
+    /// "The location on the instance where the file … should be copied".
+    pub destination: String,
+}
+
+/// One script of the `hooks` section: which lifecycle event the agent runs it
+/// for, and everything that entry says about running it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeclaredScript {
+    /// The lifecycle event this script runs for, as the section's key spells it.
+    pub lifecycle_event_name: String,
+    /// The script's path inside the revision's bundle.
+    pub location: String,
+    /// "The number of seconds to allow the script to execute before it is
+    /// considered to have failed", where the entry states one.
+    ///
+    /// Held because the document states it, and not observable in this emulator: a
+    /// script is performed by a bounded, in-process session that answers within one
+    /// call ([`super::instance_lifecycle`]), so no script of a revision outlives a
+    /// timeout of its own.
+    pub timeout: Option<i64>,
+    /// "The user to impersonate when running the script", where the entry states
+    /// one.
+    ///
+    /// Held for the same reason and just as unobservable: the session performs the
+    /// script as the machine's own program, which has one identity
+    /// ([`super::instance_lifecycle`]).
+    pub runas: Option<String>,
+}
+
+impl ServerDeclaration {
+    /// The scripts this revision declares for `lifecycle_event_name`, in the
+    /// order the document lists them — which is the order the agent runs them in.
+    #[must_use]
+    pub fn scripts_for(&self, lifecycle_event_name: &str) -> Vec<&DeclaredScript> {
+        self.scripts
+            .iter()
+            .filter(|script| script.lifecycle_event_name == lifecycle_event_name)
+            .collect()
+    }
+}
+
+/// What the AppSpec document `content` declares for an EC2/on-premises
+/// deployment, or `None` for content that is no AppSpec of that platform at all —
+/// content outside the bounds [`declared_in_app_spec`] states, content that is no
+/// YAML (or JSON) document, and a document that states neither of the two members
+/// such an AppSpec must carry (its `version` and its `os`).
+///
+/// A document that carries those two and declares NEITHER section still reads as a
+/// declaration: the AppSpec was there and said to install nothing and run nothing,
+/// which is not the same as a revision whose AppSpec could not be read.
+#[must_use]
+pub fn declared_server_in_app_spec(content: &str) -> Option<ServerDeclaration> {
+    if !within_bounds(content) || !parses_within_depth(content) {
+        return None;
+    }
+    ::yaml_rust2::YamlLoader::load_from_str(content)
+        .ok()?
+        .iter()
+        .find_map(server_declaration_in_document)
+}
+
+/// The declaration one document carries; `None` for a document that is no mapping
+/// at all and for one that states neither member such an AppSpec must carry, so
+/// another document of the same stream can be read instead.
+fn server_declaration_in_document(document: &Yaml) -> Option<ServerDeclaration> {
+    if !matches!(document, Yaml::Hash(_)) {
+        return None;
+    }
+    // "The AppSpec file for an EC2/on-premises deployment must have the following
+    // structure": its `version` and its `os`. A document stating neither is not one
+    // CodeDeploy reads as an AppSpec, whatever else it holds.
+    let _version = property(document, VERSION_KEY)?;
+    Some(ServerDeclaration {
+        os: property(document, OS_KEY)?,
+        files: declared_files_in(document),
+        scripts: declared_scripts_in(document),
+    })
+}
+
+/// The `files` section's entries, in document order.
+///
+/// An entry needs BOTH members: a mapping that names only one of them describes
+/// no copy — there is either nothing to copy or nowhere to put it — so it
+/// declares nothing here.
+fn declared_files_in(document: &Yaml) -> Vec<DeclaredFile> {
+    let Some(Yaml::Array(entries)) = mapping_get(document, FILES_KEY) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let source = property(entry, SOURCE_KEY)?;
+            let destination = property(entry, DESTINATION_KEY)?;
+            Some(DeclaredFile {
+                source,
+                destination,
+            })
+        })
+        .take(MAX_DECLARED_FILES)
+        .collect()
+}
+
+/// The `hooks` section's scripts, in document order.
+///
+/// The section is a mapping of lifecycle event name to the list of scripts that
+/// event runs, and a single script may also be written as one mapping rather than
+/// as a one-entry list, so both spellings are read. An entry that names no
+/// `location` names no script to run.
+fn declared_scripts_in(document: &Yaml) -> Vec<DeclaredScript> {
+    let Some(Yaml::Hash(hooks)) = mapping_get(document, HOOKS_KEY) else {
+        return Vec::new();
+    };
+    let mut scripts: Vec<DeclaredScript> = Vec::new();
+    for (event, declared) in hooks {
+        let Some(lifecycle_event_name) = event.as_str().map(str::trim) else {
+            continue;
+        };
+        if lifecycle_event_name.is_empty() {
+            continue;
+        }
+        let entries: Vec<&Yaml> = match declared {
+            Yaml::Array(entries) => entries.iter().collect(),
+            single => vec![single],
+        };
+        for entry in entries {
+            if scripts.len() >= MAX_DECLARED_SCRIPTS {
+                return scripts;
+            }
+            let Some(location) = property(entry, LOCATION_KEY) else {
+                continue;
+            };
+            scripts.push(DeclaredScript {
+                lifecycle_event_name: lifecycle_event_name.to_string(),
+                location,
+                timeout: mapping_get(entry, TIMEOUT_KEY)
+                    .and_then(scalar)
+                    .and_then(|timeout| timeout.trim().parse().ok()),
+                runas: property(entry, RUNAS_KEY),
+            });
+        }
+    }
+    scripts
+}
+
 /// One key of a YAML mapping; `None` for a node that is no mapping, and for a
 /// mapping that does not carry the key.
 ///

@@ -75,11 +75,12 @@
 //! A program written against storage is written as a SCRIPT, so a session that was given a
 //! tree — a machine's ([`ShellSession::in_volume`]) or its own working one — also performs
 //! the grammar's own control flow over the commands inside it: `if`/`elif`/`else`, `while`,
-//! `until` and `for`, and a brace group. Each of those runs the same catalog this module
-//! performs and needs no primitive beyond it, each command inside spends the same budget
-//! ([`Bounds::commands`]), and that budget is what ends a loop with no end of its own. A
-//! subshell, a `case` clause, a function definition and a compound command carrying
-//! redirections of its own are forms no session performs.
+//! `until` and `for`, and a brace group — with the standard output of the whole compound
+//! command redirected where it carries such a redirection. Each of those runs the same
+//! catalog this module performs and needs no primitive beyond it, each command inside spends
+//! the same budget ([`Bounds::commands`]), and that budget is what ends a loop with no end of
+//! its own. A subshell, a `case` clause, a function definition and a compound command
+//! redirecting another descriptor are forms no session performs.
 //!
 //! # A session that runs in a MACHINE's tree
 //!
@@ -98,7 +99,8 @@
 //!   program names without a directory is resolved against it ([`ShellSession::at`]), which is
 //!   how a script written for a machine names a file it put somewhere;
 //! * the redirections that reach the tree's other descriptors: standard error to a file or a
-//!   device, and standard input from one;
+//!   device, and standard input from one — and the standard output of a whole COMPOUND
+//!   command, which is how such a script writes one file out of several lines;
 //! * arithmetic expansion ([`super::posix_shell_arithmetic`]), which is how such a program
 //!   computes what it writes — performed by every session that works over a tree.
 //!
@@ -1178,9 +1180,11 @@ impl ShellSession {
     /// A SIMPLE command is the form every session performs. The grammar's COMPOUND
     /// commands — the control flow a program is written with — are performed over this
     /// same catalog by a session that works over a tree ([`Self::run_compound`]), because
-    /// they need no primitive beyond the commands inside them. Every other form a shell
+    /// they need no primitive beyond the commands inside them, and so is the output
+    /// REDIRECTION of a whole compound command ([`Self::run_redirected_compound`]), which
+    /// is how a script writes one file from several commands. Every other form a shell
     /// grammar admits — a function definition, an extended test, a compound command
-    /// carrying redirections of its own — is one this session does not perform, and a
+    /// redirecting another descriptor — is one this session does not perform, and a
     /// command that did not run answers as one that could not be run rather than as one
     /// that succeeded.
     ///
@@ -1196,12 +1200,65 @@ impl ShellSession {
         match command {
             ::brush_parser::ast::Command::Simple(simple) => self.run_simple_command(simple),
             ::brush_parser::ast::Command::Compound(compound, redirections)
-                if redirections.is_none() && self.works_over_a_tree() =>
+                if self.works_over_a_tree() =>
             {
-                self.run_compound(compound)
+                match redirections {
+                    None => self.run_compound(compound),
+                    Some(list) => self.run_redirected_compound(compound, &list.0),
+                }
             }
             _ => self.config.statuses.could_not_run,
         }
+    }
+
+    /// Perform a compound command whose STANDARD OUTPUT is redirected: `{ …; } > PATH`,
+    /// and the `>> PATH` form that adds to what the file holds.
+    ///
+    /// "The redirection applies to the compound command as a whole", so what every command
+    /// inside it wrote is ONE write of that file — which is how a script that builds a file
+    /// out of several lines writes it, rather than appending to it once per line. The write
+    /// happens when the compound command has finished, the way a redirected simple command's
+    /// does ([`Self::run_simple_command`]), and a write the tree will not take leaves the
+    /// tree as it was and answers as a command that could not be run.
+    ///
+    /// Only standard output is redirected here: a compound command redirecting another
+    /// descriptor is a form this session does not perform, since the commands INSIDE it are
+    /// what redirect their own input and diagnostics.
+    fn run_redirected_compound(
+        &mut self,
+        compound: &::brush_parser::ast::CompoundCommand,
+        redirects: &[::brush_parser::ast::IoRedirect],
+    ) -> i32 {
+        let mut redirections = Redirections::default();
+        for redirect in redirects {
+            if !self.apply_redirect(redirect, &mut redirections) {
+                return self.config.statuses.could_not_run;
+            }
+        }
+        let Some((path, append)) = redirections.out.take() else {
+            return self.config.statuses.could_not_run;
+        };
+        if redirections != Redirections::default() {
+            // Another descriptor was redirected beside standard output, which is not a
+            // form performed here.
+            return self.config.statuses.could_not_run;
+        }
+        // The refused-write flag is this command's own, exactly as it is for a redirected
+        // simple command: one held for a command still running is restored after it.
+        let outer_refused = ::std::mem::replace(&mut self.redirect_failed, false);
+        self.captures.push(Capture {
+            limit: self.config.bounds.file_bytes,
+            ..Capture::default()
+        });
+        let status = self.run_compound(compound);
+        let captured = self.captures.pop().unwrap_or_default();
+        if captured.overflowed || !self.write_path(&path, &captured.text, append) {
+            self.redirect_failed = true;
+        }
+        if ::std::mem::replace(&mut self.redirect_failed, outer_refused) {
+            return self.config.statuses.could_not_run;
+        }
+        status
     }
 
     /// Whether this session works over a TREE — a machine's ([`Self::in_volume`]) or its

@@ -112,6 +112,18 @@ pub mod target_waves;
 /// the one place a deployment whose revision cannot be located is failed.
 pub mod s3_revision;
 
+/// The BUNDLE an EC2/on-premises revision is: the one place that archive is
+/// unpacked into the AppSpec file and the files and scripts it names.
+pub mod revision_bundle;
+
+/// What the CodeDeploy AGENT does on one of those instances: the lifecycle events
+/// it runs there, the bundle it puts on the host and the files it installs.
+pub mod instance_lifecycle;
+
+/// The pass that drives an EC2/on-premises deployment's instance targets: the one
+/// place the agent's work on a deployment's fleet falls due.
+pub mod agent_deployment;
+
 use crate::ops::types::{
     AlarmConfiguration, AutoRollbackConfiguration, BlueGreenDeploymentConfiguration,
     DeploymentStyle, EC2DeploymentOptions, EC2TagFilter, EC2TagSet, ECSService, LoadBalancerInfo,
@@ -1669,6 +1681,11 @@ pub struct Deployment {
     /// replacement was installed, until the deployment has terminated it ("The
     /// original task set is terminated after a successful deployment").
     pub ecs_original_task_set: Option<String>,
+    /// What this deployment's AGENT PLANE holds, for a deployment of the compute
+    /// platform whose work is done by an agent ON each target instance: whether
+    /// that work is still owed, and the revision it installs
+    /// ([`agent_deployment`]). Empty for every other platform.
+    pub agent: agent_deployment::AgentDeployment,
 }
 
 /// The result a validation function reported for one of a deployment's
@@ -1696,7 +1713,7 @@ pub struct LifecycleEventHookExecution {
 /// (`smithy_query(query="doc",shape="BatchGetDeploymentTargetsInput",member="targetIds")`):
 /// an EC2/on-premises instance id, a Lambda function name, or an Amazon ECS
 /// `<clustername>:<servicename>` pair.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeploymentTargetSnapshot {
     /// The id this target is reported and looked up under.
     ///
@@ -1713,6 +1730,20 @@ pub struct DeploymentTargetSnapshot {
     /// The `TargetLabel` this target carries, for a target of an EC2/on-premises
     /// deployment that HAS one; see [`deployment_targets`].
     pub instance_label: Option<String>,
+    /// The `TargetStatus` THIS target reached, for a target whose own progress
+    /// this service holds: an Amazon EC2 instance the agent took through the
+    /// deployment's lifecycle events ([`instance_lifecycle`]) ended as that run
+    /// ended, which is not the same for every host of a fleet.
+    ///
+    /// `None` for a target the agent has not been round yet, whose status is where
+    /// its deployment's waves have got to ([`target_waves::target_status`]).
+    pub status: Option<String>,
+    /// The lifecycle events THIS target reported, in the order they ran; empty for
+    /// a target whose events are the deployment's own ([`target_lifecycle`]).
+    pub lifecycle_events: Vec<crate::ops::types::LifecycleEvent>,
+    /// When this target's own status last changed, for a target that has one;
+    /// `None` where it follows the deployment's ([`target_last_updated_at_ms`]).
+    pub updated_at_ms: Option<i64>,
     /// Which WAVE of its deployment deploys to this target, counted from zero:
     /// the deployment takes its targets out of service a wave at a time, as many
     /// to a wave as the resolved configuration's `minimumHealthyHosts` allows
@@ -1978,6 +2009,18 @@ pub struct ComAmazonawsCodedeployCodedeploy20141006State {
     /// Only these are walked per pass, so the cost of publishing what a deployment
     /// owes does not grow with the deployment history.
     notifying_deployments: Vec<String>,
+    /// What the last SUCCESSFUL deployment of each (deployment group, instance)
+    /// left on that host: the archive its ApplicationStop runs out of and the
+    /// files that "were part of the previous successful deployment"
+    /// ([`instance_lifecycle::InstanceArchive`]).
+    ///
+    /// It outlives the deployment that wrote it, because it is what the NEXT
+    /// deployment to that host needs; see
+    /// [`Self::record_instance_archive`], which keeps it bounded.
+    pub instance_archives: HashMap<(String, String), instance_lifecycle::InstanceArchive>,
+    /// The order those entries were recorded in, so the oldest is the one dropped
+    /// when the history is full.
+    instance_archive_order: Vec<(String, String)>,
 }
 
 /// One of the built-in deployment configurations CodeDeploy ships.
@@ -2438,6 +2481,11 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 // set serving the production traffic and the original one being
                 // taken away (see `ecs_blue_green::apply_due_steps`).
                 && !ecs_blue_green::blocks_completion(deployment)
+                // Nor is an EC2/on-premises deployment whose fleet the agent has
+                // not been round yet: what such a deployment comes to is what its
+                // hosts did with the revision (see
+                // `agent_deployment::drive_due_instance_targets`).
+                && !agent_deployment::blocks_completion(deployment)
                 // Nor is a deployment whose lifecycle event hooks have not all
                 // reported `Succeeded`: the result of a validation function is
                 // what the lifecycle event it validates completed with, so a
@@ -2455,7 +2503,17 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                         deployment.error_information = Some(failure);
                         DEPLOYMENT_STATUS_FAILED
                     }
-                    None => terminal_status(deployment.target_count()),
+                    // An EC2/on-premises deployment ends as its HOSTS did: one
+                    // whose instance target failed cannot report success for a
+                    // revision that is not running there (see
+                    // `agent_deployment::instance_failure`).
+                    None => match agent_deployment::instance_failure(deployment) {
+                        Some(failure) => {
+                            deployment.error_information = Some(failure);
+                            DEPLOYMENT_STATUS_FAILED
+                        }
+                        None => terminal_status(deployment.target_count()),
+                    },
                 };
                 deployment.status = status.to_string();
                 deployment.complete_time_ms = Some(deployment.completes_at_ms);
@@ -3067,7 +3125,9 @@ pub fn malformed_deployment_id_message(deployment_id: &str) -> String {
 ///   belong to Amazon EC2, so they are RESOLVED from that service before this is
 ///   called and handed in as `ec2_fleet` ([`ec2_fleet`]). An Auto Scaling group
 ///   names Amazon EC2 Auto Scaling's own membership, which this emulator reads
-///   from no service, so that selector resolves nothing.
+///   from no service, so that selector resolves nothing. What a deployment then
+///   DOES on each of those instances is the agent's work on that host
+///   ([`instance_lifecycle`], driven by [`agent_deployment`]).
 ///
 /// A target of a blue/green deployment group carries the `TargetLabel` of the
 /// environment it belongs to: the instances the group selects are the ORIGINAL
@@ -3096,17 +3156,14 @@ pub fn deployment_targets(
                     service.service_name.clone().unwrap_or_default()
                 )),
                 target_type: DEPLOYMENT_TARGET_TYPE_ECS.to_string(),
-                instance_label: None,
-                wave: 0,
+                ..DeploymentTargetSnapshot::default()
             })
             .collect(),
         // Lambda: one target per deployment, named inside the revision; see the
         // note above.
         "Lambda" => vec![DeploymentTargetSnapshot {
-            target_id: None,
             target_type: DEPLOYMENT_TARGET_TYPE_LAMBDA.to_string(),
-            instance_label: None,
-            wave: 0,
+            ..DeploymentTargetSnapshot::default()
         }],
         // Server (EC2/on-premises), which is what `computePlatform` holds here
         // when it is neither of the two above — the member is the modelled enum
@@ -3130,7 +3187,7 @@ pub fn deployment_targets(
                     target_id: Some(instance_id),
                     target_type: DEPLOYMENT_TARGET_TYPE_INSTANCE.to_string(),
                     instance_label: instance_label.clone(),
-                    wave: 0,
+                    ..DeploymentTargetSnapshot::default()
                 })
                 .collect()
         }
@@ -3341,9 +3398,9 @@ pub fn deployment_target_view(
 ) -> crate::ops::types::DeploymentTarget {
     let deployment_id = Some(deployment.deployment_id.clone());
     let target_id = target.target_id.clone();
-    let status = Some(target_status(deployment, target).to_string());
-    let last_updated_at = Some(timestamp(target_last_updated_at_ms(deployment)));
-    let lifecycle_events = target_lifecycle::events_of(deployment);
+    let status = Some(effective_target_status(deployment, target));
+    let last_updated_at = Some(timestamp(effective_target_updated_at_ms(deployment, target)));
+    let lifecycle_events = effective_target_events(deployment, target);
     let mut view = crate::ops::types::DeploymentTarget {
         deployment_target_type: Some(target.target_type.clone()),
         instance_target: None,
@@ -3412,11 +3469,56 @@ pub fn instance_summary(
     crate::ops::types::InstanceSummary {
         deployment_id: Some(deployment.deployment_id.clone()),
         instance_id: target.target_id.clone(),
-        status: Some(target_status(deployment, target).to_string()),
-        last_updated_at: Some(timestamp(target_last_updated_at_ms(deployment))),
-        lifecycle_events: target_lifecycle::events_of(deployment),
+        status: Some(effective_target_status(deployment, target)),
+        last_updated_at: Some(timestamp(effective_target_updated_at_ms(deployment, target))),
+        lifecycle_events: effective_target_events(deployment, target),
         instance_type: target.instance_label.clone(),
     }
+}
+
+/// The `TargetStatus` one target reports: the one its deployment's progress through
+/// its WAVES gives it ([`target_waves::target_status`]), and — once that wave is
+/// behind the deployment — what the agent's own run on that host came to.
+///
+/// Both halves are needed, and in that order. A wave is out of service until it is
+/// finished, so a host of the wave being deployed to right now reports `InProgress`
+/// however far the agent has got on it, and one in a wave the deployment has not
+/// started reports `Pending`: that is the partition a client pacing a fleet reads
+/// ([`deployment_summary::deployment_overview`] counts it). Once the deployment is
+/// past that wave — or has reached its own outcome — the host reports what happened
+/// on IT ([`instance_lifecycle`]): a fleet's hosts do not all end the same way, so a
+/// host that failed reports `Failed` beside one that succeeded.
+pub fn effective_target_status(
+    deployment: &Deployment,
+    target: &DeploymentTargetSnapshot,
+) -> String {
+    let paced = target_waves::target_status(deployment, target);
+    if matches!(paced, TARGET_STATUS_IN_PROGRESS | TARGET_STATUS_PENDING) {
+        return paced.to_string();
+    }
+    target.status.clone().unwrap_or_else(|| paced.to_string())
+}
+
+/// The lifecycle events one target reports: its OWN, where it ran any, and
+/// otherwise the deployment's ([`target_lifecycle::events_of`]); see
+/// [`effective_target_status`].
+pub fn effective_target_events(
+    deployment: &Deployment,
+    target: &DeploymentTargetSnapshot,
+) -> Option<Vec<crate::ops::types::LifecycleEvent>> {
+    non_empty(&target.lifecycle_events).or_else(|| target_lifecycle::events_of(deployment))
+}
+
+/// When one target's status last changed: the instant ITS own run was recorded,
+/// and otherwise the instant the deployment last moved
+/// ([`target_last_updated_at_ms`]); see [`effective_target_status`].
+pub fn effective_target_updated_at_ms(
+    deployment: &Deployment,
+    target: &DeploymentTargetSnapshot,
+) -> i64 {
+    target
+        .updated_at_ms
+        .unwrap_or_else(|| target_last_updated_at_ms(deployment))
 }
 
 /// The `targetArn` of an instance target: the ARN of the instance itself.
@@ -3486,11 +3588,14 @@ fn on_premises_instance_arn(
 ///   `<clustername>:<servicename>` pair:
 ///   `arn:<partition>:ecs:<region>:<account>:service/<clustername>/<servicename>`.
 ///
-/// This is a rendering of the identifier the CALLER sent, not a claim that the
-/// resource exists — which is why it needs no record and why it is NOT what a
-/// target's `targetArn` is reported from: that member says which resource a
-/// deployment deployed to, so it is answered from the record this service holds
-/// (see [`instance_target_arn`]) and left absent where it holds none.
+/// This is a rendering of the identifier the CALLER sent rather than a claim that
+/// the resource exists, which is why it needs no record. A target of an
+/// EC2/on-premises deployment is reported under the SAME rendering
+/// ([`instance_target_arn`], which calls this): an Amazon EC2 instance id resolves
+/// to that instance's own ARN, and an on-premises host name to the ARN its
+/// registration minted — so what a refusal names a target by and what a reader
+/// reports as its `targetArn` are one string. A target of a platform whose
+/// resources this service holds no record of is left without one.
 ///
 /// `None` where no ARN follows from the id alone: an on-premises host name no
 /// registration exists for, because that ARN names a REGISTRATION (see
@@ -4526,6 +4631,12 @@ pub fn with_state<Eng: Send + Sync + 'static, R>(
     // stopped moves no traffic, and none reaches a successful outcome before the
     // replacement task set it described is serving that traffic.
     ecs_blue_green::apply_due_steps(engine, now);
+    // The work an EC2/on-premises deployment does on its fleet happens in the
+    // stores of the services that own them — which instances the group selects in
+    // Amazon EC2, and the bundle and the hook scripts in each instance's own guest
+    // — with this store unlocked for the same reason, and before the clock: a
+    // deployment's outcome follows what its hosts did with the revision.
+    agent_deployment::drive_due_instance_targets(engine, now);
     let mut guard = state.lock();
     guard.ensure_seeded(now);
     guard.advance_clock(now);

@@ -30,6 +30,15 @@ use super::{
 /// for them.
 pub const FILE_EXISTS_BEHAVIOR_DISALLOW: &str = "DISALLOW";
 
+/// See [`FILE_EXISTS_BEHAVIOR_DISALLOW`]: "OVERWRITE: The version of the file
+/// from the application revision currently being deployed replaces the version
+/// already on the instance".
+pub const FILE_EXISTS_BEHAVIOR_OVERWRITE: &str = "OVERWRITE";
+
+/// See [`FILE_EXISTS_BEHAVIOR_DISALLOW`]: "RETAIN: The version of the file
+/// already on the instance is kept and used as part of the new deployment".
+pub const FILE_EXISTS_BEHAVIOR_RETAIN: &str = "RETAIN";
+
 /// The file-handling policy a deployment created with `requested` runs under.
 ///
 /// A policy the request named is the policy the deployment runs under; a request
@@ -57,13 +66,17 @@ pub fn file_exists_behavior(requested: Option<String>) -> String {
 /// the summary is one view of the same target state the target readers answer
 /// from and cannot disagree with them.
 ///
+/// This emulator deploys to every target of a deployment together unless it holds
+/// the progress of that target ALONE — which it does for a host the agent went
+/// round ([`super::instance_lifecycle`]) — so each target is counted under the
+/// status that target reports ([`super::effective_target_status`]).
+///
 /// So the summary PARTITIONS the deployment's targets: every one of them is
-/// counted exactly once, under the status it holds
-/// ([`super::target_waves::target_status`]), and the counts therefore add up to
-/// the fleet at every instant — which for a deployment pacing its fleet a wave at
-/// a time means some targets counted as finished, at most a wave's worth counted
-/// as in progress, and the rest still pending. `Ready` counts "the number of
-/// instances in a replacement environment ready to receive traffic in a
+/// counted exactly once, under the status it holds, and the counts therefore add
+/// up to the fleet at every instant — which for a deployment pacing its fleet a
+/// wave at a time means some targets counted as finished, at most a wave's worth
+/// counted as in progress, and the rest still pending. `Ready` counts "the number
+/// of instances in a replacement environment ready to receive traffic in a
 /// blue/green deployment": a replacement environment is provisioned from EC2
 /// inventory this emulator does not keep, so no deployment here resolves such a
 /// target (see [`super::deployment_targets`]) and nothing is counted under it.
@@ -71,7 +84,7 @@ pub fn file_exists_behavior(requested: Option<String>) -> String {
 pub fn deployment_overview(deployment: &Deployment) -> DeploymentOverview {
     let mut overview = DeploymentOverview::default();
     for target in &deployment.targets {
-        let counted = match super::target_waves::target_status(deployment, target) {
+        let counted = match super::effective_target_status(deployment, target).as_str() {
             TARGET_STATUS_PENDING => &mut overview.pending,
             TARGET_STATUS_IN_PROGRESS => &mut overview.in_progress,
             TARGET_STATUS_SUCCEEDED => &mut overview.succeeded,

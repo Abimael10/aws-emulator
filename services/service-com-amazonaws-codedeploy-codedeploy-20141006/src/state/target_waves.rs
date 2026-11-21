@@ -363,8 +363,8 @@ mod tests {
         DeploymentTargetSnapshot {
             target_id: None,
             target_type: super::super::DEPLOYMENT_TARGET_TYPE_INSTANCE.to_string(),
-            instance_label: None,
             wave: 0,
+            ..DeploymentTargetSnapshot::default()
         }
     }
 

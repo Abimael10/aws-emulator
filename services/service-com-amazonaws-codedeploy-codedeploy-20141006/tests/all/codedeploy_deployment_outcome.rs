@@ -55,8 +55,10 @@ async fn a_deployment_ends_failed_when_its_group_resolves_no_target() {
     let emulator = Emulator::new();
 
     // Rows differ along the compute platform and along how the group selects its
-    // targets: an EC2 selector (tag filter, tag set, Auto Scaling group) resolves
-    // nothing, because CodeDeploy's state keeps no EC2 inventory, and an
+    // targets: an EC2 selector (tag filter, tag set, Auto Scaling group) names the
+    // instances of Amazon EC2's own inventory, and no instance store is mounted
+    // beside this suite, so it resolves nothing here (the fleet such a selector does
+    // resolve is `tests/all/server_platform_instance_deployments.rs`'s); an
     // on-premises selector resolves only registered instances whose tags it
     // matches — none are registered here — while an ECS group's targets are the
     // `ecsServices` it carries and a Lambda group's target is the function its

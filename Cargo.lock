@@ -12006,6 +12006,7 @@ dependencies = [
 name = "service-com-amazonaws-codedeploy-codedeploy-20141006"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -12022,11 +12023,13 @@ dependencies = [
  "aws-smithy-types",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "hex",
  "http",
  "percent-encoding",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-ecs-amazonec2containerservicev20141113",
  "service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
@@ -12036,6 +12039,7 @@ dependencies = [
  "service-com-amazonaws-sqs-amazonsqs",
  "service-common",
  "sha2 0.10.9",
+ "tar",
  "tokio",
  "tracing",
  "yaml-rust2",
