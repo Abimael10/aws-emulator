@@ -61,7 +61,7 @@
 //! released before the object store is locked: the two locks are never held at once, and the
 //! Amazon S3 service never reaches into this one, so the two cannot deadlock.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use ::service_com_amazonaws_s3_amazons3 as s3;
@@ -96,6 +96,13 @@ const LIST_SEPARATOR: &str = "|";
 /// keyed by the field's modelled name (an `Exportable*Field` value). A field the analysis
 /// records no value for has NO entry, and the cell under its column is empty.
 pub type ExportRow = BTreeMap<String, String>;
+
+/// The column of an export row that names the account whose recommendation it is: the
+/// `AccountId` exportable field every resource type's `Exportable*Field` value set declares
+/// (`crate::ops::types::EXPORTABLE_INSTANCE_FIELD_VALUES` and its siblings). It is the
+/// account a row is SELECTED by when a request names the accounts to export, whether or not
+/// the request asked for the column itself.
+pub const ACCOUNT_ID_COLUMN: &str = "AccountId";
 
 /// One filter of any of this service's filter vocabularies.
 ///
@@ -327,7 +334,10 @@ pub struct ExportRequest<'a, F: ExportFilter> {
     /// The request's `accountIds` and whether it asked for the organization's member accounts
     /// — "The parameters are mutually exclusive." They select WHOSE recommendations go into
     /// the file, not where it is written, so an id naming an account this service cannot
-    /// answer about ([`super::is_foreign_account`]) is refused rather than exported under.
+    /// answer about
+    /// ([`super::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::answers_for_account`])
+    /// is refused rather than exported under, and the file holds the rows of the accounts the
+    /// request named and of no others.
     pub account_ids: Option<Vec<String>>,
     /// See [`ExportRequest::account_ids`]. Asking for the member accounts is asking for the
     /// resources of "all member accounts of the organization", which only a management account
@@ -408,9 +418,10 @@ pub struct CreatedExport {
 ///
 /// A malformed request is refused BEFORE the store is read, so an invalid parameter takes
 /// precedence over the enrollment gate, as it does in every other operation of this service.
-/// An `accountIds` naming another account is such a request: it asks for an export of an
-/// account this service answers nothing about, and is refused with the crate's one
-/// cross-account refusal ([`super::CROSS_ACCOUNT_MESSAGE`]) exactly as a reader refuses it. So
+/// An `accountIds` naming an account outside the set this service answers for is such a
+/// request: it asks for an export of an account this service answers nothing about, and is
+/// refused with the crate's one cross-account refusal ([`super::CROSS_ACCOUNT_MESSAGE`])
+/// exactly as a reader refuses it. So
 /// is an `includeMemberAccounts` asking to cover the organization's member accounts from a
 /// caller that manages no organization, which is refused before the enrollment gate and
 /// before any job is recorded.
@@ -451,17 +462,23 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
              12-digit Amazon Web Services account ID."
         )));
     }
-    // `accountIds` is the MANAGEMENT-account mechanism for naming a member account of an
-    // organization, and this emulator presents exactly one standalone account
-    // ([`super::is_foreign_account`]) and records no organization. So an id naming any OTHER
-    // account asks for an export of an account whose analysis this service does not hold, and
-    // is refused with the refusal the whole crate shares ([`super::CROSS_ACCOUNT_MESSAGE`]) —
-    // the same answer a `Get*Recommendations` reader gives the same id, rather than writing
-    // THIS account's rows into a file whose metadata names that other account.
-    if account_ids
-        .iter()
-        .any(|value| super::is_foreign_account(value))
-    {
+    // `accountIds` is the MANAGEMENT-account mechanism for naming a member account of the
+    // organization the caller manages, so the accounts an export may name are the caller's own
+    // and the member accounts this service records
+    // ([`super::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::answers_for_account`],
+    // the one set every surface of this service answers for). An id naming any account outside
+    // it asks for an export of an account whose analysis this service does not hold, and is
+    // refused with the refusal the whole crate shares ([`super::CROSS_ACCOUNT_MESSAGE`]) — the
+    // same answer a `Get*Recommendations` reader gives the same id. A named account's rows are
+    // its OWN ([`ComAmazonawsComputeoptimizerComputeoptimizerserviceState::export_rows`]), so
+    // no file ever holds THIS account's rows under metadata naming another account.
+    let names_an_unanswerable_account = {
+        let guard = state.lock();
+        account_ids
+            .iter()
+            .any(|value| !guard.answers_for_account(value))
+    };
+    if names_an_unanswerable_account {
         return Err(ExportRefusal::InvalidParameter(
             super::CROSS_ACCOUNT_MESSAGE.to_string(),
         ));
@@ -954,14 +971,20 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     }
 
     /// The recommendation rows one export file holds: those of the job's resource type that
-    /// the account's analysis holds and the request's filters select, in analysis order.
+    /// the analysis of the accounts the request named holds and the request's filters select,
+    /// in analysis order.
     ///
-    /// The rows are the ONE account this emulator presents
-    /// ([`engine::emulator_account_id`]): `accountIds` and `includeMemberAccounts` select
-    /// whose recommendations go into the file, an admitted request can name no account but
-    /// this one ([`create_export_job`]), and this emulator records no organization and holds
-    /// no other account's analysis, so neither of them selects any row away or adds one —
-    /// they are stated in the metadata file as what the export was asked for.
+    /// `accountIds` selects WHOSE recommendations go into the file, so a row of an account the
+    /// request did not name is not part of the export ([`ACCOUNT_ID_COLUMN`]). This emulator
+    /// records an analysis for the ONE account it presents
+    /// ([`engine::emulator_account_id`]), so an export that names a member account of the
+    /// organization — an account an admitted request may name
+    /// ([`create_export_job`]) — holds the header row alone, exactly as that account's
+    /// recommendation reader reports no rows, rather than this account's rows under a file
+    /// whose metadata names another account. A request naming no account exports the rows the
+    /// caller can read, which is what `includeMemberAccounts` asks for over an organization
+    /// whose member accounts hold no analysis here; both are stated in the metadata file as
+    /// what the export was asked for.
     ///
     /// Compute Optimizer reports an account's STORED analysis to an ENROLLED account only, and
     /// only once the analysis its enrollment starts is due, so an export of that analysis
@@ -979,6 +1002,13 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
             .last_analysis_refresh()
             .map(|generated| generated.as_secs_f64());
         let mut rows = self.rows_of_resource_type(plan, last_refresh);
+        if !plan.account_ids.is_empty() {
+            let named: BTreeSet<&str> = plan.account_ids.iter().map(String::as_str).collect();
+            rows.retain(|row| {
+                row.get(ACCOUNT_ID_COLUMN)
+                    .is_some_and(|account_id| named.contains(account_id.as_str()))
+            });
+        }
         rows.retain(|row| row_matches_filters(row, &plan.resource_type, &plan.filters));
         rows
     }
@@ -1309,7 +1339,7 @@ fn auto_scaling_group_row(
     last_refresh: Option<f64>,
 ) -> ExportRow {
     let mut row = ExportRow::new();
-    put(&mut row, "AccountId", group.account_id.clone());
+    put(&mut row, ACCOUNT_ID_COLUMN, group.account_id.clone());
     put(&mut row, "AutoScalingGroupArn", arn.to_string());
     put(&mut row, "AutoScalingGroupName", group.name.clone());
     put(&mut row, "Finding", group.finding());
@@ -1486,7 +1516,7 @@ fn analysed_resource_row(
     last_refresh: Option<f64>,
 ) -> ExportRow {
     let mut row = ExportRow::new();
-    put(&mut row, "AccountId", resource.account_id.clone());
+    put(&mut row, ACCOUNT_ID_COLUMN, resource.account_id.clone());
     put(&mut row, arn_field_of(resource_type), arn);
     put(&mut row, "Finding", resource.finding.clone());
     put_list(
@@ -1553,7 +1583,7 @@ fn instance_row(
     last_refresh: Option<f64>,
 ) -> ExportRow {
     let mut row = ExportRow::new();
-    put(&mut row, "AccountId", instance.account_id.clone());
+    put(&mut row, ACCOUNT_ID_COLUMN, instance.account_id.clone());
     put(&mut row, "InstanceArn", arn.to_string());
     put(
         &mut row,
@@ -1768,7 +1798,7 @@ const STORAGE_OPTION: &str = "StorageRecommendationOptions";
 fn rds_database_row(recommendation: &RDSDBRecommendation, last_refresh: Option<f64>) -> ExportRow {
     let text = |member: &Option<String>| member.clone().unwrap_or_default();
     let mut row = ExportRow::new();
-    put(&mut row, "AccountId", text(&recommendation.account_id));
+    put(&mut row, ACCOUNT_ID_COLUMN, text(&recommendation.account_id));
     put(&mut row, "ResourceArn", text(&recommendation.resource_arn));
     put(&mut row, "Engine", text(&recommendation.engine));
     put(
@@ -2108,7 +2138,7 @@ fn license_row(
     last_refresh: Option<f64>,
 ) -> ExportRow {
     let mut row = ExportRow::new();
-    put(&mut row, "AccountId", license.account_id.clone());
+    put(&mut row, ACCOUNT_ID_COLUMN, license.account_id.clone());
     put(&mut row, "ResourceArn", arn);
     put(&mut row, "Finding", license.finding());
     put_list(
@@ -2223,7 +2253,7 @@ fn idle_row(
     let look_back_days = analysis.analysed_days(&preferences.look_back_period);
     let (percentage, _value) = analysis.savings();
     let mut row = ExportRow::new();
-    put(&mut row, "AccountId", analysis.account_id.clone());
+    put(&mut row, ACCOUNT_ID_COLUMN, analysis.account_id.clone());
     put(&mut row, "ResourceArn", arn);
     put(&mut row, "ResourceId", analysis.resource_id());
     put(
@@ -2289,7 +2319,7 @@ fn ecs_service_row(
 ) -> ExportRow {
     let text = |member: &Option<String>| member.clone().unwrap_or_default();
     let mut row = ExportRow::new();
-    put(&mut row, "AccountId", text(&recommendation.account_id));
+    put(&mut row, ACCOUNT_ID_COLUMN, text(&recommendation.account_id));
     put(
         &mut row,
         arn_field_of(RESOURCE_TYPE_ECS_SERVICE),

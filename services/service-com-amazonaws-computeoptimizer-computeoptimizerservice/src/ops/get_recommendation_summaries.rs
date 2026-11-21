@@ -222,11 +222,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service cannot report on.
         //
         // `accountIds` is the management account's mechanism for naming a MEMBER account
-        // ("Only one account ID can be specified per request"), and this emulator presents
-        // one standalone account and records no organization — so the account summarised is
-        // the caller's own, and any other id is refused rather than summarised as nothing
+        // ("Only one account ID can be specified per request"): the account summarised is the
+        // one it names — the caller's own, or a member account of the organization this
+        // service records — or the caller's own when it names none, and an id outside that set
+        // is refused rather than summarised as nothing
         // ([`crate::state::requested_account_id`], shared by every reader of this service).
-        let account_id = crate::state::requested_account_id(input.account_ids.as_deref())
+        let account_id = crate::state::requested_account_id(&state, input.account_ids.as_deref())
             .map_err(invalid_parameter)?;
 
         // A `nextToken` names the group the next page STARTS at, so it is resolved to that

@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // InvalidParameterValueException takes precedence over the opt-in gate below, as it
         // does in this service's other readers; so is every request that asks about an
         // account this service cannot answer for (see [`foreign_account`]).
-        let account_id = requested_account_id(input.account_ids.as_deref())?;
+        let account_id = requested_account_id(&state, input.account_ids.as_deref())?;
 
         // `resourceArns`: "The ARN that identifies the Amazon EC2 instance" — so each value
         // is an ARN, and one that names another account's instance asks about an account this
@@ -375,10 +375,11 @@ fn invalid_parameter(message: String) -> GetLicenseRecommendationsError {
 ///
 /// `accountIds` is how a MANAGEMENT account names a member account of its organization: "If
 /// your account is the management account of an organization, use this parameter to specify
-/// the member account for which you want to return license recommendations." This emulator
-/// presents one standalone account (`::engine::emulator_account_id`) and records no
-/// organization, so no other account is a member account it can be asked about — in
-/// `accountIds`, or through a `resourceArns` entry that names one. The refusal is worded once
+/// the member account for which you want to return license recommendations." The accounts
+/// this service answers for are the one the emulator presents
+/// (`::engine::emulator_account_id`) and the member accounts of the organization it records,
+/// so an `accountIds` outside that set — or a `resourceArns` entry whose account field names
+/// an account other than the one the request is about — is refused. The refusal is worded once
 /// for the whole crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no two readers differ.
 fn foreign_account() -> GetLicenseRecommendationsError {
     invalid_parameter(crate::state::CROSS_ACCOUNT_MESSAGE.to_string())
@@ -390,10 +391,12 @@ fn foreign_account() -> GetLicenseRecommendationsError {
 /// The rule is the crate's ([`crate::state::requested_account_id`]): "Only one account ID can
 /// be specified per request" (`GetLicenseRecommendations$accountIds`), an `AccountId` is a
 /// 12-digit Amazon Web Services account id (`Scope$value`), and an id that is well-formed but
-/// names another account is refused by [`foreign_account`] rather than used as a filter key.
+/// names an account this service answers nothing about is refused by [`foreign_account`]
+/// rather than used as a filter key.
 /// This wrapper only lifts the reason into this operation's error channel.
 fn requested_account_id(
+    state: &crate::state::ServiceStore,
     account_ids: Option<&[String]>,
 ) -> Result<String, GetLicenseRecommendationsError> {
-    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
+    crate::state::requested_account_id(state, account_ids).map_err(invalid_parameter)
 }

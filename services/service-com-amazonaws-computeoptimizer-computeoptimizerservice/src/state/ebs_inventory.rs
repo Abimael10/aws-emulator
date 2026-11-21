@@ -102,9 +102,10 @@ pub fn analysed_volumes<Eng: Send + Sync + 'static>(
     if !store.enrollment.analysis_visible() {
         return Vec::new();
     }
-    // The inventory is the ONE account this emulator presents ([`is_foreign_account`]): a
-    // request asking about any other account was refused by the reader that took it, so no
-    // inventory is swept on its behalf here either.
+    // The inventory holds the resources of the ONE account this emulator presents
+    // ([`engine::emulator_account_id`]), so an account the request named that is not it — a
+    // member account of the organization this service records — owns no volume here and has
+    // no inventory swept on its behalf.
     if account_id != ::engine::emulator_account_id() {
         return Vec::new();
     }

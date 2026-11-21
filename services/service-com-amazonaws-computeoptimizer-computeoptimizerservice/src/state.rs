@@ -958,14 +958,16 @@ pub const INCLUDE_MEMBER_ACCOUNTS_MESSAGE: &str = "Cannot include member account
      be because you are not an AWS Organization user or you are not the master account in the \
      organization.";
 
-/// Whether `account_id` — an id a request named, or the account field of an ARN it carried
-/// — names an account OTHER than the one this service answers for.
+/// Whether `account_id` — the account field of an ARN a request carried — names an account
+/// OTHER than the caller's own ([`engine::emulator_account_id`]).
 ///
-/// This emulator presents exactly one standalone account ([`engine::emulator_account_id`])
-/// and records no organization, so a resource owned by any other account is one no request
-/// can be answered about: a reader refuses it with [`CROSS_ACCOUNT_MESSAGE`] rather than
-/// resolving an answer under that other account. ONE test for the whole crate, so an
-/// account id and the account field of an ARN are judged by the same rule.
+/// A request that names no account is a request about the caller's OWN account, so a
+/// resource owned by any other account is one it cannot be answered about: the reader
+/// refuses it with [`CROSS_ACCOUNT_MESSAGE`] rather than resolving an answer under another
+/// account. Another account's analysis is asked for by NAMING that account — the
+/// `accountIds` member is the one mechanism for it ([`requested_account_id`]) — and then the
+/// identifiers the same request carries are judged against the account it named, not against
+/// the caller's own.
 pub fn is_foreign_account(account_id: &str) -> bool {
     account_id != ::engine::emulator_account_id()
 }
@@ -978,15 +980,24 @@ pub fn is_foreign_account(account_id: &str) -> bool {
 /// account is the management account of an organization, use this parameter to specify the
 /// member account for which you want to return \<resource\> recommendations. Only one
 /// account ID can be specified per request", and an account id is "a 12-digit Amazon Web
-/// Services account ID" (`Scope$value`). This emulator presents exactly one standalone
-/// account ([`engine::emulator_account_id`]) and records no organization, so a well-formed
-/// id naming any OTHER account asks about an account this service cannot report on: it is
-/// refused with [`CROSS_ACCOUNT_MESSAGE`], never used as a filter key and answered with an
-/// empty selection a client would read as "that account has no recommendations".
+/// Services account ID" (`Scope$value`). So the accounts a request may name are the caller's
+/// own and the member accounts of the organization this service records
+/// ([`ComAmazonawsComputeoptimizerComputeoptimizerserviceState::answers_for_account`]); a
+/// well-formed id naming any account outside that set asks about an account this service
+/// cannot report on and is refused with [`CROSS_ACCOUNT_MESSAGE`], never used as a filter key
+/// and answered with an empty selection a client would read as "that account has no
+/// recommendations".
+///
+/// The store is read for the LAST of those checks only, so a malformed `accountIds` is still
+/// refused before anything is read, and the refusal still precedes every gate that depends on
+/// what the store holds for the caller.
 ///
 /// Shared by every reader that takes `accountIds` so one cannot accept what another
 /// refuses.
-pub fn requested_account_id(account_ids: Option<&[String]>) -> Result<String, String> {
+pub fn requested_account_id(
+    state: &ServiceStore,
+    account_ids: Option<&[String]>,
+) -> Result<String, String> {
     let account_ids = account_ids.unwrap_or_default();
     if account_ids.len() > 1 {
         return Err(format!(
@@ -1004,7 +1015,7 @@ pub fn requested_account_id(account_ids: Option<&[String]>) -> Result<String, St
              12-digit Amazon Web Services account ID."
         ));
     }
-    if is_foreign_account(account_id) {
+    if is_foreign_account(account_id) && !state.lock().answers_for_account(account_id) {
         return Err(CROSS_ACCOUNT_MESSAGE.to_string());
     }
     Ok(account_id.clone())
@@ -4052,6 +4063,28 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
         !self.organization_members.is_empty()
     }
 
+    /// Whether this service can be asked about `account_id`: the account the emulator
+    /// presents, or an account recorded as a member of the organization that account manages.
+    ///
+    /// A management account "specif[ies] the member account for which you want to return
+    /// recommendations" by naming it, so the accounts a request may name are the caller's own
+    /// and the member accounts this store records ([`OrganizationMemberStore`]) — the very
+    /// accounts `GetEnrollmentStatusesForOrganization` reports a row for, that an
+    /// `UpdateEnrollmentStatus` including member accounts writes enrollment into, and that
+    /// `GetEnrollmentStatus$numberOfMemberAccountsOptedIn` counts. An account outside that set
+    /// is one this service answers nothing about, and is refused with
+    /// [`CROSS_ACCOUNT_MESSAGE`].
+    ///
+    /// Each account's analysis is its OWN: this emulator records an analysis for the account
+    /// it presents only, so a request admitted for a member account is answered from that
+    /// account's rows — none — rather than from another account's.
+    ///
+    /// The ONE test for the whole crate, so no two surfaces that take an account id differ on
+    /// which accounts they answer for.
+    pub fn answers_for_account(&self, account_id: &str) -> bool {
+        !is_foreign_account(account_id) || self.organization_members.get(account_id).is_some()
+    }
+
     /// Why an `includeMemberAccounts` the request carries cannot be honoured, or `None` when
     /// it can.
     ///
@@ -4186,10 +4219,14 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
-pub fn service_state<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-) -> Option<::engine::ServiceState<ComAmazonawsComputeoptimizerComputeoptimizerserviceState>> {
+pub fn service_state<Eng: Send + Sync + 'static>(engine: &Eng) -> Option<ServiceStore> {
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsComputeoptimizerComputeoptimizerserviceState>)
 }
+
+/// The handle to this service's store that [`service_state`] hands back, named once so a
+/// helper that has to read the store before a handler takes its lock — resolving the account
+/// a request asks about ([`requested_account_id`]), say — can take it as an argument.
+pub type ServiceStore =
+    ::engine::ServiceState<ComAmazonawsComputeoptimizerComputeoptimizerserviceState>;

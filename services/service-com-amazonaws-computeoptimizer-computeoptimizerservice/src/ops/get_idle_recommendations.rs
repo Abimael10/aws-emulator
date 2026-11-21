@@ -15,11 +15,12 @@
 //! holds no analysis for is simply absent from the answer: the call stays a successful empty
 //! result rather than a per-resource failure of the request.
 //!
-//! It reports for exactly ONE account, the one this emulator presents: a request that asks
-//! about any other account — in `accountIds`, or through a `resourceArns` entry whose
-//! account field names one — is refused with `InvalidParameterValueException` (see
-//! [`foreign_account`]), as every other reader of this service refuses it, and no
-//! recommendation recorded against another account is reported.
+//! It reports for exactly ONE account: the one its `accountIds` names — the caller's own, or a
+//! member account of the organization this service records — or the caller's own when it names
+//! none. A request that asks about any other account — in `accountIds`, or through a
+//! `resourceArns` entry whose account field names one — is refused with
+//! `InvalidParameterValueException` (see [`foreign_account`]), as every other reader of this
+//! service refuses it, and no recommendation recorded against another account is reported.
 //!
 //! ## Shape of an operation
 //!
@@ -199,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // InvalidParameterValueException takes precedence over the opt-in gate below, as it
         // does in the other read operations of this service; so is every request that asks
         // about an account this service cannot answer for (see [`foreign_account`]).
-        let account_id = requested_account_id(input.account_ids.as_deref())?;
+        let account_id = requested_account_id(&state, input.account_ids.as_deref())?;
 
         // `resourceArns`: "The ARN that identifies the idle resource" — so each value is an
         // ARN, and one whose account field names another account asks about an account this
@@ -420,9 +421,10 @@ fn invalid_parameter(message: String) -> GetIdleRecommendationsError {
 /// `accountIds` is how a MANAGEMENT account names a member account of its organization: "If
 /// your account is the management account or the delegated administrator of an organization,
 /// use this parameter to return the idle resource recommendations to specific member
-/// accounts." This emulator presents one standalone account (`::engine::emulator_account_id`)
-/// and records no organization, so no other account is a member account it can be asked
-/// about — in `accountIds`, or through a `resourceArns` entry that names one. The refusal is
+/// accounts." The accounts this service answers for are the one the emulator presents
+/// (`::engine::emulator_account_id`) and the member accounts of the organization it records,
+/// so an `accountIds` outside that set — or a `resourceArns` entry whose account field names
+/// an account other than the one the request is about — is refused. The refusal is
 /// worded once for the whole crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no two
 /// readers differ.
 fn foreign_account() -> GetIdleRecommendationsError {
@@ -435,10 +437,12 @@ fn foreign_account() -> GetIdleRecommendationsError {
 /// The rule is the crate's ([`crate::state::requested_account_id`]): "You can only specify
 /// one account ID per request" (`GetIdleRecommendations$accountIds`), an `AccountId` is a
 /// 12-digit Amazon Web Services account id (`Scope$value`), and an id that is well-formed but
-/// names another account is refused by [`foreign_account`] rather than used as a filter key.
+/// names an account this service answers nothing about is refused by [`foreign_account`]
+/// rather than used as a filter key.
 /// This wrapper only lifts the reason into this operation's error channel.
 fn requested_account_id(
+    state: &crate::state::ServiceStore,
     account_ids: Option<&[String]>,
 ) -> Result<String, GetIdleRecommendationsError> {
-    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
+    crate::state::requested_account_id(state, account_ids).map_err(invalid_parameter)
 }

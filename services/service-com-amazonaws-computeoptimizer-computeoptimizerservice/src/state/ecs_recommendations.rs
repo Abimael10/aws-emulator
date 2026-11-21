@@ -174,9 +174,10 @@ pub fn analysed_ecs_services<Eng: Send + Sync + 'static>(
     if !store.enrollment.is_opted_in() {
         return Vec::new();
     }
-    // The inventory is the ONE account this emulator presents ([`is_foreign_account`]): a
-    // request asking about any other account was refused by the operation that took it, so no
-    // inventory is swept on its behalf here either.
+    // The inventory holds the resources of the ONE account this emulator presents
+    // ([`engine::emulator_account_id`]), so an account the request named that is not it — a
+    // member account of the organization this service records — runs no service here and has
+    // no inventory swept on its behalf.
     if account_id != ::engine::emulator_account_id() {
         return Vec::new();
     }

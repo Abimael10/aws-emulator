@@ -195,8 +195,8 @@ impl ObservedLicensedInstance {
     /// instance-id" (`GetLicenseRecommendations$resourceArns`).
     ///
     /// Built through [`engine::emulator_arn`], the one ARN construction path: this emulator
-    /// presents exactly one account ([`engine::emulator_account_id`]) and answers for no
-    /// other ([`requested_account_id`]), so every observation it holds is that account's.
+    /// records an analysis for exactly one account ([`engine::emulator_account_id`]), so every
+    /// observation it holds is that account's.
     pub fn instance_arn(&self, region: &str) -> String {
         debug_assert_eq!(
             self.account_id,

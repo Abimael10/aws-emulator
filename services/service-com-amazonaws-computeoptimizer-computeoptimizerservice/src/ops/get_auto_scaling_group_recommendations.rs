@@ -12,10 +12,11 @@
 //! architectures and the inferred workload types, and the look-back period and the
 //! effective preferences from the account's stored recommendation preferences.
 //!
-//! A request whose `accountIds` names an account other than the one this emulator presents
-//! asks about a member account of an organization this service records none of, so it is
-//! refused with `InvalidParameterValueException` rather than answered with an empty list
-//! ([`crate::state::requested_account_id`], shared with this service's other readers).
+//! A request whose `accountIds` names the caller's own account, or a member account of the
+//! organization this service records, is answered from THAT account's analysis; one naming any
+//! other account is refused with `InvalidParameterValueException` rather than answered with an
+//! empty list ([`crate::state::requested_account_id`], shared with this service's other
+//! readers).
 //!
 //! This operation REPORTS; it writes nothing to the store.
 //!
@@ -216,16 +217,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names, or the caller's own account where it names none
         // ([`crate::state::requested_account_id`], which every reader of this service
         // resolves `accountIds` through).
-        let account_id = crate::state::requested_account_id(input.account_ids.as_deref())
+        let account_id = crate::state::requested_account_id(&state, input.account_ids.as_deref())
             .map_err(invalid_parameter)?;
 
         // Every `autoScalingGroupArns` entry must be the ARN of an Auto Scaling group;
         // an ARN that names something else cannot identify a group to report on. The
         // refusal carries the message the service answers for this condition, which the
         // recorded AWS behaviour pins to this exact wording for any malformed ARN. An ARN
-        // whose ACCOUNT field names another account asks about a group this service cannot
-        // report on, exactly as `accountIds` naming that account does, so it is refused
-        // with the crate's cross-account message rather than selecting nothing.
+        // whose ACCOUNT field names an account other than the one this request asks about
+        // names a group this request cannot report on, exactly as an `accountIds` naming an
+        // account this service answers nothing about does, so it is refused with the crate's
+        // cross-account message rather than selecting nothing.
         // The model bounds this list's length nowhere, so the service does: a request may
         // name at most the crate's ceiling
         // ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]), the same bound every reader of this
@@ -248,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Invalid Auto Scaling group ARN.".to_string(),
                 ));
             };
-            if crate::state::is_foreign_account(parsed.account_id) {
+            if parsed.account_id != account_id {
                 return Err(foreign_account());
             }
         }
@@ -439,13 +441,14 @@ fn invalid_parameter(message: String) -> GetAutoScalingGroupRecommendationsError
 }
 
 /// A 400 `InvalidParameterValueException` for a request that asks about an account other
-/// than the one this service answers for.
+/// than the one it is about.
 ///
-/// This emulator presents one standalone account (`::engine::emulator_account_id`) and
-/// records no organization, so no other account is a member account it can be asked about
-/// — in `accountIds`, or through an `autoScalingGroupArns` entry whose account field names
-/// one. The refusal is worded once for the whole crate
-/// ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no two readers differ.
+/// The accounts this service answers for are the one the emulator presents
+/// (`::engine::emulator_account_id`) and the member accounts of the organization it records,
+/// and a request is about ONE of them: the id its `accountIds` names, or the caller's own when
+/// it names none. An `autoScalingGroupArns` entry whose account field names any other account
+/// asks about a group that request cannot report on. The refusal is worded once for the whole
+/// crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no two readers differ.
 fn foreign_account() -> GetAutoScalingGroupRecommendationsError {
     invalid_parameter(crate::state::CROSS_ACCOUNT_MESSAGE.to_string())
 }

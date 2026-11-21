@@ -19,10 +19,10 @@
 //! absent from the answer, which stays a successful empty result rather than a per-resource
 //! failure of the request.
 //!
-//! The rows it reports are those of the ONE account it answers for: `accountIds` names a
-//! member account of an organization, which this emulator has none of, so a well-formed id
-//! naming another account is refused rather than used to select rows with (see
-//! [`requested_account_id`]).
+//! The rows it reports are those of the ONE account the request is about: `accountIds` names
+//! the caller's own account or a member account of the organization this service records, so a
+//! well-formed id naming an account outside that set is refused rather than used to select
+//! rows with (see [`requested_account_id`]).
 //!
 //! ## Shape of an operation
 //!
@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // InvalidParameterValueException takes precedence over the opt-in gate below, as it
         // does in this service's other readers; so is a request that asks about an account
         // this service cannot answer for (see [`requested_account_id`]).
-        let account_id = requested_account_id(input.account_ids.as_deref())?;
+        let account_id = requested_account_id(&state, input.account_ids.as_deref())?;
 
         // `resourceArns`: "The ARN that identifies the Amazon Aurora or RDS database" — so
         // each value is an ARN. WHICH resource an ARN names is not checked here: a
@@ -381,15 +381,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The rule is the crate's ([`crate::state::requested_account_id`]): "You can only specify
 /// one account ID per request" (`GetRDSDatabaseRecommendations$accountIds`), an account id
 /// is "a 12-digit Amazon Web Services account ID" (`Scope$value`), and `accountIds` is the
-/// MANAGEMENT account's mechanism for naming a MEMBER account of its organization — of
-/// which this emulator, presenting one standalone account, has none. So an id that is
-/// well-formed but names another account asks for recommendations this service cannot
-/// report and is refused, never used as a key to select rows of the findings catalog with.
+/// MANAGEMENT account's mechanism for naming a MEMBER account of its organization — so the
+/// accounts it may name are the caller's own and the member accounts this service records. An
+/// id that is well-formed but names an account outside that set asks for recommendations this
+/// service cannot report and is refused, never used as a key to select rows of the findings
+/// catalog with.
 /// This wrapper only lifts the reason into this operation's error channel.
 fn requested_account_id(
+    state: &crate::state::ServiceStore,
     account_ids: Option<&[String]>,
 ) -> Result<String, GetRDSDatabaseRecommendationsError> {
-    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
+    crate::state::requested_account_id(state, account_ids).map_err(invalid_parameter)
 }
 
 /// The 400 `InvalidParameterValueException` this operation refuses a bad request with: "The

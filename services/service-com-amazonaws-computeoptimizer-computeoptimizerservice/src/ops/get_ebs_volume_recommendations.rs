@@ -11,8 +11,8 @@
 //! writes nothing.
 //!
 //! A request narrows the answer three ways, each applied before the page is cut:
-//! `accountIds` (one account id, as the model documents — naming any account other than
-//! the one this emulator presents is refused, see [`foreign_account`]), `volumeArns`
+//! `accountIds` (one account id, as the model documents — naming an account this service
+//! answers nothing about is refused, see [`foreign_account`]), `volumeArns`
 //! (the volumes asked about; one this service holds no recommendation for is absent from
 //! the answer rather than reported in `errors`) and `filters` (the `Finding`
 //! classification — the one name the model's `EBSFilterName` enum admits).
@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // InvalidParameterValueException takes precedence over the opt-in gate below, as
         // it does in this service's other readers; so is every request that asks about an
         // account this service cannot answer for (see [`foreign_account`]).
-        let account_id = requested_account_id(input.account_ids.as_deref())?;
+        let account_id = requested_account_id(&state, input.account_ids.as_deref())?;
         let requested_volumes =
             requested_volume_ids(input.volume_arns.as_deref(), &account_id, &region)?;
         let filters = volume_filters(input.filters.as_deref())?;
@@ -375,14 +375,15 @@ fn invalid_parameter(message: String) -> GetEBSVolumeRecommendationsError {
 const CROSS_ACCOUNT_MESSAGE: &str = crate::state::CROSS_ACCOUNT_MESSAGE;
 
 /// A 400 `InvalidParameterValueException` for a request that asks about an account other
-/// than the one this service answers for.
+/// than the one it is about.
 ///
 /// `accountIds` is how a MANAGEMENT account names a member account of its organization:
 /// "If your account is the management account of an organization, use this parameter to
-/// specify the member account for which you want to return volume recommendations." This
-/// emulator presents one standalone account (`::engine::emulator_account_id`) and records
-/// no organization, so no other account is a member account it can be asked about — in
-/// `accountIds`, or through a `volumeArns` entry that names one.
+/// specify the member account for which you want to return volume recommendations." The
+/// accounts this service answers for are the one the emulator presents
+/// (`::engine::emulator_account_id`) and the member accounts of the organization it records,
+/// so an `accountIds` outside that set — or a `volumeArns` entry whose account field names an
+/// account other than the one the request is about — is refused.
 fn foreign_account() -> GetEBSVolumeRecommendationsError {
     invalid_parameter(CROSS_ACCOUNT_MESSAGE.to_string())
 }
@@ -393,12 +394,14 @@ fn foreign_account() -> GetEBSVolumeRecommendationsError {
 /// The rule is the crate's ([`crate::state::requested_account_id`]): "Only one account ID
 /// can be specified per request" (`GetEBSVolumeRecommendations$accountIds`), an
 /// `AccountId` is a 12-digit Amazon Web Services account id (`Scope$value`), and an id
-/// that is well-formed but names another account is refused by [`foreign_account`]. This
-/// wrapper only lifts the reason into this operation's error channel.
+/// that is well-formed but names an account this service answers nothing about is refused by
+/// [`foreign_account`]. This wrapper only lifts the reason into this operation's error
+/// channel.
 fn requested_account_id(
+    state: &crate::state::ServiceStore,
     account_ids: Option<&[String]>,
 ) -> Result<String, GetEBSVolumeRecommendationsError> {
-    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
+    crate::state::requested_account_id(state, account_ids).map_err(invalid_parameter)
 }
 
 /// The volumes this request asks about, by volume id, or `None` when it names none and so

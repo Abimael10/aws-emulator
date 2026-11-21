@@ -162,9 +162,10 @@ pub fn analysed_databases<Eng: Send + Sync + 'static>(
         .filter(|resource| resource.account_id == account_id)
         .cloned()
         .collect();
-    // The inventory is the ONE account this emulator presents ([`is_foreign_account`]): a
-    // request asking about any other account was refused by the reader that took it, so no
-    // inventory is swept on its behalf here either.
+    // The inventory holds the resources of the ONE account this emulator presents
+    // ([`engine::emulator_account_id`]), so an account the request named that is not it — a
+    // member account of the organization this service records — owns no database here and has
+    // no inventory swept on its behalf.
     if account_id != ::engine::emulator_account_id() {
         return rows;
     }

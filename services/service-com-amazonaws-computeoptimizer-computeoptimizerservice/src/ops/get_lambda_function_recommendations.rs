@@ -202,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // InvalidParameterValueException takes precedence over the opt-in gate below, as it
         // does in this service's other readers; so is every request that asks about an
         // account this service cannot answer for (see [`foreign_account`]).
-        let account_id = requested_account_id(input.account_ids.as_deref())?;
+        let account_id = requested_account_id(&state, input.account_ids.as_deref())?;
         let requested_functions =
             requested_functions(input.function_arns.as_deref(), &account_id, &region)?;
         let filters = input.filters.clone().unwrap_or_default();
@@ -388,14 +388,15 @@ fn foreign_account() -> GetLambdaFunctionRecommendationsError {
 /// The rule is the crate's ([`crate::state::requested_account_id`]): "Only one account ID
 /// can be specified per request" (`GetLambdaFunctionRecommendations$accountIds`), an
 /// `AccountId` is a 12-digit Amazon Web Services account id (`Scope$value`), and an id that
-/// is well-formed but names another account is refused by [`foreign_account`] \u2014 this
-/// emulator presents one standalone account (`::engine::emulator_account_id`) and records
-/// no organization, so no other account is a member account it can be asked about. This
-/// wrapper only lifts the reason into this operation's error channel.
+/// is well-formed but names an account this service answers nothing about is refused by
+/// [`foreign_account`] — the accounts it answers for are the one the emulator presents
+/// (`::engine::emulator_account_id`) and the member accounts of the organization it records.
+/// This wrapper only lifts the reason into this operation's error channel.
 fn requested_account_id(
+    state: &crate::state::ServiceStore,
     account_ids: Option<&[String]>,
 ) -> Result<String, GetLambdaFunctionRecommendationsError> {
-    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
+    crate::state::requested_account_id(state, account_ids).map_err(invalid_parameter)
 }
 
 /// The function VERSIONS this request asks about, by the resource part of their ARN, or

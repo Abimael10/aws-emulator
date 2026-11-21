@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The organization-wide `includeMemberAccounts` member, end to end over the wire.
+//! The organization-wide `includeMemberAccounts` member, and the `accountIds` that names one
+//! member account of the same organization, end to end over the wire.
 //!
-//! Nine operations of this service take it — the eight `Export*Recommendations` surfaces and
-//! `UpdateEnrollmentStatus` — and every one of them conditions it on the CALLER's role: the
+//! Nine operations of this service take `includeMemberAccounts` — the eight
+//! `Export*Recommendations` surfaces and `UpdateEnrollmentStatus` — and every one of them
+//! conditions it on the CALLER's role: the
 //! member asks for the resources, or the enrollment, of "all member accounts of the
 //! organization", which only an organization's management account or delegated administrator
 //! has. So a caller that manages no organization asking for them is refused with the modelled
 //! 400 `InvalidParameterValueException` and nothing is written, while the same call that does
 //! not ask for them is admitted, and a caller whose organization this service records has the
 //! member honoured.
+//!
+//! `accountIds` is the OTHER side of the same organization: it is how a management account
+//! "specif[ies] the member account for which you want to return recommendations", so the
+//! accounts any surface of this service answers for are the caller's own and the member
+//! accounts the store records — the very accounts `GetEnrollmentStatusesForOrganization`
+//! reports a row for. A request naming one of them is answered from THAT account's analysis
+//! (none, here: this emulator records an analysis for the account it presents only), and only
+//! an id naming an account outside that set is refused with the cross-account refusal.
 //!
 //! WHICH accounts an organization holds is recorded by AWS Organizations and no operation of
 //! THIS API creates one, so the fixtures record member accounts into the store the way that
@@ -22,11 +32,15 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, MemberAccountEnrollment,
+    service_state, MemberAccountEnrollment, EXPORT_JOB_STEP, JOB_STATUS_COMPLETE,
+    JOB_STATUS_FAILED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, create_bucket, emulator_with_engine, error_code, opt_in, ACCOUNT};
+use crate::harness::{
+    call, create_bucket, csv_rows, emulator_with_engine, error_code, export_destination,
+    get_object, make_analysis_due, opt_in, ACCOUNT,
+};
 
 /// The refusal every operation answers a caller that asks for member accounts while managing
 /// no organization with: the service's constant, which names neither the member nor the
@@ -406,5 +420,493 @@ async fn the_mutual_exclusion_is_judged_before_the_organization() {
                 "case {case:?}: expected the mutual-exclusion refusal, got {body}"
             );
         }
+    }
+}
+
+// ===========================================================================
+// `accountIds` naming a member account of the SAME organization
+//
+// `accountIds` is how a management account "specif[ies] the member account for which you want
+// to return recommendations", so the accounts every surface of this service answers for are the
+// caller's own and the member accounts the store records — the accounts
+// `GetEnrollmentStatusesForOrganization` reports a row for and `includeMemberAccounts` covers.
+// A request naming one of them is answered from THAT account's analysis, and only an id naming
+// an account outside the set is refused.
+// ===========================================================================
+
+/// The refusal every surface answers a request about an account it answers nothing about with:
+/// the service's constant, which names neither the member nor the account. Spelled out here
+/// rather than imported so the WORDING is what this suite pins.
+const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another account. If this \
+     is an organization account, request the management account to enable service access.";
+
+/// How many times [`completed_job`] looks at an export job before giving up, one of the job's
+/// own lifecycle steps apart: a deadline far past the steps a job takes, because what it waits
+/// for is the job reaching its terminal status rather than a span of the clock.
+const JOB_POLLS: usize = 200;
+
+/// Every reader of this service that takes `accountIds`: the operation, the member of its
+/// answer that carries what it reports, and whether the store this emulator starts with holds
+/// an analysis of that resource type for the caller's own account (an Amazon ECS service
+/// recommendation is computed over the ECS services the ECS emulator holds, and an Amazon
+/// Aurora or RDS database recommendation over the DB instances the Amazon RDS emulator holds —
+/// this suite creates neither).
+const READERS: [(&str, &str, bool); 9] = [
+    (
+        "GetAutoScalingGroupRecommendations",
+        "autoScalingGroupRecommendations",
+        true,
+    ),
+    ("GetEBSVolumeRecommendations", "volumeRecommendations", true),
+    (
+        "GetEC2InstanceRecommendations",
+        "instanceRecommendations",
+        true,
+    ),
+    (
+        "GetECSServiceRecommendations",
+        "ecsServiceRecommendations",
+        false,
+    ),
+    ("GetIdleRecommendations", "idleRecommendations", true),
+    (
+        "GetLambdaFunctionRecommendations",
+        "lambdaFunctionRecommendations",
+        true,
+    ),
+    ("GetLicenseRecommendations", "licenseRecommendations", true),
+    (
+        "GetRDSDatabaseRecommendations",
+        "rdsDBRecommendations",
+        false,
+    ),
+    ("GetRecommendationSummaries", "recommendationSummaries", true),
+];
+
+/// The eight `Export*Recommendations` surfaces: the rows of [`surfaces`] that export, without
+/// the enrollment write, which takes no `accountIds`.
+fn export_surfaces() -> Vec<Surface> {
+    surfaces()
+        .into_iter()
+        .filter(|surface| surface.operation != "UpdateEnrollmentStatus")
+        .collect()
+}
+
+/// The account ids of `members`, in the order the organization holds them.
+fn member_ids(members: &[MemberAccountEnrollment]) -> Vec<String> {
+    members
+        .iter()
+        .map(|member| member.account_id.clone())
+        .collect()
+}
+
+/// Well-formed 12-digit ids that are NEITHER the caller's own account NOR a member account of
+/// the recorded organization: the class "an account this service answers nothing about",
+/// spanned rather than named once — the extremes of the 12-digit range, the documentation's own
+/// example account, and the ids one digit away from the caller's own and from a member account,
+/// so membership is pinned to the recorded id and not to a prefix it shares.
+fn accounts_outside(members: &[MemberAccountEnrollment]) -> Vec<String> {
+    let neighbour = |account_id: &str| {
+        let mut neighbour = account_id.to_string();
+        let last = neighbour.pop().unwrap_or('0');
+        neighbour.push(if last == '9' { '8' } else { '9' });
+        neighbour
+    };
+    let recorded = member_ids(members);
+    let mut candidates = vec![
+        "000000000001".to_string(),
+        "999999999999".to_string(),
+        "111122223333".to_string(),
+        neighbour(ACCOUNT),
+    ];
+    if let Some(member) = recorded.first() {
+        candidates.push(neighbour(member));
+    }
+    candidates.retain(|id| id != ACCOUNT && !recorded.contains(id));
+    candidates
+}
+
+/// The `accountIds` lists an export may name over a recorded organization, spanning what the
+/// rule generalises over: how many ids the list holds, and whether the caller's own account is
+/// among them ("You can specify multiple account IDs per request").
+fn member_account_lists(members: &[MemberAccountEnrollment]) -> Vec<(String, Vec<String>)> {
+    let recorded = member_ids(members);
+    let mut rows = vec![("every member account".to_string(), recorded.clone())];
+    if let Some(member) = recorded.first() {
+        rows.push((
+            "the caller's own account and a member account".to_string(),
+            vec![ACCOUNT.to_string(), member.clone()],
+        ));
+        rows.push(("one member account".to_string(), vec![member.clone()]));
+    }
+    rows
+}
+
+/// Call `operation` and assert it was served, answering the body.
+async fn read(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    request: Value,
+) -> Value {
+    let (status, body) = call(router, operation, request.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected {request} to be served, got {status}: {body}"
+    );
+    body
+}
+
+/// Assert `request` is refused with the modelled 400 and the cross-account refusal.
+async fn refused_as_cross_account(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    request: Value,
+) {
+    let (status, body) = call(router, operation, request).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected the request to be refused, got {status}: {body}"
+    );
+    assert!(
+        error_code(&body).contains("InvalidParameterValueException"),
+        "case {case:?}: expected InvalidParameterValueException, got {body}"
+    );
+    assert_eq!(
+        body["message"].as_str(),
+        Some(CROSS_ACCOUNT_MESSAGE),
+        "case {case:?}: expected the cross-account refusal, got {body}"
+    );
+}
+
+/// Whether `body` reports no resource at all in `member`.
+///
+/// A findings reader reports one row per resource, so an account that holds no analysis reads
+/// an empty list. `GetRecommendationSummaries` instead reports one summary per resource type
+/// this service TRACKS whatever the account holds — "the number of" resources at each finding —
+/// so for such an account every count it carries is zero.
+fn reports_no_resource(member: &str, body: &Value) -> bool {
+    let reported = body[member].as_array().cloned().unwrap_or_default();
+    if member != "recommendationSummaries" {
+        return reported.is_empty();
+    }
+    reported.iter().all(|summary| {
+        summary["summaries"]
+            .as_array()
+            .is_none_or(|counts| counts.iter().all(|count| count["value"] == json!(0.0)))
+    })
+}
+
+/// Every `accountId` the answer carries, wherever it appears in it: what a reader reports
+/// belongs to the account the request named and to no other.
+fn account_ids_in(body: &Value) -> Vec<String> {
+    let mut found = Vec::new();
+    collect_account_ids(body, &mut found);
+    found
+}
+
+/// See [`account_ids_in`].
+fn collect_account_ids(body: &Value, found: &mut Vec<String>) {
+    match body {
+        Value::Object(members) => {
+            for (name, value) in members {
+                if name == "accountId" {
+                    if let Some(id) = value.as_str() {
+                        found.push(id.to_string());
+                    }
+                }
+                collect_account_ids(value, found);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_account_ids(value, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Poll `job_id` to its terminal status, asserting it completed.
+///
+/// Waits for the JOB's own status rather than for a span of the clock, so nothing built on it
+/// depends on how fast the host runs.
+async fn completed_job(router: &MultiServiceRouter, case: &str, job_id: &str) {
+    for _ in 0..JOB_POLLS {
+        let (status, body) = call(
+            router,
+            "DescribeRecommendationExportJobs",
+            json!({"jobIds": [job_id]}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading job {job_id}: got {status}: {body}"
+        );
+        let reported = body["recommendationExportJobs"][0]["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if reported == JOB_STATUS_COMPLETE || reported == JOB_STATUS_FAILED {
+            assert_eq!(
+                reported, JOB_STATUS_COMPLETE,
+                "case {case:?}: the export job must complete, got {body}"
+            );
+            return;
+        }
+        tokio::time::sleep(EXPORT_JOB_STEP).await;
+    }
+    panic!("case {case:?}: export job {job_id} never reached a terminal status");
+}
+
+/// Export through `operation` with `request`, assert the call was admitted, and answer the job
+/// id and the two object keys its destination names.
+async fn admitted_export(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    request: Value,
+) -> (String, String, String, String) {
+    let body = read(router, case, operation, request).await;
+    let job_id = body["jobId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: an admitted export answers a job id, got {body}"))
+        .to_string();
+    let (bucket, key, metadata_key) = export_destination(case, &body);
+    (job_id, bucket, key, metadata_key)
+}
+
+/// Download the object at `key`, asserting Amazon S3 served it.
+async fn downloaded(router: &MultiServiceRouter, case: &str, bucket: &str, key: &str) -> Vec<u8> {
+    let (status, object) = get_object(router, bucket, key).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: downloading {key}: got {status}: {}",
+        String::from_utf8_lossy(&object)
+    );
+    object
+}
+
+/// Every reader that takes `accountIds` answers for a member account of the recorded
+/// organization — the accounts `includeMemberAccounts` covers — instead of refusing it: the
+/// call is served, and it reports that account's own analysis, which this emulator holds none
+/// of, rather than the caller's rows under another account's id.
+#[tokio::test]
+async fn a_member_account_is_answered_for_by_every_reader_that_takes_account_ids() {
+    for (organization, members) in organizations() {
+        let (router, engine) = enrolled_emulator().await;
+        record_organization(&engine, &members);
+        make_analysis_due(&engine);
+
+        for (operation, member, holds_analysis) in READERS {
+            // The caller's own account reads its own analysis, whichever organization it
+            // manages: the row every member-account row below is compared against.
+            let case = format!("{organization}: {operation} for the caller's own account");
+            let own = read(&router, &case, operation, json!({})).await;
+            assert_eq!(
+                !reports_no_resource(member, &own),
+                holds_analysis,
+                "case {case:?}: expected the caller's own analysis to be reported \
+                 (rows={holds_analysis}), got {own}"
+            );
+            assert!(
+                account_ids_in(&own).iter().all(|id| id == ACCOUNT),
+                "case {case:?}: the caller's own answer names only its own account, got {own}"
+            );
+
+            for account_id in member_ids(&members) {
+                let case = format!("{organization}: {operation} for member account {account_id}");
+                let body = read(
+                    &router,
+                    &case,
+                    operation,
+                    json!({"accountIds": [account_id.clone()]}),
+                )
+                .await;
+                assert!(
+                    reports_no_resource(member, &body),
+                    "case {case:?}: this emulator records no analysis for a member account, so \
+                     the reader reports no resource for it, got {body}"
+                );
+                let named = account_ids_in(&body);
+                assert!(
+                    named.iter().all(|id| id == &account_id),
+                    "case {case:?}: the answer carries only the account the request named, got \
+                     {named:?} in {body}"
+                );
+            }
+        }
+    }
+}
+
+/// Every export surface admits an `accountIds` naming member accounts of the recorded
+/// organization: the job is queued and reported, it completes, and the metadata of the file it
+/// writes names exactly the accounts the request asked for.
+#[tokio::test]
+async fn an_export_may_name_a_member_account_of_the_recorded_organization() {
+    for (organization, members) in organizations() {
+        for (form, account_ids) in member_account_lists(&members) {
+            // One emulator per `accountIds` form: only one export job of a resource type may
+            // be in progress per Region, so two forms of one surface cannot share a store.
+            let (router, engine) = enrolled_emulator().await;
+            record_organization(&engine, &members);
+            make_analysis_due(&engine);
+
+            let mut queued: Vec<(String, String, String, String)> = Vec::new();
+            for surface in export_surfaces() {
+                let case = format!("{organization}/{form}: {}", surface.operation);
+                let mut asked = (surface.rest)();
+                asked["accountIds"] = json!(account_ids);
+                let (job_id, bucket, _, metadata_key) =
+                    admitted_export(&router, &case, surface.operation, asked).await;
+                queued.push((case, job_id, bucket, metadata_key));
+            }
+
+            // The store holds exactly the jobs those calls answered, in creation order.
+            let jobs = reported_jobs(&router, &format!("{organization}/{form}")).await;
+            let admitted: Vec<String> = queued
+                .iter()
+                .map(|(_, job_id, _, _)| job_id.clone())
+                .collect();
+            assert_eq!(
+                jobs, admitted,
+                "case {organization:?}/{form:?}: the store holds exactly the admitted export \
+                 jobs, got {jobs:?}"
+            );
+
+            for (case, job_id, bucket, metadata_key) in &queued {
+                completed_job(&router, case, job_id).await;
+                let object = downloaded(&router, case, bucket, metadata_key).await;
+                let metadata: Value = serde_json::from_slice(&object).unwrap_or_else(|error| {
+                    panic!("case {case:?}: the metadata file is JSON: {error}")
+                });
+                assert_eq!(
+                    metadata["accountIds"],
+                    json!(account_ids),
+                    "case {case:?}: the metadata names the accounts the export asked for, got \
+                     {metadata}"
+                );
+            }
+        }
+    }
+}
+
+/// The exported FILE holds the rows of the accounts the request named and of no others: an
+/// export that names a member account — whose analysis this emulator holds none of — writes the
+/// header row alone, while one that names the caller's own account writes exactly the rows a
+/// default export writes.
+#[tokio::test]
+async fn an_export_file_holds_only_the_rows_of_the_accounts_it_named() {
+    let member = "200000000001".to_string();
+    let members = vec![MemberAccountEnrollment::new(&member)];
+
+    // Two surfaces whose analysis this emulator records rows of, so "only the named account's
+    // rows" is a difference the file can show.
+    for operation in [
+        "ExportAutoScalingGroupRecommendations",
+        "ExportEC2InstanceRecommendations",
+    ] {
+        let mut own_rows: Option<usize> = None;
+        for (form, account_ids) in [
+            ("absent", None),
+            ("the caller's own account", Some(vec![ACCOUNT.to_string()])),
+            (
+                "the caller's own account and a member account",
+                Some(vec![ACCOUNT.to_string(), member.clone()]),
+            ),
+            ("a member account", Some(vec![member.clone()])),
+        ] {
+            let case = format!("{operation} with accountIds {form}");
+            let (router, engine) = enrolled_emulator().await;
+            record_organization(&engine, &members);
+            make_analysis_due(&engine);
+
+            let mut request = export_rest();
+            if let Some(account_ids) = &account_ids {
+                request["accountIds"] = json!(account_ids);
+            }
+            let (job_id, bucket, key, _) =
+                admitted_export(&router, &case, operation, request).await;
+            completed_job(&router, &case, &job_id).await;
+            let object = downloaded(&router, &case, &bucket, &key).await;
+            let document = String::from_utf8(object)
+                .unwrap_or_else(|error| panic!("case {case:?}: the export file is text: {error}"));
+            let rows = csv_rows(&document);
+            let (header, data) = rows
+                .split_first()
+                .unwrap_or_else(|| panic!("case {case:?}: the export file carries a header row"));
+
+            // Every row the file holds belongs to an account the request named.
+            let names_own = account_ids
+                .as_ref()
+                .is_none_or(|named| named.iter().any(|id| id == ACCOUNT));
+            for row in data {
+                let reported = crate::harness::cell(header, row, "AccountId");
+                assert!(
+                    account_ids
+                        .as_ref()
+                        .is_none_or(|named| named.iter().any(|id| id == reported)),
+                    "case {case:?}: the file holds a row of {reported:?}, which the export did \
+                     not name: {row:?}"
+                );
+            }
+
+            if names_own {
+                // The caller's own rows: as many as a default export writes, whichever form
+                // named the account.
+                let counted = *own_rows.get_or_insert(data.len());
+                assert!(
+                    data.len() == counted && counted > 0,
+                    "case {case:?}: expected the caller's own {counted} rows, got {}",
+                    data.len()
+                );
+            } else {
+                assert!(
+                    data.is_empty(),
+                    "case {case:?}: this emulator records no analysis for a member account, so \
+                     the file holds the header row alone, got {data:?}"
+                );
+            }
+        }
+    }
+}
+
+/// An account that is NEITHER the caller's own nor a member account of the recorded
+/// organization is still refused with the cross-account refusal — by every reader that takes
+/// `accountIds` and by every export surface — so admitting a member account did not admit any
+/// account at all.
+#[tokio::test]
+async fn an_account_outside_the_organization_is_refused_by_every_surface() {
+    for (organization, members) in organizations() {
+        let (router, engine) = enrolled_emulator().await;
+        record_organization(&engine, &members);
+        make_analysis_due(&engine);
+
+        for account_id in accounts_outside(&members) {
+            for (operation, _, _) in READERS {
+                let case = format!("{organization}: {operation} for {account_id}");
+                refused_as_cross_account(
+                    &router,
+                    &case,
+                    operation,
+                    json!({"accountIds": [account_id.clone()]}),
+                )
+                .await;
+            }
+            for surface in export_surfaces() {
+                let case = format!("{organization}: {} for {account_id}", surface.operation);
+                let mut asked = (surface.rest)();
+                asked["accountIds"] = json!([account_id.clone()]);
+                refused_as_cross_account(&router, &case, surface.operation, asked).await;
+            }
+        }
+
+        // Not one of those calls wrote: no export job was queued.
+        let jobs = reported_jobs(&router, organization).await;
+        assert!(
+            jobs.is_empty(),
+            "case {organization:?}: a refused export records no job, got {jobs:?}"
+        );
     }
 }

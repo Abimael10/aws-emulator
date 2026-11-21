@@ -254,20 +254,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `accountIds` names the account to report on: "You can only specify one account ID
         // per request", it must be a 12-digit account id, and it must be an account this
-        // service can report on — this emulator presents one standalone account and records
-        // no organization, so any other account is refused rather than used as a filter key
-        // ([`crate::state::requested_account_id`], shared by every reader of this service).
+        // service can report on — the caller's own, or a member account of the organization
+        // this service records — so an id outside that set is refused rather than used as a
+        // filter key ([`crate::state::requested_account_id`], shared by every reader of this
+        // service).
         let accounts = input.account_ids.clone().unwrap_or_default();
-        let account_id = match crate::state::requested_account_id(Some(&accounts)) {
+        let account_id = match crate::state::requested_account_id(&state, Some(&accounts)) {
             Ok(account_id) => account_id,
             Err(reason) => return Err(invalid(reason)),
         };
         let filters = requested_filters(input.filters.as_deref())?;
         // Every `serviceArns` entry must be in the documented form,
         // `arn:aws:ecs:region:aws_account_id:service/cluster-name/service-name`. An ARN
-        // whose ACCOUNT field names another account asks about a service this service
-        // cannot report on, exactly as `accountIds` naming that account does, so it is
-        // refused with the crate's cross-account message rather than reported in `errors`.
+        // whose ACCOUNT field names an account other than the one this request is about
+        // asks about a service this request cannot report on, exactly as an `accountIds`
+        // naming an account this service answers nothing about does, so it is refused with
+        // the crate's cross-account message rather than reported in `errors`.
         let mut requested: Vec<crate::state::EcsServiceRef> = Vec::new();
         // The model bounds this list's length nowhere, so the service does: a request may
         // name at most the crate's ceiling
@@ -289,7 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      arn:aws:ecs:region:aws_account_id:service/cluster-name/service-name."
                 )));
             };
-            if crate::state::is_foreign_account(&reference.account_id) {
+            if reference.account_id != account_id {
                 return Err(foreign_account());
             }
             requested.push(reference);
@@ -474,11 +476,13 @@ fn invalid(message: impl Into<String>) -> GetECSServiceRecommendationsError {
 }
 
 /// A 400 `InvalidParameterValueException` for a request that asks about an account other
-/// than the one this service answers for.
+/// than the one it is about.
 ///
-/// This emulator presents one standalone account (`::engine::emulator_account_id`) and
-/// records no organization, so no other account is a member account it can be asked about
-/// — in `accountIds`, or through a `serviceArns` entry whose account field names one. The
+/// The accounts this service answers for are the one the emulator presents
+/// (`::engine::emulator_account_id`) and the member accounts of the organization it records,
+/// and a request is about ONE of them: the id its `accountIds` names, or the caller's own when
+/// it names none. An `accountIds` outside that set, or a `serviceArns` entry whose account
+/// field names an account other than the one the request is about, is refused. The
 /// refusal is worded once for the whole crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so
 /// no two readers differ.
 fn foreign_account() -> GetECSServiceRecommendationsError {
