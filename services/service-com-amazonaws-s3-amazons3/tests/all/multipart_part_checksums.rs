@@ -32,6 +32,11 @@
 //! Every expected digest is DERIVED in this suite from the part's bytes through the hash
 //! crate that implements the algorithm, so the assertions do not read a value back out of
 //! the code under test.
+//!
+//! The last suite closes the loop a client actually drives: the per-part digest a completion's
+//! manifest carries is the one the part write ANSWERED, not one derived a second time, so a
+//! part write that answers no digest leaves the manifest unbuildable and the upload
+//! uncompletable.
 
 use aws_smithy_types::base64;
 use smithy_server_runtime::MultiServiceRouter;
@@ -48,6 +53,15 @@ const MIN_MULTIPART_PART_BYTES: usize = 5 * 1024 * 1024;
 /// The code S3 answers a declared digest that is not the digest of the bytes it received:
 /// `BadDigest`, HTTP 400 (Amazon S3 *Error responses*, list of error codes).
 const BAD_DIGEST: &str = "BadDigest";
+
+/// The two values `ChecksumType` publishes
+/// (`smithy_query(query="shape",shape="com.amazonaws.s3#ChecksumType")` reports `[COMPOSITE,
+/// FULL_OBJECT]`) — which of them an upload settles decides how the OBJECT's checksum is built
+/// from its parts: the digest of the bytes they assemble into, or the composition over their
+/// own digests.
+const FULL_OBJECT: &str = "FULL_OBJECT";
+/// See [`FULL_OBJECT`].
+const COMPOSITE: &str = "COMPOSITE";
 
 /// Every `x-amz-checksum-*` response header the model binds, so a row that expects exactly
 /// ONE of them can assert that no other carries a value.
@@ -215,9 +229,31 @@ async fn complete(
 }
 
 /// `HEAD /<bucket>/<key>` — `HeadObject`, which is what shows whether a refused completion
-/// stored an object after all.
-async fn head_object(router: &MultiServiceRouter, name: &str, key: &str) -> Answer {
-    send(router, "HEAD", &format!("/{name}/{key}"), &[], "").await
+/// stored an object after all, and — asked with `x-amz-checksum-mode: ENABLED` — what a later
+/// read reports of a stored object's checksum.
+async fn head_object(
+    router: &MultiServiceRouter,
+    name: &str,
+    key: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
+    send(router, "HEAD", &format!("/{name}/{key}"), headers, "").await
+}
+
+/// The COMPOSITE checksum of an object assembled from `parts`, under `algorithm`: S3
+/// "concatenates the … checksums … and then calculates the checksum of these concatenated
+/// values" and reports it "with the total number of parts" after a dash (Amazon S3 User Guide,
+/// *Checking object integrity*) — so the algorithm's digest of the parts' RAW digests, with the
+/// count appended.
+///
+/// ONE derivation of it in this suite, so the rows that expect a composition and the rows that
+/// assert a full-object value is NOT one cannot drift apart.
+fn composition(algorithm: &str, parts: &[Vec<u8>]) -> String {
+    let mut digests: Vec<u8> = Vec::new();
+    for part in parts {
+        digests.extend_from_slice(&base64::decode(digest(algorithm, part)).expect("a Base64 digest"));
+    }
+    format!("{}-{}", digest(algorithm, &digests), parts.len())
 }
 
 /// `GET /<bucket>/<key>?attributes` — `GetObjectAttributes`, asking for the object's
@@ -429,11 +465,7 @@ async fn each_part_of_one_upload_carries_its_own_digest() {
         completed.status,
         text(&completed)
     );
-    let mut digests: Vec<u8> = Vec::new();
-    for part in parts.iter() {
-        digests.extend_from_slice(&base64::decode(digest(algorithm, part)).expect("Base64"));
-    }
-    let composed = format!("{}-{}", digest(algorithm, &digests), parts.len());
+    let composed = composition(algorithm, &parts);
     let object = completed.element(&format!("Checksum{algorithm}"));
     assert_eq!(
         object.as_deref(),
@@ -605,7 +637,7 @@ async fn a_wrong_declared_object_checksum_is_refused_and_stores_no_object() {
 
     // A full-object algorithm and a composite one, so the rule is asserted over both ways
     // an object's checksum is computed from its parts.
-    for (algorithm, requested_type) in [("CRC64NVME", "FULL_OBJECT"), ("SHA256", "COMPOSITE")] {
+    for (algorithm, requested_type) in [("CRC64NVME", FULL_OBJECT), ("SHA256", COMPOSITE)] {
         let case = format!("{algorithm}/{requested_type}");
         let key = format!("object-digest/{algorithm}.bin");
         let parts = [filler(MIN_MULTIPART_PART_BYTES, 23), b"and the rest".to_vec()];
@@ -645,7 +677,7 @@ async fn a_wrong_declared_object_checksum_is_refused_and_stores_no_object() {
             // The completion names each part's own digest for a COMPOSITE upload, whose
             // object-level checksum is composed of exactly those values; a FULL_OBJECT
             // upload's completion is not asked for them.
-            let part_checksum = (requested_type == "COMPOSITE")
+            let part_checksum = (requested_type == COMPOSITE)
                 .then(|| (format!("Checksum{algorithm}"), own.clone()));
             named.push((
                 number,
@@ -695,7 +727,7 @@ async fn a_wrong_declared_object_checksum_is_refused_and_stores_no_object() {
         );
 
         // Nothing was stored, and the upload still holds its parts.
-        let head = head_object(&router, name, &key).await;
+        let head = head_object(&router, name, &key, &[]).await;
         assert_eq!(
             head.status, 404,
             "case {case:?}: a refused completion must store no object, HeadObject answered {}",
@@ -719,16 +751,10 @@ async fn a_wrong_declared_object_checksum_is_refused_and_stores_no_object() {
         // The TRUE object checksum — the full object's digest for a FULL_OBJECT upload, the
         // composition over the parts' digests for a COMPOSITE one — is accepted, and the
         // completion answers that same value.
-        let truthful = if requested_type == "FULL_OBJECT" {
+        let truthful = if requested_type == FULL_OBJECT {
             digest(algorithm, &parts.concat())
         } else {
-            let mut digests: Vec<u8> = Vec::new();
-            for part in parts.iter() {
-                digests.extend_from_slice(
-                    &base64::decode(digest(algorithm, part)).expect("a Base64 digest"),
-                );
-            }
-            format!("{}-{}", digest(algorithm, &digests), parts.len())
+            composition(algorithm, &parts)
         };
         let completed = complete(
             &router,
@@ -752,5 +778,228 @@ async fn a_wrong_declared_object_checksum_is_refused_and_stores_no_object() {
             Some(truthful.as_str()),
             "case {case:?}: expected the completion to report {truthful:?}, got {reported:?}"
         );
+    }
+}
+
+/// One row of the MANIFEST table: how the upload is configured, and the bytes of each part in
+/// ascending part-number order.
+struct ManifestCase {
+    case: &'static str,
+    key: &'static str,
+    algorithm: &'static str,
+    /// The `ChecksumType` the initiation asks for, or `None` to leave it to the algorithm —
+    /// one algorithm's checksum "is always a full object checksum"
+    /// (`CompleteMultipartUploadOutput$ChecksumCRC64NVME`), so an initiation naming it asks
+    /// for nothing.
+    requested_type: Option<&'static str>,
+    /// Whether each part request DECLARES its own digest on `x-amz-checksum-<algorithm>`, the
+    /// way a client that computed it does, or names the algorithm nowhere and leaves it to
+    /// the initiation — the answered digest is the same either way.
+    declares_part_digests: bool,
+    parts: Vec<Vec<u8>>,
+}
+
+/// The manifest table. The rows differ along what the rule generalises over: WHICH algorithm
+/// the full-object checksum is computed under (every one the Amazon S3 User Guide (*Checking
+/// object integrity*) publishes a full object checksum for — `CRC32`, `CRC32C` and
+/// `CRC64NVME`), HOW the type was settled (taken from the algorithm, or asked for), HOW MANY
+/// parts the object is assembled from (one, two, three), the SIZES of those parts (a handful
+/// of bytes, exactly the published minimum, above it), and whether each part request carried
+/// the client's own digest.
+fn manifest_cases() -> Vec<ManifestCase> {
+    vec![
+        ManifestCase {
+            case: "three parts under the algorithm that is always a full-object checksum",
+            key: "manifest/crc64nvme-three.bin",
+            algorithm: "CRC64NVME",
+            requested_type: None,
+            declares_part_digests: true,
+            parts: vec![
+                filler(MIN_MULTIPART_PART_BYTES, 11),
+                filler(MIN_MULTIPART_PART_BYTES + 13, 29),
+                b"the tail of the object".to_vec(),
+            ],
+        },
+        ManifestCase {
+            case: "one part, which no minimum size applies to",
+            key: "manifest/crc64nvme-one.bin",
+            algorithm: "CRC64NVME",
+            requested_type: Some(FULL_OBJECT),
+            declares_part_digests: true,
+            parts: vec![b"the whole object arrived as one part".to_vec()],
+        },
+        ManifestCase {
+            case: "two parts, the algorithm named by the initiation alone",
+            key: "manifest/crc32-two.bin",
+            algorithm: "CRC32",
+            requested_type: Some(FULL_OBJECT),
+            declares_part_digests: false,
+            parts: vec![
+                filler(MIN_MULTIPART_PART_BYTES, 37),
+                b"and the rest of it".to_vec(),
+            ],
+        },
+        ManifestCase {
+            case: "two parts under the other CRC that admits a full-object checksum",
+            key: "manifest/crc32c-two.bin",
+            algorithm: "CRC32C",
+            requested_type: Some(FULL_OBJECT),
+            declares_part_digests: true,
+            parts: vec![
+                filler(MIN_MULTIPART_PART_BYTES, 41),
+                b"the final bytes".to_vec(),
+            ],
+        },
+    ]
+}
+
+/// RULE: a part write ANSWERS the digest of that part's own bytes in the member its algorithm
+/// names, and that answered value is the one a completion's part manifest may carry for the
+/// part — so an upload completes from the digests its own part writes answered, and the object
+/// it assembles carries the checksum the settled type defines: for a full-object upload the
+/// algorithm's digest of the ASSEMBLED bytes, with no part-count suffix, which every later
+/// read of the object reports beside that type.
+///
+/// This is the whole loop a client can actually drive: the per-part digest it puts in the
+/// manifest is not derived a second time, it is read back off the part write's own response,
+/// so a response that omits the member leaves the manifest unbuildable.
+#[tokio::test]
+async fn a_full_object_upload_completes_from_the_digests_its_part_writes_answered() {
+    for row in manifest_cases() {
+        // A store per row, so one row's parts and object cannot crowd another's out of the
+        // byte budget this emulator keeps per bucket.
+        let router = router();
+        let name = "multipart-full-object-manifest-bucket";
+        bucket(&router, name).await;
+        let case = row.case;
+
+        let mut headers: Vec<(&str, &str)> = vec![("x-amz-checksum-algorithm", row.algorithm)];
+        if let Some(requested) = row.requested_type {
+            headers.push(("x-amz-checksum-type", requested));
+        }
+        let upload_id = initiate(&router, name, row.key, &headers).await;
+
+        let header = checksum_header(row.algorithm);
+        let element = format!("Checksum{}", row.algorithm);
+        // The manifest, built ONLY out of what the part writes answered.
+        let mut manifest: Vec<NamedPart> = Vec::new();
+        for (index, body) in row.parts.iter().enumerate() {
+            let number = index as i32 + 1;
+            let own = digest(row.algorithm, body);
+            let declared: Vec<(&str, &str)> = match row.declares_part_digests {
+                true => vec![(header.as_str(), own.as_str())],
+                false => Vec::new(),
+            };
+            let uploaded =
+                upload_part(&router, name, row.key, &upload_id, number, &declared, body).await;
+            assert_eq!(
+                uploaded.status,
+                200,
+                "case {case:?}: part {number} expected HTTP 200 from UploadPart, got {} with \
+                 body {:?}",
+                uploaded.status,
+                text(&uploaded)
+            );
+            let answered = uploaded.header(&header);
+            assert_eq!(
+                answered.as_deref(),
+                Some(own.as_str()),
+                "case {case:?}: part {number} expected {header} = {own:?}, got {answered:?}"
+            );
+            let answered = answered.unwrap_or_default();
+            let etag = uploaded.header("etag").unwrap_or_else(|| {
+                panic!("case {case:?}: part {number} must report an ETag header")
+            });
+            manifest.push((number, etag, Some((element.clone(), answered))));
+        }
+
+        let completed = complete(&router, name, row.key, &upload_id, &manifest, &[]).await;
+        assert_eq!(
+            completed.status,
+            200,
+            "case {case:?}: a manifest of the answered per-part digests must complete the \
+             upload, got {} with body {:?}",
+            completed.status,
+            text(&completed)
+        );
+        let settled = completed.element("ChecksumType");
+        assert_eq!(
+            settled.as_deref(),
+            Some(FULL_OBJECT),
+            "case {case:?}: expected ChecksumType {FULL_OBJECT:?}, got {settled:?}"
+        );
+
+        // The object's own value: the digest of the bytes the parts assemble into, which is
+        // what a full-object checksum is computed over.
+        let expected_object = digest(row.algorithm, &row.parts.concat());
+        let reported = completed.element(&element);
+        assert_eq!(
+            reported.as_deref(),
+            Some(expected_object.as_str()),
+            "case {case:?}: expected <{element}> = {expected_object:?}, got {reported:?}"
+        );
+        // And carries no part-count suffix: the dash and the count belong to a COMPOSITE
+        // value, and no Base64 digest contains a dash.
+        let reported = reported.unwrap_or_default();
+        assert!(
+            !reported.contains('-'),
+            "case {case:?}: a full-object checksum carries no part-count suffix, got {reported:?}"
+        );
+        // Nor is it the COMPOSITION over the parts' digests — the other way an object's
+        // checksum is built from its parts, which is what makes the settled type observable.
+        let composed = composition(row.algorithm, &row.parts);
+        assert_ne!(
+            reported, composed,
+            "case {case:?}: a full-object checksum must not be the composition {composed:?}"
+        );
+
+        // Every later read of the object reports the same pair — to a read that asked for it.
+        let read = head_object(
+            &router,
+            name,
+            row.key,
+            &[("x-amz-checksum-mode", "ENABLED")],
+        )
+        .await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected HTTP 200 from HeadObject, got {}",
+            read.status
+        );
+        let carried = read.header(&header);
+        assert_eq!(
+            carried.as_deref(),
+            Some(expected_object.as_str()),
+            "case {case:?}: expected the read-back to report {header} = {expected_object:?}, \
+             got {carried:?}"
+        );
+        let carried = read.header("x-amz-checksum-type");
+        assert_eq!(
+            carried.as_deref(),
+            Some(FULL_OBJECT),
+            "case {case:?}: expected the read-back to report {FULL_OBJECT:?}, got {carried:?}"
+        );
+
+        // And each part of the completed object still reports its OWN digest, which is what
+        // the manifest named it by.
+        let attributes = object_attributes(&router, name, row.key).await;
+        assert_eq!(
+            attributes.status,
+            200,
+            "case {case:?}: expected HTTP 200 from GetObjectAttributes, got {} with body {:?}",
+            attributes.status,
+            text(&attributes)
+        );
+        for (index, body) in row.parts.iter().enumerate() {
+            let number = index as i32 + 1;
+            let own = digest(row.algorithm, body);
+            let part_reported = part_element(&attributes, number, &element);
+            assert_eq!(
+                part_reported.as_deref(),
+                Some(own.as_str()),
+                "case {case:?}: part {number} must still report its own digest {own:?}, got \
+                 {part_reported:?}"
+            );
+        }
     }
 }
