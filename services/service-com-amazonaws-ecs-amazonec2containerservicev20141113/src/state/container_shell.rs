@@ -42,9 +42,12 @@
 //! is therefore no language subset to keep in step with a specification: a command either
 //! names one of those utilities, or it did not run.
 //!
-//! The one program of the container's ENVIRONMENT this session provides beside those
-//! utilities is the AWS CLI ([`super::container_aws_cli`]): a container's image is routinely
-//! one whose program calls the account's services, and those calls are made as the task role.
+//! The programs of the container's ENVIRONMENT this session provides beside those utilities
+//! are the AWS CLI ([`super::container_aws_cli`]) — a container's image is routinely one whose
+//! program calls the account's services, and those calls are made as the task role — and the
+//! HTTP CLIENT a request to a server of the container's own task is made with
+//! ([`super::container_http_client`]), which is what every documented container health check is
+//! written with.
 //!
 //! A run that reached such a command CLAIMS NOTHING about the container
 //! ([`ContainerOutcome::Abandoned`]): the status above is what the declining command answered
@@ -622,6 +625,11 @@ pub struct ContainerShell {
     /// none — one whose commands reach no account service at all, so an `aws` command is one
     /// it could not run ([`super::container_aws_cli`]).
     aws: Option<Arc<ContainerAwsCli>>,
+    /// The HTTP CLIENT this container's environment provides, and `None` for a session given
+    /// none — one whose task this emulator holds no address for, which reaches no server of
+    /// its own, so such a request is a command it could not run
+    /// ([`super::container_http_client`]).
+    http: Option<Arc<ContainerHttpClient>>,
     /// What the PROCESS this session is runs as — the user and the resource limits its
     /// container definition gives it, and the ephemeral storage its task was given — which
     /// is what the utilities that report a process's own session answer
@@ -689,6 +697,7 @@ impl ContainerShell {
             pipefail: false,
             last_status: EXIT_SUCCESS,
             aws: None,
+            http: None,
             process: ContainerProcess::default(),
             consumption: Arc::new(ContainerConsumption::new()),
             executing_since: Instant::now(),
@@ -711,6 +720,15 @@ impl ContainerShell {
     #[must_use]
     pub fn with_aws_cli(mut self, aws: ContainerAwsCli) -> Self {
         self.aws = Some(Arc::new(aws));
+        self
+    }
+
+    /// This session with the HTTP CLIENT its container's environment provides on it: the
+    /// requests the container's program and its probe make to the servers of their own task
+    /// ([`super::container_http_client`]). A session built without it provides no such program.
+    #[must_use]
+    pub fn with_http_client(mut self, http: ContainerHttpClient) -> Self {
+        self.http = Some(Arc::new(http));
         self
     }
 
@@ -1896,6 +1914,12 @@ impl ContainerShell {
             if name == ::service_common::aws_s3_cli::CLI_PROGRAM {
                 return self.run_aws_cli(arguments, redirections).await;
             }
+            // An HTTP client, which is a program of the container's ENVIRONMENT for the same
+            // reason: the request it makes is to a server of this container's own task
+            // ([`super::container_http_client`]).
+            if let Some(client) = container_http_client::http_client_invoked(name) {
+                return self.run_http_client(client, arguments, redirections).await;
+            }
             // The catalogs are what this container provides: a command outside them needs a
             // program or a network this container does not have — and the NAME of it is what
             // the detail such a container reports names
@@ -2512,6 +2536,48 @@ impl ContainerShell {
             return EXIT_FAILURE;
         }
         outcome.status
+    }
+
+    /// Perform one request of the container's HTTP client: the fetch of
+    /// [`super::container_http_client`], answered by a server of this container's own task.
+    ///
+    /// The invocation is read by the shared reading of that client, so one it performs nothing
+    /// of — a host this container has no network to reach, a scheme it makes no request over, an
+    /// option form that reading does not read — is a command this container could not run
+    /// ([`Self::declined`]), and so is such a request in a session whose task this emulator
+    /// holds no address for. What was FETCHED goes through this session's own streams, or to the
+    /// file the invocation asked it to be saved at — and a save that did not happen is the
+    /// status that client reports for one.
+    async fn run_http_client(
+        &mut self,
+        name: &str,
+        arguments: &[String],
+        redirections: &Redirections,
+    ) -> i32 {
+        let Some(client) = self.http.clone() else {
+            return self.declined();
+        };
+        let Some(fetched) = client.fetch(name, arguments) else {
+            return self.declined();
+        };
+        let Some(document) = fetched.document else {
+            return fetched.status;
+        };
+        match fetched.save_to {
+            Some(path) => {
+                if self.filesystem.write(&path, &document, false).is_err() {
+                    return ::service_common::instance_metadata_service::WRITE_ERROR;
+                }
+                fetched.status
+            }
+            None => {
+                if self.write_stdout(&document, redirections).await {
+                    fetched.status
+                } else {
+                    EXIT_FAILURE
+                }
+            }
+        }
     }
 
     /// `word` with its expansions resolved, or `None` when it carries an expansion this

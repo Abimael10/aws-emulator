@@ -400,6 +400,11 @@ pub use task_role_credentials::*;
 mod container_aws_cli;
 pub use container_aws_cli::*;
 
+/// The HTTP CLIENT a container's session provides: the request its program — or the probe the
+/// agent runs inside it — makes to the server that same container is running.
+mod container_http_client;
+pub use container_http_client::*;
+
 /// The FILESYSTEM a container's program runs over: its own writable layer, and the volumes
 /// the task definition mounts into it.
 mod container_filesystem;

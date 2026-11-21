@@ -781,6 +781,14 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
             .clone()
             .zip(addresses.clone())
             .map(|(address, addresses)| ContainerServing::new(address, addresses));
+        // And the client its program reaches those same servers THROUGH, for a task reached at
+        // an address of its own: a container's program routinely asks its own server for a
+        // document ([`super::container_http_client`]).
+        let http = launch
+            .address
+            .clone()
+            .zip(addresses.clone())
+            .map(|(address, addresses)| ContainerHttpClient::new(address, addresses));
         // The volumes the container's `mountPoints` mount, resolved with NO guard of this
         // store held: the files of an `efsVolumeConfiguration` volume are the Amazon EFS
         // service's own, so resolving one reads that service's store
@@ -804,7 +812,7 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
             },
         );
         let handle = runtime.spawn(async move {
-            run_container(run_state, callback, launch, filesystem, serving).await
+            run_container(run_state, callback, launch, filesystem, serving, http).await
         });
         // The handle is kept with the run, so a run whose task is gone is aborted rather
         // than merely forgotten.
@@ -830,6 +838,7 @@ async fn run_container(
     launch: ContainerLaunch,
     filesystem: ContainerFilesystem,
     serving: Option<ContainerServing>,
+    http: Option<ContainerHttpClient>,
 ) {
     // The values the agent fetches for the container, before anything of it runs: a secret
     // it could not retrieve starts NO program, so the container reports no exit code —
@@ -884,6 +893,11 @@ async fn run_container(
     // Where this session accounts for what the container's run consumes
     // ([`super::container_consumption`]).
     .with_consumption(Arc::clone(&launch.consumption));
+    // The HTTP client its program asks its own task's servers for a document with
+    // ([`super::container_http_client`]), for a task this emulator holds an address for.
+    if let Some(http) = http {
+        shell = shell.with_http_client(http);
+    }
     let outcome = shell.run(program).await;
     // What is known about a run that produced no status of its own, which is what such a
     // container reports as the additional detail about it

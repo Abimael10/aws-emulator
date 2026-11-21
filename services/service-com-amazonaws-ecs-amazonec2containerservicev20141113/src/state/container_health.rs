@@ -23,9 +23,9 @@
 //!
 //! * the probe is EXECUTED — in this process, through the same session a container's own
 //!   `command` runs in ([`ContainerShell`]), over the container's OWN filesystem
-//!   ([`super::container_filesystem::ContainerLayer`]), because the probe runs INSIDE the
-//!   container — once the container is running, and again one `interval` after each
-//!   execution;
+//!   ([`super::container_filesystem::ContainerLayer`]) and reaching the servers of its own
+//!   task ([`super::container_http_client`]), because the probe runs INSIDE the container —
+//!   once the container is running, and again one `interval` after each execution;
 //! * an execution that exits zero makes the container `HEALTHY` and clears the failures
 //!   counted against it; one that exits non-zero, or that the `timeout` ran out on, counts
 //!   as a failure;
@@ -432,6 +432,11 @@ pub struct HealthProbeLaunch {
     /// container, so the files its command names are the ones the container's own program
     /// left there ([`super::container_filesystem::ContainerLayer`]).
     layer: ContainerLayer,
+    /// The private address of the interface the TASK was allocated, for that same reason: the
+    /// probe runs inside the container, so the server it asks for a document is one of its own
+    /// task ([`super::container_http_client`]). `None` for a task this store holds no address
+    /// for, whose containers reach no server of their own.
+    address: Option<String>,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -572,6 +577,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     layer: self
                         .container_layer(&container.container_arn)
                         .unwrap_or_default(),
+                    // The address the task's own interface holds, which is where its
+                    // containers' servers are reached — the one a probe written as a request
+                    // to `localhost` is answered by ([`super::container_http_client`]).
+                    address: task
+                        .attachments
+                        .iter()
+                        .find_map(AttachmentRecord::private_ipv4_address)
+                        .map(str::to_string),
                 });
             }
         }
@@ -844,6 +857,10 @@ pub fn settle_container_health<Eng: Send + Sync + 'static>(
     let probes = state
         .lock()
         .settle_container_health_probes(SystemTime::now());
+    // The records the servers a probe asks for a document are published in, taken once for the
+    // whole pass, exactly as a container's own run takes them
+    // ([`super::container_runtime::settle_container_runtime`]).
+    let addresses = ::service_common::served_http_addresses::ServedAddresses::of(&**engine);
     for probe in probes {
         let container_arn = probe.container_arn.clone();
         let probe_state = ::engine::ServiceState::clone(&state);
@@ -855,8 +872,15 @@ pub fn settle_container_health<Eng: Send + Sync + 'static>(
             probe.working_directory.as_deref(),
             mounted_volumes(&**engine, &state, &probe.mounts),
         );
+        // The client the probe asks the server of its own task for a document with, for a task
+        // reached at an address of its own ([`super::container_http_client`]).
+        let http = probe
+            .address
+            .clone()
+            .zip(addresses.clone())
+            .map(|(address, addresses)| ContainerHttpClient::new(address, addresses));
         let handle = runtime
-            .spawn(async move { run_health_probe(probe_state, callback, probe, filesystem).await });
+            .spawn(async move { run_health_probe(probe_state, callback, probe, filesystem, http).await });
         // The handle is kept with the container's health record, so a probe whose container
         // is gone is aborted rather than merely forgotten.
         state.lock().attach_health_probe(&container_arn, handle);
@@ -877,6 +901,7 @@ async fn run_health_probe(
     callback: ::smithy_server_runtime::EmbeddedEmulator,
     probe: HealthProbeLaunch,
     filesystem: ContainerFilesystem,
+    http: Option<ContainerHttpClient>,
 ) {
     let output = Arc::new(ContainerOutput::new(&callback, None));
     // The probe answers no signal: `StopTask` stops the container, and the probe is bounded
@@ -889,6 +914,12 @@ async fn run_health_probe(
     let mut shell =
         ContainerShell::new(probe.environment, output, signals, deadline, filesystem, None)
             .with_process(probe.process.clone());
+    // What it DOES reach is the server the container's own program started: the probe runs
+    // inside the container, and the command a health check is written with is a request to it
+    // ([`super::container_http_client`]).
+    if let Some(http) = http {
+        shell = shell.with_http_client(http);
+    }
     let program = probe.program;
     let outcome = ::tokio::time::timeout(probe.timeout, async move { shell.run(&program).await })
         .await
