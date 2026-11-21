@@ -15,9 +15,10 @@
 //!
 //! Each table's rows differ along what the rule generalises over: the shape of the
 //! profile being enabled (which optional members its create carried, how many role and
-//! managed-policy ARNs it holds, what `enabled` its create asked for), how many siblings
-//! the store holds, how many times the call is repeated, and — on the refusal table —
-//! why the id does not resolve and the Region the request is signed for.
+//! managed-policy ARNs it holds, what `enabled` its create asked for, which members and
+//! attribute mappings LATER writes left on the stored record), how many siblings the store
+//! holds, how many times the call is repeated, and — on the refusal table — why the id does
+//! not resolve and the Region the request is signed for.
 //!
 //! The harness below is local to this suite, as in each sibling suite.
 
@@ -207,6 +208,48 @@ impl Client {
     async fn disable_profile(&self, id: &str) -> Answer {
         self.send("POST", &format!("/profile/{id}/disable"), None)
             .await
+    }
+
+    /// `PATCH /profile/{profileId}` — `UpdateProfile`, which this suite uses to put members
+    /// into the stored record that no create carried.
+    async fn update_profile(&self, id: &str, body: Value) -> Answer {
+        self.send("PATCH", &format!("/profile/{id}"), Some(body))
+            .await
+    }
+
+    /// `PUT /profiles/{profileId}/mappings` — `PutAttributeMapping`, whose
+    /// `certificateField` and `mappingRules` travel in the body.
+    async fn put_mapping(&self, id: &str, certificate_field: &str, specifiers: &[&str]) -> Answer {
+        let rules: Vec<Value> = specifiers
+            .iter()
+            .map(|specifier| json!({"specifier": specifier}))
+            .collect();
+        self.send(
+            "PUT",
+            &format!("/profiles/{id}/mappings"),
+            Some(json!({"certificateField": certificate_field, "mappingRules": rules})),
+        )
+        .await
+    }
+
+    /// `DELETE /profiles/{profileId}/mappings` — `DeleteAttributeMapping`, whose
+    /// `certificateField` and `specifiers` travel in the query string.
+    ///
+    /// The values are placed in the query string as given, so a row may only name
+    /// specifiers made of characters a query string carries literally (the rows below name
+    /// `OU`); a specifier holding `/`, `&` or `=` would need encoding first.
+    async fn delete_mapping(
+        &self,
+        id: &str,
+        certificate_field: &str,
+        specifiers: &[&str],
+    ) -> Answer {
+        let mut uri = format!("/profiles/{id}/mappings?certificateField={certificate_field}");
+        for specifier in specifiers {
+            uri.push_str("&specifiers=");
+            uri.push_str(specifier);
+        }
+        self.send("DELETE", &uri, None).await
     }
 }
 
@@ -649,4 +692,202 @@ async fn enable_profile_refuses_an_id_that_resolves_to_nothing() {
         "case \"sibling-survives-the-refusals\": a refused call must change nothing, got \
          {still_there:?}"
     );
+}
+
+/// A write this service offers on a stored profile besides the enablement pair itself, so a
+/// row can put the record into a shape no create could have reported. The HTTP bindings are
+/// the ones `smithy_query(query="digest")` lists for `UpdateProfile`,
+/// `PutAttributeMapping` and `DeleteAttributeMapping`.
+#[derive(Clone, Debug)]
+enum LaterWrite {
+    /// `UpdateProfile` with this partial body.
+    Update(Value),
+    /// `PutAttributeMapping` for one certificate field and these specifiers.
+    PutMapping(&'static str, &'static [&'static str]),
+    /// `DeleteAttributeMapping` for one certificate field and these specifiers.
+    DeleteMapping(&'static str, &'static [&'static str]),
+}
+
+/// Run `writes` against the profile `id` in the order given, asserting each was served.
+async fn apply(client: &Client, case: &str, id: &str, writes: &[LaterWrite]) {
+    for (index, write) in writes.iter().enumerate() {
+        let labelled = format!("{case}/write-{index}");
+        let answer = match write {
+            LaterWrite::Update(body) => client.update_profile(id, body.clone()).await,
+            LaterWrite::PutMapping(field, specifiers) => {
+                client.put_mapping(id, field, specifiers).await
+            }
+            LaterWrite::DeleteMapping(field, specifiers) => {
+                client.delete_mapping(id, field, specifiers).await
+            }
+        };
+        ok(&labelled, 200, &answer);
+    }
+}
+
+/// The specifiers a profile detail reports for one certificate field, out of
+/// `attributeMappings` (a list of `{certificateField, mappingRules: [{specifier}]}` —
+/// `smithy_query(query="shape", shape="ProfileDetail")`, member `attributeMappings`).
+fn specifiers_of(detail: &Value, certificate_field: &str) -> Vec<String> {
+    detail
+        .get("attributeMappings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry.get("certificateField").and_then(Value::as_str) == Some(certificate_field)
+        })
+        .flat_map(|entry| {
+            entry
+                .get("mappingRules")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|rule| {
+            rule.get("specifier")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The certificate fields a row's mapping writes name.
+fn fields_written(writes: &[LaterWrite]) -> Vec<&'static str> {
+    let mut fields: Vec<&'static str> = Vec::new();
+    for write in writes {
+        if let LaterWrite::PutMapping(field, _) | LaterWrite::DeleteMapping(field, _) = write {
+            if !fields.contains(field) {
+                fields.push(field);
+            }
+        }
+    }
+    fields
+}
+
+/// `EnableProfile` answers the record as the STORE holds it at the instant of the call, not
+/// the record some earlier call reported: members only a later write set — the updated
+/// members, the attribute mappings of each certificate field — come back unchanged beside
+/// the flag it wrote, and the next read reports the same thing.
+///
+/// The rows differ along which later writes ran before the enable, how many of them there
+/// were, and how many certificate fields the profile maps. The specifiers are ones the
+/// fields they are written on carry (`MappingRule$specifier`, from
+/// `smithy_query(query="shape", shape="MappingRule")`).
+#[tokio::test]
+async fn enable_profile_reports_the_record_later_writes_left() {
+    let rows: Vec<(&str, Vec<LaterWrite>)> = vec![
+        ("no-later-write", vec![]),
+        (
+            "mappings-on-one-field",
+            vec![LaterWrite::PutMapping("x509Subject", &["CN", "OU"])],
+        ),
+        (
+            "mappings-on-three-fields",
+            vec![
+                LaterWrite::PutMapping("x509Subject", &["CN"]),
+                LaterWrite::PutMapping("x509Issuer", &["CN", "O"]),
+                LaterWrite::PutMapping("x509SAN", &["Name/CN"]),
+            ],
+        ),
+        (
+            "mappings-put-then-partly-deleted",
+            vec![
+                LaterWrite::PutMapping("x509Subject", &["CN", "OU", "UID"]),
+                LaterWrite::DeleteMapping("x509Subject", &["OU"]),
+            ],
+        ),
+        (
+            "updated-then-mapped",
+            vec![
+                LaterWrite::Update(json!({
+                    "name": "updated before the enable",
+                    "managedPolicyArns": ["arn:aws:iam::aws:policy/ReadOnlyAccess"],
+                    "sessionPolicy": "{\"Version\":\"2012-10-17\",\"Statement\":[]}",
+                    "durationSeconds": 7200,
+                    "acceptRoleSessionName": true,
+                })),
+                LaterWrite::PutMapping("x509Issuer", &["CN"]),
+            ],
+        ),
+        (
+            "lists-emptied-by-an-update",
+            vec![LaterWrite::Update(
+                json!({"roleArns": [], "managedPolicyArns": []}),
+            )],
+        ),
+    ];
+
+    for (case, writes) in rows {
+        let client = Client::new();
+        let (id, _) = created(
+            &client,
+            case,
+            json!({
+                "name": "later written",
+                "roleArns": [role_arn("LaterWritten")],
+                // Created disabled, so the enable has a flag to change.
+                "enabled": false,
+            }),
+        )
+        .await;
+        apply(&client, case, &id, &writes).await;
+
+        // The record as the store holds it just before the call: this is what the enable
+        // has to answer, flag aside.
+        let read = client.get_profile(&id).await;
+        ok(&format!("{case}/before"), 200, &read);
+        let before = read.profile(case);
+        assert!(
+            !enabled(case, &before),
+            "case {case:?}: the fixture must stand disabled before the enable, got {before:?}"
+        );
+
+        let answer = client.enable_profile(&id).await;
+        ok(case, 200, &answer);
+        let detail = answer.profile(case);
+        assert!(
+            enabled(case, &detail),
+            "case {case:?}: EnableProfile must answer with enabled true, got {detail:?}"
+        );
+        let mut expected = without_updated_at(case, &before);
+        expected["enabled"] = Value::Bool(true);
+        assert_eq!(
+            without_updated_at(case, &detail),
+            expected,
+            "case {case:?}: EnableProfile must answer the stored record with only enabled \
+             changed, got {detail:?}"
+        );
+        assert!(
+            instant(case, &detail, "updatedAt").as_nanos()
+                >= instant(case, &before, "updatedAt").as_nanos(),
+            "case {case:?}: updatedAt must not go backwards, got {before:?} then {detail:?}"
+        );
+
+        // Each field a mapping write named is still mapped, with exactly the specifiers it
+        // held — and with something, so a record that lost its mappings cannot pass.
+        for field in fields_written(&writes) {
+            let held = specifiers_of(&detail, field);
+            assert_eq!(
+                held,
+                specifiers_of(&before, field),
+                "case {case:?}: the specifiers mapped for {field} must survive the enable, got \
+                 {held:?}"
+            );
+            assert!(
+                !held.is_empty(),
+                "case {case:?}: {field} must still map specifiers after the enable, got \
+                 {detail:?}"
+            );
+        }
+
+        // Persisted: the read path answers exactly what the enable answered.
+        let after = client.get_profile(&id).await;
+        ok(&format!("{case}/after"), 200, &after);
+        assert_eq!(
+            after.profile(case),
+            detail,
+            "case {case:?}: GetProfile must report what the enable wrote, got {after:?}"
+        );
+    }
 }
