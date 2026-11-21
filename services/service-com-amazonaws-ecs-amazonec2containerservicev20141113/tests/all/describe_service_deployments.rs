@@ -41,19 +41,13 @@
 //! Every case goes through the same front door a client uses, so nothing reaches into the
 //! state struct and a response that is not computed from persisted state cannot pass.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    cluster_with_capacity, count, list, ok, refusal, register_definition, service, string, ACCOUNT,
-    SIGNED_REGION,
+    cluster_with_capacity, count, list, ok, poll_deployment_status, refusal, register_definition,
+    service, string, ACCOUNT, SIGNED_REGION,
 };
-
-/// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to fall
-/// due, with margin for a loaded test machine.
-const ONE_SPAN: Duration = Duration::from_millis(900);
 
 /// The cluster every service below is created in.
 const CLUSTER: &str = "demo";
@@ -271,11 +265,12 @@ async fn a_described_deployment_reports_the_rollout_its_release_recorded() {
         "case {case:?}: no task of the rollout failed, got {deployment}"
     );
 
-    // The CLOCK settles the rollout, and the deployment reports the same end its brief
-    // does.
-    tokio::time::sleep(ONE_SPAN).await;
+    // The CLOCK settles the rollout, once the task set it placed has STAYED up, and the
+    // deployment then reports the same end its brief does — polled for through the shared
+    // wait, so the case is about WHETHER the rollout settles rather than about how fast
+    // this host is.
     let case = "the rollout the clock settled";
-    let deployment = describe_one(&router, &first_deployment, case).await;
+    let deployment = poll_deployment_status(&router, &first_deployment, "SUCCESSFUL", case).await;
     assert_eq!(
         string(&deployment, "status", case),
         "SUCCESSFUL",

@@ -115,7 +115,7 @@
 //! onto the account's default bus for each move, so a client can watch a task without
 //! calling Amazon ECS again.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
@@ -4241,6 +4241,21 @@ pub struct TaskRecord {
     /// When `PENDING` -> `RUNNING` falls due; `None` once it has been materialised, and
     /// `None` for a task that has not been placed yet.
     pub running_due_at: Option<SystemTime>,
+    /// When this task's run is CONFIRMED HELD — one [`TRANSITION_SPAN`] after it started —
+    /// and `None` once that has been materialised (or for a task that has not started).
+    pub kept_running_due_at: Option<SystemTime>,
+    /// When this task's run WAS confirmed held: the instant above, materialised by the clock
+    /// for a task that was still running and still wanted running when it fell due, and
+    /// `None` for a task that has not held its run that long — one that has only just
+    /// started, and one that was lost inside the span.
+    ///
+    /// What makes a started task one the rollout that placed it has ACHIEVED: a task is
+    /// "successfully running" (`Deployment$failedTasks`) once the service has kept it, not in
+    /// the instant it came up, so this is the instant a rollout's steady state waits for
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::settle_services`]) and the
+    /// instant the deployment circuit breaker reads as a healthy state
+    /// ([`TaskRecord::reached_healthy_state_at`]).
+    pub kept_running_at: Option<SystemTime>,
     /// When `DEACTIVATING` -> `STOPPED` falls due; `None` once materialised.
     pub stopped_due_at: Option<SystemTime>,
     /// When the scale-in protection `UpdateTaskProtection` set on this task expires, and
@@ -4723,6 +4738,16 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// daemon's configuration at the time a deployment was initiated", so an entry is never
     /// rewritten: a later rollout captures another revision instead.
     pub daemon_revisions: HashMap<String, DaemonRevisionRecord>,
+    /// `daemonArn` -> the instant the DELETE of that daemon was carried out, for the daemons
+    /// this account has deleted ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_daemon_deployments`]).
+    ///
+    /// The delete takes the daemon's own record away and `DaemonStatus` carries no value for
+    /// a daemon that is gone, so this is what the account still holds about it: that the ARN
+    /// named a daemon of its own and that daemon was deleted
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::daemon_delete_was_asked_for`]).
+    /// Bounded like the daemons themselves ([`MAX_DELETED_DAEMONS`]), so a caller creating
+    /// and deleting without end cannot grow the store without end.
+    pub deleted_daemons: BTreeMap<String, SystemTime>,
     /// `taskArn` -> the task.
     pub tasks: HashMap<String, TaskRecord>,
     /// `containerInstanceArn` -> the registered container instance.

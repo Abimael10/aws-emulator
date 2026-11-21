@@ -45,7 +45,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    cluster_with_capacity, list, ok, refusal, register_definition, service, string,
+    cluster_with_capacity, describe_service_deployment, list, ok, poll_deployment_status, refusal,
+    register_definition, service, string,
 };
 
 /// Long enough for one clock-owed transition (`state::TRANSITION_SPAN` is 500 ms) to fall
@@ -153,19 +154,7 @@ async fn describe_service(router: &MultiServiceRouter, name: &str, case: &str) -
 
 /// The stored rollout `arn` names, as `DescribeServiceDeployments` reports it.
 async fn describe_deployment(router: &MultiServiceRouter, arn: &str, case: &str) -> Value {
-    let body = ok(
-        router,
-        "DescribeServiceDeployments",
-        json!({ "serviceDeploymentArns": [arn] }),
-        case,
-    )
-    .await;
-    list(&body, "serviceDeployments", case)
-        .first()
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: expected the service deployment {arn} to be described")
-        })
-        .clone()
+    describe_service_deployment(router, arn, case).await
 }
 
 /// The ARNs `ListServiceDeployments` reports for `name` under the `status` filter — the
@@ -369,12 +358,11 @@ async fn the_stop_type_decides_where_a_stopped_rollout_leaves_the_service() {
             "case {case:?}: expected the service on {expected_definition}, got {stored}"
         );
 
-        // A rollback takes one more span to run its course; a stop that puts nothing back
-        // is over as soon as it is carried out.
-        if expectation.rolls_back {
-            tokio::time::sleep(ONE_SPAN).await;
-        }
-        let deployment = describe_deployment(&router, &stopped, case).await;
+        // A rollback runs its course once the revision it puts back is running again; a
+        // stop that puts nothing back is over as soon as it is carried out. Either end is
+        // the CLOCK's, so it is polled for rather than timed.
+        let deployment =
+            poll_deployment_status(&router, &stopped, expectation.final_status, case).await;
         assert_eq!(
             deployment["status"],
             json!(expectation.final_status),
@@ -567,8 +555,10 @@ async fn a_stop_already_asked_for_is_answered_with_the_stop_in_effect() {
     cluster_with_capacity(&router, CLUSTER, case).await;
     let first = register_definition(&router, "repeated", case).await;
     let second = register_definition(&router, "repeated", case).await;
-    create_service(&router, "repeated-service", &first, case).await;
-    tokio::time::sleep(ONE_SPAN).await;
+    let created = create_service(&router, "repeated-service", &first, case).await;
+    // The rollout the create released has to have reached its end before a second release
+    // replaces it, and that end is the CLOCK's: it is polled for rather than timed.
+    poll_deployment_status(&router, &created, "SUCCESSFUL", case).await;
     let stopped = update_service(&router, "repeated-service", &second, &[], case).await;
 
     for round in 0..3 {
@@ -592,10 +582,9 @@ async fn a_stop_already_asked_for_is_answered_with_the_stop_in_effect() {
         );
     }
 
-    // The repeats changed nothing, so the ONE stop that was asked for runs its course.
-    tokio::time::sleep(ONE_SPAN).await;
-    tokio::time::sleep(ONE_SPAN).await;
-    let deployment = describe_deployment(&router, &stopped, case).await;
+    // The repeats changed nothing, so the ONE stop that was asked for runs its course,
+    // which the clock carries out: polled for rather than timed.
+    let deployment = poll_deployment_status(&router, &stopped, "ROLLBACK_SUCCESSFUL", case).await;
     assert_eq!(
         deployment["status"],
         json!("ROLLBACK_SUCCESSFUL"),

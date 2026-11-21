@@ -453,6 +453,15 @@ pub struct ServiceDeploymentRecord {
     /// When the ROLLBACK this rollout was ended by has run its course, or `None` for a
     /// rollout that is not rolling back.
     pub rollback_due_at: Option<SystemTime>,
+    /// `Deployment$id` of the REDEPLOYMENT that puts the previous revision back, for a
+    /// rollout a rollback ended, and `None` for every other rollout.
+    ///
+    /// A rollback is carried out by running that revision again, which is a rollout of its
+    /// own ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::roll_back_service_deployment_to`]),
+    /// so WHICH rollout the rollback is waiting on is this id and not whatever the service
+    /// happens to be rolling out later
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::finish_rolled_back_deployments`]).
+    pub rollback_deployment_id: Option<String>,
     /// `ServiceDeployment$rollback`: "The rollback options the service deployment uses when
     /// the deployment fails" — carried by exactly the rollouts a rollback ended.
     pub rollback: Option<Rollback>,

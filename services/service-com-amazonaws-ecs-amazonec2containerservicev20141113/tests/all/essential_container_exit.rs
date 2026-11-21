@@ -35,6 +35,13 @@
 //!    a `FAILED` state", with `DeploymentCircuitBreaker$rollback` deciding where that
 //!    leaves the service — "the service is rolled back to the last deployment that
 //!    completed successfully".
+//! 4. The other side of that same sentence: a rollout has reached the steady state it was
+//!    rolling out ("When the service reaches a steady state, the deployment transitions to a
+//!    `COMPLETED` state") only once the task set it placed has STAYED up, so a task set that
+//!    stood at the count the service wants for one instant settles nothing — a revision
+//!    whose containers end as soon as they start is never reported as a rollout that
+//!    succeeded, and the breaker watching it takes it to a terminal `ROLLBACK` status
+//!    instead.
 //!
 //! The containers below run REAL programs through the container data plane (the same
 //! session a `RunTask` container's command runs in), so the exit each row asserts on is one
@@ -46,7 +53,10 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ecs_wire::{cluster_with_capacity, count, list, ok, present_count, service, string};
+use crate::ecs_wire::{
+    cluster_with_capacity, count, describe_service_deployment, list, ok, present_count, service,
+    string,
+};
 
 /// The cluster every service below runs in.
 const CLUSTER: &str = "exiting";
@@ -889,4 +899,312 @@ async fn a_container_still_running_past_the_stop_span_reports_its_own_exit_statu
     // And the task itself claims no stop: neither of those two was essential, and the
     // essential container of the task has not exited.
     claims_no_stop(&settled, case);
+}
+
+// --- rule 4: a rollout is not a steady state until its task set has STAYED up -------------
+
+/// Every TERMINAL `ServiceDeploymentStatus` a rollout can end in
+/// (`smithy_query(query="shape", shape="ServiceDeploymentStatus")` -> PENDING, SUCCESSFUL,
+/// STOPPED, STOP_REQUESTED, IN_PROGRESS, ROLLBACK_REQUESTED, ROLLBACK_IN_PROGRESS,
+/// ROLLBACK_SUCCESSFUL, ROLLBACK_FAILED): the four a rollout stops moving in.
+const TERMINAL_DEPLOYMENT_STATUSES: [&str; 4] = [
+    "SUCCESSFUL",
+    "STOPPED",
+    "ROLLBACK_SUCCESSFUL",
+    "ROLLBACK_FAILED",
+];
+
+/// The `ServiceDeploymentStatus` of a rollout that reached the steady state it was rolling
+/// out — the one a rollout whose task set does not stay up must never be reported in.
+const SUCCESSFUL: &str = "SUCCESSFUL";
+
+/// One row: what the rollout's own revision does once its task starts, the bounds the
+/// rolling update runs under, and where that leaves the rollout.
+struct RolloutRow {
+    case: &'static str,
+    /// The service (and task-definition family) of this row.
+    name: &'static str,
+    /// The command the revision this rollout rolls out runs.
+    command: &'static [&'static str],
+    /// Whether the service is created straight onto that revision — a FIRST rollout, which
+    /// has no earlier task set of the service standing beside the one it places — or is
+    /// created on a revision that stays up and then updated onto it.
+    first_rollout: bool,
+    /// Whether the rollout the update replaces is waited for before the update is made. A
+    /// row that does not wait releases over a rollout the clock has not settled yet, so the
+    /// service holds no rollout recorded as completed when the breaker fires.
+    waits_for_the_rollout_it_replaces: bool,
+    /// `(minimumHealthyPercent, maximumPercent)` the service is created with: the lower
+    /// limit on the tasks that "must continue to run" through the rollout and the upper
+    /// limit on those "allowed in the RUNNING or PENDING state".
+    percentages: (i64, i64),
+    /// Whether the service must be holding a RUNNING task once the rollout has ended: a
+    /// floor of the whole desired count is one the rollout may not take the service below,
+    /// so the task set that was running before it keeps the service up through it.
+    keeps_a_running_task: bool,
+    /// The terminal status the rollout ends in.
+    ends: &'static str,
+}
+
+/// The rows. They differ along what the rule generalises over: whether the rollout's task
+/// stays up at all, HOW it ends when it does not (a clean exit and a failing one, both of
+/// which are a task the service could not keep), whether anything of the service was running
+/// before the rollout started, and the bounds the rolling update runs under.
+const ROLLOUT_ROWS: [RolloutRow; 5] = [
+    RolloutRow {
+        case: "a first rollout whose task exits non-zero as soon as it starts",
+        name: "firstrollout",
+        command: &["sh", "-c", "exit 1"],
+        first_rollout: true,
+        waits_for_the_rollout_it_replaces: false,
+        percentages: (0, 100),
+        // Nothing of this service was ever running, so the floor has nothing to keep up.
+        keeps_a_running_task: false,
+        // "If rollback is on, when a service deployment fails, the service is rolled back to
+        // the last deployment that completed successfully" — a service whose FIRST rollout
+        // failed has none, and no earlier rollout at all, so the rollback it asked for has
+        // nothing to put back.
+        ends: "ROLLBACK_FAILED",
+    },
+    RolloutRow {
+        case: "an update onto a revision whose task exits zero as soon as it starts",
+        name: "updatedrollout",
+        command: &["sh", "-c", "exit 0"],
+        first_rollout: false,
+        waits_for_the_rollout_it_replaces: true,
+        // A floor of none lets the scheduler take the task set it is replacing off before
+        // the replacement is up, so the rollout's own task set is all that stands for it.
+        percentages: (0, 100),
+        keeps_a_running_task: false,
+        ends: "ROLLBACK_SUCCESSFUL",
+    },
+    RolloutRow {
+        case: "the same update under the documented default bounds",
+        name: "defaultbounds",
+        command: &["sh", "-c", "exit 1"],
+        first_rollout: false,
+        waits_for_the_rollout_it_replaces: true,
+        // The defaults a `CreateService` with no percentages of its own takes for a REPLICA
+        // service, stated here because what they decide is this row's subject.
+        percentages: (100, 200),
+        // A floor of the whole desired count is one the rollout may not take the service
+        // below: the task the rollout is replacing keeps running until a replacement has
+        // STAYED up, and a revision whose tasks end at once never produces one.
+        keeps_a_running_task: true,
+        ends: "ROLLBACK_SUCCESSFUL",
+    },
+    RolloutRow {
+        case: "an update released over a rollout the clock had not settled yet",
+        name: "unsettledrollout",
+        command: &["sh", "-c", "exit 1"],
+        first_rollout: false,
+        // The release is made without waiting, so the rollout it replaces is superseded
+        // before it reached a steady state and the service holds NO rollout recorded as
+        // completed — the revision this one is replacing is still the one the service was
+        // running, which is where the rollback goes.
+        waits_for_the_rollout_it_replaces: false,
+        percentages: (100, 200),
+        keeps_a_running_task: true,
+        ends: "ROLLBACK_SUCCESSFUL",
+    },
+    RolloutRow {
+        case: "an update onto a revision whose task stays up",
+        name: "staysuprollout",
+        command: &STAYS_UP,
+        first_rollout: false,
+        waits_for_the_rollout_it_replaces: true,
+        percentages: (100, 200),
+        keeps_a_running_task: true,
+        ends: SUCCESSFUL,
+    },
+];
+
+/// Watch one rollout until it reaches a terminal status, and answer every status it was seen
+/// in, in the order it was seen in them.
+async fn observed_statuses(router: &MultiServiceRouter, arn: &str, case: &str) -> Vec<String> {
+    let deadline = Instant::now() + POLL_BUDGET;
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let record = describe_service_deployment(router, arn, case).await;
+        let status = string(&record, "status", case);
+        if seen.last() != Some(&status) {
+            seen.push(status.clone());
+        }
+        if TERMINAL_DEPLOYMENT_STATUSES.contains(&status.as_str()) {
+            return seen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the rollout to reach a terminal status, saw {seen:?}: \
+             {record}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: a rollout has reached the steady state it was rolling out only once the task set it
+/// placed has STAYED up — a task the service is about to lose is not one the rollout
+/// achieved — so a revision whose containers end as soon as they start is never reported
+/// SUCCESSFUL, and the circuit breaker watching it drives the rollout to a ROLLBACK status
+/// instead, onto the revision the service was running; a rollout whose task set does stay up
+/// still reaches SUCCESSFUL.
+#[tokio::test]
+async fn a_rollout_whose_task_set_does_not_stay_up_is_never_reported_successful() {
+    let router = service();
+    cluster_with_capacity(&router, CLUSTER, "rollout steady state").await;
+    for row in &ROLLOUT_ROWS {
+        let case = row.case;
+        // The revision the service is CREATED on: for a row that updates onto the rolled-out
+        // revision, one that stays up, registered first so it is the earlier revision of the
+        // family; for a first rollout, the rolled-out revision itself.
+        let created_on = if row.first_rollout {
+            register(
+                &router,
+                row.name,
+                vec![container("app", row.command, true)],
+                case,
+            )
+            .await
+        } else {
+            register(
+                &router,
+                row.name,
+                vec![container("app", &STAYS_UP, true)],
+                case,
+            )
+            .await
+        };
+        let rolling_out = if row.first_rollout {
+            created_on.clone()
+        } else {
+            register(
+                &router,
+                row.name,
+                vec![container("app", row.command, true)],
+                case,
+            )
+            .await
+        };
+        // Every service configures the breaker that watches its rollouts, under the bounds
+        // this row states: "the lower limit on the number of tasks ... that must continue to
+        // run" and "the upper limit on the number of tasks ... that are allowed in the
+        // RUNNING or PENDING state".
+        let (minimum, maximum) = row.percentages;
+        let configuration = json!({
+            "deploymentCircuitBreaker": { "enable": true, "rollback": true },
+            "minimumHealthyPercent": minimum,
+            "maximumPercent": maximum,
+        });
+        create_service(&router, row.name, &created_on, configuration, case).await;
+        if !row.first_rollout {
+            if row.waits_for_the_rollout_it_replaces {
+                // The rollout that COMPLETED, which is what a rollback has to put back.
+                poll_service(&router, row.name, case, "the first rollout to complete", |view| {
+                    string(&primary(view, case), "rolloutState", case) == "COMPLETED"
+                        && count(view, "runningCount", case) == 1
+                })
+                .await;
+            }
+            ok(
+                &router,
+                "UpdateService",
+                json!({
+                    "cluster": CLUSTER,
+                    "service": row.name,
+                    "taskDefinition": rolling_out,
+                }),
+                case,
+            )
+            .await;
+        }
+        let view = describe(&router, row.name, case).await;
+        let rollout = string(&view, "currentServiceDeployment", case);
+
+        let seen = observed_statuses(&router, &rollout, case).await;
+        assert_eq!(
+            seen.last().map(String::as_str),
+            Some(row.ends),
+            "case {case:?}: expected the rollout to end {:?}, saw {seen:?}",
+            row.ends
+        );
+        if row.ends != SUCCESSFUL {
+            assert!(
+                !seen.iter().any(|status| status == SUCCESSFUL),
+                "case {case:?}: expected a rollout whose task set did not stay up never to be \
+                 reported {SUCCESSFUL:?}, saw {seen:?}"
+            );
+        }
+        // Where the rollout left the SERVICE: the revision it was rolling out when it stayed
+        // up, and the one that completed before it when the rollback put that back.
+        let expected_revision = if row.ends == "ROLLBACK_SUCCESSFUL" {
+            created_on.clone()
+        } else {
+            rolling_out.clone()
+        };
+        let settled = poll_service(
+            &router,
+            row.name,
+            case,
+            "the service to settle on the revision the rollout left it on",
+            |view| string(view, "taskDefinition", case) == expected_revision,
+        )
+        .await;
+        assert_eq!(
+            string(&settled, "taskDefinition", case),
+            expected_revision,
+            "case {case:?}: expected the service to be left on the revision the rollout's own \
+             end names, got {settled}"
+        );
+        // And what the floor the rollout ran under owed the service: a lower limit on the
+        // tasks that "must continue to run" is one a rollout may not take the service below,
+        // however badly the revision it was rolling out ends, so the service is still
+        // holding a task of its own once the rollout has.
+        if row.keeps_a_running_task {
+            let running = running_task_count(&router, row.name, case).await;
+            assert!(
+                running >= 1,
+                "case {case:?}: expected the floor to keep a task of the service running \
+                 through the rollout, got {running} running task(s)"
+            );
+        }
+        // The rollout the service ends up on is one of its own: the revision the rollback
+        // put back is deployed by a rollout like any other, so the service converges on the
+        // count it wants and that rollout reports the steady state it reached. A rollout the
+        // breaker failed with nothing to put back is the exception the same doc names: "a
+        // deployment in FAILED state doesn't launch any new tasks", so the service it failed
+        // converges on nothing.
+        if row.ends != "ROLLBACK_FAILED" {
+            let converged = poll_service(
+                &router,
+                row.name,
+                case,
+                "the service to converge on the rollout it was left on",
+                |view| {
+                    string(&primary(view, case), "rolloutState", case) == "COMPLETED"
+                        && count(view, "runningCount", case) == 1
+                },
+            )
+            .await;
+            assert_eq!(
+                string(&primary(&converged, case), "taskDefinition", case),
+                expected_revision,
+                "case {case:?}: expected the converged rollout to run the revision the \
+                 service was left on, got {converged}"
+            );
+        }
+    }
+}
+
+/// How many tasks of one service are RUNNING, read back through `ListTasks` and
+/// `DescribeTasks` — the task's own reported status rather than a count the service
+/// published.
+async fn running_task_count(router: &MultiServiceRouter, name: &str, case: &str) -> usize {
+    let mut running = 0;
+    for arn in task_arns(router, name, "RUNNING", case).await {
+        let task = describe_task(router, &arn, case).await;
+        if string(&task, "lastStatus", case) == "RUNNING" {
+            running += 1;
+        }
+    }
+    running
 }

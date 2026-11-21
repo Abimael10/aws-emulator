@@ -43,6 +43,80 @@ pub(crate) const AWSVPC_START: std::time::Duration = std::time::Duration::from_m
         + 400,
 );
 
+/// The ONE shared wait of these suites: look again at what `read` answers until `settled`
+/// holds of it, and answer the value it settled as.
+///
+/// Every clock-owed transition of this service is one the CLOCK materialises, so a suite
+/// waits for the CONDITION rather than for a span: this is that loop, held here so a suite
+/// does not carry a deadline and an interval of its own. [`POLL_BUDGET`] is generous — a
+/// rollout is several spans, and a poll stops the instant its condition holds — so the
+/// deadline only turns a failure into a failure rather than a hang.
+pub(crate) async fn poll_until<Read, Reading>(
+    case: &str,
+    what: &str,
+    mut read: Read,
+    settled: impl Fn(&Value) -> bool,
+) -> Value
+where
+    Read: FnMut() -> Reading,
+    Reading: std::future::Future<Output = Value>,
+{
+    let deadline = std::time::Instant::now() + POLL_BUDGET;
+    loop {
+        let answered = read().await;
+        if settled(&answered) {
+            return answered;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected {what}, got {answered}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// How long [`poll_until`] keeps looking before it gives up.
+pub(crate) const POLL_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often it looks again.
+pub(crate) const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// One service deployment, as `DescribeServiceDeployments` reports it.
+pub(crate) async fn describe_service_deployment(
+    router: &MultiServiceRouter,
+    arn: &str,
+    case: &str,
+) -> Value {
+    let body = ok(
+        router,
+        "DescribeServiceDeployments",
+        json!({ "serviceDeploymentArns": [arn] }),
+        case,
+    )
+    .await;
+    list(&body, "serviceDeployments", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the rollout {arn} back, got {body}"))
+}
+
+/// That same rollout once it reports `wanted`, looked for until it does: where a rollout is
+/// left is the CLOCK's, so a case about WHERE waits for the status rather than for a span.
+pub(crate) async fn poll_deployment_status(
+    router: &MultiServiceRouter,
+    arn: &str,
+    wanted: &str,
+    case: &str,
+) -> Value {
+    poll_until(
+        case,
+        &format!("the rollout to reach {wanted:?}"),
+        || describe_service_deployment(router, arn, case),
+        |deployment| deployment["status"] == json!(wanted),
+    )
+    .await
+}
+
 /// A router with this service mounted on a fresh engine beside Amazon EC2 Auto Scaling,
 /// and the one Amazon VPC subnet every `awsvpc` placement of these suites names
 /// ([`AWSVPC_SUBNET`]) in the account's records.

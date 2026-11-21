@@ -247,8 +247,18 @@ async fn a_created_service_reports_a_rollout_that_has_taken_nothing_over_yet() {
              got {early}"
         );
 
-        tokio::time::sleep(ONE_SPAN).await;
-        let settled = describe(&router, cluster, service_name, case).await;
+        // The CLOCK settles the rollout, once the task set it placed has STAYED up: the
+        // condition is polled for rather than timed, so the case is about WHETHER the
+        // rollout settles and not about how fast this host is.
+        let settled = poll_until(
+            &router,
+            cluster,
+            service_name,
+            case,
+            "the rollout to be confirmed stable",
+            |view| string(&primary(view, case), "stabilityStatus", case) == "STEADY_STATE",
+        )
+        .await;
         let deployment = primary(&settled, case);
         assert_eq!(
             string(&deployment, "stabilityStatus", case),
@@ -756,8 +766,15 @@ async fn create_cluster_with_live_service(
     let cluster = "untouched";
     cluster_with_capacity(router, cluster, case).await;
     create_service(router, cluster, "live", definition_arn, 1, case).await;
-    tokio::time::sleep(ONE_SPAN).await;
-    let read = describe(router, cluster, "live", case).await;
+    let read = poll_until(
+        router,
+        cluster,
+        "live",
+        case,
+        "the live service to reach the steady state it holds",
+        |view| view["runStatus"].as_str() == Some("SteadyState"),
+    )
+    .await;
     assert_eq!(
         (
             string(&read, "runStatus", case),

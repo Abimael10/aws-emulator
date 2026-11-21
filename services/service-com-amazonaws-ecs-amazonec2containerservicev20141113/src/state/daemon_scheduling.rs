@@ -43,6 +43,18 @@ use super::*;
 /// enum beside [`DAEMON_ACTIVE`] (`smithy_query(query="shape", shape="DaemonStatus")`).
 pub const DAEMON_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
 
+/// How long a daemon stays [`DAEMON_DELETE_IN_PROGRESS`] before the delete has been carried
+/// out and the record is gone.
+///
+/// EMULATOR-CHOSEN, and deliberately longer than the span a task's own transitions take:
+/// "Deleting a daemon stops all running daemon tasks on the associated container instances.
+/// Amazon ECS drains existing container instances" (`DeleteDaemon`), so the delete is a DRAIN
+/// a client WATCHES rather than a step taken in the instant the call answers — the daemon is
+/// reported in that status with its tasks stopping, and a client that reads it, lists it or
+/// asks to update it in between is answered about a daemon whose delete is under way. Stored
+/// as a due instant and compared, never slept on.
+pub const DAEMON_DRAIN_SPAN: Duration = Duration::from_secs(3);
+
 /// `DaemonDeploymentStatus` for a rollout that has been created and has not begun
 /// replacing tasks yet — the status a deployment is answered in, one
 /// [`TRANSITION_SPAN`] before it starts.
@@ -82,11 +94,25 @@ pub fn daemon_not_found_message(reference: &str) -> String {
 /// the request carried.
 pub const DAEMON_METADATA_NOT_FOUND_MESSAGE: &str = "No daemon metadata found.";
 
-/// `DaemonNotActiveException$message` for a `daemonArn` this store HOLDS in a status that
-/// is not [`DAEMON_ACTIVE`] — the error shape's own doc: "The specified daemon isn't
-/// active. You can't update a daemon that's inactive." One fixed sentence, like
-/// [`SERVICE_NOT_ACTIVE_MESSAGE`].
-pub const DAEMON_NOT_ACTIVE_MESSAGE: &str = "Daemon was not ACTIVE.";
+/// `InvalidParameterException$message` for a call that would CHANGE a daemon whose delete
+/// this account has already asked for.
+///
+/// The template AWS words for that condition: the identifier the request carried, followed
+/// by the fixed text stating what is happening to the daemon it names — so a client reading
+/// the refusal is told which daemon of the ones it asked about is on its way out. ONE
+/// sentence for the whole condition, whether the delete is still being carried out or has
+/// taken the daemon's record away already: what the refusal states is the delete, which is
+/// the same fact either way.
+pub fn daemon_deletion_in_progress_message(reference: &str) -> String {
+    format!("{} deletion is in progress", reference.trim())
+}
+
+/// How many DELETED daemons this store remembers having deleted
+/// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::deleted_daemons`]). THIS NUMBER
+/// IS THE EMULATOR'S: a deleted daemon's record is gone, so all that is left of it is one
+/// entry of that map, and the bound is the one the live daemons have ([`MAX_DAEMONS`]) because
+/// a caller that may hold that many daemons may have deleted that many.
+pub const MAX_DELETED_DAEMONS: usize = MAX_DAEMONS;
 
 /// The ARN resource type a DAEMON REVISION is named under, as the resource segment of
 /// [`daemon_revision_arn`] — its own resource beside the daemon and the deployment that
@@ -539,6 +565,44 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.daemons.values().find(|daemon| daemon.arn == reference)
     }
 
+    /// Whether the DELETE of the daemon `reference` names has already been asked for: the
+    /// daemon is on its way out ([`DAEMON_DELETE_IN_PROGRESS`]), or the delete has been
+    /// carried out and the record is gone ([`Self::deleted_daemons`]).
+    ///
+    /// What tells a reference to a daemon of this account that was DELETED from a reference
+    /// to no daemon at all: once the record is gone the two are the same lookup
+    /// ([`Self::daemon_from_arn`] resolves neither), and they are not the same request — one
+    /// names a resource whose lifecycle this account ended, the other names none.
+    pub fn daemon_delete_was_asked_for(&self, reference: &str) -> bool {
+        let reference = reference.trim();
+        match self.daemon_from_arn(reference) {
+            Some(daemon) => {
+                daemon.removal_due_at.is_some() || daemon.status == DAEMON_DELETE_IN_PROGRESS
+            }
+            None => self.deleted_daemons.contains_key(reference),
+        }
+    }
+
+    /// Record that the delete of `daemon_arn` has been CARRIED OUT, as of `at`.
+    ///
+    /// Bounded by [`MAX_DELETED_DAEMONS`]: once the bound is reached the entry whose delete
+    /// was carried out longest ago is dropped, because the newest deletes are the ones a
+    /// client is still making calls about.
+    fn record_daemon_deleted(&mut self, daemon_arn: &str, at: SystemTime) {
+        self.deleted_daemons.insert(daemon_arn.to_string(), at);
+        while self.deleted_daemons.len() > MAX_DELETED_DAEMONS {
+            let Some(oldest) = self
+                .deleted_daemons
+                .iter()
+                .min_by_key(|(arn, at)| (*at, arn.as_str()))
+                .map(|(arn, _)| arn.clone())
+            else {
+                break;
+            };
+            self.deleted_daemons.remove(&oldest);
+        }
+    }
+
     /// Every capacity provider a daemon's `capacityProviderArns` names, by NAME, in the
     /// order the request named them — or WHY one of them names no provider a daemon can
     /// deploy onto.
@@ -851,7 +915,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         if let Some(daemon) = self.daemons.get_mut(daemon_arn) {
             daemon.status = DAEMON_DELETE_IN_PROGRESS.to_string();
             daemon.updated_at = at;
-            daemon.removal_due_at = Some(now + TRANSITION_SPAN);
+            daemon.removal_due_at = Some(now + DAEMON_DRAIN_SPAN);
             daemon.deployment_arn = deployment_arn.clone();
         }
         let tasks = self.daemon_task_arns(daemon_arn);
@@ -933,17 +997,26 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // The delete a `DeleteDaemon` call asked for: once it is due the daemon is gone,
         // whether or not anybody called to look — and with it the rollouts and revisions
         // that were read back through it.
-        let removed: Vec<String> = self
+        let removed: Vec<(String, SystemTime)> = self
             .daemons
             .values()
-            .filter(|daemon| daemon.removal_due_at.is_some_and(|due| due <= now))
-            .map(|daemon| daemon.arn.clone())
+            .filter_map(|daemon| {
+                daemon
+                    .removal_due_at
+                    .filter(|due| *due <= now)
+                    .map(|due| (daemon.arn.clone(), due))
+            })
             .collect();
-        for daemon_arn in removed {
+        for (daemon_arn, due) in removed {
             self.daemons.remove(&daemon_arn);
             self.daemon_deployments
                 .retain(|_, deployment| deployment.daemon_arn != daemon_arn);
             self.prune_daemon_revisions();
+            // The record is gone; what the account still holds is that this ARN named a
+            // daemon of its own and that daemon was deleted, dated by the instant the delete
+            // was carried out rather than by whoever happened to call
+            // ([`Self::deleted_daemons`]).
+            self.record_daemon_deleted(&daemon_arn, due);
         }
     }
 
@@ -1234,6 +1307,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // being waited for: only its own start is owed.
             pending_due_at: None,
             running_due_at: Some(now + TRANSITION_SPAN),
+            // A task that has not started has held no run yet.
+            kept_running_due_at: None,
+            kept_running_at: None,
             stopped_due_at: None,
             protection_expires_at: None,
             // A daemon task shares the networking of the host that runs it: a daemon task

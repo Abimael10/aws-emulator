@@ -210,6 +210,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 [
                     task.pending_due_at.filter(|_| task.interfaces_attached()),
                     task.running_due_at,
+                    // The confirmation that a started task's run is HELD, which the steady
+                    // state of the rollout that placed it waits for
+                    // ([`TaskRecord::kept_running_at`]) — owed whether or not anybody calls
+                    // again, and only for a task that is still running.
+                    task.kept_running_due_at
+                        .filter(|_| task.last_status == STATUS_RUNNING),
                     task.work_done_due_at.filter(|_| task.work_is_running()),
                     task.stopped_due_at,
                 ]

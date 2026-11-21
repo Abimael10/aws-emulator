@@ -22,8 +22,9 @@
 //! The update ACTS in the daemon's cluster — it replaces what runs there — so a `daemonArn`
 //! whose cluster this account does not hold is refused about the cluster
 //! (`ClusterNotFoundException`), an ARN under a cluster that IS there naming no stored
-//! daemon is `DaemonNotFoundException`, and a daemon whose delete has been asked for is
-//! `DaemonNotActiveException`.
+//! daemon is `DaemonNotFoundException`, and a daemon this account DELETED — whether the
+//! delete is still being carried out or has taken the record away already — names a daemon
+//! that can no longer take an update, which is `InvalidParameterException`.
 //!
 //! ## Shape of an operation
 //!
@@ -357,6 +358,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A daemon this account DELETED is not a daemon that was never there: the delete
+        // ended that daemon's lifecycle, so an update of it names a daemon that can no
+        // longer take one — whether the delete is still being carried out or has taken the
+        // record away already, which is ONE request class and one refusal
+        // ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::daemon_delete_was_asked_for`]).
+        if guard.daemon_delete_was_asked_for(&input.daemon_arn) {
+            return Err(UpdateDaemonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::daemon_deletion_in_progress_message(
+                        &input.daemon_arn,
+                    )),
+                },
+            )
+            .into());
+        }
         let daemon = match guard.daemon_from_arn(&input.daemon_arn) {
             Some(daemon) => daemon.clone(),
             // The ARN identifies the daemon by itself, so anything it does not resolve to
@@ -371,17 +387,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         };
-        // "The specified daemon isn't active. You can't update a daemon that's inactive" —
-        // which is a daemon whose delete has been asked for: it is on its way out, so there
-        // is no rollout to start on it.
-        if daemon.status != crate::state::DAEMON_ACTIVE {
-            return Err(UpdateDaemonErrorModeled::DaemonNotActiveException(
-                DaemonNotActiveException {
-                    message: Some(crate::state::DAEMON_NOT_ACTIVE_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
 
         // Every member this request carries is one the updated daemon runs under, so the
         // stored record takes them all: `UpdateDaemon` states the whole configuration

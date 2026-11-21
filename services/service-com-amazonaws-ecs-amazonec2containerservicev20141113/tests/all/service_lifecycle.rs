@@ -478,20 +478,31 @@ async fn service_create_reads_back_with_the_task_set_its_scheduler_placed() {
         settling.push((case, test.cluster, test.service_name, test.desired));
     }
 
-    // The clock, not a reader, is what starts the tasks the scheduler placed — one wait
-    // covers every row, since they were all placed before it started.
-    tokio::time::sleep(TASK_START).await;
+    // The clock, not a reader, is what starts the tasks the scheduler placed and confirms
+    // the rollout once they have STAYED up, so each row is polled for its own condition
+    // through the shared wait rather than read after a span.
     for (case, cluster, service_name, desired) in settling {
-        let settled = describe(&router, cluster, service_name, false, case).await;
+        let settled = crate::ecs_wire::poll_until(
+            case,
+            "every placed task RUNNING and the rollout COMPLETED",
+            || describe(&router, cluster, service_name, false, case),
+            |view| {
+                count(view, "runningCount", case) == desired
+                    && count(view, "pendingCount", case) == 0
+                    && string(&list(view, "deployments", case)[0], "rolloutState", case)
+                        == "COMPLETED"
+            },
+        )
+        .await;
         assert_eq!(
             count(&settled, "runningCount", case),
             desired,
-            "case {case:?}: expected every placed task RUNNING after one span, got {settled}"
+            "case {case:?}: expected every placed task RUNNING, got {settled}"
         );
         assert_eq!(
             count(&settled, "pendingCount", case),
             0,
-            "case {case:?}: expected no PENDING task after one span, got {settled}"
+            "case {case:?}: expected no PENDING task, got {settled}"
         );
         assert_eq!(
             string(&list(&settled, "deployments", case)[0], "rolloutState", case),

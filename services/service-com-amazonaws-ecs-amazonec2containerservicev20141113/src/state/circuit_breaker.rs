@@ -165,10 +165,14 @@ impl TaskRecord {
     ///   (`Task$healthStatus` is "determined by the health of the essential containers in
     ///   the task"); one still being evaluated has reached nothing, and the instant is the
     ///   one its probes passed at ([`ContainerHealthRecord::healthy_at`]);
-    /// * a task whose essential containers declare NO check reaches it by STARTING: a
+    /// * a task whose essential containers declare NO check reaches it by being KEPT: a
     ///   container with no check reports `UNKNOWN` for ever, so a reset keyed on a passing
     ///   check would never come for it, and "successfully running" is all such a task can
-    ///   ever report.
+    ///   ever report — but a task is successfully running only once the service has HELD it
+    ///   ([`TaskRecord::kept_running_at`]), not in the instant it came up. A revision whose
+    ///   containers end as soon as they start therefore resets nothing however many
+    ///   replacements the scheduler launches, which is what leaves the breaker counting
+    ///   those launches consecutively until it fails the rollout.
     ///
     /// A task the rollout LOST is never one of them, whatever it reported on the way: a task
     /// that "fails any of its defined health checks and is stopped" is one of the failures
@@ -179,10 +183,7 @@ impl TaskRecord {
         if self.failed_for_deployment() {
             return None;
         }
-        let started = self
-            .started_at
-            .and_then(|at| SystemTime::try_from(at).ok())?;
-        let mut reached = started;
+        let mut reached = self.kept_running_at?;
         for container in self.containers.iter().filter(|container| container.essential) {
             let Some(health) = container.health.as_ref() else {
                 continue;
@@ -423,8 +424,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // a rollout that is already ending under one is not rolled back twice.
             !record.is_finished() && !record.stop_requested() && !record.is_stopping()
         }) {
-            let source = self.last_completed_service_deployment(&record).cloned();
-            // A service with no completed rollout to put back, and one whose revision is no
+            // "The service is rolled back to the last deployment that completed
+            // successfully" — and where no rollout of the service is recorded as having
+            // completed, the one this rollout was REPLACING is where the service goes back
+            // to: `ServiceDeployment$sourceServiceRevisions` is "the currently deployed
+            // workload configuration", so that rollout's revision is the one the service was
+            // running when this one began failing, which is the last good one it has.
+            let source = self
+                .last_completed_service_deployment(&record)
+                .or_else(|| self.previous_service_deployment(&record))
+                .cloned();
+            // A service with no earlier rollout to put back, and one whose revision is no
             // longer there to run again, are the same case: there is nothing to roll back to.
             let rolled_back = match source {
                 Some(source) => self.roll_back_service_deployment_to(
@@ -483,5 +493,26 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     && other.status == SERVICE_DEPLOYMENT_SUCCESSFUL
             })
             .max_by(|left, right| left.order_key().cmp(&right.order_key()))
+    }
+
+    /// Whether `service`'s CURRENT rollout is still waiting for a task of its own to be
+    /// KEPT: one it placed that is wanted running and running, and whose run has not been
+    /// confirmed held yet ([`TaskRecord::kept_running_at`]).
+    ///
+    /// What holds a rollout's steady state off until its task set has STAYED up. "When the
+    /// service reaches a steady state, the deployment transitions to a `COMPLETED` state"
+    /// (`Deployment$rolloutState`), and a task set that stood at the count the service wants
+    /// for one instant has reached no steady state: a rollout settled there would be one
+    /// declared complete on a task the service is about to lose — and, with that state
+    /// terminal, the circuit breaker watching it would have stopped watching.
+    pub(super) fn rollout_awaits_kept_tasks(&self, service: &ServiceRecord) -> bool {
+        self.tasks.values().any(|task| {
+            task.cluster_name == service.cluster_name
+                && task.service_name.as_deref() == Some(service.name.as_str())
+                && task.started_by.as_deref() == Some(service.deployment_id.as_str())
+                && task.desired_status == STATUS_RUNNING
+                && task.last_status == STATUS_RUNNING
+                && task.kept_running_at.is_none()
+        })
     }
 }

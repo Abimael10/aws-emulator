@@ -39,7 +39,9 @@
 //!   and because it only reports, repeating it changes nothing a later caller sees;
 //! * `DeleteDaemon`: "Deleting a daemon stops all running daemon tasks on the associated
 //!   container instances", the daemon is answered `DELETE_IN_PROGRESS`, and it leaves
-//!   `ListDaemons` on the clock;
+//!   `ListDaemons` on the clock — after which an `UpdateDaemon` naming it names a daemon
+//!   that can no longer take one, whichever stage the delete has reached, which is a
+//!   different refusal from the one an ARN that never named a daemon earns;
 //! * the same placement rule over the other daemon-scheduled workload this service has:
 //!   "The daemon scheduling strategy deploys exactly one task on each active container
 //!   instance", so a `schedulingStrategy=DAEMON` SERVICE's `desiredCount` follows the
@@ -56,8 +58,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::capacity_providers::managed_instances;
 use crate::ecs_wire::{
-    count, create_cluster, list, ok, refusal, register_instance, service, string, ACCOUNT,
-    SIGNED_REGION,
+    answered, count, create_cluster, list, ok, refusal, register_instance, service, string,
+    ACCOUNT, SIGNED_REGION,
 };
 
 /// How long a poll waits for a clock-owed daemon transition before failing. Generous
@@ -2005,4 +2007,171 @@ async fn an_update_states_the_whole_configuration_and_the_revision_it_captures_s
             );
         }
     }
+}
+
+/// `InvalidParameterException$message` an update of a daemon this account deleted is refused
+/// with, whichever stage the delete has reached: the identifier the request carried and the
+/// fixed text that states what is happening to the daemon it names.
+fn deleted_daemon_update_refusal(daemon_arn: &str) -> (String, String) {
+    (
+        "InvalidParameterException".to_string(),
+        format!("{daemon_arn} deletion is in progress"),
+    )
+}
+
+/// The smallest `UpdateDaemon` request the model accepts for one daemon — every other member
+/// of it is optional — so what the call is refused for is the daemon the ARN names and not
+/// another member.
+fn update_daemon_request(daemon_arn: &str, definition: &str, provider: &str) -> Value {
+    json!({
+        "daemonArn": daemon_arn,
+        "daemonTaskDefinitionArn": definition,
+        "capacityProviderArns": [provider],
+    })
+}
+
+/// Look for `DescribeDaemon` of `daemon_arn` to report the daemon as gone, which is where
+/// the delete leaves it on the CLOCK, and answer when it does.
+async fn deleted_daemon_is_gone(router: &MultiServiceRouter, daemon_arn: &str, case: &str) {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let (status, answer) = answered(
+            router,
+            "DescribeDaemon",
+            json!({ "daemonArn": daemon_arn }),
+        )
+        .await;
+        if status != 200 {
+            assert!(
+                answer["__type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("DaemonNotFoundException"),
+                "case {case:?}: expected the daemon that is gone to be answered about the \
+                 daemon, got {status} with {answer}"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the delete to take the daemon away, still answered \
+             {answer}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: a `daemonArn` naming a daemon this account DELETED names a daemon that can no
+/// longer take an update, whichever stage the delete has reached, so `UpdateDaemon` is
+/// refused for the parameter naming it — while an ARN that named no daemon of this account
+/// at all is still the daemon-not-found refusal every read of one daemon answers, and a
+/// daemon created AGAIN under that ARN takes an update like any other
+/// ("If you have previously deleted a daemon, you can re-create it with CreateDaemon").
+#[tokio::test]
+async fn an_update_of_a_daemon_this_account_deleted_is_refused_for_the_daemon_it_names() {
+    let router = service();
+    const CLUSTER: &str = "daemon-deleted-update";
+    const CASE: &str = "setup";
+    create_cluster(&router, CLUSTER, CASE).await;
+    let provider = create_managed_provider(&router, CLUSTER, "mi-deletedupdate", CASE).await;
+    let definition = register_daemon_definition(&router, "daemondeletedupdate", IMAGE, CASE).await;
+
+    // The rows differ along the STAGE the delete of the daemon has reached when the update
+    // arrives: one still being carried out, and one carried out already — the second read
+    // through the same front door rather than waited out by a span.
+    let stages: [(&str, bool); 2] = [
+        ("while the delete is still being carried out", false),
+        ("once the delete has been carried out", true),
+    ];
+    for (stage, wait_for_the_record_to_go) in stages {
+        let name = if wait_for_the_record_to_go {
+            "carriedout"
+        } else {
+            "deleting"
+        };
+        let (daemon_arn, _) = create_daemon(
+            &router,
+            CLUSTER,
+            name,
+            std::slice::from_ref(&provider),
+            &definition,
+            stage,
+        )
+        .await;
+        let deleted = ok(
+            &router,
+            "DeleteDaemon",
+            json!({ "daemonArn": daemon_arn }),
+            stage,
+        )
+        .await;
+        assert_eq!(
+            string(&deleted, "status", stage),
+            "DELETE_IN_PROGRESS",
+            "case {stage:?}: expected the delete to be answered with the daemon on its way \
+             out, got {deleted}"
+        );
+        if wait_for_the_record_to_go {
+            deleted_daemon_is_gone(&router, &daemon_arn, stage).await;
+        }
+        let (code, message) = refusal(
+            &router,
+            "UpdateDaemon",
+            update_daemon_request(&daemon_arn, &definition, &provider),
+            stage,
+        )
+        .await;
+        let (expected_code, expected_message) = deleted_daemon_update_refusal(&daemon_arn);
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (expected_code.as_str(), expected_message.as_str()),
+            "case {stage:?}: expected the update of a deleted daemon to be refused for the \
+             daemon it names"
+        );
+    }
+
+    // The contrast the rule is bounded by: an ARN of a cluster this account DOES hold that
+    // never named a daemon of it is not a deleted daemon — it is a daemon that is not there.
+    let case = "an ARN that never named a daemon of this account";
+    let never = format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:daemon/{CLUSTER}/nosuchdaemon");
+    let (code, message) = refusal(
+        &router,
+        "UpdateDaemon",
+        update_daemon_request(&never, &definition, &provider),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (
+            "DaemonNotFoundException",
+            format!("Daemon not found: {never}").as_str()
+        ),
+        "case {case:?}: expected the refusal a daemon that is not there earns"
+    );
+
+    // And the other side of it: the delete ends that daemon's lifecycle, it does not take the
+    // NAME away, so a daemon created again under the same ARN takes an update again.
+    let case = "a daemon created again under the ARN the delete took away";
+    let (recreated, _) = create_daemon(
+        &router,
+        CLUSTER,
+        "carriedout",
+        std::slice::from_ref(&provider),
+        &definition,
+        case,
+    )
+    .await;
+    let updated = ok(
+        &router,
+        "UpdateDaemon",
+        update_daemon_request(&recreated, &definition, &provider),
+        case,
+    )
+    .await;
+    assert_eq!(
+        string(&updated, "status", case),
+        "ACTIVE",
+        "case {case:?}: expected the re-created daemon to take the update, got {updated}"
+    );
 }

@@ -414,6 +414,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     task.started_at = task
                         .started_at
                         .or(Some(crate::state::reported_instant(now)));
+                    // A task reported running has not yet shown that the service can keep
+                    // it: that is confirmed one span later, exactly as it is for a start the
+                    // clock itself materialised
+                    // ([`crate::state::TaskRecord::kept_running_at`]).
+                    if task.kept_running_at.is_none() {
+                        task.kept_running_due_at = Some(now + crate::state::TRANSITION_SPAN);
+                    }
                 }
                 if reported == crate::state::STATUS_DEACTIVATING {
                     // `Task$stoppingAt`: "the time when the task transitions from the

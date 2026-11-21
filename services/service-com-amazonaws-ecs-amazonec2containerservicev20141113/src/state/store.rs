@@ -143,6 +143,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                             task.running_due_at = None;
                             task.last_status = STATUS_RUNNING.to_string();
                             task.started_at = Some(reported_instant(due));
+                            // A task that has STARTED has not yet shown that the service can
+                            // keep it: that is confirmed one span later, and until then the
+                            // rollout that placed it has achieved nothing by it
+                            // ([`TaskRecord::kept_running_at`]).
+                            task.kept_running_due_at = Some(due + TRANSITION_SPAN);
                             // A task placed on its own runs the work it was placed for
                             // and then ends, so the instant that work is finished is owed
                             // from the instant it started ([`CONTAINER_WORK_SPAN`]); a
@@ -169,6 +174,21 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                             task.report_connected(due);
                             task.version += 1;
                         }
+                    }
+                }
+            }
+            // The confirmation that this task's run is HELD: once the span after its start
+            // has passed and the task is still running and still wanted running, the service
+            // has kept it ([`TaskRecord::kept_running_at`]). A task lost inside that span
+            // reaches this instant on its way out and is confirmed nothing, which is what
+            // makes it one of the launches the rollout that placed it LOST rather than a task
+            // that rollout achieved.
+            if let Some(due) = task.kept_running_due_at {
+                if due <= now {
+                    task.kept_running_due_at = None;
+                    if task.last_status == STATUS_RUNNING && task.desired_status == STATUS_RUNNING
+                    {
+                        task.kept_running_at = Some(due);
                     }
                 }
             }
@@ -387,6 +407,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // that has just started has its tasks placed by the same pass.
         self.advance_daemon_deployments(now);
         self.settle_services(now);
+        // The rollbacks whose redeployment has now taken the service over: a rollback ends
+        // where the revision it put back comes up ([`Self::finish_rolled_back_deployments`]),
+        // so it is materialised by the same pass that settled that redeployment.
+        self.finish_rolled_back_deployments(now);
         // The scheduler's steady-state work: a service that is short of the tasks its
         // caller asked it to maintain has the shortfall placed, which was owed from the
         // instant it fell short ([`super::service_steady_state`]). Run AFTER the stops this
@@ -453,6 +477,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // ([`super::unhealthy_task_replacement`]), so a task still being evaluated is a
             // task it is still waiting on.
             let awaits_health = self.rollout_awaits_container_health(service);
+            // And one whose tasks have only just come up has reached none either: a task the
+            // service has not HELD is a task it may be about to lose
+            // ([`Self::rollout_awaits_kept_tasks`]), so the rollout waits for its own task
+            // set to stay up rather than settling on the instant it reached the count.
+            let awaits_kept_tasks = self.rollout_awaits_kept_tasks(service);
             // Whether THIS rollout has already reached its steady state once. A later pass
             // can settle the same deployment again — a scale-out gives the scheduler the
             // same rollout's task set to settle afresh — but the deployment state machine
@@ -463,6 +492,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 *due <= now
                     && service.places_tasks()
                     && !awaits_health
+                    && !awaits_kept_tasks
                     && rollout.running == service.desired_count
                     && rollout.pending == 0
                     && tally.running == rollout.running
@@ -1106,6 +1136,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 hook_due_at,
                 complete_due_at: None,
                 rollback_due_at: None,
+                rollback_deployment_id: None,
                 rollback: None,
                 stop_due_at: None,
                 stop_type: None,
@@ -1420,14 +1451,48 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     }
                 }
             }
-            // The end of a rollout a ROLLBACK undid: the previous service revision is the
-            // one the service runs again.
+        }
+    }
+
+    /// Materialise the end of every rollout a ROLLBACK undid, as of `now`: the previous
+    /// service revision is the one the service runs again, and the rollback is CARRIED OUT
+    /// once that revision is running.
+    ///
+    /// Putting a revision back means running it again, which is a rollout of its own
+    /// ([`Self::roll_back_service_deployment_to`]), so a rollback whose redeployment has not
+    /// taken the service over yet is still in progress: a client told
+    /// [`SERVICE_DEPLOYMENT_ROLLBACK_SUCCESSFUL`] is told the service is back on the revision
+    /// the rollback names, not that it will be. Run after the pass that settles that
+    /// redeployment ([`Self::settle_services`]), so the rollback ends in the same pass the
+    /// revision it put back came up in.
+    pub(super) fn finish_rolled_back_deployments(&mut self, now: SystemTime) {
+        let arns: Vec<String> = self.service_deployments.keys().cloned().collect();
+        for arn in arns {
             let rolled_back = self
                 .service_deployments
                 .get(&arn)
                 .and_then(|record| record.rollback_due_at)
                 .filter(|due| *due <= now);
-            if let Some(due) = rolled_back {
+            // The REDEPLOYMENT this rollback started, as the service stands now: the
+            // rollback is carried out once that rollout has taken the service over, and a
+            // rollback whose redeployment the service has itself left behind — somebody
+            // released again — is over too, because the rollout that was putting the
+            // revision back is not the one being made any more.
+            let restored = self
+                .service_deployments
+                .get(&arn)
+                .and_then(|record| {
+                    let service = self
+                        .services
+                        .get(&(record.cluster_name.clone(), record.service_name.clone()))?;
+                    let redeployment = record.rollback_deployment_id.as_deref()?;
+                    Some(
+                        service.deployment_id != redeployment
+                            || service.deployment_rollout_completed,
+                    )
+                })
+                .unwrap_or_default();
+            if let Some(due) = rolled_back.filter(|_| restored) {
                 if let Some(record) = self.service_deployments.get_mut(&arn) {
                     record.rollback_due_at = None;
                     if !record.is_finished() {
@@ -1572,6 +1637,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let key = (record.cluster_name.clone(), record.service_name.clone());
         let timestamp = reported_instant(at);
         let deployment_id = self.next_deployment_id();
+        let redeployment_id = deployment_id.clone();
         // The service a rollout belongs to outlives it, but a rollout of a service that is
         // gone has nothing to put a revision back onto.
         let Some(service) = self.services.get_mut(&key) else {
@@ -1626,6 +1692,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             record.hook_due_at = None;
             record.pending_hook_stops.clear();
             record.rollback_due_at = Some(at + TRANSITION_SPAN);
+            // WHICH rollout the rollback is waiting on: the redeployment that puts the
+            // revision back, so a later release of the service settling is not read as this
+            // rollback having been carried out
+            // ([`Self::finish_rolled_back_deployments`]).
+            record.rollback_deployment_id = Some(redeployment_id);
             record.rollback = Some(Rollback {
                 // "The reason the rollback happened. For example, the circuit breaker
                 // initiated the rollback operation" — whichever of them this rollback is,
@@ -4120,6 +4191,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // be attached first is placed at the instant it is in place.
             pending_due_at: schedule.pending_due_at,
             running_due_at: schedule.running_due_at,
+            // A task that has not started has held no run yet, whoever placed it.
+            kept_running_due_at: None,
+            kept_running_at: None,
             stopped_due_at: None,
             // Nobody has protected a task the scheduler has just placed.
             protection_expires_at: None,

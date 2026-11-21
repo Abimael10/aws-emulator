@@ -659,6 +659,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // one transition span from here and the clock materialises it.
                 pending_due_at: schedule.pending_due_at,
                 running_due_at: schedule.running_due_at,
+                // A task that has not started has held no run yet.
+                kept_running_due_at: None,
+                kept_running_at: None,
                 stopped_due_at: None,
                 // Scale-in protection is `UpdateTaskProtection`'s to set; a task nobody
                 // has protected holds none.
