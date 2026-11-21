@@ -77,55 +77,87 @@ fn tags(count: usize) -> Vec<Value> {
 async fn create_activity_accepts_every_encryption_configuration_it_can_apply() {
     let emulator = Emulator::new();
 
+    // The key every customer-managed row names, which has to EXIST: a configuration
+    // naming a key KMS holds nothing for is one the service cannot apply. The four
+    // reference forms below are four ways of naming THIS key, and what the record
+    // keeps — and the describe reports — is the key itself, so each of them reads back
+    // as the key's own ARN.
+    let key = emulator.kms_key().await;
+    let key_id = key.rsplit('/').next().unwrap_or_default().to_string();
+    emulator.kms_alias("alias/sfn", &key).await;
+    let alias_arn = format!("arn:aws:kms:{REGION}:{ACCOUNT}:alias/sfn");
+    let customer_managed = |period: Option<i32>| {
+        let mut expected = json!({
+            "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
+            "kmsKeyId": key,
+        });
+        if let Some(period) = period {
+            expected["kmsDataKeyReusePeriodSeconds"] = json!(period);
+        }
+        expected
+    };
+
     // Rows vary along the FORM of the key the configuration names and along the
-    // reuse period, taken at each published bound of the modelled 60..900 range.
-    let accepted: Vec<(&str, Value)> = vec![
-        ("no encryption configuration at all", json!({})),
+    // reuse period, taken at each published bound of the modelled 60..900 range; each
+    // row states what the record must report back for it.
+    let accepted: Vec<(&str, Value, Value)> = vec![
+        (
+            "no encryption configuration at all",
+            json!({}),
+            json!({ "type": ENCRYPTION_TYPE_AWS_OWNED_KEY }),
+        ),
         (
             "the AWS owned key spelled out",
+            json!({ "type": ENCRYPTION_TYPE_AWS_OWNED_KEY }),
             json!({ "type": ENCRYPTION_TYPE_AWS_OWNED_KEY }),
         ),
         (
             "a customer-managed key named by key ARN",
-            json!({ "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY, "kmsKeyId": KEY_ARN }),
+            json!({ "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY, "kmsKeyId": key }),
+            customer_managed(None),
         ),
         (
             "a customer-managed key named by key id",
             json!({
                 "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
-                "kmsKeyId": "12345678-1234-1234-1234-123456789012",
+                "kmsKeyId": key_id,
             }),
+            customer_managed(None),
         ),
         (
             "a customer-managed key named by alias",
             json!({ "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY, "kmsKeyId": "alias/sfn" }),
+            customer_managed(None),
         ),
         (
             "a customer-managed key named by alias ARN",
             json!({
                 "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
-                "kmsKeyId": "arn:aws:kms:us-west-2:000000000000:alias/sfn",
+                "kmsKeyId": alias_arn,
             }),
+            customer_managed(None),
         ),
         (
             "a customer-managed key at the lowest reuse period the range allows",
             json!({
                 "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
-                "kmsKeyId": KEY_ARN,
+                "kmsKeyId": key,
                 "kmsDataKeyReusePeriodSeconds": MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS,
             }),
+            customer_managed(Some(MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS)),
         ),
         (
             "a customer-managed key at the highest reuse period the range allows",
             json!({
                 "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
-                "kmsKeyId": KEY_ARN,
+                "kmsKeyId": key,
                 "kmsDataKeyReusePeriodSeconds": MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS,
             }),
+            customer_managed(Some(MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS)),
         ),
     ];
 
-    for (index, (case, configuration)) in accepted.into_iter().enumerate() {
+    for (index, (case, configuration, reported)) in accepted.into_iter().enumerate() {
         let name = format!("encryption-ok-{index}");
         let mut request = json!({ "name": name });
         let configured = configuration.as_object().is_some_and(|it| !it.is_empty());
@@ -148,15 +180,8 @@ async fn create_activity_accepts_every_encryption_configuration_it_can_apply() {
         );
 
         // The EFFECTIVE configuration: a create that named none reads back the type
-        // its data is encrypted under.
-        let expected = discriminated(
-            "EncryptionConfiguration",
-            if configured {
-                configuration
-            } else {
-                json!({ "type": ENCRYPTION_TYPE_AWS_OWNED_KEY })
-            },
-        );
+        // its data is encrypted under, and one that named a key reads back that key.
+        let expected = discriminated("EncryptionConfiguration", reported);
         let described = emulator
             .ok("DescribeActivity", &json!({ "activityArn": arn }))
             .await;

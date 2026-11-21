@@ -17,8 +17,9 @@ use super::*;
 /// variables, written as that language's own expressions: a payload template here
 /// ([`Interpreter::jsonpath_assign`]) and a JSONata template in the other
 /// ([`jsonata_members`]) — so every type that may carry it in one may carry it in the
-/// other. A `Fail` state carries none of the two languages' data-flow members at all,
-/// and so none of this one either.
+/// other. The two types that END an execution carry none of it: a variable is assigned
+/// for a LATER state to read, and nothing runs after a `Succeed` or a `Fail`. A `Fail`
+/// state carries none of the two languages' data-flow members at all either.
 ///
 /// A `Task`'s members depend on WHICH work its `Resource` names, so the type alone
 /// does not decide them: this answers the ACTIVITY task's set, and
@@ -67,7 +68,6 @@ pub(super) fn executable_members(state_type: &str) -> &'static [&'static str] {
             "Type",
             "Comment",
             "QueryLanguage",
-            "Assign",
             "InputPath",
             "OutputPath",
         ],
@@ -310,7 +310,7 @@ pub(super) fn jsonata_members(state_type: &str, activity: bool) -> &'static [&'s
             "Choices",
             "Default",
         ],
-        "Succeed" => &["Type", "Comment", "QueryLanguage", "Assign", "Output"],
+        "Succeed" => &["Type", "Comment", "QueryLanguage", "Output"],
         "Fail" => &["Type", "Comment", "QueryLanguage", "Error", "Cause"],
         // An ACTIVITY task's work is a worker's, which is what SENDS the heartbeats the
         // member's window is measured between; a task whose work this emulator performs

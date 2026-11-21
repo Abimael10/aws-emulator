@@ -192,15 +192,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "You must specify at least one of the description or routingConfiguration
         // parameters to update a state machine alias": a request that names neither
-        // asks for no change at all, which this operation's own rule refuses.
+        // asks for no change at all, which this operation's own rule refuses. The
+        // sentence is the service's own and carries no value of the request — what the
+        // request is missing is both of the two members it names.
         if input.description.is_none() && input.routing_configuration.is_none() {
             return Err(
                 UpdateStateMachineAliasErrorModeled::ValidationException(ValidationException {
-                    message: Some(
-                        "At least one of the description or routingConfiguration parameters \
-                         must be specified"
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::ALIAS_UPDATE_NAMES_NO_MEMBER.to_string()),
                     reason: None,
                 })
                 .into(),

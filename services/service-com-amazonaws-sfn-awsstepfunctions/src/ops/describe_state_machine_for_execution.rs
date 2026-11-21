@@ -201,29 +201,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service and an ARN of another region are defects in the REQUEST, which
         // `InvalidArn` reports, not an execution that is absent here.
         let endpoint_region = crate::state::request_region(ctx.parts());
-        if let Err(message) =
-            crate::state::read_execution_arn(&input.execution_arn, &endpoint_region)
-        {
-            return Err(
-                DescribeStateMachineForExecutionErrorModeled::InvalidArn(InvalidArn {
-                    message: Some(message),
-                })
-                .into(),
-            );
-        }
+        let read = crate::state::read_execution_arn(&input.execution_arn, &endpoint_region);
+        let labeled = match read {
+            Err(message) => {
+                return Err(
+                    DescribeStateMachineForExecutionErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into(),
+                )
+            }
+            // The execution ARN of a CHILD workflow execution of a Distributed Map
+            // state carries the Map state's label beside the state machine's name
+            // (`execution:<stateMachineName>/<label>:<id>`), which is what makes such
+            // an ARN a LABELED one.
+            Ok((state_machine, _)) => state_machine.contains('/'),
+        };
 
         // `includedData` is `ALL_DATA | METADATA_ONLY`; the `definition` output
         // member documents what the latter reports. A value outside the modelled
         // enum is a bad request this operation models no error for, so it goes out
         // through the one non-modelled channel the crate has.
-        let Some(included_data) =
-            crate::state::IncludedData::from_wire(input.included_data.as_deref())
+        let Some(asked_for) = crate::state::IncludedData::from_wire(input.included_data.as_deref())
         else {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "includedData must be one of [{}], got '{}'",
                 INCLUDED_DATA_VALUES.join(", "),
                 input.included_data.unwrap_or_default()
             )));
+        };
+        // The read of a LABELED execution ARN does not apply the member: what it reports
+        // is the configuration a CHILD workflow execution of a Distributed Map state ran
+        // — the one read this operation answers for a child rather than for an execution
+        // of the state machine itself — and that read carries the definition and
+        // everything read out of it whatever `includedData` asks for.
+        let included_data = match labeled {
+            true => crate::state::IncludedData::AllData,
+            false => asked_for,
         };
 
         let now = crate::state::now();

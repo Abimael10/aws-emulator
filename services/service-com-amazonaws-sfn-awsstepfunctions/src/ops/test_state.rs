@@ -280,6 +280,34 @@ fn mock_unsupported_state_type(state_type: &str) -> String {
     format!("State type '{state_type}' is not supported when a mock is specified")
 }
 
+/// What this operation answers for a `variables` member that is not a JSON object
+/// literal.
+///
+/// RECORDED text, and a FIXED sentence: the member is `@sensitive`, so the refusal
+/// names the member and says what it had to be, quoting nothing of the document it
+/// could not read — not a parser's own reading of where the text stopped.
+const VARIABLES_NOT_JSON: &str = "The value of 'variables' is not valid JSON.";
+
+/// What this operation answers for a `variables` member that parses as JSON but is not
+/// a JSON OBJECT.
+///
+/// RECORDED text, and a FIXED sentence beside [`VARIABLES_NOT_JSON`]: the member is a
+/// "JSON object literal", so a document that parsed but is an array, a string or a
+/// number is refused for what it is not rather than as text no parse could read — and,
+/// being `@sensitive`, it is not quoted either.
+const VARIABLES_NOT_AN_OBJECT: &str = "The value of 'variables' must be a valid JSON object.";
+
+/// What this operation answers for a `variables` object whose KEY is not a name a state
+/// could have assigned a variable under ([`crate::state::asl::is_variable_name`]).
+///
+/// RECORDED text: the document parsed, so what the refusal states is the KEY it could
+/// not read as a variable name — the one value in the sentence — and then the rule that
+/// name broke. A variable name is the caller's own text, which is why it is the only
+/// part of the `@sensitive` document the refusal quotes.
+fn invalid_variable_name(name: &str) -> String {
+    format!("Invalid variable name '{name}': the variable name contains invalid characters.")
+}
+
 /// The validation mode a `mock` that names none is judged at: "If no value is
 /// specified, the default value is `STRICT`."
 const DEFAULT_FIELD_VALIDATION_MODE: &str = "STRICT";
@@ -555,25 +583,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "JSON object literal that sets variables used in the state under test.
-        // Object keys are the variable names and values are the variable values."
+        // Object keys are the variable names and values are the variable values." Each
+        // way the value can fail to be one is refused in the service's own fixed
+        // sentence for it, quoting nothing of the `@sensitive` document: text no JSON
+        // parse reads ([`VARIABLES_NOT_JSON`]), a document that is not an object
+        // ([`VARIABLES_NOT_AN_OBJECT`]), and an object whose KEY is not a variable name
+        // — which names that key, the rule it broke being about the name itself.
         let variables = match input.variables.as_deref() {
             None => None,
             Some(text) => match serde_json::from_str::<Value>(text) {
-                Ok(value) if value.is_object() => Some(value),
-                Ok(_) => {
-                    return Err(refuse(
-                        "variables must be a JSON object literal whose keys are the variable \
-                         names"
-                            .to_string(),
-                    ))
+                Ok(Value::Object(fields)) => {
+                    if let Some(name) = fields.keys().find(|name| !asl::is_variable_name(name)) {
+                        return Err(refuse(invalid_variable_name(name)));
+                    }
+                    Some(Value::Object(fields))
                 }
-                Err(error) => {
-                    return Err(refuse(format!(
-                        "variables must be a JSON object literal whose keys are the variable \
-                         names: {}",
-                        crate::state::json_parse_diagnostic(text, &error)
-                    )))
-                }
+                Ok(_) => return Err(refuse(VARIABLES_NOT_AN_OBJECT.to_string())),
+                Err(_) => return Err(refuse(VARIABLES_NOT_JSON.to_string())),
             },
         };
 

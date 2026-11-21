@@ -430,9 +430,10 @@ pub fn state_fields(state_type: &str) -> &'static [&'static str] {
         ],
         // The two types that END an execution: there is nowhere for them to go, and no
         // failure of theirs for a retrier or a catcher to take over. The output a
-        // `Succeed` puts out is the execution's own.
+        // `Succeed` puts out is the execution's own. Neither declares `Assign`: the
+        // field is for "assigning values to variables" a LATER state reads, and nothing
+        // runs after a state that ends the execution.
         "Succeed" => &[
-            "Assign",
             "Comment",
             "InputPath",
             "Output",

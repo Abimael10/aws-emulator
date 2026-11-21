@@ -67,10 +67,6 @@ const LOG_LEVELS: &[&str] = &["ALL", "ERROR", "FATAL", "OFF"];
 /// (`smithy_query(query="shape",shape="EncryptionType")`).
 const ENCRYPTION_TYPES: &[&str] = &["AWS_OWNED_KEY", "CUSTOMER_MANAGED_KMS_KEY"];
 
-/// A KMS key ARN inside the modelled `kmsKeyId` length (1..2048).
-const KMS_KEY_ARN: &str =
-    "arn:aws:kms:us-west-2:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab";
-
 /// The one log destination a logging configuration may carry (`destinations` is
 /// "limited to size 1", and required at any level other than OFF).
 fn log_destinations() -> Value {
@@ -217,6 +213,9 @@ fn the_catalog_of_discriminated_members_is_the_model_s_own() {
 #[tokio::test]
 async fn describe_state_machine_discriminates_every_configuration_structure() {
     let emulator = Emulator::new();
+    // The key the customer-managed rows name, which has to exist for a configuration
+    // on it to be one the service can apply.
+    let key = emulator.kms_key().await;
 
     // Rows differ along WHICH configurations the create named and what each held:
     // none at all, each one alone, and all three at once.
@@ -235,7 +234,7 @@ async fn describe_state_machine_discriminates_every_configuration_structure() {
                     "destinations": log_destinations(),
                 },
                 "tracingConfiguration": { "enabled": true },
-                "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": KMS_KEY_ARN },
+                "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key },
             }),
         ),
     ];
@@ -255,7 +254,7 @@ async fn describe_state_machine_discriminates_every_configuration_structure() {
         let encryption = if *encryption_type == "AWS_OWNED_KEY" {
             json!({ "type": encryption_type })
         } else {
-            json!({ "type": encryption_type, "kmsKeyId": KMS_KEY_ARN })
+            json!({ "type": encryption_type, "kmsKeyId": key })
         };
         cases.push((
             format!("the modelled encryption type {encryption_type}"),

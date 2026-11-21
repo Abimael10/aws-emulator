@@ -79,38 +79,65 @@ fn create_request(name: &str, options: Value) -> Value {
 #[tokio::test]
 async fn create_state_machine_checks_the_encryption_configuration() {
     let emulator = Emulator::new();
+    // The keys the rows below name: a configuration naming a customer managed key is
+    // one the service can apply only while KMS holds that key, and what the record
+    // keeps — and the describe reports — is the key itself, whichever of the reference
+    // forms named it.
+    let key = emulator.kms_key().await;
+    let key_id = key.rsplit('/').next().unwrap_or_default().to_string();
+    emulator.kms_alias("alias/sfn-probe", &key).await;
+    let multi_region = string(
+        &emulator
+            .kms(
+                "CreateKey",
+                &json!({ "KeySpec": "SYMMETRIC_DEFAULT", "MultiRegion": true }),
+            )
+            .await["KeyMetadata"],
+        "Arn",
+    );
+    let multi_region_id = multi_region
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
 
     // Rows vary along the `type`, whether each KMS member is set, and the FORM of
     // the key reference. The accepted forms are the four the `kmsKeyId` member's own
     // documentation names — "an alias, alias ARN, key ID, or key ARN of a symmetric
     // encryption KMS key" — plus the `mrk-` id a multi-Region key carries; none of
-    // them is the configuration the issue recorded.
-    let accepted: Vec<(&str, Value)> = vec![
+    // them is the configuration the issue recorded. Each row states what the record
+    // must report back for it.
+    let accepted: Vec<(&str, Value, Value)> = vec![
         (
             "no encryptionConfiguration at all",
             json!({}),
+            json!({ "type": "AWS_OWNED_KEY" }),
         ),
         (
             "the AWS owned key, with no KMS member",
             json!({ "encryptionConfiguration": { "type": "AWS_OWNED_KEY" } }),
+            json!({ "type": "AWS_OWNED_KEY" }),
         ),
         (
             "a customer-managed key named by key ARN",
-            json!({ "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": KEY_ARN } }),
+            json!({ "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key } }),
+            json!({ "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key }),
         ),
         (
             "a customer-managed key named by key id",
             json!({ "encryptionConfiguration": {
                 "type": "CUSTOMER_MANAGED_KMS_KEY",
-                "kmsKeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
+                "kmsKeyId": key_id,
             } }),
+            json!({ "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key }),
         ),
         (
             "a customer-managed multi-Region key id",
             json!({ "encryptionConfiguration": {
                 "type": "CUSTOMER_MANAGED_KMS_KEY",
-                "kmsKeyId": "mrk-1234abcd12ab34cd56ef1234567890ab",
+                "kmsKeyId": multi_region_id,
             } }),
+            json!({ "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": multi_region }),
         ),
         (
             "a customer-managed key named by alias",
@@ -118,25 +145,32 @@ async fn create_state_machine_checks_the_encryption_configuration() {
                 "type": "CUSTOMER_MANAGED_KMS_KEY",
                 "kmsKeyId": "alias/sfn-probe",
             } }),
+            json!({ "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key }),
         ),
         (
             "a customer-managed key named by alias ARN",
             json!({ "encryptionConfiguration": {
                 "type": "CUSTOMER_MANAGED_KMS_KEY",
-                "kmsKeyId": "arn:aws:kms:us-west-2:000000000000:alias/sfn-probe",
+                "kmsKeyId": format!("arn:aws:kms:{REGION}:{ACCOUNT}:alias/sfn-probe"),
             } }),
+            json!({ "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key }),
         ),
         (
             "a customer-managed key with a reuse period inside the modelled range",
             json!({ "encryptionConfiguration": {
                 "type": "CUSTOMER_MANAGED_KMS_KEY",
-                "kmsKeyId": KEY_ARN,
+                "kmsKeyId": key,
                 "kmsDataKeyReusePeriodSeconds": 120,
             } }),
+            json!({
+                "type": "CUSTOMER_MANAGED_KMS_KEY",
+                "kmsKeyId": key,
+                "kmsDataKeyReusePeriodSeconds": 120,
+            }),
         ),
     ];
 
-    for (index, (case, options)) in accepted.into_iter().enumerate() {
+    for (index, (case, options, reported)) in accepted.into_iter().enumerate() {
         let name = format!("encryption-ok-{index}");
         let request = create_request(&name, options.clone());
         let (status, body) = emulator.call("CreateStateMachine", &request).await;
@@ -156,13 +190,7 @@ async fn create_state_machine_checks_the_encryption_configuration() {
                 &json!({ "stateMachineArn": string(&body, "stateMachineArn") }),
             )
             .await;
-        let expected = discriminated(
-            "EncryptionConfiguration",
-            options
-                .get("encryptionConfiguration")
-                .cloned()
-                .unwrap_or(json!({ "type": "AWS_OWNED_KEY" })),
-        );
+        let expected = discriminated("EncryptionConfiguration", reported);
         assert_eq!(
             described.get("encryptionConfiguration"),
             Some(&expected),
@@ -274,6 +302,9 @@ async fn create_state_machine_checks_the_encryption_configuration() {
 #[tokio::test]
 async fn the_data_key_reuse_period_is_bounded_at_its_edges() {
     let emulator = Emulator::new();
+    // The key every row names, which has to exist for a configuration on it to be one
+    // the service can apply.
+    let key = emulator.kms_key().await;
 
     let inside = [
         ("the lowest reuse period the range allows", MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS),
@@ -282,7 +313,7 @@ async fn the_data_key_reuse_period_is_bounded_at_its_edges() {
     for (index, (case, period)) in inside.into_iter().enumerate() {
         let options = json!({ "encryptionConfiguration": {
             "type": "CUSTOMER_MANAGED_KMS_KEY",
-            "kmsKeyId": KEY_ARN,
+            "kmsKeyId": key,
             "kmsDataKeyReusePeriodSeconds": period,
         } });
         let (status, body) = emulator
@@ -315,7 +346,7 @@ async fn the_data_key_reuse_period_is_bounded_at_its_edges() {
         let name = format!("reuse-bad-{index}");
         let options = json!({ "encryptionConfiguration": {
             "type": "CUSTOMER_MANAGED_KMS_KEY",
-            "kmsKeyId": KEY_ARN,
+            "kmsKeyId": key,
             "kmsDataKeyReusePeriodSeconds": period,
         } });
         let (status, body) = emulator
@@ -675,6 +706,9 @@ async fn deleting_a_state_machine_deletes_its_versions() {
 #[tokio::test]
 async fn idempotency_compares_the_effective_configuration() {
     let emulator = Emulator::new();
+    // The key the customer-managed row names, which has to exist for that repeat to
+    // reach the idempotency check at all.
+    let key = emulator.kms_key().await;
     let first = emulator
         .ok(
             "CreateStateMachine",
@@ -746,7 +780,7 @@ async fn idempotency_compares_the_effective_configuration() {
             "a customer-managed key where the stored machine uses the AWS owned key",
             json!({ "encryptionConfiguration": {
                 "type": "CUSTOMER_MANAGED_KMS_KEY",
-                "kmsKeyId": KEY_ARN,
+                "kmsKeyId": key,
             } }),
         ),
         (
@@ -873,16 +907,42 @@ async fn idempotency_follows_the_updated_configuration() {
         format!("{arn}:1"),
         "the first published version of this state machine is version 1, got {published:?}"
     );
+    // The next publish has to ask for something the state machine does not already
+    // hold — here another definition — because an update that asks for nothing new
+    // stays on its revision and answers the version that revision was already
+    // published as.
     let republished = emulator
         .ok(
             "UpdateStateMachine",
-            &json!({ "stateMachineArn": arn, "definition": HELLO_DEFINITION, "publish": true }),
+            &json!({
+                "stateMachineArn": arn,
+                "definition": r#"{"StartAt":"Encore","States":{"Encore":{"Type":"Succeed"}}}"#,
+                "publish": true,
+            }),
         )
         .await;
     assert_eq!(
         string(&republished, "stateMachineVersionArn"),
         format!("{arn}:2"),
         "the next published version takes the next number, got {republished:?}"
+    );
+    // And a publish that asks for nothing new is the documented idempotent answer:
+    // "it doesn't create a duplicate state machine version if it already exists for
+    // the current revision."
+    let repeat = emulator
+        .ok(
+            "UpdateStateMachine",
+            &json!({
+                "stateMachineArn": arn,
+                "definition": r#"{"StartAt":"Encore","States":{"Encore":{"Type":"Succeed"}}}"#,
+                "publish": true,
+            }),
+        )
+        .await;
+    assert_eq!(
+        string(&repeat, "stateMachineVersionArn"),
+        format!("{arn}:2"),
+        "a publish of the unchanged revision answers the version it already has, got {repeat:?}"
     );
 
     // Each version is its own stored snapshot, read back through the describe.
@@ -975,13 +1035,14 @@ async fn idempotency_follows_the_updated_configuration() {
     }
 
     // A refused update changed nothing: the state machine still reports the last
-    // definition an accepted update wrote.
+    // definition an accepted update wrote, which is the one the last publish above
+    // snapshotted.
     let described = emulator
         .ok("DescribeStateMachine", &json!({ "stateMachineArn": arn }))
         .await;
     assert_eq!(
         described.get("definition").and_then(Value::as_str),
-        Some(HELLO_DEFINITION),
+        Some(r#"{"StartAt":"Encore","States":{"Encore":{"Type":"Succeed"}}}"#),
         "a refused update must leave the record as it was, got {described:?}"
     );
 }

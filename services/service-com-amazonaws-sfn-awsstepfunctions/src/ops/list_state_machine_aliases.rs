@@ -258,22 +258,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => input.state_machine_arn.clone(),
         };
 
-        let Some(machine) = store.state_machines.get(&state_machine_arn) else {
+        // A state machine whose deletion has BEGUN still answers this listing: the
+        // deletion is asynchronous ("it sets the state machine's status to DELETING and
+        // begins the deletion process"), and until it is through the aliases are still
+        // there — which is what a caller tearing a deployment down reads to find out
+        // what it still has. The refusal this operation models for that state is for
+        // the MUTATIONS of those aliases, not for reporting them; once the deletion is
+        // through, the ARN names nothing and this refusal is what answers.
+        if !store.state_machines.contains_key(&state_machine_arn) {
             return Err(ListStateMachineAliasesErrorModeled::StateMachineDoesNotExist(
                 StateMachineDoesNotExist {
                     message: Some(crate::state::resource_error_message(
                         crate::state::STATE_MACHINE_DOES_NOT_EXIST,
-                        &input.state_machine_arn,
-                    )),
-                },
-            )
-            .into());
-        };
-        if machine.is_deleting() {
-            return Err(ListStateMachineAliasesErrorModeled::StateMachineDeleting(
-                StateMachineDeleting {
-                    message: Some(crate::state::resource_error_message(
-                        crate::state::STATE_MACHINE_DELETING,
                         &input.state_machine_arn,
                     )),
                 },

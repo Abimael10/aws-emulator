@@ -353,6 +353,16 @@ pub const NOT_REDRIVABLE_SUCCEEDED: &str = "Execution is SUCCEEDED and cannot be
 /// "State machine is in DELETING status."
 pub const NOT_REDRIVABLE_DELETING: &str = "State machine is in DELETING status";
 
+/// The same ineligibility as [`NOT_REDRIVABLE_DELETING`], as the REFUSAL of a redrive
+/// words it.
+///
+/// RECORDED text, under the same rule as [`NOT_REDRIVABLE_EVENT_LIMIT_REFUSED`]: the
+/// two places this service reports an execution's ineligibility word a state machine
+/// being deleted differently — `redriveStatusReason` carries the sentence that member's
+/// own documentation lists, and `ExecutionNotRedrivable` names the STATUS the state
+/// machine is in ([`not_redrivable_message`], where the two are mapped).
+pub const NOT_REDRIVABLE_DELETING_REFUSED: &str = "State machine is DELETING";
+
 /// "Execution history event limit exceeded."
 pub const NOT_REDRIVABLE_EVENT_LIMIT: &str = "Execution history event limit exceeded";
 
@@ -427,18 +437,24 @@ pub const EVENT_EXECUTION_REDRIVEN: &str = "ExecutionRedriven";
 /// `StartExecution`'s documented same-name idempotency is observable.
 pub const EXECUTION_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
-/// How long after `DeleteStateMachine` the state machine is removed.
+/// The SOONEST after `DeleteStateMachine` the state machine can be removed.
 ///
 /// EMULATOR-CHOSEN: `DeleteStateMachine` documents only that it "sets the state machine's
 /// status to DELETING and begins the deletion process", with no published duration. It is
 /// deliberately non-zero, so a caller that reads the state machine straight after asking
-/// for its deletion still observes the DELETING status the operation documents.
+/// for its deletion still observes the `DELETING` status the operation documents, and the
+/// refusals every call on it answers while that lasts.
 ///
-/// It is also what everything WAITING for the deletion waits out, because every waiter
-/// waits for the RECORD to go: a caller polling `DescribeStateMachine`, and another
-/// service's provisioner polling that same read for a resource it deleted. A longer span
-/// is therefore not this service's decision alone — see the issue this fix carried the
-/// deletion window over to.
+/// It is a FLOOR rather than the whole span: "a state machine is deleted only when all
+/// its executions are completed", so one whose executions are still running is removed
+/// once the last of them is done and not at this instant
+/// ([`ComAmazonawsSfnAwsstepfunctionsState::settle`]) — which is what makes those
+/// refusals readable for as long as the deletion really is in progress.
+///
+/// It is also what everything WAITING for the deletion of an IDLE state machine waits
+/// out, because every waiter waits for the RECORD to go: a caller polling
+/// `DescribeStateMachine`, and another service's provisioner polling that same read for
+/// a resource it deleted.
 pub const DELETE_SETTLE_DELAY: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
@@ -3042,6 +3058,7 @@ pub fn resource_error_message(error_name: &str, arn: &str) -> String {
 pub fn not_redrivable_message(execution_arn: &str, reason: &str) -> String {
     let reason = match reason {
         NOT_REDRIVABLE_EVENT_LIMIT => NOT_REDRIVABLE_EVENT_LIMIT_REFUSED,
+        NOT_REDRIVABLE_DELETING => NOT_REDRIVABLE_DELETING_REFUSED,
         stated => stated,
     };
     format!("Execution {execution_arn} invalid for redrive as: {reason}")
@@ -3068,26 +3085,40 @@ pub fn stale_revision_message(requested: &str, current: Option<&str>) -> String 
 }
 
 /// `StateMachineDoesNotExist`'s own name, as its message spells it. RECORDED text.
+///
+/// What an operation that ACTS ON the state machine behind the ARN states for every ARN
+/// it can be given, whatever qualifier it carries: the refusal states this condition and
+/// then the ARN AS SUBMITTED ([`resource_error_message`]), so a version- or
+/// alias-qualified ARN no record answers for reads the same sentence an unqualified one
+/// does — what the request asked that operation to do was about the state machine. A
+/// READ of the resource the ARN REFERS to states the referenced resource's condition
+/// instead ([`absent_state_machine_condition`]).
 pub const STATE_MACHINE_DOES_NOT_EXIST: &str = "State Machine Does Not Exist";
 
 /// What the same error says when the ARN named a state machine VERSION that the store
 /// holds nothing for. RECORDED text.
 ///
-/// One rule, stated by [`resource_error_message`]: the condition names the resource
-/// the request's ARN REFERRED to, and a version-qualified ARN refers to a version
-/// rather than to the state machine behind it — so the condition is the version's,
-/// even though the error shape is the state machine's (the model declares no
-/// version-specific one).
+/// Which of the two conditions an operation states is decided by what that operation is
+/// ABOUT ([`absent_state_machine_condition`]): a READ addressed by a version-qualified
+/// ARN is about the version, so the condition is the version's, even though the error
+/// shape is the state machine's (the model declares no version-specific one), while an
+/// operation that runs or lists the executions OF a state machine is about the state
+/// machine and states its condition for every ARN that names it.
 pub const STATE_MACHINE_VERSION_DOES_NOT_EXIST: &str = "State Machine Version Does Not Exist";
 
-/// The condition a resource-absent refusal names for the state machine ARN `parsed`:
-/// the VERSION condition for an ARN qualified with a version number, and the state
-/// machine's own otherwise.
+/// The condition a resource-absent refusal names for the state machine ARN `parsed`,
+/// for an operation whose SUBJECT is the resource the ARN refers to — the reads that
+/// report a state machine, a version of it, or its aliases.
 ///
-/// The ONE place that choice is made, so every operation that resolves a qualified
-/// ARN words the refusal the same way. An alias qualifier keeps the state machine's
-/// condition: an alias is a route to a version rather than a resource the request
-/// asked to read.
+/// The ONE place that choice is made, so every such operation words the refusal the
+/// same way: the VERSION condition for an ARN qualified with a version number, and the
+/// state machine's own otherwise. An alias qualifier keeps the state machine's
+/// condition: an alias is a route to a version rather than a resource of its own.
+///
+/// An operation that ACTS ON the state machine behind the ARN — starting an execution
+/// through a version or an alias, listing the executions associated with one — states
+/// [`STATE_MACHINE_DOES_NOT_EXIST`] for every ARN it can be given, because the state
+/// machine is what it is about.
 pub fn absent_state_machine_condition(parsed: &StateMachineArn) -> &'static str {
     match parsed.qualifier.as_deref() {
         Some(qualifier)
@@ -3112,8 +3143,17 @@ pub const EXECUTION_DOES_NOT_EXIST: &str = "Execution Does Not Exist";
 /// `ExecutionAlreadyExists`'s, for [`resource_error_message`]. RECORDED text.
 pub const EXECUTION_ALREADY_EXISTS: &str = "Execution Already Exists";
 
-/// `StateMachineAlreadyExists`'s, for [`resource_error_message`]. RECORDED text.
-pub const STATE_MACHINE_ALREADY_EXISTS: &str = "State Machine Already Exists";
+/// What the modelled `StateMachineAlreadyExists` says.
+///
+/// The sentence the SHAPE documents for this condition, and the WHOLE message: what the
+/// caller is told is the rule the create broke — a name is in use by a state machine
+/// this request does not describe — rather than the words of the shape name. It carries
+/// no value of the request, because the name the caller sent is the one it sent, so it
+/// is not the condition-and-value envelope ([`resource_error_message`]) a refusal about
+/// a resource the request named is otherwise stated in.
+pub const STATE_MACHINE_ALREADY_EXISTS: &str = "A state machine with the same name but a \
+                                                different definition or role ARN already \
+                                                exists.";
 
 /// What the modelled `ConflictException` says when a `CreateStateMachineAlias`
 /// names an alias that already exists under other parameters.
@@ -3128,6 +3168,38 @@ pub const STATE_MACHINE_ALREADY_EXISTS: &str = "State Machine Already Exists";
 pub const ALIAS_ROUTING_CONFLICT: &str = "Failed to create alias because an alias with the same \
                                           name and a different routing configuration already \
                                           exists.";
+
+/// What the modelled `StateMachineDeleting` says when a `CreateStateMachineAlias` names
+/// a state machine whose deletion has begun.
+///
+/// RECORDED text: this operation states the condition as what it could not do and why —
+/// the alias was not created, because the state machine it would have belonged to is in
+/// the `DELETING` state — rather than as the condition and an ARN
+/// ([`resource_error_message`]), exactly as [`ALIAS_ROUTING_CONFLICT`] states the other
+/// reason a create of one cannot be served. The one value in the sentence is that state
+/// machine's NAME, read off the record the alias would have belonged to, and `DELETING`
+/// is the status `DescribeStateMachine` reports for it
+/// ([`STATE_MACHINE_STATUS_DELETING`]).
+pub fn alias_create_deleting_message(state_machine_name: &str) -> String {
+    format!(
+        "Failed to create alias because the State Machine {state_machine_name} is in the \
+         {STATE_MACHINE_STATUS_DELETING} state"
+    )
+}
+
+/// The NAME of the state machine `arn` names, read off the ARN itself.
+///
+/// The resource field of a state machine ARN is `stateMachine:<name>[:qualifier]`
+/// ([`state_machine_arn`]), so the name is the field after the resource type — which is
+/// what a refusal naming the state machine rather than its ARN states
+/// ([`alias_create_deleting_message`]). Empty for text that is not such an ARN.
+pub fn state_machine_name_of(arn: &str) -> &str {
+    let mut fields = arn.splitn(7, ':');
+    match fields.nth(6) {
+        Some(name) => name.split(':').next().unwrap_or_default(),
+        None => "",
+    }
+}
 
 /// What the modelled `ConflictException` says when a `DeleteStateMachineVersion`
 /// names a version one or more aliases still route to.
@@ -3156,6 +3228,17 @@ pub fn version_referenced_by_aliases_message(alias_names: &[String]) -> String {
 pub const UPDATE_NAMES_NO_MEMBER: &str = "Either the definition, the role ARN, the \
                                           LoggingConfiguration, or the TracingConfiguration must \
                                           be specified";
+
+/// What the modelled `ValidationException` says when an `UpdateStateMachineAlias` names
+/// no member that would change the alias.
+///
+/// RECORDED text, and a FIXED sentence worded exactly as [`UPDATE_NAMES_NO_MEMBER`] is
+/// for the same condition on the state machine itself: the service states the
+/// ALTERNATIVES the update may name — "you must specify at least one of the description
+/// or routingConfiguration parameters" — in its own words, naming the two members and no
+/// value of the request.
+pub const ALIAS_UPDATE_NAMES_NO_MEMBER: &str =
+    "Either description or routing configuration must be specified";
 
 /// `ActivityDoesNotExist`'s, for [`resource_error_message`]. The error's own name
 /// under the rule above — the condition in spaced Title Case, then the ARN the
@@ -3860,6 +3943,21 @@ pub fn invalid_arn_message(diagnosis: String) -> String {
 /// here and not through the envelope every other ARN diagnosis is wrapped in.
 pub fn missing_version_qualifier_message(arn: &str) -> String {
     format!("Arn missing version qualifier: {arn}")
+}
+
+/// What the modelled `InvalidArn` says about an ARN an operation needs UNQUALIFIED and
+/// which carries a version or alias qualifier.
+///
+/// RECORDED text, and the counterpart of [`missing_version_qualifier_message`], worded
+/// for the same reason and in the same place: the ARN is well formed, so what the
+/// refusal names is the QUALIFIER SUFFIX the operation cannot take, followed by the ARN
+/// the request sent, rather than the generic ARN diagnosis every other refusal about an
+/// ARN's shape is wrapped in. An operation whose subject is the state machine itself —
+/// the one record with a current revision to publish from — takes neither reference to
+/// it, and the ARN is what is wrong with such a request rather than a resource it could
+/// not find.
+pub fn unexpected_qualifier_message(arn: &str) -> String {
+    format!("State machine ARN must not have a qualifier suffix: {arn}")
 }
 
 /// What the modelled `InvalidArn` says about an ARN whose RESOURCE TYPE is not one
@@ -4576,19 +4674,21 @@ pub fn sensitive_member(included_data: IncludedData, value: Option<String>) -> O
         .flatten()
 }
 
-/// The `variableReferences` a read reports for `definition`, given its
-/// `includedData`.
+/// The `variableReferences` a read reports for `definition`, given its `includedData`.
 ///
-/// Two rules the member documents, applied in ONE place so every read that reports
-/// a state machine's configuration — the state machine itself, a published version
-/// of it, or the configuration an execution ran — reports them the same way:
+/// Two rules, applied in ONE place so every read that reports a state machine's
+/// configuration — the state machine itself, a published version of it, or the
+/// configuration an execution ran — reports the member the same way:
 ///
-/// * "states that do not use variable references will not be shown in the
-///   response", so a definition whose states reference none is no member at all
-///   rather than an empty map;
-/// * the member is read OUT OF the definition, so a metadata-only read — which
-///   reports no definition ([`reported_definition`]) — reports nothing derived from
-///   one either.
+/// * "states that do not use variable references will not be shown in the response",
+///   so a definition whose states reference none is no member at all rather than an
+///   empty map;
+/// * the member is read OUT OF the definition, so a read that reports no definition
+///   ([`reported_definition`]) reports nothing read out of one either.
+///
+/// `DescribeStateMachineForExecution` is the one reader with a case of its own, stated
+/// there: the read of a Distributed Map's CHILD workflow execution reports the
+/// references whatever `includedData` asks for.
 pub fn reported_variable_references(
     definition: &str,
     included_data: IncludedData,
@@ -4785,7 +4885,8 @@ pub mod result_writer;
 pub mod run_a_job;
 pub mod store;
 pub use store::{
-    ActivityPoll, CallbackHandoverReply, StateMachineUpdate, StateMachineUpdateRejection, Stopped,
+    ActivityPoll, AppliedUpdate, CallbackHandoverReply, StateMachineUpdate,
+    StateMachineUpdateRejection, Stopped,
 };
 pub mod task_authorization;
 pub mod target_resource_policy;

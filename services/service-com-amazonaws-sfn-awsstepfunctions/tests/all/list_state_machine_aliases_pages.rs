@@ -26,7 +26,7 @@
 //!    while the record stands, `StateMachineDoesNotExist` once the clock has removed
 //!    it, because an alias dies with the state machine it belongs to.
 //!
-//! The harness (`Emulator`, `string`, `PAST_THE_DELETE_DELAY`) is the one
+//! The harness (`Emulator`, `string`) is the one
 //! `state_machine_lifecycle` builds, the published version comes from
 //! `state_machine_versions`' `machine_with_versions` and the `(status, code, message)`
 //! reader from `error_messages`' `failure`; `tests/all.rs` is this binary's crate
@@ -36,11 +36,11 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
     invalid_token_message, resource_error_message, DEFAULT_PAGE_SIZE,
-    MAX_ALIASES_PER_STATE_MACHINE, STATE_MACHINE_DELETING, STATE_MACHINE_DOES_NOT_EXIST,
+    MAX_ALIASES_PER_STATE_MACHINE, STATE_MACHINE_DOES_NOT_EXIST,
 };
 
 use crate::error_messages::failure;
-use crate::state_machine_lifecycle::{string, Emulator, PAST_THE_DELETE_DELAY};
+use crate::state_machine_lifecycle::{string, Emulator};
 use crate::state_machine_versions::machine_with_versions;
 
 /// One row of the bad-token table: the case, the token sent, and the HTTP status,
@@ -447,30 +447,22 @@ async fn paging_changes_nothing_and_the_aliases_die_with_the_state_machine() {
         "paging reports the alias records, it does not change them"
     );
 
-    // The deletion the clock owes: the record is still there, so the listing is the
-    // modelled `StateMachineDeleting`.
+    // The deletion the clock owes: the record is still there, so the listing still
+    // reports the aliases it holds — what a caller tearing a deployment down reads to
+    // find out what it still has. The refusal this operation models for that state is
+    // for the mutations of those aliases, not for reporting them.
     emulator
         .ok("DeleteStateMachine", &json!({ "stateMachineArn": &machine }))
         .await;
-    let (status, code, message) = failure(
-        &emulator,
-        "a state machine whose deletion has begun",
-        "ListStateMachineAliases",
-        &json!({ "stateMachineArn": &machine }),
-    )
-    .await;
+    let (while_deleting, _) = walk(&emulator, &machine, None).await;
     assert_eq!(
-        (status, code.as_str(), message.as_str()),
-        (
-            400,
-            "StateMachineDeleting",
-            resource_error_message(STATE_MACHINE_DELETING, &machine).as_str()
-        ),
-        "a deleting state machine refuses the listing, got {status} {code} {message:?}"
+        while_deleting, created,
+        "a deleting state machine still lists its aliases, got {while_deleting:?}"
     );
 
-    // Once it has become due, the state machine and its aliases are gone.
-    std::thread::sleep(PAST_THE_DELETE_DELAY);
+    // Once the deletion has gone through, the state machine and its aliases are gone.
+    // The wait is for the RECORD, never for a span of the clock.
+    crate::error_messages::poll_until_absent(&emulator, &machine).await;
     let (status, code, message) = failure(
         &emulator,
         "a state machine the clock has removed",

@@ -479,56 +479,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             logging_configuration: input.logging_configuration,
             tracing_configuration: input.tracing_configuration,
             encryption_configuration,
-            revision_id: revision_id.clone(),
+            // The description the version this update publishes carries is part of what
+            // the update asks for, so a description the state machine's published
+            // version does not already carry is a change like any other.
+            version_description: input.version_description.clone(),
+            revision_id,
             now,
         };
-        if let Err(rejection) = store.apply_state_machine_update(&input.state_machine_arn, update) {
-            return Err(match rejection {
-                // Both conditions are worded by the service's ONE constructor,
-                // from the ARN the request named, so this operation reads the same
-                // sentence every other operation raising the same shape reads.
-                crate::state::StateMachineUpdateRejection::NotFound => {
-                    UpdateStateMachineErrorModeled::StateMachineDoesNotExist(
-                        StateMachineDoesNotExist {
+        let applied = store
+            .apply_state_machine_update(&input.state_machine_arn, update)
+            .map_err(|rejection| -> UpdateStateMachineError {
+                match rejection {
+                    // Both conditions are worded by the service's ONE constructor,
+                    // from the ARN the request named, so this operation reads the same
+                    // sentence every other operation raising the same shape reads.
+                    crate::state::StateMachineUpdateRejection::NotFound => {
+                        UpdateStateMachineErrorModeled::StateMachineDoesNotExist(
+                            StateMachineDoesNotExist {
+                                message: Some(crate::state::resource_error_message(
+                                    crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                                    &input.state_machine_arn,
+                                )),
+                            },
+                        )
+                    }
+                    crate::state::StateMachineUpdateRejection::Deleting => {
+                        UpdateStateMachineErrorModeled::StateMachineDeleting(StateMachineDeleting {
                             message: Some(crate::state::resource_error_message(
-                                crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                                crate::state::STATE_MACHINE_DELETING,
                                 &input.state_machine_arn,
                             )),
-                        },
-                    )
+                        })
+                    }
+                    // The store's bound is on the WHOLE store in bytes, and a longer
+                    // definition is what an update can grow it by, so an update that
+                    // does not fit is refused with the operation's own quota error and
+                    // the state machine is left exactly as it was.
+                    crate::state::StateMachineUpdateRejection::NoRoom => {
+                        UpdateStateMachineErrorModeled::ServiceQuotaExceededException(
+                            ServiceQuotaExceededException {
+                                message: Some(format!(
+                                    "this update would take the store past the {} bytes this \
+                                     emulator retains",
+                                    crate::state::MAX_STORE_BYTES
+                                )),
+                            },
+                        )
+                    }
                 }
-                crate::state::StateMachineUpdateRejection::Deleting => {
-                    UpdateStateMachineErrorModeled::StateMachineDeleting(StateMachineDeleting {
-                        message: Some(crate::state::resource_error_message(
-                            crate::state::STATE_MACHINE_DELETING,
-                            &input.state_machine_arn,
-                        )),
-                    })
-                }
-                // The store's bound is on the WHOLE store in bytes, and a longer
-                // definition is what an update can grow it by, so an update that
-                // does not fit is refused with the operation's own quota error and
-                // the state machine is left exactly as it was.
-                crate::state::StateMachineUpdateRejection::NoRoom => {
-                    UpdateStateMachineErrorModeled::ServiceQuotaExceededException(
-                        ServiceQuotaExceededException {
-                            message: Some(format!(
-                                "this update would take the store past the {} bytes this emulator \
-                                 retains",
-                                crate::state::MAX_STORE_BYTES
-                            )),
-                        },
-                    )
-                }
-            }
-            .into());
-        }
+                .into()
+            })?;
 
         // "After you update your state machine, you can set the publish parameter to
         // true in the same action to publish a new version." The version is a
         // snapshot of the configuration the update just wrote, so it is published
         // from the record after the write — and its bytes are admitted against the
         // store's bound first, the way every other growth site does it.
+        //
+        // An update that CHANGED nothing left the state machine on the revision it was
+        // already on, and "it doesn't create a duplicate state machine version if it
+        // already exists for the current revision" — so a publish asked for here
+        // answers the version that revision was already published as, exactly as
+        // `PublishStateMachineVersion` answers a repeat, and mints no second snapshot
+        // of one configuration.
+        if input.publish && !applied.modified {
+            if let Some(published) = store
+                .version_of_revision(&input.state_machine_arn, applied.revision_id.as_deref())
+            {
+                return Ok(UpdateStateMachineOutput {
+                    update_date: crate::state::to_date_time(applied.update_date),
+                    revision_id: applied.revision_id.clone(),
+                    state_machine_version_arn: Some(published.arn.clone()),
+                });
+            }
+        }
         let state_machine_version_arn = if input.publish {
             if !store.has_room_for(store.version_reserve(&input.state_machine_arn)) {
                 return Err(
@@ -556,8 +580,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(UpdateStateMachineOutput {
-            update_date: crate::state::to_date_time(now),
-            revision_id: Some(revision_id),
+            // What the state machine now reports: the instant of THIS update where it
+            // changed something, and the instant of the last change where it changed
+            // nothing — which for a state machine nothing has ever changed is its
+            // creation, so the two timestamps a client compares to detect a real change
+            // stay equal until one happens.
+            update_date: crate::state::to_date_time(applied.update_date),
+            revision_id: applied.revision_id,
             state_machine_version_arn,
         })
     }

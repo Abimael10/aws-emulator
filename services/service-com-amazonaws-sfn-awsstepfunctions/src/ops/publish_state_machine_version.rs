@@ -220,15 +220,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A version or an alias is a REFERENCE to a state machine rather than a state
+        // machine with a current revision of its own, so neither is an ARN this
+        // operation can publish from — and that is a defect in the ARN the request
+        // carried, which `InvalidArn` reports, rather than a resource that is absent.
         if parsed.qualifier.is_some() {
-            return Err(PublishStateMachineVersionErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(format!(
-                        "'{}' is a qualified ARN, naming a version or an alias, which has no \
-                         version of its own to publish",
-                        input.state_machine_arn
+            return Err(PublishStateMachineVersionErrorModeled::InvalidArn(
+                InvalidArn {
+                    message: Some(crate::state::unexpected_qualifier_message(
+                        &input.state_machine_arn,
                     )),
-                    reason: None,
                 },
             )
             .into());
@@ -258,10 +259,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 PublishStateMachineVersionErrorModeled::StateMachineDeleting(
                     StateMachineDeleting {
-                        message: Some(crate::state::resource_error_message(
-                            crate::state::STATE_MACHINE_DELETING,
-                            &input.state_machine_arn,
-                        )),
+                        // RECORDED: the publish on a state machine whose deletion has
+                        // begun answers the condition in its error code and an EMPTY
+                        // message — the empty string the recording carries, not an
+                        // absent member — where the alias create and the redrive of the
+                        // same state machine each word one for themselves.
+                        message: Some(String::new()),
                     },
                 )
                 .into(),

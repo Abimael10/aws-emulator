@@ -62,6 +62,11 @@ use crate::state_machine_versions::machine_with_versions;
 /// row below is one character past.
 const MAX_DEFINITION_CHARS: usize = 1_048_576;
 
+/// A second definition, so an update that names one asks for a definition the state
+/// machine does not already hold.
+const OTHER_DEFINITION: &str =
+    r#"{"StartAt":"Other","States":{"Other":{"Type":"Pass","Result":{"msg":"other"},"End":true}}}"#;
+
 /// The modelled maximum of the `SensitiveData` members (`@length` 0..262144).
 const MAX_SENSITIVE_DATA_CHARS: usize = 262_144;
 
@@ -941,13 +946,25 @@ async fn test_state_names_where_the_input_stopped_and_withholds_the_input() {
 async fn an_update_naming_one_member_it_can_change_is_served() {
     let emulator = Emulator::new();
     let machine = create_machine(&emulator, "update-members", HELLO_DEFINITION).await;
+    // A key for the encryption row, which has to name a key KMS holds for the
+    // configuration to be one the service can apply.
+    let key = emulator.kms_key().await;
 
+    // Each row names ONE member at a value the state machine does not already hold,
+    // because an update that asks for nothing new changes nothing — and so mints no
+    // revision.
     for (case, member) in [
-        ("the definition", json!({ "definition": HELLO_DEFINITION })),
-        ("the role ARN", json!({ "roleArn": ROLE_ARN })),
+        (
+            "the definition",
+            json!({ "definition": OTHER_DEFINITION }),
+        ),
+        (
+            "the role ARN",
+            json!({ "roleArn": format!("{ROLE_ARN}-other") }),
+        ),
         (
             "the logging configuration",
-            json!({ "loggingConfiguration": { "level": "OFF", "includeExecutionData": false } }),
+            json!({ "loggingConfiguration": { "level": "OFF", "includeExecutionData": true } }),
         ),
         (
             "the tracing configuration",
@@ -955,7 +972,12 @@ async fn an_update_naming_one_member_it_can_change_is_served() {
         ),
         (
             "the encryption configuration",
-            json!({ "encryptionConfiguration": { "type": "AWS_OWNED_KEY" } }),
+            json!({
+                "encryptionConfiguration": {
+                    "type": "CUSTOMER_MANAGED_KMS_KEY",
+                    "kmsKeyId": key,
+                },
+            }),
         ),
     ] {
         let mut body = json!({ "stateMachineArn": &machine });

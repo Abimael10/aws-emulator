@@ -397,10 +397,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListExecutionsErrorModeled::StateMachineDoesNotExist(
                 StateMachineDoesNotExist {
                     message: Some(crate::state::resource_error_message(
-                        // The condition names the resource the ARN REFERRED to, so a
-                        // version ARN no record answers for is reported as the
-                        // version it named.
-                        crate::state::absent_state_machine_condition(&parsed),
+                        // ONE condition for every ARN this operation can be given,
+                        // stated with the ARN as submitted: what this operation is
+                        // about is the STATE MACHINE whose executions it lists, so a
+                        // qualifier it holds no version or alias under is reported as
+                        // that state machine rather than as the reference — and never
+                        // as an empty page, which would make a version that never
+                        // existed indistinguishable from one that ran nothing.
+                        crate::state::STATE_MACHINE_DOES_NOT_EXIST,
                         state_machine_arn,
                     )),
                 },

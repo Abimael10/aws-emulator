@@ -42,6 +42,11 @@ use crate::state_machine_lifecycle::{
 const GOODBYE_DEFINITION: &str =
     r#"{"StartAt":"Bye","States":{"Bye":{"Type":"Pass","Result":{"msg":"bye"},"End":true}}}"#;
 
+/// A third definition, for the one publish that follows a machine whose last version
+/// snapshotted either of the two above.
+const THIRD_DEFINITION: &str =
+    r#"{"StartAt":"Again","States":{"Again":{"Type":"Pass","Result":{"msg":"again"},"End":true}}}"#;
+
 /// Create a state machine, publishing version 1, and return its unqualified ARN.
 async fn create_published(emulator: &Emulator, name: &str) -> String {
     let created = emulator
@@ -60,11 +65,18 @@ async fn create_published(emulator: &Emulator, name: &str) -> String {
 
 /// Update a state machine, publishing the next version, and return that version's
 /// ARN.
+///
+/// The caller passes a definition the state machine does not already hold, because an
+/// update that asks for nothing new publishes no second version of one revision.
 async fn update_published(emulator: &Emulator, arn: &str, definition: &str) -> String {
     let updated = emulator
         .ok(
             "UpdateStateMachine",
-            &json!({ "stateMachineArn": arn, "definition": definition, "publish": true }),
+            &json!({
+                "stateMachineArn": arn,
+                "definition": definition,
+                "publish": true,
+            }),
         )
         .await;
     string(&updated, "stateMachineVersionArn")
@@ -566,8 +578,10 @@ async fn listing_does_not_change_what_a_later_caller_sees() {
         );
     }
 
-    // And publishing one more version is the only thing that changes the listing.
-    let published = update_published(&emulator, &arn, GOODBYE_DEFINITION).await;
+    // And publishing one more version is the only thing that changes the listing. The
+    // definition it names is one the state machine does not already hold, so the update
+    // really moves it to a fresh revision.
+    let published = update_published(&emulator, &arn, THIRD_DEFINITION).await;
     let listed = listed_arns(&list(&emulator, &arn, json!({})).await);
     assert_eq!(
         listed.first().map(String::as_str),

@@ -284,9 +284,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let not_found = || {
             DescribeStateMachineErrorModeled::StateMachineDoesNotExist(StateMachineDoesNotExist {
                 message: Some(crate::state::resource_error_message(
-                    // The condition names the resource the ARN REFERRED to: a
-                    // version-qualified ARN that resolves to nothing is a version
-                    // that does not exist, not a state machine that does not exist.
+                    // This operation REPORTS the resource the ARN refers to, so a
+                    // version-qualified ARN that resolves to nothing is a version that
+                    // does not exist rather than a state machine that does not exist.
                     crate::state::absent_state_machine_condition(&parsed),
                     &input.state_machine_arn,
                 )),
@@ -345,10 +345,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found().into());
         };
 
-        // `variableReferences` is read OUT OF the definition, so a metadata-only
-        // read — which does not report the definition — reports nothing derived from
-        // it either. An empty map is no member at all: "states that do not use
-        // variable references will not be shown in the response".
+        // `variableReferences` is read OUT OF the definition, so a metadata-only read —
+        // which reports no definition — reports nothing read out of one either. An empty
+        // map is no member at all: "states that do not use variable references will not
+        // be shown in the response".
         let variable_references =
             crate::state::reported_variable_references(&machine.definition, included_data);
 

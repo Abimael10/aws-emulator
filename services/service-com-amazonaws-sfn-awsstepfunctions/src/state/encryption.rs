@@ -242,6 +242,10 @@ pub enum ConfigurationRefusal {
     /// invalid encryption configuration ([`KEY_NOT_ENABLED`]). These operations model no
     /// `KmsInvalidStateException`: a configuration is refused as a configuration.
     NotEnabled,
+    /// The reference names no key of this account in this Region, so there is nothing to
+    /// seal the resource's data with — the modelled `InvalidEncryptionConfiguration`
+    /// again, carrying the sentence KMS answered the lookup with, relayed.
+    NotFound(String),
     /// KMS does not let this caller mint a data key with the key —
     /// `KmsAccessDeniedException`, carrying the sentence KMS refused the call with.
     AccessDenied(String),
@@ -262,6 +266,13 @@ macro_rules! kms_configuration_refusal {
                 $modeled::InvalidEncryptionConfiguration(
                     $crate::ops::types::InvalidEncryptionConfiguration {
                         message: Some($crate::state::encryption::KEY_NOT_ENABLED.to_string()),
+                    },
+                )
+            }
+            $crate::state::encryption::ConfigurationRefusal::NotFound(message) => {
+                $modeled::InvalidEncryptionConfiguration(
+                    $crate::ops::types::InvalidEncryptionConfiguration {
+                        message: Some(message),
                     },
                 )
             }
@@ -788,18 +799,18 @@ pub fn activity_configuration_refusal<Eng: Send + Sync + 'static>(
 /// for this caller.
 ///
 /// The key itself is consulted, because that is what the configuration commits the
-/// resource to: a key in a key state no cryptographic operation can use would seal
-/// nothing, so the configuration is invalid rather than stored and left to fail later,
-/// and a caller the key does not permit a data key of is refused the KMS refusal.
+/// resource to: a reference that names no key of this account in this Region, and a key
+/// in a key state no cryptographic operation can use, would both seal nothing, so the
+/// configuration is invalid rather than stored and left to fail later — and a caller the
+/// key does not permit a data key of is refused the KMS refusal.
 ///
 /// The configuration asks for the data key the resource's payloads will go under
 /// ([`CONFIGURED_KEY_USE`]), bound to the encryption context the resource's ARN gives it
 /// — which is what makes a grant scoped to one resource apply to the configuration of
 /// that resource and of no other.
 ///
-/// `None` wherever nothing of the kind can be shown, exactly as every other decision
-/// here: a configuration on an Amazon Web Services owned key, no KMS beside this
-/// service, and an identifier naming no key KMS holds.
+/// `None` wherever nothing of the kind can be shown: a configuration on an Amazon Web
+/// Services owned key, and no KMS beside this service to resolve the reference in.
 fn configuration_refusal<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -809,6 +820,23 @@ fn configuration_refusal<Eng: Send + Sync + 'static>(
     resource_arn: &str,
 ) -> Option<ConfigurationRefusal> {
     let key = customer_managed_key(configuration)?;
+    // A reference KMS resolves to nothing is not a key this configuration can be applied
+    // on at all: there is nothing to mint the resource's data keys with. Step Functions
+    // does not word that condition itself — the lookup is a call it makes on the
+    // caller's behalf — so the sentence KMS answered is RELAYED, exactly as every other
+    // refusal of a key of this service's resources is ([`relayed`]), in the class the
+    // operation models for a configuration it cannot apply.
+    if let Some(kms) = kms_store::service_state(engine) {
+        let resolved = matches!(
+            kms.lock().resolve(region, key),
+            kms_store::KeyRef::Found(_)
+        );
+        if !resolved {
+            return Some(ConfigurationRefusal::NotFound(relayed(
+                &kms_store::key_not_found_message(region, key),
+            )));
+        }
+    }
     let used = KeyUse::of(key, entry, resource_arn);
     match key_denied(engine, ctx, region, &used, CONFIGURED_KEY_USE)? {
         KeyRefusal::InvalidState { .. } => Some(ConfigurationRefusal::NotEnabled),

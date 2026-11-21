@@ -36,7 +36,8 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
-    version_limit_message, INITIAL_REVISION_ID, MAX_VERSIONS_PER_STATE_MACHINE,
+    unexpected_qualifier_message, version_limit_message, INITIAL_REVISION_ID,
+    MAX_VERSIONS_PER_STATE_MACHINE,
 };
 
 use crate::state_machine_lifecycle::{
@@ -782,23 +783,19 @@ async fn a_malformed_or_qualified_arn_is_refused_before_the_lookup() {
         );
     }
 
-    // (case, qualified ARN, the modelled reason the refusal must carry).
-    let mut qualified: Vec<(String, String, Option<&str>)> = Vec::new();
+    // A LABELED ARN names a Distributed Map state inside a state machine, which this
+    // operation's own documentation refuses with `ValidationException` and a reason of
+    // its own; a version- or alias-qualified ARN is a REFERENCE to a state machine
+    // rather than one with a current revision to publish, which is a defect in the ARN
+    // the request carried.
+    let mut labeled: Vec<(String, String)> = Vec::new();
     for label in ["mapStateLabel", "Map", "inner-map_1"] {
-        qualified.push((
+        labeled.push((
             format!("a labeled ARN '{arn}/{label}'"),
             format!("{arn}/{label}"),
-            Some("API_DOES_NOT_SUPPORT_LABELED_ARNS"),
         ));
     }
-    for qualifier in ["1", "2", "PROD", "live-alias"] {
-        qualified.push((
-            format!("a qualified ARN '{arn}:{qualifier}'"),
-            format!("{arn}:{qualifier}"),
-            None,
-        ));
-    }
-    for (case, value, reason) in &qualified {
+    for (case, value) in &labeled {
         let (status, body) = publish_call(&emulator, value, json!({})).await;
         let code = error_code(&body);
         assert_eq!(
@@ -809,8 +806,27 @@ async fn a_malformed_or_qualified_arn_is_refused_before_the_lookup() {
         );
         assert_eq!(
             body.get("reason").and_then(Value::as_str),
-            *reason,
-            "case {case:?}: expected reason {reason:?}, got {body:?}"
+            Some("API_DOES_NOT_SUPPORT_LABELED_ARNS"),
+            "case {case:?}: expected the labeled-ARN reason, got {body:?}"
+        );
+    }
+
+    // The rows vary along WHICH kind of qualifier the ARN carries: a version number
+    // that exists, one that does not, and an alias name.
+    for qualifier in ["1", "2", "PROD", "live-alias"] {
+        let value = format!("{arn}:{qualifier}");
+        let case = format!("a qualified ARN '{value}'");
+        let (status, body) = publish_call(&emulator, &value, json!({})).await;
+        let code = error_code(&body);
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidArn"),
+            "case {case:?}: expected 400 InvalidArn, got {status} {code} with body {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(unexpected_qualifier_message(&value).as_str()),
+            "case {case:?}: the refusal must name the qualifier suffix, got {body:?}"
         );
     }
 
@@ -842,11 +858,17 @@ async fn the_version_quota_counts_the_versions_a_state_machine_holds() {
     let arn = create_machine(&emulator, "quota-versions", HELLO_DEFINITION).await;
     let other = create_machine(&emulator, "quota-elsewhere", HELLO_DEFINITION).await;
 
-    // Every update mints a fresh revision, so every publish of one takes the next
-    // number: this is a client driving the cap the way a deploy that publishes per
-    // update does.
+    // Every update that asks for something the state machine does not already hold
+    // mints a fresh revision, so every publish of one takes the next number: this is a
+    // client driving the cap the way a deploy that publishes per update does. The
+    // definition ALTERNATES, so each update really changes the state machine's own
+    // configuration.
     for number in 1..=MAX_VERSIONS_PER_STATE_MACHINE {
-        let published = update_and_publish(&emulator, &arn, HELLO_DEFINITION).await;
+        let definition = match number % 2 {
+            0 => GOODBYE_DEFINITION,
+            _ => HELLO_DEFINITION,
+        };
+        let published = update_and_publish(&emulator, &arn, definition).await;
         assert_eq!(
             string(&published, "stateMachineVersionArn"),
             format!("{arn}:{number}"),
@@ -854,10 +876,7 @@ async fn the_version_quota_counts_the_versions_a_state_machine_holds() {
         );
     }
 
-    // Both operations that mint a version are refused for the same reason. The second
-    // needs a revision that has no version yet, because a publish of one that has is the
-    // documented idempotent answer rather than a new version — so the update between them
-    // publishes nothing, which the cap does not count.
+    // Both operations that mint a version are refused for the same reason.
     let (status, body) = emulator
         .call(
             "UpdateStateMachine",
@@ -877,7 +896,12 @@ async fn the_version_quota_counts_the_versions_a_state_machine_holds() {
         Some(version_limit_message("quota-versions").as_str()),
         "the refusal must state the limit it is about, got {body:?}"
     );
-    update_definition(&emulator, &arn, GOODBYE_DEFINITION).await;
+    // The second operation needs a revision that has no version yet, because a publish
+    // of one that has is the documented idempotent answer rather than a new version —
+    // so the update between them moves the state machine's definition (to the one the
+    // last publish did not snapshot) and publishes nothing, which the cap does not
+    // count.
+    update_definition(&emulator, &arn, HELLO_DEFINITION).await;
     let (status, body) = publish_call(&emulator, &arn, json!({})).await;
     assert_eq!(
         (status, error_code(&body).as_str()),
@@ -900,7 +924,7 @@ async fn the_version_quota_counts_the_versions_a_state_machine_holds() {
          machine held, got {} of them",
         listed.len()
     );
-    let elsewhere = update_and_publish(&emulator, &other, HELLO_DEFINITION).await;
+    let elsewhere = update_and_publish(&emulator, &other, GOODBYE_DEFINITION).await;
     assert_eq!(
         string(&elsewhere, "stateMachineVersionArn"),
         format!("{other}:1"),
@@ -937,6 +961,11 @@ async fn the_version_quota_counts_the_versions_a_state_machine_holds() {
 
 /// `UpdateStateMachine` with `publish` set, which must succeed, and the body it
 /// answered: the ONE call a client that publishes per deploy makes.
+///
+/// The caller passes a definition the state machine does not already hold, because an
+/// update that asks for nothing new leaves it on the revision it is on and "it doesn't
+/// create a duplicate state machine version if it already exists for the current
+/// revision".
 async fn update_and_publish(emulator: &Emulator, arn: &str, definition: &str) -> Value {
     emulator
         .ok(

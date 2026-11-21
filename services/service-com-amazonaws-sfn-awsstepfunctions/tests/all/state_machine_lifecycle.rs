@@ -97,11 +97,68 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // AWS KMS over the SAME engine, so a key a suite creates is the key Step
+        // Functions resolves an `encryptionConfiguration` against: a configuration
+        // naming a customer managed key is one this service can apply only while KMS
+        // holds that key, so a suite that configures one has to create it first.
+        router.register_service(
+            service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
+        );
         Self {
             router,
             engine,
             region: region.to_string(),
         }
+    }
+
+    /// Create one customer managed KMS key over that service's own wire and answer its
+    /// ARN, which is the form `kmsKeyId` reports a configured key by.
+    pub(crate) async fn kms_key(&self) -> String {
+        let created = self.kms("CreateKey", &json!({ "KeySpec": "SYMMETRIC_DEFAULT" })).await;
+        string(&created["KeyMetadata"], "Arn")
+    }
+
+    /// Give the key `key` the alias `name` (an `alias/<name>` reference), so a
+    /// configuration may name the key by it.
+    pub(crate) async fn kms_alias(&self, name: &str, key: &str) {
+        self.kms(
+            "CreateAlias",
+            &json!({ "AliasName": name, "TargetKeyId": key }),
+        )
+        .await;
+    }
+
+    /// One AWS KMS operation over the same router, requiring a 200, and the body it
+    /// answered.
+    pub(crate) async fn kms(&self, operation: &str, body: &Value) -> Value {
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{}/kms/aws4_request, \
+             SignedHeaders=host;x-amz-target, Signature=0123456789abcdef",
+            self.region
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("TrentService.{operation}"))
+            .header("authorization", authorization)
+            .body(Bytes::from(
+                serde_json::to_vec(body).expect("the request body serializes"),
+            ))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let parsed: Value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        assert_eq!(
+            status, 200,
+            "case {operation}: expected 200 from KMS, got {status} with body {parsed:?}"
+        );
+        parsed
     }
 
     /// Call one operation and return `(status, body)`. The `Authorization` header is

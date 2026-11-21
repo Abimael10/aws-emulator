@@ -40,10 +40,6 @@ use crate::state_machine_lifecycle::{
     create_machine, discriminated, string, Emulator, ACCOUNT, HELLO_DEFINITION, REGION,
 };
 
-/// A KMS key ARN of the form `kmsKeyId` documents ("an alias, alias ARN, key ID, or
-/// key ARN"), for the customer-managed rows below.
-const KMS_KEY_ARN: &str = "arn:aws:kms:us-west-2:000000000000:key/12345678-1234-1234-1234-123456789012";
-
 /// The longest name the modelled `Name` shape admits (len 1..80).
 const MAX_NAME_CHARS: usize = 80;
 
@@ -106,6 +102,13 @@ async fn tags_of(emulator: &Emulator, arn: &str) -> BTreeMap<String, String> {
 async fn describe_activity_reports_the_created_record() {
     let emulator = Emulator::new();
 
+    // The key a customer-managed row configures has to EXIST: a configuration naming
+    // a key KMS holds nothing for is one the service cannot apply. The alias below is
+    // another reference FORM of that same key, which is why both rows report the key's
+    // own ARN back.
+    let key = emulator.kms_key().await;
+    emulator.kms_alias("alias/activities", &key).await;
+
     let longest = "a".repeat(MAX_NAME_CHARS);
     let aws_owned = discriminated(
         "EncryptionConfiguration",
@@ -160,7 +163,7 @@ async fn describe_activity_reports_the_created_record() {
                 "name": "cmk-low",
                 "encryptionConfiguration": {
                     "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
-                    "kmsKeyId": KMS_KEY_ARN,
+                    "kmsKeyId": key,
                     "kmsDataKeyReusePeriodSeconds": MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS,
                 },
             }),
@@ -169,13 +172,13 @@ async fn describe_activity_reports_the_created_record() {
                 "EncryptionConfiguration",
                 json!({
                     "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
-                    "kmsKeyId": KMS_KEY_ARN,
+                    "kmsKeyId": key,
                     "kmsDataKeyReusePeriodSeconds": MIN_KMS_DATA_KEY_REUSE_PERIOD_SECONDS,
                 }),
             ),
         ),
         (
-            "a customer-managed key at the longest reuse period",
+            "a customer-managed key named by an alias, reported as the key",
             json!({
                 "name": "cmk-high",
                 "encryptionConfiguration": {
@@ -189,7 +192,7 @@ async fn describe_activity_reports_the_created_record() {
                 "EncryptionConfiguration",
                 json!({
                     "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
-                    "kmsKeyId": "alias/activities",
+                    "kmsKeyId": key,
                     "kmsDataKeyReusePeriodSeconds": MAX_KMS_DATA_KEY_REUSE_PERIOD_SECONDS,
                 }),
             ),
@@ -250,6 +253,9 @@ async fn describe_activity_reports_the_created_record() {
 #[tokio::test]
 async fn creating_the_same_activity_again_answers_the_first_response() {
     let emulator = Emulator::new();
+    // The key the refused repeat below names, which has to exist for the repeat to be
+    // refused for the reason this test is about.
+    let key = emulator.kms_key().await;
 
     let first = create_activity(
         &emulator,
@@ -303,7 +309,7 @@ async fn creating_the_same_activity_again_answers_the_first_response() {
                 "name": "poller",
                 "encryptionConfiguration": {
                     "type": ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
-                    "kmsKeyId": KMS_KEY_ARN,
+                    "kmsKeyId": key,
                 },
             }),
         )

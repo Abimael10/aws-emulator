@@ -266,12 +266,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into())
                 }
                 Err(crate::state::RoutingRejection::Deleting(machine_arn)) => {
+                    // The refusal names the state machine the alias would have
+                    // belonged to, by the name its record carries.
+                    let name = store
+                        .state_machines
+                        .get(&machine_arn)
+                        .map(|machine| machine.name.clone())
+                        .unwrap_or_else(|| {
+                            crate::state::state_machine_name_of(&machine_arn).to_string()
+                        });
                     return Err(CreateStateMachineAliasErrorModeled::StateMachineDeleting(
                         StateMachineDeleting {
-                            message: Some(crate::state::resource_error_message(
-                                crate::state::STATE_MACHINE_DELETING,
-                                &machine_arn,
-                            )),
+                            message: Some(crate::state::alias_create_deleting_message(&name)),
                         },
                     )
                     .into())

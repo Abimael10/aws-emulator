@@ -34,8 +34,7 @@ use service_com_amazonaws_sfn_awsstepfunctions::state::{
 };
 
 use crate::state_machine_lifecycle::{
-    create_machine, error_code, string, Emulator, ACCOUNT, HELLO_DEFINITION,
-    PAST_THE_DELETE_DELAY, REGION, ROLE_ARN,
+    create_machine, error_code, string, Emulator, ACCOUNT, HELLO_DEFINITION, REGION, ROLE_ARN,
 };
 
 /// This service's Smithy model, read at compile time so the fractional-member
@@ -94,6 +93,28 @@ fn execution_arn(state_machine: &str, execution: &str) -> String {
     format!("arn:aws:states:{REGION}:{ACCOUNT}:execution:{state_machine}:{execution}")
 }
 
+/// Read `machine` until this service answers for nothing under its ARN, which is what
+/// a started deletion going THROUGH looks like to a caller.
+///
+/// The wait is for that answer, never for a span: the loop looks again until the read
+/// is refused, under a bound generous enough to fail only a store that never removes
+/// the record.
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling
+/// suite waiting for the same condition reads this helper rather than carrying a
+/// second copy of it.
+pub(crate) async fn poll_until_absent(emulator: &Emulator, machine: &str) {
+    for _ in 0..10_000 {
+        let (status, _) = emulator
+            .call("DescribeStateMachine", &json!({ "stateMachineArn": machine }))
+            .await;
+        if status != 200 {
+            return;
+        }
+    }
+    panic!("case {machine}: expected the started deletion to remove the record");
+}
+
 // ---------------------------------------------------------------------------
 // Rule 1: `<Condition>: '<value>'`
 // ---------------------------------------------------------------------------
@@ -121,7 +142,10 @@ async fn a_client_error_names_its_condition_and_the_request_value() {
     emulator
         .ok("DeleteStateMachine", &json!({ "stateMachineArn": deleted }))
         .await;
-    std::thread::sleep(PAST_THE_DELETE_DELAY);
+    // The deletion is asynchronous, and the rows below are about the state machine
+    // being GONE: the read is repeated until it answers for nothing, which is the
+    // condition they need, rather than for a span of the clock.
+    poll_until_absent(&emulator, &deleted).await;
 
     let absent_machine = state_machine_arn("msg-never-created");
     let absent_execution = execution_arn("msg-never-created", "msg-never-started");
@@ -129,13 +153,6 @@ async fn a_client_error_names_its_condition_and_the_request_value() {
     // Each row differs along the error shape, the operation raising it, the
     // resource kind and which resource the condition is about.
     let cases: Vec<(&str, &str, Value, &str, String)> = vec![
-        (
-            "CreateStateMachine on a name in use with a different definition",
-            "CreateStateMachine",
-            json!({ "name": "msg-standard", "definition": OTHER_DEFINITION, "roleArn": ROLE_ARN }),
-            "StateMachineAlreadyExists",
-            format!("State Machine Already Exists: '{standard}'"),
-        ),
         (
             "StartExecution reusing a running execution's name with a different input",
             "StartExecution",
@@ -388,6 +405,103 @@ async fn the_unsupported_type_message_is_a_constant() {
         );
         assert!(
             !message.contains(arn.as_str()) && !message.contains("ListExecutions"),
+            "case {case:?}: expected no request value in the message, got {message:?}"
+        );
+    }
+}
+
+/// The refusals whose whole message is a FIXED sentence about the rule the request
+/// broke read that sentence whatever the request named: the conflict a repeat create
+/// under a name already in use earns — the sentence its error shape documents — and the
+/// update of an alias that names neither of the two members it may change.
+///
+/// The sentences are spelled LITERALLY here, not read from the service's constants, so
+/// a reworded constant fails as well as a varying one.
+///
+/// The rows differ along WHICH request value is varied — the state machine's name, its
+/// definition, the alias — none of which may reach the message.
+#[tokio::test]
+async fn a_fixed_sentence_carries_no_value_of_the_request() {
+    const ALREADY_EXISTS: &str =
+        "A state machine with the same name but a different definition or role ARN already exists.";
+    const NEITHER_ALIAS_MEMBER: &str =
+        "Either description or routing configuration must be specified";
+
+    let emulator = Emulator::new();
+
+    // Two state machines differing in name and definition: a repeat create of each,
+    // under a different definition, reads the same sentence.
+    for (index, definition) in [HELLO_DEFINITION, OTHER_DEFINITION].into_iter().enumerate() {
+        let name = format!("fixed-sentence-{index}");
+        let created = create_machine(&emulator, &name, definition).await;
+        let case = format!("CreateStateMachine on the name {name} already in use");
+        let (status, code, message) = failure(
+            &emulator,
+            &case,
+            "CreateStateMachine",
+            &json!({
+                "name": &name,
+                "definition": format!(
+                    "{{\"StartAt\":\"X{index}\",\"States\":{{\"X{index}\":{{\"Type\":\"Succeed\"}}}}}}"
+                ),
+                "roleArn": ROLE_ARN,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (400, "StateMachineAlreadyExists", ALREADY_EXISTS),
+            "case {case:?}: expected the conflict's own sentence, got {status} {code} {message:?}"
+        );
+        assert!(
+            !message.contains(&name) && !message.contains(created.as_str()),
+            "case {case:?}: expected no request value in the message, got {message:?}"
+        );
+    }
+
+    // And two aliases of one state machine: an update naming neither member reads the
+    // same sentence for each.
+    let machine = create_machine(&emulator, "fixed-sentence-aliases", HELLO_DEFINITION).await;
+    let version = string(
+        &emulator
+            .ok(
+                "PublishStateMachineVersion",
+                &json!({ "stateMachineArn": &machine }),
+            )
+            .await,
+        "stateMachineVersionArn",
+    );
+    for alias_name in ["live", "a-much-longer-alias-name"] {
+        let alias = string(
+            &emulator
+                .ok(
+                    "CreateStateMachineAlias",
+                    &json!({
+                        "name": alias_name,
+                        "routingConfiguration": [
+                            { "stateMachineVersionArn": &version, "weight": 100 },
+                        ],
+                    }),
+                )
+                .await,
+            "stateMachineAliasArn",
+        );
+        let case = format!("UpdateStateMachineAlias on {alias} naming neither member");
+        let (status, code, message) = failure(
+            &emulator,
+            &case,
+            "UpdateStateMachineAlias",
+            &json!({ "stateMachineAliasArn": &alias }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (400, "ValidationException", NEITHER_ALIAS_MEMBER),
+            "case {case:?}: expected the alternatives the update may name, got {status} {code} \
+             {message:?}"
+        );
+        assert!(
+            !message.contains(alias.as_str()),
             "case {case:?}: expected no request value in the message, got {message:?}"
         );
     }

@@ -499,13 +499,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(CreateStateMachineErrorModeled::StateMachineAlreadyExists(
                 StateMachineAlreadyExists {
-                    // The service's message for this condition is the condition's
-                    // own name followed by the colliding ARN in single quotes, built
-                    // from the request rather than from this emulator's prose.
-                    message: Some(crate::state::resource_error_message(
-                        crate::state::STATE_MACHINE_ALREADY_EXISTS,
-                        &existing_arn,
-                    )),
+                    // The whole message is the sentence the shape documents for the
+                    // rule this create broke; it quotes no value of the request,
+                    // because the name the caller sent is the one it sent.
+                    message: Some(crate::state::STATE_MACHINE_ALREADY_EXISTS.to_string()),
                 },
             )
             .into());

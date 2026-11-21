@@ -30,7 +30,7 @@ use crate::encrypted_execution_writes::{message, outstanding_task, writes, Write
 use crate::execution_data_encryption::{
     customer_managed, granting_policy, reads, Chain, Read, SFN,
 };
-use crate::state_machine_lifecycle::{error_code, string};
+use crate::state_machine_lifecycle::{error_code, string, ACCOUNT, HELLO_DEFINITION, REGION, ROLE_ARN};
 
 /// The modelled error class a call the key's state refuses answers, and the status it
 /// carries: "The KMS key is not in valid state, for example: Disabled or Deleted"
@@ -498,11 +498,12 @@ async fn a_state_machine_on_an_aws_owned_key_has_no_key_state_to_follow() {
     }
 }
 
-/// An identifier that names no key KMS holds attributes no key state to the resource,
-/// so the read is served: the refusal is the KEY's state, and a state nobody can
-/// observe refuses nothing.
+/// An `encryptionConfiguration` naming an identifier that KMS holds no key under is
+/// one the service cannot apply at all: there is nothing to seal the resource's data
+/// with, so the CREATE is refused — in the class the operation models for a
+/// configuration — rather than accepted and left to fail at the first write.
 #[tokio::test]
-async fn a_configuration_naming_no_key_refuses_nothing() {
+async fn a_configuration_naming_no_key_is_refused_by_the_create() {
     let chain = Chain::new();
     let key = chain.create_key(&granting_policy()).await;
     // A key ARN of the same account and Region that KMS holds no key under: the one
@@ -513,28 +514,51 @@ async fn a_configuration_naming_no_key_refuses_nothing() {
             .map(|(prefix, _)| prefix)
             .unwrap_or_else(|| panic!("case the key: expected a key ARN, got {key:?}"))
     );
-    let (machine, execution) = chain
-        .run_with_input("absent-key", Some(customer_managed(&absent)), PAYLOAD)
+    let (status, answer) = chain
+        .call(
+            &SFN,
+            "CreateStateMachine",
+            &json!({
+                "name": "absent-key",
+                "definition": HELLO_DEFINITION,
+                "roleArn": ROLE_ARN,
+                "encryptionConfiguration": customer_managed(&absent),
+            }),
+        )
         .await;
-
-    for Read {
-        case,
-        operation,
-        request,
-        ..
-    } in reads()
-    {
-        let (status, answer) = chain
-            .call(&SFN, operation, &request(&machine, &execution))
-            .await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: an identifier naming no key attributes no key state, got {status} \
-             with {answer:?}"
-        );
-    }
-    // And the key that does exist is untouched by the state machine that named a
-    // different identifier.
+    assert_eq!(
+        (status, error_code(&answer).as_str()),
+        (400, "InvalidEncryptionConfiguration"),
+        "a configuration naming no key must be refused, got {status} with {answer:?}"
+    );
+    // The refusal RELAYS what the lookup came back with, naming the identifier the
+    // configuration carried.
+    let message = answer
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        message.contains(&format!("Key '{absent}' does not exist")),
+        "the refusal must relay the lookup, got {message:?}"
+    );
+    // Nothing was created under that name.
+    let (status, answer) = chain
+        .call(
+            &SFN,
+            "DescribeStateMachine",
+            &json!({
+                "stateMachineArn":
+                    format!("arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:absent-key"),
+            }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&answer).as_str()),
+        (400, "StateMachineDoesNotExist"),
+        "a refused create must store nothing, got {status} with {answer:?}"
+    );
+    // And the key that does exist is untouched by the create that named a different
+    // identifier.
     let reported = reported_key_state(&chain, &key).await;
     assert_eq!(
         reported, "Enabled",

@@ -57,6 +57,10 @@ const VALIDATION_SUMMARY: &str = "Validation failed with 1 error(s). Call Descri
 
 /// A KMS key ARN of the form Step Functions' `kmsKeyId` documents ("an alias, alias ARN,
 /// key ID, or key ARN"), for the customer-managed row.
+/// The PLACEHOLDER the customer-managed row writes its `KmsKeyId` as, which the test
+/// replaces with the ARN of the key it created: a configuration naming a customer
+/// managed key is one Step Functions can apply only while KMS holds that key, and a key
+/// id is minted by KMS rather than chosen by a caller.
 const KMS_KEY_ARN: &str = "arn:aws:kms:eu-west-1:000000000000:key/12345678-1234-1234-1234-123456789012";
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly
@@ -73,8 +77,13 @@ fn build_router() -> MultiServiceRouter {
         )),
     );
     router.register_service(
-        service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(engine),
+        service_com_amazonaws_sfn_awsstepfunctions::EmulatedService::new(Arc::clone(&engine)),
     );
+    // AWS KMS over the same engine, so the key a template's `EncryptionConfiguration`
+    // names is the key KMS's own handlers hold.
+    router.register_service(service_com_amazonaws_kms_trentservice::EmulatedService::new(
+        engine,
+    ));
     router
 }
 
@@ -130,6 +139,30 @@ async fn sfn(
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("AWSStepFunctions.{operation}"))
         .header("authorization", authorization("states", region))
+        .body(Bytes::from(
+            serde_json::to_vec(body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    (status, payload)
+}
+
+/// Call one AWS KMS operation over its awsJson1_1 wire, signed for `region`.
+async fn kms(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("kms.{region}.amazonaws.com"))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", format!("TrentService.{operation}"))
+        .header("authorization", authorization("kms", region))
         .body(Bytes::from(
             serde_json::to_vec(body).expect("the request body serializes"),
         ))
@@ -329,12 +362,30 @@ const ROWS: &[Row] = &[
 #[tokio::test]
 async fn a_stack_provisions_the_step_functions_activity_its_template_declares() {
     let router = build_router();
+    // The key the customer-managed row names, created through KMS's own wire in the
+    // Region that row deploys in: the reference every row writes as [`KMS_KEY_ARN`] is
+    // replaced by this one, because a key id is KMS's to mint.
+    let (status, created) = kms(
+        &router,
+        "eu-west-1",
+        "CreateKey",
+        &json!({ "KeySpec": "SYMMETRIC_DEFAULT" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected HTTP 200 from CreateKey, got {status} with body {created}"
+    );
+    let key = created["KeyMetadata"]["Arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a key ARN in {created}"))
+        .to_string();
 
     for (index, row) in ROWS.iter().enumerate() {
         let case = row.case;
         let region = row.region;
         let stack_name = format!("sfn-activity-stack-{index}");
-        let template = (row.template)();
+        let template = (row.template)().replace(KMS_KEY_ARN, &key);
 
         let (status, body) = cloudformation(
             &router,
@@ -451,9 +502,15 @@ async fn a_stack_provisions_the_step_functions_activity_its_template_declares() 
             .cloned()
             .unwrap_or(Value::Null);
         for (member, expected) in row.expected_encryption {
+            // The row writes the key by the placeholder the test replaced in its
+            // template, so what the record must report is the key that was created.
+            let expected = match *expected == KMS_KEY_ARN {
+                true => key.as_str(),
+                false => *expected,
+            };
             assert_eq!(
                 encryption.get(*member).and_then(Value::as_str),
-                Some(*expected),
+                Some(expected),
                 "case {case:?}: expected encryptionConfiguration.{member} to be {expected:?}, \
                  got {encryption}"
             );
@@ -559,6 +616,25 @@ async fn an_activity_the_owning_service_refuses_fails_the_stack() {
     let region = "us-east-2";
     let name = "already-there";
 
+    // The key the client's own create names has to exist in that Region: a
+    // configuration naming a key KMS holds nothing for is one Step Functions cannot
+    // apply at all.
+    let (status, minted) = kms(
+        &router,
+        region,
+        "CreateKey",
+        &json!({ "KeySpec": "SYMMETRIC_DEFAULT" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from CreateKey, got {status} with body {minted}"
+    );
+    let key = minted["KeyMetadata"]["Arn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a key ARN in {minted}"))
+        .to_string();
+
     let (status, created) = sfn(
         &router,
         region,
@@ -567,7 +643,7 @@ async fn an_activity_the_owning_service_refuses_fails_the_stack() {
             "name": name,
             "encryptionConfiguration": {
                 "type": "CUSTOMER_MANAGED_KMS_KEY",
-                "kmsKeyId": "arn:aws:kms:us-east-2:000000000000:key/12345678-1234-1234-1234-123456789012",
+                "kmsKeyId": key,
             },
         }),
     )

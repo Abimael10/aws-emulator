@@ -31,6 +31,11 @@ pub struct StateMachineUpdate {
     pub logging_configuration: Option<LoggingConfiguration>,
     pub tracing_configuration: Option<TracingConfiguration>,
     pub encryption_configuration: Option<EncryptionConfiguration>,
+    /// `versionDescription`: "an optional description of the state machine version" the
+    /// update publishes. It describes the VERSION rather than the state machine, and it
+    /// is still part of what the update asks for — a description the state machine's
+    /// published version does not carry is a change like any other.
+    pub version_description: Option<String>,
     /// The revision the update moves the state machine to; see
     /// [`ComAmazonawsSfnAwsstepfunctionsState::fresh_revision_id`].
     pub revision_id: String,
@@ -49,6 +54,60 @@ pub enum StateMachineUpdateRejection {
     Deleting,
     /// The updated record would take the store past [`MAX_STORE_BYTES`].
     NoRoom,
+}
+
+/// What the state machine holds after an `UpdateStateMachine`, which is what that call
+/// answers with ([`ComAmazonawsSfnAwsstepfunctionsState::apply_state_machine_update`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedUpdate {
+    /// The revision the state machine is on: the one the update minted where it changed
+    /// something, and the one it was already on where it changed nothing.
+    pub revision_id: Option<String>,
+    /// What the state machine reports as `updateDate`: the instant of the update where
+    /// it changed something, and the instant of the last change otherwise — which for a
+    /// state machine nothing has ever changed is its creation.
+    pub update_date: SystemTime,
+    /// Whether the update really changed the state machine's configuration.
+    pub modified: bool,
+}
+
+/// Whether `updated` — a record with every member one update carries already applied to
+/// it — asks for anything the state machine `machine` does not already hold.
+///
+/// Two clauses, kept apart because they are about different things:
+///
+/// * the state machine's own CONFIGURATION — its definition, its role and each
+///   configuration structure, the last three compared at their EFFECTIVE value, the same
+///   reading every report of them is projected through, so an update that spells a
+///   default out explicitly, or names the same key by another reference form, asks for
+///   the configuration the state machine already has rather than for a change to it;
+/// * the description the state machine's published VERSION carries. RECORDED: an update
+///   that names a `versionDescription` the state machine does not already carry, with
+///   its definition and role unchanged, moves it off the revision it was on ("adding a
+///   versionDescription (null -> non-null) with unchanged definition/role must mint a
+///   new revision distinct from `<the revision before it>`", and a client that publishes
+///   per update with a fresh description each time takes the next version number each
+///   time, which is how the recorded walk reaches the per-state-machine version cap).
+///   It is not part of the configuration above and is read separately here for that
+///   reason: what it changes is the version the update publishes, which is why
+///   `PublishStateMachineVersion`'s own idempotency — keyed on the revision — is
+///   untouched by it ([`ComAmazonawsSfnAwsstepfunctionsState::version_of_revision`]).
+fn asks_for_nothing_new(machine: &StateMachine, updated: &StateMachine) -> bool {
+    !modifies_configuration(machine, updated)
+        && machine.version_description == updated.version_description
+}
+
+/// Whether `updated` differs from `machine` in the state machine's own configuration:
+/// the definition, the role, and each configuration structure at its effective value.
+fn modifies_configuration(machine: &StateMachine, updated: &StateMachine) -> bool {
+    machine.definition != updated.definition
+        || machine.role_arn != updated.role_arn
+        || effective_logging_configuration(machine.logging_configuration.as_ref())
+            != effective_logging_configuration(updated.logging_configuration.as_ref())
+        || effective_tracing_configuration(machine.tracing_configuration.as_ref())
+            != effective_tracing_configuration(updated.tracing_configuration.as_ref())
+        || effective_encryption_configuration(machine.encryption_configuration.as_ref())
+            != effective_encryption_configuration(updated.encryption_configuration.as_ref())
 }
 
 /// What a `SendTask*` quoting a token found when it looked for a handed-over callback
@@ -142,6 +201,17 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 continue;
             };
             if due > now {
+                still_deleting.push(arn);
+                continue;
+            }
+            // "A state machine is deleted only when all its executions are completed":
+            // a state machine still running one is not removed at the instant above,
+            // so it keeps reporting `DELETING` — and every call on it keeps answering
+            // the refusal for that state — until the last of them is done. The wait is
+            // bounded by the executions' OWN outcomes, which the walk already dated
+            // (`pending_executions`), so an execution nothing will finish by itself —
+            // one suspended at a task somebody else has to answer — holds nothing up.
+            if self.runs_an_unfinished_execution(&arn) {
                 still_deleting.push(arn);
                 continue;
             }
@@ -2201,6 +2271,13 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// created with, which is what a later `DescribeStateMachine` reports and what
     /// `CreateStateMachine`'s idempotency check compares a repeat against.
     ///
+    /// An update that MODIFIES none of them — every member it carries already holds the
+    /// value it asks for — writes nothing at all: there is no new configuration, so the
+    /// state machine keeps the revision it is on and the `updateDate` it already
+    /// reports, which is what the answer carries back ([`AppliedUpdate`]). That is what
+    /// makes the two timestamps a client compares to detect a real change move only for
+    /// a change, and what keeps a publish of the unchanged revision idempotent.
+    ///
     /// The definition is caller-sized, so the record's measurement moves by what the
     /// write changed and an update that would take the store past
     /// [`MAX_STORE_BYTES`] is refused instead of growing it, leaving the state
@@ -2209,7 +2286,7 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         &mut self,
         arn: &str,
         update: StateMachineUpdate,
-    ) -> Result<(), StateMachineUpdateRejection> {
+    ) -> Result<AppliedUpdate, StateMachineUpdateRejection> {
         let Some(machine) = self.state_machines.get(arn) else {
             return Err(StateMachineUpdateRejection::NotFound);
         };
@@ -2233,7 +2310,19 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         if update.encryption_configuration.is_some() {
             updated.encryption_configuration = update.encryption_configuration;
         }
-        updated.revision_id = Some(update.revision_id);
+        if update.version_description.is_some() {
+            updated.version_description = update.version_description;
+        }
+        // Nothing the update asked for differs from what the state machine holds, so
+        // there is nothing to write and no new revision to move it to.
+        if asks_for_nothing_new(machine, &updated) {
+            return Ok(AppliedUpdate {
+                revision_id: machine.revision_id.clone(),
+                update_date: machine.update_date,
+                modified: false,
+            });
+        }
+        updated.revision_id = Some(update.revision_id.clone());
         updated.update_date = update.now;
 
         let before = machine.retained_bytes;
@@ -2247,7 +2336,11 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .saturating_add(after)
             .saturating_sub(before);
         self.state_machines.insert(arn.to_string(), updated);
-        Ok(())
+        Ok(AppliedUpdate {
+            revision_id: Some(update.revision_id),
+            update_date: update.now,
+            modified: true,
+        })
     }
 
     /// Begin deleting the state machine `arn` names: it reports `DELETING` from now
@@ -2264,6 +2357,25 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         machine.delete_due_at = Some(now + DELETE_SETTLE_DELAY);
         self.deleting_state_machines.push(arn.to_string());
         true
+    }
+
+    /// Whether the state machine `arn` names still runs an execution that will finish
+    /// by itself.
+    ///
+    /// This is what "a state machine is deleted only when all its executions are
+    /// completed" is read as: an execution whose outcome the clock still owes
+    /// ([`PendingOutcome`]) is one the deletion waits for, so the record keeps
+    /// reporting `DELETING` — and every call on it keeps answering that refusal — until
+    /// the last of them is done. An execution that is waiting for somebody ELSE (a
+    /// worker's reply, a token) is owed no outcome of its own, so it is not one the
+    /// deletion waits for: the deletion would otherwise never go through.
+    fn runs_an_unfinished_execution(&self, arn: &str) -> bool {
+        self.executions_by_sm
+            .get(arn)
+            .into_iter()
+            .flatten()
+            .filter_map(|execution_arn| self.executions.get(execution_arn))
+            .any(|execution| !execution.is_terminal() && execution.pending.is_some())
     }
 
     /// Remove a state machine, its versions, its aliases and its executions.

@@ -331,6 +331,7 @@ impl NativeResourceProvider for StateMachineProvider {
             logging_configuration: None,
             tracing_configuration: None,
             encryption_configuration: None,
+            version_description: None,
             revision_id: store.fresh_revision_id(),
             now: at,
         };

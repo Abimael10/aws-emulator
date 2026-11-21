@@ -33,27 +33,18 @@
 //! crate root, so it is reached through `crate::state_machine_lifecycle`.
 
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sfn_awsstepfunctions::state::{
-    not_redrivable_message, EXECUTION_SETTLE_DELAY, INVALID_STATE_MACHINE_DEFINITION,
-    INVALID_STATE_MACHINE_EXECUTION_INPUT, NOT_REDRIVABLE_DELETING, NOT_REDRIVABLE_RUNNING,
-    NOT_REDRIVABLE_SUCCEEDED,
+    not_redrivable_message, INVALID_STATE_MACHINE_DEFINITION,
+    INVALID_STATE_MACHINE_EXECUTION_INPUT, NOT_REDRIVABLE_DELETING,
+    NOT_REDRIVABLE_DELETING_REFUSED, NOT_REDRIVABLE_RUNNING, NOT_REDRIVABLE_SUCCEEDED,
 };
 
 use crate::error_messages::{failure, MODEL};
 use crate::state_machine_lifecycle::{
     create_machine, string, Emulator, HELLO_DEFINITION, ROLE_ARN,
 };
-
-/// Long enough that an outcome the clock owed has become due.
-///
-/// `std::thread::sleep`, for the reason `state_machine_lifecycle` records: the
-/// workspace's `tokio` carries no `time` feature, and each test runs on its own
-/// single-threaded runtime with no concurrent task.
-const PAST_THE_EXECUTION_DELAY: Duration =
-    EXECUTION_SETTLE_DELAY.saturating_add(Duration::from_millis(300));
 
 /// A definition that fails immediately, so the execution reaches a terminal
 /// status AWS reports as redrivable.
@@ -230,20 +221,35 @@ async fn a_redrive_refusal_names_the_execution_and_then_the_reason() {
     let emulator = Emulator::new();
 
     // Each row: how the execution got where it is, whether its state machine is
-    // then deleted, and the reason the refusal must carry.
+    // then deleted, the reason the REFUSAL must carry and the one
+    // `redriveStatusReason` lists for the same ineligibility — the same sentence for
+    // every reason but one, which the member documents in its own words.
     let cases = [
-        ("a run still in flight", SLOW_DEFINITION, false, NOT_REDRIVABLE_RUNNING),
-        ("a succeeded run", HELLO_DEFINITION, false, NOT_REDRIVABLE_SUCCEEDED),
+        (
+            "a run still in flight",
+            SLOW_DEFINITION,
+            false,
+            NOT_REDRIVABLE_RUNNING,
+            NOT_REDRIVABLE_RUNNING,
+        ),
+        (
+            "a succeeded run",
+            HELLO_DEFINITION,
+            false,
+            NOT_REDRIVABLE_SUCCEEDED,
+            NOT_REDRIVABLE_SUCCEEDED,
+        ),
         (
             "a failed run whose state machine is being deleted",
             FAIL_DEFINITION,
             true,
+            NOT_REDRIVABLE_DELETING_REFUSED,
             NOT_REDRIVABLE_DELETING,
         ),
     ];
 
     let mut started = Vec::new();
-    for (index, (_, definition, delete, _)) in cases.iter().enumerate() {
+    for (index, (_, definition, delete, _, _)) in cases.iter().enumerate() {
         let machine = create_machine(&emulator, &format!("wrap-redrive-{index}"), definition).await;
         let execution = string(
             &emulator
@@ -260,10 +266,28 @@ async fn a_redrive_refusal_names_the_execution_and_then_the_reason() {
         );
         started.push((machine, execution, *delete));
     }
-    // The outcomes the clock owes are due once, for the whole table; the
-    // deletions are started afterwards so each row's execution is terminal
-    // before its state machine goes.
-    std::thread::sleep(PAST_THE_EXECUTION_DELAY);
+    // Each row's execution has to be where the row says it is before its state machine
+    // is deleted: the RUNNING row stays running, and every other row's outcome is read
+    // until it is terminal. The wait is for the STATUS, never for a span of the clock.
+    for ((case, definition, _, _, _), (_, execution, _)) in cases.iter().zip(&started) {
+        if *definition == SLOW_DEFINITION {
+            continue;
+        }
+        let mut status = String::new();
+        for _ in 0..10_000 {
+            let described = emulator
+                .ok("DescribeExecution", &json!({ "executionArn": execution }))
+                .await;
+            status = string(&described, "status");
+            if status != "RUNNING" {
+                break;
+            }
+        }
+        assert_ne!(
+            status, "RUNNING",
+            "case {case:?}: expected the execution to reach a terminal status, got {status}"
+        );
+    }
     for (machine, _, delete) in &started {
         if *delete {
             emulator
@@ -272,7 +296,7 @@ async fn a_redrive_refusal_names_the_execution_and_then_the_reason() {
         }
     }
 
-    for ((case, _, _, reason), (_, execution, _)) in cases.iter().zip(&started) {
+    for ((case, _, _, reason, projected_reason), (_, execution, _)) in cases.iter().zip(&started) {
         let (status, code, message) = failure(
             &emulator,
             case,
@@ -312,8 +336,8 @@ async fn a_redrive_refusal_names_the_execution_and_then_the_reason() {
             .and_then(Value::as_str)
             .unwrap_or_else(|| panic!("case {case:?}: expected a redriveStatusReason in {described:?}"));
         assert_eq!(
-            projected, *reason,
-            "case {case:?}: expected redriveStatusReason {reason:?}, got {projected:?}"
+            projected, *projected_reason,
+            "case {case:?}: expected redriveStatusReason {projected_reason:?}, got {projected:?}"
         );
         assert!(
             !projected.contains("invalid for redrive as"),

@@ -376,10 +376,11 @@ async fn an_alias_only_blocks_the_versions_of_its_own_state_machine() {
 // What a deleted version's ARN then answers
 // ---------------------------------------------------------------------------
 
-/// A resource-absent refusal names the resource the ARN REFERRED to: after the
-/// delete, every operation that resolves a state machine ARN reports the version
-/// condition for the deleted version's ARN, and the state machine condition for an
-/// unqualified ARN that names nothing.
+/// A resource-absent refusal names the resource the request's ARN is ABOUT: a read of
+/// the resource the ARN refers to reports the version condition for the deleted
+/// version's ARN, while an operation that acts on the state machine behind the ARN —
+/// starting an execution of it — reports the state machine's own condition, and so does
+/// every operation for an unqualified ARN that names nothing.
 ///
 /// The rows vary along the operation doing the resolving and along the ARN's form,
 /// which is what the rule generalises over.
@@ -404,13 +405,7 @@ async fn an_absent_version_is_reported_as_a_version() {
             "StartExecution on the deleted version",
             "StartExecution",
             json!({ "stateMachineArn": &version_arn, "name": "after-the-delete" }),
-            format!("State Machine Version Does Not Exist: '{version_arn}'"),
-        ),
-        (
-            "ListExecutions on the deleted version",
-            "ListExecutions",
-            json!({ "stateMachineArn": &version_arn }),
-            format!("State Machine Version Does Not Exist: '{version_arn}'"),
+            format!("State Machine Does Not Exist: '{version_arn}'"),
         ),
         (
             "DescribeStateMachine on a number never published",
@@ -447,6 +442,24 @@ async fn an_absent_version_is_reported_as_a_version() {
             "case {case:?}: expected the message {message:?}, got {answered:?}"
         );
     }
+
+    // `ListExecutions` is about the state machine whose executions it lists, and it
+    // reports the same condition for a version ARN it holds no version under: the ARN
+    // as submitted, with the state machine's own condition.
+    let (status, answered) = emulator
+        .call("ListExecutions", &json!({ "stateMachineArn": &version_arn }))
+        .await;
+    let code = error_code(&answered);
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "StateMachineDoesNotExist"),
+        "a deleted version lists no executions, got {status} {code} with body {answered:?}"
+    );
+    assert_eq!(
+        answered.get("message").and_then(Value::as_str),
+        Some(format!("State Machine Does Not Exist: '{version_arn}'").as_str()),
+        "the listing is about the state machine, got {answered:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

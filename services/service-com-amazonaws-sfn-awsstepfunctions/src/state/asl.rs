@@ -2044,6 +2044,24 @@ fn about_the_single_state(found: &Diagnostic) -> String {
 /// variable a state assigned.
 const RESERVED_TERMS: &[&str] = &["states"];
 
+/// Whether `name` is a name a state could have assigned a variable under.
+///
+/// The Amazon States Language names a variable as an identifier: "variable names can
+/// contain letters, numbers, and underscores" and begin with a letter or an underscore,
+/// and `$states` is the reserved context object rather than a variable
+/// ([`RESERVED_TERMS`]), so a document whose keys are not such names declares no
+/// variables — which is what `TestState`'s `variables` member is read by.
+#[must_use]
+pub fn is_variable_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    let starts = characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_');
+    starts
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+        && !RESERVED_TERMS.contains(&name)
+}
+
 /// The variables each state of `definition` references, keyed by state name.
 ///
 /// `DescribeStateMachine`'s `variableReferences` is "a map of state name to a

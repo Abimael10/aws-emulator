@@ -268,8 +268,9 @@ async fn a_jsonata_expression_that_does_not_parse_is_refused_as_an_invalid_defin
         UnparsedCase {
             case: "an Assign member whose expression leaves a string unterminated",
             state: json!({
-                "Type": "Succeed",
+                "Type": "Pass",
                 "Assign": { "total": "{% 'unterminated %}" },
+                "End": true,
             }),
             named: true,
             reached: None,

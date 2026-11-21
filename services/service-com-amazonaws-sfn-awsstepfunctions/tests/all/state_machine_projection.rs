@@ -48,10 +48,6 @@ const ENCRYPTION_TYPES: &[&str] = &["AWS_OWNED_KEY", "CUSTOMER_MANAGED_KMS_KEY"]
 /// (`range 60..900` in the model).
 const KMS_REUSE_PERIOD_BOUNDS: (i64, i64) = (60, 900);
 
-/// A KMS key ARN inside the modelled `kmsKeyId` length (1..2048).
-const KMS_KEY_ARN: &str =
-    "arn:aws:kms:us-west-2:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab";
-
 /// The one log destination a logging configuration may carry: `destinations` is
 /// "limited to size 1" and "required, if your log level is not set to OFF", which
 /// `CreateStateMachine` and `UpdateStateMachine` both enforce, so every row below
@@ -109,6 +105,9 @@ fn variable_references(described: &Value) -> Value {
 #[tokio::test]
 async fn describe_reports_every_configuration_structure_at_its_effective_value() {
     let emulator = Emulator::new();
+    // The key the customer-managed rows name, which has to exist for a configuration
+    // on it to be one the service can apply.
+    let key = emulator.kms_key().await;
 
     let default_logging = json!({ "level": LOG_LEVEL_OFF, "includeExecutionData": false });
     let default_tracing = json!({ "enabled": false });
@@ -166,7 +165,7 @@ async fn describe_reports_every_configuration_structure_at_its_effective_value()
             json!({
                 "encryptionConfiguration": {
                     "type": "CUSTOMER_MANAGED_KMS_KEY",
-                    "kmsKeyId": KMS_KEY_ARN,
+                    "kmsKeyId": key,
                     "kmsDataKeyReusePeriodSeconds": KMS_REUSE_PERIOD_BOUNDS.0,
                 },
             }),
@@ -174,7 +173,7 @@ async fn describe_reports_every_configuration_structure_at_its_effective_value()
             default_tracing.clone(),
             json!({
                 "type": "CUSTOMER_MANAGED_KMS_KEY",
-                "kmsKeyId": KMS_KEY_ARN,
+                "kmsKeyId": key,
                 "kmsDataKeyReusePeriodSeconds": KMS_REUSE_PERIOD_BOUNDS.0,
             }),
         ),
@@ -183,7 +182,7 @@ async fn describe_reports_every_configuration_structure_at_its_effective_value()
             json!({
                 "encryptionConfiguration": {
                     "type": "CUSTOMER_MANAGED_KMS_KEY",
-                    "kmsKeyId": KMS_KEY_ARN,
+                    "kmsKeyId": key,
                     "kmsDataKeyReusePeriodSeconds": KMS_REUSE_PERIOD_BOUNDS.1,
                 },
             }),
@@ -191,7 +190,7 @@ async fn describe_reports_every_configuration_structure_at_its_effective_value()
             default_tracing.clone(),
             json!({
                 "type": "CUSTOMER_MANAGED_KMS_KEY",
-                "kmsKeyId": KMS_KEY_ARN,
+                "kmsKeyId": key,
                 "kmsDataKeyReusePeriodSeconds": KMS_REUSE_PERIOD_BOUNDS.1,
             }),
         ),
@@ -218,7 +217,7 @@ async fn describe_reports_every_configuration_structure_at_its_effective_value()
         let encryption = if *encryption_type == ENCRYPTION_TYPE_AWS_OWNED_KEY {
             json!({ "type": encryption_type })
         } else {
-            json!({ "type": encryption_type, "kmsKeyId": KMS_KEY_ARN })
+            json!({ "type": encryption_type, "kmsKeyId": key })
         };
         cases.push((
             format!("the modelled encryption type {encryption_type}"),
@@ -541,6 +540,9 @@ async fn describe_reports_a_published_version_by_the_same_rules() {
 #[tokio::test]
 async fn update_state_machine_persists_what_it_names_and_revises_the_record() {
     let emulator = Emulator::new();
+    // The key the encryption rows name, which has to exist for a configuration on it
+    // to be one the service can apply.
+    let key = emulator.kms_key().await;
     let arn = create_machine(&emulator, "updated", HELLO_DEFINITION).await;
 
     let wait_definition =
@@ -589,7 +591,7 @@ async fn update_state_machine_persists_what_it_names_and_revises_the_record() {
             json!({
                 "definition": wait_definition,
                 "tracingConfiguration": { "enabled": true },
-                "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": KMS_KEY_ARN },
+                "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key },
             }),
             json!({
                 "definition": wait_definition,
@@ -600,7 +602,7 @@ async fn update_state_machine_persists_what_it_names_and_revises_the_record() {
                     "destinations": log_destinations(),
                 },
                 "tracingConfiguration": { "enabled": true },
-                "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": KMS_KEY_ARN },
+                "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key },
             }),
         ),
         (
@@ -615,7 +617,7 @@ async fn update_state_machine_persists_what_it_names_and_revises_the_record() {
                     "destinations": log_destinations(),
                 },
                 "tracingConfiguration": { "enabled": true },
-                "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": KMS_KEY_ARN },
+                "encryptionConfiguration": { "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key },
                 "variableReferences": { "Compose": ["greeting", "target"], "Emit": ["message", "target"] },
             }),
         ),

@@ -97,10 +97,6 @@ fn log_destinations() -> Value {
     }])
 }
 
-/// A KMS key ARN inside the modelled `kmsKeyId` length (1..2048).
-const KMS_KEY_ARN: &str =
-    "arn:aws:kms:us-west-2:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab";
-
 /// `DescribeStateMachineForExecution` on `execution_arn`, which must succeed, with
 /// the `includedData` the row names (none when `included` is `None`).
 async fn describe_for_execution(
@@ -524,6 +520,9 @@ async fn reports_no_map_run_members_for_an_execution_that_owns_a_map_run() {
 #[tokio::test]
 async fn reports_every_configuration_structure_at_its_effective_value() {
     let emulator = Emulator::new();
+    // The key the customer-managed row names, which has to exist for the
+    // configuration to be one the service can apply.
+    let key = emulator.kms_key().await;
 
     let default_logging = json!({ "level": "OFF", "includeExecutionData": false });
     let default_tracing = json!({ "enabled": false });
@@ -579,7 +578,7 @@ async fn reports_every_configuration_structure_at_its_effective_value() {
                 },
                 "encryptionConfiguration": {
                     "type": "CUSTOMER_MANAGED_KMS_KEY",
-                    "kmsKeyId": KMS_KEY_ARN,
+                    "kmsKeyId": key,
                 },
             }),
             json!({
@@ -588,7 +587,7 @@ async fn reports_every_configuration_structure_at_its_effective_value() {
                 "destinations": log_destinations(),
             }),
             default_tracing.clone(),
-            json!({ "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": KMS_KEY_ARN }),
+            json!({ "type": "CUSTOMER_MANAGED_KMS_KEY", "kmsKeyId": key }),
             false,
         ),
     ];
@@ -719,6 +718,111 @@ async fn included_data_decides_the_definition_and_its_variable_references() {
             metadata.get("roleArn").and_then(Value::as_str),
             Some(ROLE_ARN),
             "case {case:?}: expected the roleArn beside the withheld definition, got {metadata:?}"
+        );
+    }
+}
+
+/// The read of a LABELED execution ARN — the one this operation answers for a CHILD
+/// workflow execution of a Distributed Map state — does not apply `includedData`: it
+/// reports the configuration that child ran in full, definition and variable
+/// references included, where the same read of an execution of the state machine
+/// itself withholds both.
+///
+/// The rows differ along WHICH execution the read is addressed to (the one that owns
+/// the Map Run, and each child it started) under the same `METADATA_ONLY` request.
+#[tokio::test]
+async fn a_labeled_execution_arn_reports_in_full_under_metadata_only() {
+    let emulator = Emulator::new();
+
+    // A Distributed Map whose item processor assigns a variable and then reads it, so
+    // the configuration carries variable references to report.
+    let distributed = json!({
+        "StartAt": "M",
+        "States": {
+            "M": {
+                "Type": "Map",
+                "Items": [1, 2],
+                "ItemProcessor": {
+                    "ProcessorConfig": { "Mode": "DISTRIBUTED" },
+                    "StartAt": "Set",
+                    "States": {
+                        "Set": {
+                            "Type": "Pass",
+                            "QueryLanguage": "JSONata",
+                            "Assign": { "w": 1 },
+                            "Next": "Use",
+                        },
+                        "Use": {
+                            "Type": "Pass",
+                            "QueryLanguage": "JSONata",
+                            "Output": "{% { 'w': $w } %}",
+                            "End": true,
+                        },
+                    },
+                },
+                "End": true,
+            },
+        },
+    })
+    .to_string();
+
+    let machine = create_machine(&emulator, "labeled-metadata", &distributed).await;
+    let execution = start_execution(&emulator, &machine, "labeled-metadata", "{}").await;
+    let references = json!({ "Use": ["w"] });
+
+    // The execution that OWNS the Map Run is an execution of the state machine itself:
+    // its metadata-only read withholds the definition and what is read out of it.
+    let owner = describe_for_execution(&emulator, &execution, Some(INCLUDED_DATA_METADATA_ONLY))
+        .await;
+    assert_eq!(
+        owner.get("definition").and_then(Value::as_str),
+        Some(METADATA_ONLY_DEFINITION),
+        "the owning execution's metadata-only read withholds the definition, got {owner:?}"
+    );
+    assert!(
+        owner.get("variableReferences").is_none_or(Value::is_null),
+        "the owning execution's metadata-only read withholds the references, got {owner:?}"
+    );
+
+    // Each CHILD workflow execution is addressed by a labeled ARN, and reports in full.
+    let runs = emulator
+        .ok("ListMapRuns", &json!({ "executionArn": &execution }))
+        .await;
+    let map_run_arn = string(
+        runs.get("mapRuns")
+            .and_then(Value::as_array)
+            .and_then(|runs| runs.first())
+            .unwrap_or_else(|| panic!("expected one Map Run in {runs:?}")),
+        "mapRunArn",
+    );
+    let listed = emulator
+        .ok("ListExecutions", &json!({ "mapRunArn": &map_run_arn }))
+        .await;
+    let children: Vec<String> = listed
+        .get("executions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|child| string(child, "executionArn"))
+        .collect();
+    assert_eq!(
+        children.len(),
+        2,
+        "the Distributed Map must start one child per item, got {listed:?}"
+    );
+    for child in &children {
+        let described =
+            describe_for_execution(&emulator, child, Some(INCLUDED_DATA_METADATA_ONLY)).await;
+        assert_eq!(
+            described.get("definition").and_then(Value::as_str),
+            Some(distributed.as_str()),
+            "case {child:?}: a labeled ARN reports the whole definition, got {described:?}"
+        );
+        assert_eq!(
+            described.get("variableReferences"),
+            Some(&references),
+            "case {child:?}: a labeled ARN reports the variable references, got {described:?}"
         );
     }
 }

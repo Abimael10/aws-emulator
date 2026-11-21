@@ -1360,8 +1360,14 @@ async fn an_update_replaces_the_whole_encryption_configuration() {
             ),
         ),
         (
+            // The update has to name something the state machine does not already
+            // hold for it to be an update at all — here another definition — and what
+            // it names no encryption configuration for is what it RETAINS.
             "an update naming no encryption configuration at all",
-            json!({ "definition": HELLO_DEFINITION }),
+            json!({
+                "definition":
+                    r#"{"StartAt":"Retained","States":{"Retained":{"Type":"Succeed"}}}"#
+            }),
             reported(
                 ENCRYPTION_TYPE_CUSTOMER_MANAGED_KMS_KEY,
                 Some(&first),
