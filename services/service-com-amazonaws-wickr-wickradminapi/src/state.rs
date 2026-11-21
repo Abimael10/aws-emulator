@@ -445,6 +445,77 @@ pub struct SecurityGroupRecord {
     pub settings: crate::ops::types::SecurityGroupSettings,
 }
 
+/// The first group id a network's store mints.
+///
+/// `SecurityGroup$id` is a `GenericString` the model constrains in no way, and
+/// every network is seeded with [`DEFAULT_SECURITY_GROUP_ID`] (`0`), so ids a
+/// caller's create is handed start one past it and no minted id can collide with
+/// the default group.
+const FIRST_SECURITY_GROUP_ID: u32 = 1;
+
+/// The values `federationMode` names, as its documentation enumerates them:
+/// "0 (none), 1 (federated - all networks), 2 (restricted - only permitted
+/// networks)".
+pub const FEDERATION_MODES: [i32; 3] = [0, 1, 2];
+
+/// The settings a group created with `requested` carries.
+///
+/// `SecurityGroupSettingsRequest` is "a subset of SecurityGroupSettings
+/// containing only the modifiable federation and security settings", and each of
+/// its members is the same-named member of `SecurityGroupSettings`, so a created
+/// group carries exactly the settings the request named and nothing else.
+pub fn requested_security_group_settings(
+    requested: &crate::ops::types::SecurityGroupSettingsRequest,
+) -> crate::ops::types::SecurityGroupSettings {
+    crate::ops::types::SecurityGroupSettings {
+        lockout_threshold: requested.lockout_threshold,
+        permitted_networks: requested.permitted_networks.clone(),
+        enable_guest_federation: requested.enable_guest_federation,
+        global_federation: requested.global_federation,
+        federation_mode: requested.federation_mode,
+        enable_restricted_global_federation: requested.enable_restricted_global_federation,
+        permitted_wickr_aws_networks: requested.permitted_wickr_aws_networks.clone(),
+        permitted_wickr_enterprise_networks: requested.permitted_wickr_enterprise_networks.clone(),
+        ..Default::default()
+    }
+}
+
+/// Why a requested `securityGroupSettings` was refused — the member to name and
+/// the reason to state — or `None` when the settings are ones this service
+/// accepts.
+///
+/// Both rules come from the member documentation, which is where they live: the
+/// shapes carry no constraint trait that could have refused either value before
+/// a handler ran, so the service owns them.
+pub fn security_group_settings_problem(
+    requested: &crate::ops::types::SecurityGroupSettingsRequest,
+) -> Option<(&'static str, String)> {
+    // `federationMode` names one of a closed set of modes, so a number outside
+    // that set names no mode at all.
+    if let Some(mode) = requested
+        .federation_mode
+        .filter(|mode| !FEDERATION_MODES.contains(mode))
+    {
+        let allowed = FEDERATION_MODES.map(|mode| mode.to_string()).join(", ");
+        return Some((
+            "federationMode",
+            format!("federationMode must be one of {allowed}, got {mode}"),
+        ));
+    }
+    // `enableRestrictedGlobalFederation` "requires globalFederation to be
+    // enabled": it narrows global federation, so there is nothing for it to
+    // narrow unless the same request enables global federation too.
+    if requested.enable_restricted_global_federation == Some(true)
+        && requested.global_federation != Some(true)
+    {
+        return Some((
+            "enableRestrictedGlobalFederation",
+            "enableRestrictedGlobalFederation requires globalFederation to be enabled".to_string(),
+        ));
+    }
+    None
+}
+
 /// Per-service state for com-amazonaws-wickr-wickradminapi. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsWickrWickradminapiState {
@@ -478,6 +549,17 @@ pub struct ComAmazonawsWickrWickradminapiState {
     minted_networks: u32,
     /// How many user ids this store has minted, with the same guarantee.
     minted_users: u64,
+    /// How many security group ids this store has minted for each `networkId`.
+    /// Group ids are scoped to their network, so each network counts its own,
+    /// and the count is monotonic so a deleted group's id is never reissued.
+    /// An entry exists only for a network [`Self::mint_network_id`] handed out,
+    /// and goes with the network in [`Self::remove_network`].
+    minted_security_groups: BTreeMap<String, u32>,
+    /// The group a `clientToken` created, by `networkId` then by token, so a
+    /// retried create is answered with the group the first attempt made instead
+    /// of creating a second one. One entry per group created with a token, so it
+    /// is bounded by the groups the store holds.
+    security_group_tokens: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl ComAmazonawsWickrWickradminapiState {
@@ -500,6 +582,51 @@ impl ComAmazonawsWickrWickradminapiState {
         }
         self.minted_users = next;
         Some(next.to_string())
+    }
+
+    /// Mint the next unused group id of `network_id`, or `None` once that
+    /// network's id space is exhausted.
+    pub fn mint_security_group_id(&mut self, network_id: &str) -> Option<String> {
+        let minted = self
+            .minted_security_groups
+            .entry(network_id.to_string())
+            .or_default();
+        let next = FIRST_SECURITY_GROUP_ID.checked_add(*minted)?;
+        *minted = minted.checked_add(1)?;
+        Some(next.to_string())
+    }
+
+    /// The group an earlier create with `client_token` made in `network_id`, if
+    /// one did.
+    ///
+    /// Reporting only — a lookup, never a write.
+    pub fn security_group_by_token(
+        &self,
+        network_id: &str,
+        client_token: &str,
+    ) -> Option<&SecurityGroupRecord> {
+        let group_id = self.security_group_tokens.get(network_id)?.get(client_token)?;
+        self.security_groups.get(network_id)?.get(group_id)
+    }
+
+    /// Store `record` under `network_id`, remembering `client_token` as the token
+    /// that created it so a retry of the same request resolves to this group.
+    pub fn insert_security_group(
+        &mut self,
+        network_id: &str,
+        record: SecurityGroupRecord,
+        client_token: Option<&str>,
+    ) {
+        if let Some(token) = client_token {
+            self.security_group_tokens
+                .entry(network_id.to_string())
+                .or_default()
+                .insert(token.to_string(), record.group_id.clone());
+        }
+        self.security_groups
+            .entry(network_id.to_string())
+            .or_default()
+            .insert(record.group_id.clone(), record);
     }
 
     /// How `network_id` resolves for the caller: a network this account owns,
@@ -628,6 +755,8 @@ impl ComAmazonawsWickrWickradminapiState {
         self.deleted_networks.insert(network_id.to_string());
         let removed_users = self.users.remove(network_id).unwrap_or_default();
         self.security_groups.remove(network_id);
+        self.minted_security_groups.remove(network_id);
+        self.security_group_tokens.remove(network_id);
         self.network_settings.remove(network_id);
         self.username_index.remove(network_id);
         Some(removed_users.len())

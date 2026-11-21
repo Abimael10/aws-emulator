@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSecurityGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSecurityGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSecurityGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one security group in a network: a group id unused in that network, the
+//! settings the request named, and the instant it was written. A `clientToken` the
+//! network has already seen resolves to the group that token created rather than to a
+//! second group, which is what `@idempotencyToken` on an `@idempotent` create means.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +166,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSecurityGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSecurityGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSecurityGroup"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+
+        // Neither settings rule is expressible as a constraint trait, so no boundary
+        // check can have refused the request: a setting the service will not accept is
+        // refused here, naming the member and stating why.
+        if let Some((field, reason)) =
+            crate::state::security_group_settings_problem(&input.security_group_settings)
+        {
+            return Err(CreateSecurityGroupErrorModeled::ValidationError(
+                crate::state::field_validation_error(field, &reason),
+            )
+            .into());
+        }
+
+        let now = crate::state::now_epoch_secs();
+        let mut store = state.lock();
+
+        // A security group exists only inside a network, so there is nothing to create
+        // one in when the network named by the path does not exist or has been deleted.
+        if !store.networks.contains_key(&input.network_id) {
+            return Err(CreateSecurityGroupErrorModeled::ResourceNotFoundError(
+                ResourceNotFoundError {
+                    message: Some(format!("network {} does not exist", input.network_id)),
+                },
+            )
+            .into());
+        }
+
+        // A retry of a create this network already carried out under the same token is
+        // answered with the group that create made: an idempotency token makes the
+        // repeated call report the first one's outcome instead of minting a second group.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.security_group_by_token(&input.network_id, token))
+        {
+            return Ok(CreateSecurityGroupOutput {
+                security_group: store.security_group_view(&input.network_id, existing),
+            });
+        }
+
+        let group_id = store
+            .mint_security_group_id(&input.network_id)
+            .ok_or_else(|| {
+                CreateSecurityGroupErrorModeled::InternalServerError(InternalServerError {
+                    message: format!(
+                        "the security group id space of network {} is exhausted",
+                        input.network_id
+                    ),
+                })
+            })?;
+
+        store.insert_security_group(
+            &input.network_id,
+            crate::state::SecurityGroupRecord {
+                group_id: group_id.clone(),
+                name: input.name,
+                // Only the group a network is created with is its default one.
+                is_default: false,
+                settings: crate::state::requested_security_group_settings(
+                    &input.security_group_settings,
+                ),
+                modified_at: now,
+            },
+            input.client_token.as_deref(),
+        );
+
+        // Answer from what was stored, so the response cannot drift from the record
+        // `GetSecurityGroup` reads back.
+        let stored = store
+            .security_groups
+            .get(&input.network_id)
+            .and_then(|groups| groups.get(&group_id))
+            .ok_or_else(store_unavailable)?;
+        Ok(CreateSecurityGroupOutput {
+            security_group: store.security_group_view(&input.network_id, stored),
+        })
     }
+}
+
+/// The modelled server error for a store this service cannot reach — the one
+/// failure that is the emulator's own fault rather than the request's.
+fn store_unavailable() -> CreateSecurityGroupError {
+    CreateSecurityGroupErrorModeled::InternalServerError(InternalServerError {
+        message: "the Wickr network store is unavailable".to_string(),
+    })
+    .into()
 }
