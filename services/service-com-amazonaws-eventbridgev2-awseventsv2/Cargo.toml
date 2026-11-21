@@ -37,6 +37,13 @@ uuid = "1"
 # split a caller's ARN its own way (`state::subscribers`,
 # `state::subscriber_delivery`).
 service-common = { path = "../common" }
+# The engine behind a modelled `@pattern` at the request boundary, asked in
+# `service::unapplied_patterns` whether that boundary can compile one at all.
+regex = "1.13"
+# Evaluates a modelled `@pattern` whose look-around the boundary's engine cannot
+# compile, so the requirement the model states for such a member still reaches a
+# request (`service::unapplied_patterns`).
+fancy-regex = "0.16"
 # The AWS SDK for Amazon SQS, driven over the in-process callback
 # (`OperationContext::callback`): a subscriber whose target is a queue delivers
 # each matching event with `SendMessageBatch`, the API `SqsParameters` states

@@ -44,6 +44,7 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod unapplied_patterns;
 mod validation;
 
 use smithy_server_runtime::{

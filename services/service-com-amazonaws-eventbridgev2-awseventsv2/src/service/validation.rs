@@ -28,6 +28,12 @@
 //! accepts is delegated, untouched, to the generated operation in the routing table, so
 //! every handler, its state and its 501 are exactly as before.
 //!
+//! One class of the model's own rules that walk cannot report is collected beside it
+//! ([`super::unapplied_patterns`]): a `@pattern` the engine behind that trait cannot
+//! compile, which it treats as satisfied. Both sets are counted in the ONE envelope below,
+//! so a request breaking an expression the walk applies and one it skips is a single counted
+//! refusal.
+//!
 //! The model's rules are the WHOLE of it: a member the model leaves optional is optional
 //! here too, including an `@idempotencyToken` member, which a request may state or omit —
 //! an SDK fills one in when the caller omits it, and a request that carries none is a
@@ -38,7 +44,7 @@
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::Violation;
 use service_common::unstated_members::{stating_every_absence, unstated_members, worth_walking};
-use service_common::validation::refusing_violations;
+use service_common::validation::{refusing_violations, MAX_VIOLATIONS};
 use service_common::validation_message::aws_validation_refusal;
 use smithy_server_runtime::{
     BoxFuture, ErasedOperation, Operation, OperationContext, Refusal, ServerHttpProtocol, Service,
@@ -47,6 +53,8 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use crate::ops::types::{InvalidInputException, SCHEMA_INVALID_INPUT_EXCEPTION};
+use crate::service::unapplied_patterns;
+use crate::service::unapplied_patterns::unapplied_violations;
 
 /// The wire error code (`__type`) of this service's input-validation refusal: the
 /// shape its model lists as a common error of every operation for "A request
@@ -72,6 +80,25 @@ fn invalid_input(message: String) -> InvalidInputException {
 /// violation to state.
 fn refusal_message(violations: Vec<Violation>) -> Option<String> {
     aws_validation_refusal(&Refusal::Invalid(violations)).map(|refused| refused.message)
+}
+
+/// The violations of one request as ONE refusal states them: the ones the shared collecting
+/// walk reported and the ones whose expression that walk could not compile
+/// ([`super::unapplied_patterns`]) together, in the order the operation's input shape declares
+/// the members they are about — which is the order the walk itself reports its own in, so a
+/// clause from either collection is stated where its member sits — under the ceiling that
+/// walk collects under (`MAX_VIOLATIONS`), so the clause count of one message stays a
+/// constant of this tree rather than something a request chooses by breaking both classes at
+/// once.
+fn stated<Op: Operation>(walked: Vec<Violation>, unapplied: Vec<Violation>) -> Vec<Violation> {
+    if unapplied.is_empty() {
+        return walked;
+    }
+    let mut violations = walked;
+    violations.extend(unapplied);
+    let mut violations = unapplied_patterns::in_member_order(Op::INPUT_SCHEMA, violations);
+    violations.truncate(MAX_VIOLATIONS);
+    violations
 }
 
 /// The whole `Message` of a refusal of a union-typed member the request did not set exactly
@@ -134,6 +161,11 @@ impl<Op: Operation> ModelledInputRefusal<Op> {
     ) -> Option<InvalidInputException> {
         // The model's own constraints first, since they answer most refusals on their own.
         let violations = refusing_violations::<Op>(protocol, req);
+        // Beside them, the violations of the SAME model rules that walk cannot report,
+        // because the engine behind `@pattern` could not compile the expression and so left
+        // the value admitted ([`super::unapplied_patterns`]). Collected for an operation
+        // whose input declares such an expression and for no other.
+        let unapplied = unapplied_violations::<Op>(protocol, req);
         // What the request left UNSTATED about the input shapes is found by a walk of its
         // own, and only TWO violation sets leave anything for it to find
         // ([`worth_walking`]): exactly ONE absence, where the framework's own read stopped
@@ -147,10 +179,13 @@ impl<Op: Operation> ModelledInputRefusal<Op> {
         // union" is not a question the schema can answer. A request with two violations, or
         // with one that is not an absence, is answered without the walk.
         if !worth_walking(&violations) {
-            return refusal_message(violations).map(invalid_input);
+            return refusal_message(stated::<Op>(violations, unapplied)).map(invalid_input);
         }
         let unstated = unstated_members::<Op>(protocol, req).await;
-        let violations = stating_every_absence(violations, &unstated.omitted);
+        let violations = stated::<Op>(
+            stating_every_absence(violations, &unstated.omitted),
+            unapplied,
+        );
         if !violations.is_empty() {
             return refusal_message(violations).map(invalid_input);
         }
