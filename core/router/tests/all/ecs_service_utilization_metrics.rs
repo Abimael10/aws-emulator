@@ -45,27 +45,27 @@ const ACCOUNT: &str = "000000000000";
 /// The namespace and the two metric names this suite reads, and the dimensions they carry —
 /// spelled out here rather than imported, so a wrong constant in the implementation cannot
 /// make a test pass.
-const NAMESPACE: &str = "AWS/ECS";
-const CPU_UTILIZATION: &str = "CPUUtilization";
-const MEMORY_UTILIZATION: &str = "MemoryUtilization";
-const CLUSTER_DIMENSION: &str = "ClusterName";
-const SERVICE_DIMENSION: &str = "ServiceName";
+pub(crate) const NAMESPACE: &str = "AWS/ECS";
+pub(crate) const CPU_UTILIZATION: &str = "CPUUtilization";
+pub(crate) const MEMORY_UTILIZATION: &str = "MemoryUtilization";
+pub(crate) const CLUSTER_DIMENSION: &str = "ClusterName";
+pub(crate) const SERVICE_DIMENSION: &str = "ServiceName";
 
 /// The `StandardUnit` a percentage is published in.
-const PERCENT: &str = "Percent";
+pub(crate) const PERCENT: &str = "Percent";
 
 /// The alarm states a `StateValue` may report, of the three this suite reads.
-const INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
+pub(crate) const INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
 const ALARM: &str = "ALARM";
 
 /// The network the `awsvpc` placements name.
 const VPC: &str = "vpc-0123456789abcdef0";
-const SUBNET: &str = "subnet-0123456789abcdef0";
+pub(crate) const SUBNET: &str = "subnet-0123456789abcdef0";
 
 /// The image every container names, and a program that stays up — so a task that is running is
 /// still running while its series is read.
-const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
-const STAYS_UP: [&str; 3] = ["sh", "-c", "while true; do sleep 1; done"];
+pub(crate) const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
+pub(crate) const STAYS_UP: [&str; 3] = ["sh", "-c", "while true; do sleep 1; done"];
 
 /// How often a poll re-reads what it is waiting on.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -142,7 +142,11 @@ const ROWS: &[Row] = &[
 /// One emulator carrying Amazon ECS and CloudWatch — which owns the metric store the series is
 /// published into — over ONE shared engine, exactly as the production router builds them, with
 /// the network the `awsvpc` placements name held in the account's Amazon EC2 store.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)`, with the calls and the readers below it, because the sibling suite over the
+/// same two stores ([`crate::ecs_service_utilization_setting_independence`]) needs the same
+/// pair mounted the same way: one harness for one rule, rather than a second copy of it.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     crate::ec2_network::register_network(&engine, VPC, &[SUBNET], &format!("{REGION}a"));
     // A task placed in this subnet reaches the registry its containers' image comes from, so
@@ -207,7 +211,7 @@ async fn rpc(
 }
 
 /// One ECS call, the way a client makes it.
-async fn ecs(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn ecs(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     rpc(
         router,
         "ecs",
@@ -221,7 +225,11 @@ async fn ecs(router: &MultiServiceRouter, operation: &str, body: Value) -> Value
 }
 
 /// One CloudWatch call, the way a client makes it. CloudWatch's `sigv4Name` is `monitoring`.
-async fn cloudwatch(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn cloudwatch(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> Value {
     rpc(
         router,
         "monitoring",
@@ -424,7 +432,7 @@ async fn put_alarm(router: &MultiServiceRouter, name: &str, metric: &str, dimens
 }
 
 /// The `StateValue` CloudWatch reports for the alarm `name`.
-async fn alarm_state(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn alarm_state(router: &MultiServiceRouter, name: &str) -> String {
     let described = cloudwatch(router, "DescribeAlarms", json!({ "AlarmNames": [name] })).await;
     described["MetricAlarms"][0]["StateValue"]
         .as_str()
