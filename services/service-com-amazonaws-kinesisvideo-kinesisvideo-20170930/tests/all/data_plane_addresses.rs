@@ -237,22 +237,25 @@ async fn a_control_call_is_not_served_at_an_address_announced_for_a_data_plane()
     }
 }
 
-/// RULE: an announced address belongs to the stream it was discovered for, so it stops
-/// being an address of this store when that stream is removed — the record that holds the
-/// port goes with the stream, and the address no longer places on any plane.
+/// RULE: an announced address OUTLIVES the stream it was announced for — the listener stays
+/// bound, the address keeps placing on its plane and keeps naming the stream it was
+/// discovered for — because a client was told to dial it and a published data host does not
+/// stop answering when one stream reached through it is deleted; the modelled refusal for a
+/// stream the registry no longer holds is served THERE.
 ///
-/// The rows are the two planes of the removed stream, so the release is a property of the
-/// stream rather than of one endpoint; a second stream's addresses are announced beside
-/// them and keep placing on their planes, so the release is about the removed stream alone.
+/// The rows are the two planes of the removed stream, so the lifetime is a property of the
+/// announcement rather than of one endpoint; a second stream's addresses are announced
+/// beside them and are unaffected, so nothing here is passing because every address of the
+/// store is kept alive by that other stream.
 #[tokio::test]
-async fn an_announced_address_is_released_when_its_stream_is_removed() {
+async fn an_announced_address_outlives_the_stream_it_was_announced_for() {
     let harness = Harness::new();
     let removed_arn = harness.create_stream("released").await;
-    harness.create_stream("retained").await;
-    let mut released: Vec<(&str, String)> = Vec::new();
+    let retained_arn = harness.create_stream("retained").await;
+    let mut outliving: Vec<(&str, String)> = Vec::new();
     let mut kept: Vec<(&str, String)> = Vec::new();
     for api_name in ["PUT_MEDIA", "LIST_FRAGMENTS"] {
-        released.push((
+        outliving.push((
             api_name,
             harness
                 .announced_authority(serde_json::json!({ "StreamName": "released" }), api_name)
@@ -265,7 +268,7 @@ async fn an_announced_address_is_released_when_its_stream_is_removed() {
                 .await,
         ));
     }
-    for (api_name, authority) in released.iter().chain(kept.iter()) {
+    for (api_name, authority) in outliving.iter().chain(kept.iter()) {
         assert!(
             kvs::state::published_plane(&*harness.engine, authority).is_some(),
             "case {api_name:?}: the announced address must place on its plane before the \
@@ -287,17 +290,26 @@ async fn an_announced_address_is_released_when_its_stream_is_removed() {
         status, 200,
         "DeleteStream of an ACTIVE stream expected HTTP 200, got {status} with {body:?}"
     );
-    // And the removal itself is what releases the endpoints, so the case waits until the
-    // record is gone rather than for a span.
+    // The removal is the event the rule is about, so the case waits until the record is
+    // gone rather than for a span.
     await_removed(&harness, "released").await;
 
-    for (api_name, authority) in &released {
+    for (api_name, authority) in &outliving {
         let placed = kvs::state::published_plane(&*harness.engine, authority);
-        assert_eq!(
-            placed, None,
-            "case {api_name:?}: the removed stream's announced address belongs to no plane, \
-             got {placed:?} for {authority:?}"
+        assert!(
+            placed.is_some(),
+            "case {api_name:?}: the removed stream's announced address must still place on \
+             its plane, got {placed:?} for {authority:?}"
         );
+        assert_eq!(
+            kvs::state::published_endpoint_stream(&*harness.engine, authority).as_deref(),
+            Some(removed_arn.as_str()),
+            "case {api_name:?}: the address must still name the stream it was announced \
+             for, so a call there is read against that stream"
+        );
+        // The listener is what any answer at that address depends on, so the port is still
+        // dialable: a client holding the endpoint reaches this emulator, not a closed port.
+        assert_dialable(api_name, authority).await;
     }
     for (api_name, authority) in &kept {
         assert!(
@@ -305,7 +317,29 @@ async fn an_announced_address_is_released_when_its_stream_is_removed() {
             "case {api_name:?}: another stream's address keeps placing on its plane, got none \
              for {authority:?}"
         );
+        assert_eq!(
+            kvs::state::published_endpoint_stream(&*harness.engine, authority).as_deref(),
+            Some(retained_arn.as_str()),
+            "case {api_name:?}: another stream's address keeps naming that stream"
+        );
+        assert!(
+            outliving
+                .iter()
+                .all(|(_, released)| released != authority),
+            "case {api_name:?}: the removed stream's address must not be handed to another \
+             stream, got {authority:?} for both"
+        );
     }
+}
+
+/// Open a connection to an announced authority, as the client handed that address does: an
+/// address nothing listens on fails right here.
+///
+/// The dial itself is the one this test target keeps
+/// ([`crate::stream_data_endpoint::dial_authority`]), so both suites reach an announced
+/// address the same way.
+async fn assert_dialable(case: &str, authority: &str) {
+    drop(crate::stream_data_endpoint::dial_authority(case, authority).await);
 }
 
 /// Poll `DescribeStream` until the stream `name` reports `wanted`, under a deadline far
@@ -326,8 +360,8 @@ async fn await_status(harness: &Harness, name: &str, wanted: &str) {
     panic!("case {name:?}: expected Status {wanted:?} before the deadline, got {last:?}");
 }
 
-/// Poll `DescribeStream` until the stream `name` is gone from the registry, which is the
-/// instant its announced endpoints are owed their release.
+/// Poll `DescribeStream` until the stream `name` is gone from the registry — the event the
+/// announced endpoints' lifetime is asserted across.
 async fn await_removed(harness: &Harness, name: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut last = 0;

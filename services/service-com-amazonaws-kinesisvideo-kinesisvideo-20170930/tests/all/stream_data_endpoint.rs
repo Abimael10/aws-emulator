@@ -200,20 +200,27 @@ fn host_and_port(case: &str, authority: &str) -> (String, u16) {
 /// addresses — the interface the emulator's core binds its listeners on — and the dial
 /// below is to that address and no other.
 async fn connect(case: &str, endpoint: &str) -> tokio::net::TcpStream {
-    let authority = base_url_authority(case, endpoint);
-    let (host, port) = host_and_port(case, &authority);
+    dial_authority(case, &base_url_authority(case, endpoint)).await
+}
+
+/// Open a TCP connection to the announced AUTHORITY `authority`: the one dial of this test
+/// target, `pub(crate)` because the sibling suite that reads which plane an address belongs
+/// to (`data_plane_addresses`) asserts over the same addresses and dials them the same way
+/// rather than keeping a second copy of the loopback arms below.
+pub(crate) async fn dial_authority(case: &str, authority: &str) -> tokio::net::TcpStream {
+    let (host, port) = host_and_port(case, authority);
     let dialed = match host.as_str() {
         "127.0.0.1" => tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await,
         "::1" => tokio::net::TcpStream::connect((Ipv6Addr::LOCALHOST, port)).await,
         "localhost" => tokio::net::TcpStream::connect(("localhost", port)).await,
         other => panic!(
             "case {case:?}: the announced endpoint must be an address of this machine, got \
-             {other:?} in {endpoint:?}"
+             {other:?} in {authority:?}"
         ),
     };
     dialed.unwrap_or_else(|error| {
         panic!(
-            "case {case:?}: the announced endpoint {endpoint:?} must accept a connection, \
+            "case {case:?}: the announced endpoint {authority:?} must accept a connection, \
              got {error}"
         )
     })

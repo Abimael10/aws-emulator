@@ -44,6 +44,14 @@
 //! naming any other stream reached an endpoint that does not serve the stream it asked
 //! for.
 //!
+//! An announced address OUTLIVES that stream, though. The value is one the client was told
+//! to dial and keeps dialing, and a published data host does not stop answering when one
+//! stream reached through it is deleted: the media call made there afterwards is exactly
+//! the call that has to be answered with the serving operation's own modelled refusal for a
+//! stream the registry no longer holds, which nothing on a closed port could answer. So an
+//! entry here is held for the life of the store ([`MAX_ANNOUNCED_ENDPOINTS`]) and the
+//! removal of a stream reclaims none.
+//!
 //! # The announced authority is one this emulator ANSWERS on, over a transport the
 //! calling client can dial
 //!
@@ -155,7 +163,8 @@ pub fn service_host(region: &str) -> String {
 /// answers there.
 ///
 /// The state OWNS the listener: dropping it closes the port, so it must outlive every
-/// endpoint handed out, which is the whole life of the store.
+/// endpoint handed out — and every stream one was announced for — which is the whole life
+/// of the store.
 pub struct DataPlaneEndpoint {
     /// `http://host:port`, the whole value `GetDataEndpoint` reports for this plane.
     base_url: String,
@@ -201,13 +210,13 @@ impl std::fmt::Debug for DataPlaneEndpoint {
 /// be appended to rather than replaced.
 ///
 /// Opening a listener changes no stream and is idempotent: the first listener of a
-/// (stream, plane) pair is kept, so one stream's plane resolves to the same address for
-/// as long as the store lives — a client can key a session on it — while another stream
-/// of the same plane is announced at an address of its own, since the endpoint the
-/// discovery call reports is the endpoint of the stream it named. `None` when the address
-/// could not be opened at all, or when this store already holds as many announced
-/// endpoints as it opens ([`MAX_ANNOUNCED_ENDPOINTS`]), which leaves the caller to answer
-/// with a modelled error rather than to announce an endpoint nothing serves.
+/// (stream, plane) pair is kept, so one stream's plane resolves to the same address for as
+/// long as the store lives, whatever becomes of the stream — a client can key a session on
+/// it — while another stream of the same plane is announced at an address of its own, since
+/// the endpoint the discovery call reports is the endpoint of the stream it named. `None`
+/// when the address could not be opened at all, or when this store already holds as many
+/// announced endpoints as it opens ([`MAX_ANNOUNCED_ENDPOINTS`]), which leaves the caller to
+/// answer with a modelled error rather than to announce an endpoint nothing serves.
 pub async fn ensure_data_endpoint<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &::engine::ServiceState<ServiceState>,
@@ -280,15 +289,23 @@ pub const DATA_PLANE_SCHEME: &str = "http";
 
 /// How many announced endpoints one store holds open at once.
 ///
-/// Each one is a listening socket of the host, held for as long as the stream it belongs
-/// to exists, and a stream has two of them (the live media endpoint and the archived-media
-/// one) — so this is what keeps a caller that discovers endpoints for stream after stream
-/// from taking the host's handles. AWS publishes no figure (it announces an endpoint for
-/// every stream of an account), so the ceiling is CHOSEN: far above any set of streams a
-/// session works with, and well inside what one process may keep open. A discovery call
-/// that would exceed it is answered with the throttle-shaped error this operation models
-/// rather than with an address nothing serves, and an endpoint is released again when the
-/// stream it belongs to is removed.
+/// Each one is a listening socket of the host, held for the life of the store, and a
+/// stream has two of them (the live media endpoint and the archived-media one) — so this
+/// is what keeps a caller that discovers endpoints for stream after stream from taking the
+/// host's handles. AWS publishes no figure (it announces an endpoint for every stream of an
+/// account), so the ceiling is CHOSEN: far above any set of streams a session works with,
+/// and well inside what one process may keep open. A discovery call that would exceed it is
+/// answered with the throttle-shaped error this operation models rather than with an
+/// address nothing serves.
+///
+/// Nothing is reclaimed below it — not even when the stream an entry was announced for is
+/// removed. An announced address is one a client was TOLD to dial and keeps dialing, and a
+/// published data host does not stop answering because one stream reached through it went
+/// away: the media call that arrives there after the removal is the call that has to be
+/// answered with the serving operation's own modelled refusal for a stream its registry no
+/// longer holds, which cannot happen on a closed port. Reclaiming an entry would strand
+/// exactly the address already handed out, so this ceiling bounds how many addresses are
+/// ever announced rather than how long one of them lives.
 pub const MAX_ANNOUNCED_ENDPOINTS: usize = 128;
 
 /// Which plane of THIS store the authority `authority` is the published address of, or

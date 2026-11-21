@@ -538,9 +538,11 @@ pub struct ComAmazonawsKinesisvideoKinesisvideo20170930State {
     /// The address each announced endpoint of this store is published at, with the
     /// listener that answers there — opened on the first `GetDataEndpoint` for that
     /// stream and plane (see [`ensure_data_endpoint`]) and held here for the life of the
-    /// store, so an announced endpoint never moves under a client. Keyed by both halves
-    /// of what a discovery call resolves ([`StreamPlane`]), because the endpoint it
-    /// reports is the endpoint of the stream the call named.
+    /// store, so an announced endpoint never moves under a client and never stops
+    /// answering: an entry OUTLIVES the stream it was announced for, because the host a
+    /// client was told to dial is where the refusal for a removed stream has to be
+    /// served. Keyed by both halves of what a discovery call resolves ([`StreamPlane`]),
+    /// because the endpoint it reports is the endpoint of the stream the call named.
     pub data_endpoints: BTreeMap<StreamPlane, DataPlaneEndpoint>,
 }
 
@@ -568,11 +570,11 @@ impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
         for (stream_name, stream_arn) in due {
             self.streams.remove(&stream_name);
             self.stream_arn_index.remove(&stream_arn);
-            // A removed stream's announced endpoints go with it: an endpoint belongs to
-            // the stream it was discovered for, so once that stream is gone there is
-            // nothing for it to serve — and dropping the record closes the port it held.
-            self.data_endpoints
-                .retain(|announced, _| announced.stream_arn != stream_arn);
+            // The stream's announced endpoints are NOT reclaimed with it: an address a
+            // discovery call handed a client is a host that keeps answering, so a media
+            // call arriving there for a stream this registry no longer holds is refused by
+            // the serving operation's own stream resolution rather than dropped at the
+            // socket. See [`data_endpoint::MAX_ANNOUNCED_ENDPOINTS`].
         }
 
         for stream in self.streams.values_mut() {
