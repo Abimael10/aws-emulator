@@ -71,7 +71,8 @@ pub mod ec2_instances;
 /// The rules a request that configures a group is taken against: which launch source it
 /// may name, whether the zones and launch templates it names exist, and the cross-member
 /// rules of the policies the group carries — shared by the create and the update, which
-/// write the same group.
+/// write the same group, and (for the launch template a group points at) by each LAUNCH
+/// the group makes, which resolves that same reference again.
 pub mod group_configuration;
 
 /// The tags an Auto Scaling group carries: how a requested tag becomes a stored one, and
@@ -495,8 +496,10 @@ pub const ACTIVITY_MID_LIFECYCLE_ACTION: &str = "MidLifecycleAction";
 pub const ACTIVITY_SUCCESSFUL: &str = "Successful";
 /// A scaling activity that did not place the instance it was started for.
 pub const ACTIVITY_FAILED: &str = "Failed";
-/// A scaling activity whose instance was launched into no service and taken back, so the
-/// capacity change it was started for was cancelled rather than attempted and failed.
+/// A scaling activity whose launch Amazon EC2 did not carry out — the launch source it would
+/// have run cannot be resolved there, or the instance it launched was taken back before it
+/// reached service — so the capacity change it was started for was cancelled rather than
+/// attempted and failed.
 pub const ACTIVITY_CANCELLED: &str = "Cancelled";
 
 /// `Activity$AutoScalingGroupState` for a group that still exists.
@@ -538,10 +541,12 @@ pub fn failed_launch_description(status_message: &str) -> String {
 /// "If an attempt to launch instances failed, the StatusCode value is Failed or Cancelled and
 /// the StatusMessage element in the response indicates the cause of the failure"
 /// (`DescribeScalingActivities`' own documentation): WHICH of the two a launch records is a
-/// property of the reason it did not place the instance — a launch that could not be made at
-/// all FAILED, and one whose instance was launched into no service and taken back was
-/// CANCELLED — so the reason and the code travel together from the one place that judges the
-/// launch ([`ec2_instances::launch_failure_reason`]) to the recorder.
+/// property of the reason it did not place the instance — a launch Amazon EC2 Auto Scaling
+/// itself could not make the attempt for FAILED, while one Amazon EC2 did not carry out (the
+/// launch source it would have run resolves to nothing there, or the instance it launched
+/// would never reach service and is taken back) was CANCELLED — so the reason and the code
+/// travel together from the one place that judges the launch
+/// ([`ec2_instances::launch_failure_reason`]) to the recorder.
 #[derive(Debug, Clone)]
 pub struct BlockedLaunch {
     /// The cause the activity reports under `Activity$StatusMessage`.
@@ -551,8 +556,9 @@ pub struct BlockedLaunch {
 }
 
 impl BlockedLaunch {
-    /// A launch that could not be MADE: the group's configuration asks for an instance the
-    /// account's own state cannot produce.
+    /// A launch that could not be MADE: Amazon EC2 Auto Scaling itself could not make the
+    /// attempt, the group's configuration asking for an instance the account's own state
+    /// cannot produce.
     #[must_use]
     pub fn failed(status_message: String) -> Self {
         Self {
@@ -561,8 +567,9 @@ impl BlockedLaunch {
         }
     }
 
-    /// A launch whose instance would never reach service and is taken back, so the capacity
-    /// change ends CANCELLED.
+    /// A launch Amazon EC2 did not carry out: the launch source it would have run resolves to
+    /// nothing there, or the instance it launched would never reach service and is taken back
+    /// — either way the capacity change ends CANCELLED.
     #[must_use]
     pub fn cancelled(status_message: String) -> Self {
         Self {

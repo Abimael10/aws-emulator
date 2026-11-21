@@ -1410,14 +1410,19 @@ fn resolved_specification(
 /// ([`super::AutoScalingState::record_failed_activity`]), which is where a client reads why
 /// its group never reached its desired capacity.
 ///
-/// Which terminal code that activity ends in follows the reason: a launch that could not be
-/// MADE at all is an attempt that `Failed`, while one whose instance Amazon EC2 would take
-/// back before it ever reached service is `Cancelled` — "the StatusCode value is Failed or
-/// Cancelled and the StatusMessage element in the response indicates the cause of the
-/// failure" (`DescribeScalingActivities`' own documentation).
+/// Which terminal code that activity ends in follows the reason: a launch Amazon EC2 Auto
+/// Scaling itself could not make the attempt for is an attempt that `Failed`, while one
+/// Amazon EC2 would not carry out — the launch source the instance would run resolves to
+/// nothing there, or the instance it launched would be taken back before it ever reached
+/// service — is `Cancelled` — "the StatusCode value is Failed or Cancelled and the
+/// StatusMessage element in the response indicates the cause of the failure"
+/// (`DescribeScalingActivities`' own documentation).
 ///
 /// What is resolved here is what this service, as the CONSUMER of the template, resolves
-/// when it launches from it: the IAM instance profile the instances would run as
+/// when it launches from it: the launch-template version the launch reads
+/// ([`super::group_configuration::unresolved_launch_template_launch_failure`], which answers
+/// Amazon EC2's own sentence for a reference that no longer resolves), the IAM instance
+/// profile the instances would run as
 /// ([`super::iam_instance_profiles`], whose header states why that reference is this
 /// service's to resolve) and the KMS key the volumes they boot would be encrypted under
 /// ([`super::volume_encryption_keys`]). What Amazon EC2 itself validates about a launch (an
@@ -1425,13 +1430,32 @@ fn resolved_specification(
 /// that owns the images and the instance types.
 ///
 /// The sentence a reason of this crate's own carries ends the way every launch failure does
-/// ([`super::LAUNCH_FAILED_SENTENCE`]). `None` also covers an engine carrying neither the
-/// IAM nor the KMS store: a failure has to be grounded in what the account's state
-/// answered, never assumed.
+/// ([`super::LAUNCH_FAILED_SENTENCE`]); a reason another service worded is reported as that
+/// service worded it. `None` also covers an engine carrying neither the Amazon EC2, the IAM
+/// nor the KMS store: a failure has to be grounded in what the account's state answered,
+/// never assumed.
 pub fn launch_failure_reason<Eng: Send + Sync + 'static>(
     engine: &Eng,
     request: &LaunchRequest<'_>,
 ) -> Option<super::BlockedLaunch> {
+    // The launch-template version this launch would READ, resolved against Amazon EC2 at the
+    // instant of the launch. A launch template is Amazon EC2's resource and stays the client's
+    // to delete after a group was configured against it, so a reference that no longer
+    // resolves is a launch Amazon EC2 would not carry out: nothing is placed and the capacity
+    // change ends CANCELLED, carrying Amazon EC2's own sentence for the reference
+    // it could not resolve
+    // ([`super::group_configuration::unresolved_launch_template_launch_failure`]). Asked
+    // first, because nothing else of a launch source can be read from a version that is not
+    // there.
+    if let Some(reason) =
+        super::group_configuration::unresolved_launch_template_launch_failure(
+            engine,
+            request.launch_template,
+            request.mixed_instances_policy,
+        )
+    {
+        return Some(super::BlockedLaunch::cancelled(reason));
+    }
     // A launch source that chooses its instance type by ATTRIBUTES can launch only a type
     // those attributes admit: "if you specify `InstanceRequirements`, you can't specify
     // `InstanceType`" (`LaunchTemplateOverrides$InstanceRequirements`), so one whose

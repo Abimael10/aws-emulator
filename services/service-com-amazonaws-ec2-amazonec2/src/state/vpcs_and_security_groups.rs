@@ -3140,9 +3140,20 @@ pub fn invalid_launch_template_id_not_found<E>() -> crate::scaffolded::Scaffolde
     crate::scaffolded::Scaffolded::service_error(
         INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND,
         400,
-        "At least one of the launch templates specified in the request does not exist.",
+        LAUNCH_TEMPLATES_NOT_FOUND_MESSAGE,
     )
 }
+
+/// That refusal's SENTENCE, which the two codes above share: a launch template a caller named
+/// by either key being absent in exactly one way, EC2 states it in exactly one way.
+///
+/// Named here rather than written at each call site for the reason
+/// [`specified_launch_template_version_not_found_message`] is: a CONSUMER of a launch template
+/// — Amazon EC2 Auto Scaling resolving the template a group launches from — reports this
+/// wording inside an answer of its own, so the sentence is worded once, by the service that
+/// owns launch templates.
+pub const LAUNCH_TEMPLATES_NOT_FOUND_MESSAGE: &str =
+    "At least one of the launch templates specified in the request does not exist.";
 
 /// Refuse a request that named something that is not a launch template id at all: HTTP 400
 /// `InvalidLaunchTemplateId.Malformed`.
@@ -3213,10 +3224,43 @@ pub fn specified_launch_template_id_not_found<E>(
     crate::scaffolded::Scaffolded::service_error(
         INVALID_LAUNCH_TEMPLATE_ID_NOT_FOUND,
         400,
-        format!(
-            "The specified launch template, with template ID {}, does not exist.",
-            echoed_resource_id(launch_template_id)
-        ),
+        specified_launch_template_id_not_found_message(launch_template_id),
+    )
+}
+
+/// That refusal's SENTENCE on its own, for the consumer of a launch template that reports
+/// EC2's wording inside an answer of its own rather than answering EC2's error.
+///
+/// Amazon EC2 Auto Scaling launching an instance from the `LaunchTemplate` a group is
+/// configured with is the caller: the launch is made against this service, so what the client
+/// reads off the scaling activity that launched nothing is what EC2 answered the launch —
+/// worded HERE once, by the service that owns launch templates, exactly as
+/// [`specified_launch_template_version_not_found_message`] words the version half.
+#[must_use]
+pub fn specified_launch_template_id_not_found_message(launch_template_id: &str) -> String {
+    format!(
+        "The specified launch template, with template ID {}, does not exist.",
+        echoed_resource_id(launch_template_id)
+    )
+}
+
+/// The NAME half of that same sentence, for the consumer of a launch template whose reference
+/// names it by name: `The specified launch template, with template name <name>, does not
+/// exist.`
+///
+/// One sentence family with [`specified_launch_template_id_not_found_message`] — the fixed
+/// text differs only in which half of the reference it names, and the one variable part is the
+/// identifier the reference carried — so a consumer that resolves a reference stated either
+/// way reports the half it was given, worded HERE by the service that owns launch templates.
+/// Recorded for a consumer of a template that names it by name: Amazon EC2 Auto Scaling
+/// resolving the `LaunchTemplate` a group is configured with answers this sentence with the
+/// `LaunchTemplateName` it was given. The value is cut to length by [`echoed_resource_id`] the
+/// way every refusal of this crate bounds a value it repeats back.
+#[must_use]
+pub fn specified_launch_template_name_not_found_message(launch_template_name: &str) -> String {
+    format!(
+        "The specified launch template, with template name {}, does not exist.",
+        echoed_resource_id(launch_template_name)
     )
 }
 
@@ -3257,7 +3301,7 @@ pub fn invalid_launch_template_name_not_found<E>() -> crate::scaffolded::Scaffol
     crate::scaffolded::Scaffolded::service_error(
         INVALID_LAUNCH_TEMPLATE_NAME_NOT_FOUND,
         400,
-        "At least one of the launch templates specified in the request does not exist.",
+        LAUNCH_TEMPLATES_NOT_FOUND_MESSAGE,
     )
 }
 
