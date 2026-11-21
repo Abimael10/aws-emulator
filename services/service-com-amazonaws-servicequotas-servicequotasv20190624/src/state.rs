@@ -3058,8 +3058,9 @@ fn seed_default_quotas() -> Vec<DefaultQuota> {
 /// AWS's published catalog and then looks a quota up by, so a code of that form this
 /// emulator made up would resolve a quota AWS never published. Where this catalog
 /// cannot cite AWS's code for a quota, the code is therefore DESCRIPTIVE — the
-/// quota's own published name with its words joined, the same form the `b2bi` row
-/// below carries because that service's own refusal reports its limit under it.
+/// quota's own published name with its words joined, the same form the
+/// `notifications-contacts` row below carries because that service's own refusal
+/// reports its limit under it.
 ///
 /// It is the same on every run, in every region, and unique per quota name within a
 /// service (quota names are unique there, and [`seed_default_quotas`] asserts the
@@ -3073,9 +3074,12 @@ fn seed_default_quotas() -> Vec<DefaultQuota> {
 ///
 /// 1. AWS's own `QuotaCode`, where this catalog can cite it for that quota;
 /// 2. the code the SERVICE'S OWN API reports for the limit, where it reports one —
-///    `b2bi` and `notifications-contacts` name theirs in their
+///    `notifications-contacts` names its email-contact limit in its
 ///    `ServiceQuotaExceededException`, and the refusal that names a code has to
-///    resolve to a quota;
+///    resolve to a quota. Case 1 outranks it: where AWS's own code for the quota IS
+///    citable, that is the code the row is published under, which is why `b2bi`
+///    publishes its profile limit under AWS's code and not under the one its own
+///    refusal reports;
 /// 3. otherwise this descriptive stand-in.
 ///
 /// With ONE exception, which applies to the stand-in of case 3 alone: where the
@@ -3256,6 +3260,16 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
                 quota("Branches per app", 50.0).code("L-A6716586"),
             ],
         ),
+        service(
+            "amplifyuibuilder",
+            "Amplify UI Builder",
+            amplifyuibuilder_quotas(),
+        ),
+        service(
+            "aoss",
+            "Amazon OpenSearch Serverless",
+            aoss_quotas(),
+        ),
         service("apigateway", "Amazon API Gateway", apigateway_quotas()),
         service("appconfig", "AWS AppConfig", appconfig_quotas()),
         service(
@@ -3268,6 +3282,11 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Application Auto Scaling",
             application_autoscaling_quotas(),
         ),
+        service(
+            "application-signals",
+            "Amazon CloudWatch Application Signals",
+            application_signals_quotas(),
+        ),
         service("appmesh", "AWS App Mesh", appmesh_quotas()),
         service("apprunner", "AWS App Runner", apprunner_quotas()),
         service(
@@ -3275,19 +3294,28 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon AppStream 2.0",
             vec![quota("Fleets", 10.0)],
         ),
+        service("appstudio", "AWS App Studio", appstudio_quotas()),
         service(
             "appsync",
             "AWS AppSync",
             vec![quota("APIs per Region", 25.0)],
         ),
         service("athena", "Amazon Athena", athena_quotas()),
+        service("auditmanager", "AWS Audit Manager", auditmanager_quotas()),
         service("autoscaling", "Amazon EC2 Auto Scaling", autoscaling_quotas()),
+        service(
+            "autoscaling-plans",
+            "AWS Auto Scaling Plans",
+            autoscaling_plans_quotas(),
+        ),
+        service("aws-marketplace", "AWS Marketplace", aws_marketplace_quotas()),
+        service("aws-mcp", "AWS MCP", aws_mcp_quotas()),
         // THE EXCEPTION [`descriptive_quota_code`] names, row by row. For each pair
         // below, the recorded default-quota listing of that service carries NO row
         // under the descriptive stand-in this catalog would publish it as — the
         // recording reports the emulator's row as a surplus entry — so the service
         // publishes no quota under that code and the row is not published here:
-        // `autoscaling-plans/ScalingPlansPerRegion`, `config/DeliveryChannels`,
+        // `config/DeliveryChannels`,
         // `datasync/TasksPerAccount`, `datasync/AgentsPerAccount`,
         // `emr-serverless/ApplicationsPerAccount`,
         // `kinesisanalytics/ApplicationsPerRegion`,
@@ -3404,30 +3432,15 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         // the rows that evidence DOES bind to a code, and the quotas of its published
         // catalog whose name, value or rate no source available here states stay in the
         // default-quota-set gap.
-        service(
-            "b2bi",
-            "B2B Data Interchange",
-            // The VALUE is documented: b2bi's own `CreateProfile` states "You can have
-            // up to five customer profiles, each representing a distinct private
-            // network", and the b2bi emulator enforces exactly this number. No
-            // cross-crate dependency links the two, so keep it in step with
-            // `MAX_PROFILES_PER_ACCOUNT` in
-            // `services/service-com-amazonaws-b2bi-b2bi/src/state.rs` (each side has a
-            // test pinning it).
-            //
-            // The CODE is carried here rather than derived, under case 2 of
-            // [`descriptive_quota_code`]'s rule: b2bi publishes no `L-…` code in its
-            // model, and its own `ServiceQuotaExceededException` reports `quotaCode`
-            // `ProfilesPerAccount`, so a client that reads the refusal and then looks
-            // the limit up here finds it under the code the refusal named. It
-            // satisfies the modelled `QuotaCode` pattern
-            // `^[a-zA-Z][a-zA-Z0-9-]{1,128}$`. The recorded listing of this service
-            // carries its own codes instead (`L-05F6A9EF`, `L-19B5E505`,
-            // `L-CD5D2786`, `L-E15C983E`, none of them citable here with a name or a
-            // value), which is why the row is case 2 rather than case 1 — and case
-            // 2, unlike the stand-in of case 3, is published even so.
-            vec![quota("Customer profiles per account", 5.0).code("ProfilesPerAccount")],
-        ),
+        // And it covers one row published under the code case 2 of
+        // [`descriptive_quota_code`]'s rule names — the code the SERVICE'S OWN API
+        // reports — rather than under a stand-in: the recorded default-quota listing of
+        // `b2bi` reports `b2bi/ProfilesPerAccount` as a surplus entry and states AWS's
+        // own code for that quota, so the row is RE-KEYED onto it ([`b2bi_quotas`]) and
+        // the code the service's refusal names is not published here. Case 1 outranks
+        // case 2 wherever AWS's code for the quota is citable: a client that reads AWS's
+        // published catalog resolves the limit by the code AWS mints for it.
+        service("b2bi", "B2B Data Interchange", b2bi_quotas()),
         service("backup", "AWS Backup", backup_quotas()),
         service("batch", "AWS Batch", batch_quotas()),
         service(
@@ -3440,6 +3453,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon Keyspaces (for Apache Cassandra)",
             cassandra_quotas(),
         ),
+        service("chime", "Amazon Chime", chime_quotas()),
         service("cloud9", "AWS Cloud9", cloud9_quotas()),
         service(
             "cloudformation",

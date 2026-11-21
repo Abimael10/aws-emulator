@@ -76,17 +76,31 @@ fn rows() -> Vec<Row> {
             period: None,
             metric: None,
         },
-        // A quota published under a DESCRIPTIVE code — the one this catalog carries
-        // because the service's own refusal reports the limit under it, not a
-        // stand-in for an AWS code.
+        // A quota published under AWS's own code for a service whose refusal reports a
+        // descriptive code of its own: the published catalog's code is the one the row
+        // carries.
         Row {
             service_code: "b2bi",
-            quota_code: "ProfilesPerAccount",
-            quota_name: "Customer profiles per account",
+            quota_code: "L-05F6A9EF",
+            quota_name: "Profiles",
             value: 5.0,
             unit: "None",
             adjustable: true,
             description: None,
+            period: None,
+            metric: None,
+        },
+        // A quota published under a DESCRIPTIVE code — the one the service's own
+        // refusal reports the limit under, for a quota whose AWS code this catalog
+        // cannot cite.
+        Row {
+            service_code: "notifications-contacts",
+            quota_code: "EmailContactsPerAccount",
+            quota_name: "Email contacts per account",
+            value: 10.0,
+            unit: "None",
+            adjustable: true,
+            description: Some("The maximum number of email contacts per account."),
             period: None,
             metric: None,
         },
@@ -271,6 +285,11 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("acm", "Certificate Manager"),
     ("agent-registry", "Agent Registry"),
     ("aiops", "Amazon AI Operations"),
+    // `AWS/Usage` publishes CloudWatch Application Signals' call counts under the
+    // feature's name WITHOUT the `Amazon` prefix the service catalog reports for the
+    // code, which is the dimension value the recorded default-quota listing of
+    // `application-signals` carries on its rate rows.
+    ("application-signals", "CloudWatch Application Signals"),
     // `AWS/Usage` publishes AWS AppConfig's API call counts under the service's short
     // display name and its RESOURCE counts under the product's full one, which is what
     // the recorded default-quota listing of `appconfig` carries on its resource planes.

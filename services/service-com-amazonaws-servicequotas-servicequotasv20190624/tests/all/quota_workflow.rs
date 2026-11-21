@@ -586,8 +586,8 @@ async fn every_seeded_service_code_resolves_to_readable_quotas() {
 }
 
 /// RULE: the quota a client plans against for AWS B2B Data Interchange profiles is the
-/// documented five, published under ServiceCode `b2bi` with the `quotaCode` the b2bi
-/// service's own `ServiceQuotaExceededException` names.
+/// documented five, published under ServiceCode `b2bi` with the `QuotaCode` AWS's own
+/// published catalog names that quota under.
 #[tokio::test]
 async fn the_b2bi_profile_quota_publishes_the_documented_limit() {
     let engine = emulator();
@@ -605,12 +605,12 @@ async fn the_b2bi_profile_quota_publishes_the_documented_limit() {
     // `CreateProfile` in the b2bi model: "You can have up to five customer profiles".
     let profiles = quotas
         .iter()
-        .find(|quota| quota["QuotaCode"] == json!("ProfilesPerAccount"))
+        .find(|quota| quota["QuotaCode"] == json!("L-05F6A9EF"))
         .unwrap_or_else(|| panic!("case b2bi: expected a profiles quota, got {quotas:?}"));
     assert_eq!(
         profiles["Value"].as_f64(),
         Some(5.0),
-        "case b2bi/ProfilesPerAccount: expected the documented limit of five profiles, \
+        "case b2bi/L-05F6A9EF: expected the documented limit of five profiles, \
          got {profiles}"
     );
     assert_eq!(
@@ -621,9 +621,9 @@ async fn the_b2bi_profile_quota_publishes_the_documented_limit() {
     assert_eq!(
         profiles["QuotaArn"],
         json!(format!(
-            "arn:aws:servicequotas:us-east-1:{ACCOUNT}:b2bi/ProfilesPerAccount"
+            "arn:aws:servicequotas:us-east-1:{ACCOUNT}:b2bi/L-05F6A9EF"
         )),
-        "case b2bi/ProfilesPerAccount: the ARN must name the pair, got {profiles}"
+        "case b2bi/L-05F6A9EF: the ARN must name the pair, got {profiles}"
     );
 }
 

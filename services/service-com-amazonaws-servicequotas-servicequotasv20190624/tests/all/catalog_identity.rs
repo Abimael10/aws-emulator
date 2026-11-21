@@ -70,6 +70,9 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("airflow", "L-78AC1883"),
     ("amplify", "L-2FC3A2FA"),
     ("amplify", "L-A6716586"),
+    ("amplifyuibuilder", "L-D500C0BA"),
+    ("amplifyuibuilder", "L-E4AD9560"),
+    ("aoss", "L-2005AF7E"),
     ("apigateway", "L-01C8A9E0"),
     ("apigateway", "L-05295E0B"),
     ("apigateway", "L-154598D1"),
@@ -145,6 +148,8 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("application-autoscaling", "L-A2AD6458"),
     ("application-autoscaling", "L-B395C81B"),
     ("application-autoscaling", "L-D75CA9D2"),
+    ("application-signals", "L-D898488F"),
+    ("application-signals", "L-EB837E0B"),
     ("appmesh", "L-33E8F9C9"),
     ("appmesh", "L-50F6C35A"),
     ("appmesh", "L-606A910B"),
@@ -162,6 +167,8 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("apprunner", "L-69F96A0C"),
     ("apprunner", "L-A0B46A0C"),
     ("apprunner", "L-F7ADEB8C"),
+    ("appstudio", "L-45B0D852"),
+    ("appstudio", "L-B07DC829"),
     ("athena", "L-076245C0"),
     ("athena", "L-07F4444F"),
     ("athena", "L-0F303755"),
@@ -192,6 +199,10 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("athena", "L-FC5F6546"),
     ("athena", "L-FD9D80C2"),
     ("athena", "L-FE3693EE"),
+    ("auditmanager", "L-0255B75F"),
+    ("auditmanager", "L-724DD74D"),
+    ("auditmanager", "L-8935A6F1"),
+    ("auditmanager", "L-BEA222D4"),
     ("autoscaling", "L-05CB8B12"),
     ("autoscaling", "L-1312BBBF"),
     ("autoscaling", "L-6B80B8FA"),
@@ -201,6 +212,19 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("autoscaling", "L-CEE5E714"),
     ("autoscaling", "L-F0B00D71"),
     ("autoscaling", "L-F786B2E5"),
+    ("autoscaling-plans", "L-6538FA5E"),
+    ("autoscaling-plans", "L-7FAA513E"),
+    ("autoscaling-plans", "L-BD401546"),
+    ("aws-marketplace", "L-68F80CEA"),
+    ("aws-marketplace", "L-96311249"),
+    ("aws-marketplace", "L-CD4DC1E4"),
+    ("aws-marketplace", "L-DF8B8977"),
+    ("aws-mcp", "L-7A518ECF"),
+    ("aws-mcp", "L-E5DA7401"),
+    ("b2bi", "L-05F6A9EF"),
+    ("b2bi", "L-19B5E505"),
+    ("b2bi", "L-CD5D2786"),
+    ("b2bi", "L-E15C983E"),
     ("backup", "L-366B61FD"),
     ("backup", "L-514878B6"),
     ("backup", "L-7705D2CB"),
@@ -255,6 +279,10 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
     ("cassandra", "L-F41E662B"),
     ("cassandra", "L-F90953AC"),
     ("cassandra", "L-FDBA801F"),
+    ("chime", "L-398B2BD6"),
+    ("chime", "L-B6F2C623"),
+    ("chime", "L-F147F728"),
+    ("chime", "L-FE9F896D"),
     ("cloud9", "L-5D26553C"),
     ("cloud9", "L-65F36924"),
     ("cloud9", "L-8ECD6BDB"),
@@ -1179,10 +1207,14 @@ const CITED_AWS_QUOTA_CODES: &[(&str, &str)] = &[
 ];
 
 /// The `(ServiceCode, QuotaCode)` pairs this catalog cites from a SERVICE'S OWN API
-/// rather than from AWS's minted namespace: `b2bi` reports its profile limit under
-/// `ProfilesPerAccount` in its own `ServiceQuotaExceededException`, so a client that
-/// reads that refusal finds the quota here under the code the refusal named.
-const CITED_SERVICE_QUOTA_CODES: &[(&str, &str)] = &[("b2bi", "ProfilesPerAccount")];
+/// rather than from AWS's minted namespace: `notifications-contacts` reports its email
+/// contact limit under `EmailContactsPerAccount` in its own
+/// `ServiceQuotaExceededException`, so a client that reads that refusal finds the quota
+/// here under the code the refusal named. Such a code happens to be the DESCRIPTIVE
+/// code of the quota's name too, so the sweep below counts it as cited rather than as a
+/// stand-in.
+const CITED_SERVICE_QUOTA_CODES: &[(&str, &str)] =
+    &[("notifications-contacts", "EmailContactsPerAccount")];
 
 /// The service codes AWS's inventory lists for which this catalog carries no display
 /// name it can cite, and which therefore report their code (see the tail of
@@ -1639,7 +1671,11 @@ async fn a_minted_code_this_catalog_does_not_cite_resolves_nothing() {
         ("iot", "RulesPerAccount", "Rules per account"),
         ("states", "StateMachinesPerAccount", "State machines per account"),
         // The one row whose code the SERVICE's own refusal publishes.
-        ("b2bi", "ProfilesPerAccount", "Customer profiles per account"),
+        (
+            "notifications-contacts",
+            "EmailContactsPerAccount",
+            "Email contacts per account",
+        ),
     ] {
         let case = format!("{service_code}/{quota_code}");
         let quota = client
