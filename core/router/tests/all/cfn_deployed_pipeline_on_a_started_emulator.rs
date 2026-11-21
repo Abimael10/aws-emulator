@@ -302,6 +302,18 @@ impl Started {
         (&self.key, &self.secret)
     }
 
+    /// The HTTPS client that trusts the certificate THIS start published — the certificate every
+    /// listener of that process presents, its data port and each per-resource listener alike.
+    ///
+    /// `pub(crate)` for the reason [`Started`] is: a suite that has to DIAL an address this
+    /// emulator PUBLISHED (a per-resource listener, which is not the address this harness knows
+    /// the emulator by — [`Self::authority`]) with no credential at all, as a client handed a
+    /// domain name does, needs this client rather than one of its own, which would trust nothing
+    /// that start signed.
+    pub(crate) fn client(&self) -> &reqwest::blocking::Client {
+        &self.client
+    }
+
     /// `request` signed with the published key pair for `signing_name`, as an SDK signs it.
     fn signed(
         &self,
