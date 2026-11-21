@@ -352,6 +352,48 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         self.trust_stores.contains_key(id)
     }
 
+    /// Apply an UPDATE to the trust store `id` names, and report the record as it now
+    /// stands — or `None` when the store holds no such trust store.
+    ///
+    /// Every member a trust store update can submit is OPTIONAL, so each `None` argument
+    /// leaves the stored value exactly as it was: what is replaced is what the request
+    /// stated, and only that. `bundle` carries the source the request named together with
+    /// the certificate count READ out of it, because the two are one fact about one object —
+    /// a record never holds a source whose certificates were counted in another bundle.
+    ///
+    /// The write versions the trust store the way every other conditional write of this
+    /// service versions its resource: `LastModifiedTime` becomes `now`, a fresh version token
+    /// is minted so the token this caller matched on no longer satisfies an `If-Match`, and
+    /// the trust store goes back to [`TRUST_STORE_STATUS_PENDING`] with a new propagation
+    /// deadline — the trust store it now describes has to reach the edge locations before it
+    /// validates client certificates again. The mint happens only once the record is known to
+    /// be there, so a version token is never spent on a trust store that is not.
+    pub fn apply_trust_store_update(
+        &mut self,
+        id: &str,
+        bundle: Option<(CaCertificatesBundleSource, i32)>,
+        use_client_certificate_ocsp_endpoint: Option<bool>,
+        now: SystemTime,
+    ) -> Option<&StoredTrustStore> {
+        if !self.trust_stores.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.trust_stores.get_mut(id)?;
+        if let Some((source, number_of_ca_certificates)) = bundle {
+            stored.bundle_source = source;
+            stored.number_of_ca_certificates = number_of_ca_certificates;
+        }
+        if let Some(use_ocsp) = use_client_certificate_ocsp_endpoint {
+            stored.use_client_certificate_ocsp_endpoint = use_ocsp;
+        }
+        stored.last_modified_time = now;
+        stored.etag = etag;
+        stored.status = TRUST_STORE_STATUS_PENDING.to_string();
+        stored.active_due = now + PROPAGATION_DELAY;
+        Some(stored)
+    }
+
     /// Whether the account already holds a trust store called `name` — what makes a
     /// repeated name a [`trust_store_already_exists`] rather than a second trust store.
     ///

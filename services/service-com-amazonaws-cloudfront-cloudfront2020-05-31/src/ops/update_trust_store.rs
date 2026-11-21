@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTrustStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTrustStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTrustStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Updates a trust store": a CONDITIONAL write of the one record the create persisted,
+//! under the optimistic-concurrency precondition every conditional write of this service
+//! runs under. Every member the request can state beyond the `Id` and the `If-Match` is
+//! OPTIONAL, so each one the request leaves out leaves the stored value exactly as it was
+//! and only what the request stated is replaced
+//! ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::apply_trust_store_update`]).
+//!
+//! `TrustStore$NumberOfCaCertificates` is a property of the bundle's bytes, so a request
+//! that names a new `CaCertificatesBundleSource` has that object READ and its certificates
+//! counted before anything is written: an address this emulator's Amazon S3 holds nothing at
+//! is `EntityNotFound`, an address it may not read is `AccessDenied`, and a source that
+//! addresses no object or whose bytes hold no certificate is `InvalidArgument`
+//! ([`crate::state::ca_certificates_bundle`]). Where NOTHING answers the read — an emulator
+//! assembled with no object store at all — the operation answers the scaffold's 501 instead,
+//! because the caller's bundle is not what is at fault. The stored record therefore never
+//! reports a bundle source whose certificates were counted in another object.
+//!
+//! The refusals are decided in the order the request can be judged in: the `Id` has to name
+//! a stored trust store (`EntityNotFound`, 404), the `If-Match` has to be that record's
+//! current version token — a value that is no version token at all is
+//! `InvalidIfMatchVersion` (400) and a well-formed token that is not the current one is
+//! `PreconditionFailed` (412) — and only then is a bundle read. NO refusal writes anything,
+//! so a caller that re-reads the trust store and retries with the version it reports lands.
+//!
+//! An accepted update is a WRITE: it versions the record afresh, so the token the caller
+//! matched on no longer satisfies an `If-Match`, and the trust store goes back to the
+//! non-terminal status with a new propagation deadline, because what it now describes has to
+//! reach the edge locations before it validates client certificates again — the CLOCK owes it
+//! the terminal status, exactly as it owes one to the trust store a create just stored.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +98,12 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::{
+    CaCertificatesBundle, ComAmazonawsCloudfrontCloudfront20200531State, IfMatch,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -150,18 +177,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTrustStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTrustStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTrustStore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+
+        // The request is judged against the record as it stands BEFORE anything is spent on
+        // reading a bundle, so a caller holding a stale version learns that rather than
+        // having an object fetched on its behalf. The guard is dropped with this block: no
+        // state lock is held across the read below.
+        {
+            let mut store = state.lock();
+            // Materialise the propagation the clock already owes, so the version this
+            // precondition is evaluated against is the one a read at this instant reports.
+            store.settle(SystemTime::now());
+            admitted(&store, &input.id, &input.if_match)?;
+        }
+
+        // "The CA certificates bundle source": a source the request names is READ, and the
+        // certificate count the record then reports is the count of certificates in THAT
+        // object — the source and the count are one fact about one object, so they are
+        // carried together into the write. A request naming no source asks for no new
+        // bundle, so nothing is read and the stored count stands.
+        let bundle = match input.ca_certificates_bundle_source {
+            None => None,
+            Some(source) => {
+                match crate::state::resolve_ca_certificates_bundle(ctx, &source).await {
+                    CaCertificatesBundle::Counted(counted) => Some((source, counted)),
+                    // The object store answered that it holds nothing at the address the
+                    // request named, so the entity the request pointed at was not found.
+                    CaCertificatesBundle::Absent => {
+                        return Err(UpdateTrustStoreErrorModeled::EntityNotFound(
+                            crate::state::ca_certificates_bundle_not_found(),
+                        )
+                        .into())
+                    }
+                    // The object store answered that the bundle may not be read, which is not
+                    // a statement about whether it is there.
+                    CaCertificatesBundle::Denied => {
+                        return Err(UpdateTrustStoreErrorModeled::AccessDenied(
+                            crate::state::ca_certificates_bundle_access_denied(),
+                        )
+                        .into())
+                    }
+                    // The source addresses no object at all, the object is empty or past what
+                    // this emulator reads, its bytes hold no certificate, or the store
+                    // answered something no bundle can be read through: either way there is
+                    // no bundle to describe the trust store with, so nothing is written and
+                    // the argument is what is refused.
+                    CaCertificatesBundle::Invalid => {
+                        return Err(UpdateTrustStoreErrorModeled::InvalidArgument(
+                            crate::state::invalid_ca_certificates_bundle(),
+                        )
+                        .into())
+                    }
+                    // NOTHING answered the read: no object store is mounted to ask, or the
+                    // bytes never arrived. The caller's bundle may well be a good one, so the
+                    // request is neither refused as invalid nor applied as a bundle whose
+                    // certificates were never counted — this emulator simply cannot serve the
+                    // operation as assembled, which is what the scaffold's 501 channel states.
+                    CaCertificatesBundle::Unanswered => {
+                        return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                            crate::scaffolded::NotImplemented {
+                                message: crate::state::CA_CERTIFICATES_BUNDLE_UNREAD.to_string(),
+                            },
+                        ))
+                    }
+                }
+            }
+        };
+
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+        // Judged AGAIN, because the bundle read above held no lock: the precondition this
+        // write runs under is the one that holds at the instant of the write, so a trust
+        // store that was deleted or rewritten while its bundle was being read is not written
+        // over.
+        admitted(&store, &input.id, &input.if_match)?;
+
+        let Some(stored) = store.apply_trust_store_update(
+            &input.id,
+            bundle,
+            input.use_client_certificate_ocsp_endpoint,
+            now,
+        ) else {
+            return Err(UpdateTrustStoreErrorModeled::EntityNotFound(
+                crate::state::trust_store_not_found(),
+            )
+            .into());
+        };
+
+        Ok(UpdateTrustStoreOutput {
+            // "The trust store" — the record as it now stands, read back from the store, so
+            // the answer and every later read are the same document.
+            trust_store: Some(stored.to_trust_store()),
+            // "The version identifier for the current version of the trust store": the
+            // freshly minted token, so the version this caller just replaced no longer
+            // satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
+    }
+}
+
+/// Whether a request may write the trust store `id` names, under the `If-Match` it carried.
+///
+/// The two refusals a conditional write of this resource is judged by, in the order it can
+/// be judged in: the id has to name a stored trust store at all — `EntityNotFound` is what
+/// this operation models for an entity it cannot find, and a precondition can only be
+/// checked against a stored version — and the `If-Match` has to be that record's current
+/// version token, where a value that is no version token at all is "the If-Match version is
+/// missing or not valid" and a well-formed token that is not the stored one is a failed
+/// precondition, worded as the resources a caller conditionally rewrites word it. The
+/// `If-Match` member is `@required`, so a request stating none is refused at the request
+/// boundary.
+///
+/// ONE function, called both before and after the bundle read, so the request is judged by
+/// the same rule at the instant it is admitted and at the instant it is written.
+fn admitted(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    id: &str,
+    if_match: &str,
+) -> Result<(), UpdateTrustStoreError> {
+    let Some(stored) = store.trust_stores.get(id) else {
+        return Err(UpdateTrustStoreErrorModeled::EntityNotFound(
+            crate::state::trust_store_not_found(),
+        )
+        .into());
+    };
+    match crate::state::check_if_match(&stored.etag, Some(if_match)) {
+        IfMatch::Current => Ok(()),
+        IfMatch::Invalid => Err(UpdateTrustStoreErrorModeled::InvalidIfMatchVersion(
+            crate::state::invalid_if_match_version(),
+        )
+        .into()),
+        IfMatch::Stale => Err(UpdateTrustStoreErrorModeled::PreconditionFailed(
+            crate::state::precondition_failed(),
+        )
+        .into()),
     }
 }
