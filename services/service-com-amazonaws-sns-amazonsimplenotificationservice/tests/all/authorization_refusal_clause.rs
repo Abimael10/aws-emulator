@@ -191,11 +191,8 @@ fn topic_calls<'a>(queue_arn: &'a str) -> Vec<Call<'a>> {
                 ("ReturnSubscriptionArn", "true"),
             ],
         },
-        Call {
-            operation: "Publish",
-            action: "SNS:Publish",
-            extra: vec![("Message", "probe")],
-        },
+        // The publish row has ONE statement in this suite, beside the action name it performs.
+        publish_call(),
         Call {
             operation: "GetTopicAttributes",
             action: "SNS:GetTopicAttributes",
@@ -736,35 +733,15 @@ async fn an_ungranted_publish_blames_the_identity_based_policy() {
                 set_topic_policy(&emulator, &topic, &document).await;
             }
 
-            let (status, body) = sns_as(
+            publish_is_refused_for_want_of_an_identity_grant(
                 &emulator,
                 &caller.access_key_id,
-                "Publish",
-                &[("TopicArn", &topic), ("Message", "probe")],
+                &caller.reported,
+                &publish_call(),
+                &topic,
+                &case,
             )
             .await;
-            let code = text_of(&body, "Code");
-            assert_eq!(
-                (status, code.as_str()),
-                AUTHORIZATION_ERROR,
-                "case {case:?}: expected the modelled refusal, got {status} / {body}"
-            );
-            let message = text_of(&body, "Message");
-            assert_eq!(
-                message,
-                not_authorized(
-                    &caller.reported,
-                    PUBLISH_ACTION,
-                    &topic,
-                    &no_identity_policy_allows(PUBLISH_ACTION)
-                ),
-                "case {case:?}: expected IAM's default-deny sentence, got {message:?}"
-            );
-            assert!(
-                !message.contains("resource-based"),
-                "case {case:?}: the default-deny sentence must not blame the resource-based \
-                 policy, got {message:?}"
-            );
         }
     }
 }
@@ -791,17 +768,14 @@ async fn a_withdrawn_topic_grant_returns_the_publish_to_the_default_deny_sentenc
             })),
         )
         .await;
-        let publish = [("TopicArn", topic.as_str()), ("Message", "probe")];
-
-        let (status, body) = sns_as(&emulator, &caller.access_key_id, "Publish", &publish).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected the granted publish to be served, got {status} / {body}"
-        );
-        assert!(
-            !text_of(&body, "MessageId").is_empty(),
-            "case {case:?}: expected a MessageId, got {body}"
-        );
+        publish_is_served(
+            &emulator,
+            &caller.access_key_id,
+            &publish_call(),
+            &topic,
+            &case,
+        )
+        .await;
 
         // An empty value removes a policy-valued attribute, so the topic is back to the
         // document SNS generates for one whose owner has set none.
@@ -813,22 +787,219 @@ async fn a_withdrawn_topic_grant_returns_the_publish_to_the_default_deny_sentenc
              {attributes}"
         );
 
-        let (status, body) = sns_as(&emulator, &caller.access_key_id, "Publish", &publish).await;
-        let code = text_of(&body, "Code");
-        assert_eq!(
-            (status, code.as_str()),
-            AUTHORIZATION_ERROR,
-            "case {case:?}: expected the modelled refusal, got {status} / {body}"
-        );
-        assert_eq!(
-            text_of(&body, "Message"),
-            not_authorized(
-                &caller.reported,
-                PUBLISH_ACTION,
+        publish_is_refused_for_want_of_an_identity_grant(
+            &emulator,
+            &caller.access_key_id,
+            &caller.reported,
+            &publish_call(),
+            &topic,
+            &case,
+        )
+        .await;
+    }
+}
+
+/// The publish of ONE message to the topic the request names.
+fn publish_call() -> Call<'static> {
+    Call {
+        operation: "Publish",
+        action: PUBLISH_ACTION,
+        extra: vec![("Message", "probe")],
+    }
+}
+
+/// Both operations that perform [`PUBLISH_ACTION`], each with the parameters it carries
+/// beside `TopicArn`: the SNS action namespace publishes no action of its own for the batch
+/// call, so the two are authorized — and refused — under the same action name ("Actions
+/// defined by Amazon Simple Notification Service", IAM Service Authorization Reference).
+fn publishing_calls() -> Vec<Call<'static>> {
+    vec![
+        publish_call(),
+        Call {
+            operation: "PublishBatch",
+            action: PUBLISH_ACTION,
+            extra: vec![
+                ("PublishBatchRequestEntries.member.1.Id", "one"),
+                ("PublishBatchRequestEntries.member.1.Message", "probe"),
+            ],
+        },
+    ]
+}
+
+/// The call `call` on `topic`, signed by `access_key_id`, asserted to be SERVED: a published
+/// message is answered with the id SNS minted for it, whichever operation carried it.
+async fn publish_is_served(
+    emulator: &Emulator,
+    access_key_id: &str,
+    call: &Call<'_>,
+    topic: &str,
+    case: &str,
+) {
+    let (status, body) = sns_as(
+        emulator,
+        access_key_id,
+        call.operation,
+        &parameters(call, topic),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the granted {} to be served, got {status} / {body}",
+        call.operation
+    );
+    assert!(
+        !text_of(&body, "MessageId").is_empty(),
+        "case {case:?}: expected a MessageId from the served {}, got {body}",
+        call.operation
+    );
+}
+
+/// The call `call` on `topic`, signed by `access_key_id`, asserted to be refused with IAM's
+/// default-deny sentence naming `principal` — the clause that blames the identity-based
+/// policies and says nothing about a resource-based one.
+async fn publish_is_refused_for_want_of_an_identity_grant(
+    emulator: &Emulator,
+    access_key_id: &str,
+    principal: &str,
+    call: &Call<'_>,
+    topic: &str,
+    case: &str,
+) {
+    let (status, body) = sns_as(
+        emulator,
+        access_key_id,
+        call.operation,
+        &parameters(call, topic),
+    )
+    .await;
+    let code = text_of(&body, "Code");
+    assert_eq!(
+        (status, code.as_str()),
+        AUTHORIZATION_ERROR,
+        "case {case:?}: expected the modelled refusal, got {status} / {body}"
+    );
+    let message = text_of(&body, "Message");
+    assert_eq!(
+        message,
+        not_authorized(
+            principal,
+            call.action,
+            topic,
+            &no_identity_policy_allows(call.action)
+        ),
+        "case {case:?}: expected IAM's default-deny sentence, got {message:?}"
+    );
+    assert!(
+        !message.contains("resource-based"),
+        "case {case:?}: a refusal for want of an identity grant must not blame the \
+         resource-based policy, got {message:?}"
+    );
+}
+
+/// RULE: a grant belongs to the principal it names — of three principals on ONE topic, the
+/// one the topic's policy names and the one its own identity policy grants each publish,
+/// while the one neither names is refused with the clause naming the IDENTITY-based policies,
+/// because what IT is missing is a permission of its own; adding a statement that names it
+/// beside the other principal's serves the identical call.
+#[tokio::test]
+async fn a_publish_grant_authorizes_only_the_principal_it_names() {
+    for form in [Form::RoleSession, Form::User] {
+        // One emulator per form, so each form's principals are made under their own names.
+        let emulator = emulator();
+        let topic = given_topic(&emulator, "publish-grant-attribution").await;
+        let by_topic_policy = given_caller(&emulator, Form::User, "granted-by-the-topic").await;
+        let by_identity_policy =
+            given_caller(&emulator, Form::User, "granted-by-its-own-policy").await;
+        let ungranted = given_caller(&emulator, form, "granted-by-nothing").await;
+
+        // The topic's policy names ONE of the three, replacing the document SNS generates for
+        // a topic whose owner has set none.
+        let names_one_principal = policy(json!({
+            "Effect": "Allow",
+            "Principal": {"AWS": by_topic_policy.entity_arn},
+            "Action": PUBLISH_ACTION,
+            "Resource": topic,
+        }));
+        set_topic_policy(&emulator, &topic, &names_one_principal).await;
+        // Another holds the same permission in its OWN documents, which name no principal.
+        grant(
+            &emulator,
+            &by_identity_policy,
+            &policy(json!({
+                "Effect": "Allow",
+                "Action": "sns:Publish",
+                "Resource": topic,
+            })),
+        )
+        .await;
+
+        for call in publishing_calls() {
+            let case = format!("{form:?} with {} asked", call.operation);
+            publish_is_served(
+                &emulator,
+                &by_topic_policy.access_key_id,
+                &call,
                 &topic,
-                &no_identity_policy_allows(PUBLISH_ACTION)
-            ),
-            "case {case:?}: expected IAM's default-deny sentence, got {body}"
-        );
+                &format!("{case}: the principal the topic policy names"),
+            )
+            .await;
+            publish_is_served(
+                &emulator,
+                &by_identity_policy.access_key_id,
+                &call,
+                &topic,
+                &format!("{case}: the principal its own policy grants"),
+            )
+            .await;
+            publish_is_refused_for_want_of_an_identity_grant(
+                &emulator,
+                &ungranted.access_key_id,
+                &ungranted.reported,
+                &call,
+                &topic,
+                &format!("{case}: the principal neither document names"),
+            )
+            .await;
+        }
+
+        // The refusal was the absence of a grant of ITS OWN and nothing else: a statement
+        // naming the ungranted caller, beside the one naming the other principal, serves the
+        // identical calls.
+        set_topic_policy(
+            &emulator,
+            &topic,
+            &json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": by_topic_policy.entity_arn},
+                        "Action": PUBLISH_ACTION,
+                        "Resource": topic,
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"AWS": ungranted.entity_arn},
+                        "Action": PUBLISH_ACTION,
+                        "Resource": topic,
+                    },
+                ],
+            })
+            .to_string(),
+        )
+        .await;
+        for call in publishing_calls() {
+            publish_is_served(
+                &emulator,
+                &ungranted.access_key_id,
+                &call,
+                &topic,
+                &format!(
+                    "{form:?} asking {} once the topic policy names it too",
+                    call.operation
+                ),
+            )
+            .await;
+        }
     }
 }
