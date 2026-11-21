@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateUserJourney
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateUserJourney`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateUserJourney::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Edits a user journey stored inside the system the request names: every member the
+//! request carries beyond the pair that addresses the journey replaces what the record
+//! held, and the answer is projected from the record every later read answers from. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +147,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateUserJourney` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateUserJourneyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateUserJourney"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateUserJourneyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the resiliencehub service store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A journey lives WITHIN its system, so the parent is resolved first: a `systemArn`
+        // naming no stored system is reported as that missing system rather than as a
+        // missing journey, because the caller addressed a system that is not there. Both
+        // addressing members' lengths and patterns are modelled, so a malformed one is
+        // already refused with a 400 `ValidationException` before this handler runs.
+        let Some(system) = store.systems.get_mut(&input.system_arn) else {
+            return Err(UpdateUserJourneyErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::SYSTEM_RESOURCE_TYPE,
+                    &input.system_arn,
+                ),
+            )
+            .into());
+        };
+        // A `userJourneyId` the addressed system does not hold names nothing to edit: a 404
+        // rather than a 200 that would claim an edit the store never took. An id is only
+        // meaningful within its own system, so another system's journey is not found here
+        // either, and nothing about it changes.
+        let Some(record) = system.user_journeys.get_mut(&input.user_journey_id) else {
+            return Err(UpdateUserJourneyErrorModeled::ResourceNotFoundException(
+                crate::state::user_journey_not_found(&input.user_journey_id),
+            )
+            .into());
+        };
+
+        // Every member beyond the pair that addresses the journey is optional, and an absent
+        // one means "leave it alone": the value the caller sent becomes the journey's, and a
+        // member the caller omitted keeps what it held. Neither the `userJourneyId` nor
+        // `createdAt` is a member of this request, so neither can change here.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        // The policy a journey is held to is named by ARN, and this request's `policyArn`
+        // becomes the journey's, the same way the create stored the one it was given.
+        if let Some(policy_arn) = input.policy_arn {
+            record.policy_arn = Some(policy_arn);
+        }
+        // The record changed, so this call is the instant it was last updated. `createdAt`
+        // stays where it was: the journey was not created again.
+        record.updated_at = now;
+
+        // The body comes from the record's own `UserJourney` projection, the one path
+        // `CreateUserJourney` and `GetUserJourney` answer from as well, so a later read
+        // cannot disagree with what this call reported.
+        Ok(UpdateUserJourneyOutput {
+            user_journey: record.to_user_journey(),
+        })
     }
 }

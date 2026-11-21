@@ -41,5 +41,10 @@ hex = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so the crate's single integration-test
+# target picks up every suite without a hand-maintained list.
+automod = { workspace = true }
+
 [lints]
 workspace = true
