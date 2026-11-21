@@ -404,7 +404,7 @@ fn expand_at(
         // this expansion has already minted and the parent's own, which the caller stores
         // after these: the hierarchy is as bounded as every other write to the store.
         let minting = nested.len() + 1;
-        if store.change_sets.len() + minting >= super::MAX_CHANGE_SETS
+        if store.held_change_sets() + minting >= super::MAX_CHANGE_SETS
             || store.change_sets_of(&stack.stack_id).count() + minting
                 >= super::MAX_CHANGE_SETS_PER_STACK
         {
@@ -549,6 +549,8 @@ fn record(
         hooks: Vec::new(),
         parent_change_set_id: Some(parent.change_set_id.to_string()),
         root_change_set_id: Some(parent.root_change_set_id.to_string()),
+        // Nothing has discarded this record: a delete is what sets that.
+        discarded: false,
     }
 }
 

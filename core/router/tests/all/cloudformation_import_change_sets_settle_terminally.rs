@@ -535,14 +535,15 @@ async fn an_import_that_resolves_settles_the_change_set_the_stack_and_its_resour
         }
 
         // The IMPORT change set, named as `cdk import` names one on a stack it already
-        // deployed. The change set the deploy left is no longer a plan that tool can clear
-        // away where it used one: it has been EXECUTED, so it is the record of what was
-        // applied and `DeleteChangeSet` for it is refused on that execution status.
+        // deployed. The change set the deploy left is the record of what was applied, and that
+        // record is one the tool clears away before it plans again: `DeleteChangeSet` discards
+        // it, which is what frees the name it deployed under.
         let adopted: Vec<&str> = entries.iter().map(|(logical_id, _)| *logical_id).collect();
         let template = template_body(row.own_queue, &adopted);
         if row.through_a_change_set {
-            let (status, refused) = cloudformation(
+            cloudformation_ok(
                 &router,
+                case,
                 "DeleteChangeSet",
                 &[
                     member("StackName", row.stack_name),
@@ -550,19 +551,20 @@ async fn an_import_that_resolves_settles_the_change_set_the_stack_and_its_resour
                 ],
             )
             .await;
+            let (status, gone) = cloudformation(
+                &router,
+                "DescribeChangeSet",
+                &[
+                    member("StackName", row.stack_name),
+                    member("ChangeSetName", "deploy"),
+                ],
+            )
+            .await;
             assert_eq!(
-                (
-                    status,
-                    opt_element(&refused, "Code").unwrap_or_default(),
-                    opt_element(&refused, "Message").unwrap_or_default(),
-                ),
-                (
-                    400,
-                    "InvalidChangeSetStatus".to_string(),
-                    "Cannot delete ChangeSet in execution status EXECUTE_COMPLETE".to_string(),
-                ),
-                "case {case:?}: the change set that deployed the stack is no longer a \
-                 discardable plan, got {status} with {refused}"
+                (status, opt_element(&gone, "Code").unwrap_or_default()),
+                (404, "ChangeSetNotFound".to_string()),
+                "case {case:?}: the discarded record must read back as not found, got {status} \
+                 with {gone}"
             );
         }
         let mut members = vec![

@@ -81,6 +81,8 @@
 //! sets one `CreateChangeSet` expands into bounded by
 //! [`nested_change_set::MAX_NESTED_CHILDREN`] and [`nested_change_set::MAX_NESTED_DEPTH`]
 //! inside those same ceilings,
+//! [`MAX_DISCARDED_CHANGE_SETS_RETAINED`] records a `DeleteChangeSet` discarded
+//! (oldest-first, since such a record counts against no ceiling a caller can plan under),
 //! [`template::MAX_EXPANDED_ENTRIES`] / [`template::MAX_EXPANDED_BYTES`] /
 //! [`template::MAX_EXPANSION_DEPTH`] on what a template's transforms may expand to (the
 //! expansion is multiplicative, so the submitted body's own bound does not bound it),
@@ -743,6 +745,15 @@ pub const MAX_LIVE_STACKS: usize = 5 * MAX_STACKS;
 /// loop cannot grow the store without limit. Chosen, like every count here; it sits far
 /// above any client workflow.
 pub const MAX_DELETED_STACKS_RETAINED: usize = 200;
+
+/// The most DISCARDED change-set records this emulator keeps, oldest reclaimed first.
+///
+/// A record a `DeleteChangeSet` discarded is kept only so that an attempt to execute the plan
+/// it already applied is answered on that execution ([`StoredChangeSet::discarded`]), and it
+/// counts against no bound a caller can plan under, so this is what keeps a caller that deploys
+/// and discards in a loop from growing the store without limit. Chosen, like every count here;
+/// it sits far above any client workflow, which holds one such record per deployment of a stack.
+pub const MAX_DISCARDED_CHANGE_SETS_RETAINED: usize = 200;
 
 /// The most events one stack retains, oldest evicted first.
 ///
@@ -3170,17 +3181,57 @@ impl ComAmazonawsCloudformationCloudformationState {
             .collect();
         self.change_sets
             .retain(|change_set| live.contains(change_set.stack_id.as_str()));
+        self.reclaim_discarded_change_sets();
+    }
+
+    /// Drop the oldest DISCARDED change-set records past
+    /// [`MAX_DISCARDED_CHANGE_SETS_RETAINED`].
+    ///
+    /// Retention, not a mutation a caller asked for, exactly like [`Self::reclaim_retired_stacks`]:
+    /// such a record is over the bound the moment the delete that pushed the count past it was
+    /// made, whether or not anybody called. The records a stack still HOLDS are never touched —
+    /// those are bounded where they are planned ([`MAX_CHANGE_SETS_PER_STACK`]).
+    fn reclaim_discarded_change_sets(&mut self) {
+        let discarded = self
+            .change_sets
+            .iter()
+            .filter(|change_set| change_set.discarded)
+            .count();
+        if discarded <= MAX_DISCARDED_CHANGE_SETS_RETAINED {
+            return;
+        }
+        // Oldest first, which is the order the records are stored in.
+        let mut over = discarded - MAX_DISCARDED_CHANGE_SETS_RETAINED;
+        self.change_sets.retain(|change_set| {
+            if change_set.discarded && over > 0 {
+                over -= 1;
+                return false;
+            }
+            true
+        });
     }
 
     /// The change sets of one stack, in creation order: what `ListChangeSets` reports and
     /// what [`MAX_CHANGE_SETS_PER_STACK`] bounds.
+    ///
+    /// The records the stack still HOLDS: one a `DeleteChangeSet` has discarded
+    /// ([`StoredChangeSet::discarded`]) is reported by no read of the stack's change sets, and
+    /// counts against no bound, so the name it carried is free for a new plan.
     pub fn change_sets_of<'a>(
         &'a self,
         stack_id: &'a str,
     ) -> impl Iterator<Item = &'a StoredChangeSet> {
         self.change_sets
             .iter()
-            .filter(move |change_set| change_set.stack_id == stack_id)
+            .filter(move |change_set| change_set.stack_id == stack_id && !change_set.discarded)
+    }
+
+    /// How many change sets this store still HOLDS, which is what [`MAX_CHANGE_SETS`] bounds.
+    pub fn held_change_sets(&self) -> usize {
+        self.change_sets
+            .iter()
+            .filter(|change_set| !change_set.discarded)
+            .count()
     }
 
     /// Resolve the `ChangeSetName` input member, which CloudFormation accepts as either a
@@ -3189,14 +3240,28 @@ impl ComAmazonawsCloudformationCloudformationState {
     ///
     /// Scoped to the Region the request was signed for, like the stacks the change sets
     /// belong to ([`Self::resolve`]): a change set of another Region's stack names nothing
-    /// here.
+    /// here. A record a `DeleteChangeSet` has discarded names nothing here either
+    /// ([`Self::discarded_change_set`] is the one lookup that asks for one).
     pub fn resolve_change_set(
         &self,
         region: &str,
         name_or_id: &str,
         stack_name_or_id: Option<&str>,
     ) -> Option<&StoredChangeSet> {
-        self.change_set_position(region, name_or_id, stack_name_or_id)
+        self.change_set_position(region, name_or_id, stack_name_or_id, Records::Held)
+            .map(|index| &self.change_sets[index])
+    }
+
+    /// The DISCARDED record a request names, for the one caller that must still answer on one:
+    /// `ExecuteChangeSet`, which refuses a change set whose execution was already carried out
+    /// on that execution rather than as a change set that never existed.
+    pub fn discarded_change_set(
+        &self,
+        region: &str,
+        name_or_id: &str,
+        stack_name_or_id: Option<&str>,
+    ) -> Option<&StoredChangeSet> {
+        self.change_set_position(region, name_or_id, stack_name_or_id, Records::Discarded)
             .map(|index| &self.change_sets[index])
     }
 
@@ -3207,7 +3272,7 @@ impl ComAmazonawsCloudformationCloudformationState {
         name_or_id: &str,
         stack_name_or_id: Option<&str>,
     ) -> Option<&mut StoredChangeSet> {
-        self.change_set_position(region, name_or_id, stack_name_or_id)
+        self.change_set_position(region, name_or_id, stack_name_or_id, Records::Held)
             .map(|index| &mut self.change_sets[index])
     }
 
@@ -3220,14 +3285,17 @@ impl ComAmazonawsCloudformationCloudformationState {
         region: &str,
         name_or_id: &str,
         stack_name_or_id: Option<&str>,
+        records: Records,
     ) -> Option<usize> {
+        let considered = |change_set: &StoredChangeSet| match records {
+            Records::Held => !change_set.discarded,
+            Records::Discarded => change_set.discarded,
+        };
         // The change set's own ARN identifies it; a stack named beside it must be the
         // stack it belongs to, or the pair names nothing.
-        if let Some(index) = self
-            .change_sets
-            .iter()
-            .rposition(|change_set| change_set.change_set_id == name_or_id)
-        {
+        if let Some(index) = self.change_sets.iter().rposition(|change_set| {
+            change_set.change_set_id == name_or_id && considered(change_set)
+        }) {
             let change_set = &self.change_sets[index];
             // The change set is this Region's only where the stack it plans changes for
             // is.
@@ -3242,7 +3310,9 @@ impl ComAmazonawsCloudformationCloudformationState {
         let stack_name_or_id = stack_name_or_id?;
         let stack_id = self.resolve(region, stack_name_or_id)?.stack_id.clone();
         self.change_sets.iter().rposition(|change_set| {
-            change_set.stack_id == stack_id && change_set.change_set_name == name_or_id
+            change_set.stack_id == stack_id
+                && change_set.change_set_name == name_or_id
+                && considered(change_set)
         })
     }
 

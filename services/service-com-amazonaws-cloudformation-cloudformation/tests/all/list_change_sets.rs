@@ -615,9 +615,9 @@ async fn a_change_set_that_is_no_longer_held_is_no_longer_listed() {
          {body}"
     );
 
-    // "When you execute a change set, CloudFormation deletes all other change sets
-    // associated with the stack": the plans they describe go, so the only record the stack
-    // still holds is the executed one, reporting its execution.
+    // Executing a change set SUPERSEDES the stack's other plans rather than taking their
+    // records away: every record the stack holds is still listed, the superseded one in the
+    // modelled OBSOLETE execution status and the executed one reporting its execution.
     let (status, body) = call(
         &router,
         "ExecuteChangeSet",
@@ -637,15 +637,21 @@ async fn a_change_set_that_is_no_longer_held_is_no_longer_listed() {
     let summaries = wire_summaries(&body);
     assert_eq!(
         listed_names(&summaries),
-        vec!["cs-list-gone-a".to_string()],
-        "case \"a change set superseded by an execution\": only the executed record is still \
-         held, got {body}"
+        vec!["cs-list-gone-a".to_string(), "cs-list-gone-c".to_string()],
+        "case \"a change set superseded by an execution\": both records are still held, got \
+         {body}"
     );
     assert_eq!(
-        summaries[0].execution_status.as_deref(),
-        Some(execution_status::EXECUTE_COMPLETE),
+        summaries
+            .iter()
+            .map(|summary| summary.execution_status.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(execution_status::EXECUTE_COMPLETE),
+            Some(execution_status::OBSOLETE),
+        ],
         "case \"a change set superseded by an execution\": the executed one reports its \
-         execution, got {body}"
+         execution and the superseded one reports OBSOLETE, got {body}"
     );
 
     let (status, body) =

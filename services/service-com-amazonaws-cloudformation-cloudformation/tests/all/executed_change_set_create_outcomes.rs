@@ -405,15 +405,17 @@ async fn an_executed_create_change_set_settles_the_stack_it_left_in_review() {
             row.case
         );
         // "Preserve the state of previously provisioned resources when an operation fails":
-        // the member reports the FLAG the request stated, so it reads `true` for the
-        // execution that stated it and `false` where the change set's own failure ACTION kept
-        // the failed state instead — a different member of a different request, however alike
-        // the two behave.
-        let expected_flag = if row.disable_rollback == Some("true") {
-            "true"
-        } else {
-            "false"
-        };
+        // the member reports the FLAG the execution ran under, and a change set's
+        // `OnStackFailure` states that flag — "DO_NOTHING … is equivalent to specifying true
+        // for the DisableRollback parameter to the ExecuteChangeSet API operation" — so it
+        // reads `true` both where the execution stated the flag itself and where the change
+        // set stated the equivalent.
+        let expected_flag =
+            if row.disable_rollback == Some("true") || row.on_stack_failure == Some("DO_NOTHING") {
+                "true"
+            } else {
+                "false"
+            };
         assert_eq!(
             xml_text(&settled, "DisableRollback").as_deref(),
             Some(expected_flag),

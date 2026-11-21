@@ -2,20 +2,23 @@
 
 //! What becomes of a stack's OTHER change sets when one of them is executed.
 //!
-//! RULE: executing a change set TAKES AWAY the other outstanding plans of the stack it
-//! belongs to — "when you execute a change set, CloudFormation deletes all other change sets
-//! associated with the stack because they aren't valid for the updated stack" — so each such
-//! record stops being addressable: `DescribeChangeSet` for it is answered with the modelled
-//! `ChangeSetNotFound` and `ListChangeSets` no longer lists it. Only a PLAN goes: a change set
-//! whose own execution has begun carries the record of the change the stack took rather than a
-//! plan for one, so it stays describable and listed, and another stack's change sets are not
-//! this stack's plans at all.
+//! RULE: executing a change set SUPERSEDES the other outstanding plans of the stack it belongs
+//! to — each was computed against the configuration the execution replaces, so none of them can
+//! be executed any more, which the model's `ExecutionStatus` reports as `OBSOLETE` ("a change
+//! set might be ... in an OBSOLETE state because the stack was already updated"). The RECORD
+//! stays: `DescribeChangeSet` still resolves it in that status, `ListChangeSets` still lists
+//! it, an execution of it is refused with the modelled `InvalidChangeSetStatus` naming that
+//! status rather than answered not-found, and a caller may discard it with `DeleteChangeSet`.
+//! Only a PLAN is superseded: a change set whose own execution has begun carries the record of
+//! the change the stack took rather than a plan for one, a creation whose outcome left no plan
+//! at all keeps the status that outcome gave it, and another stack's change sets are not this
+//! stack's plans at all.
 //!
-//! The table below spans the states a sibling can be in when the execution runs — a plan
-//! ready to execute (two shapes of it), a creation whose outcome left nothing to execute, a
-//! creation still in flight — and the second phase covers a stack whose plans a FIRST
-//! execution had already taken away, so the recorded call this suite was written for is one
-//! row of it. Every read goes through the awsQuery wire.
+//! The table below spans the states a sibling can be in when the execution runs — a plan ready
+//! to execute (two shapes of it), a creation whose outcome left nothing to execute, a creation
+//! still in flight — and the second phase covers a stack a FIRST execution had already
+//! superseded the plans of, so the recorded call this suite was written for is one row of it.
+//! Every read goes through the awsQuery wire.
 
 use service_com_amazonaws_cloudformation_cloudformation::state::{
     change_set_status, execution_status, status,
@@ -42,8 +45,9 @@ fn adding(logical_id: &str) -> String {
     )
 }
 
-/// One sibling of the executed change set: the state its own creation leaves it in, which is
-/// what the rows span — every one of them is an outstanding PLAN, so every one of them goes.
+/// One sibling of the executed change set: the state its own creation leaves it in, and the
+/// `(ChangeSetStatus, ExecutionStatus)` pair the execution that supersedes it must leave it
+/// reporting.
 struct Sibling {
     case: &'static str,
     name: &'static str,
@@ -52,8 +56,15 @@ struct Sibling {
     adds: Option<&'static str>,
     /// Whether its creation has concluded BEFORE the execution that supersedes it: a
     /// creation still in flight is computing its plan against the configuration that
-    /// execution supersedes.
+    /// execution supersedes, so the conclusion it is already headed for is what supersedes it.
     creation_concluded: bool,
+    /// The `ChangeSetStatus` it reports once the execution has run and everything the store
+    /// owes has been materialised.
+    settles_to_status: &'static str,
+    /// The `ExecutionStatus` it reports then — `OBSOLETE` for every plan the execution
+    /// supersedes, and the status its own creation's outcome gave it for one that left no plan
+    /// to supersede.
+    settles_to_execution: &'static str,
 }
 
 fn siblings() -> Vec<Sibling> {
@@ -63,24 +74,34 @@ fn siblings() -> Vec<Sibling> {
             name: "superseded-ready",
             adds: Some("C"),
             creation_concluded: true,
+            settles_to_status: change_set_status::CREATE_COMPLETE,
+            settles_to_execution: execution_status::OBSOLETE,
         },
         Sibling {
             case: "a second plan ready to execute, adding a resource of its own",
             name: "superseded-ready-other",
             adds: Some("D"),
             creation_concluded: true,
+            settles_to_status: change_set_status::CREATE_COMPLETE,
+            settles_to_execution: execution_status::OBSOLETE,
         },
         Sibling {
             case: "a creation whose outcome left nothing to execute",
             name: "superseded-no-changes",
             adds: None,
             creation_concluded: true,
+            // Its creation FAILED, so there was never a plan for the execution to supersede:
+            // the record keeps what its own outcome gave it.
+            settles_to_status: change_set_status::FAILED,
+            settles_to_execution: execution_status::UNAVAILABLE,
         },
         Sibling {
             case: "a creation still in flight when the execution ran",
             name: "superseded-in-flight",
             adds: Some("E"),
             creation_concluded: false,
+            settles_to_status: change_set_status::CREATE_COMPLETE,
+            settles_to_execution: execution_status::OBSOLETE,
         },
     ]
 }
@@ -124,31 +145,46 @@ async fn described(
     )
 }
 
-/// Assert that `change_set` is no longer a change set of `stack`: the read is refused with the
-/// modelled `ChangeSetNotFound`, and so is a call asking for it to be executed.
-async fn assert_taken_away(router: &MultiServiceRouter, case: &str, change_set: &str, stack: &str) {
-    for (what, (code, body)) in [
+/// Assert that `change_set` of `stack` is still the record the execution left and that nothing
+/// can execute it any more: the refusal is the modelled `InvalidChangeSetStatus`, reporting the
+/// `ExecutionStatus` where the execution superseded a plan and the `ChangeSetStatus` where the
+/// creation's own outcome left nothing to execute.
+async fn assert_superseded(router: &MultiServiceRouter, sibling: &Sibling, stack: &str) {
+    let case = sibling.case;
+    let (reported_status, reported_execution, change_set_id) =
+        described(router, case, sibling.name, stack).await;
+    assert_eq!(
+        (reported_status.as_str(), reported_execution.as_str()),
+        (sibling.settles_to_status, sibling.settles_to_execution),
+        "case {case:?}: expected ({:?}, {:?}), got ({reported_status:?}, {reported_execution:?})",
+        sibling.settles_to_status,
+        sibling.settles_to_execution
+    );
+    let expected_message = if sibling.settles_to_status == change_set_status::CREATE_COMPLETE {
+        format!(
+            "ChangeSet [{change_set_id}] cannot be executed in its current execution status of \
+             [{}]",
+            sibling.settles_to_execution
+        )
+    } else {
+        format!(
+            "ChangeSet [{change_set_id}] cannot be executed in its current status of [{}]",
+            sibling.settles_to_status
+        )
+    };
+    let (code, body) = execute_change_set(router, sibling.name, Some(stack)).await;
+    assert_eq!(
+        (code, refusal(&body)),
         (
-            "DescribeChangeSet",
-            describe_change_set(router, change_set, Some(stack)).await,
+            400,
+            (
+                "InvalidChangeSetStatus".to_string(),
+                expected_message.clone()
+            ),
         ),
-        (
-            "ExecuteChangeSet",
-            execute_change_set(router, change_set, Some(stack)).await,
-        ),
-    ] {
-        assert_eq!(
-            code, 404,
-            "case {case:?}: expected {what} of a superseded plan to be refused, got {code} \
-             {body}"
-        );
-        let (reported_code, _) = refusal(&body);
-        assert_eq!(
-            reported_code, "ChangeSetNotFound",
-            "case {case:?}: expected {what} to answer ChangeSetNotFound, got {reported_code:?} \
-             {body}"
-        );
-    }
+        "case {case:?}: expected the execution to be refused with {expected_message:?}, got \
+         {code} {body}"
+    );
 }
 
 /// The change set names `ListChangeSets` reports for one stack.
@@ -159,7 +195,7 @@ async fn listed(router: &MultiServiceRouter, stack: &str) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn executing_one_change_set_takes_away_its_siblings() {
+async fn executing_one_change_set_supersedes_its_siblings() {
     let (router, engine) = router_with_engine();
     let stack = "superseded-siblings";
     let elsewhere = "superseded-siblings-other";
@@ -244,18 +280,51 @@ async fn executing_one_change_set_takes_away_its_siblings() {
          {executed_execution:?}"
     );
 
-    // ...and every other plan of the stack is gone, whatever state its own creation left it
-    // in.
+    // ...and every other plan of the stack is superseded: still there, in the status that says
+    // nothing can execute it any more.
     for sibling in &table {
-        assert_taken_away(&router, sibling.case, sibling.name, stack).await;
+        assert_superseded(&router, sibling, stack).await;
     }
 
-    // The only record the stack still holds is the one that was executed.
+    // Every record the stack holds is still listed, the executed one among them.
+    let mut names = listed(&router, stack).await;
+    names.sort();
+    let mut expected: Vec<String> = table
+        .iter()
+        .map(|sibling| sibling.name.to_string())
+        .chain(["executed-set".to_string()])
+        .collect();
+    expected.sort();
     assert_eq!(
-        listed(&router, stack).await,
-        vec!["executed-set".to_string()],
-        "expected the executed change set to be the stack's only remaining record"
+        names, expected,
+        "expected every change set of the stack to stay listed, got {names:?}"
     );
+
+    // A superseded plan is a record a caller may discard, and discarding it takes only that
+    // record.
+    let discarded = table[0].name;
+    let (code, body) = call(
+        &router,
+        "DeleteChangeSet",
+        &[
+            member("ChangeSetName", discarded),
+            member("StackName", stack),
+        ],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "a superseded plan is discardable, got {code} {body}"
+    );
+    let (code, body) = describe_change_set(&router, discarded, Some(stack)).await;
+    assert_eq!(
+        (code, refusal(&body).0),
+        (404, "ChangeSetNotFound".to_string()),
+        "expected the discarded record to read back as not found, got {code} {body}"
+    );
+    for sibling in table.iter().skip(1) {
+        assert_superseded(&router, sibling, stack).await;
+    }
 
     // The other stack's plan is untouched, and still executes.
     let (status_elsewhere, execution_elsewhere, _) = described(
@@ -281,8 +350,9 @@ async fn executing_one_change_set_takes_away_its_siblings() {
     );
 
     // A SECOND execution on the stack: the change set the FIRST execution carried out keeps
-    // the record of that execution rather than going with the plans, and the plan this one
-    // supersedes — created after the first execution — goes the same way its siblings did.
+    // the record of that execution rather than being superseded with the plans, and the plan
+    // this one supersedes — created after the first execution — goes the same way its siblings
+    // did.
     for (name, template) in [("second-set", adding("F")), ("spare-set", adding("G"))] {
         let (code, body) = create_updating_change_set(&router, stack, name, &template).await;
         assert_eq!(code, 200, "the change set {name} must be created, got {code} {body}");
@@ -292,10 +362,16 @@ async fn executing_one_change_set_takes_away_its_siblings() {
     assert_eq!(code, 200, "the second change set must execute, got {code} {body}");
     settle_the_store(&router, &engine).await;
 
-    assert_taken_away(
+    assert_superseded(
         &router,
-        "a plan outstanding when the second execution ran",
-        "spare-set",
+        &Sibling {
+            case: "a plan outstanding when the second execution ran",
+            name: "spare-set",
+            adds: Some("G"),
+            creation_concluded: true,
+            settles_to_status: change_set_status::CREATE_COMPLETE,
+            settles_to_execution: execution_status::OBSOLETE,
+        },
         stack,
     )
     .await;

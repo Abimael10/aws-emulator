@@ -48,6 +48,14 @@ pub struct StackProgress {
     pub carried_through: bool,
 }
 
+/// Which records a change-set lookup considers: the ones the store still HOLDS, or the ones a
+/// `DeleteChangeSet` has DISCARDED ([`StoredChangeSet::discarded`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Records {
+    Held,
+    Discarded,
+}
+
 /// One change set, as this emulator persists it.
 ///
 /// The change set owns the template and the configuration the request submitted;
@@ -126,6 +134,17 @@ pub struct StoredChangeSet {
     /// the one an execution of the hierarchy is driven from. `None` for that change set
     /// itself, which is the root of nothing it reports.
     pub root_change_set_id: Option<String>,
+    /// Whether a `DeleteChangeSet` has DISCARDED this record.
+    ///
+    /// What a delete takes away is the PLAN, and a change set that still is one is taken out of
+    /// the store outright. A change set whose execution has already begun has no plan left to
+    /// take away: the delete is accepted, no read of the stack's change sets reports the record
+    /// any more — so the next deployment may plan under the name it deployed under — and this
+    /// flag is what keeps the execution it carried out answerable, so a request to execute that
+    /// change set is still refused on the execution that happened rather than answered as a
+    /// change set that never existed ("deleting change sets ensures that no one executes the
+    /// wrong change set").
+    pub discarded: bool,
 }
 
 impl StoredChangeSet {
@@ -254,22 +273,49 @@ impl StoredChangeSet {
         )
     }
 
-    /// Whether this change set's `ExecutionStatus` still leaves a PLAN for `DeleteChangeSet`
-    /// to discard.
+    /// Whether `DeleteChangeSet` may discard this record.
     ///
-    /// Deleting a change set discards a plan, so what may be discarded is a change set that
-    /// still is one: `UNAVAILABLE`, which is the status of a plan CloudFormation has not
-    /// finished computing, and `AVAILABLE`, the plan nothing has acted on. Every other
-    /// `ExecutionStatus` the model declares says something has already happened to the plan —
-    /// CloudFormation is applying it, it has been applied (however that application ended), or
-    /// another execution superseded it — and a change set in one of those is a record of what
-    /// became of a plan rather than a plan, which is why the delete is refused on that very
-    /// status ([`cannot_delete_change_set`]) and the record stays exactly where it was.
-    pub fn plan_is_discardable(&self) -> bool {
-        matches!(
-            self.execution_status.as_str(),
-            execution_status::UNAVAILABLE | execution_status::AVAILABLE
-        )
+    /// "Deleting change sets ensures that no one executes the wrong change set": the delete
+    /// takes away the RECORD, whatever became of the plan it describes — one nothing acted on,
+    /// one another execution superseded, and one that was executed, which is what lets a stack's
+    /// next deployment re-use the name the last one deployed under. What CloudFormation will
+    /// not discard is a record it has an operation of its own in flight on, which is the state
+    /// the model's `InvalidChangeSetStatusException` names ("the change set status might be
+    /// CREATE_IN_PROGRESS, or the stack status might be UPDATE_IN_PROGRESS"): a creation whose
+    /// plan it is still computing, and an execution it is applying to the stack right now. Such
+    /// a delete is refused on that very status ([`cannot_delete_change_set`]) and the record
+    /// stays exactly where it was.
+    pub fn record_is_discardable(&self) -> bool {
+        self.creation_settled()
+            && self.execution_status != execution_status::EXECUTE_IN_PROGRESS
+    }
+
+    /// Mark this change set SUPERSEDED by the execution of another change set of its stack.
+    ///
+    /// The plan this change set describes was computed against the configuration that
+    /// execution replaced, so nothing can execute it any more — which is exactly what the
+    /// model's `ExecutionStatus` reports as `OBSOLETE` ("a change set might be ... in an
+    /// OBSOLETE state because the stack was already updated"). The RECORD stays: it is still
+    /// addressable by name and by ARN, `ListChangeSets` still lists it, an execution of it is
+    /// refused on that status rather than answered not-found, and a caller may discard it.
+    ///
+    /// Only a PLAN is superseded. A record whose own execution has begun carries the record of
+    /// a change the stack took rather than a plan for one, and a creation that left no plan at
+    /// all — one that failed, one still computing its own outcome — has nothing to supersede
+    /// yet, so a creation still in flight is superseded by the transition its own conclusion
+    /// is already headed for.
+    pub fn supersede(&mut self) {
+        if self.execution_began() {
+            return;
+        }
+        if self.execution_status == execution_status::AVAILABLE {
+            self.execution_status = execution_status::OBSOLETE.to_string();
+        }
+        if let Some(pending) = &mut self.pending {
+            if pending.execution_status.as_deref() == Some(execution_status::AVAILABLE) {
+                pending.execution_status = Some(execution_status::OBSOLETE.to_string());
+            }
+        }
     }
 
     /// The `InvalidChangeSetStatusException` message `ExecuteChangeSet` answers for this

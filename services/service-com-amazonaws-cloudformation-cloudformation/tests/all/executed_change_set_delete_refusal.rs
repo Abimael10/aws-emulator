@@ -3,21 +3,24 @@
 //! What `DeleteChangeSet` does with a change set its stack has already acted on, driven the
 //! whole way over the awsQuery wire.
 //!
-//! The rule every case here holds the service to: **`DeleteChangeSet` discards a PLAN, so a
-//! change set is deletable only while it still is one — `ExecutionStatus` `UNAVAILABLE` or
-//! `AVAILABLE`. In every other execution status something has already become of the plan
-//! (CloudFormation is applying it, it has been applied however that application ended, or
-//! another execution superseded it), and the call is refused with HTTP 400, the modelled
-//! `InvalidChangeSetStatus` and `Cannot delete ChangeSet in execution status
-//! <ExecutionStatus>` — fixed text followed by the status the change set is in, read off this
-//! service's own state. A refusal writes nothing: the change set is still resolved by a
-//! following `DescribeChangeSet`, in the very status that refused the delete.**
+//! The rule every case here holds the service to: **`DeleteChangeSet` takes away the PLAN. A
+//! change set nothing has executed is taken away outright, and one whose execution has been
+//! carried out has no plan left to take away: the call succeeds, no read of the stack's change
+//! sets reports the record any more — `DescribeChangeSet` for it answers the modelled
+//! `ChangeSetNotFound` — and the one thing the delete makes sure of is that nobody executes
+//! that plan again, so `ExecuteChangeSet` for it is still answered on the execution it carried
+//! out. The only change set CloudFormation will not discard is one it has an operation of its
+//! own in flight on, which it refuses with HTTP 400, the modelled `InvalidChangeSetStatus` and
+//! `Cannot delete ChangeSet in execution status <ExecutionStatus>` — fixed text followed by the
+//! status read off this service's own state. A refusal writes nothing, and a delete that
+//! succeeds takes only the change set it addressed: the stack whose change the executed plan
+//! carried out is left exactly where that execution left it.**
 //!
 //! `change_set_status_refusals.rs` holds the same rule over every `ExecutionStatus` the model
 //! declares, by putting a change set in each; this suite reaches the one the REAL path produces
 //! — the execution the stack carries through — for each change-set type whose execution changes
 //! a stack, addressing the change set both ways a request may (by ARN, and by name beside its
-//! stack), with a plan nothing has executed as the positive control.
+//! stack), with the execution still in flight as the refusing control.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +31,7 @@ use crate::change_set_lifecycle::{
     create_change_set, describe_change_set, execute_change_set, settle_the_store,
 };
 use crate::harness::{call, create_stack, member, router_with_engine, xml_text};
+use crate::stack_lifecycle::describe_stack;
 
 /// The template the stack is created from, and the ones its change sets plan: a second
 /// resource beside the topic, and a renamed topic, so each change set plans a real change.
@@ -73,8 +77,8 @@ fn refused(body: &str) -> (String, String) {
     )
 }
 
-/// The refusal a delete of a change set in `execution` must answer, as CloudFormation words
-/// it.
+/// The refusal a delete of a change set CloudFormation has an operation in flight on must
+/// answer, as CloudFormation words it.
 fn cannot_delete(execution: &str) -> (String, String) {
     (
         "InvalidChangeSetStatus".to_string(),
@@ -144,22 +148,22 @@ async fn awaiting_execution_status(
     }
 }
 
-/// The rule over the status the real path reaches, for each change-set type whose execution
-/// changes a stack and each way a request may address the change set: the executed plan is
-/// refused and stays readable, while a plan nothing has executed is deleted and reads back as
-/// the modelled not-found afterwards.
+/// The rule over the statuses the real path reaches, for each change-set type whose execution
+/// changes a stack and each way a request may address the change set: the execution still being
+/// applied is refused and stays readable, the record of the execution that was carried out is
+/// discarded and reads back as the modelled not-found, and so is a plan nothing executed —
+/// while the stack that execution changed is left exactly where it was.
 #[tokio::test]
-async fn a_change_set_its_stack_has_acted_on_cannot_be_deleted() {
+async fn an_executed_change_sets_record_is_discarded_once_its_execution_has_concluded() {
     for addressed_by in [AddressedBy::Arn, AddressedBy::NameAndStack] {
         // Both change-set types whose execution changes a stack: the one that brings the stack
         // into existence, and the one that updates a stack that already exists.
         for change_set_type in ["CREATE", "UPDATE"] {
             let (router, engine) = router_with_engine();
             let case = format!("{addressed_by:?}/{change_set_type}");
-            let stack_name =
-                format!("delrefuse-{addressed_by:?}-{change_set_type}").to_lowercase();
-            // The template the executed plan carries, and the one the control plans on top of
-            // what that execution left in force.
+            let stack_name = format!("delrecord-{addressed_by:?}-{change_set_type}").to_lowercase();
+            // The template the executed plan carries, and the one the second case plans on top
+            // of what that execution left in force.
             let (applied_template, control_template) = if change_set_type == "UPDATE" {
                 let (code, body) = create_stack(&router, &stack_name, TOPIC, &[]).await;
                 assert_eq!(
@@ -191,39 +195,108 @@ async fn a_change_set_its_stack_has_acted_on_cannot_be_deleted() {
                 "case {case:?}: the change set must execute, got {code} {body}"
             );
 
-            // The change set the stack has acted on: the delete is refused naming its
-            // execution status, and the record is still there afterwards reporting that same
-            // status.
-            let execution = execution_status::EXECUTE_COMPLETE;
-            awaiting_execution_status(&case, &router, &engine, &applied_arn, execution).await;
             let (addressed, stack) = match addressed_by {
-                AddressedBy::Arn => (applied_arn.as_str(), None),
-                AddressedBy::NameAndStack => (applied_name.as_str(), Some(stack_name.as_str())),
+                AddressedBy::Arn => (applied_arn.clone(), None),
+                AddressedBy::NameAndStack => (applied_name.clone(), Some(stack_name.as_str())),
             };
-            let (code, body) = delete_change_set(&router, addressed, stack).await;
-            assert_eq!(
-                code, 400,
-                "case {case:?}: the delete must be refused, got {code} {body}"
-            );
-            assert_eq!(
-                refused(&body),
-                cannot_delete(execution),
-                "case {case:?}: expected the modelled refusal naming the execution status, got \
-                 {body}"
-            );
-            // The refusal did not take effect: the change set is still resolved, in the very
-            // status that refused the call.
+
+            // While the execution is being applied CloudFormation has an operation of its own
+            // in flight on the record: the delete is refused naming that execution status, and
+            // the record is still there afterwards reporting it.
             let (code, body) = describe_change_set(&router, &applied_arn, None).await;
             assert_eq!(
                 (code, xml_text(&body, "ExecutionStatus").unwrap_or_default()),
-                (200, execution.to_string()),
+                (200, execution_status::EXECUTE_IN_PROGRESS.to_string()),
+                "case {case:?}: the execution is in flight with the stack, got {code} {body}"
+            );
+            let (code, body) = delete_change_set(&router, &addressed, stack).await;
+            assert_eq!(
+                code, 400,
+                "case {case:?}: the delete must be refused while the execution is applied, got \
+                 {code} {body}"
+            );
+            assert_eq!(
+                refused(&body),
+                cannot_delete(execution_status::EXECUTE_IN_PROGRESS),
+                "case {case:?}: expected the modelled refusal naming the execution status, got \
+                 {body}"
+            );
+            let (code, body) = describe_change_set(&router, &applied_arn, None).await;
+            assert_eq!(
+                (code, xml_text(&body, "ExecutionStatus").unwrap_or_default()),
+                (200, execution_status::EXECUTE_IN_PROGRESS.to_string()),
                 "case {case:?}: a refused delete leaves the change set exactly where it was, \
                  got {code} {body}"
             );
 
-            // The positive control, on the same stack: a plan nothing has executed — created
-            // against the template the execution above left in force — is deleted cleanly, and
-            // a read of it then answers the modelled not-found naming what the request named.
+            // Once the stack has carried the change through, the record of that execution is
+            // discardable like any other: the delete succeeds and the record is gone.
+            awaiting_execution_status(
+                &case,
+                &router,
+                &engine,
+                &applied_arn,
+                execution_status::EXECUTE_COMPLETE,
+            )
+            .await;
+            let (_, before) = describe_stack(&router, &stack_name).await;
+            let stack_status_before = xml_text(&before, "StackStatus").unwrap_or_default();
+            let (code, body) = delete_change_set(&router, &addressed, stack).await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: the record of a concluded execution is discardable, got {code} \
+                 {body}"
+            );
+            let (code, body) = describe_change_set(&router, &applied_arn, None).await;
+            assert_eq!(
+                (code, refused(&body)),
+                (
+                    404,
+                    (
+                        "ChangeSetNotFound".to_string(),
+                        format!("ChangeSet [{applied_arn}] does not exist"),
+                    ),
+                ),
+                "case {case:?}: expected the discarded record to read back as not found, got \
+                 {body}"
+            );
+            // ...and what the delete made sure of is that nobody executes that plan again: a
+            // request to execute the discarded record is answered on the execution it carried
+            // out rather than as a change set that never existed.
+            let (code, body) = execute_change_set(&router, &applied_arn, None).await;
+            assert_eq!(
+                (code, refused(&body)),
+                (
+                    400,
+                    (
+                        "InvalidChangeSetStatus".to_string(),
+                        format!(
+                            "ChangeSet [{applied_arn}] cannot be executed in its current \
+                             execution status of [{}]",
+                            execution_status::EXECUTE_COMPLETE
+                        ),
+                    ),
+                ),
+                "case {case:?}: expected the execution that happened to refuse the call, got \
+                 {code} {body}"
+            );
+            // The delete took only the change set it addressed: the stack the execution
+            // changed is left in the status that execution left it in.
+            let (code, after) = describe_stack(&router, &stack_name).await;
+            assert_eq!(
+                (code, xml_text(&after, "StackStatus").unwrap_or_default()),
+                (200, stack_status_before.clone()),
+                "case {case:?}: deleting a change set leaves its stack alone, got {code} {after}"
+            );
+            assert!(
+                stack_status_before.ends_with("_COMPLETE"),
+                "case {case:?}: the execution must have carried the change through, got \
+                 {stack_status_before:?}"
+            );
+
+            // The same on the other side of the execution: a plan nothing has executed —
+            // created against the template that execution left in force — is deleted just as
+            // cleanly.
             let control_name = format!("{stack_name}-untouched");
             let control_arn = plan(
                 &case,
@@ -263,13 +336,14 @@ async fn a_change_set_its_stack_has_acted_on_cannot_be_deleted() {
                 "case {case:?}: expected the discarded plan to read back as not found, got \
                  {body}"
             );
-            // ...and the applied plan is still there once the control is gone, so the delete
-            // that succeeded took only what it addressed.
-            let (code, body) = describe_change_set(&router, &applied_arn, None).await;
+            // A plan the delete took away outright has no execution to be answered on, so the
+            // same call is the modelled not-found here.
+            let (code, body) = execute_change_set(&router, &control_arn, None).await;
             assert_eq!(
-                code, 200,
-                "case {case:?}: the applied plan outlives the control's delete, got {code} \
-                 {body}"
+                (code, refused(&body).0),
+                (404, "ChangeSetNotFound".to_string()),
+                "case {case:?}: expected a discarded plan to answer the modelled not-found, \
+                 got {code} {body}"
             );
         }
     }

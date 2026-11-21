@@ -1257,7 +1257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
-        if store.change_sets.len() >= crate::state::MAX_CHANGE_SETS {
+        if store.held_change_sets() >= crate::state::MAX_CHANGE_SETS {
             return Err(CreateChangeSetErrorModeled::LimitExceededException(
                 LimitExceededException {
                     message: Some(format!(
@@ -1581,6 +1581,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // neither a parent nor a root.
             parent_change_set_id: None,
             root_change_set_id: None,
+            // Nothing has discarded this record: a delete is what sets that.
+            discarded: false,
         });
         // ...and the change sets of the children below it, stored beside the parent's own so
         // `DescribeChangeSet` answers for every id the plan reports.

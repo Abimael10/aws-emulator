@@ -4,14 +4,18 @@
 //! IMPLEMENTED: drops the named change set from this service's store, so a later
 //! `DescribeChangeSet` for it answers the modelled 404. Deleting a change set that is not
 //! there succeeds and changes nothing — the model declares no not-found error for this
-//! operation, and the request asks for a state the store is already in. What a delete discards
-//! is a PLAN, so a change set that is no longer only a plan is refused with the modelled
-//! `InvalidChangeSetStatusException` naming the `ExecutionStatus` that refuses it: one whose
-//! creation has not concluded, and one whose execution has begun or whose plan another
-//! execution superseded ([`crate::state::StoredChangeSet::plan_is_discardable`]). A refusal
-//! writes nothing — the change set is still resolved by every read afterwards. The stack
-//! the change set described is never touched: deleting a change set discards a plan, not a
-//! stack.
+//! operation, and the request asks for a state the store is already in. What a delete takes
+//! away is the PLAN: a change set that still is one is taken out of the store outright, and one
+//! whose execution has already begun has no plan left to take away — the delete is accepted,
+//! the record stops being reported by every read of the stack's change sets, and only an
+//! attempt to EXECUTE it is still answered on the execution it carried out
+//! ([`crate::state::StoredChangeSet::discarded`]). The only change set CloudFormation will not
+//! discard is one it has an operation of its own in flight on: a creation whose plan it is
+//! still computing, and an execution it is applying to the stack right now
+//! ([`crate::state::StoredChangeSet::record_is_discardable`]), each refused with the modelled
+//! `InvalidChangeSetStatusException` naming the `ExecutionStatus` it is in. A refusal writes
+//! nothing — the change set is still resolved by every read afterwards. The stack the change
+//! set described is never touched: deleting a change set discards a plan, not a stack.
 //!
 //! ## Shape of an operation
 //!
@@ -172,17 +176,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Ok(DeleteChangeSetOutput {});
         };
-        // CloudFormation will not discard a plan that is no longer only a plan. A change set
-        // whose CREATION has not concluded is one it is still computing, and every
-        // `ExecutionStatus` past the two a plan waits in says something has already happened
-        // to that plan — it is being applied to the stack, it has been applied, or another
-        // execution superseded it ([`crate::state::StoredChangeSet::plan_is_discardable`]) —
+        // What CloudFormation will not discard is a record it has an operation of its own in
+        // flight on: a change set whose CREATION has not concluded is one it is still
+        // computing the plan for, and one whose execution is being applied is a stack
+        // operation under way ([`crate::state::StoredChangeSet::record_is_discardable`]) —
         // which is the state the model's own `InvalidChangeSetStatusException` names ("the
         // change set status might be CREATE_IN_PROGRESS, or the stack status might be
-        // UPDATE_IN_PROGRESS"). The refusal names the execution status the change set is in,
-        // which is its only variable part, and leaves the record exactly where it was: a read
-        // of the change set still resolves it afterwards.
-        if !change_set.creation_settled() || !change_set.plan_is_discardable() {
+        // UPDATE_IN_PROGRESS"). Everything a plan can have BECOME is discardable: the record
+        // of an execution that was carried out, and a plan another execution superseded, are
+        // both taken away, which is what lets a stack's next deployment re-use the change-set
+        // name the last one deployed under. The refusal names the execution status the change
+        // set is in, which is its only variable part, and leaves the record exactly where it
+        // was: a read of the change set still resolves it afterwards.
+        if !change_set.record_is_discardable() {
             return Err(
                 DeleteChangeSetErrorModeled::InvalidChangeSetStatusException(
                     InvalidChangeSetStatusException {
@@ -201,9 +207,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it, so what this discards is the hierarchy below this one as well as this one
         // ([`crate::state::nested_change_set::hierarchy_of`]).
         let hierarchy = crate::state::nested_change_set::hierarchy_of(&store, &change_set_id);
+        // What the delete takes away is the PLAN. A change set that still is one is taken out
+        // of the store outright, so every read of it afterwards is the modelled not-found. One
+        // whose execution has already BEGUN has no plan left to take away: the record of that
+        // execution stops being reported by every read of the stack's change sets, which frees
+        // the name it deployed under for the next plan, while the execution it carried out
+        // stays answerable — "deleting change sets ensures that no one executes the wrong
+        // change set", and the one thing nobody may do with it is execute it again
+        // ([`crate::state::StoredChangeSet::discarded`]).
+        for candidate in &mut store.change_sets {
+            if hierarchy.contains(&candidate.change_set_id) && candidate.execution_began() {
+                candidate.discarded = true;
+            }
+        }
         store
             .change_sets
-            .retain(|candidate| !hierarchy.contains(&candidate.change_set_id));
+            .retain(|candidate| {
+                !hierarchy.contains(&candidate.change_set_id) || candidate.discarded
+            });
 
         Ok(DeleteChangeSetOutput {})
     }

@@ -23,11 +23,13 @@
 //! what it no longer declares is deleted in the owning service.
 //!
 //! The change set itself moves to `EXECUTE_IN_PROGRESS` and reaches `EXECUTE_COMPLETE`
-//! with the stack, and "CloudFormation deletes all other change sets associated with the
-//! stack because they aren't valid for the updated stack" — each of those plans is TAKEN
-//! AWAY, so a later read of one is answered as a change set the stack does not hold and
-//! `ListChangeSets` stops listing it; a change set whose own execution has begun carries the
-//! record of a change the stack took rather than a plan, so it stays addressable. A change
+//! with the stack, and the stack's OTHER outstanding plans are SUPERSEDED: each was computed
+//! against the configuration this execution replaces, so each reports the modelled `OBSOLETE`
+//! execution status ("in an OBSOLETE state because the stack was already updated") while
+//! staying addressable — a read of one still resolves it, `ListChangeSets` still lists it, and
+//! an execution of one is refused on that status. A change set whose own execution has begun
+//! carries the record of a change the stack took rather than a plan, so nothing supersedes it.
+//! A change
 //! set whose creation has not completed, or that has already been executed, is
 //! refused with the modelled
 //! `InvalidChangeSetStatusException`, and a request whose `ClientRequestToken` an operation
@@ -370,14 +372,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
 
-            let change_set = store
-                .resolve_change_set(
-                    &request_region,
-                    &input.change_set_name,
-                    input.stack_name.as_deref(),
-                )
-                .ok_or_else(|| {
-                    ExecuteChangeSetError::from(
+            let change_set = match store.resolve_change_set(
+                &request_region,
+                &input.change_set_name,
+                input.stack_name.as_deref(),
+            ) {
+                Some(change_set) => change_set,
+                None => {
+                    // A change set a `DeleteChangeSet` DISCARDED after its execution had been
+                    // carried out is not a change set the stack holds any more, but the
+                    // execution it carried out is still what refuses this call: the plan it
+                    // names was applied to the stack, which is what the delete made sure
+                    // nobody could do again
+                    // ([`crate::state::StoredChangeSet::discarded`]).
+                    let discarded = store
+                        .discarded_change_set(
+                            &request_region,
+                            &input.change_set_name,
+                            input.stack_name.as_deref(),
+                        )
+                        .and_then(|discarded| discarded.not_executable_refusal());
+                    if let Some(message) = discarded {
+                        return Err(
+                            ExecuteChangeSetErrorModeled::InvalidChangeSetStatusException(
+                                InvalidChangeSetStatusException {
+                                    message: Some(message),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                    return Err(ExecuteChangeSetError::from(
                         ExecuteChangeSetErrorModeled::ChangeSetNotFoundException(
                             ChangeSetNotFoundException {
                                 message: Some(crate::state::change_set_does_not_exist(
@@ -385,8 +410,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 )),
                             },
                         ),
-                    )
-                })?;
+                    ));
+                }
+            };
             // "This parameter can't be specified when the OnStackFailure parameter to the
             // CreateChangeSet API operation was specified": the two say the same thing, so
             // a request that states both is refused rather than one of them being dropped.
@@ -467,11 +493,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // off the change set here with everything else it carries.
             let deletes_the_stack_on_failure =
                 change_set.on_stack_failure.as_deref() == Some(ON_STACK_FAILURE_DELETE);
-            // The same member, kept as the failure ACTION this execution runs under: it is
-            // what the stack then records about the operation that deployed onto it
-            // ([`crate::state::StoredStack::on_failure`]), read off the change set here with
-            // everything else it carries.
-            let on_stack_failure = change_set.on_stack_failure.clone();
             // "DO_NOTHING - if the stack creation fails, do nothing. This is equivalent to
             // specifying true for the DisableRollback parameter." The deployment
             // configuration the change set was created with states the same thing through
@@ -664,13 +685,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(disable_rollback) = disable_rollback {
                 stack.disable_rollback = disable_rollback;
             }
-            // The failure ACTION in force on the stack is now this change set's own
-            // `OnStackFailure` — "determines what action will be taken if stack creation
-            // fails" — and nothing where the change set chose none: what the setting above
-            // reports and what a failure of THIS execution may be deployed onto again are this
-            // execution's statements, not those of the operation before it
-            // ([`crate::state::StoredStack::on_failure`]).
-            stack.on_failure = on_stack_failure;
+            // "DO_NOTHING … is equivalent to specifying true for the DisableRollback parameter
+            // to the ExecuteChangeSet API operation", and `ROLLBACK` to false: a change set's
+            // `OnStackFailure` states the FLAG this execution runs under, which is what the
+            // setting above records and what `Stack$DisableRollback` therefore reports. It is
+            // not the failure ACTION a create's own `OnFailure` records — this operation has no
+            // such member — so the action in force is cleared here, exactly as `UpdateStack`
+            // clears it ([`crate::state::StoredStack::on_failure`]).
+            stack.on_failure = None;
             // `RetainExceptOnCreate` is THIS execution's, under its documented default of
             // `false` for an execution that states it nowhere — the same reading
             // `UpdateStack` gives the member.
@@ -859,22 +881,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ..stack.provenance()
             };
 
-            // "When you execute a change set, CloudFormation deletes all other change sets
-            // associated with the stack because they aren't valid for the updated stack."
-            // The plan each of them describes was computed against the configuration this
-            // execution supersedes, so each is TAKEN AWAY: the record stops being
-            // addressable, so a later read of it is answered as the change set this stack no
-            // longer holds and `ListChangeSets` stops listing it.
+            // What becomes of the stack's OTHER outstanding plans: each was computed against
+            // the configuration this execution supersedes, so none of them can be executed any
+            // more — which is what the model's `ExecutionStatus` reports as `OBSOLETE` ("a
+            // change set might be ... in an OBSOLETE state because the stack was already
+            // updated"). The RECORD stays addressable: a read of it still resolves it in that
+            // status, `ListChangeSets` still lists it, an execution of it is refused on that
+            // status rather than answered not-found, and a caller may discard it
+            // ([`crate::state::StoredChangeSet::supersede`]).
             //
-            // Only a PLAN is taken away. A change set whose own execution has begun carries
-            // the record of a change the stack took rather than a plan for one
-            // (`crate::state::StoredChangeSet::execution_began`), so it stays addressable —
-            // that is what lets a caller ask about the execution it reports.
-            store.change_sets.retain(|other| {
-                other.stack_id != stack_id
-                    || other.change_set_id == change_set_id
-                    || other.execution_began()
-            });
+            // Only a PLAN is superseded. A change set whose own execution has begun carries the
+            // record of a change the stack took rather than a plan for one, and another stack's
+            // change sets are not this stack's plans at all.
+            for other in &mut store.change_sets {
+                if other.stack_id == stack_id && other.change_set_id != change_set_id {
+                    other.supersede();
+                }
+            }
             // The change set is executing now and reaches EXECUTE_COMPLETE with the stack
             // it applied: its execution is finished when the stack operation it started is,
             // so a stack held past this span — by a wait condition nobody has signalled, or

@@ -4,9 +4,9 @@
 //! end to end over the awsQuery wire.
 //!
 //! RULE under test: **the failed state of a create is kept either because the request named
-//! the failure ACTION (`OnFailure=DO_NOTHING`, or an executed change set's own
-//! `OnStackFailure=DO_NOTHING`) or because it stated the FLAG that disables the rollback
-//! (`DisableRollback=true`), and which of the two it used decides what the stack takes next: a
+//! the failure ACTION (`OnFailure=DO_NOTHING`) or because it stated the FLAG that disables the
+//! rollback (`DisableRollback=true`), and which of the two it used decides what the stack takes
+//! next: a
 //! stack kept by the ACTION takes no deployment at all — neither `UpdateStack` nor the
 //! execution of a change set, whatever the request asks — and is refused `400 ValidationError`
 //! "This stack cannot be updated from [&lt;StackStatus&gt;] state because it contains
@@ -43,8 +43,8 @@ use crate::stack_lifecycle::describe_stack;
 /// This service's one wire code for a request it refuses on input grounds.
 const VALIDATION_ERROR: &str = "ValidationError";
 
-/// The failure ACTION that keeps a failed create's state, as `OnFailure` and `OnStackFailure`
-/// both spell it.
+/// The failure ACTION that keeps a failed create's state, as `CreateStack`'s `OnFailure`
+/// spells it.
 const DO_NOTHING: &str = "DO_NOTHING";
 
 /// How long a poll waits for a condition the emulator owes: generous, since nothing here is
