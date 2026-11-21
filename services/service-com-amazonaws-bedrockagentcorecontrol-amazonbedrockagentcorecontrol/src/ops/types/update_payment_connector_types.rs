@@ -22,7 +22,15 @@ pub struct UpdatePaymentConnectorInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#UpdatePaymentConnectorResponse")]
+/// `UpdatePaymentConnectorResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `lastUpdatedAt` targets `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="UpdatePaymentConnector")`), and the derive
+/// does not put that trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct UpdatePaymentConnectorOutput {
     pub payment_connector_id: String,
@@ -34,4 +42,55 @@ pub struct UpdatePaymentConnectorOutput {
     pub status: String,
     pub authorization_url: Option<String>,
 }
+
+agentcore_schema_and_codec!(
+    UpdatePaymentConnectorOutput,
+    UPDATE_PAYMENT_CONNECTOR_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#UpdatePaymentConnectorResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "UpdatePaymentConnectorResponse",
+    (
+        M_PAYMENT_CONNECTOR_ID,
+        payment_connector_id,
+        "paymentConnectorId",
+        0,
+        req,
+        string
+    ),
+    (
+        M_PAYMENT_MANAGER_ID,
+        payment_manager_id,
+        "paymentManagerId",
+        1,
+        req,
+        string
+    ),
+    (M_NAME, name, "name", 2, req, string),
+    (M_TYPE, r#type, "type", 3, req, string),
+    (
+        M_CREDENTIAL_PROVIDER_CONFIGURATIONS,
+        credential_provider_configurations,
+        "credentialProviderConfigurations",
+        4,
+        req,
+        list_of_union(CredentialsProviderConfiguration)
+    ),
+    (
+        M_LAST_UPDATED_AT,
+        last_updated_at,
+        "lastUpdatedAt",
+        5,
+        req,
+        date_time
+    ),
+    (M_STATUS, status, "status", 6, req, string),
+    (
+        M_AUTHORIZATION_URL,
+        authorization_url,
+        "authorizationUrl",
+        7,
+        opt,
+        string
+    ),
+);
 

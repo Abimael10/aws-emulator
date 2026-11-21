@@ -32,6 +32,7 @@ use super::*;
 use super::consent_portals::escaped;
 use crate::ops::types::{
     CreatePaymentConnectorOutput, CredentialsProviderConfiguration, GetPaymentConnectorOutput,
+    UpdatePaymentConnectorOutput,
 };
 
 /// `PaymentConnectorStatus` members this service drives. The enum's full value
@@ -43,6 +44,7 @@ use crate::ops::types::{
 /// authentication ones to a consent that was given and then lapsed, neither of
 /// which anything here makes happen.
 pub const PAYMENT_CONNECTOR_STATUS_CREATING: &str = "CREATING";
+pub const PAYMENT_CONNECTOR_STATUS_UPDATING: &str = "UPDATING";
 pub const PAYMENT_CONNECTOR_STATUS_READY: &str = "READY";
 pub const PAYMENT_CONNECTOR_STATUS_PENDING_AUTHENTICATION: &str = "PENDING_AUTHENTICATION";
 
@@ -96,6 +98,29 @@ pub fn payment_connector_not_found(payment_connector_id: &str) -> ResourceNotFou
     ResourceNotFoundException {
         message: Some(format!(
             "Payment connector not found: {payment_connector_id}"
+        )),
+    }
+}
+
+/// The modelled conflict for a write asked of a payment connector whose own
+/// write is still under way: its create or a previous update has not taken
+/// effect yet, so this one collides with it.
+///
+/// The sentence is fixed and tells the caller what to wait for; its variable
+/// parts are the id the request's path carried, the status the connector is in
+/// right now and the one the clock owes it, each as the enum spells it — the
+/// same tokens every response reports a status in. Worded as its sibling
+/// [`super::consent_portal_status_conflict`] words the same refusal, so one
+/// service does not report a busy resource in two sentences.
+pub fn payment_connector_status_conflict(
+    payment_connector_id: &str,
+    status: &str,
+    settled_status: &str,
+) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Payment connector {payment_connector_id} is in {status} status and cannot be \
+             modified. Retry the request once its status is {settled_status}."
         )),
     }
 }
@@ -230,6 +255,51 @@ impl PaymentConnectorRecord {
         }
     }
 
+    /// Whether every write already asked of this connector has taken effect by
+    /// `now`, which is what decides whether a further write collides with one
+    /// still in flight ([`payment_connector_status_conflict`]).
+    ///
+    /// A connector waiting for an end user's consent is settled: nothing is
+    /// being written to it — the consent is an act at the payment provider — so
+    /// it is reconfigurable, while one the clock still owes a `CREATING` or
+    /// `UPDATING` transition is not.
+    pub fn is_settled(&self, now: SystemTime) -> bool {
+        now >= self.settles_at
+    }
+
+    /// Apply one update's PATCH to the connector: "This operation uses PATCH
+    /// semantics, so you only need to specify the fields you want to change"
+    /// (`smithy_query doc shape=UpdatePaymentConnector`) — a member the request
+    /// carried replaces the stored one, and a member it omitted leaves the
+    /// stored one alone.
+    ///
+    /// The write is not instantaneous: the connector moves to `UPDATING` and the
+    /// clock owes it the status it was in before, exactly as a create's
+    /// transition is owed. That status is the connector's own settled one rather
+    /// than `READY`: a connector whose credentials the service provisions after
+    /// OAuth consent goes back to waiting for that consent, which no update
+    /// grants.
+    pub fn apply_update(
+        &mut self,
+        description: Option<String>,
+        connector_type: Option<String>,
+        credential_provider_configurations: Option<Vec<CredentialsProviderConfiguration>>,
+        now: SystemTime,
+    ) {
+        if description.is_some() {
+            self.description = description;
+        }
+        if let Some(connector_type) = connector_type {
+            self.connector_type = connector_type;
+        }
+        if let Some(configurations) = credential_provider_configurations {
+            self.credential_provider_configurations = configurations;
+        }
+        self.updated_at = now;
+        self.transient_status = PAYMENT_CONNECTOR_STATUS_UPDATING.to_string();
+        self.settles_at = now + PAYMENT_CONNECTOR_SETTLE_DELAY;
+    }
+
     /// The status at `now`: the transient one until the clock owes the
     /// transition, the settled one from then on. No read performs it — it is due
     /// at that instant whether or not anybody looks.
@@ -266,6 +336,26 @@ impl PaymentConnectorRecord {
             created_at: timestamp(self.created_at),
             status: self.status_at(now).to_string(),
             authorization_url: self.reported_authorization_url(now),
+        }
+    }
+
+    /// This connector as `UpdatePaymentConnector`'s response envelope: the
+    /// members `UpdatePaymentConnectorResponse` declares, read off the record the
+    /// update just wrote. That response declares the instant of that write where
+    /// the create's declares the instant of the create, and neither the
+    /// description nor the provision mode, so both are reported by a read of the
+    /// connector.
+    pub fn update_output(&self, now: SystemTime) -> UpdatePaymentConnectorOutput {
+        let created = self.create_output(now);
+        UpdatePaymentConnectorOutput {
+            payment_connector_id: created.payment_connector_id,
+            payment_manager_id: created.payment_manager_id,
+            name: created.name,
+            r#type: created.r#type,
+            credential_provider_configurations: created.credential_provider_configurations,
+            last_updated_at: timestamp(self.updated_at),
+            status: created.status,
+            authorization_url: created.authorization_url,
         }
     }
 
@@ -359,6 +449,15 @@ impl PaymentConnectorStore {
     /// one.
     pub fn get(&self, payment_connector_id: &str) -> Option<&PaymentConnectorRecord> {
         self.connectors.get(payment_connector_id)
+    }
+
+    /// The connector this manager holds under `payment_connector_id`, for a
+    /// write to it.
+    pub fn get_mut(
+        &mut self,
+        payment_connector_id: &str,
+    ) -> Option<&mut PaymentConnectorRecord> {
+        self.connectors.get_mut(payment_connector_id)
     }
 
     /// Whether this manager already holds a connector under

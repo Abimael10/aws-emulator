@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePaymentConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePaymentConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePaymentConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies one PATCH to a payment connector STORED on the payment manager its path
+//! names, and reports the connector as that write left it: the payment provider it
+//! integrates with, the credential provider configuration it authenticates through,
+//! the instant of the write and the status the write puts it in. Every later read of
+//! the connector ([`crate::ops::get_payment_connector`]) comes from the same record.
+//!
+//! A connector is addressed only THROUGH its manager
+//! (`/payments/managers/{paymentManagerId}/connectors/{paymentConnectorId}`), so the
+//! record lives on the manager's own record and the shape every response of it is
+//! rendered from is `crate::state::payment_connectors`.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +198,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePaymentConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePaymentConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePaymentConnector"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdatePaymentConnectorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment manager store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the connector
+        // as that token's update left it, rather than applying the change a second
+        // time: "If this token matches a previous request, the service ignores the
+        // request, but doesn't return an error." The record is held by the manager the
+        // request addresses, because a connector is addressed only through its manager.
+        if let Some(replayed) = store
+            .payment_managers
+            .get(&input.payment_manager_id)
+            .and_then(|manager| {
+                manager
+                    .payment_connectors
+                    .replayed(Self::NAME, input.client_token.as_deref())
+            })
+        {
+            return Ok(replayed.update_output(now));
+        }
+
+        // "Updates an existing payment connector", addressed by the two ids its path
+        // carries: a manager this account holds none under, or a connector that manager
+        // does not hold, is the modelled 404 rather than a connector an update minted.
+        let manager = store
+            .payment_managers
+            .get(&input.payment_manager_id)
+            .ok_or_else(|| {
+                UpdatePaymentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_manager_not_found(&input.payment_manager_id),
+                )
+            })?;
+        let connector = manager
+            .payment_connectors
+            .get(&input.payment_connector_id)
+            .ok_or_else(|| {
+                UpdatePaymentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_connector_not_found(&input.payment_connector_id),
+                )
+            })?;
+
+        // One write at a time: a connector whose own create or update has not taken
+        // effect yet is still being written, so a second writer collides with the first
+        // and is refused the modelled 409 naming the status it found. The refusal is
+        // decided BEFORE anything is written, so a refused writer changes nothing and
+        // the connector settles carrying the values the writer that won submitted.
+        if !connector.is_settled(now) {
+            return Err(UpdatePaymentConnectorErrorModeled::ConflictException(
+                crate::state::payment_connector_status_conflict(
+                    &input.payment_connector_id,
+                    connector.status_at(now),
+                    &connector.settled_status,
+                ),
+            )
+            .into());
+        }
+
+        // The type and the configuration the connector WOULD carry once this PATCH is
+        // applied: a member the request carried replaces the stored one, and a member it
+        // omitted leaves the stored one alone.
+        let connector_type = input
+            .r#type
+            .clone()
+            .unwrap_or_else(|| connector.connector_type.clone());
+        let configurations = input
+            .credential_provider_configurations
+            .clone()
+            .unwrap_or_else(|| connector.credential_provider_configurations.clone());
+
+        // "MANUAL - You provide the credential provider configurations directly", so a
+        // connector that authenticates with the caller's own credentials has to be left
+        // carrying one: a PATCH that would leave it with none is refused in the sentence
+        // this service states an undefined credential provider configuration in, the
+        // same one the create refuses that body with. A connector whose provider the
+        // service provisions after consent carries none of the caller's, so the same
+        // PATCH is served for it.
+        let service_provisioned = connector.provision_mode
+            == crate::state::PAYMENT_CONNECTOR_PROVISION_MODE_QUICK_CREATE;
+        if !service_provisioned && configurations.is_empty() {
+            return Err(UpdatePaymentConnectorErrorModeled::ValidationException(
+                crate::state::member_not_defined(
+                    crate::state::CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE,
+                ),
+            )
+            .into());
+        }
+
+        // The same pairing rule the create enforces — "Provide the member that matches
+        // the payment connector's type" — read against the pair the PATCH would leave
+        // behind, so an update that changes one side without the other is refused: the
+        // other member configures a different vendor's provider, which this connector
+        // could not authenticate through.
+        if let Some(configured) = configurations
+            .iter()
+            .map(crate::state::configured_connector_type)
+            .find(|configured| *configured != connector_type)
+        {
+            return Err(UpdatePaymentConnectorErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    CREDENTIAL_PROVIDER_CONFIGURATIONS_MEMBER,
+                    &format!(
+                        "configures {configured}, which is not this payment connector's type \
+                         {connector_type}"
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // A configuration the REQUEST names has to name a credential provider of this
+        // account's token vault, exactly as the create's does: an ARN that is not one a
+        // provider of this vault reports is a resource referenced by the operation that
+        // does not exist. Nothing is written for it, so no connector reports credentials
+        // that are not there.
+        for configuration in input.credential_provider_configurations.iter().flatten() {
+            let arn = crate::state::configured_credential_provider_arn(configuration);
+            if !crate::state::holds_payment_credential_provider(
+                &store.payment_credential_providers,
+                arn,
+            ) {
+                return Err(
+                    UpdatePaymentConnectorErrorModeled::ResourceNotFoundException(
+                        crate::state::payment_credential_provider_not_found(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The checks above read the stored connector and this handler holds the store's
+        // lock across all of them, so the connector the write applies to is the one they
+        // read — and an update must never report a success for a write that was dropped,
+        // so a miss is a server error rather than a 202 with nothing stored.
+        let Some(manager) = store.payment_managers.get_mut(&input.payment_manager_id) else {
+            return Err(UpdatePaymentConnectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "payment manager {} is no longer held by the payment manager store",
+                        input.payment_manager_id
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(record) = manager
+            .payment_connectors
+            .get_mut(&input.payment_connector_id)
+        else {
+            return Err(UpdatePaymentConnectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "payment connector {} is no longer held by payment manager {}",
+                        input.payment_connector_id, input.payment_manager_id
+                    )),
+                },
+            )
+            .into());
+        };
+        record.apply_update(
+            input.description,
+            input.r#type,
+            input.credential_provider_configurations,
+            now,
+        );
+        let output = record.update_output(now);
+
+        manager.payment_connectors.remember_client_token(
+            Self::NAME,
+            input.client_token,
+            &input.payment_connector_id,
+        );
+
+        Ok(output)
     }
 }
+
+/// `credentialProviderConfigurations` as the request spells it, for the refusal that
+/// names the member (`smithy_query operation=UpdatePaymentConnector`).
+const CREDENTIAL_PROVIDER_CONFIGURATIONS_MEMBER: &str = "credentialProviderConfigurations";
