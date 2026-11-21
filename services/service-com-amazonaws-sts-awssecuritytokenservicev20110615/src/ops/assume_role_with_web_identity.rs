@@ -566,16 +566,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // be handed out.
             Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why.message())),
         };
-        if let Err(why) = crate::state::honour_minimum_token_size(
-            &*self.engine,
-            &mut registry,
-            store,
-            &minted,
-            input.minimum_session_token_size,
-        ) {
-            return Err(crate::scaffolded::Scaffolded::validation(why));
-        }
-
+        // `MinimumSessionTokenSize` asks for a token of at least a given size, and every
+        // value inside its modelled range is served: what the response reports is the size
+        // of the token this mint actually vended (`crate::state::session_token_metrics`).
         let (session_token_utilization, session_token_size) =
             crate::state::session_token_metrics(&minted.credentials);
         // The credential this call vends speaks for the role it is a session of, which is

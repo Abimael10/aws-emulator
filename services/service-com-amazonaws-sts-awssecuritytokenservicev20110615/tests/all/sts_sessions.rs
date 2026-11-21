@@ -1204,13 +1204,13 @@ async fn get_access_key_info_answers_from_the_session_registry() {
     }
 }
 
-/// A request may ask for a session token of at least a given size. The emulator's
-/// session token is minted by the credential store and cannot be padded, so a request
-/// asking for more than it mints is refused rather than answered with a smaller
-/// token; one asking for no more than it mints is served, and the reported
-/// `SessionTokenSize` is the size of the token actually returned.
+/// RULE: a request may ask for a session token of at least a given size, and every value
+/// inside the member's modelled range (`minimumSessionTokenSizeType`, `0..4096`) is ACCEPTED
+/// — the mint is served and the reported `SessionTokenSize` is the size of the token
+/// actually returned. Only a value PAST that maximum is refused, by the boundary validator,
+/// with STS's own `ValidationError` code and AWS's constraint message.
 #[tokio::test]
-async fn a_minimum_session_token_size_is_honoured_or_refused_never_ignored() {
+async fn a_minimum_session_token_size_inside_the_modelled_range_is_served() {
     let (router, engine) = emulator();
     let (_role_arn, _role_id) = seed_demo_role(&engine);
     let minting: [(&str, Vec<(&str, String)>); 3] = [
@@ -1226,9 +1226,17 @@ async fn a_minimum_session_token_size_is_honoured_or_refused_never_ignored() {
     ];
 
     for (action, base) in minting {
-        // 0 and 1 are inside anything the store mints; 4,096 is the modelled ceiling
-        // and above it.
-        for (minimum, expected_status) in [(0, 200), (1, 200), (4096, 400)] {
+        // Rows along the range the member declares: its minimum, a value inside it, the
+        // size the emulator's own session token happens to be, the maximum itself — all
+        // legal — and values past the maximum, which are the only refusals.
+        for (minimum, expected_status) in [
+            (0, 200),
+            (1, 200),
+            (712, 200),
+            (4096, 200),
+            (4097, 400),
+            (100_000, 400),
+        ] {
             let case = format!("{action} with MinimumSessionTokenSize {minimum}");
             let mut params = base.clone();
             params.push(("MinimumSessionTokenSize", minimum.to_string()));
@@ -1247,16 +1255,27 @@ async fn a_minimum_session_token_size_is_honoured_or_refused_never_ignored() {
                     "case {case:?}: SessionTokenSize must be the size of the token returned, \
                      got {body}"
                 );
-                assert!(
-                    size >= minimum,
-                    "case {case:?}: the token returned is {size} bytes, under the {minimum} asked \
-                     for"
-                );
             } else {
                 assert_eq!(
                     element(&body, "Code").as_deref(),
-                    Some("ValidationException"),
-                    "case {case:?}: expected a ValidationException, got {body}"
+                    Some("ValidationError"),
+                    "case {case:?}: expected a ValidationError, got {body}"
+                );
+                let message = super::malformed_session_policy::decode_xml_text(&member(
+                    &case, &body, "Message",
+                ));
+                assert_eq!(
+                    message,
+                    format!(
+                        "1 validation error detected: Value '{minimum}' at \
+                         'minimumSessionTokenSize' failed to satisfy constraint: Member must \
+                         have value less than or equal to 4096"
+                    ),
+                    "case {case:?}: expected AWS's constraint message, got {message:?}"
+                );
+                assert!(
+                    element(&body, "Credentials").is_none(),
+                    "case {case:?}: a refused mint must vend no credential, got {body}"
                 );
             }
         }

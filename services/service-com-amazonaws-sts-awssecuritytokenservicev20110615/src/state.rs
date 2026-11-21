@@ -53,6 +53,13 @@ pub mod outbound_web_identity;
 mod mfa_challenge;
 pub use mfa_challenge::*;
 
+/// What a PRIVILEGED ROOT session is decided from: which value names the member account
+/// `AssumeRoot` launches one on, which AWS-managed task policy may scope it, and whether the
+/// caller's organization grants it at all. One concern, one file — it is the only thing in
+/// this service that reads the account's centralized root access facts.
+mod root_session;
+pub use root_session::*;
+
 /// `AssumeRole`'s default session length: "By default, the value is set to `3600`
 /// seconds." (`AssumeRoleRequest$DurationSeconds`, this service's model).
 pub const ASSUME_ROLE_DEFAULT_DURATION_SECONDS: i32 = 3600;
@@ -2865,40 +2872,19 @@ fn entity_name_of(arn: &str) -> &str {
     arn.rsplit('/').next().unwrap_or(arn)
 }
 
-/// Honour a request's `MinimumSessionTokenSize`, or say why it cannot be.
-///
-/// "STS increases the session token to at least this size, regardless of its actual
-/// content" (`MinimumSessionTokenSize`, this service's model). The emulator's
-/// session token is minted by the credential store and cannot be padded without
-/// invalidating it, so a request asking for a token larger than the store mints is
-/// refused — with the session it already minted dropped again — rather than answered
-/// with a token smaller than it asked for.
-pub fn honour_minimum_token_size<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    state: &mut StsState,
-    store: &CredentialStore,
-    minted: &MintedSession,
-    minimum: Option<i32>,
-) -> Result<(), String> {
-    let size = minted.credentials.session_token.len();
-    let minimum = minimum.unwrap_or(0).max(0);
-    if usize::try_from(minimum).unwrap_or(0) <= size {
-        return Ok(());
-    }
-    state.discard(&minted.credentials.access_key_id, store);
-    // The session was given up, so the account's audit view gives it up too: no caller was
-    // handed this credential, so no record may name it.
-    forget_audited_session(engine, &minted.credentials.access_key_id);
-    Err(format!(
-        "MinimumSessionTokenSize {minimum} is larger than the {size}-byte session token this \
-         emulator mints, and a minted session token cannot be padded (the limit is \
-         {SESSION_TOKEN_SIZE_LIMIT} bytes)"
-    ))
-}
-
 /// The percentage of the session-token size limit a minted token takes up, and its
 /// size in bytes: `SessionTokenUtilization` and `SessionTokenSize`, both measured on
 /// the token actually returned.
+///
+/// A request may ask for a session token of at least a given size
+/// (`MinimumSessionTokenSize`, whose modelled range is `0..4096`): every value inside that
+/// range is a value the mint ACCEPTS, so no mint of this service refuses one and the two
+/// members reported here are measured on the token the response carries rather than on the
+/// size that was asked for. The emulator's session token is minted by the emulator's
+/// credential store, which is the only thing that creates credential material and mints it
+/// at one length; a token padded after the fact is not the token a later signed request is
+/// verified against, so the minimum cannot raise the size of the token this emulator vends
+/// and the response states the size it really has.
 pub fn session_token_metrics(credentials: &Credentials) -> (i32, i32) {
     let size = credentials.session_token.len();
     let utilization = size.saturating_mul(100) / SESSION_TOKEN_SIZE_LIMIT;

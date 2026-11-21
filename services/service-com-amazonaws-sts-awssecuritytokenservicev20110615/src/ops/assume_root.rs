@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssumeRoot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssumeRoot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssumeRoot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Launches a PRIVILEGED ROOT session on a member account of the caller's organization: a
+//! credential that speaks for that account's root user, scoped to the AWS-managed task
+//! policy the request names.
+//!
+//! The request's own values are read first — the target principal has to name an account and
+//! the task policy has to be one AWS publishes for root sessions — and the grant is decided
+//! after them, out of the centralized root access facts the organization record in the IAM
+//! store of the same engine carries ([`crate::state::organization_grants_root_session`]). An
+//! account whose organization does not grant that access is refused `AccessDenied`, the same
+//! answer AWS gives a caller that has not enabled centralized root access.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +188,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssumeRoot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssumeRootErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::{
+            caller_may_call, is_root_task_policy_arn, long_term_identity,
+            not_authorized_message, organization_grants_root_session, resolve_request_caller,
+            target_principal_account, Identity, NewSession, SessionKind, SessionPolicies,
+            ASSUME_ROOT_ACTION, INVALID_TARGET_PRINCIPAL_MESSAGE,
+            INVALID_TASK_POLICY_ARN_MESSAGE, ROOT_SESSION_DEFAULT_DURATION_SECONDS,
+        };
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service has no store on the engine it was mounted on, so it cannot
+            // serve anything. The router builds the one engine that does, so this is
+            // unreachable there.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("AssumeRoot"));
+        };
+        let store = ctx.credential_store();
+        let now = ::std::time::SystemTime::now();
+
+        // The request's own values decide the refusal BEFORE the grant does: which account
+        // the session would be launched on, and whether the task policy is one AWS publishes
+        // for root sessions, are facts about the request, so a malformed one is refused
+        // whatever the caller's standing — and a caller that may not launch a session learns
+        // nothing from the answer about the organization's state.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssumeRoot"))
+        // "The member account principal ARN or account ID"
+        // (`AssumeRootRequest$TargetPrincipal`): the member's own `@length` bound admits far
+        // more than that, so the two spellings of an account are read here
+        // ([`crate::state::target_principal_account`]).
+        let Some(target_account) = target_principal_account(&input.target_principal) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                INVALID_TARGET_PRINCIPAL_MESSAGE,
+            ));
+        };
+        // "You must use one of following Amazon Web Services managed policies to scope root
+        // session actions" (`AssumeRootRequest$TaskPolicyArn`), which is the family AWS
+        // publishes under the root-task path and nothing else
+        // ([`crate::state::is_root_task_policy_arn`]).
+        let task_policy_arn = input.task_policy_arn.arn.clone().unwrap_or_default();
+        if !is_root_task_policy_arn(&task_policy_arn) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                INVALID_TASK_POLICY_ARN_MESSAGE,
+            ));
+        }
+
+        let access_key_id = ::service_common::request_access_key_id(ctx.parts());
+        // The IAM store is read FIRST, and only the facts this decision needs are copied
+        // out, so this handler never holds the IAM lock and the session lock at once: the
+        // identity a long-term key speaks for, and the organization record the centralized
+        // root access grant is read off. A router without IAM mounted holds no organization
+        // at all, which is the position an account outside one is in.
+        let iam = crate::state::iam_state(&*self.engine);
+        let (long_term, organization) = match iam.as_ref() {
+            Some(iam) => {
+                let iam = iam.lock();
+                (
+                    long_term_identity(Some(&iam), &access_key_id),
+                    iam.organization.clone(),
+                )
+            }
+            None => (long_term_identity(None, &access_key_id), None),
+        };
+
+        let mut registry = state.lock();
+        // A caller presenting an expired session credential is refused, never served as
+        // another identity.
+        let caller =
+            resolve_request_caller(&mut registry, &access_key_id, now, store, long_term)
+                .map_err(|expired| {
+                    AssumeRootErrorModeled::ExpiredTokenException(ExpiredTokenException {
+                        message: Some(expired.message()),
+                    })
+                })?;
+
+        // Which STS operations a temporary credential may call is documented per kind; see
+        // `caller_may_call`.
+        if !caller_may_call(caller.kind, Self::NAME) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                crate::state::session_credentials_message(Self::NAME),
+            ));
+        }
+
+        // "Before you can launch a privileged session, you must have centralized root access
+        // in your organization" (`AssumeRoot`), and the session is launched on "a member
+        // account in your organization": both are facts about the ORGANIZATION, read off its
+        // record ([`organization_grants_root_session`]). STS does not disclose which of them
+        // is missing — nor whether the target account exists — so every caller the
+        // organization does not grant a root session is refused in one sentence, naming the
+        // action it is not authorized for and the root principal it asked to assume.
+        let target_root_arn =
+            ::service_common::iam_policy_principals::account_root_arn(&target_account);
+        if !organization_grants_root_session(
+            organization.as_ref(),
+            &caller.identity.account,
+            &target_account,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                not_authorized_message(
+                    &caller.identity.arn,
+                    ASSUME_ROOT_ACTION,
+                    &target_root_arn,
+                ),
+            ));
+        }
+
+        // "The duration, in seconds, of the privileged session … By default, the value is
+        // set to 900 seconds" (`AssumeRootRequest$DurationSeconds`); anything past that
+        // maximum is outside the member's modelled range and was refused before this
+        // handler ran.
+        let duration_seconds = input
+            .duration_seconds
+            .unwrap_or(ROOT_SESSION_DEFAULT_DURATION_SECONDS);
+        // The session speaks for the ROOT USER of the target account — these are "short term
+        // credentials you can use to perform privileged tasks on a member account"
+        // (`AssumeRoot`) — which is the principal `sts:GetCallerIdentity` reports for a root
+        // credential: the account id as the user id, and that account's root ARN.
+        let identity = Identity {
+            user_id: target_account.clone(),
+            account: target_account.clone(),
+            arn: target_root_arn,
+        };
+        // "The identity based policy that scopes the session to the privileged tasks that can
+        // be performed" (`AssumeRootRequest$TaskPolicyArn`) is a scope on the CREDENTIAL, so
+        // it travels with the session exactly as a managed session policy an assume passed
+        // does, and the service deciding a request signed with this credential reads it from
+        // there.
+        let minted = crate::state::mint_session(
+            &*self.engine,
+            store,
+            &mut registry,
+            now,
+            NewSession {
+                // "The source identity specified by the principal that is calling the
+                // AssumeRoot operation" (`AssumeRootResponse$SourceIdentity`): the value the
+                // calling session carries, which this mint carries onto the session it
+                // creates. A long-term caller carries none.
+                source_identity: caller.source_identity.clone(),
+                policies: SessionPolicies {
+                    managed_arns: vec![task_policy_arn],
+                    // The task policy is where this session's permissions come from and
+                    // the only place: the root user it speaks for carries no
+                    // identity-based policy of its own, so a scope holding no readable
+                    // document grants nothing rather than withholding nothing — the
+                    // standing a federated-user session's scope has.
+                    none_means_no_permissions: true,
+                    ..SessionPolicies::default()
+                },
+                ..NewSession::new(identity, SessionKind::AssumedRole, duration_seconds)
+            },
+        );
+        let minted = match minted {
+            Ok(minted) => minted,
+            // The bounded session registry is full of sessions that have not expired, so
+            // this one cannot be recorded — and a credential that is not recorded must not
+            // be handed out.
+            Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why.message())),
+        };
+        // `MinimumSessionTokenSize` asks for a token of at least a given size, and every
+        // value inside its modelled range is served: what the response reports is the size
+        // of the token this mint actually vended (`crate::state::session_token_metrics`).
+        let (session_token_utilization, session_token_size) =
+            crate::state::session_token_metrics(&minted.credentials);
+        let source_identity = minted.session.source_identity.clone();
+        // The class of credential this call vends is what a service deciding a request signed
+        // with it reads (`crate::state::publish_minted_credential`). The session lock is
+        // given up first, so this handler never holds the IAM lock and the session lock at
+        // once.
+        drop(registry);
+        crate::state::publish_minted_credential(iam.as_ref(), &minted, now);
+        Ok(AssumeRootOutput {
+            credentials: Some(minted.credentials),
+            source_identity,
+            session_token_utilization: Some(session_token_utilization),
+            session_token_size: Some(session_token_size),
+        })
     }
 }
