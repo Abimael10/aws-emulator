@@ -180,24 +180,36 @@ async fn update(router: &MultiServiceRouter, cluster_arn: &str, patch: Value) ->
     call(router, "PUT", &path, Some(patch)).await
 }
 
-/// `POST /cluster/{clusterArn}/stop`, asserted accepted.
-async fn stop(router: &MultiServiceRouter, cluster_arn: &str) {
+/// `POST /cluster/{clusterArn}/stop`, asserted accepted, and the status its own response
+/// reports for the cluster.
+async fn stop(router: &MultiServiceRouter, cluster_arn: &str) -> String {
     let path = format!("/cluster/{}/stop", label(cluster_arn));
     let (status, response) = call(router, "POST", &path, None).await;
     assert_eq!(
         status, 200,
         "case {cluster_arn}: StopCluster must answer 200, got {status} with {response}"
     );
+    reported_status(&response)
 }
 
-/// `POST /cluster/{clusterArn}/start`, asserted accepted.
-async fn start(router: &MultiServiceRouter, cluster_arn: &str) {
+/// `POST /cluster/{clusterArn}/start`, asserted accepted, and the status its own response
+/// reports for the cluster.
+async fn start(router: &MultiServiceRouter, cluster_arn: &str) -> String {
     let path = format!("/cluster/{}/start", label(cluster_arn));
     let (status, response) = call(router, "POST", &path, None).await;
     assert_eq!(
         status, 200,
         "case {cluster_arn}: StartCluster must answer 200, got {status} with {response}"
     );
+    reported_status(&response)
+}
+
+/// The `cluster.status` an accepted call reported for the cluster it acted on.
+fn reported_status(response: &Value) -> String {
+    response["cluster"]["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no cluster.status in {response}"))
+        .to_string()
 }
 
 /// How a row gets its cluster out of the settled available status.
@@ -231,10 +243,18 @@ struct Row {
     patch: Value,
 }
 
-/// Build the row's cluster and leave it in the status the row names, returning its ARN.
-async fn arrange(router: &MultiServiceRouter, row: &Row) -> String {
+/// Build the row's cluster and leave it in the status the row names, returning its ARN
+/// and the status the service last REPORTED for it.
+///
+/// A change to a cluster is in flight when the call that started it answers, so that
+/// answer is where its transient status lives; the settled status it leads to is owed
+/// from the same instant, so a call that only REPORTS the cluster afterwards is answered
+/// the settled one. The row's status is therefore taken from the setup's own last answer
+/// — for a transient row the accepted change, for the settled row the read that reports
+/// it — rather than from a `GetCluster` squeezed in before the modification.
+async fn arrange(router: &MultiServiceRouter, row: &Row) -> (String, String) {
     let cluster_arn = create_cluster(router, row.name).await;
-    match row.setup {
+    let reported = match row.setup {
         Setup::WhileUpdating => {
             wait_for_status(router, &cluster_arn, "ACTIVE").await;
             let (status, response) = update(router, &cluster_arn, json!({"shardCapacity": 4})).await;
@@ -243,6 +263,7 @@ async fn arrange(router: &MultiServiceRouter, row: &Row) -> String {
                 "case {:?}: the first modification must be accepted, got {status} with {response}",
                 row.case
             );
+            reported_status(&response)
         }
         Setup::WhileResizing => {
             wait_for_status(router, &cluster_arn, "ACTIVE").await;
@@ -252,24 +273,29 @@ async fn arrange(router: &MultiServiceRouter, row: &Row) -> String {
                 "case {:?}: the first modification must be accepted, got {status} with {response}",
                 row.case
             );
+            reported_status(&response)
         }
         Setup::WhileStopping => {
             wait_for_status(router, &cluster_arn, "ACTIVE").await;
-            stop(router, &cluster_arn).await;
+            stop(router, &cluster_arn).await
         }
         Setup::WhenStopped => {
             wait_for_status(router, &cluster_arn, "ACTIVE").await;
             stop(router, &cluster_arn).await;
-            wait_for_status(router, &cluster_arn, "STOPPED").await;
+            let stopped = wait_for_status(router, &cluster_arn, "STOPPED").await;
+            stopped["status"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {:?}: no status in {stopped}", row.case))
+                .to_string()
         }
         Setup::WhileStarting => {
             wait_for_status(router, &cluster_arn, "ACTIVE").await;
             stop(router, &cluster_arn).await;
             wait_for_status(router, &cluster_arn, "STOPPED").await;
-            start(router, &cluster_arn).await;
+            start(router, &cluster_arn).await
         }
-    }
-    cluster_arn
+    };
+    (cluster_arn, reported)
 }
 
 /// The rows: every way a cluster can be unavailable for a modification, each with its
@@ -368,15 +394,12 @@ fn assert_in_use(case: &str, status: u16, body: &Value, cluster_arn: &str, row: 
 async fn a_modification_of_an_unavailable_cluster_carries_the_fixed_in_use_sentence() {
     let router = emulator();
     for row in rows() {
-        let cluster_arn = arrange(&router, &row).await;
-        let observed = get_cluster(&router, &cluster_arn).await;
+        let (cluster_arn, reported) = arrange(&router, &row).await;
         assert_eq!(
-            observed["status"].as_str(),
-            Some(row.status),
-            "case {:?}: the row's cluster must report {:?} when the modification arrives, got \
-             {observed}",
-            row.case,
-            row.status
+            reported, row.status,
+            "case {:?}: the row's cluster must be reported {:?} when the modification arrives, \
+             got {reported:?}",
+            row.case, row.status
         );
 
         let (status, refused) = update(&router, &cluster_arn, row.patch.clone()).await;
@@ -404,7 +427,7 @@ async fn one_sentence_serves_every_unavailable_cluster() {
     let router = emulator();
     let mut messages = BTreeSet::new();
     for row in rows() {
-        let cluster_arn = arrange(&router, &row).await;
+        let (cluster_arn, _) = arrange(&router, &row).await;
         let (status, refused) = update(&router, &cluster_arn, row.patch.clone()).await;
         assert_eq!(
             status, 409,

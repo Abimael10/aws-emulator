@@ -16,20 +16,26 @@ use crate::ops::types::{
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime};
 
-/// How long after the call that starts it a status transition of a resource this store
-/// ALREADY holds — the change `UpdateCluster`, `StopCluster` or `StartCluster` applies to
-/// a cluster that was already there — becomes due.
+/// How long a change to a resource this store ALREADY holds — what `UpdateCluster`,
+/// `StopCluster` or `StartCluster` applies to a cluster that was already there — stays
+/// in flight for a further call that ACTS on that resource.
 ///
-/// The emulator never sleeps for it: the due instant is stored on the record and
-/// materialised by whoever next looks at that record. The span is non-zero because a
-/// cluster carries one change at a time: while the change it has taken is still in
+/// A cluster carries one change at a time: while the change it has taken is still in
 /// flight the cluster is not available for the next one, which is the refusal
 /// [`ensure_modifiable`], [`ensure_available`], [`ensure_startable`] and
-/// [`ensure_deletable`] answer from the record's own transient status. It is wide enough
-/// that a caller acting right after the change still meets that refusal on a machine
+/// [`ensure_deletable`] answer from the record's own transient status — the status the
+/// call that started the change reported to its own caller. This span is what makes the
+/// outcome of two overlapping changes decided rather than a race: it is wide enough that
+/// a second call arriving right after the first still meets the refusal on a machine
 /// under load.
 ///
-/// A resource a call MINTS has no such span: see [`mint_settle_instant`].
+/// It is NOT how long the transient status is withheld from a call that only REPORTS the
+/// resource: the settled status is owed from the moment the call that started the change
+/// answers, so a reporting operation materialises it however soon it looks
+/// ([`ClusterRecord::settle_reported`]). The emulator never sleeps for either — the
+/// instant is stored on the record.
+///
+/// A resource a call MINTS has no such span at all: see [`mint_in_flight_until`].
 const SETTLE_AFTER: Duration = Duration::from_secs(3);
 
 /// Per-service state for com-amazonaws-docdbelastic-chimeradblionfishservicelambda. A handler reaches it through [`service_state`].
@@ -112,8 +118,11 @@ pub struct ClusterRecord {
     /// created does. Both maintenance operations read the list from here rather than
     /// assuming what it holds.
     pub pending_maintenance_actions: Vec<PendingMaintenanceActionDetails>,
-    /// When the clock owes this cluster a move to `ACTIVE`; `None` once it is settled.
-    pub settles_at: Option<Instant>,
+    /// The change this cluster is carrying, if any: its settled status has been owed
+    /// since the call that started it answered, and a call that ACTS on the cluster still
+    /// meets it in flight until this instant ([`SETTLE_AFTER`]). `None` once the
+    /// transition has been materialised.
+    pub change_in_flight_until: Option<Instant>,
 }
 
 /// One shard of a persisted cluster.
@@ -186,8 +195,9 @@ pub struct SnapshotRecord {
     /// The rest of the source cluster's configuration, captured when the snapshot was
     /// taken, so `RestoreClusterFromSnapshot` can rebuild a cluster from it.
     pub source_config: SourceClusterConfig,
-    /// When the clock owes this snapshot a move to `ACTIVE`; `None` once settled.
-    pub settles_at: Option<Instant>,
+    /// The change this snapshot is carrying; see
+    /// [`ClusterRecord::change_in_flight_until`]. `None` once it has been materialised.
+    pub change_in_flight_until: Option<Instant>,
 }
 
 impl ::std::fmt::Debug for ClusterRecord {
@@ -221,52 +231,80 @@ impl ::std::fmt::Debug for ClusterRecord {
                 "pending_maintenance_actions",
                 &self.pending_maintenance_actions,
             )
-            .field("settles_at", &self.settles_at)
+            .field("change_in_flight_until", &self.change_in_flight_until)
             .finish()
     }
 }
 
 impl ClusterRecord {
-    /// Start a status transition the clock owes a cluster this store already holds: the
-    /// transient `status` now, and the settled status that transient one leads to
-    /// ([`settled_status`]) once [`SETTLE_AFTER`] has elapsed.
+    /// Start a status transition of a cluster this store already holds: the transient
+    /// `status` now, the settled status that transient one leads to ([`settled_status`])
+    /// owed from the moment this call answers, and the change in flight for a further
+    /// call that ACTS on the cluster until [`in_flight_until`].
     pub fn begin_transition(&mut self, status: &str) {
-        self.begin_transition_due_at(status, settle_instant());
+        self.begin_transition_in_flight_until(status, in_flight_until());
     }
 
     /// Start the transition a MINT owes the cluster it has just built: the transient
-    /// `status` for this call's own response, and the settled status due the moment that
-    /// response is answered ([`mint_settle_instant`]), so the next caller to look —
-    /// reader or writer — is answered the settled cluster.
+    /// `status` for this call's own response, and nothing serialised against it
+    /// ([`mint_in_flight_until`]) — a minted cluster carries no change against a previous
+    /// state — so the next caller to look, reader or writer, is answered the settled
+    /// cluster.
     pub fn begin_mint_transition(&mut self, status: &str) {
-        self.begin_transition_due_at(status, mint_settle_instant());
+        self.begin_transition_in_flight_until(status, mint_in_flight_until());
     }
 
     /// The one writer of a transition: the transient status on the cluster and every
-    /// shard it owns, and the instant the settled status it leads to becomes due.
-    fn begin_transition_due_at(&mut self, status: &str, due: Instant) {
+    /// shard it owns, and how long the change stays in flight for a call that acts on it.
+    fn begin_transition_in_flight_until(&mut self, status: &str, in_flight_until: Instant) {
         self.status = status.to_string();
-        self.settles_at = Some(due);
+        self.change_in_flight_until = Some(in_flight_until);
         for shard in &mut self.shards {
             shard.status = status.to_string();
         }
     }
 
-    /// Materialise the transition the clock has already made due. Reporting
-    /// operations call this: it only completes work that was owed at this instant
-    /// whether or not anybody called.
+    /// Materialise the transition for a call that ACTS on this cluster, once the change
+    /// it carries is no longer in flight.
     ///
-    /// Which settled status is owed follows from the transient one the cluster is in
-    /// ([`settled_status`]), so a cluster that is being stopped settles stopped and one
-    /// that is being built, changed or restarted settles available.
-    pub fn settle_due(&mut self) {
-        if self.settles_at.is_some_and(|due| Instant::now() >= due) {
-            let settled = settled_status(&self.status);
-            self.settles_at = None;
-            self.status = settled.to_string();
-            for shard in &mut self.shards {
-                shard.status = settled.to_string();
-            }
+    /// A cluster carries one change at a time, so until then the transient status is what
+    /// such a call is answered from — the state refusal [`ensure_modifiable`],
+    /// [`ensure_available`], [`ensure_startable`] and [`ensure_deletable`] state
+    /// ([`SETTLE_AFTER`]).
+    pub fn settle_unless_in_flight(&mut self) {
+        if self
+            .change_in_flight_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.apply_settled();
+        }
+    }
+
+    /// Materialise the transition for a call that REPORTS this cluster.
+    ///
+    /// The settled status is owed from the moment the call that started the transition
+    /// answered — that response is the one answer which observed the cluster mid
+    /// transition — so by the time any later call arrives the move is one this cluster
+    /// was owed whether or not anybody looked, and a client that polls for the settled
+    /// cluster converges on its FIRST poll whatever its poll interval is. Nothing is
+    /// brought forward: reporting the cluster is the service announcing the change it
+    /// already made.
+    pub fn settle_reported(&mut self) {
+        if self.change_in_flight_until.is_some() {
+            self.apply_settled();
+        }
+    }
+
+    /// Complete the transition: the settled status the transient one leads to
+    /// ([`settled_status`]) on the cluster and on every shard it owns, and no change left
+    /// in flight. A cluster that is being stopped settles stopped, and one that is being
+    /// built, changed or restarted settles available.
+    fn apply_settled(&mut self) {
+        let settled = settled_status(&self.status);
+        self.change_in_flight_until = None;
+        self.status = settled.to_string();
+        for shard in &mut self.shards {
+            shard.status = settled.to_string();
         }
     }
 
@@ -276,8 +314,8 @@ impl ClusterRecord {
     /// The one predicate both status refusals ask ([`ensure_modifiable`] and
     /// [`ensure_available`]), so the two cannot disagree about which cluster is settled
     /// while answering the refusal each of their operations models. Ask it after
-    /// [`settle_due`](Self::settle_due), so the answer is about the status the clock owes
-    /// the cluster rather than the one it was left in.
+    /// [`settle_unless_in_flight`](Self::settle_unless_in_flight), so the answer is about
+    /// the status the cluster is owed rather than the one it was left in.
     pub fn is_settled_available(&self) -> bool {
         self.status == STATUS_ACTIVE
     }
@@ -353,13 +391,32 @@ impl ClusterRecord {
 }
 
 impl SnapshotRecord {
-    /// Materialise the transition the clock has already made due; see
-    /// [`ClusterRecord::settle_due`].
-    pub fn settle_due(&mut self) {
-        if self.settles_at.is_some_and(|due| Instant::now() >= due) {
-            self.settles_at = None;
-            self.status = STATUS_ACTIVE.to_string();
+    /// Materialise the transition for a call that ACTS on this snapshot, once the change
+    /// it carries is no longer in flight; see
+    /// [`ClusterRecord::settle_unless_in_flight`].
+    pub fn settle_unless_in_flight(&mut self) {
+        if self
+            .change_in_flight_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.apply_settled();
         }
+    }
+
+    /// Materialise it for a call that REPORTS this snapshot; see
+    /// [`ClusterRecord::settle_reported`]. Every transition a snapshot takes is started
+    /// by the call that MINTS it, so the two agree here — the readers still go through
+    /// the reporting path, so one rule paces every resource this store holds.
+    pub fn settle_reported(&mut self) {
+        if self.change_in_flight_until.is_some() {
+            self.apply_settled();
+        }
+    }
+
+    /// Complete the transition: the settled status, and no change left in flight.
+    fn apply_settled(&mut self) {
+        self.change_in_flight_until = None;
+        self.status = STATUS_ACTIVE.to_string();
     }
 
     /// The modelled `ClusterSnapshot` for this record.
@@ -457,26 +514,32 @@ pub fn request_region(parts: &::smithy_server_runtime::http::request::Parts) -> 
         .unwrap_or_else(|| "us-east-1".to_string())
 }
 
-/// The instant a transition of a resource this store already holds, started now,
-/// becomes due ([`SETTLE_AFTER`]).
-pub fn settle_instant() -> Instant {
+/// Until when a change to a resource this store ALREADY holds, started now, stays in
+/// flight for a further call that ACTS on that resource ([`SETTLE_AFTER`]).
+///
+/// The settled status the change leads to is owed from the moment the call that started
+/// it answers, so a call that REPORTS the resource materialises the transition however
+/// soon it looks ([`ClusterRecord::settle_reported`]); this instant only decides how long
+/// the resource is unavailable for the NEXT change.
+pub fn in_flight_until() -> Instant {
     Instant::now() + SETTLE_AFTER
 }
 
-/// The instant the transition a MINT starts becomes due: the moment the minting call
-/// answers.
+/// Until when the transition a MINT starts stays in flight: no longer than the minting
+/// call itself.
 ///
-/// A resource a call mints — a cluster, a cluster restored from a snapshot, a snapshot,
-/// a copy of one — reports its transient status (`CREATING`, `COPYING`) in the response
-/// of the call that minted it, which is the one answer that observed the resource mid
-/// transition. Its settled status is owed from the moment that call answers, so the
-/// FIRST caller to look at the record afterwards is answered the settled resource rather
-/// than being made to look again: a client that creates a resource and then polls for it
-/// converges on its first poll, whatever its poll interval is.
+/// A resource a call mints — a cluster, a cluster restored from a snapshot, a snapshot, a
+/// copy of one — reports its transient status (`CREATING`, `COPYING`) in the response of
+/// the call that minted it, which is the one answer that observed the resource mid
+/// transition. It carries no change against a previous state, so nothing is serialised
+/// against it: the FIRST caller to look at the record afterwards — reader or writer — is
+/// answered the settled resource rather than being made to look again, and a client that
+/// creates a resource and then polls for it converges on its first poll, whatever its
+/// poll interval is.
 ///
 /// Nothing is withheld by this: whoever looks next materialises a move that was already
-/// due at that instant whether or not anybody called.
-pub fn mint_settle_instant() -> Instant {
+/// owed at that instant whether or not anybody called.
+pub fn mint_in_flight_until() -> Instant {
     Instant::now()
 }
 
@@ -1047,10 +1110,10 @@ pub const CLUSTER_IN_USE: &str = "Can't perform operation on cluster as it's in 
 /// a second write. That is what makes the outcome of two overlapping modifications
 /// decided rather than a race: exactly one is accepted.
 ///
-/// Call [`ClusterRecord::settle_due`] first, so a cluster whose transition the clock
-/// has already made due is judged by the status it is owed and not by the one it was
-/// left in. The refusal is worded by [`CLUSTER_IN_USE`], so every state-refused
-/// modification of every cluster states it identically.
+/// Call [`ClusterRecord::settle_unless_in_flight`] first, so a cluster whose change is no
+/// longer in flight is judged by the status it is owed and not by the one it was left in.
+/// The refusal is worded by [`CLUSTER_IN_USE`], so every state-refused modification of
+/// every cluster states it identically.
 pub fn ensure_modifiable(record: &ClusterRecord) -> Result<(), ConflictException> {
     if record.is_settled_available() {
         return Ok(());
@@ -1075,8 +1138,8 @@ pub fn ensure_modifiable(record: &ClusterRecord) -> Result<(), ConflictException
 /// `action` is the past participle of the action being refused, so the sentence names
 /// what the caller asked for; the status the cluster is actually in is reported too, so
 /// a caller can tell "not settled yet" from "already stopped". Call
-/// [`ClusterRecord::settle_due`] first, so the judgement is on the status the clock
-/// owes the cluster rather than the one it was left in.
+/// [`ClusterRecord::settle_unless_in_flight`] first, so the judgement is on the status the
+/// cluster is owed rather than the one it was left in.
 pub fn ensure_available(record: &ClusterRecord, action: &str) -> Result<(), ValidationException> {
     if record.is_settled_available() {
         return Ok(());
@@ -1105,8 +1168,8 @@ pub fn ensure_available(record: &ClusterRecord, action: &str) -> Result<(), Vali
 /// service states this one as fixed text that interpolates nothing — not the cluster, not
 /// the status it is in.
 ///
-/// Call [`ClusterRecord::settle_due`] first, so a cluster whose stop the clock has
-/// already made due is judged by the status it is owed rather than the one it was left in.
+/// Call [`ClusterRecord::settle_unless_in_flight`] first, so a cluster whose stop is no
+/// longer in flight is judged by the status it is owed rather than the one it was left in.
 pub fn ensure_startable(record: &ClusterRecord) -> Result<(), ValidationException> {
     if record.status == STATUS_STOPPED {
         return Ok(());
@@ -1135,8 +1198,8 @@ pub const UNDELETABLE_STATUSES: &[&str] = &[STATUS_STOPPING, STATUS_STOPPED];
 /// models for a request it will not act on (`smithy_query(query="operation",
 /// operation="DeleteCluster")`) — and the service states it as one sentence whose only
 /// variable part is the status the cluster is stored in. Ask it after
-/// [`ClusterRecord::settle_due`] and BEFORE anything is removed, so the judgement is on
-/// the status the clock owes the cluster and a refused delete leaves the record
+/// [`ClusterRecord::settle_unless_in_flight`] and BEFORE anything is removed, so the
+/// judgement is on the status the cluster is owed and a refused delete leaves the record
 /// readable in that status.
 pub fn ensure_deletable(record: &ClusterRecord) -> Result<(), ValidationException> {
     if !UNDELETABLE_STATUSES.contains(&record.status.as_str()) {

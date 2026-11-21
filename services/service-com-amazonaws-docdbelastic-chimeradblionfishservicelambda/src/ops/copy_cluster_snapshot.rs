@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Completes the transition the clock already made due on the snapshot being
         // read, which was owed at this instant whether or not anybody called.
-        source.settle_due();
+        source.settle_unless_in_flight();
         let cluster_arn = source.cluster_arn.clone();
         let cluster_creation_time = source.cluster_creation_time.clone();
         let admin_user_name = source.admin_user_name.clone();
@@ -263,9 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_security_group_ids,
             tags,
             source_config,
-            // Reported COPYING by this response, with ACTIVE owed by the clock from the
-            // moment it answers: the next caller to look sees the copy settled.
-            settles_at: Some(state::mint_settle_instant()),
+            // Reported COPYING by this response, with ACTIVE owed from the moment it
+            // answers: the next caller to look sees the copy settled.
+            change_in_flight_until: Some(state::mint_in_flight_until()),
         };
 
         let snapshot = record.as_snapshot();

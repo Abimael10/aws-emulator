@@ -478,12 +478,15 @@ async fn a_cluster_that_is_not_yet_settled_is_not_modifiable() {
             status, 200,
             "case {case:?}: the setup start must be accepted, got {status} with {starting}"
         );
-        let restarting = get_cluster(&router, &cluster_arn).await;
+        // The restart is in flight when `StartCluster` answers, so its own response is
+        // where the transient status lives; the available status it leads to is owed from
+        // that same instant, so a `GetCluster` here would report the settled cluster and
+        // the modification below would no longer meet a change in flight.
         assert_eq!(
-            restarting["status"].as_str(),
+            starting["cluster"]["status"].as_str(),
             Some("STARTING"),
             "case {case:?}: a cluster the service is still restarting reports STARTING, got \
-             {restarting}"
+             {starting}"
         );
 
         let (status, refused) = update(&router, &cluster_arn, patch.clone()).await;

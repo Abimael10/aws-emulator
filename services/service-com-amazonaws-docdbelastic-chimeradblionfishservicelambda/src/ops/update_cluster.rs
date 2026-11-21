@@ -5,10 +5,10 @@
 //! keeps its previous value — and returns the updated cluster. The change is visible
 //! to the next `GetCluster`.
 //!
-//! An applied change leaves the cluster in a transient `UPDATING` status until the
-//! clock settles it back to `ACTIVE`, and a cluster is modifiable only from a settled
-//! status: a request arriving while a change is still in flight is refused with
-//! `ConflictException` (409) rather than applied on top of it.
+//! An applied change leaves the cluster in a transient `UPDATING` status, with the
+//! available status owed from the moment this call answers, and a cluster is modifiable
+//! only from a settled status: a request arriving while a change is still in flight is
+//! refused with `ConflictException` (409) rather than applied on top of it.
 //!
 //! ## Shape of an operation
 //!
@@ -236,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        record.settle_due();
+        record.settle_unless_in_flight();
         // A cluster takes one modification at a time: while the change a previous call
         // started is still in flight the cluster is not in a modifiable status, so this
         // request is refused instead of overwriting it. The store is locked across the
@@ -294,9 +294,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             applied = true;
         }
-        // An applied update is reported UPDATING and the clock owes it ACTIVE. A
-        // request that carried no updatable member changed nothing, so it moves no
-        // status and re-arms no transition.
+        // An applied update is reported UPDATING, with the available status owed from the
+        // moment this call answers: the first caller to REPORT the cluster is answered the
+        // settled one, while a second modification arriving before the change has been
+        // reported meets it still in flight. A request that carried no updatable member
+        // changed nothing, so it moves no status and re-arms no transition.
         if applied {
             record.begin_transition(state::STATUS_UPDATING);
         }

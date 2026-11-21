@@ -400,8 +400,17 @@ async fn deleting_a_cluster_in_a_status_that_admits_it_still_succeeds() {
         for shape in &shapes() {
             let case = format!("{} while {suffix}", shape.case);
             let name = format!("{}{suffix}", shape.name);
-            let cluster_arn = match when {
-                When::WhenActive => create_active_cluster(&router, &case, &name, &shape.extra).await,
+            // The status the setup leaves the cluster in is taken from its own last
+            // answer: a restart is in flight when `StartCluster` answers, and the
+            // available status it leads to is owed from that instant, so a `GetCluster`
+            // squeezed in before the delete would report the settled cluster instead.
+            let (cluster_arn, reported) = match when {
+                When::WhenActive => {
+                    let arn = create_active_cluster(&router, &case, &name, &shape.extra).await;
+                    let active = get_cluster(&router, &case, &arn).await;
+                    let status = active["status"].as_str().unwrap_or("<no status>").to_string();
+                    (arn, status)
+                }
                 When::WhileStarting => {
                     let arn = create_active_cluster(&router, &case, &name, &shape.extra).await;
                     stop(&router, &case, &arn).await;
@@ -412,14 +421,16 @@ async fn deleting_a_cluster_in_a_status_that_admits_it_still_succeeds() {
                         "case {case:?}: the setup start must be accepted, got {status} with \
                          {response}"
                     );
-                    arn
+                    let reported = response["cluster"]["status"]
+                        .as_str()
+                        .unwrap_or("<no status>")
+                        .to_string();
+                    (arn, reported)
                 }
             };
-            let before = get_cluster(&router, &case, &cluster_arn).await;
             assert_eq!(
-                before["status"].as_str(),
-                Some(expected),
-                "case {case:?}: the setup must leave the cluster in {expected}, got {before}"
+                reported, expected,
+                "case {case:?}: the setup must leave the cluster in {expected}, got {reported:?}"
             );
 
             let (status, response) = delete(&router, &cluster_arn).await;

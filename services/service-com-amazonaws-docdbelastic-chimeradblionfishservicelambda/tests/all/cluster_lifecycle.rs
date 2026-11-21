@@ -1768,9 +1768,9 @@ async fn a_flow_that_chains_three_mints_settles_with_one_read_each() {
 #[tokio::test]
 async fn a_change_to_an_existing_cluster_keeps_its_transient_window() {
     // The other half of the pacing rule: a change applied to a cluster this store ALREADY
-    // holds leaves it transient for a clock-owed span, because a cluster carries one
-    // change at a time — which is what the state-gated refusals are asked of. The rows
-    // differ in the change in flight and the refusal it produces.
+    // holds stays in flight for a further call that ACTS on that cluster, because a
+    // cluster carries one change at a time — which is what the state-gated refusals are
+    // asked of. The rows differ in the change in flight and the refusal it produces.
     let router = emulator();
 
     // A modification in flight: the cluster is not modifiable again until it settles.
@@ -1886,5 +1886,468 @@ async fn a_snapshot_of_a_cluster_that_does_not_exist_is_404_before_any_other_ref
             "ResourceNotFoundException",
             "case {case:?}: expected a ResourceNotFoundException, got {response}"
         );
+    }
+}
+
+/// Which change a row applies to a cluster this store ALREADY holds.
+#[derive(Debug, Clone)]
+enum Change {
+    /// `StopCluster` on the settled available cluster the row created.
+    Stop,
+    /// `StartCluster` on that cluster, stopped first.
+    Start,
+    /// `UpdateCluster` carrying the members this row names.
+    Update(Value),
+}
+
+/// One row: the cluster to build, the change to apply to it, the transient status the
+/// changing call's OWN response must carry and the settled status that transient one
+/// leads to.
+///
+/// The statuses are modelled `Status` values (`smithy_query(query="shape",
+/// shape="Status")`, also listed in `ops::types::STATUS_VALUES`).
+struct ChangeRow {
+    case: &'static str,
+    /// The members `CreateCluster` carries beyond the required minimum.
+    extra: Value,
+    change: Change,
+    transient: &'static str,
+    settled: &'static str,
+}
+
+/// `POST /cluster/{clusterArn}/{action}` — one `StopCluster` or `StartCluster` call,
+/// asserted accepted, returning the `cluster` its own response reports.
+async fn act_ok(router: &MultiServiceRouter, cluster_arn: &str, action: &str) -> Value {
+    let path = format!("/cluster/{}/{action}", label(cluster_arn));
+    let (status, response) = call(router, "POST", &path, None).await;
+    assert_eq!(
+        status, 200,
+        "case {cluster_arn}: expected {action} to answer 200, got {status} with {response}"
+    );
+    response["cluster"].clone()
+}
+
+/// `PUT /cluster/{clusterArn}` — one `UpdateCluster` call, asserted accepted, returning
+/// the `cluster` its own response reports.
+async fn update_ok(router: &MultiServiceRouter, cluster_arn: &str, patch: Value) -> Value {
+    let path = format!("/cluster/{}", label(cluster_arn));
+    let (status, response) = call(router, "PUT", &path, Some(patch.clone())).await;
+    assert_eq!(
+        status, 200,
+        "case {patch}: expected UpdateCluster to answer 200, got {status} with {response}"
+    );
+    response["cluster"].clone()
+}
+
+/// The status every shard of `cluster` reports, asserted to be `expected` — a shard moves
+/// with the cluster it belongs to.
+fn assert_shard_statuses(case: &str, cluster: &Value, expected: &str) {
+    for shard in cluster["shards"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: no `shards` in {cluster}"))
+    {
+        assert_eq!(
+            shard["status"].as_str(),
+            Some(expected),
+            "case {case:?}: every shard moves with the cluster, expected {expected:?}, got \
+             {shard}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_change_to_an_existing_cluster_is_settled_for_the_first_caller_that_reports_it() {
+    // The rule: the transient status of a change to a cluster this store already holds
+    // belongs to the response of the call that started it, and the settled status that
+    // transient one leads to is owed from the moment that call answers — so the FIRST
+    // caller to report the cluster afterwards is answered the settled cluster rather than
+    // being made to look again, however soon or late it looks. The rows differ in the
+    // change applied (a stop, a restart, and modifications carrying one member, several
+    // members and a resize), in the transient and settled statuses that change moves the
+    // cluster through, and in the shape of the cluster it is applied to, so the pacing is
+    // not a property of one transition or one record.
+    let rows: Vec<ChangeRow> = vec![
+        ChangeRow {
+            case: "a stop of a single-shard cluster",
+            extra: json!({}),
+            change: Change::Stop,
+            transient: "STOPPING",
+            settled: "STOPPED",
+        },
+        ChangeRow {
+            case: "a stop of a multi-shard cluster",
+            extra: json!({"shardCount": 3, "shardCapacity": 8}),
+            change: Change::Stop,
+            transient: "STOPPING",
+            settled: "STOPPED",
+        },
+        ChangeRow {
+            case: "a restart of a stopped cluster",
+            extra: json!({}),
+            change: Change::Start,
+            transient: "STARTING",
+            settled: "ACTIVE",
+        },
+        ChangeRow {
+            case: "a restart of a stopped multi-shard cluster",
+            extra: json!({"shardCount": 2, "shardCapacity": 4}),
+            change: Change::Start,
+            transient: "STARTING",
+            settled: "ACTIVE",
+        },
+        ChangeRow {
+            case: "a modification of one member",
+            extra: json!({}),
+            change: Change::Update(json!({"shardInstanceCount": 2})),
+            transient: "UPDATING",
+            settled: "ACTIVE",
+        },
+        ChangeRow {
+            case: "a resize of the shard count",
+            extra: json!({"shardCount": 2}),
+            change: Change::Update(json!({"shardCount": 4})),
+            transient: "UPDATING",
+            settled: "ACTIVE",
+        },
+        ChangeRow {
+            case: "a modification carrying several members",
+            extra: json!({}),
+            change: Change::Update(json!({
+                "shardCapacity": 16,
+                "backupRetentionPeriod": 14,
+                "subnetIds": ["subnet-settled"],
+            })),
+            transient: "UPDATING",
+            settled: "ACTIVE",
+        },
+    ];
+
+    let router = emulator();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let mut body = minimal_create(&format!("changepaced{index}"));
+        for (member, value) in row.extra.as_object().expect("an object") {
+            body[member] = value.clone();
+        }
+        let created = create_ok(&router, body).await;
+        let cluster_arn = created["clusterArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no clusterArn in {created}"))
+            .to_string();
+        // One read settles the create, so every row's change acts on a settled cluster.
+        let before = get_ok(&router, &cluster_arn).await;
+        assert_eq!(
+            before["status"].as_str(),
+            Some("ACTIVE"),
+            "case {case:?}: the change must act on a settled cluster, got {before}"
+        );
+
+        let changed = match &row.change {
+            Change::Stop => act_ok(&router, &cluster_arn, "stop").await,
+            Change::Start => {
+                let stopping = act_ok(&router, &cluster_arn, "stop").await;
+                assert_eq!(
+                    stopping["status"].as_str(),
+                    Some("STOPPING"),
+                    "case {case:?}: the setup stop reports STOPPING, got {stopping}"
+                );
+                let stopped = get_ok(&router, &cluster_arn).await;
+                assert_eq!(
+                    stopped["status"].as_str(),
+                    Some("STOPPED"),
+                    "case {case:?}: one read must settle the setup stop, got {stopped}"
+                );
+                act_ok(&router, &cluster_arn, "start").await
+            }
+            Change::Update(patch) => update_ok(&router, &cluster_arn, patch.clone()).await,
+        };
+
+        // The changing call's OWN response is where the transient status lives, on the
+        // cluster and on every shard it owns.
+        assert_eq!(
+            changed["status"].as_str(),
+            Some(row.transient),
+            "case {case:?}: the call that starts the change must report {:?}, got {changed}",
+            row.transient
+        );
+        assert_shard_statuses(case, &changed, row.transient);
+
+        // The FIRST report after that call — one read, no second poll — is answered the
+        // settled cluster.
+        let first = get_ok(&router, &cluster_arn).await;
+        assert_eq!(
+            first["status"].as_str(),
+            Some(row.settled),
+            "case {case:?}: the first read after the change must report {:?}, got {first}",
+            row.settled
+        );
+        assert_shard_statuses(case, &first, row.settled);
+        // Both readers agree, and the settled status is where the cluster stays.
+        let listed = listed_status(&router, ReadBy::Cluster, &cluster_arn).await;
+        assert_eq!(
+            listed, row.settled,
+            "case {case:?}: the listing must report the same settled status, got {listed:?}"
+        );
+        let again = get_ok(&router, &cluster_arn).await;
+        assert_eq!(
+            again["status"].as_str(),
+            Some(row.settled),
+            "case {case:?}: a settled cluster stays settled, got {again}"
+        );
+        // The change itself is what settled: a modification's members are applied, and a
+        // stop or a restart moved the status and nothing else.
+        match &row.change {
+            Change::Update(patch) => {
+                for (member, value) in patch.as_object().expect("a patch object") {
+                    assert_eq!(
+                        first.get(member),
+                        Some(value),
+                        "case {case:?}: `{member}` must be the modification's {value}, got {:?}",
+                        first.get(member)
+                    );
+                }
+            }
+            Change::Stop | Change::Start => {
+                for member in ["clusterName", "clusterArn", "clusterEndpoint", "createTime"] {
+                    assert_eq!(
+                        first.get(member),
+                        before.get(member),
+                        "case {case:?}: `{member}` must be unchanged by the change, got {:?}",
+                        first.get(member)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_stop_start_lifecycle_settles_with_one_read_per_transition() {
+    // A client doing the documented stop/start lifecycle — stop the cluster and wait for
+    // it to be stopped, start it and wait for it to be available, then modify it — looks
+    // once per transition, whatever its poll interval is. The topology it reports across
+    // the whole flow is the one the create persisted.
+    let router = emulator();
+    let created = create_ok(
+        &router,
+        json!({
+            "clusterName": "lifecyclepaced", "authType": "PLAIN_TEXT",
+            "adminUserName": "owner", "adminUserPassword": "Secret123!",
+            "shardCapacity": 2, "shardCount": 2,
+        }),
+    )
+    .await;
+    let cluster_arn = created["clusterArn"].as_str().expect("clusterArn").to_string();
+
+    // Transition 1: the create.
+    let active = get_ok(&router, &cluster_arn).await;
+    assert_eq!(
+        active["status"].as_str(),
+        Some("ACTIVE"),
+        "case the lifecycle: one read must settle the created cluster, got {active}"
+    );
+
+    // Transition 2: the stop.
+    let stopping = act_ok(&router, &cluster_arn, "stop").await;
+    assert_eq!(
+        stopping["status"].as_str(),
+        Some("STOPPING"),
+        "case the lifecycle: the stop reports STOPPING, got {stopping}"
+    );
+    let stopped = get_ok(&router, &cluster_arn).await;
+    assert_eq!(
+        stopped["status"].as_str(),
+        Some("STOPPED"),
+        "case the lifecycle: one read must settle the stop, got {stopped}"
+    );
+
+    // Transition 3: the restart.
+    let starting = act_ok(&router, &cluster_arn, "start").await;
+    assert_eq!(
+        starting["status"].as_str(),
+        Some("STARTING"),
+        "case the lifecycle: the start reports STARTING, got {starting}"
+    );
+    let restarted = get_ok(&router, &cluster_arn).await;
+    assert_eq!(
+        restarted["status"].as_str(),
+        Some("ACTIVE"),
+        "case the lifecycle: one read must settle the restart, got {restarted}"
+    );
+    // The stop/start moved the status and nothing else.
+    for member in ["shardCapacity", "shardCount", "clusterEndpoint", "createTime"] {
+        assert_eq!(
+            restarted.get(member),
+            active.get(member),
+            "case the lifecycle: `{member}` must survive the stop and the start, expected {:?}, \
+             got {:?}",
+            active.get(member),
+            restarted.get(member)
+        );
+    }
+    assert_eq!(
+        restarted["shards"].as_array().map(Vec::len),
+        active["shards"].as_array().map(Vec::len),
+        "case the lifecycle: the shard topology must survive the stop and the start, got \
+         {restarted}"
+    );
+
+    // Transition 4: a modification of the restarted cluster, which the settled status it
+    // reached admits.
+    let updating = update_ok(&router, &cluster_arn, json!({"shardInstanceCount": 2})).await;
+    assert_eq!(
+        updating["status"].as_str(),
+        Some("UPDATING"),
+        "case the lifecycle: the modification reports UPDATING, got {updating}"
+    );
+    let applied = get_ok(&router, &cluster_arn).await;
+    assert_eq!(
+        applied["status"].as_str(),
+        Some("ACTIVE"),
+        "case the lifecycle: one read must settle the modification, got {applied}"
+    );
+    assert_eq!(
+        applied["shardInstanceCount"].as_i64(),
+        Some(2),
+        "case the lifecycle: the modification must be applied, got {applied}"
+    );
+}
+
+/// The `shardCapacity` the acting `UpdateCluster` of
+/// [`a_change_still_in_flight_is_met_by_the_next_call_that_acts_on_the_cluster`] carries:
+/// one of the published capacities, and not one any row's cluster already has, so the
+/// stored value tells a refused call from an applied one.
+const ACTING_CAPACITY: i64 = 32;
+
+/// The call a row makes against a cluster whose previous change is still in flight.
+enum Acting {
+    /// `UpdateCluster`, refused with `ConflictException` (HTTP 409).
+    Modify,
+    /// `StopCluster`, refused with `ValidationException` (HTTP 400).
+    Stop,
+    /// `DeleteCluster`, refused with `ValidationException` (HTTP 400).
+    Delete,
+}
+
+/// Issue one acting call against `cluster_arn`, and return its status and body.
+async fn acting_call(
+    router: &MultiServiceRouter,
+    acting: &Acting,
+    cluster_arn: &str,
+) -> (u16, Value) {
+    let path = format!("/cluster/{}", label(cluster_arn));
+    match acting {
+        Acting::Modify => {
+            call(
+                router,
+                "PUT",
+                &path,
+                Some(json!({"shardCapacity": ACTING_CAPACITY})),
+            )
+            .await
+        }
+        Acting::Stop => call(router, "POST", &format!("{path}/stop"), None).await,
+        Acting::Delete => call(router, "DELETE", &path, None).await,
+    }
+}
+
+#[tokio::test]
+async fn a_change_still_in_flight_is_met_by_the_next_call_that_acts_on_the_cluster() {
+    // The pacing settles the status for a caller that REPORTS the cluster; it does not
+    // give a cluster two changes at once. Each row starts a change and then acts on the
+    // cluster again without reporting it in between, and the refusal that call meets is
+    // the one the service models for a cluster whose previous change is still in flight.
+    // The rows differ in the change in flight and in the call that is refused.
+
+    let rows: Vec<(&str, Change, Acting, u16, &str, bool)> = vec![
+        (
+            "a modification in flight, then another modification",
+            Change::Update(json!({"shardCapacity": 8})),
+            Acting::Modify,
+            409,
+            "ConflictException",
+            true,
+        ),
+        (
+            "a modification in flight, then a stop",
+            Change::Update(json!({"shardCount": 3})),
+            Acting::Stop,
+            400,
+            "ValidationException",
+            true,
+        ),
+        (
+            "a restart in flight, then a modification",
+            Change::Start,
+            Acting::Modify,
+            409,
+            "ConflictException",
+            true,
+        ),
+        (
+            // The settled status a stop leads to is STOPPED, from which a delete is
+            // refused on its own account, so this row has no positive control here —
+            // `cluster_delete_state_gate` owns that one.
+            "a stop in flight, then a delete",
+            Change::Stop,
+            Acting::Delete,
+            400,
+            "ValidationException",
+            false,
+        ),
+    ];
+
+    let router = emulator();
+    for (index, (case, change, acting, expected_status, expected_code, retry_accepted)) in
+        rows.into_iter().enumerate()
+    {
+        let created = create_ok(&router, minimal_create(&format!("inflight{index}"))).await;
+        let cluster_arn = created["clusterArn"].as_str().expect("clusterArn").to_string();
+        get_ok(&router, &cluster_arn).await;
+
+        match &change {
+            Change::Stop => {
+                act_ok(&router, &cluster_arn, "stop").await;
+            }
+            Change::Start => {
+                act_ok(&router, &cluster_arn, "stop").await;
+                get_ok(&router, &cluster_arn).await;
+                act_ok(&router, &cluster_arn, "start").await;
+            }
+            Change::Update(patch) => {
+                update_ok(&router, &cluster_arn, patch.clone()).await;
+            }
+        }
+
+        let (status, refused) = acting_call(&router, &acting, &cluster_arn).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: a call acting on a cluster whose change is still in flight must \
+             answer {expected_status}, got {status} with {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            expected_code,
+            "case {case:?}: expected a {expected_code}, got {refused}"
+        );
+
+        // The refused call wrote nothing, and the change that was in flight still settles:
+        // one read reports the settled cluster.
+        let settled = get_ok(&router, &cluster_arn).await;
+        assert_ne!(
+            settled["shardCapacity"].as_i64(),
+            Some(ACTING_CAPACITY),
+            "case {case:?}: the refused call must not have been applied, got {settled}"
+        );
+        // Positive control: from that reported status the very same call is taken, so the
+        // refusal was about the change in flight and not about the request.
+        if retry_accepted {
+            let (status, retried) = acting_call(&router, &acting, &cluster_arn).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the same call must be taken once the cluster is reported \
+                 settled, got {status} with {retried}"
+            );
+        }
     }
 }

@@ -2,9 +2,9 @@
 
 //! @op StopCluster
 //! Stops a running elastic cluster: the cluster the request names moves to `STOPPING`
-//! and the clock owes it `STOPPED` a short span later, and the response is computed
-//! from the record this call wrote. A cluster that is not in its settled available
-//! status is refused and nothing is written.
+//! and the clock owes it `STOPPED` from the moment this call answers, and the response is
+//! computed from the record this call wrote. A cluster that is not in its settled
+//! available status is refused and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -159,10 +159,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The transition the clock has already made due is completed first, so a cluster
-        // whose create or update became due is judged — and stopped — by the status it is
-        // owed rather than the one it was left in.
-        record.settle_due();
+        // The transition whose change is no longer in flight is completed first, so a
+        // cluster whose create or update is done is judged — and stopped — by the status
+        // it is owed rather than the one it was left in.
+        record.settle_unless_in_flight();
         // A cluster is stopped only from its settled available status: one the service is
         // still building or changing, and one that is already stopping or stopped, is
         // refused and nothing is written.
@@ -170,8 +170,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(StopClusterErrorModeled::ValidationException)?;
 
         // The stop is in flight when this call answers: the cluster reports STOPPING, and
-        // the clock owes it STOPPED a short span later. Nothing sleeps for that — the due
-        // instant is stored on the record and materialised by whoever next reads it.
+        // STOPPED is owed from that instant. Nothing sleeps for it — the due instant is
+        // stored on the record, so the first call that REPORTS the cluster answers the
+        // settled STOPPED, while a call that ACTS on the cluster meanwhile meets the stop
+        // still in flight.
         record.begin_transition(state::STATUS_STOPPING);
         let cluster = record.as_cluster();
         drop(guard);

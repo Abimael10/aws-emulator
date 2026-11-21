@@ -220,7 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // Completes the transition the clock already made due on the snapshot being
         // read, which was owed at this instant whether or not anybody called.
-        snapshot.settle_due();
+        snapshot.settle_unless_in_flight();
         let source = snapshot.source_config.clone();
         let admin_user_name = snapshot.admin_user_name.clone();
         let snapshot_kms_key_id = snapshot.kms_key_id.clone();
@@ -257,10 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut record = state::ClusterRecord {
             cluster_name: cluster_name.clone(),
             cluster_arn: cluster_arn.clone(),
-            // `begin_mint_transition` below sets the status and the instant it settles
-            // at.
+            // `begin_mint_transition` below sets the status and how long the transition
+            // it starts stays in flight.
             status: String::new(),
-            settles_at: None,
+            change_in_flight_until: None,
             cluster_endpoint: state::cluster_endpoint(&cluster_name, &cluster_id, &region),
             create_time: create_time.clone(),
             admin_user_name,

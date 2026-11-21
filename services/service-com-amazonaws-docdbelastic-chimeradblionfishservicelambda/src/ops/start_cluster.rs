@@ -2,8 +2,8 @@
 
 //! @op StartCluster
 //! Restarts a stopped elastic cluster: the stored cluster moves to `STARTING` and the
-//! clock owes it `ACTIVE` a short span later. A cluster that is not stopped is refused
-//! with `ValidationException` (HTTP 400) and nothing is written.
+//! clock owes it `ACTIVE` from the moment this call answers. A cluster that is not
+//! stopped is refused with `ValidationException` (HTTP 400) and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +157,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The transition the clock has already made due is completed first, so a cluster
-        // whose stop became due is judged — and started — by the status it is owed rather
-        // than the one it was left in.
-        record.settle_due();
+        // The transition whose change is no longer in flight is completed first, so a
+        // cluster whose stop is done is judged — and started — by the status it is owed
+        // rather than the one it was left in.
+        record.settle_unless_in_flight();
         // This operation restarts a STOPPED cluster, so that is the only status it acts
         // from: a running cluster, one still being built or changed, and one still
         // stopping are refused and nothing is written.
         state::ensure_startable(record).map_err(StartClusterErrorModeled::ValidationException)?;
 
         // The start is in flight when this call answers: the cluster reports STARTING, and
-        // the clock owes it ACTIVE a short span later. Nothing sleeps for that — the due
-        // instant is stored on the record and materialised by whoever next reads it.
+        // its available status is owed from that instant. Nothing sleeps for it — the due
+        // instant is stored on the record, so the first call that REPORTS the cluster
+        // answers the settled status, while a call that ACTS on the cluster meanwhile
+        // meets the restart still in flight.
         record.begin_transition(state::STATUS_STARTING);
         let cluster = record.as_cluster();
         drop(guard);

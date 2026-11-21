@@ -156,9 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // Reporting only: this completes the CREATING/UPDATING -> ACTIVE move the clock
-        // already made due, which was owed at this instant whether or not anybody read.
-        record.settle_due();
+        // Reporting only: this completes the move the clock owed the cluster from the
+        // moment the call that started it answered, so the first read after a stop, a
+        // start, a change or a create reports the settled cluster.
+        record.settle_reported();
         let cluster = record.as_cluster();
         drop(guard);
 

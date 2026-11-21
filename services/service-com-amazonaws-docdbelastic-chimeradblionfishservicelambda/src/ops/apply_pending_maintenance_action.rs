@@ -273,9 +273,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        // Completes the transition the clock already made due on the cluster being
-        // addressed, which was owed at this instant whether or not anybody called.
-        record.settle_due();
+        // Completes the transition of the cluster being addressed once the change it was
+        // carrying is no longer in flight; this call acts on the cluster, so it is the
+        // status the cluster is owed that it reports and opts in on.
+        record.settle_unless_in_flight();
 
         // Only an action the service has already scheduled for this cluster can be
         // opted in to. There is no such action for a cluster with nothing pending, so

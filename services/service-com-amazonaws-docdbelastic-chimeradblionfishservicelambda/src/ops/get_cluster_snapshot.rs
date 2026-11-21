@@ -158,8 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // Reporting only: completes the CREATING -> ACTIVE move the clock already owed.
-        record.settle_due();
+        // Reporting only: completes the move the clock owed this snapshot from the moment
+        // the call that created or copied it answered.
+        record.settle_reported();
         let snapshot = record.as_snapshot();
         drop(guard);
 

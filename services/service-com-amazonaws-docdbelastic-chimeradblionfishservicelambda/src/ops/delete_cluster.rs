@@ -167,10 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // The transition the clock has already made due is completed first, so the gate
-        // below judges the cluster by the status it is owed rather than the one it was
-        // left in.
-        record.settle_due();
+        // The change that is no longer in flight is completed first, so the gate below
+        // judges the cluster by the status it is owed rather than the one it was left in.
+        record.settle_unless_in_flight();
         // The status gate comes before any write: a cluster whose stored status does not
         // admit a delete is refused and nothing is removed, so a following read still
         // reports it in that status.
@@ -179,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The caller is told the cluster is going away; nothing settles it to ACTIVE
         // again, because the record is removed in the same breath.
         record.status = state::STATUS_DELETING.to_string();
-        record.settles_at = None;
+        record.change_in_flight_until = None;
         for shard in &mut record.shards {
             shard.status = state::STATUS_DELETING.to_string();
         }

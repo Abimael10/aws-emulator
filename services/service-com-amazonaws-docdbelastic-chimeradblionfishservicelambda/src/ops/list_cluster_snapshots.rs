@@ -223,8 +223,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 continue;
             }
-            // Reporting only: materialise the status move the clock already made due.
-            record.settle_due();
+            // Reporting only: materialise the move the clock owed this snapshot from the
+            // moment the call that started it answered.
+            record.settle_reported();
             snapshots.push(record.as_snapshot_in_list());
         }
         drop(guard);

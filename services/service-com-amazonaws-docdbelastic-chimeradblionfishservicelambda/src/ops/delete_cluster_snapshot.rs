@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The caller is told the snapshot is going away; nothing settles it to ACTIVE
         // again, because the record no longer exists.
         record.status = state::STATUS_DELETING.to_string();
-        record.settles_at = None;
+        record.change_in_flight_until = None;
 
         Ok(DeleteClusterSnapshotOutput {
             snapshot: record.as_snapshot(),

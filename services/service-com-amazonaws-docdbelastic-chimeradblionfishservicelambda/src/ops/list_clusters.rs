@@ -190,8 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_token = Some(state::encode_page_token(cluster_arn));
                 break;
             }
-            // Reporting only: materialise the status move the clock already made due.
-            record.settle_due();
+            // Reporting only: materialise the move the clock owed this cluster from the
+            // moment the call that started it answered, so the listing and `GetCluster`
+            // report the same settled status.
+            record.settle_reported();
             clusters.push(record.as_cluster_in_list());
         }
         drop(guard);
