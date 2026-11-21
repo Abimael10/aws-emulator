@@ -11,16 +11,17 @@
 //!   every daemon ARN that resolves to no rollout — a cluster this account never held, a
 //!   cluster that holds no such daemon — and keeps its 400s for a value that identifies no
 //!   daemon of any account;
-//! * a read whose required member is a LIST OF RESOURCE ARNS refuses an entry that could
-//!   identify no resource of this account — one that is not shaped like that resource's ARN,
-//!   and one whose DAEMON this account holds no record of (a cluster it never created, or a
-//!   cluster that holds no such daemon) — as the invalid parameter it is
-//!   (`InvalidParameterException`, with the sentence the member's own read words), and keeps
-//!   the `failures` channel for an entry under a daemon it DOES hold;
+//! * a read whose required member is a LIST OF RESOURCE ARNS refuses an entry that is not
+//!   shaped like that resource's ARN, and so could identify no resource of ANY account, as the
+//!   invalid parameter it is (`InvalidParameterException`, with the sentence the member's own
+//!   read words), and keeps the `failures` channel for every entry that IS shaped like one and
+//!   resolves to nothing here — a cluster this account never created, a cluster that holds no
+//!   such daemon, an id nothing is stored under — answering HTTP 200 with one `MISSING` failure
+//!   per such entry beside the resources the request did resolve;
 //! * the ID in the last segment of such an ARN is MINTED by the service, so how it is spelled
-//!   is no part of what makes the ARN an identifier: an entry of that shape under a daemon
-//!   this account holds is read as the resource it names whatever its id looks like, and an
-//!   id this store holds nothing under is one `MISSING` failure of its own entry;
+//!   is no part of what makes the ARN an identifier: an entry of that shape is read as the
+//!   resource it names whatever its id looks like, and one this store holds nothing under is
+//!   one `MISSING` failure of its own entry;
 //! * a daemon write resolves the resources its own PARAMETERS name — the daemon task
 //!   definition first, then the capacity providers — before the cluster and the daemon its
 //!   `daemonArn` identifies, so a request naming a task definition that does not exist is
@@ -272,23 +273,23 @@ const ARN_LIST_READS: [ArnListRead; 2] = [
 ];
 
 #[tokio::test]
-async fn a_daemon_read_refuses_an_arn_that_could_identify_no_resource_of_this_account() {
+async fn a_daemon_read_refuses_an_arn_that_could_identify_no_resource_of_any_account() {
     let router = service();
     const CLUSTER: &str = "daemon-arn-rules";
     const CASE: &str = "setup";
     create_cluster(&router, CLUSTER, CASE).await;
 
     for (operation, member, resource_type, expected) in ARN_LIST_READS {
-        // The rows differ along WHAT about the ARN makes it name nothing: its not being an
-        // ARN, its partition/vendor fields, its resource type, how many segments its
-        // resource path carries, the character set of the names in it, and the daemon it
-        // sits under — the cluster that was never created, and the daemon a cluster that WAS
-        // created does not hold. How the ID is spelled is NOT one of them: the service mints
-        // it, so it is read as the identifier it is whatever it looks like
-        // ([`a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled`]). The
-        // last row pairs an unusable entry with a usable one, so the refusal is of the
+        // The rows differ along WHAT about the ARN makes it name nothing of any account: its
+        // not being an ARN, its partition/vendor fields, its resource type, how many segments
+        // its resource path carries, and the character set of the names in it. What the ARN
+        // RESOLVES to here is NOT one of them — neither the daemon it sits under nor how its
+        // id is spelled — since an entry of this shape names a resource of this account and is
+        // reported on the `failures` channel when this store holds none
+        // ([`a_daemon_read_reports_an_entry_under_a_daemon_it_does_not_hold_as_a_failure`]).
+        // The last row pairs an unusable entry with a usable one, so the refusal is of the
         // REQUEST and not of one entry's own report.
-        let rows: [(&str, Value); 12] = [
+        let rows: [(&str, Value); 10] = [
             ("a value that is no ARN at all", json!(["not-an-arn"])),
             (
                 "an ARN of another service",
@@ -342,24 +343,6 @@ async fn a_daemon_read_refuses_an_arn_that_could_identify_no_resource_of_this_ac
                     resource_type,
                     CLUSTER,
                     "agents!",
-                    &sequence_id(1)
-                )]),
-            ),
-            (
-                "a cluster this account holds no record of",
-                json!([below_daemon(
-                    resource_type,
-                    "daemon-nowhere",
-                    "agents",
-                    &sequence_id(1)
-                )]),
-            ),
-            (
-                "a daemon the cluster this account holds does not hold",
-                json!([below_daemon(
-                    resource_type,
-                    CLUSTER,
-                    "nosuchdaemon",
                     &sequence_id(1)
                 )]),
             ),
@@ -710,7 +693,7 @@ async fn a_daemon_read_reads_an_id_it_holds_nothing_under_however_it_is_spelled(
 }
 
 #[tokio::test]
-async fn a_daemon_read_refuses_an_entry_under_a_daemon_this_account_does_not_hold() {
+async fn a_daemon_read_reports_an_entry_under_a_daemon_it_does_not_hold_as_a_failure() {
     let router = service();
     const CLUSTER: &str = "daemon-unheld-daemons";
     // A second cluster of this account that holds no daemon at all, so a row can differ
@@ -724,7 +707,7 @@ async fn a_daemon_read_refuses_an_entry_under_a_daemon_this_account_does_not_hol
     let (deployment, revision) =
         minted_daemon_arns(&router, CLUSTER, &provider, &definition, CASE).await;
 
-    for (operation, member, resource_type, expected) in ARN_LIST_READS {
+    for (operation, member, resource_type, _) in ARN_LIST_READS {
         // The ARNs this service MINTED for the daemon it holds, so every row below is
         // answered against a store that does hold such resources.
         let held = if resource_type == "daemon-deployment" {
@@ -741,8 +724,9 @@ async fn a_daemon_read_refuses_an_entry_under_a_daemon_this_account_does_not_hol
         // The rows differ along WHY this account holds no such daemon: the cluster was
         // never created, the cluster exists but holds no daemon, the cluster holds a
         // daemon under another name, and the name it holds is a PREFIX of the name the
-        // entry carries. A `daemon-deployment`/`daemon-revision` exists only as part of a
-        // daemon's history, so when the daemon is not there no id under it can name one.
+        // entry carries. Each entry is still shaped like the ARN of a resource of this
+        // account, so each is reported on its own `failures` entry at HTTP 200 rather than
+        // refusing the read — the not-found convention the other ECS batch reads follow.
         let rows: [(&str, String); 4] = [
             (
                 "a cluster this account never created",
@@ -763,30 +747,53 @@ async fn a_daemon_read_refuses_an_entry_under_a_daemon_this_account_does_not_hol
         ];
         for (row, entry) in rows {
             let case = format!("{operation} given an entry under {row}");
-            let (code, message) =
-                refusal(&router, operation, json!({ member: [entry.clone()] }), &case).await;
+            let body = ok(&router, operation, json!({ member: [entry.clone()] }), &case).await;
+            assert!(
+                list(&body, reported.0, &case).is_empty(),
+                "case {case:?}: expected no resource reported for an entry that resolves to \
+                 none, got {body}"
+            );
             assert_eq!(
-                (code.as_str(), message.as_str()),
-                (INVALID_PARAMETER, expected),
-                "case {case:?}: expected the sentence this read words for an unusable \
-                 {member} entry, got {code:?} with {message:?}"
+                list(&body, "failures", &case)
+                    .iter()
+                    .map(|failure| (
+                        string(failure, "arn", &case),
+                        string(failure, "reason", &case)
+                    ))
+                    .collect::<Vec<(String, String)>>(),
+                vec![(entry.clone(), "MISSING".to_string())],
+                "case {case:?}: expected the entry echoed as MISSING, got {body}"
             );
 
-            // The same entry BESIDE the one that resolves: the refusal is of the REQUEST,
-            // so a usable entry does not turn it into a per-entry failure.
+            // The same entry BESIDE the one that resolves: the entry that names nothing is
+            // its own failure, so the answer the caller could have had is not lost.
             let case = format!("{case}, beside a usable entry");
-            let (code, message) = refusal(
+            let body = ok(
                 &router,
                 operation,
-                json!({ member: [held.clone(), entry] }),
+                json!({ member: [held.clone(), entry.clone()] }),
                 &case,
             )
             .await;
             assert_eq!(
-                (code.as_str(), message.as_str()),
-                (INVALID_PARAMETER, expected),
-                "case {case:?}: expected the whole request to be refused, got {code:?} with \
-                 {message:?}"
+                list(&body, reported.0, &case)
+                    .iter()
+                    .map(|resolved| string(resolved, reported.1, &case))
+                    .collect::<Vec<String>>(),
+                vec![held.clone()],
+                "case {case:?}: expected the resource that resolves to still be reported, \
+                 got {body}"
+            );
+            assert_eq!(
+                list(&body, "failures", &case)
+                    .iter()
+                    .map(|failure| (
+                        string(failure, "arn", &case),
+                        string(failure, "reason", &case)
+                    ))
+                    .collect::<Vec<(String, String)>>(),
+                vec![(entry, "MISSING".to_string())],
+                "case {case:?}: expected the unresolved entry echoed as MISSING, got {body}"
             );
         }
 
@@ -826,6 +833,157 @@ async fn a_daemon_read_refuses_an_entry_under_a_daemon_this_account_does_not_hol
                 .collect::<Vec<(String, String)>>(),
             vec![(unheld, "MISSING".to_string())],
             "case {case:?}: expected the unheld id echoed as MISSING, got {body}"
+        );
+    }
+}
+
+/// One row of the batch table below: the case, the entries the request carries, the ARNs the
+/// read resolves and reports, and the ARNs it reports as `MISSING` failures.
+type BatchRow = (&'static str, Vec<String>, Vec<String>, Vec<String>);
+
+#[tokio::test]
+async fn a_daemon_read_answers_every_entry_it_resolves_beside_the_ones_it_does_not() {
+    let router = service();
+    const CLUSTER: &str = "daemon-arn-batches";
+    // A second cluster of this account that holds no daemon, so a row can differ along the
+    // DAEMON while the cluster it names is one this account created.
+    const EMPTY_CLUSTER: &str = "daemon-arn-batches-empty";
+    const CASE: &str = "setup";
+    create_cluster(&router, CLUSTER, CASE).await;
+    create_cluster(&router, EMPTY_CLUSTER, CASE).await;
+    let provider = managed_provider(&router, CLUSTER, "mi-batches", CASE).await;
+    let definition = daemon_definition(&router, "daemonarnbatches", CASE).await;
+    let (deployment, revision) =
+        minted_daemon_arns(&router, CLUSTER, &provider, &definition, CASE).await;
+
+    for (operation, member, resource_type, _) in ARN_LIST_READS {
+        // The ARN this service MINTED for the resource, so each row is answered against a
+        // store that does hold one of them.
+        let held = if resource_type == "daemon-deployment" {
+            deployment.clone()
+        } else {
+            revision.clone()
+        };
+        let reported = if resource_type == "daemon-deployment" {
+            ("daemonDeployments", "daemonDeploymentArn")
+        } else {
+            ("daemonRevisions", "daemonRevisionArn")
+        };
+
+        // Entries of the ARN's own shape that this store resolves nothing for, one per part
+        // of the identifier it holds nothing for.
+        let unknown_cluster = below_daemon(resource_type, "daemon-nowhere", "agents", "17");
+        let empty_cluster = below_daemon(resource_type, EMPTY_CLUSTER, "agents", "17");
+        let unknown_daemon = below_daemon(resource_type, CLUSTER, "nosuchdaemon", "17");
+        let unknown_id = below_daemon(
+            resource_type,
+            CLUSTER,
+            "agents",
+            "00000000-0000-0000-0000-000000000000",
+        );
+
+        // The rows differ along how many unresolved entries the batch carries, where they sit
+        // relative to the entry that resolves, which part of the identifier each of them
+        // resolves nothing for, whether the batch resolves anything at all, and whether an
+        // entry is repeated — none of which may cost the caller the answers it could have had.
+        let rows: [BatchRow; 6] = [
+            (
+                "one unresolved entry after the resource it holds",
+                vec![held.clone(), unknown_cluster.clone()],
+                vec![held.clone()],
+                vec![unknown_cluster.clone()],
+            ),
+            (
+                "one unresolved entry before the resource it holds",
+                vec![unknown_cluster.clone(), held.clone()],
+                vec![held.clone()],
+                vec![unknown_cluster.clone()],
+            ),
+            (
+                "one unresolved entry per part of the identifier",
+                vec![
+                    unknown_cluster.clone(),
+                    empty_cluster.clone(),
+                    held.clone(),
+                    unknown_daemon.clone(),
+                    unknown_id.clone(),
+                ],
+                vec![held.clone()],
+                vec![
+                    unknown_cluster.clone(),
+                    empty_cluster.clone(),
+                    unknown_daemon.clone(),
+                    unknown_id.clone(),
+                ],
+            ),
+            (
+                "nothing but unresolved entries",
+                vec![unknown_cluster.clone(), unknown_id.clone()],
+                Vec::new(),
+                vec![unknown_cluster.clone(), unknown_id.clone()],
+            ),
+            (
+                "the same unresolved entry named twice",
+                vec![
+                    held.clone(),
+                    unknown_cluster.clone(),
+                    unknown_cluster.clone(),
+                ],
+                vec![held.clone()],
+                vec![unknown_cluster.clone()],
+            ),
+            (
+                "the resource it holds named twice beside one unresolved entry",
+                vec![held.clone(), held.clone(), unknown_daemon.clone()],
+                vec![held.clone()],
+                vec![unknown_daemon.clone()],
+            ),
+        ];
+
+        for (row, entries, expected_resolved, expected_failures) in rows {
+            let case = format!("{operation} given {row}");
+            let body = ok(&router, operation, json!({ member: entries }), &case).await;
+            assert_eq!(
+                list(&body, reported.0, &case)
+                    .iter()
+                    .map(|resolved| string(resolved, reported.1, &case))
+                    .collect::<Vec<String>>(),
+                expected_resolved,
+                "case {case:?}: expected every entry that resolves to be reported once, \
+                 got {body}"
+            );
+            assert_eq!(
+                list(&body, "failures", &case)
+                    .iter()
+                    .map(|failure| (
+                        string(failure, "arn", &case),
+                        string(failure, "reason", &case)
+                    ))
+                    .collect::<Vec<(String, String)>>(),
+                expected_failures
+                    .iter()
+                    .map(|arn| (arn.clone(), "MISSING".to_string()))
+                    .collect::<Vec<(String, String)>>(),
+                "case {case:?}: expected one MISSING failure per unresolved entry, in the \
+                 order the request named them, got {body}"
+            );
+        }
+
+        // These reads report: after every row above, the resource the store holds still
+        // resolves on its own and nothing was failed for it.
+        let case = format!("{operation} re-reading the resource the store holds");
+        let body = ok(&router, operation, json!({ member: [held.clone()] }), &case).await;
+        assert_eq!(
+            list(&body, reported.0, &case)
+                .iter()
+                .map(|resolved| string(resolved, reported.1, &case))
+                .collect::<Vec<String>>(),
+            vec![held.clone()],
+            "case {case:?}: expected the reads to leave the resource readable, got {body}"
+        );
+        assert!(
+            list(&body, "failures", &case).is_empty(),
+            "case {case:?}: expected no failure for the resource the store holds, got {body}"
         );
     }
 }

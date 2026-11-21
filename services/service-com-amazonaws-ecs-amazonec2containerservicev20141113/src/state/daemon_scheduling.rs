@@ -521,45 +521,6 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         (!self.has_active_cluster(&cluster_name)).then_some(cluster_name)
     }
 
-    /// Whether a reference of `resource_type` names a resource BELOW a daemon this account
-    /// holds no record of — a cluster it never created, or a daemon that cluster does not
-    /// hold.
-    ///
-    /// A `daemon-deployment`/`daemon-revision` ARN carries the daemon the resource belongs to
-    /// (`<type>/<cluster>/<daemon>/<id>`, [`is_daemon_scoped_arn`]), and those resources exist
-    /// only as part of a daemon's own history: when the daemon is not there, no id under it
-    /// can name a rollout or a revision of this account, so such an entry is the unusable
-    /// parameter it is rather than one resource reported as `MISSING`. Within a daemon this
-    /// account DOES hold, an id this store holds nothing under is exactly that `MISSING`
-    /// report, whatever the id looks like.
-    ///
-    /// `false` when `references` names no such daemon at all (every entry is not an ARN of
-    /// `resource_type`): what the entries ARE is settled before this, by the shape test.
-    pub fn names_an_unheld_daemon<'a>(
-        &self,
-        references: impl IntoIterator<Item = &'a str>,
-        resource_type: &str,
-    ) -> bool {
-        references.into_iter().any(|reference| {
-            daemon_scoped_arn_path(reference.trim(), resource_type).is_some_and(|segments| {
-                matches!(
-                    segments.as_slice(),
-                    [cluster_name, daemon_name, _] if !self.holds_daemon(cluster_name, daemon_name)
-                )
-            })
-        })
-    }
-
-    /// Whether this account holds the daemon `daemon_name` of the cluster `cluster_name` —
-    /// the pair a daemon ARN identifies a daemon by ("Amazon ECS daemons are cluster
-    /// specific"), read off the stored records rather than off an ARN, so an entry naming the
-    /// daemon in another Region's or account's spelling resolves to the same daemon.
-    fn holds_daemon(&self, cluster_name: &str, daemon_name: &str) -> bool {
-        self.daemons
-            .values()
-            .any(|daemon| daemon.cluster_name == cluster_name && daemon.name == daemon_name)
-    }
-
     /// The stored daemon a `daemonArn` names, or `None` when no daemon of this account
     /// answers to it.
     ///

@@ -9,12 +9,13 @@
 //!
 //! A daemon-revision ARN carries the daemon whose history the revision belongs to
 //! (`daemon-revision/<cluster>/<daemon>/<id>`), so what an entry can identify is settled
-//! before anything is looked up: an entry that is not shaped like such an ARN, and one whose
-//! daemon this account holds no record of, could name no revision of this account at all,
-//! and both are refused as the invalid revision ARN they are
-//! (`InvalidParameterException`). An ARN under a daemon this account DOES hold that names no
-//! stored revision is a `MISSING` failure of its own entry rather than a refusal that would
-//! lose the revisions the request did resolve.
+//! before anything is looked up: an entry that is not shaped like such an ARN could name no
+//! revision of any account and is refused as the invalid revision ARN it is
+//! (`InvalidParameterException`). An entry that IS shaped like one names a revision of this
+//! account, so whatever leaves it unresolved here — a cluster this store never created, a
+//! cluster that holds no such daemon, an id nothing is stored under — is reported on the
+//! modelled `failures` channel as that entry's own `MISSING` report, with the revisions the
+//! request did resolve still answered beside it.
 //!
 //! ## Shape of an operation
 //!
@@ -185,12 +186,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each entry is "the ARN of the daemon revision" and nothing else, so what it can
         // identify is settled before any revision is looked up: a value that is not shaped
-        // like a revision's ARN ([`crate::state::is_daemon_revision_arn`]), and one whose
-        // daemon this account holds no record of, could name no revision of this account at
-        // all, and both are refused as the unusable ARN the member was given rather than
-        // reported as a revision that happens to be missing or as the cluster the ARN
-        // carries. The `failures` channel answers for an ARN that COULD name a revision of
-        // this account and names none.
+        // like a revision's ARN ([`crate::state::is_daemon_revision_arn`]) could name no
+        // revision of ANY account and is refused as the unusable ARN the member was given.
+        // The `failures` channel answers for an entry that COULD name a revision of this
+        // account and resolves to none.
         if input
             .daemon_revision_arns
             .iter()
@@ -211,25 +210,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        // An entry whose DAEMON this account holds no record of — a cluster it never
-        // created, or a cluster that holds no such daemon — could name no revision of this
-        // account either, so it earns the same refusal as an entry of the wrong shape.
-        if guard.names_an_unheld_daemon(
-            input.daemon_revision_arns.iter().map(String::as_str),
-            crate::state::DAEMON_REVISION_RESOURCE_TYPE,
-        ) {
-            return Err(
-                DescribeDaemonRevisionsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            crate::state::DAEMON_REVISION_ARN_INVALID_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-
         let mut daemon_revisions = Vec::new();
         let mut failures = Vec::new();
         // A revision is reported once however many times the request names it.
@@ -241,6 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             match guard.daemon_revisions.get(reference) {
                 Some(record) => daemon_revisions.push(record.view()),
+                // An entry that resolves to no stored revision is a failure of its own
+                // entry, naming the ARN the caller sent — whichever part of the identifier
+                // this store holds nothing for, since the ARN is the whole identifier.
                 None => failures.push(crate::state::missing_failure(reference)),
             }
         }

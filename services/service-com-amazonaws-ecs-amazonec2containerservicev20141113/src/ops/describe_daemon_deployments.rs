@@ -8,12 +8,13 @@
 //!
 //! A daemon-deployment ARN carries the daemon whose rollout it is
 //! (`daemon-deployment/<cluster>/<daemon>/<id>`), so what an entry can identify is settled
-//! before anything is looked up: an entry that is not shaped like such an ARN, and one
-//! whose daemon this account holds no record of, could name no rollout of this account at
-//! all, and both are refused as the unusable parameter the member was given
-//! (`InvalidParameterException`). An ARN under a daemon this account DOES hold that names no
-//! stored rollout is a `MISSING` failure of its own entry rather than a refusal that would
-//! lose the deployments the request did resolve.
+//! before anything is looked up: an entry that is not shaped like such an ARN could name no
+//! rollout of any account and is refused as the unusable parameter the member was given
+//! (`InvalidParameterException`). An entry that IS shaped like one names a rollout of this
+//! account, so whatever leaves it unresolved here — a cluster this store never created, a
+//! cluster that holds no such daemon, an id nothing is stored under — is reported on the
+//! modelled `failures` channel as that entry's own `MISSING` report, with the rollouts the
+//! request did resolve still answered beside it.
 //!
 //! ## Shape of an operation
 //!
@@ -184,9 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Each entry is "the ARN of the daemon deployment" and nothing else, so the SHAPE of
         // every one of them is settled before any state is consulted: a value that could
-        // name no rollout of this account is refused for what it IS
-        // ([`crate::state::is_daemon_deployment_arn`]) rather than resolved against the
-        // cluster it appears to carry or reported as a rollout that happens to be missing.
+        // name no rollout of ANY account is refused for what it IS
+        // ([`crate::state::is_daemon_deployment_arn`]). What an entry of that shape fails to
+        // RESOLVE to is left to the per-entry `failures` channel below.
         if input
             .daemon_deployment_arns
             .iter()
@@ -215,27 +216,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(now);
 
-        // An entry whose DAEMON this account holds no record of could name no rollout of
-        // this account either — a cluster that was never created, or a cluster that holds no
-        // such daemon — so it is the same unusable ARN and earns the same refusal; the
-        // `failures` channel answers for an entry under a daemon this account DOES hold
-        // whose id resolves to no rollout.
-        if guard.names_an_unheld_daemon(
-            input.daemon_deployment_arns.iter().map(String::as_str),
-            crate::state::DAEMON_DEPLOYMENT_RESOURCE_TYPE,
-        ) {
-            return Err(
-                DescribeDaemonDeploymentsErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            crate::state::DAEMON_DEPLOYMENT_ARNS_INVALID_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-
         let mut daemon_deployments = Vec::new();
         let mut failures = Vec::new();
         // A deployment is reported once however many times the request names it: the same
@@ -249,7 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match guard.daemon_deployments.get(reference) {
                 Some(record) => daemon_deployments.push(guard.daemon_deployment_view(record)),
                 // An entry that names no stored rollout is a failure of its own entry,
-                // naming the ARN the caller sent.
+                // naming the ARN the caller sent — whichever part of the identifier this
+                // store holds nothing for, since the ARN is the whole identifier.
                 None => failures.push(crate::state::missing_failure(reference)),
             }
         }
