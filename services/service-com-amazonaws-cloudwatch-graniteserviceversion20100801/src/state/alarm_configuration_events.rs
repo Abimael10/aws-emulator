@@ -38,7 +38,7 @@
 
 use ::serde_json::{Map, Value};
 
-use super::alarm_actions::state_change_events::{state_document, AlarmEvent};
+use super::alarm_actions::state_change_events::{metric_queries, state_document, AlarmEvent};
 use crate::ops::types::{CompositeAlarm, LogAlarm, MetricAlarm};
 
 /// The `detail-type` of the event a change to an alarm's configuration publishes.
@@ -105,6 +105,10 @@ impl AlarmConfigurationChange {
         stored: &MetricAlarm,
         at_secs: f64,
     ) -> Option<Self> {
+        // The create/update/no-op decision is made on the store's OWN configuration record,
+        // the one the history item of the same write records, so a write the history reports as
+        // an update cannot be one this path reports as a no-op. The metric selection is
+        // normalised on the documents the event RENDERS, afterwards.
         let before = previous.map(super::alarm_configuration_document);
         let after = super::alarm_configuration_document(stored);
         let operation = write_operation(before.as_ref(), &after)?;
@@ -114,8 +118,10 @@ impl AlarmConfigurationChange {
             at_secs,
             operation,
             state: reported_state(&super::AlarmStateSnapshot::of_metric_alarm(stored))?,
-            configuration: after,
-            previous_configuration: before,
+            configuration: with_metric_selection(after, stored),
+            previous_configuration: before
+                .zip(previous)
+                .map(|(document, alarm)| with_metric_selection(document, alarm)),
         })
     }
 
@@ -128,7 +134,10 @@ impl AlarmConfigurationChange {
             at_secs,
             operation: OPERATION_DELETE,
             state: reported_state(&super::AlarmStateSnapshot::of_metric_alarm(deleted))?,
-            configuration: super::alarm_configuration_document(deleted),
+            configuration: with_metric_selection(
+                super::alarm_configuration_document(deleted),
+                deleted,
+            ),
             previous_configuration: None,
         })
     }
@@ -228,6 +237,34 @@ impl AlarmConfigurationChange {
         }
         Value::Object(detail)
     }
+}
+
+/// `document` — the store's record of the METRIC alarm `alarm`'s configuration — with the
+/// METRIC SELECTION it reports stated as the list of queries that alarm evaluates, which is how
+/// the event a change to it publishes reports the selection.
+///
+/// The selection is reported as `metrics` whichever way the alarm was configured — a query-array
+/// alarm reports its own queries and an alarm configured with a single metric reports the one
+/// query that metric IS — through the ONE builder of that list ([`metric_queries`]), the same one
+/// the state-change event's configuration takes, so a consumer reads one shape of metric
+/// selection from either event and from either kind of alarm. An alarm that evaluates no metric
+/// at all (one configured with a query language) reports no `metrics` rather than an empty list,
+/// exactly as it names no metric.
+///
+/// Applied to the document the event RENDERS and never to the one the no-op decision is made on:
+/// that decision belongs to the store's own configuration record, which reports every member a
+/// client wrote as it wrote it, so a write that changed only a member this normalisation would
+/// default is still the update it is.
+fn with_metric_selection(mut document: Value, alarm: &MetricAlarm) -> Value {
+    let queries = metric_queries(alarm);
+    if let Some(members) = document.as_object_mut() {
+        if queries.is_empty() {
+            members.remove("metrics");
+        } else {
+            members.insert("metrics".to_string(), Value::Array(queries));
+        }
+    }
+    document
 }
 
 /// Which operation a write PERFORMED on an alarm's configuration, and `None` when it performed

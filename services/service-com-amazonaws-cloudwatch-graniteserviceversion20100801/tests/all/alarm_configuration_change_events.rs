@@ -259,7 +259,12 @@ pub(crate) async fn collect(emulator: &Emulator, url: &str, held: &mut Vec<Value
 ///
 /// The wait is for the CONDITION rather than for a span: it looks again until the events are
 /// there or [`WORK_WAIT`] has passed.
-async fn until_delivered(emulator: &Emulator, url: &str, wanted: usize, held: &mut Vec<Value>) {
+pub(crate) async fn until_delivered(
+    emulator: &Emulator,
+    url: &str,
+    wanted: usize,
+    held: &mut Vec<Value>,
+) {
     let looks = WORK_WAIT.as_millis() / LOOK_INTERVAL.as_millis().max(1);
     for _ in 0..looks {
         collect(emulator, url, held).await;

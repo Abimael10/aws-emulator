@@ -291,15 +291,27 @@ fn metric_alarm_configuration(alarm: &MetricAlarm) -> Value {
     if let Some(description) = alarm.alarm_description.as_deref() {
         configuration.insert("description".to_string(), Value::from(description));
     }
-    // "One item in the Metrics array is the expression that the alarm watches"
-    // (`PutMetricAlarmInput$Metrics`): a query-array alarm reports its queries, and an alarm
-    // configured with a single metric reports the one query that metric IS.
-    let metrics = match alarm.metrics.as_deref() {
+    configuration.insert("metrics".to_string(), Value::Array(metric_queries(alarm)));
+    Value::Object(configuration)
+}
+
+/// The QUERIES a metric alarm evaluates, as the `metrics` of a configuration document reports
+/// them — one entry per query, whichever way the alarm was configured.
+///
+/// "One item in the Metrics array is the expression that the alarm watches"
+/// (`PutMetricAlarmInput$Metrics`): a query-array alarm reports its queries, and an alarm
+/// configured with a single metric reports the one query that metric IS, so a consumer reads one
+/// shape of metric selection either way. Empty for an alarm that evaluates no metric at all (one
+/// configured with a query language instead).
+///
+/// Shared with the configuration-change event
+/// ([`crate::state::alarm_configuration_events`]), which reports the same selection of the same
+/// alarm: the two events cannot describe one alarm's metrics two ways.
+pub(crate) fn metric_queries(alarm: &MetricAlarm) -> Vec<Value> {
+    match alarm.metrics.as_deref() {
         Some(queries) => queries.iter().map(query_document).collect(),
         None => implicit_query_document(alarm).into_iter().collect(),
-    };
-    configuration.insert("metrics".to_string(), Value::Array(metrics));
-    Value::Object(configuration)
+    }
 }
 
 /// A COMPOSITE alarm's `configuration`: the rule it evaluates, its description, and the
