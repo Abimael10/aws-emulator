@@ -39,7 +39,12 @@ const ACCOUNT: &str = "000000000000";
 
 /// The most tags one resource carries: the modelled `TagMap`'s own length maximum
 /// (`smithy_query(query="shape",shape="TagMap")` reports `len 1..50`).
-const MAX_RESOURCE_TAGS: usize = 50;
+pub(crate) const MAX_RESOURCE_TAGS: usize = 50;
+
+/// The status a SERVED tag mutation answers: `TagResourceResponse` declares no member, so
+/// the answer carries nothing to parse and is 204 No Content. The status and the body it
+/// carries are owned by `tag_mutation_no_content.rs`.
+const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
 
 /// A build component document: one `build` phase, which is all `CreateComponent` needs to
 /// store a component this suite can tag.
@@ -495,9 +500,9 @@ async fn tags_a_call_writes_are_the_tags_every_later_read_reports() {
             }
             let (status, body) = tag_resource(&router, &arn, call).await;
             assert_eq!(
-                status, 200,
-                "case {:?}: expected tagging call {step} to answer HTTP 200, got {status} with \
-                 {body}",
+                status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {:?}: expected tagging call {step} to answer HTTP \
+                 {TAG_MUTATION_SUCCESS_STATUS}, got {status} with {body}",
                 row.case
             );
         }
@@ -633,8 +638,9 @@ async fn a_resource_carries_no_more_tags_than_the_modelled_maximum() {
         let tags: Vec<(&str, &str)> = chunk.iter().map(|key| (key.as_str(), "set")).collect();
         let (status, body) = tag_resource(&router, &arn, &tags).await;
         assert_eq!(
-            status, 200,
-            "case filling to the bound: expected HTTP 200, got {status} with {body}"
+            status, TAG_MUTATION_SUCCESS_STATUS,
+            "case filling to the bound: expected HTTP {TAG_MUTATION_SUCCESS_STATUS}, got \
+             {status} with {body}"
         );
     }
 
@@ -651,8 +657,9 @@ async fn a_resource_carries_no_more_tags_than_the_modelled_maximum() {
     // A key already present replaces its value, so the map does not grow past the bound.
     let (status, body) = tag_resource(&router, &arn, &[("key-00", "replaced")]).await;
     assert_eq!(
-        status, 200,
-        "case replacing a key at the bound: expected HTTP 200, got {status} with {body}"
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case replacing a key at the bound: expected HTTP {TAG_MUTATION_SUCCESS_STATUS}, got \
+         {status} with {body}"
     );
 
     // One key PAST the bound is refused, and the resource keeps the tags it had.

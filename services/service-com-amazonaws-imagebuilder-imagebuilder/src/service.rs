@@ -75,9 +75,24 @@
 //! * [`RequestIdEnvelopeDefinition::error_member`], the definition wrapper `definition` hands
 //!   back, covers a response NO operation produced: a routing failure, a transport failure
 //!   detected up front, and a pre-dispatch authentication refusal.
+//!
+//! ## And how an answer that carries NO CONTENT is framed
+//!
+//! The two tag mutations are the only operations of this model whose output structure declares
+//! no member at all, so their success leaves the caller nothing to parse and answers
+//! `204 No Content` (`SUCCESS_STATUS` in `src/ops/tag_resource.rs` and
+//! `src/ops/untag_resource.rs`). Such a structure is not `smithy.api#Unit`, the one shape the
+//! renderers treat as bodyless, so the protocol renders it as the empty JSON object — content
+//! on an answer that states it has none. [`no_content_framing::NoContentRestJson`] is
+//! therefore what this service serves at [`Service::override_protocol`]: the model's own
+//! `restJson1` with a response at that status handed through the tree's one reading of that
+//! framing, at the one place every response of this service passes through rather than per
+//! operation.
 
+pub mod no_content_framing;
 pub mod parameter_refusal;
 
+use no_content_framing::NoContentRestJson;
 use parameter_refusal::{
     body_parameter_refusal, pipeline_listing_body_refusal, unstated_pattern_refusal,
     uri_parameter_refusal,
@@ -160,6 +175,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// operation reads and writes the one store. Held on the service because
     /// [`Service::override_operation`] hands back a borrow of `self`.
     front_door: OperationRoutingTable,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: NoContentRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -269,6 +287,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: RequestIdEnvelopeDefinition::error_member(crate::ServiceDefinition::new(engine)),
             front_door,
+            protocol: NoContentRestJson::new(),
         }
     }
 }
@@ -353,5 +372,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own `restJson1`, with one framing correction on the way out: an answer
+        // that carries no content — a tag mutation's success — carries no body rather than the
+        // empty JSON object the renderer writes for a members-less output structure (see the
+        // module docs). Every answer that does carry content is left exactly as rendered.
+        Some(&self.protocol)
     }
 }

@@ -7,6 +7,11 @@
 //! A key the resource does not carry is nothing to remove, so naming one is served rather
 //! than refused.
 //!
+//! A served removal leaves the caller nothing to parse — the modelled output structure
+//! declares no member — so the answer is HTTP 204 No Content with an empty body rather than
+//! the 200 the protocol leaves defaulted (`SUCCESS_STATUS` below; the body itself is emptied
+//! at `crate::service::no_content_framing`).
+//!
 //! The handler below is this operation's implementation. `crate::scaffolded` remains its
 //! error channel, which is also how it refuses a request its own model has no error for.
 //!
@@ -133,7 +138,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// `204 No Content`: this operation's modelled output structure declares no member
+    /// (`smithy_query(query="shape",shape="UntagResourceResponse")`), so a served removal
+    /// leaves the caller nothing to parse. The BODY that status carries — none — is framed
+    /// by the protocol this service serves (`crate::service::no_content_framing`).
+    const SUCCESS_STATUS: u16 = ::service_common::no_content_responses::NO_CONTENT_STATUS;
 
     async fn handle(
         &self,

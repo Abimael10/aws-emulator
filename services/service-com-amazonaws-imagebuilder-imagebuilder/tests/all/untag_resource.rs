@@ -20,6 +20,9 @@
 //! the tags first got onto the record (a create or a tagging call), how many keys one call
 //! names, what a key looks like, whether the key is carried or absent, and whether the
 //! call empties the record's tags or leaves some behind.
+//!
+//! A served tag mutation answers [`TAG_MUTATION_SUCCESS_STATUS`]; the status and the body it
+//! carries are owned by `tag_mutation_no_content.rs`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,7 +31,12 @@ use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region a case signs for when it only needs one; the ARNs it creates carry it.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
+
+/// The status a SERVED tag mutation answers: both tagging mutations' modelled output
+/// structures declare no member, so the answer carries nothing to parse and is 204 No
+/// Content.
+const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
 
 /// A second Region, for the case that checks a regional endpoint reaches only its own
 /// Region's resources.
@@ -42,7 +50,7 @@ const ACCOUNT: &str = "000000000000";
 const BUILD_DOCUMENT: &str = "name: HelloWorld\nschemaVersion: 1.0\nphases:\n  - name: build\n    steps:\n      - name: Greet\n        action: ExecuteBash\n        inputs:\n          commands:\n            - echo hello\n";
 
 /// One emulator with an empty store, mounted exactly as the router mounts it.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -54,7 +62,7 @@ fn emulator() -> MultiServiceRouter {
 
 /// A request signed for `imagebuilder` in `region` — the signal the router routes on and
 /// the handlers read the Region from.
-fn request(
+pub(crate) fn request(
     region: &str,
     method: &str,
     uri: &str,
@@ -115,7 +123,7 @@ async fn call_in(
 /// Percent-encode one path segment, as an AWS SDK encodes a NON-greedy `@httpLabel`:
 /// everything outside the RFC 3986 unreserved set, so the `:` and `/` of an ARN travel as
 /// `%3A` and `%2F` and the whole ARN stays ONE path segment.
-fn encode_label(value: &str) -> String {
+pub(crate) fn encode_label(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
@@ -181,7 +189,7 @@ async fn untag_resource(router: &MultiServiceRouter, arn: &str, keys: &[&str]) -
 }
 
 /// The pairs as the JSON object a `tags` member carries.
-fn tag_object(tags: &[(&str, &str)]) -> Value {
+pub(crate) fn tag_object(tags: &[(&str, &str)]) -> Value {
     let mut map = Map::new();
     for (key, value) in tags {
         map.insert((*key).to_string(), json!(value));
@@ -241,6 +249,19 @@ fn assert_refused(case: &str, status: u16, body: &Value, expect_status: u16, exp
     );
 }
 
+/// Assert a tag mutation was served: it answers the no-content status and no body.
+fn assert_mutated(case: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case:?}: expected HTTP {TAG_MUTATION_SUCCESS_STATUS}, got {status} with {body}"
+    );
+    assert_eq!(
+        body,
+        &Value::Null,
+        "case {case:?}: expected no body at all, got {body}"
+    );
+}
+
 /// Assert a call succeeded, and answer its body.
 fn assert_ok(case: &str, status: u16, body: Value) -> Value {
     assert_eq!(
@@ -268,7 +289,7 @@ async fn tags_of(router: &MultiServiceRouter, case: &str, arn: &str) -> BTreeMap
 /// Which resource kind a row untags, and how a resource of that kind is created and read
 /// back through its own Get.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     InfrastructureConfiguration,
     Component,
     ImageRecipe,
@@ -277,7 +298,7 @@ enum Kind {
 impl Kind {
     /// Create a resource of this kind in `region`, optionally carrying `tags`, and answer
     /// its ARN.
-    async fn create(
+    pub(crate) async fn create(
         self,
         router: &MultiServiceRouter,
         region: &str,
@@ -456,20 +477,11 @@ async fn untagging_removes_exactly_the_keys_the_request_names() {
             .await;
         if !row.tagged_with.is_empty() {
             let (status, body) = tag_resource(&router, &arn, row.tagged_with).await;
-            assert_eq!(
-                status, 200,
-                "case {:?}: expected the tagging call to answer HTTP 200, got {status} with \
-                 {body}",
-                row.case
-            );
+            assert_mutated(row.case, status, &body);
         }
 
         let (status, body) = untag_resource(&router, &arn, row.remove).await;
-        assert_eq!(
-            status, 200,
-            "case {:?}: expected the untagging call to answer HTTP 200, got {status} with {body}",
-            row.case
-        );
+        assert_mutated(row.case, status, &body);
 
         let expected = tag_map(row.expected);
         let actual = tags_of(&router, row.case, &arn).await;
@@ -491,12 +503,7 @@ async fn untagging_removes_exactly_the_keys_the_request_names() {
         // Naming the same keys again removes nothing more: what is already absent stays
         // absent, and the keys the first call left are the keys the second call leaves.
         let (status, body) = untag_resource(&router, &arn, row.remove).await;
-        assert_eq!(
-            status, 200,
-            "case {:?}: expected the repeated untagging call to answer HTTP 200, got {status} \
-             with {body}",
-            row.case
-        );
+        assert_mutated(row.case, status, &body);
         let repeated = tags_of(&router, row.case, &arn).await;
         assert_eq!(
             repeated, expected,
@@ -515,10 +522,10 @@ async fn a_key_removed_can_be_written_again() {
         .await;
 
     let (status, body) = tag_resource(&router, &arn, &[("Stage", "dev")]).await;
-    assert_ok("tag the recipe", status, body);
+    assert_mutated("tag the recipe", status, &body);
 
     let (status, body) = untag_resource(&router, &arn, &["Stage"]).await;
-    assert_ok("remove the only key", status, body);
+    assert_mutated("remove the only key", status, &body);
     let emptied = tags_of(&router, "remove the only key", &arn).await;
     assert!(
         emptied.is_empty(),
@@ -528,7 +535,7 @@ async fn a_key_removed_can_be_written_again() {
     // A resource left carrying no tags is a resource that can be tagged again, and the
     // value it takes is the new one — not the value the removed key used to carry.
     let (status, body) = tag_resource(&router, &arn, &[("Stage", "prod")]).await;
-    assert_ok("tag the recipe again", status, body);
+    assert_mutated("tag the recipe again", status, &body);
     let expected = tag_map(&[("Stage", "prod")]);
     let actual = tags_of(&router, "tag the recipe again", &arn).await;
     assert_eq!(
@@ -553,7 +560,7 @@ async fn untagging_one_resource_leaves_every_other_resource_alone() {
 
     // Untag exactly one of them; the other records name the same keys and must keep them.
     let (status, body) = untag_resource(&router, &arns[1].2, &["Stage"]).await;
-    assert_ok("untag only the component", status, body);
+    assert_mutated("untag only the component", status, &body);
 
     for (index, (kind, name, arn)) in arns.iter().enumerate() {
         let case = format!("{name} after untagging only the component");
