@@ -323,6 +323,11 @@ pub use container_insights::*;
 mod container_consumption;
 pub use container_consumption::*;
 
+/// The CONTAINER INSIGHTS utilization figures a cluster publishes — the CPU units and the MiB
+/// its running tasks are using and reserving — read off that same accounting.
+mod container_usage;
+pub use container_usage::*;
+
 /// The `AWS/ECS` CPU and memory utilization a SERVICE publishes into CloudWatch while it
 /// holds a running task, on the cluster-and-service dimension pair that identifies it.
 mod service_utilization;
@@ -4846,6 +4851,11 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// while it holds a running task — so the map is the set of services whose utilization
     /// CloudWatch is receiving.
     service_utilization: HashMap<(String, String), UtilizationSeries>,
+    /// The cluster, and the service of it, each Container Insights UTILIZATION series is of ->
+    /// what that series reported last, so the next figure it reports measures the interval
+    /// since then (see [`container_usage`]). An entry exists only while the cluster, and the
+    /// service, still exist.
+    insights_baselines: InsightsBaselines,
     /// `containerArn` -> the in-process task performing that container's HEALTH-CHECK probe
     /// (see [`container_health`]). Kept for the same reason the runs above keep theirs: a
     /// probe whose container is gone is ABORTED rather than merely forgotten, so no probe

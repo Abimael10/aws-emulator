@@ -18,7 +18,7 @@ use super::*;
 /// How many CPU units one vCPU is, so a `cpu` given "as a string using vCPUs (for
 /// example, `1 vCPU` or `1 vcpu`)" is read as the CPU units it stands for
 /// (`RegisterTaskDefinition$cpu`).
-const CPU_UNITS_PER_VCPU: f64 = 1024.0;
+pub const CPU_UNITS_PER_VCPU: f64 = 1024.0;
 
 /// How many MiB one GB is, so a `memory` given "as a string using GB (for example,
 /// `1GB` or `1 GB`)" is read as the MiB it stands for

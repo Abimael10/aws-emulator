@@ -19,24 +19,32 @@
 //!
 //! # What is published, and what is NOT
 //!
-//! Every datapoint is COUNTED off this store's own records, at the instant it is taken:
+//! Every datapoint is read off this store's own records, at the instant it is taken — the
+//! COUNTS off the records themselves, and the UTILIZATION off the runs this emulator
+//! performs for the containers of those records ([`super::container_usage`]):
 //!
 //! * per cluster ([`CLUSTER_DIMENSION`]): how many of its tasks are running
 //!   ([`METRIC_TASK_COUNT`]), how many services it holds ([`METRIC_SERVICE_COUNT`]) and how
 //!   many container instances are registered into it
-//!   ([`METRIC_CONTAINER_INSTANCE_COUNT`]);
+//!   ([`METRIC_CONTAINER_INSTANCE_COUNT`]), beside the CPU and memory its running tasks are
+//!   using and reserving ([`METRIC_CPU_UTILIZED`], [`METRIC_CPU_RESERVED`],
+//!   [`METRIC_MEMORY_UTILIZED`], [`METRIC_MEMORY_RESERVED`]);
 //! * per service of that cluster ([`SERVICE_DIMENSION`] beside the cluster's): the
 //!   running, pending and desired task counts of that service
 //!   ([`METRIC_RUNNING_TASK_COUNT`], [`METRIC_PENDING_TASK_COUNT`],
 //!   [`METRIC_DESIRED_TASK_COUNT`]), the deployments it holds
-//!   ([`METRIC_DEPLOYMENT_COUNT`]) and the task sets in it ([`METRIC_TASK_SET_COUNT`]).
+//!   ([`METRIC_DEPLOYMENT_COUNT`]), the task sets in it ([`METRIC_TASK_SET_COUNT`]) and the
+//!   same four utilization figures for its own tasks.
 //!
-//! The UTILIZATION metrics Container Insights also publishes for a cluster — the CPU,
-//! memory, network and storage a task used — are deliberately NOT published: nothing here
-//! measures them. A container's program runs in this process and no resource accounting
-//! stands behind it, so a number published under one of those names would be an observation
-//! of work nothing observed. A count of records this store holds is not that: it is read off
-//! the very records `DescribeClusters` and `DescribeServices` report.
+//! The utilization is a MEASUREMENT of the containers of those tasks: what this emulator
+//! performs for a container is its program in this process, so the CPU figure is the CPU
+//! units the programs of those containers have occupied and the memory figure the MiB their
+//! sessions hold — never a number for work nothing performed. The NETWORK and STORAGE
+//! Container Insights also publishes for a cluster are NOT published: nothing here moves a
+//! byte over a network or onto a disk for a container, so a number under one of those names
+//! would be an observation of traffic nothing observed. A count of records this store holds
+//! is not that either: it is read off the very records `DescribeClusters` and
+//! `DescribeServices` report.
 //!
 //! # The clock the series is published on
 //!
@@ -77,6 +85,23 @@ pub const METRIC_PENDING_TASK_COUNT: &str = "PendingTaskCount";
 pub const METRIC_DESIRED_TASK_COUNT: &str = "DesiredTaskCount";
 pub const METRIC_DEPLOYMENT_COUNT: &str = "DeploymentCount";
 pub const METRIC_TASK_SET_COUNT: &str = "TaskSetCount";
+
+/// The UTILIZATION metrics it publishes at both levels: the CPU units and the MiB the
+/// running tasks are using, beside what their task definitions reserve, by the names
+/// Container Insights publishes them under.
+pub const METRIC_CPU_UTILIZED: &str = "CpuUtilized";
+pub const METRIC_CPU_RESERVED: &str = "CpuReserved";
+pub const METRIC_MEMORY_UTILIZED: &str = "MemoryUtilized";
+pub const METRIC_MEMORY_RESERVED: &str = "MemoryReserved";
+
+/// The `StandardUnit` a number of CPU UNITS is published in: a CPU unit is not one of the
+/// units the enumerated type names, so these two carry the value it has for a measurement
+/// with no unit of its own ([`cloudwatch::UNIT_NONE`]).
+const CPU_UNIT: &str = cloudwatch::UNIT_NONE;
+
+/// The `StandardUnit` an amount of memory is published in — the unit a task definition sizes
+/// memory in.
+const MEMORY_UNIT: &str = "Megabytes";
 
 /// The `StandardUnit` a count of resources is published in.
 const COUNT_UNIT: &str = "Count";
@@ -121,6 +146,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         &mut self,
         now: SystemTime,
     ) -> Vec<(cloudwatch::MetricKey, cloudwatch::StoredDatum)> {
+        // A series of a cluster or a service this store no longer holds reports nothing more,
+        // so what it last reported is forgotten with it ([`super::container_usage`]).
+        self.prune_insights_baselines();
         let cluster_names: Vec<String> = self
             .clusters
             .values()
@@ -138,7 +166,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         for cluster_name in cluster_names {
             let tally = self.tally(&cluster_name);
             let instances = self.registered_container_instances(&cluster_name);
-            let mut counts: Vec<(BTreeMap<String, String>, &str, f64)> = Vec::new();
+            let mut counts: Vec<(BTreeMap<String, String>, &str, f64, &str)> = Vec::new();
             let cluster_dimensions: BTreeMap<String, String> =
                 [(CLUSTER_DIMENSION.to_string(), cluster_name.clone())]
                     .into_iter()
@@ -148,7 +176,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 (METRIC_SERVICE_COUNT, tally.active_services as f64),
                 (METRIC_CONTAINER_INSTANCE_COUNT, instances as f64),
             ] {
-                counts.push((cluster_dimensions.clone(), metric_name, count));
+                counts.push((cluster_dimensions.clone(), metric_name, count, COUNT_UNIT));
+            }
+            // What every running task of the cluster is consuming, read off the accounting
+            // the runs of their containers keep ([`super::container_usage`]).
+            for (metric_name, measured, unit) in
+                insights_figures(&self.cluster_insights_utilization(&cluster_name, now))
+            {
+                counts.push((cluster_dimensions.clone(), metric_name, measured, unit));
             }
             let services: Vec<(String, i32, usize)> = self
                 .services
@@ -186,7 +221,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     (METRIC_DEPLOYMENT_COUNT, deployments as f64),
                     (METRIC_TASK_SET_COUNT, task_sets as f64),
                 ] {
-                    counts.push((dimensions.clone(), metric_name, count));
+                    counts.push((dimensions.clone(), metric_name, count, COUNT_UNIT));
+                }
+                // And what that service's own running tasks are consuming, on the dimension
+                // pair a per-service alarm and dashboard select.
+                for (metric_name, measured, unit) in insights_figures(
+                    &self.service_insights_utilization(&cluster_name, &service_name, now),
+                ) {
+                    counts.push((dimensions.clone(), metric_name, measured, unit));
                 }
             }
             if let Some(cluster) = self.clusters.get_mut(&cluster_name) {
@@ -195,7 +237,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     Some((tally.running, tally.active_services, instances));
             }
             let timestamp_secs = epoch_seconds(now);
-            for (dimensions, metric_name, count) in counts {
+            for (dimensions, metric_name, count, unit) in counts {
                 published.push((
                     cloudwatch::MetricKey {
                         namespace: CONTAINER_INSIGHTS_NAMESPACE.to_string(),
@@ -204,12 +246,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     },
                     cloudwatch::StoredDatum {
                         timestamp_secs,
-                        // One observation: this collection's own count of the records.
+                        // One observation: this collection's own reading of the records.
                         sample_count: 1.0,
                         sum: count,
                         minimum: count,
                         maximum: count,
-                        unit: Some(COUNT_UNIT.to_string()),
+                        unit: Some(unit.to_string()),
                         storage_resolution: STORAGE_RESOLUTION_SECS,
                     },
                 ));
@@ -254,6 +296,33 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 pub(super) fn epoch_seconds(at: SystemTime) -> f64 {
     at.duration_since(::std::time::UNIX_EPOCH)
         .map_or(0.0, |since| since.as_secs_f64())
+}
+
+/// The utilization datapoints one reading carries, each with the unit it is published in: the
+/// CPU units and the MiB the tasks are using, and the ones their task definitions reserve.
+///
+/// A figure the reading has none of is not published at all — there is no quantity of CPU to
+/// report for tasks that were given none ([`super::container_usage`]).
+fn insights_figures(
+    utilization: &InsightsUtilization,
+) -> Vec<(&'static str, f64, &'static str)> {
+    [
+        (METRIC_CPU_UTILIZED, utilization.cpu_utilized, CPU_UNIT),
+        (METRIC_CPU_RESERVED, utilization.cpu_reserved, CPU_UNIT),
+        (
+            METRIC_MEMORY_UTILIZED,
+            Some(utilization.memory_utilized),
+            MEMORY_UNIT,
+        ),
+        (
+            METRIC_MEMORY_RESERVED,
+            utilization.memory_reserved,
+            MEMORY_UNIT,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(metric_name, figure, unit)| figure.map(|figure| (metric_name, figure, unit)))
+    .collect()
 }
 
 /// Publish the Container Insights datapoints the clock owes the clusters this store holds —

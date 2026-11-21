@@ -129,6 +129,10 @@ pub(super) struct ServiceConsumption {
     /// zero when none of them states a reservation at all — the denominator a memory
     /// utilization is a percentage of.
     pub(super) reserved_bytes: u128,
+    /// How many CPU UNITS the task definitions of those tasks reserve for them, and zero when
+    /// none of them states a reservation at all — what the share of its performers a program
+    /// held stands for as a quantity of CPU ([`super::container_usage`]).
+    pub(super) reserved_cpu_units: u128,
 }
 
 impl ServiceConsumption {
@@ -185,16 +189,31 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         cluster_name: &str,
         service_name: &str,
     ) -> ServiceConsumption {
+        self.consumption_of(|task| {
+            task.cluster_name == cluster_name && task.service_name.as_deref() == Some(service_name)
+        })
+    }
+
+    /// What the containers of the RUNNING tasks `selected` picks consume, read off the runs
+    /// this store holds for them — the one walk every reading of a container's consumption
+    /// takes, whether the tasks selected are one service's ([`Self::service_consumption`]) or
+    /// a whole cluster's ([`super::container_usage`]).
+    pub(super) fn consumption_of(
+        &self,
+        selected: impl Fn(&TaskRecord) -> bool,
+    ) -> ServiceConsumption {
         let mut reading = ServiceConsumption::default();
         for task in self.tasks.values().filter(|task| {
             task.desired_status == STATUS_RUNNING
                 && task.last_status == STATUS_RUNNING
-                && task.cluster_name == cluster_name
-                && task.service_name.as_deref() == Some(service_name)
+                && selected(task)
         }) {
             reading.reserved_bytes = reading
                 .reserved_bytes
                 .saturating_add(u128::from(task_reserved_memory_bytes(task)));
+            reading.reserved_cpu_units = reading
+                .reserved_cpu_units
+                .saturating_add(u128::from(task_reserved_cpu_units(task)));
             for container in &task.containers {
                 let Some(run) = self.container_runs.get(&container.container_arn) else {
                     continue;
@@ -247,4 +266,26 @@ fn mebibytes_as_bytes(mib: i64) -> u64 {
     u64::try_from(mib)
         .unwrap_or_default()
         .saturating_mul(BYTES_PER_MIB)
+}
+
+/// How many CPU UNITS ONE task's definition RESERVES for it, and zero for a definition that
+/// states no reservation anywhere.
+///
+/// `TaskDefinition$cpu` is "the number of CPU units used by the task", which is what the whole
+/// task reserves; a definition that states none states it per CONTAINER instead
+/// (`ContainerDefinition$cpu`, "the number of cpu units the Amazon ECS container agent reserves
+/// for the container"), and what the task then reserves is the sum over its containers — read
+/// the same way the memory reservation beside it is ([`task_reserved_memory_bytes`]).
+fn task_reserved_cpu_units(task: &TaskRecord) -> u64 {
+    if let Some(units) = task.cpu.as_deref().and_then(cpu_units) {
+        if units > 0 {
+            return u64::try_from(units).unwrap_or_default();
+        }
+    }
+    task.containers
+        .iter()
+        .filter_map(|container| container.cpu.as_deref())
+        .filter_map(cpu_units)
+        .map(|units| u64::try_from(units).unwrap_or_default())
+        .fold(0, u64::saturating_add)
 }

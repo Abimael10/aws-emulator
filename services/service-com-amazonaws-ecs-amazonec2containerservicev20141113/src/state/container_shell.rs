@@ -134,6 +134,16 @@
 //! control, so there is no second thread of execution for a job to run on, and `wait`
 //! answers success because no job is outstanding.
 //!
+//! # What the run CONSUMES
+//!
+//! Performing the program IS the container's work, so this session accounts for it as it
+//! goes: at each point its time divides — the step it is about to take, the wait it is about
+//! to enter, and the end of the run — it records the span its program spent EXECUTING and how
+//! many bytes it is holding ([`super::container_consumption`]). That accounting is what every
+//! utilization series about the container's task, service or cluster is read off, and it is
+//! taken here because this is the only place that knows which spans were the program RUNNING
+//! rather than waiting.
+//!
 //! # Bounds
 //!
 //! Every bound is this emulator's, held in code the program cannot reach: how many STEPS

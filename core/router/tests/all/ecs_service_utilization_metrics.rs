@@ -5,11 +5,14 @@
 //! RULE: Amazon ECS publishes a service's CPU and memory utilization as the `AWS/ECS` metrics
 //! `CPUUtilization` and `MemoryUtilization`, in `Percent`, dimensioned on EXACTLY the pair
 //! `ClusterName` + `ServiceName` that names the service — for as long as that service holds a
-//! running task, and for no service that holds none. Each datapoint is a percentage of what
-//! the service's task definition reserves (the ECS developer guide's service utilization
-//! divides what the tasks of one service use by what that definition reserves), so none of
-//! them is negative or past 100. The same namespace carries no series on `ClusterName` alone
-//! for such a service — a cluster-wide utilization is a measurement of the container instances
+//! running task, and for no service that holds none. Each datapoint MEASURES what the
+//! containers of those tasks are doing — the share of the CPU they were given that their
+//! programs spent EXECUTING, and the memory they are occupying over what the service's task
+//! definition reserves (the ECS developer guide's service utilization divides what the tasks
+//! of one service use by what that definition reserves): so none of them is negative or past
+//! 100, and a service whose container keeps COMPUTING reports more CPU in use than one whose
+//! container only WAITS. The same namespace carries no series on `ClusterName` alone for such
+//! a service — a cluster-wide utilization is a measurement of the container instances
 //! registered to the cluster, of which a Fargate-only cluster has none — so an alarm over the
 //! pair transitions on the published data while its `ClusterName`-only twin stays
 //! `INSUFFICIENT_DATA`, and `ListMetrics` over the namespace lists both metric names under
@@ -20,9 +23,11 @@
 //! third (Amazon EC2 holds the network), so the suite lives here.
 //!
 //! The rows differ along what the rule generalises over: HOW MANY tasks the service runs (one,
-//! three, and none at all) and WHICH capacity runs them (Fargate, and the EC2 launch type on a
-//! registered container instance), each service in a cluster of its own so a row's series are
-//! read on their own. A recording of a single `desiredCount=1` Fargate service is one row.
+//! three, and none at all), WHICH capacity runs them (Fargate, and the EC2 launch type on a
+//! registered container instance) and WHAT the containers do (a program that computes without
+//! pausing, and one that waits), each service in a cluster of its own so a row's series are
+//! read on their own. A recording of a single `desiredCount=1` Fargate service whose container
+//! spins is one row.
 //!
 //! Nothing here reaches into the ECS store: the services are created through the ECS front
 //! door, and every datapoint, metric listing and alarm state is read back through CloudWatch's
@@ -62,10 +67,13 @@ const ALARM: &str = "ALARM";
 const VPC: &str = "vpc-0123456789abcdef0";
 pub(crate) const SUBNET: &str = "subnet-0123456789abcdef0";
 
-/// The image every container names, and a program that stays up — so a task that is running is
-/// still running while its series is read.
+/// The image every container names, and the programs a row's container runs. Each of them
+/// stays up — so a task that is running is still running while its series is read — and they
+/// differ in what they DO: one computes at every step, the other waits.
 pub(crate) const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
 pub(crate) const STAYS_UP: [&str; 3] = ["sh", "-c", "while true; do sleep 1; done"];
+const COMPUTES: &str = "i=0; while true; do i=$((i+1)); done";
+const WAITS: &str = STAYS_UP[2];
 
 /// How often a poll re-reads what it is waiting on.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -90,8 +98,8 @@ enum Capacity {
     Ec2,
 }
 
-/// One row: the service to create, where it runs, how many tasks it wants, and whether it is
-/// therefore metered.
+/// One row: the service to create, where it runs, how many tasks it wants, what its container
+/// does, and what it therefore publishes.
 struct Row {
     case: &'static str,
     cluster: &'static str,
@@ -99,35 +107,45 @@ struct Row {
     capacity: Capacity,
     /// The `desiredCount` the service is created with.
     desired: i64,
+    /// The shell program the container runs.
+    program: &'static str,
     /// Whether this service publishes a series at all — it holds a running task, so something
     /// is measuring it.
     publishes: bool,
+    /// Whether its container is expected to be measured USING the CPU it was given.
+    busy: bool,
 }
 
 const ROWS: &[Row] = &[
     Row {
-        case: "the recorded shape: a Fargate service running one task",
+        case: "the recorded shape: a Fargate service running one task that computes",
         cluster: "util-fargate-one",
         service: "orders",
         capacity: Capacity::Fargate,
         desired: 1,
+        program: COMPUTES,
         publishes: true,
+        busy: true,
     },
     Row {
-        case: "a Fargate service running three tasks",
+        case: "a Fargate service running three tasks that wait",
         cluster: "util-fargate-three",
         service: "checkout",
         capacity: Capacity::Fargate,
         desired: 3,
+        program: WAITS,
         publishes: true,
+        busy: false,
     },
     Row {
-        case: "an EC2 launch-type service running one task",
+        case: "an EC2 launch-type service running one task that waits",
         cluster: "util-ec2-one",
         service: "billing",
         capacity: Capacity::Ec2,
         desired: 1,
+        program: WAITS,
         publishes: true,
+        busy: false,
     },
     Row {
         case: "a Fargate service that wants no task",
@@ -135,7 +153,9 @@ const ROWS: &[Row] = &[
         service: "idle",
         capacity: Capacity::Fargate,
         desired: 0,
+        program: WAITS,
         publishes: false,
+        busy: false,
     },
 ];
 
@@ -318,7 +338,7 @@ async fn create_service(router: &MultiServiceRouter, row: &Row) {
             "image": IMAGE,
             "memory": 128,
             "essential": true,
-            "command": STAYS_UP,
+            "command": ["sh", "-c", row.program],
         }],
     });
     let mut create = json!({
@@ -407,6 +427,39 @@ async fn published(router: &MultiServiceRouter, row: &Row, metric: &str) -> Vec<
     }
 }
 
+/// The largest `Average` any datapoint of the row's `metric` reports, and `None` for a series
+/// that holds none.
+fn highest_average(points: &[Value]) -> Option<f64> {
+    points
+        .iter()
+        .filter_map(|point| point["Average"].as_f64())
+        .fold(None, |held: Option<f64>, value| {
+            Some(held.map_or(value, |held| held.max(value)))
+        })
+}
+
+/// Wait until some datapoint of the row's `metric` reports a POSITIVE average, and answer it.
+///
+/// What a MEASUREMENT of a container that is doing work looks like: the figure is read off the
+/// run this emulator performs for that container, so it is positive once that run has
+/// performed any of its program.
+async fn measured_positive(router: &MultiServiceRouter, row: &Row, metric: &str) -> f64 {
+    let case = row.case;
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let points = datapoints(router, metric, service_dimensions(row)).await;
+        if let Some(highest) = highest_average(&points).filter(|value| *value > 0.0) {
+            return highest;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected a positive {metric} average on {}, got {points:?}",
+            service_dimensions(row)
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Put one alarm over `metric` on `dimensions`, named `name`.
 ///
 /// The condition is one every percentage satisfies — a utilization is at most 100 — so what
@@ -449,6 +502,8 @@ async fn a_running_service_publishes_percent_utilization_on_its_cluster_and_serv
         create_service(&router, row).await;
     }
 
+    let mut computing: Option<f64> = None;
+    let mut waiting: Option<f64> = None;
     for row in ROWS {
         let case = row.case;
         converged(&router, row).await;
@@ -497,6 +552,21 @@ async fn a_running_service_publishes_percent_utilization_on_its_cluster_and_serv
                     "case {case:?}: expected {metric} to report its observations, got {point}"
                 );
             }
+        }
+
+        // The memory a running container's session and its own layer hold is memory it is
+        // using, so every metered service reports some of its reserved memory in use.
+        measured_positive(&router, row, MEMORY_UTILIZATION).await;
+        // ...and the CPU is the work its containers really perform: the one that computes is
+        // measured using the CPU it was given, while the ones that wait have their waiting
+        // charged to nothing.
+        if row.busy {
+            let highest = measured_positive(&router, row, CPU_UTILIZATION).await;
+            computing = Some(computing.map_or(highest, |held: f64| held.max(highest)));
+        } else {
+            let points = datapoints(&router, CPU_UTILIZATION, service_dimensions(row)).await;
+            let highest = highest_average(&points).unwrap_or_default();
+            waiting = Some(waiting.map_or(highest, |held: f64| held.max(highest)));
         }
 
         // The namespace carries no series on the CLUSTER alone for this service: a
@@ -553,6 +623,17 @@ async fn a_running_service_publishes_percent_utilization_on_its_cluster_and_serv
             );
         }
     }
+
+    // The percentages are a MEASUREMENT of what each service's containers do: the service
+    // whose container computes at every step is using more of the CPU it was given than the
+    // ones whose containers sit in a wait.
+    let computing = computing.expect("a row whose container computes");
+    let waiting = waiting.expect("a row whose container waits");
+    assert!(
+        computing > waiting,
+        "expected the computing service's {CPU_UTILIZATION} ({computing}) to exceed the \
+         waiting services' ({waiting})"
+    );
 }
 
 #[tokio::test]
