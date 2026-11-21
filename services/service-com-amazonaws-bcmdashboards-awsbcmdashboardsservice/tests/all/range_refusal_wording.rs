@@ -28,6 +28,13 @@
 //! value it was given, and a request that breaks a range AND a length states both clauses
 //! under one envelope, each in its own class's voice.
 //!
+//! A last table varies the COUNT: the choice is made per VIOLATION, so a request that breaks
+//! several declared ranges at once is answered with one valueless clause per violated member
+//! under the counted envelope — two ranges on one widget, one range on each of several
+//! widgets, both ends of both widget members on an update — and a request that breaks a range
+//! and another class keeps the value half for the other class alone, whatever the number of
+//! clauses stated.
+//!
 //! Every call goes through the real router, so what these tests assert is what an SDK client
 //! sees.
 
@@ -460,6 +467,181 @@ async fn a_request_breaking_a_range_and_a_length_states_each_in_its_own_voice() 
             message.contains(&clause),
             "case a bad page size and a bad cursor: expected {clause:?} among the clauses, \
              got {message:?}"
+        );
+    }
+}
+
+/// The clause a class OTHER than `@range` states: the value the request submitted, quoted,
+/// then the member path and the requirement that value broke.
+fn valued_clause(value: &str, path: &str, requirement: &str) -> String {
+    format!("{VALUE_HALF_OPENING}{value}' at '{path}' failed to satisfy constraint: {requirement}")
+}
+
+/// The requirement a string shorter than `min` broke, as the framework words that class.
+fn length_at_least(min: usize) -> String {
+    format!("Member must have length greater than or equal to {min}")
+}
+
+/// One row of the multi-violation table: a request that breaks several constraints at once,
+/// and the whole clause set the refusal must state.
+struct ClauseSetCase {
+    label: &'static str,
+    operation: &'static str,
+    request: Value,
+    /// Every clause the refusal must state, in no particular order.
+    clauses: Vec<String>,
+    /// How many of those clauses quote the value the request submitted — zero while every
+    /// violation is of the `@range` class, however many of them there are.
+    value_halves: usize,
+}
+
+fn clause_set_cases() -> Vec<ClauseSetCase> {
+    vec![
+        ClauseSetCase {
+            label: "two widgets, each one past a different member's maximum",
+            operation: "CreateDashboard",
+            request: json!({
+                "name": "Two Ranges",
+                "widgets": [
+                    widget("Spend", json!({"width": 7})),
+                    widget("Coverage", json!({"height": 11}))
+                ]
+            }),
+            clauses: vec![
+                range_clause("widgets.1.member.width", &at_most(6)),
+                range_clause("widgets.2.member.height", &at_most(10)),
+            ],
+            value_halves: 0,
+        },
+        ClauseSetCase {
+            label: "one widget past both of its members' ends",
+            operation: "CreateDashboard",
+            request: json!({
+                "name": "Both Ends One Widget",
+                "widgets": [widget("Spend", json!({"width": 1, "height": 11}))]
+            }),
+            clauses: vec![
+                range_clause("widgets.1.member.width", &at_least(2)),
+                range_clause("widgets.1.member.height", &at_most(10)),
+            ],
+            value_halves: 0,
+        },
+        ClauseSetCase {
+            label: "three widgets, three ranges across both members and both ends",
+            operation: "CreateDashboard",
+            request: json!({
+                "name": "Three Ranges",
+                "widgets": [
+                    widget("Spend", json!({"width": 7})),
+                    widget("Coverage", json!({"height": 3})),
+                    widget("Utilization", json!({"width": 1}))
+                ]
+            }),
+            clauses: vec![
+                range_clause("widgets.1.member.width", &at_most(6)),
+                range_clause("widgets.2.member.height", &at_least(4)),
+                range_clause("widgets.3.member.width", &at_least(2)),
+            ],
+            value_halves: 0,
+        },
+        ClauseSetCase {
+            label: "four ranges over two widgets, on an update",
+            operation: "UpdateDashboard",
+            request: json!({
+                "arn": WELL_FORMED_DASHBOARD_ARN,
+                "name": "Four Ranges",
+                "widgets": [
+                    widget("Spend", json!({"width": 7, "height": 11})),
+                    widget("Coverage", json!({"width": 1, "height": 3}))
+                ]
+            }),
+            clauses: vec![
+                range_clause("widgets.1.member.width", &at_most(6)),
+                range_clause("widgets.1.member.height", &at_most(10)),
+                range_clause("widgets.2.member.width", &at_least(2)),
+                range_clause("widgets.2.member.height", &at_least(4)),
+            ],
+            value_halves: 0,
+        },
+        ClauseSetCase {
+            // The scope of the rule under the same envelope as a range: `description`
+            // targets `Description`, length 1..200, so the empty description keeps the value
+            // half while the widget's range drops it.
+            label: "a widget range and an empty description, on a create",
+            operation: "CreateDashboard",
+            request: json!({
+                "name": "Range And Length",
+                "description": "",
+                "widgets": [widget("Spend", json!({"width": 7}))]
+            }),
+            clauses: vec![
+                valued_clause("", "description", &length_at_least(1)),
+                range_clause("widgets.1.member.width", &at_most(6)),
+            ],
+            value_halves: 1,
+        },
+    ]
+}
+
+/// The clauses `message` states, in the order it stated them, after checking that its
+/// envelope counted `expected` of them.
+fn stated_clauses(label: &str, message: &str, expected: usize) -> Vec<String> {
+    let (counted, clauses) = message
+        .split_once(" validation errors detected: ")
+        .unwrap_or_else(|| {
+            panic!(
+                "case {label:?}: expected the plural envelope over {expected} clauses, got \
+                 {message:?}"
+            )
+        });
+    assert_eq!(
+        counted,
+        expected.to_string(),
+        "case {label:?}: expected the envelope to count {expected} errors, got {message:?}"
+    );
+    clauses.split("; ").map(str::to_owned).collect()
+}
+
+#[tokio::test]
+async fn several_ranges_in_one_request_are_each_stated_without_their_value() {
+    let router = router();
+
+    for case in clause_set_cases() {
+        let ClauseSetCase {
+            label,
+            operation,
+            request,
+            clauses,
+            value_halves,
+        } = case;
+
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            status, 400,
+            "case {label:?}: expected HTTP 400 from {operation}, got {status}: {body}"
+        );
+        assert!(
+            error_code(&body).ends_with("ValidationException"),
+            "case {label:?}: expected ValidationException from {operation}, got {:?}: {body}",
+            error_code(&body)
+        );
+
+        let message = error_message(&body);
+        let mut stated = stated_clauses(label, &message, clauses.len());
+        let mut expected = clauses;
+        stated.sort();
+        expected.sort();
+        assert_eq!(
+            stated, expected,
+            "case {label:?}: expected one clause per violated member, got {message:?}"
+        );
+        // Every clause of the `@range` class withholds its value, however many of them one
+        // envelope carries: only another class's clause quotes what it was given.
+        assert_eq!(
+            message.matches(VALUE_HALF_OPENING).count(),
+            value_halves,
+            "case {label:?}: expected {value_halves} clause(s) to quote a value, got \
+             {message:?}"
         );
     }
 }
