@@ -508,7 +508,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
         if let Some(message) = password.and_then(|password| {
             pool.check_password(
                 password,
-                crate::state::PasswordPolicyWording::UserSuppliesPassword,
+                crate::state::PasswordPolicyWording::SignsUpOrChangesPassword,
             )
         }) {
             return Err(invalid_password(message));

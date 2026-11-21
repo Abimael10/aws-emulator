@@ -310,9 +310,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // own policy, as every other password this API accepts does. Refused BEFORE
             // anything is written, and without spending the code: the reset the user asked
             // for is still outstanding, so a corrected password can still complete it.
+            // The refusal carries THIS API's own wording for a policy the password
+            // missed, which is the sentence the password-setting APIs answer and not
+            // the self-service one
+            // ([`crate::state::PasswordPolicyWording::ConfirmsPasswordReset`]).
             if let Some(message) = pool.check_password(
                 &input.password,
-                crate::state::PasswordPolicyWording::UserSuppliesPassword,
+                crate::state::PasswordPolicyWording::ConfirmsPasswordReset,
             ) {
                 return Err(invalid_password(message));
             }

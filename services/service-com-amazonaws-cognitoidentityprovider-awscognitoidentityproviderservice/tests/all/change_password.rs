@@ -50,9 +50,10 @@ const EMULATOR_HOST: &str = "127.0.0.1:9297";
 /// the error shape models (`src/service/error_wire.rs`).
 const REFUSAL_STATUS: u16 = 400;
 
-/// The prefix a password-policy refusal carries where the USER supplied the
-/// password (`ChangePassword`, `ConfirmForgotPassword`, a new password given in
-/// a challenge response).
+/// The prefix a password-policy refusal carries where the user supplies the
+/// password of its own account (`SignUp`, and `ChangePassword` here). The
+/// forgotten-password confirmation and a new password given in a challenge
+/// response answer their own sentences, asserted in their own suites.
 const USER_PASSWORD_POLICY_PREFIX: &str = "Password did not conform with policy: ";
 
 /// The sentence a password-history refusal carries. It is NOT one of the

@@ -827,11 +827,13 @@ pub const TERMS_NOT_FOUND_MESSAGE: &str = "Terms does not exist.";
 /// the requirement the password missed.
 ///
 /// Amazon Cognito does not word this refusal identically in every API that
-/// judges a password: the administrative password set, the administrative create
-/// and the paths where the user supplies its own password each answer their own
-/// sentence. The clause for the requirement is the same in all of them, so only
-/// the prefix is chosen here and every operation names the wording ITS OWN API
-/// answers.
+/// judges a password: the administrative password set, the administrative
+/// create, the confirmation of a forgotten-password reset, the answer to an
+/// authentication challenge and the self-service paths each answer their own
+/// sentence, and the model states none of them. The clause for the requirement
+/// is the same in all of them, so only the prefix is chosen here and every
+/// operation names the wording ITS OWN API answers — never the wording of
+/// another API that happens to judge a password the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasswordPolicyWording {
     /// The wording `AdminSetUserPassword` answers.
@@ -839,27 +841,32 @@ pub enum PasswordPolicyWording {
     /// The wording `AdminCreateUser` answers for a `TemporaryPassword` the
     /// policy refuses.
     AdminCreatesUser,
-    /// The wording the paths where the user itself supplies the password answer
-    /// — a sign-up, a forgotten-password confirmation, a self-service password
-    /// change.
-    UserSuppliesPassword,
+    /// The wording the self-service paths where the user supplies the password
+    /// of its OWN account answer — a sign-up, and a password change made with
+    /// the password that account already holds.
+    SignsUpOrChangesPassword,
     /// The wording the operations that answer an outstanding authentication
     /// challenge answer: a `NEW_PASSWORD_REQUIRED` response carries the chosen
     /// password in `ChallengeResponses`, and a policy the password misses is
     /// reported there in the same sentence the password-setting APIs use, not in
     /// the self-service one.
     AnswersChallenge,
+    /// The wording the confirmation of a forgotten-password reset answers: the
+    /// password replaces one the user could not present, which is the same
+    /// sentence the administrative password set answers and NOT the self-service
+    /// one.
+    ConfirmsPasswordReset,
 }
 
 impl PasswordPolicyWording {
     /// The prefix this wording carries ahead of the requirement's clause.
     fn prefix(self) -> &'static str {
         match self {
-            Self::AdminSetsPassword | Self::AnswersChallenge => {
+            Self::AdminSetsPassword | Self::AnswersChallenge | Self::ConfirmsPasswordReset => {
                 "Password does not conform to policy: "
             }
             Self::AdminCreatesUser => "Password did not conform with password policy: ",
-            Self::UserSuppliesPassword => "Password did not conform with policy: ",
+            Self::SignsUpOrChangesPassword => "Password did not conform with policy: ",
         }
     }
 }

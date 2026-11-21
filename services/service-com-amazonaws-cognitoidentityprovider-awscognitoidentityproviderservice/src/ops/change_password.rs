@@ -277,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ChangePassword<En
             // judged BEFORE anything is written.
             if let Some(message) = pool.check_password(
                 &input.proposed_password,
-                crate::state::PasswordPolicyWording::UserSuppliesPassword,
+                crate::state::PasswordPolicyWording::SignsUpOrChangesPassword,
             ) {
                 return Err(invalid_password(message));
             }
