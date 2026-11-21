@@ -32,6 +32,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_agentregistry_agentregistry::ops::types::REGISTRY_RECORD_FILTER_NAME_VALUES;
 
 use crate::discovery_read_path::{list_path, post, seeded_router, EMPTY_REGISTRY, REGION, REGISTRY};
+use crate::registry_read_refusals::admissible_value;
 use service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::state as owner;
 
 /// The `message` member of a refusal body.
@@ -53,10 +54,22 @@ fn stated_value_set() -> Vec<&'static str> {
     sorted
 }
 
-/// A `filters` entry naming `name`, with a `values` list every element constraint of
-/// `DiscoverableFilterValues` admits, so a refusal is about the filter NAME alone.
+/// A `filters` entry naming `name`, with a `values` list every constraint of
+/// `DiscoverableFilterValues` admits and a value the named dimension has, so a refusal
+/// is about the filter NAME alone.
+///
+/// Which value that is comes from the sibling suite's model-derived reading of a filter's
+/// dimension (`registry_read_refusals::admissible_value`), so no value set is spelled
+/// twice across these suites. A name that is no member of the type has no dimension of its
+/// own, so it carries a value of the type's first member: such a row is refused for its
+/// NAME, which the validating walk decides before any handler reads a value.
 fn filter(name: &str) -> Value {
-    json!({ "name": name, "values": ["MCP"] })
+    let dimension = if REGISTRY_RECORD_FILTER_NAME_VALUES.contains(&name) {
+        name
+    } else {
+        REGISTRY_RECORD_FILTER_NAME_VALUES[0]
+    };
+    json!({ "name": name, "values": [admissible_value(dimension)] })
 }
 
 /// The list read's path and the body carrying `filters`.

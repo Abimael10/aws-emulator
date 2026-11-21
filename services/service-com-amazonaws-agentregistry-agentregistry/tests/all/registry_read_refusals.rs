@@ -17,7 +17,14 @@
 //! 3. a constraint the ELEMENTS of a collection declare is stated at that MEMBER with
 //!    the element shape's whole declared set nested inside the clause, and a `@pattern`
 //!    inside or outside that set is quoted as the service advertises the expression:
-//!    without the pair of whole-value anchors the model wraps it in.
+//!    without the pair of whole-value anchors the model wraps it in;
+//! 4. a registry-record filter narrows ONE dimension to ONE of the values that
+//!    dimension has, so a `filters` entry carrying any other number of values, or a
+//!    value the dimension it names does not have, is refused with
+//!    `400 ValidationException` before the caller is authorized, before the registry is
+//!    resolved and before any record is read — over both members of
+//!    `RegistryRecordFilterName`, every value count the modelled list admits, every
+//!    position in the filter list and whatever else the request carries.
 //!
 //! The last test pins the other direction: a value AT each published bound is served,
 //! so the refusals above are about values outside the model's bounds.
@@ -29,9 +36,16 @@
 //! `tests/all/discovery_read_path.rs` already drives this service with.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_agentregistry_agentregistry::ops::types::{
+    RECORD_TYPE_VALUES, REGISTRY_RECORD_FILTER_NAME_VALUES,
+};
+use service_com_amazonaws_agentregistry_agentregistry::state::DESCRIPTOR_TYPE_KEYS;
+use service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::state as owner;
+use smithy_server_runtime::MultiServiceRouter;
 
 use crate::discovery_read_path::{
-    encode_label, list_path, post, record_ids, seeded_router, EMPTY_REGISTRY, REGISTRY,
+    encode_label, list_path, post, post_response, record_ids, seeded_router, EMPTY_REGISTRY,
+    REGION, REGISTRY,
 };
 
 /// The fixed text every discovery read states for a registry it does not hold; the
@@ -569,4 +583,384 @@ async fn a_value_at_a_published_bound_is_served() {
             "case {case:?}: expected 200, got {status}: {response}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4: what a registry-record filter's own `values` may carry.
+// ---------------------------------------------------------------------------
+
+/// `ValidationExceptionReason`'s modelled default, which every `ValidationException` of
+/// this service carries unless it states another
+/// (`smithy_query(query="shape", shape="ValidationException")`).
+const REASON_FIELD_VALIDATION_FAILED: &str = "FieldValidationFailed";
+
+/// `DiscoverableFilterValues` is modelled `@length{min:1,max:10}`
+/// (`smithy_query(query="shape", shape="DiscoverableFilterValues")`), so ten values is
+/// the most one `filters` entry can carry before the modelled bound refuses it first.
+const MOST_FILTER_VALUES: usize = 10;
+
+/// `FilterValue` is modelled `@length{min:1,max:255}`, so a value of this length is at
+/// the published maximum: it is refused for what it NAMES, not for its length.
+const LONGEST_FILTER_VALUE: usize = 255;
+
+/// `RegistryRecordFilterList` is modelled `@length{max:10}`, so this is the widest
+/// position an offending filter can sit at.
+const MOST_FILTERS: usize = 10;
+
+/// The whole set of values the dimension `filter_name` narrows, from the model: the
+/// `RecordType` enum for `recordType` (through this crate's generated catalogue of it),
+/// and the descriptor entry keys the `Descriptors` structure models for `descriptorType`
+/// — the values `DiscoverableRegistryRecordSummary$descriptorTypes` carries. Nothing
+/// here spells a value set by hand.
+pub(crate) fn dimension_values(filter_name: &str) -> Vec<&'static str> {
+    match filter_name {
+        "recordType" => RECORD_TYPE_VALUES.to_vec(),
+        "descriptorType" => DESCRIPTOR_TYPE_KEYS.to_vec(),
+        other => panic!("{other:?} is no member of RegistryRecordFilterName"),
+    }
+}
+
+/// One value the dimension `filter_name` narrows, for the elements of a filter list
+/// whose offending element sits somewhere else.
+pub(crate) fn admissible_value(filter_name: &str) -> &'static str {
+    dimension_values(filter_name)[0]
+}
+
+/// The sentence a filter carrying any number of values other than one is refused with:
+/// fixed text whose only variable part is the filter name the request carried.
+fn exactly_one_value(filter_name: &str) -> String {
+    format!("Filter {filter_name} must specify exactly one value.")
+}
+
+/// The sentence a value the named dimension does not have is refused with: fixed text
+/// plus the filter name and the offending value, both as the request carried them.
+fn invalid_value(filter_name: &str, value: &str) -> String {
+    format!("Invalid value for filter {filter_name}: {value}")
+}
+
+/// A `filters` entry naming `filter_name` and carrying `values`.
+fn filter(filter_name: &str, values: &[&str]) -> Value {
+    json!({ "name": filter_name, "values": values })
+}
+
+/// The list read of `registry` carrying `body` is refused with HTTP 400, the
+/// `ValidationException` errortype both on the wire and in the body, the `reason` the
+/// model defaults that error to, `expected` as its whole sentence — and no page.
+async fn assert_filter_refused(
+    router: &MultiServiceRouter,
+    case: &str,
+    registry: &str,
+    body: &Value,
+    expected: &str,
+) {
+    let response = post_response(router, &list_path(registry), body).await;
+    let status = response.status().as_u16();
+    let errortype = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400, got {status}: {parsed}"
+    );
+    assert!(
+        errortype.contains("ValidationException"),
+        "case {case:?}: expected the ValidationException errortype on the wire, got {errortype:?}"
+    );
+    let code = error_code(&parsed);
+    assert!(
+        code.contains("ValidationException"),
+        "case {case:?}: expected a ValidationException, got {code:?}: {parsed}"
+    );
+    let actual = stated(&parsed);
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected {expected:?}, got {actual:?}"
+    );
+    let reason = parsed["reason"].as_str().unwrap_or_default();
+    assert_eq!(
+        reason, REASON_FIELD_VALIDATION_FAILED,
+        "case {case:?}: expected reason {REASON_FIELD_VALIDATION_FAILED:?}, got {reason:?}"
+    );
+    assert!(
+        parsed.get("registryRecords").is_none(),
+        "case {case:?}: a refused read returns no page, got {parsed}"
+    );
+}
+
+/// A filter narrows its dimension to ONE value, so a `values` list of any other length
+/// the modelled list admits is refused — over both members of
+/// `RegistryRecordFilterName`, every count from two up to the list's own maximum, and
+/// values the dimension HAS, so the count is the only thing wrong.
+#[tokio::test]
+async fn a_filter_carrying_any_number_of_values_but_one_is_refused() {
+    let router = seeded_router();
+    for filter_name in REGISTRY_RECORD_FILTER_NAME_VALUES.iter().copied() {
+        let values = dimension_values(filter_name);
+        let expected = exactly_one_value(filter_name);
+        for count in [2_usize, 3, MOST_FILTER_VALUES] {
+            // Distinct values of the dimension, cycling once it has fewer than `count`.
+            let carried: Vec<&str> = (0..count)
+                .map(|index| values[index % values.len()])
+                .collect();
+            let case = format!("{filter_name} carrying {count} of its own values");
+            let body = json!({ "filters": [filter(filter_name, &carried)] });
+            assert_filter_refused(&router, &case, REGISTRY, &body, &expected).await;
+
+            // The same count of ONE value repeated: repeating a value is still not
+            // narrowing to one value.
+            let repeated = vec![values[0]; count];
+            let case = format!("{filter_name} carrying {count} copies of one value");
+            let body = json!({ "filters": [filter(filter_name, &repeated)] });
+            assert_filter_refused(&router, &case, REGISTRY, &body, &expected).await;
+        }
+
+        // One past the list's modelled maximum is refused by that bound before the
+        // handler states a sentence of its own, so this row asserts the refusal only.
+        let over_long = vec![values[0]; MOST_FILTER_VALUES + 1];
+        let case = format!("{filter_name} carrying one value past the modelled maximum");
+        let (status, response) = post(
+            &router,
+            &list_path(REGISTRY),
+            &json!({ "filters": [filter(filter_name, &over_long)] }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {response}"
+        );
+        let code = error_code(&response);
+        assert!(
+            code.contains("ValidationException"),
+            "case {case:?}: expected a ValidationException, got {code:?}: {response}"
+        );
+    }
+}
+
+/// A filter's single value must be one the dimension it names HAS, whatever form the
+/// offending value takes: a value of the other dimension, one of its own values in
+/// another casing or with a suffix, a value of another enumerated type of this model, a
+/// one-character value, and a value at `FilterValue`'s published maximum length.
+#[tokio::test]
+async fn a_filter_value_the_named_dimension_does_not_have_is_refused() {
+    let router = seeded_router();
+    let longest = "x".repeat(LONGEST_FILTER_VALUE);
+    for filter_name in REGISTRY_RECORD_FILTER_NAME_VALUES.iter().copied() {
+        let own = dimension_values(filter_name);
+        let other_dimension = REGISTRY_RECORD_FILTER_NAME_VALUES
+            .iter()
+            .copied()
+            .find(|name| *name != filter_name)
+            .expect("RegistryRecordFilterName has another member");
+        let candidates: Vec<(String, String)> = vec![
+            (
+                "a value of the other dimension".to_string(),
+                admissible_value(other_dimension).to_string(),
+            ),
+            (
+                "one of its own values lowercased".to_string(),
+                own[0].to_lowercase(),
+            ),
+            (
+                "one of its own values uppercased".to_string(),
+                own[0].to_uppercase(),
+            ),
+            (
+                "one of its own values with a suffix".to_string(),
+                format!("{}s", own[0]),
+            ),
+            (
+                // `RegistryRecordStatus` is another enumerated type of this model, and
+                // no member of either dimension.
+                "a value of another enumerated type of this model".to_string(),
+                "APPROVED".to_string(),
+            ),
+            ("a one-character value".to_string(), "x".to_string()),
+            (
+                "a value at FilterValue's maximum length".to_string(),
+                longest.clone(),
+            ),
+        ];
+
+        for (form, value) in candidates
+            .into_iter()
+            // A casing variant that happens to BE one of the dimension's own values is
+            // no offender, so it is not a case.
+            .filter(|(_, value)| !own.contains(&value.as_str()))
+        {
+            let case = format!("{filter_name} given {form}");
+            let body = json!({ "filters": [filter(filter_name, &[value.as_str()])] });
+            assert_filter_refused(&router, &case, REGISTRY, &body, &invalid_value(filter_name, &value))
+                .await;
+        }
+    }
+}
+
+/// Both refusals read alike at EVERY position the filter list admits, so the sentence is
+/// about the offending filter and not about where it sits: one offender walked across a
+/// full-length list, every other element a filter the service applies.
+#[tokio::test]
+async fn a_filter_refusal_reads_alike_at_every_position_the_list_admits() {
+    let router = seeded_router();
+    for filter_name in REGISTRY_RECORD_FILTER_NAME_VALUES.iter().copied() {
+        let admissible = admissible_value(filter_name);
+        let outside = "no-such-value";
+        // (what the offending element carries, the sentence it is refused with)
+        let offenders: [(Vec<&str>, String); 2] = [
+            (vec![admissible, admissible], exactly_one_value(filter_name)),
+            (vec![outside], invalid_value(filter_name, outside)),
+        ];
+        for (carried, expected) in offenders {
+            for position in 1..=MOST_FILTERS {
+                let filters: Vec<Value> = (1..=MOST_FILTERS)
+                    .map(|at| {
+                        if at == position {
+                            filter(filter_name, &carried)
+                        } else {
+                            filter(filter_name, &[admissible])
+                        }
+                    })
+                    .collect();
+                let case = format!(
+                    "{filter_name} offending at position {position} of {MOST_FILTERS}: {carried:?}"
+                );
+                let body = json!({ "filters": filters });
+                assert_filter_refused(&router, &case, REGISTRY, &body, &expected).await;
+            }
+        }
+    }
+}
+
+/// Whether a filter is well formed is a property of the REQUEST: the same sentence
+/// whatever else the read carries — the page members at their published bounds, a
+/// resumption token this service never minted, either admitted form of the registry
+/// identifier — and whatever the store holds for the registry named there, including a
+/// registry holding no discoverable record and one the store does not hold at all, which
+/// a 404 would otherwise pre-empt.
+#[tokio::test]
+async fn a_filter_is_refused_before_the_registry_is_resolved_or_a_record_is_read() {
+    let router = seeded_router();
+    let filter_name = "recordType";
+    let offending = json!([filter(filter_name, &["MCP", "AGENT"])]);
+    let expected = exactly_one_value(filter_name);
+    // A `RegistryIdentifier` the model admits that the store does not hold.
+    let absent_registry = "zzz999999999";
+    let arn_form = owner::registry_arn(REGION, REGISTRY);
+    // (case, the registry the path names, the body)
+    let cases: [(&str, &str, Value); 6] = [
+        (
+            "the offending filter alone",
+            REGISTRY,
+            json!({ "filters": offending }),
+        ),
+        (
+            "beside maxResults at its published minimum",
+            REGISTRY,
+            json!({ "filters": offending, "maxResults": 1 }),
+        ),
+        (
+            "beside maxResults at its published maximum",
+            REGISTRY,
+            json!({ "filters": offending, "maxResults": 100 }),
+        ),
+        (
+            "beside a token this service never minted",
+            REGISTRY,
+            json!({ "filters": offending, "nextToken": "cGFnZQ" }),
+        ),
+        (
+            "a registry that holds no discoverable record",
+            EMPTY_REGISTRY,
+            json!({ "filters": offending }),
+        ),
+        (
+            "a registry the store does not hold",
+            absent_registry,
+            json!({ "filters": offending }),
+        ),
+    ];
+    for (case, registry, body) in cases {
+        assert_filter_refused(&router, case, registry, &body, &expected).await;
+    }
+
+    // The same read addressed by the identifier's ARN form.
+    assert_filter_refused(
+        &router,
+        "the registry named by its ARN",
+        &arn_form,
+        &json!({ "filters": offending }),
+        &expected,
+    )
+    .await;
+}
+
+/// The contrast, and what the refusals above are about: EVERY value the filtered
+/// dimension has is served as a single-value filter — including the values this suite's
+/// store holds no record for — and the page it returns carries only records that value
+/// matches.
+#[tokio::test]
+async fn every_value_the_filtered_dimension_has_is_served_and_narrows_the_page() {
+    let router = seeded_router();
+    for filter_name in REGISTRY_RECORD_FILTER_NAME_VALUES.iter().copied() {
+        for value in dimension_values(filter_name) {
+            let case = format!("{filter_name}={value}");
+            let (status, body) = post(
+                &router,
+                &list_path(REGISTRY),
+                &json!({ "filters": [filter(filter_name, &[value])] }),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status}: {body}"
+            );
+            let ids = record_ids(&case, &body);
+            let records = body["registryRecords"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for record in &records {
+                if filter_name == "recordType" {
+                    assert_eq!(
+                        record["recordType"].as_str().unwrap_or_default(),
+                        value,
+                        "case {case:?}: every record of the page must match the filter, got {record}"
+                    );
+                } else {
+                    let keys: Vec<String> = record["descriptorTypes"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|key| key.as_str().unwrap_or_default().to_string())
+                        .collect();
+                    assert!(
+                        keys.iter().any(|key| key == value),
+                        "case {case:?}: every record of the page must carry the descriptor key, got {keys:?} in {ids:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // One filter per dimension, each at one value: both are applied together.
+    let filters: Vec<Value> = REGISTRY_RECORD_FILTER_NAME_VALUES
+        .iter()
+        .copied()
+        .map(|filter_name| filter(filter_name, &[admissible_value(filter_name)]))
+        .collect();
+    let case = "one single-value filter per dimension";
+    let (status, body) = post(
+        &router,
+        &list_path(REGISTRY),
+        &json!({ "filters": filters }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status}: {body}"
+    );
 }

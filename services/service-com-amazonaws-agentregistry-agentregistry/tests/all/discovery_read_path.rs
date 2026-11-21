@@ -329,6 +329,28 @@ fn document_object(entries: &[(&str, Document)]) -> Document {
 /// POST `path` with `body` through the router, returning the HTTP status and the
 /// parsed response body.
 pub(crate) async fn post(router: &MultiServiceRouter, path: &str, body: &Value) -> (u16, Value) {
+    let response = post_response(router, path, body).await;
+    let status = response.status().as_u16();
+    let parsed = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or_else(|error| {
+            panic!(
+                "response body is not JSON ({error}): {}",
+                String::from_utf8_lossy(response.body())
+            )
+        })
+    };
+    (status, parsed)
+}
+
+/// POST `path` with `body` through the router, returning the WHOLE response — so a
+/// test can read the headers a refusal carries as well as its body.
+pub(crate) async fn post_response(
+    router: &MultiServiceRouter,
+    path: &str,
+    body: &Value,
+) -> http::Response<bytes::Bytes> {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("https://agent-registry.us-east-1.amazonaws.com{path}"))
@@ -345,19 +367,7 @@ pub(crate) async fn post(router: &MultiServiceRouter, path: &str, body: &Value) 
             serde_json::to_vec(body).expect("the request body serializes"),
         ))
         .expect("the request builds");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or_else(|error| {
-            panic!(
-                "response body is not JSON ({error}): {}",
-                String::from_utf8_lossy(response.body())
-            )
-        })
-    };
-    (status, parsed)
+    router.dispatch(request).await
 }
 
 pub(crate) fn list_path(registry: &str) -> String {
@@ -506,10 +516,10 @@ async fn list_first_page_reports_a_token_only_while_records_remain() {
 }
 
 #[tokio::test]
-async fn list_applies_filters_conjunctively_and_values_disjunctively() {
+async fn list_applies_filters_conjunctively() {
     let router = seeded_router();
     // Every case is driven through paging too, so filtering and pagination compose.
-    let cases: [(&str, Value, Vec<&str>); 10] = [
+    let cases: [(&str, Value, Vec<&str>); 9] = [
         (
             "recordType=MCP",
             json!([{ "name": "recordType", "values": ["MCP"] }]),
@@ -530,11 +540,6 @@ async fn list_applies_filters_conjunctively_and_values_disjunctively() {
             "recordType=GATEWAY",
             json!([{ "name": "recordType", "values": ["GATEWAY"] }]),
             vec![],
-        ),
-        (
-            "recordType in {MCP,AGENT} (values are disjunctive)",
-            json!([{ "name": "recordType", "values": ["MCP", "AGENT"] }]),
-            vec!["rec000000001", "rec000000002"],
         ),
         (
             "descriptorType=http",

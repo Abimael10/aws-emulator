@@ -44,15 +44,29 @@ pub const ARN_SERVICE: &str = "agent-registry";
 /// discoverable yet.
 pub const STATUS_APPROVED: &str = "APPROVED";
 
+/// Every descriptor entry key this model has, in the order the `Descriptors`
+/// structure declares its members.
+///
+/// The keys are that structure's member names — the values
+/// `DiscoverableRegistryRecordSummary$descriptorTypes` carries ("Each value
+/// corresponds to a descriptor entry key on the approved record") — so this is both
+/// what a record's own key list is drawn from ([`descriptor_types`]) and the set of
+/// values a `descriptorType` filter may name.
+pub const DESCRIPTOR_TYPE_KEYS: [&str; 6] = [
+    "mcpServer",
+    "a2aAgentCard",
+    "agentSkillsDefinition",
+    "custom",
+    "http",
+    "agui",
+];
+
 /// The descriptor entry keys present on `descriptors`, derived from the structure
 /// itself rather than stored a second time.
 ///
-/// The keys are the member names the `Descriptors` structure models — the values
-/// `DiscoverableRegistryRecordSummary$descriptorTypes` carries ("Each value
-/// corresponds to a descriptor entry key on the approved record") and the values a
-/// `descriptorType` filter matches against. `Descriptors` is destructured
-/// exhaustively, so a member added to the model fails to compile here until its
-/// entry key is named.
+/// `Descriptors` is destructured exhaustively and the presence flags are paired
+/// positionally with [`DESCRIPTOR_TYPE_KEYS`], so a member added to the model fails
+/// to compile here until its entry key is named in that one list.
 pub fn descriptor_types(descriptors: &Descriptors) -> Vec<String> {
     let Descriptors {
         mcp_server,
@@ -62,18 +76,19 @@ pub fn descriptor_types(descriptors: &Descriptors) -> Vec<String> {
         http,
         agui,
     } = descriptors;
-    let entries = [
-        ("mcpServer", mcp_server.is_some()),
-        ("a2aAgentCard", a2a_agent_card.is_some()),
-        ("agentSkillsDefinition", agent_skills_definition.is_some()),
-        ("custom", custom.is_some()),
-        ("http", http.is_some()),
-        ("agui", agui.is_some()),
+    let present: [bool; DESCRIPTOR_TYPE_KEYS.len()] = [
+        mcp_server.is_some(),
+        a2a_agent_card.is_some(),
+        agent_skills_definition.is_some(),
+        custom.is_some(),
+        http.is_some(),
+        agui.is_some(),
     ];
-    entries
-        .into_iter()
+    DESCRIPTOR_TYPE_KEYS
+        .iter()
+        .zip(present)
         .filter(|(_, present)| *present)
-        .map(|(key, _)| key.to_string())
+        .map(|(key, _)| (*key).to_string())
         .collect()
 }
 
@@ -107,6 +122,19 @@ pub fn field_validation(member: &str, message: &str) -> ValidationException {
             name: member.to_string(),
             message: message.to_string(),
         }]),
+    }
+}
+
+/// The modelled `ValidationException` whose sentence the service words itself,
+/// rather than the member-and-constraint sentence [`field_validation`] builds: a
+/// refusal about a request value the service alone decides, stated verbatim.
+///
+/// The `reason` is `FieldValidationFailed`, the member the model defaults it to.
+pub fn validation_failure(message: &str) -> ValidationException {
+    ValidationException {
+        message: message.to_string(),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: None,
     }
 }
 

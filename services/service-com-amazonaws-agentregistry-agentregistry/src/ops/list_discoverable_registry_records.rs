@@ -177,6 +177,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A filter's `values` is as much part of a well-formed request as its name:
+        // one filter narrows ONE dimension to ONE of the values that dimension
+        // admits, so a `values` list of any other length, or a value the named
+        // dimension does not have, is refused rather than applied. Checked for every
+        // filter before the caller is authorized, before the registry is resolved and
+        // before any record is read, so whether a request is well formed never depends
+        // on who asked or on what the store holds.
+        for filter in &filters {
+            if filter.values.len() != VALUES_PER_FILTER {
+                return Err(validation(&format!(
+                    "Filter {} must specify exactly one value.",
+                    filter.name
+                )));
+            }
+            for value in &filter.values {
+                if !admissible_values(&filter.name).contains(&value.as_str()) {
+                    return Err(validation(&format!(
+                        "Invalid value for filter {}: {value}",
+                        filter.name
+                    )));
+                }
+            }
+        }
+
         let max_results = match input.max_results {
             Some(requested) => {
                 if !(MIN_MAX_RESULTS..=MAX_MAX_RESULTS).contains(&requested) {
@@ -296,6 +320,13 @@ const MAX_MAX_RESULTS: i32 = 100;
 /// `ListDiscoverableRegistryRecordsRequest$filters` is modelled `@length{max:10}`.
 const MAX_FILTERS: usize = 10;
 
+/// How many values ONE filter narrows its dimension to.
+///
+/// `DiscoverableFilterValues` is modelled `@length{min:1,max:10}`, so the shape alone
+/// admits a list; the service narrows a dimension to a single value per filter and
+/// refuses a list of any other length.
+const VALUES_PER_FILTER: usize = 1;
+
 /// Version tag inside the opaque pagination token, so a token in any other shape is
 /// refused rather than misread as a record id.
 const TOKEN_PREFIX: &str = "v1:";
@@ -328,21 +359,52 @@ fn decode_next_token(token: &str, registry_id: &str) -> Option<String> {
     (named_registry == registry_id).then(|| record_id.to_string())
 }
 
-/// Whether `record` satisfies every filter: filters are conjunctive, and one
-/// filter's own `values` are disjunctive.
-fn matches_filters(record: &RegistryRecord, filters: &[RegistryRecordFilter]) -> bool {
-    filters.iter().all(|filter| match filter.name.as_str() {
-        FILTER_RECORD_TYPE => filter.values.contains(&record.record_type),
-        FILTER_DESCRIPTOR_TYPE => {
-            let descriptor_types = record.descriptor_types();
-            filter
-                .values
-                .iter()
-                .any(|value| descriptor_types.iter().any(|present| present == value))
-        }
+/// The values the dimension a filter names admits.
+///
+/// A `recordType` filter narrows a record's `recordType`, whose value set the model
+/// declares as the `RecordType` enum; a `descriptorType` filter narrows the
+/// descriptor entry keys a record carries, whose set is the member names of
+/// `Descriptors` ([`crate::state::DESCRIPTOR_TYPE_KEYS`]). Both sets come from the
+/// model, so neither is spelled twice.
+fn admissible_values(filter_name: &str) -> &'static [&'static str] {
+    match filter_name {
+        FILTER_RECORD_TYPE => RECORD_TYPE_VALUES,
+        FILTER_DESCRIPTOR_TYPE => &crate::state::DESCRIPTOR_TYPE_KEYS,
         // Unreachable: an unsupported filter name is refused above.
-        _ => false,
+        _ => &[],
+    }
+}
+
+/// Whether `record` satisfies every filter: filters are conjunctive, and each one
+/// narrows its dimension to the single value it carries — the shape every filter is
+/// validated into before any record is read, so what is applied here cannot drift
+/// from what was validated.
+fn matches_filters(record: &RegistryRecord, filters: &[RegistryRecordFilter]) -> bool {
+    filters.iter().all(|filter| {
+        // Unreachable: a filter carrying no single value is refused above.
+        let Some(value) = filter.values.first() else {
+            return false;
+        };
+        match filter.name.as_str() {
+            FILTER_RECORD_TYPE => value == &record.record_type,
+            FILTER_DESCRIPTOR_TYPE => record
+                .descriptor_types()
+                .iter()
+                .any(|present| present == value),
+            // Unreachable: an unsupported filter name is refused above.
+            _ => false,
+        }
     })
+}
+
+/// A 400 `ValidationException` stating `message` verbatim: a refusal about a filter's
+/// own values, which the service words as one sentence rather than as a member and a
+/// constraint.
+fn validation(message: &str) -> ListDiscoverableRegistryRecordsError {
+    ListDiscoverableRegistryRecordsErrorModeled::ValidationException(
+        crate::state::validation_failure(message),
+    )
+    .into()
 }
 
 /// A 400 `ValidationException` naming the member that failed and why, in this
