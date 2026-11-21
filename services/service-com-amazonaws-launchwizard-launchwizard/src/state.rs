@@ -9,6 +9,7 @@
 //! beside this one — shared service logic lives here rather than being copied into
 //! each operation file.
 
+pub mod pattern_version_capabilities;
 pub mod workload_icons;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -476,6 +477,11 @@ impl DeploymentPattern {
     /// publishes one deployment document per application rather than one per pattern
     /// version (it is what `WorkloadData$documentationUrl` reports), so the member is
     /// left out rather than filled with the document of another resource.
+    ///
+    /// `featureFlags` states which optional deployment capabilities the version supports,
+    /// projected from what this emulator serves for a deployment of it
+    /// ([`pattern_version_capabilities::feature_flags`]) rather than stored beside the
+    /// version, so the block cannot claim a capability nothing here serves.
     fn summary_of(&self, version: &PatternVersion) -> DeploymentPatternVersionDataSummary {
         DeploymentPatternVersionDataSummary {
             deployment_pattern_version_name: Some(version.version_name.clone()),
@@ -483,6 +489,10 @@ impl DeploymentPattern {
             documentation_url: None,
             workload_name: Some(self.workload_name.clone()),
             deployment_pattern_name: Some(self.pattern_name.clone()),
+            feature_flags: Some(pattern_version_capabilities::feature_flags(
+                self,
+                &version.version_name,
+            )),
         }
     }
 

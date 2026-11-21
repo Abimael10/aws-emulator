@@ -66,15 +66,11 @@ pub struct DelegatedAdminConstraint {
     pub service_principal: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.launchwizard#DeploymentPatternVersionDataSummary")]
-#[derive(Debug, Clone, Default)]
-pub struct DeploymentPatternVersionDataSummary {
-    pub deployment_pattern_version_name: Option<String>,
-    pub description: Option<String>,
-    pub documentation_url: Option<String>,
-    pub workload_name: Option<String>,
-    pub deployment_pattern_name: Option<String>,
-}
+// `DeploymentPatternVersionDataSummary` is reached by both version views, so it would
+// live here — but the wire carries a member of it the on-disk model does not declare, and
+// the derive admits exactly the model's member list, so its schema and codec are written
+// out in `super::deployment_pattern_version_wire` instead. It is declared THERE, exactly
+// once, like every other shape of this service.
 
 /// The values `DeploymentFilterKey` accepts on the wire.
 pub const DEPLOYMENT_FILTER_KEY_VALUES: &[&str] = &["DEPLOYMENT_STATUS", "WORKLOAD_NAME"];

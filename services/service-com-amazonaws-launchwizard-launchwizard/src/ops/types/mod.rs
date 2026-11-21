@@ -16,6 +16,10 @@
 
 pub mod create_deployment_types;
 pub mod delete_deployment_types;
+// The deployment-pattern-version summary, whose schema and codec are written out rather
+// than derived because the wire carries a member of it the on-disk model does not declare
+// — see that module's own note.
+pub mod deployment_pattern_version_wire;
 pub mod get_deployment_pattern_version_types;
 pub mod get_deployment_types;
 pub mod get_workload_deployment_pattern_types;
@@ -35,6 +39,8 @@ pub mod update_deployment_types;
 pub use create_deployment_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_deployment_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use deployment_pattern_version_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use get_deployment_pattern_version_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

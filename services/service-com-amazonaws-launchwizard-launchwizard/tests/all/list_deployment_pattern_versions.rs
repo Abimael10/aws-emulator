@@ -20,12 +20,19 @@
 //! * a filter that names no value, a filter name outside the modelled enum and a filter
 //!   value outside the modelled value shape are each refused, with the clause the
 //!   refusal states;
-//! * an absent workload or pattern is a 404 whose message echoes nothing of the request.
+//! * an absent workload or pattern is a 404 whose message echoes nothing of the request;
+//! * every version BOTH views report carries the capability block — one entry per
+//!   optional deployment capability with that capability's status, plus the versions an
+//!   update can reach the version from — and the targets it names are exactly the ones
+//!   the `updateFromVersion` filter selects by.
 
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_launchwizard_launchwizard::ops::types::DEPLOYMENT_PATTERN_VERSION_FILTER_KEY_VALUES;
+use service_com_amazonaws_launchwizard_launchwizard::state::pattern_version_capabilities::{
+    CAPABILITY_DISABLED, CAPABILITY_ENABLED,
+};
 use service_com_amazonaws_launchwizard_launchwizard::state::{
     CATALOGUE_PATTERN_VERSIONS, INVALID_NEXT_TOKEN_MESSAGE,
 };
@@ -602,6 +609,242 @@ async fn an_absent_workload_or_pattern_is_a_404_that_echoes_nothing() {
             harness
                 .refused(&case, PATH, Value::Object(object), STATUS, CODE)
                 .await;
+        }
+    }
+}
+
+/// The member a version's optional-capability block travels on.
+const FLAGS: &str = "featureFlags";
+
+/// The capabilities the block states a status for, one entry each, and whether the
+/// capability is CONFIGURABLE — that is, whether it states the fields it is configured
+/// through beside its status.
+///
+/// The names and the configurable half are what a Launch Wizard version report carries:
+/// whether a deployment of the version reports its CloudFormation output (configured by
+/// the fields that output is read through), whether it can be modified after it was
+/// created, and whether steps run after the deployment itself finished. The emulator's
+/// own projection of them is
+/// `crate::state::pattern_version_capabilities::feature_flags`.
+const CAPABILITIES: [(&str, bool); 3] = [
+    ("cloudFormationOutput", true),
+    ("modifyDeployments", false),
+    ("postDeploymentSteps", false),
+];
+
+/// The block's other entry: the versions an update can move a deployment onto the
+/// reported version FROM. Named like the `DeploymentPatternVersionFilterKey` the same
+/// rule is filtered by, which
+/// [`the_filter_key_and_version_set_this_suite_drives_are_the_models`] pins to the model.
+const UPDATE_TARGETS: &str = "updateFromVersion";
+
+/// The capability block one reported version carries, with the SHAPE of the rule
+/// asserted: the member is present, it names one entry per capability and nothing else,
+/// each capability states a status from the two-value vocabulary, a configurable
+/// capability states its configuration (empty when it configures nothing), and the update
+/// targets are a list (empty when there are none) rather than an absent member.
+fn capability_block(case: &str, summary: &Value) -> Value {
+    let flags = summary.get(FLAGS).cloned().unwrap_or(Value::Null);
+    let named: BTreeSet<String> = flags
+        .as_object()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: a reported version must carry {FLAGS}, got {summary}")
+        })
+        .keys()
+        .cloned()
+        .collect();
+    let expected: BTreeSet<String> = CAPABILITIES
+        .iter()
+        .map(|(capability, _)| (*capability).to_string())
+        .chain([UPDATE_TARGETS.to_string()])
+        .collect();
+    assert_eq!(
+        named, expected,
+        "case {case:?}: expected one entry per capability plus {UPDATE_TARGETS}, got {flags}"
+    );
+
+    for (capability, configurable) in CAPABILITIES {
+        let entry = &flags[capability];
+        let status = entry["status"].as_str().unwrap_or_else(|| {
+            panic!("case {case:?}: capability {capability:?} must state a status, got {entry}")
+        });
+        assert!(
+            [CAPABILITY_ENABLED, CAPABILITY_DISABLED].contains(&status),
+            "case {case:?}: capability {capability:?} must state a status of \
+             {CAPABILITY_ENABLED:?} or {CAPABILITY_DISABLED:?}, got {status:?}"
+        );
+        // A capability carries a configuration only when it is configurable at all, and
+        // then it is a `fields` list — empty where the capability configures nothing,
+        // never an absent member a client cannot tell from "unknown".
+        let members: BTreeSet<&str> = entry
+            .as_object()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: capability {capability:?} must be a structure, got {entry}")
+            })
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for member in &members {
+            assert!(
+                ["status", "configuration"].contains(member),
+                "case {case:?}: capability {capability:?} carries an unexpected member \
+                 {member:?}, got {entry}"
+            );
+        }
+        assert_eq!(
+            entry.get("configuration").is_some(),
+            configurable,
+            "case {case:?}: capability {capability:?} must state a configuration exactly when \
+             it is configurable ({configurable}), got {entry}"
+        );
+        if let Some(configuration) = entry.get("configuration") {
+            let fields = configuration["fields"].as_array().unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: capability {capability:?} states a configuration, so it \
+                     states the fields it configures, got {configuration}"
+                )
+            });
+            for field in fields {
+                assert!(
+                    field.is_string(),
+                    "case {case:?}: capability {capability:?} must name its configuration \
+                     fields, got {field}"
+                );
+            }
+        }
+    }
+
+    assert!(
+        flags[UPDATE_TARGETS].is_array(),
+        "case {case:?}: {UPDATE_TARGETS} must be a list, got {}",
+        flags[UPDATE_TARGETS]
+    );
+    flags
+}
+
+/// The versions the block names as update targets, as a set.
+fn update_targets(case: &str, flags: &Value) -> BTreeSet<String> {
+    flags[UPDATE_TARGETS]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: {UPDATE_TARGETS} must be a list, got {flags}"))
+        .iter()
+        .map(|version| {
+            version
+                .as_str()
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: an update target must be a version name, got {version}")
+                })
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn both_version_views_report_the_capability_block_of_every_published_version() {
+    let harness = Harness::new();
+    // Rows span the whole published set: every workload of the catalogue, every pattern
+    // of each, and every version each pattern publishes — so the block is asserted for
+    // the newest version, the oldest and the ones between, not for one cited version.
+    for (workload, pattern) in every_pattern(&harness).await {
+        let listed = listed(
+            &harness,
+            &format!("{workload}/{pattern}"),
+            list_body(&workload, &pattern),
+        )
+        .await;
+        for version in CATALOGUE_PATTERN_VERSIONS {
+            let case = format!("{workload}/{pattern}@{version}");
+            let read = get_version(&harness, &case, &workload, &pattern, version).await;
+            let from_read = capability_block(&case, &read);
+
+            // The page reports a version exactly as the single-version read does, so the
+            // capability block is one projection rather than two that can drift.
+            let entry = listed
+                .iter()
+                .find(|summary| summary["deploymentPatternVersionName"] == json!(version))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the page did not report this version: {listed:?}")
+                });
+            let from_page = capability_block(&case, entry);
+            assert_eq!(
+                from_page, from_read,
+                "case {case:?}: the page and the version read must report one capability \
+                 block, got {from_page} and {from_read}"
+            );
+
+            // Reading capabilities changes nothing a later caller sees.
+            let again = get_version(&harness, &case, &workload, &pattern, version).await;
+            assert_eq!(
+                again.get(FLAGS),
+                read.get(FLAGS),
+                "case {case:?}: reading a version's capabilities must not change what a \
+                 later caller sees"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_update_targets_a_version_reports_are_the_ones_the_filter_selects_by() {
+    let harness = Harness::new();
+    let whole = published();
+    for (workload, pattern) in every_pattern(&harness).await {
+        let base = list_body(&workload, &pattern);
+        for version in CATALOGUE_PATTERN_VERSIONS {
+            let case = format!("{workload}/{pattern}@{version}");
+            let read = get_version(&harness, &case, &workload, &pattern, version).await;
+            let targets = update_targets(&case, &capability_block(&case, &read));
+
+            // An update moves a deployment onto a published version it is not already on,
+            // so the versions this one can be reached FROM are every other published
+            // version of the pattern — the rule `UpdateDeployment` applies.
+            let expected: BTreeSet<String> = whole
+                .iter()
+                .filter(|published| published.as_str() != *version)
+                .cloned()
+                .collect();
+            assert_eq!(
+                targets, expected,
+                "case {case:?}: expected the versions an update can reach this one from \
+                 {expected:?}, got {targets:?}"
+            );
+
+            // Each target is a version this pattern publishes, and the filter that
+            // selects by the SAME rule answers this version for it — the block and the
+            // filter are two reports of one rule, so neither names a move the other
+            // refuses.
+            for from in &targets {
+                let case = format!("{case} from {from}");
+                get_version(&harness, &case, &workload, &pattern, from).await;
+                let selected: BTreeSet<String> = names(
+                    &case,
+                    &listed(&harness, &case, with(&base, "filters", update_from(&[from]))).await,
+                )
+                .into_iter()
+                .collect();
+                assert!(
+                    selected.contains(*version),
+                    "case {case:?}: the filter must select this version for a version it \
+                     names as a target, got {selected:?}"
+                );
+            }
+
+            // And a starting version the block does NOT name — the version itself, and
+            // one the pattern does not publish — selects this version for nobody.
+            for from in [(*version).to_string(), "9.9.9".to_string()] {
+                let case = format!("{case} from the unnamed {from}");
+                let selected: BTreeSet<String> = names(
+                    &case,
+                    &listed(&harness, &case, with(&base, "filters", update_from(&[&from]))).await,
+                )
+                .into_iter()
+                .collect();
+                assert!(
+                    !selected.contains(*version),
+                    "case {case:?}: a starting version the block does not name must not \
+                     select this version, got {selected:?}"
+                );
+            }
         }
     }
 }
