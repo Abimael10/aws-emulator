@@ -514,7 +514,76 @@ const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
         "DescribeClientVpnAuthorizationRules",
         SdkDiagnostic::Attempts,
     ),
+    // The calls that act on a listener's CERTIFICATE LIST are CloudFormation's own, not a
+    // registry provider's: an `AWS::ElasticLoadBalancingV2::ListenerCertificate` is deployed by
+    // a handler CloudFormation ships ([`provisioning::elbv2_listener_certificate`]), built
+    // against a generation of that service's SDK that words the PROXIED shape — where the four
+    // types that ARE resources of that service have providers wording its entry's bare envelope.
+    // Read from the recorded `ResourceStatusReason` of a `ListenerCertificate` pointed at a
+    // well-formed certificate ARN that service resolves to nothing (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `acm__cloudformation__ec2__elbv2.cfn-\
+    // listenercertificate-nonexistent-certificate-rejected`, whose reason reads `<the service's
+    // sentence> (Service: AmazonElasticLoadBalancing; Status Code: 400; Error Code:
+    // CertificateNotFound; Request ID: …; Proxy: null)`, with no provider envelope quoted around
+    // it at all).
+    (
+        "elasticloadbalancing",
+        "AddListenerCertificates",
+        SdkDiagnostic::Proxied,
+    ),
+    (
+        "elasticloadbalancing",
+        "RemoveListenerCertificates",
+        SdkDiagnostic::Proxied,
+    ),
+    (
+        "elasticloadbalancing",
+        "DescribeListenerCertificates",
+        SdkDiagnostic::Proxied,
+    ),
 ];
+
+/// The SDK NAME a provider reports the service it called under, where that differs from the name
+/// its service's own entry carries ([`SDK_SERVICE_NAMES`]), keyed by the OPERATION the refused
+/// call named exactly as [`SDK_PROVIDER_SHAPES`] is.
+///
+/// The name in the diagnostic is the name of the SDK CLIENT the caller used, so it travels with
+/// the same thing the shape does: a handler built against another generation of a service's SDK
+/// names that generation's client, where a registry provider of the same service names the one
+/// it was generated with.
+const SDK_PROVIDER_SERVICE_NAMES: &[(&str, &str, &str)] = &[
+    // The certificate-list calls name the client of the generation that words the proxied shape
+    // beside them, whose client for Elastic Load Balancing v2 is `AmazonElasticLoadBalancing` —
+    // read from the same recorded reason those rows cite.
+    (
+        "elasticloadbalancing",
+        "AddListenerCertificates",
+        LEGACY_ELB_SDK_NAME,
+    ),
+    (
+        "elasticloadbalancing",
+        "RemoveListenerCertificates",
+        LEGACY_ELB_SDK_NAME,
+    ),
+    (
+        "elasticloadbalancing",
+        "DescribeListenerCertificates",
+        LEGACY_ELB_SDK_NAME,
+    ),
+];
+
+/// See [`SDK_PROVIDER_SERVICE_NAMES`].
+const LEGACY_ELB_SDK_NAME: &str = "AmazonElasticLoadBalancing";
+
+/// The SDK name the provider that called `operation` of `signing_name` reports that service
+/// under, where that differs from its service's own ([`SDK_PROVIDER_SERVICE_NAMES`]).
+fn provider_service_name(signing_name: &str, operation: Option<&str>) -> Option<&'static str> {
+    let operation = operation?;
+    SDK_PROVIDER_SERVICE_NAMES
+        .iter()
+        .find(|(name, called, _)| *name == signing_name && *called == operation)
+        .map(|(_, _, service)| *service)
+}
 
 /// The shape the provider that called `operation` of `signing_name` words, where that differs
 /// from its service's own ([`SDK_PROVIDER_SHAPES`]).
@@ -645,6 +714,13 @@ pub(super) fn sdk_diagnostic(
     let shape = match surface {
         Some(_) => shape,
         None => provider_shape(signing_name, operation).unwrap_or(shape),
+    };
+    // And the name that provider's own SDK client reports the service under, where that differs
+    // from its service's ([`SDK_PROVIDER_SERVICE_NAMES`]) — keyed the same way, and so not asked
+    // for a call a URI prefix already resolved to one surface, for the same reason.
+    let service = match surface {
+        Some(_) => service,
+        None => provider_service_name(signing_name, operation).unwrap_or(service),
     };
     // The envelope the two comma-separated shapes open with, written once so the two cannot
     // state the service, the status and the call's id differently.

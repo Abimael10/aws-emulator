@@ -92,9 +92,15 @@ const ELB_API_VERSION: &str = "2015-12-01";
 const NOT_FOUND_CODES: &[&str] = &[
     "LoadBalancerNotFound",
     "TargetGroupNotFound",
-    "ListenerNotFound",
+    LISTENER_NOT_FOUND,
     "RuleNotFound",
 ];
+
+/// The code Elastic Load Balancing refuses a call naming a LISTENER it does not hold with: the
+/// `awsQueryError` of `ListenerNotFoundException`, which every call that addresses a listener
+/// answers — including the ones that act on a listener's CERTIFICATE LIST, where it is what says
+/// the list went with the listener ([`super::elbv2_listener_certificate`]).
+pub(super) const LISTENER_NOT_FOUND: &str = "ListenerNotFound";
 
 /// The state code a load balancer is ready in (`LoadBalancerState$Code`: "the load balancer
 /// is ready"), which is what ends the wait its create opens.
@@ -1055,7 +1061,7 @@ fn describe(kind: Kind) -> (&'static str, &'static str, &'static str) {
         Kind::Listener => (
             "DescribeListeners",
             "ListenerArns.member.1",
-            "ListenerNotFound",
+            LISTENER_NOT_FOUND,
         ),
         Kind::ListenerRule => ("DescribeRules", "RuleArns.member.1", "RuleNotFound"),
     }
@@ -1082,7 +1088,12 @@ async fn describe_one(
 }
 
 /// Call one Elastic Load Balancing operation on the awsQuery wire its model declares.
-async fn call_elb(
+///
+/// The ONE place this crate addresses that service, so the type whose resource is no resource of
+/// its own — the certificate list entry an `AWS::ElasticLoadBalancingV2::ListenerCertificate`
+/// declares ([`super::elbv2_listener_certificate`]) — reaches it the same way the four types
+/// here do.
+pub(super) async fn call_elb(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     action: &str,

@@ -211,6 +211,12 @@ impl Owner {
             Self::ElasticLoadBalancing(kind) => {
                 elastic_load_balancing::create(ctx, region, kind, resource, propagated).await
             }
+            // A certificate ATTACHMENT carries no tags of its own: it is not a resource, but
+            // one or more entries of the certificate list of the listener it names, so
+            // CloudFormation propagates none to it.
+            Self::ElbListenerCertificate => {
+                elbv2_listener_certificate::create(ctx, region, resource).await
+            }
             // A DISTRIBUTION is taggable: its `Tags` property is the tag list the create that
             // carries tags takes, so it carries the tags CloudFormation gives it beside its
             // own. An origin access control is not: that type publishes no `Tags` property
@@ -427,6 +433,9 @@ impl Owner {
             Self::ElasticLoadBalancing(kind) => {
                 elastic_load_balancing::readiness(ctx, region, kind, physical_resource_id).await
             }
+            // A certificate is in the listener's certificate list the moment
+            // `AddListenerCertificates` answers.
+            Self::ElbListenerCertificate => Ok(Readiness::Ready),
             // A custom domain exists as `CreateDomainName` answers; a MAPPING is reported
             // `PROCESSING` until AppSync has deployed it, which that arm waits out
             // ([`appsync_domain_names::readiness`]).
@@ -640,6 +649,9 @@ impl Owner {
                 )
                 .await
             }
+            // A certificate attachment publishes no attribute at all: Elastic Load Balancing
+            // mints no handle for a certificate-list entry, so there is nothing to read for it.
+            Self::ElbListenerCertificate => Ok(BTreeMap::new()),
         }
     }
 
@@ -777,6 +789,9 @@ impl Owner {
             // service reports no state a deleted load balancer, target group, listener or rule
             // is still being removed in.
             Self::ElasticLoadBalancing(_) => Ok(elastic_load_balancing::removal()),
+            // `RemoveListenerCertificates` takes the certificate off the list as it answers, so
+            // there is nothing to wait for either.
+            Self::ElbListenerCertificate => Ok(Removal::Gone),
             // `DeleteDomainName` takes the domain away as it answers — the mapping it
             // carried with it — and `DisassociateApi` leaves the domain carrying none, so
             // there is nothing to wait for either.
@@ -999,6 +1014,12 @@ impl Owner {
             Self::ElasticLoadBalancing(kind) => {
                 elastic_load_balancing::update(ctx, region, kind, resource, declared).await
             }
+            // A certificate list is changed by the two calls Elastic Load Balancing publishes
+            // for one: the declared certificates are added and the ones the declaration no
+            // longer names removed ([`elbv2_listener_certificate::update`]).
+            Self::ElbListenerCertificate => {
+                elbv2_listener_certificate::update(ctx, region, resource, declared).await
+            }
             // A domain takes its DESCRIPTION, which is the one member `UpdateDomainName`
             // carries, and a mapping takes its API, `AssociateApi` on a domain that already
             // carries one replacing the mapping ([`appsync_domain_names::update`]).
@@ -1173,6 +1194,9 @@ impl Owner {
             // exists are reconciled by no arm here yet ([`Provisioner::retag`]'s own default),
             // so nothing is asked about them.
             Self::ElasticLoadBalancing(_) => Ok(()),
+            // A certificate attachment is not taggable at all: neither call that acts on a
+            // certificate list carries a tag, so nothing is asked about its tags.
+            Self::ElbListenerCertificate => Ok(()),
             // Nor are the tags of a custom domain that already exists; a mapping is not
             // taggable at all.
             Self::AppSyncDomainName(_) => Ok(()),
@@ -1379,6 +1403,11 @@ impl Owner {
             Self::ElasticLoadBalancing(kind) => {
                 elastic_load_balancing::delete(ctx, region, kind, resource).await
             }
+            // Nor of a certificate attachment: there is no such call, so a `Snapshot` deletion
+            // policy on one removes it with no snapshot invented for it.
+            Self::ElbListenerCertificate => {
+                elbv2_listener_certificate::delete(ctx, region, resource).await
+            }
             // AppSync takes no snapshot of a custom domain or of a mapping on the way out:
             // there is no such call, so a `Snapshot` deletion policy on either type deletes
             // the resource with no snapshot invented for it.
@@ -1568,6 +1597,9 @@ impl Owner {
             Self::ElasticLoadBalancing(kind) => {
                 elastic_load_balancing::actual_configuration(ctx, region, kind, resource).await?
             }
+            Self::ElbListenerCertificate => {
+                elbv2_listener_certificate::actual_configuration(ctx, region, resource).await?
+            }
             Self::AppSyncDomainName(kind) => {
                 appsync_domain_names::actual_configuration(ctx, region, kind, resource).await?
             }
@@ -1680,6 +1712,10 @@ impl Owner {
             Self::AppSyncResource(_) => message.to_string(),
             // Elastic Load Balancing's does the same.
             Self::ElasticLoadBalancing(_) => message.to_string(),
+            // A certificate attachment is deployed by no resource provider at all
+            // ([`Self::reported_by_a_resource_provider`]), so there is no provider wording to
+            // add: what that service answered stands as it came.
+            Self::ElbListenerCertificate => message.to_string(),
             // AppSync's does the same.
             Self::AppSyncDomainName(_) => message.to_string(),
             // And so does its Event API and merged-API provider.
@@ -1705,8 +1741,14 @@ impl Owner {
     /// resource is CloudFormation's own account of why the stack was not created and is
     /// reported in those words ([`super::own_failure_reason`]) rather than attributed to a
     /// provider that answered nothing.
+    ///
+    /// So is a type CloudFormation deploys through a handler of its OWN rather than through a
+    /// registry extension of the owning service: an
+    /// `AWS::ElasticLoadBalancingV2::ListenerCertificate` is provisioned by the calls
+    /// CloudFormation makes itself ([`elbv2_listener_certificate`]), so a refusal of one of them
+    /// is reported as the exception that call raised and nothing quotes a provider around it.
     pub(super) fn reported_by_a_resource_provider(self) -> bool {
-        !matches!(self, Self::NestedStack)
+        !matches!(self, Self::NestedStack | Self::ElbListenerCertificate)
     }
 
     /// Which `HandlerErrorCode` class this type's provider puts a refusal carrying `code`

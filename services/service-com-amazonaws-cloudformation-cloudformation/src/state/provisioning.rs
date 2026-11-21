@@ -287,6 +287,10 @@ mod ecs_task_definition;
 /// routes a request: created in Elastic Load Balancing itself
 /// ([`elastic_load_balancing`]).
 pub(super) mod elastic_load_balancing;
+/// `AWS::ElasticLoadBalancingV2::ListenerCertificate`: the certificates a stack adds to the
+/// certificate list of a listener, added in Elastic Load Balancing itself
+/// ([`elbv2_listener_certificate`]).
+mod elbv2_listener_certificate;
 mod iam_policy;
 /// `AWS::IoT::Authorizer`: the custom authorizer a stack declares, created in AWS IoT
 /// itself ([`iot_authorizer`]).
@@ -1331,6 +1335,11 @@ pub(super) enum Owner {
     /// the load balancer and a rule of that listener. Which of them it is travels with the
     /// owner, as it does for the types above.
     ElasticLoadBalancing(elastic_load_balancing::Kind),
+    /// `AWS::ElasticLoadBalancingV2::ListenerCertificate`, whose arms are
+    /// [`elbv2_listener_certificate`]'s: the resource is no resource of Elastic Load Balancing's
+    /// own but one or more ENTRIES of the certificate list of the listener it names, which
+    /// `AddListenerCertificates` adds and `RemoveListenerCertificates` removes.
+    ElbListenerCertificate,
     /// One of the four `AWS::AppConfig::*` types [`appconfig_resources`] creates in AWS
     /// AppConfig: the application, an environment of it, a configuration profile of it and the
     /// deployment strategy a rollout follows. Which of them it is travels with the owner, as
@@ -1480,6 +1489,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = elastic_load_balancing::kind_of(resource_type) {
         return Some(Owner::ElasticLoadBalancing(kind));
+    }
+    if resource_type == elbv2_listener_certificate::ELB_LISTENER_CERTIFICATE {
+        return Some(Owner::ElbListenerCertificate);
     }
     if let Some(kind) = cloudfront_resources::kind_of(resource_type) {
         return Some(Owner::CloudFrontResource(kind));
