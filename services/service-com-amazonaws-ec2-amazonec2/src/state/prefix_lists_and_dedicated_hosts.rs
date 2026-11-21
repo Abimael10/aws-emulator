@@ -1025,7 +1025,9 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// The caller-chosen bytes the record holds are charged here on top of the fixed
     /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, so no path can store one
-    /// uncharged.
+    /// uncharged. The charge is of what the store HOLDS, so a write that replaces the
+    /// reference already stored for the pair gives the superseded record's charge back
+    /// ([`Self::release_stored_bytes`]) rather than charging the pair twice.
     pub fn insert_transit_gateway_prefix_list_reference(
         &mut self,
         route_table_id: &str,
@@ -1050,7 +1052,7 @@ impl ComAmazonawsEc2Amazonec2State {
             route_table_id,
             prefix_list_id,
         ));
-        self.transit_gateway_prefix_list_references.insert(
+        let superseded = self.transit_gateway_prefix_list_references.insert(
             (route_table_id.to_string(), prefix_list_id.to_string()),
             TransitGatewayPrefixListReferenceRecord {
                 view: view.clone(),
@@ -1059,6 +1061,12 @@ impl ComAmazonawsEc2Amazonec2State {
                 )),
             },
         );
+        if superseded.is_some() {
+            self.release_stored_bytes(transit_gateway_prefix_list_reference_payload_bytes(
+                route_table_id,
+                prefix_list_id,
+            ));
+        }
         Some(view)
     }
 
@@ -1663,6 +1671,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`STORED_RECORD_OVERHEAD_BYTES`] are charged beside its caller-chosen bytes, so a
     /// host with no
     /// tags and no client token is not free against the byte budget.
+    ///
+    /// The charge is of what the store HOLDS, so a write that replaces a host already
+    /// stored under this id gives the superseded record's charge back
+    /// ([`Self::release_stored_bytes`], the one definition of that) before charging the new
+    /// one: the budget counts the records that are there, and re-writing one id cannot run
+    /// it down.
     pub fn insert_dedicated_host(&mut self, host: Host) -> Option<String> {
         let host_id = host.host_id.clone().unwrap_or_default();
         // A write that REPLACES a host already stored under this id adds no record, so only
@@ -1673,7 +1687,11 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(
             STORED_RECORD_OVERHEAD_BYTES.saturating_add(host_payload_bytes(&host)),
         );
-        self.dedicated_hosts.insert(host_id.clone(), host);
+        if let Some(superseded) = self.dedicated_hosts.insert(host_id.clone(), host) {
+            self.release_stored_bytes(
+                STORED_RECORD_OVERHEAD_BYTES.saturating_add(host_payload_bytes(&superseded)),
+            );
+        }
         Some(host_id)
     }
 }

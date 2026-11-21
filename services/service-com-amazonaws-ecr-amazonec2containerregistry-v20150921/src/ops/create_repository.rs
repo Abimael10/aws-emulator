@@ -314,10 +314,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for, since a registry is one account's in one Region, and the record is keyed by
         // it (`crate::state::registry_address`).
         let region = crate::state::request_region(ctx.parts());
-        // The repository is REPORTED at the endpoint this emulator answers this caller's
-        // registry requests at, which is the address a `docker push` of the URI reaches
-        // (`crate::state::registry_address`).
-        let registry_endpoint = crate::state::announced_registry_endpoint(ctx);
         let name = input.repository_name;
 
         // Whether this registry can hold the repository at all is judged BEFORE the key is
@@ -383,7 +379,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // the last value for it rather than two entries for one key.
                     repo.merge_tags(tags);
 
-                    let repository = repo.to_repository(&registry_endpoint);
+                    let repository = repo.to_repository();
                     store
                         .repositories
                         .insert(crate::state::repository_key(&region, &name), repo);

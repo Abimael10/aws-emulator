@@ -1069,27 +1069,23 @@ fn repository_arn(name: &str) -> String {
     format!("arn:aws:ecr:{REGION}:{ACCOUNT_ID}:repository/{name}")
 }
 
-/// `<registry endpoint>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports
+/// `<registry host>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports
 /// and a container image reference is built on. `Repository$repositoryUri` is "The URI for
-/// the repository. You can use this URI for container image `push` and `pull` operations", an
-/// ADDRESS a container client dials, so the stack's value is the one the repository's owning
-/// service reported: the endpoint this emulator answers registry requests at
+/// the repository. You can use this URI for container image `push` and `pull` operations", a
+/// REFERENCE a container client writes an image address in, so the stack's value is the one
+/// the repository's owning service reported: the host of the registry that holds it
 /// ([`registry_endpoint`]) followed by the repository's name.
 fn repository_uri(name: &str) -> String {
     format!("{}/{name}", registry_endpoint())
 }
 
-/// The endpoint Amazon ECR announces its registry at to the provisioning call this harness
-/// makes, which every repository URI it reports is built on.
-///
-/// The emulator of these suites is served on no port at all, so the address it reports for
-/// itself is the host of the base it publishes then
-/// (`smithy_server_runtime::UNSERVED_URL_BASE`, a name RFC 6761 reserves so that nothing
-/// resolves it) — never a host AWS answers on.
+/// The host of the Amazon ECR registry this account owns in the Region this harness signs
+/// for, which every repository URI it reports is built on: the owning account's id, the two
+/// fixed labels of a registry host and the Region, under the commercial partition's DNS
+/// suffix (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
+/// `https://aws_account_id.dkr.ecr.region.amazonaws.com`").
 fn registry_endpoint() -> String {
-    smithy_server_runtime::UNSERVED_URL_BASE
-        .trim_start_matches("https://")
-        .to_string()
+    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com")
 }
 
 /// `arn:aws:ecs:<region>:<account>:task-definition/<family>:1` — what `Ref` of an

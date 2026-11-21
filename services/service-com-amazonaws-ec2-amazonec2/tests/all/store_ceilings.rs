@@ -17,11 +17,14 @@
 //! The last suite pins the other half of the budget: a record that MOVES between two stores
 //! gives back exactly what its create charged and is charged for its new home, so a
 //! create/bin loop cannot walk the budget away in either direction. The BYOIP suite states
-//! the same bounds for a store keyed by a CALLER-SUPPLIED range rather than by a minted id.
+//! the same bounds for a store keyed by a CALLER-SUPPLIED range rather than by a minted id,
+//! and the rewrite suite states them for the two writers that anticipate REPLACING the
+//! record held under their key: what the budget counts is the records the store holds, so
+//! re-writing one key charges once however often a caller asks.
 
 use std::time::{Duration, SystemTime};
 
-use ec2::ops::types::{Host, IpamPool, ServiceConfiguration, VpcEndpoint};
+use ec2::ops::types::{Host, IpamPool, ServiceConfiguration, Tag, VpcEndpoint};
 use ec2::state::{
     BYOIP_CIDR_STATE_PROVISIONED, ByoipCidrRecord, ComAmazonawsEc2Amazonec2State as Ec2State,
     MAX_IPV6_ASSOCIATIONS_PER_SUBNET, MAX_STORED_DEDICATED_HOSTS, MAX_STORED_RECORDS_PER_STORE,
@@ -435,5 +438,204 @@ async fn binning_a_volume_gives_back_its_charge_and_charges_the_bin_entry() {
             "case {case:?}: the move must give back the {charged} bytes the create charged \
              and charge the bin's entry alone, expected {expected}, got {after}"
         );
+    }
+}
+
+/// One record written twice under one key: the caller-chosen bytes it carries, and the key
+/// it is stored under.
+struct Rewrite {
+    case: &'static str,
+    /// The key the record is stored under — a Dedicated Host id, or the two ids a prefix
+    /// list reference is keyed by — so the rows span short and long keys.
+    key: &'static str,
+    /// A tag the record carries, or `None` for a record carrying none.
+    tag: Option<(&'static str, &'static str)>,
+    /// The `ClientToken` the record carries, or `None` for a record carrying none.
+    client_token: Option<&'static str>,
+}
+
+/// The rows the rewrite suite drives: what the record carries (nothing the caller chose, a
+/// tag, a tag and a client token, a longer tag) crossed with how long the key is.
+const REWRITES: &[Rewrite] = &[
+    Rewrite {
+        case: "a record carrying nothing the caller chose",
+        key: "h-0store0ceiling",
+        tag: None,
+        client_token: None,
+    },
+    Rewrite {
+        case: "a record carrying a tag",
+        key: "h-0store0ceilings0rewrite",
+        tag: Some(("Name", "rewritten")),
+        client_token: None,
+    },
+    Rewrite {
+        case: "a record carrying a tag and a client token",
+        key: "h-0store0ceilings0rewrite0with0a0token",
+        tag: Some(("Name", "rewritten-with-a-token")),
+        client_token: Some("a-client-token-of-some-length"),
+    },
+    Rewrite {
+        case: "a record carrying a longer tag",
+        key: "h-0store0ceilings0rewrite0with0a0long0tag",
+        tag: Some((
+            "a-tag-key-of-some-length",
+            "a-tag-value-of-rather-more-length-again",
+        )),
+        client_token: None,
+    },
+];
+
+impl Rewrite {
+    /// The host this row writes, with `extra` tags appended to the ones it carries — which is
+    /// how a row grows the record stored under one key.
+    fn host(&self, extra: &[(&str, &str)]) -> Host {
+        let tags: Vec<Tag> = self
+            .tag
+            .iter()
+            .copied()
+            .chain(extra.iter().copied())
+            .map(|(key, value)| Tag {
+                key: Some(key.to_string()),
+                value: Some(value.to_string()),
+            })
+            .collect();
+        Host {
+            host_id: Some(self.key.to_string()),
+            tags: (!tags.is_empty()).then_some(tags),
+            client_token: self.client_token.map(str::to_string),
+            ..Host::default()
+        }
+    }
+}
+
+/// A write that REPLACES the record already held under its key is charged for what the store
+/// now holds and not for what it held before: the budget counts the records that are there,
+/// so re-writing one key cannot run it down however often a caller asks.
+///
+/// The counterpart of the BYOIP suite above for the two writers keyed by something other than
+/// a freshly minted id: a Dedicated Host, written under the id its record carries, and a
+/// transit gateway prefix list reference, keyed by the two ids the caller named. Both
+/// anticipate the replacement — neither adds a record for it — so both have to give the
+/// superseded record's charge back. The rows grow the record under one key and shrink it
+/// again, so the symmetry is read in both directions rather than only on an identical
+/// rewrite.
+#[test]
+fn a_rewrite_under_one_key_is_charged_for_what_the_store_holds() {
+    for row in REWRITES {
+        let case = row.case;
+        let (_router, engine) = super::ec2_query::emulator();
+        let state = engine.state::<Ec2State>();
+        let mut guard = state.lock();
+
+        let before = guard.stored_bytes();
+        assert_eq!(
+            guard.insert_dedicated_host(row.host(&[])).as_deref(),
+            Some(row.key),
+            "case {case:?}: a fresh store has room for one host, answered under its own id"
+        );
+        let charged = guard.stored_bytes().saturating_sub(before);
+        assert!(
+            charged >= STORED_RECORD_OVERHEAD_BYTES,
+            "case {case:?}: expected at least {STORED_RECORD_OVERHEAD_BYTES} bytes charged \
+             for a stored host, got {charged}"
+        );
+
+        // The same record again, as often as a caller asks: the store holds one host, so the
+        // budget stands where the first write left it.
+        for attempt in 0..4 {
+            assert_eq!(
+                guard.insert_dedicated_host(row.host(&[])).as_deref(),
+                Some(row.key),
+                "case {case:?}: rewrite {attempt} replaces the host held under {:?}",
+                row.key
+            );
+            assert_eq!(
+                guard.dedicated_hosts.len(),
+                1,
+                "case {case:?}: rewrite {attempt} adds no record"
+            );
+            assert_eq!(
+                guard.stored_bytes(),
+                before + charged,
+                "case {case:?}: rewrite {attempt} must leave the budget at the {charged} \
+                 bytes the stored host costs, got {}",
+                guard.stored_bytes()
+            );
+        }
+
+        // A record that GROWS under the same key is charged for the growth, and shrinking it
+        // back gives exactly that growth up again.
+        assert!(
+            guard
+                .insert_dedicated_host(row.host(&[("Grown", "by-one-more-tag")]))
+                .is_some(),
+            "case {case:?}: the grown host replaces the one held under {:?}",
+            row.key
+        );
+        let grown = guard.stored_bytes();
+        assert!(
+            grown > before + charged,
+            "case {case:?}: expected the grown record to cost more than the {charged} bytes \
+             the first one did, got {grown}"
+        );
+        assert!(
+            guard.insert_dedicated_host(row.host(&[])).is_some(),
+            "case {case:?}: the original host replaces the grown one"
+        );
+        assert_eq!(
+            guard.stored_bytes(),
+            before + charged,
+            "case {case:?}: shrinking the record back must give the growth up again, got {}",
+            guard.stored_bytes()
+        );
+
+        // The same rule on the store keyed by the two ids a CALLER named: the pair is
+        // charged once however often the reference under it is re-written.
+        let route_table_id = format!("tgw-rtb-{case_key}", case_key = row.key.replace("h-", ""));
+        let prefix_list_id = format!("pl-{case_key}", case_key = row.key.replace("h-", ""));
+        let held = guard.stored_bytes();
+        assert!(
+            guard
+                .insert_transit_gateway_prefix_list_reference(
+                    &route_table_id,
+                    &prefix_list_id,
+                    false,
+                    None,
+                )
+                .is_some(),
+            "case {case:?}: a fresh store has room for one prefix list reference"
+        );
+        let reference_charge = guard.stored_bytes().saturating_sub(held);
+        assert!(
+            reference_charge >= STORED_RECORD_OVERHEAD_BYTES,
+            "case {case:?}: expected at least {STORED_RECORD_OVERHEAD_BYTES} bytes charged \
+             for a stored reference, got {reference_charge}"
+        );
+        for attempt in 0..4 {
+            assert!(
+                guard
+                    .insert_transit_gateway_prefix_list_reference(
+                        &route_table_id,
+                        &prefix_list_id,
+                        attempt % 2 == 0,
+                        None,
+                    )
+                    .is_some(),
+                "case {case:?}: rewrite {attempt} replaces the reference held for the pair"
+            );
+            assert_eq!(
+                guard.transit_gateway_prefix_list_references.len(),
+                1,
+                "case {case:?}: rewrite {attempt} adds no record"
+            );
+            assert_eq!(
+                guard.stored_bytes(),
+                held + reference_charge,
+                "case {case:?}: rewrite {attempt} must leave the budget at the \
+                 {reference_charge} bytes the stored reference costs, got {}",
+                guard.stored_bytes()
+            );
+        }
     }
 }

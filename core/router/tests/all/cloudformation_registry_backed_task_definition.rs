@@ -297,16 +297,12 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{family}:{revision}")
 }
 
-/// `<registry endpoint>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is
-/// the address a container client pushes and pulls it at (`Repository$repositoryUri`: "You
-/// can use this URI for container image `push` and `pull` operations"): the endpoint this
-/// emulator answers registry requests at, followed by the repository's own name.
-///
-/// The emulator of these suites is served on no port at all, so the address that registry
-/// reports for itself is the host of the base it publishes then
-/// (`smithy_server_runtime::UNSERVED_URL_BASE`, a name RFC 6761 reserves so that nothing
-/// resolves it) — never the registry host AWS publishes, which resolves nowhere near this
-/// process.
+/// `<registry host>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is
+/// the reference a container client pushes and pulls it by (`Repository$repositoryUri`: "You
+/// can use this URI for container image `push` and `pull` operations"): the host of the
+/// registry that HOLDS it — this account's registry in the Region these suites sign for,
+/// `<account>.dkr.ecr.<region>.amazonaws.com` as the registry URL format AWS documents
+/// spells it — followed by the repository's own name.
 ///
 /// It is also the URI every row's registered image carries. A declaration that reaches the
 /// repository's `RepositoryUri` attribute resolves to it directly; one that spells the
@@ -315,10 +311,7 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
 /// re-points to the value the owning service assigned — so either way the image names the
 /// registry this emulator serves that repository in, which is where the image is pulled from.
 pub(crate) fn published_repository_uri(repository: &str) -> String {
-    format!(
-        "{}/{repository}",
-        smithy_server_runtime::UNSERVED_URL_BASE.trim_start_matches("https://")
-    )
+    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{repository}")
 }
 
 /// One deployment: the template, and what each owning service must then hold.
@@ -588,9 +581,9 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
             );
         }
 
-        // The URI Amazon ECR publishes for the repository: the endpoint this emulator
-        // answers the registry API at, followed by the repository's own name, so a client
-        // composes a tag or a digest on what it was handed. The stack publishes one for the
+        // The URI Amazon ECR publishes for the repository: the host of the registry that
+        // holds it, followed by the repository's own name, so a client composes a tag or a
+        // digest on what it was handed. The stack publishes one for the
         // repository it created too, and the two must agree.
         let published_uri = held["repositoryUri"].as_str().unwrap_or_default().to_string();
         let expected_uri = published_repository_uri(&repository);

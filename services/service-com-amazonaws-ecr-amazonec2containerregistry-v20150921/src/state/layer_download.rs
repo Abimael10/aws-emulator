@@ -10,9 +10,9 @@ use super::*;
 /// `<account>.dkr.ecr.<region>.<dnsSuffix>` registry host, because the address
 /// has to resolve for whoever was handed it: that host is AWS's, and an address naming it
 /// would send the next client out of the emulator entirely, while a client addressing
-/// the emulator by socket is handed that socket. A repository's `repositoryUri` and the
-/// registry URL a `docker login` is pointed at are addresses a client dials too, and are
-/// built on the endpoint it reached for the same reason — through the tree's own reading of
+/// the emulator by socket is handed that socket. The registry URL a `docker login` is
+/// pointed at is an address a client dials too, and is built on the endpoint it reached for
+/// the same reason — through the tree's own reading of
 /// that question, which also declines a host that routes to a SERVICE, since no registry
 /// request addressed to one reaches this plane (`super::announced_registry_endpoint`). A
 /// download URL is served from the path space this plane owns, which every endpoint of this

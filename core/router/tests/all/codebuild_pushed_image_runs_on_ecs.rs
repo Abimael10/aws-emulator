@@ -492,9 +492,9 @@ async fn a_builds_pushed_image_walks_the_build_phases_and_then_runs_on_ecs() {
     let router = emulator();
     let suite = "the suite's own records";
 
-    // The repositories, created through Amazon ECR's own API. The URI each one publishes is
-    // the address that registry is dialled at here, so it is the address the build's commands
-    // push to and the one the task definition pins.
+    // The repositories, created through Amazon ECR's own API. The URI each one publishes
+    // names the registry that holds it, so it is the reference the build's commands push to
+    // and the one the task definition pins.
     let mut uris: BTreeMap<&str, String> = BTreeMap::new();
     for repository in ["chain-app", "chain-sidecar"] {
         let created = ecr_ok(
@@ -512,9 +512,9 @@ async fn a_builds_pushed_image_walks_the_build_phases_and_then_runs_on_ecs() {
             .split_once('/')
             .unwrap_or_else(|| panic!("case {suite:?}: {uri:?} names no repository path"));
         assert!(
-            !authority.contains(".amazonaws.com") && uri.ends_with(&format!("/{repository}")),
-            "case {suite:?}: a push and a pull address the published URI, so it names an \
-             endpoint this emulator answers on and the repository, got {uri:?}"
+            authority.contains(".dkr.ecr.") && uri.ends_with(&format!("/{repository}")),
+            "case {suite:?}: a push and a pull address the published URI, so it names the \
+             registry that holds the repository and the repository itself, got {uri:?}"
         );
         uris.insert(repository, uri);
     }

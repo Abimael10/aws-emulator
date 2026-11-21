@@ -2115,9 +2115,8 @@ pub fn evaluate_lifecycle_policy(
 
 /// One stored repository, with the identity fields computed once at creation so every
 /// later read reports exactly what the create returned. The one field NOT stored is the
-/// repository's URI: it is an address the caller reading it dials, so it is composed from
-/// the endpoint this emulator answers that caller at and this record's name
-/// ([`Repo::to_repository`]).
+/// repository's URI: it is composed from the record's own registry — its account id and its
+/// Region — and this record's name ([`Repo::to_repository`]).
 #[derive(Debug, Clone)]
 pub struct Repo {
     pub name: String,
@@ -2233,23 +2232,21 @@ impl Repo {
         }
     }
 
-    /// The `Repository` every operation that reports this repository returns, reported to a
-    /// caller this emulator answers at `registry_endpoint`
-    /// ([`announced_registry_endpoint`]).
+    /// The `Repository` every operation that reports this repository returns.
     ///
-    /// `repositoryUri` is composed here rather than stored on the record, because it is an
-    /// ADDRESS the reader DIALS to push and pull: it is that endpoint followed by this
-    /// record's own name ([`repository_uri`], and see
-    /// [`registry_address`](crate::state::registry_address)), so the value leads back to the
-    /// registry this emulator serves. WHICH registry holds the repository is reported by the
-    /// members that carry that identity — `registryId` and the ARN, which names the Region —
-    /// and those are labels of the record that no reader's endpoint moves.
-    pub fn to_repository(&self, registry_endpoint: &str) -> Repository {
+    /// `repositoryUri` is composed here rather than stored on the record, from the registry
+    /// that HOLDS this repository — the account id and the Region the record carries — and
+    /// the record's own name ([`repository_uri`], and see
+    /// [`registry_address`](crate::state::registry_address)): it is the reference a client
+    /// writes an image address in, so it names that registry whoever reads it, exactly as
+    /// the other members that carry the repository's identity do (`registryId`, and the ARN,
+    /// which names the Region).
+    pub fn to_repository(&self) -> Repository {
         Repository {
             repository_arn: Some(self.arn.clone()),
             registry_id: Some(self.registry_id.clone()),
             repository_name: Some(self.name.clone()),
-            repository_uri: Some(repository_uri(registry_endpoint, &self.name)),
+            repository_uri: Some(repository_uri(&self.registry_id, &self.region, &self.name)),
             created_at: Some(reported_instant(self.created_at)),
             image_tag_mutability: Some(self.image_tag_mutability.clone()),
             image_tag_mutability_exclusion_filters: if self

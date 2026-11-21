@@ -3,27 +3,24 @@
 //! The registry address this service reports for a repository and for a `docker login`,
 //! driven end to end over the wire.
 //!
-//! BOTH values are addresses a container client DIALS, so both name an endpoint THIS
-//! emulator answers registry requests on, and the endpoint the call arrived on is what
-//! decides which:
+//! The two values answer two different questions, and the endpoint the call arrived on
+//! decides only one of them:
 //!
-//! * `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
-//!   container image `push` and `pull` operations") is that endpoint followed by the
-//!   repository's own name — the address a `docker push` of the value reaches. The rule it
-//!   belongs to is driven across Regions, name forms and minting paths in
-//!   `crate::repository_registry_uri`; what this suite adds is which endpoint each caller is
-//!   reported, and that a pull at the value reaches this registry.
 //! * `AuthorizationData$proxyEndpoint` ("The registry URL to use for this authorization
-//!   token in a `docker login` command") is that same endpoint behind a scheme, so a client
-//!   logs in exactly where it pushes.
-//!
-//! AWS publishes its own registry host for both
-//! (`https://aws_account_id.dkr.ecr.region.amazonaws.com`), which resolves nowhere near this
-//! process, and a name under any zone AWS publishes its own endpoints in resolves nowhere
-//! either; the endpoint the caller is already talking to is the one address it can reach.
-//! What a client would otherwise read off the host — the owning account and the Region — is
-//! reported beside the URI, from the stored record (`Repository$registryId` and the ARN),
-//! and no reader's endpoint moves those.
+//!   token in a `docker login` command") is a URL a client DIALS as it is handed over, so it
+//!   names an endpoint THIS emulator answers registry requests on — the endpoint the caller
+//!   reached, or the one this emulator is served at. AWS publishes its own registry host
+//!   there (`https://aws_account_id.dkr.ecr.region.amazonaws.com`), which resolves nowhere
+//!   near this process, and a name under any zone AWS publishes its own endpoints in resolves
+//!   nowhere either; the endpoint the caller is already talking to is the one address it can
+//!   reach. This suite is what varies that endpoint.
+//! * `Repository$repositoryUri` ("The URI for the repository. You can use this URI for
+//!   container image `push` and `pull` operations") is a REFERENCE a client writes an image
+//!   address in, so it names the registry that HOLDS the repository — the account id and the
+//!   Region off the stored record, then the repository's own name — whoever reads it and
+//!   wherever they read it from. That rule is driven across Regions, name forms and minting
+//!   paths in `crate::repository_registry_uri`; what this suite adds is that no reader's
+//!   endpoint moves it, and that a pull at the value reaches this registry.
 //!
 //! The class the rule generalises over is the endpoint the call arrived on crossed with the
 //! repository name and the operation reporting it, so the rows span the endpoint forms a
@@ -39,9 +36,9 @@
 //! The last tests follow the reported URI the way a container client does: they pull the
 //! manifest at the very address the `repositoryUri` named, with the credential
 //! `GetAuthorizationToken` issued, so the URI is proved to address the repository in this
-//! registry rather than merely to carry the right shape, and they require every address this
-//! service reports to be dialable — and never a name in a zone AWS publishes its own
-//! endpoints in — whatever zone the call arrived from.
+//! registry rather than merely to carry the right shape, and they require the URL a
+//! `docker login` is pointed at to be dialable — and never a name in a zone AWS publishes
+//! its own endpoints in — whatever zone the call arrived from.
 
 use std::sync::Arc;
 
@@ -51,13 +48,13 @@ use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::EmulatedServ
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{
-    at, endpoint_host, given_layer, ok, registry_get, ANNOUNCED_REGISTRY_ENDPOINT, REGION,
-    REGISTRY_ID,
+    at, endpoint_host, given_layer, ok, registry_get, repository_uri_in,
+    ANNOUNCED_REGISTRY_ENDPOINT, REGION, REGISTRY_ID,
 };
 
 /// One endpoint a caller reaches this emulator on: where the endpoint travels (the `Host`
-/// header, the request URI's authority, or neither) and the address a registry address
-/// reported to that call is built on, port included.
+/// header, the request URI's authority, or neither) and the address the registry URL a
+/// `docker login` of that call is pointed at is built on, port included.
 struct Endpoint {
     case: &'static str,
     host: Option<String>,
@@ -71,10 +68,11 @@ impl Endpoint {
         format!("https://{}", self.announced_endpoint)
     }
 
-    /// The URI the repository `name` is reported at to such a call: the address this
-    /// emulator answers it at, followed by the repository's own name.
+    /// The URI the repository `name` is reported at to such a call: the registry that HOLDS
+    /// it, which is this account's registry in the Region the call was signed for, followed
+    /// by the repository's own name — the same value whichever endpoint the call arrived on.
     fn repository_uri(&self, name: &str) -> String {
-        format!("{}/{name}", self.announced_endpoint)
+        repository_uri_in(REGION, name)
     }
 }
 
@@ -240,13 +238,12 @@ fn text(case: &str, body: &Value, pointer: &str) -> String {
 }
 
 #[tokio::test]
-async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_on() {
+async fn no_readers_endpoint_moves_the_reported_repository_uri() {
     for endpoint in endpoints() {
         let router = emulator();
         for name in REPOSITORY_NAMES {
             let case = format!("{}, repository {name}", endpoint.case);
-            // The address this emulator answers THIS caller's registry requests at, plus the
-            // repository's own name.
+            // The registry that HOLDS the repository, plus the repository's own name.
             let expected = endpoint.repository_uri(name);
 
             let created = call_at(
@@ -263,15 +260,16 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
                  {created_uri:?}"
             );
 
-            // The two parts a container client splits the value into: the address it dials,
-            // and the repository path it composes a tag, a digest or a registry v2 path on.
+            // The two parts a reader splits the value into: the registry host, and the
+            // repository path it composes a tag, a digest or a registry v2 path on.
             let (authority, path) = created_uri
                 .split_once('/')
                 .unwrap_or_else(|| panic!("case {case:?}: {created_uri:?} names no path"));
             assert_eq!(
-                authority, endpoint.announced_endpoint,
-                "case {case:?}: expected the host of {created_uri:?} to be the endpoint this \
-                 emulator answers this caller at, got {authority:?}"
+                authority,
+                crate::wire::registry_host_in(REGION),
+                "case {case:?}: expected the host of {created_uri:?} to name the registry \
+                 that holds the repository, got {authority:?}"
             );
             assert_eq!(
                 path, name,
@@ -327,9 +325,8 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
             );
 
             // The `docker login` endpoint is the address this emulator answers this caller
-            // at, behind a scheme: the client dials it with the credential it was issued,
-            // and never a host in AWS's own zone — the very address the repository URI above
-            // is pushed to, so a client logs in where it pushes.
+            // at, behind a scheme: the client dials it as it was handed over, with the
+            // credential it was issued, and never a host in AWS's own zone.
             let issued = call_at(&router, &endpoint, "GetAuthorizationToken", &json!({})).await;
             let proxy_endpoint = text(&case, &issued, "/authorizationData/0/proxyEndpoint");
             let expected_login = endpoint.login_url();
@@ -337,12 +334,6 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
                 proxy_endpoint, expected_login,
                 "case {case:?}: expected the token's registry URL to be \
                  {expected_login:?}, got {proxy_endpoint:?}"
-            );
-            assert_eq!(
-                proxy_endpoint,
-                format!("https://{authority}"),
-                "case {case:?}: expected the login URL to carry the address {created_uri:?} \
-                 is pushed to, got {proxy_endpoint:?}"
             );
             assert!(
                 !proxy_endpoint.contains(".amazonaws.com"),
@@ -354,11 +345,11 @@ async fn every_reported_repository_uri_names_an_endpoint_this_emulator_answers_o
 }
 
 #[tokio::test]
-async fn a_repository_uri_leads_back_to_the_endpoint_the_read_arrived_on() {
-    // The URI is an ADDRESS, so every reader is reported one IT can reach: the endpoint that
-    // read arrived on, with the repository as the path. What the endpoint does NOT move is
-    // the stored record's identity — the owning account and the ARN, which name the registry
-    // that holds the repository whoever reads it.
+async fn a_repository_uri_is_the_same_whichever_endpoint_the_read_arrived_on() {
+    // The URI is a REFERENCE, so every reader is reported the registry that HOLDS the
+    // repository, with the repository as the path — as is the rest of the stored record's
+    // identity, the owning account and the ARN. What DOES follow the reader is the URL its
+    // own `docker login` is pointed at.
     let router = emulator();
     let endpoints = endpoints();
     let creating = &endpoints[0];
@@ -503,14 +494,16 @@ async fn a_pull_at_the_reported_repository_uri_reaches_this_registry() {
 }
 
 #[tokio::test]
-async fn no_reported_address_names_a_zone_aws_publishes_its_own_endpoints_in() {
+async fn the_login_url_never_names_a_zone_aws_publishes_its_own_endpoints_in() {
     // The half of the rule that cannot be read off one value: WHEREVER the call came from —
-    // a host under any of the zones AWS publishes its own endpoints in included — both
-    // addresses this service reports name the endpoint this emulator answered that caller at,
+    // a host under any of the zones AWS publishes its own endpoints in included — the URL a
+    // `docker login` is pointed at names the endpoint this emulator answered that caller at,
     // and a client that dials what it was handed reaches this registry's Docker Registry v2
     // endpoint with the credential it was issued. A name under one of those zones resolves
     // nowhere near this process, so reporting one would send the next client out of the
-    // emulated environment entirely.
+    // emulated environment entirely. The repository's own URI names the registry that holds
+    // it, and this registry's v2 plane answers at that address too, whatever host a request
+    // for it arrived on.
     for endpoint in endpoints() {
         let router = emulator();
         let case = endpoint.case;
@@ -528,7 +521,7 @@ async fn no_reported_address_names_a_zone_aws_publishes_its_own_endpoints_in() {
         let proxy_endpoint = text(case, &issued, "/authorizationData/0/proxyEndpoint");
         let token = text(case, &issued, "/authorizationData/0/authorizationToken");
 
-        // The repository URI is the address this caller reached, with the repository as its
+        // The repository URI names the registry that holds it, with the repository as its
         // path.
         let expected = endpoint.repository_uri(name);
         assert_eq!(
@@ -549,23 +542,18 @@ async fn no_reported_address_names_a_zone_aws_publishes_its_own_endpoints_in() {
             "case {case:?}: expected proxyEndpoint to carry the endpoint this emulator \
              answered this caller at, got {login_authority:?}"
         );
-        for (what, authority) in [
-            ("proxyEndpoint", login_authority.as_str()),
-            ("repositoryUri", reported_authority),
-        ] {
-            for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
-                assert!(
-                    !authority.to_ascii_lowercase().contains(suffix),
-                    "case {case:?}: {what} carries {authority:?}, a name under {suffix:?} — \
-                     a zone AWS publishes its own endpoints in, which this emulator does not \
-                     answer in"
-                );
-            }
+        for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
+            assert!(
+                !login_authority.to_ascii_lowercase().contains(suffix),
+                "case {case:?}: proxyEndpoint carries {login_authority:?}, a name under \
+                 {suffix:?} — a zone AWS publishes its own endpoints in, which this emulator \
+                 does not answer in"
+            );
         }
 
-        // What the address is FOR: dialled as it was handed over, with the credential this
+        // What an address is FOR: dialled as it was handed over, with the credential this
         // call issued, it is this registry's own v2 endpoint that answers — at the login
-        // URL's address and at the repository URI's, which are the one address.
+        // URL's address, and at the registry host the repository URI names.
         for authority in [login_authority.as_str(), reported_authority] {
             let (status, answered) = registry_get(&router, authority, "/v2/", &token, None).await;
             assert_eq!(
