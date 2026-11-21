@@ -25,10 +25,15 @@
 //!
 //! The transport-safety decisions the core makes for its own HTTP listeners are applied here
 //! from the core's own predicates — the `Host` allowlist that guards against DNS rebinding,
-//! the WebSocket refusal (the real-time endpoint is the other socket), and the browser
+//! the WebSocket refusal (the real-time endpoint is the other socket) and the browser
 //! (`Origin` / `Sec-Fetch-Site`) check — and the request is read under one deadline and one
 //! body ceiling, both the core's, so a slow or oversized client cannot hold a connection
-//! permit open.
+//! permit open. The browser check admits ONE client more than a core listener does, because
+//! this endpoint is one a PAGE calls: it answers the CORS preflight itself
+//! ([`preflight_response`]) and serves the real request of a page served from THIS MACHINE
+//! ([`served_from_this_machine`]), stating what that page may read of the answer
+//! ([`cross_origin_permission`]); a page of any other site is refused before anything of the
+//! API is reached.
 //!
 //! Every answer this endpoint writes — the result, and each refusal above — carries the
 //! REQUEST ID of the request it answers in [`REQUEST_ID_FIELD`], minted per request by the
@@ -36,10 +41,11 @@
 //! a client correlates its answer with what the API LOGGED about producing it by, because
 //! every record an API with a `logConfig` writes carries that same id
 //! ([`super::field_logs`]). A request the API itself answered is also a request it LOGS;
-//! three are not, because AppSync produced no answer of its own for them: one the WEB ACL
+//! four are not, because AppSync produced no answer of its own for them: one the WEB ACL
 //! decided at the edge, one this endpoint never read (shed for want of a permit, past the
-//! body ceiling, or past the read deadline), and one refused by the transport-safety rules
-//! before any of it was dispatched.
+//! body ceiling, or past the read deadline), one refused by the transport-safety rules
+//! before any of it was dispatched, and one answered at the CORS preflight, which reaches
+//! neither the API's authorization nor a document.
 
 use ::std::future::Future;
 use ::std::pin::Pin;
@@ -54,7 +60,7 @@ use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
 use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::execution::{self, GraphqlRequest};
-use super::{authorizer, caller, field_logs, user_pool, PlaneContext};
+use super::{authorizer, caller, field_auth, field_logs, user_pool, PlaneContext};
 use crate::service::event_api::{self, PresentedAuth};
 
 /// The response field every answer this endpoint writes carries the request's own id in, as
@@ -132,12 +138,21 @@ async fn serve_connection(context: PlaneContext, in_flight: Arc<Semaphore>, conn
             // because this socket is served by this module rather than by the front door's
             // router: there is no middleware layer to carry it.
             let facts = ::emulator_server::RequestFacts::from_request(&request);
+            // What the answer may state about reading it from a PAGE, read before the request
+            // is consumed: `None` for a request this endpoint routes nowhere
+            // ([`cross_origin_permission`]).
+            let permission = cross_origin_permission(
+                request.method(),
+                request.uri().path(),
+                request.headers(),
+                &context.remote_origins,
+            );
             let answered = contained(
                 facts,
                 answer(context, in_flight, request, request_id.clone()),
             )
             .await;
-            Ok::<_, ::std::convert::Infallible>(stamped(answered, &request_id))
+            Ok::<_, ::std::convert::Infallible>(stamped(answered, &request_id, permission))
         }
     });
     if let Err(error) = ::hyper::server::conn::http1::Builder::new()
@@ -187,20 +202,123 @@ where
     ::http::Response::from_parts(parts, Full::new(bytes))
 }
 
-/// `answered` with the request's own id written on it — the one field every answer of this
-/// endpoint carries, whatever produced it.
+/// `answered` with the request's own id written on it, and — where the request reached a
+/// route of the API — with what a page may read of the answer.
 ///
 /// A minted id is a UUID, so it is always a value a response field can carry; an answer that
-/// somehow carries one already keeps it rather than being stamped twice.
+/// somehow carries one already keeps it rather than being stamped twice. The cross-origin
+/// permission is on every answer the API's own route produced, because a page that made the
+/// request has to be able to READ it — an error of this endpoint as much as a result — and on
+/// none of the answers to a request that reached no operation of the API, which no route of it
+/// produced ([`cross_origin_permission`] decides both).
 fn stamped(
     mut answered: ::http::Response<Full<Bytes>>,
     request_id: &str,
+    permission: Option<Vec<(&'static str, ::http::HeaderValue)>>,
 ) -> ::http::Response<Full<Bytes>> {
     let name = ::http::HeaderName::from_static(REQUEST_ID_FIELD);
     if let Ok(value) = ::http::HeaderValue::from_str(request_id) {
         answered.headers_mut().entry(name).or_insert(value);
     }
+    for (name, value) in permission.into_iter().flatten() {
+        answered
+            .headers_mut()
+            .entry(::http::HeaderName::from_static(name))
+            .or_insert(value);
+    }
     answered
+}
+
+/// What the answer to this request states about reading it FROM A PAGE — the origin it permits
+/// and the response fields a script may read off it — or `None` for a request this endpoint
+/// routes nowhere ([`reaches_the_api`]), whose answer no route of the API produced.
+///
+/// The origin permitted is the REQUEST's own where a page served from that origin may drive
+/// this endpoint at all ([`admitted_origin`]) — a page served from this machine, and one the
+/// operator asked for — and [`ALLOWED_ORIGIN`] otherwise: for a client that is no page at all
+/// (which sends no `Origin`), for the preflight, and for the refusal a page of another site
+/// earns, which is what lets that page read WHY it was refused. Because that value DEPENDS on
+/// the request's own `Origin`, the answer also says so ([`VARY_FIELD`]), as the core's own
+/// HTTP listeners do: a cache holding one answer must not hand it to a page of another origin.
+/// A page may read only the safelisted response fields of a cross-origin answer unless the
+/// answer says otherwise (Fetch, §3.2.3's `Access-Control-Expose-Headers`), and the two fields
+/// this endpoint writes ABOUT the answer — the request's own id and the class of a refusal —
+/// are not among them, so they are named under the very names this endpoint writes them under.
+fn cross_origin_permission(
+    method: &::http::Method,
+    path: &str,
+    headers: &::http::HeaderMap,
+    remote_origins: &::emulator_server::RemoteOrigins,
+) -> Option<Vec<(&'static str, ::http::HeaderValue)>> {
+    if !reaches_the_api(method, path, headers) {
+        return None;
+    }
+    let origin = headers
+        .get(::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .filter(|origin| admitted_origin(origin, remote_origins))
+        .and_then(|origin| ::http::HeaderValue::from_str(origin).ok())
+        .unwrap_or_else(|| ::http::HeaderValue::from_static(ALLOWED_ORIGIN));
+    Some(vec![
+        (ALLOW_ORIGIN_FIELD, origin),
+        (
+            EXPOSE_HEADERS_FIELD,
+            ::http::HeaderValue::from_static(EXPOSED_FIELDS),
+        ),
+        (
+            VARY_FIELD,
+            ::http::HeaderValue::from_static(::http::header::ORIGIN.as_str()),
+        ),
+    ])
+}
+
+/// Whether the request addresses a ROUTE of this endpoint at all: the path the API is served
+/// at, addressed with anything but an `OPTIONS` that is no preflight — the preflight being the
+/// only `OPTIONS` this endpoint routes ([`is_preflight`]).
+///
+/// The ONE reading of that question, so what an answer states about reading it from a page
+/// cannot drift from the route that produced the answer: [`served_request`] answers each
+/// request of a route it does route, and [`cross_origin_permission`] states nothing about one
+/// it does not.
+fn reaches_the_api(
+    method: &::http::Method,
+    path: &str,
+    headers: &::http::HeaderMap,
+) -> bool {
+    serves_path(path) && (method != ::http::Method::OPTIONS || is_preflight(method, headers))
+}
+
+/// Whether `path` is the one this endpoint serves its API at. The ONE reading of that
+/// question, taken by the route ([`reaches_the_api`]) and by the answer
+/// ([`served_request`]), so a change to the path cannot leave an answer stating a permission
+/// for a route nothing serves.
+fn serves_path(path: &str) -> bool {
+    path == GRAPHQL_PATH
+}
+
+/// Whether the request is a CORS PREFLIGHT: an `OPTIONS` asking about the method a browser is
+/// about to send (Fetch, §4.8's "CORS-preflight request"). The ONE reading of that question,
+/// which the answer ([`preflight_response`]), the route ([`reaches_the_api`]) and the browser
+/// check ([`refused_before_dispatch`]) all take.
+fn is_preflight(method: &::http::Method, headers: &::http::HeaderMap) -> bool {
+    method == ::http::Method::OPTIONS && headers.contains_key(REQUEST_METHOD_FIELD)
+}
+
+/// Whether `origin` is a page served from THIS MACHINE: an origin whose host is a loopback
+/// one, by the core's own reading of that question (`emulator_server::is_loopback_host`, which
+/// is also what the `Host` allowlist is decided by).
+///
+/// Such a page is the browser-based client of the emulator — a development server on a
+/// loopback port, the console opened against it — and is who this endpoint's CORS answer is
+/// for. A page of any OTHER site is not, and is refused before anything of the API is reached
+/// ([`refused_before_dispatch`]).
+fn served_from_this_machine(origin: &str) -> bool {
+    let authority = origin
+        .split_once("://")
+        .map_or(origin, |(_scheme, authority)| authority);
+    ::emulator_server::is_loopback_host(
+        ::service_common::data_plane_addressing::host_only(authority),
+    )
 }
 
 /// Answer one request to the GraphQL endpoint.
@@ -211,7 +329,7 @@ async fn answer(
     request_id: String,
 ) -> ::http::Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
-    if let Some(refused) = refused_before_dispatch(&parts) {
+    if let Some(refused) = refused_before_dispatch(&parts, &context.remote_origins) {
         return refused;
     }
     // One permit per request IN FLIGHT, taken before a byte of the body is read: a request
@@ -245,7 +363,7 @@ async fn served_request(
     // API's own records of it state ([`field_logs`]).
     let started = SystemTime::now();
     let clock = Instant::now();
-    if parts.uri.path() != GRAPHQL_PATH {
+    if !serves_path(parts.uri.path()) {
         return refusal_logged(
             context,
             request_id,
@@ -253,6 +371,26 @@ async fn served_request(
             clock,
             404,
             NOT_FOUND_ERROR_TYPE,
+            NO_SUCH_ROUTE,
+        )
+        .await;
+    }
+    // The CORS PREFLIGHT a browser makes before the real request, which this endpoint
+    // answers itself: nothing of the API is reached by it, so it presents no authorization
+    // material, carries no document and is not a request the API executed
+    // ([`preflight_response`] states the rule in full). It is also the ONLY `OPTIONS` this
+    // endpoint routes, so one that asks about no method at all addresses nothing it serves.
+    if is_preflight(&parts.method, &parts.headers) {
+        return preflight_response(parts);
+    }
+    if parts.method == ::http::Method::OPTIONS {
+        return refusal_logged(
+            context,
+            request_id,
+            started,
+            clock,
+            404,
+            UNKNOWN_OPERATION_ERROR_TYPE,
             NO_SUCH_ROUTE,
         )
         .await;
@@ -392,6 +530,10 @@ async fn served_request(
         // The groups an admitted user pool token claims, which the schema's own group guards
         // are judged against as each field resolves ([`user_pool::refused_fields`]).
         user_pool_groups: user_pool_groups.clone(),
+        // Filled in below, once every mode that decides a call has had its say: an API that
+        // set up more than one mode says per field which of them may reach it
+        // ([`field_auth`]).
+        auth_mode: None,
     };
     let mut request = request;
     // What the API's `AWS_LAMBDA` authorization mode decides about this call, which is taken
@@ -405,6 +547,7 @@ async fn served_request(
         operation_name: request.operation_name.as_deref(),
         variables: &request.variables,
     };
+    let mut lambda_admitted = false;
     match authorizer::decided(context, &presented).await {
         authorizer::Decided::NotApplicable => {}
         authorizer::Decided::Refused => {
@@ -428,8 +571,29 @@ async fn served_request(
             // fields it withheld resolve to nothing.
             request.identity = identity;
             request.unauthorized.extend(denied);
+            lambda_admitted = true;
         }
     }
+    // WHICH of the API's authorization modes this call is of, resolved once now that every
+    // mode that decides a call has had its say: it is what the schema's own `@aws_*`
+    // directives are judged against as each field resolves ([`field_auth`]).
+    request.auth_mode = context
+        .state
+        .lock()
+        .graphql_apis
+        .get(&context.api_id)
+        .and_then(|api| {
+            field_auth::resolved_mode(
+                api,
+                &field_auth::Presented {
+                    api_key: auth.api_key.as_deref(),
+                    authorization: auth.authorization.as_deref(),
+                    signed: signed.is_some(),
+                    user_pool_admitted: user_pool_groups.is_some(),
+                    lambda_admitted,
+                },
+            )
+        });
     // What IAM says about the fields this call selects. A call NONE of whose fields it
     // permits is refused outright; one it permits some of is served, with the rest reported
     // as fields the caller may not access.
@@ -707,8 +871,19 @@ fn body_ceiling() -> usize {
 
 /// The transport-safety refusals the core applies to its own HTTP listeners, applied here
 /// from the core's own predicates so this endpoint and a core listener decide them alike.
+///
+/// The BROWSER (`Origin` / `Sec-Fetch-Site`) check among them is applied to the REAL request
+/// only, and admits one more client than a core listener does: a page served from THIS
+/// MACHINE ([`served_from_this_machine`]) is the browser-based client an AppSync API's
+/// `GRAPHQL` endpoint exists to be called from, so it reaches the API and is then decided by
+/// the material it presents like any other call. A page of ANY OTHER site is refused here,
+/// before anything of the API is reached, exactly as the core refuses one on its own
+/// listeners — what guards the developer's machine against a site they happen to be visiting
+/// driving this socket — and the CORS PREFLIGHT is answered before this check runs, because a
+/// preflight presents nothing and reaches nothing ([`preflight_response`]).
 fn refused_before_dispatch(
     parts: &::http::request::Parts,
+    remote_origins: &::emulator_server::RemoteOrigins,
 ) -> Option<::http::Response<Full<Bytes>>> {
     let header = |name: &str| parts.headers.get(name).and_then(|value| value.to_str().ok());
     // HTTP/1.1 requires a `Host`, and without an authority the rebinding guard cannot be
@@ -735,16 +910,175 @@ fn refused_before_dispatch(
     ) {
         return Some(error_response(400, BAD_REQUEST_ERROR_TYPE, NO_WEBSOCKETS));
     }
-    if let Some(reason) = event_api::cross_site_browser(header("origin"), header("sec-fetch-site"))
-    {
-        return Some(error_response(
-            403,
-            event_api::UNAUTHORIZED_ERROR_TYPE,
-            &reason,
-        ));
+    // The preflight is answered before the browser check, so a page learns what it may send
+    // whatever site it was served from; what it may then DRIVE is this check's decision.
+    if is_preflight(&parts.method, &parts.headers) {
+        return None;
+    }
+    let origin = header("origin");
+    if !origin.is_some_and(|origin| admitted_origin(origin, remote_origins)) {
+        // The decision is the CORE's own reading of the browser-set fields
+        // (`emulator_server::classify_browser_request`), driven with the origins the operator
+        // asked for, so this endpoint and a core listener cannot differ on what another site
+        // is. What it answers is this endpoint's OWN policy, in its own words.
+        if let ::emulator_server::BrowserVerdict::Forbid(reason) =
+            ::emulator_server::classify_browser_request(
+                origin,
+                header("sec-fetch-site"),
+                remote_origins,
+                true,
+            )
+        {
+            ::tracing::info!(
+                %reason,
+                "refusing a request a browser made to a GraphQL API's endpoint from another site"
+            );
+            return Some(error_response(
+                403,
+                event_api::UNAUTHORIZED_ERROR_TYPE,
+                &page_of_another_site(),
+            ));
+        }
     }
     None
 }
+
+/// What this endpoint answers a request a BROWSER made from another site: its own policy,
+/// stated in its own words and naming the setting that admits the site, rather than a
+/// sentence AppSync words for something else.
+fn page_of_another_site() -> String {
+    format!(
+        "This endpoint serves a page served from this machine. Name another site in \
+         {REMOTE_ORIGINS_ENV} to serve a page from it."
+    )
+}
+
+/// Whether a page served from `origin` may DRIVE this endpoint: one served from this machine
+/// ([`served_from_this_machine`]), and one the operator asked for ([`REMOTE_ORIGINS_ENV`]) —
+/// which is the core's own allowlist reading of an origin (`RemoteOrigins::allows`, through
+/// the predicate every core HTTP listener is guarded by), asked about the origin alone.
+fn admitted_origin(origin: &str, remote_origins: &::emulator_server::RemoteOrigins) -> bool {
+    served_from_this_machine(origin)
+        || matches!(
+            ::emulator_server::classify_browser_request(Some(origin), None, remote_origins, true),
+            ::emulator_server::BrowserVerdict::Allow
+        )
+}
+
+/// The setting an operator widens this endpoint's cross-origin policy with: the origins,
+/// comma-separated, a page may DRIVE the API's data plane from besides a page served from this
+/// machine.
+///
+/// Unset — the default — admits none of them, so no site the developer happens to be visiting
+/// can reach an API of this emulator; setting it is announced ([`configured_remote_origins`]).
+pub const REMOTE_ORIGINS_ENV: &str = "APPSYNC_GRAPHQL_REMOTE_ORIGINS";
+
+/// The origins [`REMOTE_ORIGINS_ENV`] asks this endpoint to serve a page from, as the CORE's
+/// own policy for that question: read ONCE when an API's sockets are opened
+/// (`super::open_for_api`) and never in the request path, and ANNOUNCED where it asks for any,
+/// because what it widens is who can drive and read the API's data plane.
+#[must_use]
+pub fn configured_remote_origins() -> ::emulator_server::RemoteOrigins {
+    let asked: Vec<String> = ::std::env::var(REMOTE_ORIGINS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(|origin| origin.trim().to_string())
+        .filter(|origin| !origin.is_empty())
+        .collect();
+    if asked.is_empty() {
+        return ::emulator_server::RemoteOrigins::SameOriginOnly;
+    }
+    ::tracing::warn!(
+        origins = %asked.join(","),
+        setting = %REMOTE_ORIGINS_ENV,
+        "a page served from these sites may drive and read every GraphQL API of this \
+         emulator; unset this to admit only a page served from this machine"
+    );
+    ::emulator_server::RemoteOrigins::Exact(asked)
+}
+
+/// The answer to one CORS PREFLIGHT on this endpoint — the request [`is_preflight`] admits,
+/// which is the only `OPTIONS` this endpoint routes.
+///
+/// A browser asks, with `OPTIONS` and `Access-Control-Request-Method`, whether the request it
+/// is about to make may be made (Fetch, §4.8: the "CORS-preflight request"). An AppSync API's
+/// `GRAPHQL` endpoint answers that question itself, before anything that decides the real
+/// request: the preflight carries no authorization material — a browser sends none on it —
+/// and no document, so it is neither authorized nor executed, and nothing of the API is
+/// reached. What it answers is what the real request is permitted to carry: the METHOD and
+/// the FIELDS the browser asked about, which this endpoint places no restriction of its own
+/// on ([`EVERY_FIELD`] where it asked about none), and how long the answer may be reused. What
+/// a page may then READ of an answer is stated on every answer of this endpoint
+/// ([`cross_origin_permission`]), this one included.
+fn preflight_response(parts: &::http::request::Parts) -> ::http::Response<Full<Bytes>> {
+    let header = |name: &str| parts.headers.get(name).and_then(|value| value.to_str().ok());
+    // No BODY: the answer is the permission itself, and a preflight's answer carries no
+    // payload for a browser to read.
+    let mut answered = ::http::Response::builder()
+        .status(200)
+        .header(::http::header::CONTENT_LENGTH, "0")
+        .body(Full::new(Bytes::new()))
+        .unwrap_or_else(|_| ::http::Response::new(Full::new(Bytes::new())));
+    let allowed = [
+        (
+            ALLOW_METHODS_FIELD,
+            header(REQUEST_METHOD_FIELD).unwrap_or_default().to_string(),
+        ),
+        (
+            ALLOW_HEADERS_FIELD,
+            header(REQUEST_HEADERS_FIELD)
+                .unwrap_or(EVERY_FIELD)
+                .to_string(),
+        ),
+        (MAX_AGE_FIELD, PREFLIGHT_MAX_AGE_SECONDS.to_string()),
+    ];
+    for (name, value) in allowed {
+        if let Ok(value) = ::http::HeaderValue::from_str(&value) {
+            answered
+                .headers_mut()
+                .insert(::http::HeaderName::from_static(name), value);
+        }
+    }
+    answered
+}
+
+/// The fields a browser asks a preflight with, and the ones the answer states the permission
+/// in (Fetch, §3.2.2 and §3.2.3).
+const REQUEST_METHOD_FIELD: &str = "access-control-request-method";
+const REQUEST_HEADERS_FIELD: &str = "access-control-request-headers";
+const ALLOW_ORIGIN_FIELD: &str = "access-control-allow-origin";
+const ALLOW_METHODS_FIELD: &str = "access-control-allow-methods";
+const ALLOW_HEADERS_FIELD: &str = "access-control-allow-headers";
+const EXPOSE_HEADERS_FIELD: &str = "access-control-expose-headers";
+const MAX_AGE_FIELD: &str = "access-control-max-age";
+
+/// The field an answer names the request fields its own value DEPENDS on in (RFC 9110 §12.5.5),
+/// which the permitted origin does.
+const VARY_FIELD: &str = "vary";
+
+/// What a preflight's answer permits when the browser asked about no FIELD in particular:
+/// every field, as Fetch §3.2.3 spells that — a list of field names, which is why it is not
+/// the permitted ORIGIN's own spelling of "any" ([`ALLOWED_ORIGIN`]) even though both are
+/// written the same.
+const EVERY_FIELD: &str = "*";
+
+/// The response fields a page may read off an answer of this endpoint: the request's own id
+/// ([`REQUEST_ID_FIELD`]) and the class of a refusal ([`ERROR_TYPE_FIELD`]), which are the two
+/// this endpoint writes about the answer itself.
+const EXPOSED_FIELDS: &str = "x-amzn-requestid,x-amzn-errortype";
+
+/// How long a browser may reuse this endpoint's preflight answer without asking again — the
+/// two days AppSync's own preflight states, which is the maximum a browser caches one for
+/// (`Access-Control-Max-Age`, Fetch §3.2.3: "the number of seconds the information provided
+/// … can be cached"). A value of the ENDPOINT rather than of any request, so it is the same
+/// on every preflight it answers.
+const PREFLIGHT_MAX_AGE_SECONDS: u32 = 172_800;
+
+/// The origin this endpoint permits where it names no single one: ANY, which is what an
+/// answer carrying no API state states — the preflight, the refusal a page of another site
+/// earns, and the answer to a client that is no page at all. An answer to a page this
+/// endpoint does serve names THAT page's origin instead ([`cross_origin_permission`]).
+const ALLOWED_ORIGIN: &str = "*";
 
 /// One answer carrying a document.
 fn json_response(status: u16, document: &Json) -> ::http::Response<Full<Bytes>> {
@@ -780,10 +1114,13 @@ fn error_response(
     if let Ok(value) = ::http::HeaderValue::from_str(error_type) {
         response
             .headers_mut()
-            .insert(::http::HeaderName::from_static("x-amzn-errortype"), value);
+            .insert(::http::HeaderName::from_static(ERROR_TYPE_FIELD), value);
     }
     response
 }
+
+/// The field AppSync names the class of a data-plane error in.
+const ERROR_TYPE_FIELD: &str = "x-amzn-errortype";
 
 /// The members a GraphQL request carries.
 const QUERY_MEMBER: &str = "query";
@@ -793,6 +1130,10 @@ const OPERATION_NAME_MEMBER: &str = "operationName";
 /// The `errorType` values this endpoint's refusals carry, as AppSync's own errors name them.
 const BAD_REQUEST_ERROR_TYPE: &str = "BadRequestException";
 const NOT_FOUND_ERROR_TYPE: &str = "NotFoundException";
+
+/// The `errorType` AppSync names a request that reaches no operation of the API with: an
+/// `OPTIONS` that is not the CORS preflight, which is the only `OPTIONS` this endpoint routes.
+const UNKNOWN_OPERATION_ERROR_TYPE: &str = "UnknownOperationException";
 
 /// The sentences this endpoint's own refusals state.
 const NO_SUCH_ROUTE: &str = "This endpoint serves POST /graphql.";
@@ -814,3 +1155,61 @@ pub const PERMISSION_DENIED: &str = "Permission denied";
 /// request reached no field of the API, so it is refused rather than served — the status every
 /// unauthorized call on a GraphQL API's data plane is answered with.
 const UNAUTHORIZED_STATUS: u16 = 401;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which ORIGINS a page may drive this endpoint from, over the forms an origin is written
+    /// in and the two sources of admission: a page served from this machine, which is admitted
+    /// with nothing configured, and one the operator asked for.
+    #[test]
+    fn a_page_drives_the_endpoint_from_this_machine_and_from_the_origins_asked_for() {
+        let nothing_asked = ::emulator_server::RemoteOrigins::SameOriginOnly;
+        let asked = ::emulator_server::RemoteOrigins::Exact(vec![
+            "https://studio.apollographql.com".to_string(),
+            "https://console.example.aws".to_string(),
+        ]);
+        // (origin, admitted with nothing configured, admitted with `asked` configured)
+        let rows: &[(&str, bool, bool)] = &[
+            ("http://localhost:5173", true, true),
+            ("http://127.0.0.1:3000", true, true),
+            ("https://localhost", true, true),
+            ("http://[::1]:8080", true, true),
+            ("http://127.0.0.2", true, true),
+            ("https://studio.apollographql.com", false, true),
+            ("https://console.example.aws", false, true),
+            ("https://attacker.example", false, false),
+            // An exact list admits exactly what it names: neither a prefix of an origin it
+            // names nor a name merely ending in one.
+            ("https://studio.apollographql.com.attacker.example", false, false),
+            ("https://notlocalhost", false, false),
+            // The opaque origin of a sandboxed frame names no site at all.
+            ("null", false, false),
+        ];
+        for (origin, alone, configured) in rows {
+            assert_eq!(
+                admitted_origin(origin, &nothing_asked),
+                *alone,
+                "case {origin:?}: with nothing configured, expected admitted={alone}"
+            );
+            assert_eq!(
+                admitted_origin(origin, &asked),
+                *configured,
+                "case {origin:?}: with {asked:?} configured, expected admitted={configured}"
+            );
+        }
+    }
+
+    /// The fields an answer says a page may read are the ones this endpoint WRITES about an
+    /// answer, so renaming either cannot silently stop exposing it.
+    #[test]
+    fn every_field_this_endpoint_writes_about_an_answer_is_one_a_page_may_read() {
+        let exposed: Vec<&str> = EXPOSED_FIELDS.split(',').map(str::trim).collect();
+        assert_eq!(
+            exposed,
+            vec![REQUEST_ID_FIELD, ERROR_TYPE_FIELD],
+            "the exposed fields must be exactly the two this endpoint writes, got {exposed:?}"
+        );
+    }
+}

@@ -88,6 +88,15 @@ pub struct GraphqlRequest {
     /// ([`super::user_pool::refused_fields`]), which is every depth the selection reaches and
     /// not only the operation's root.
     pub user_pool_groups: Option<Vec<String>>,
+    /// WHICH of the API's authorization modes this call resolved to, as `AuthenticationType`
+    /// spells it — `None` for a call no mode of the API claimed the material of
+    /// ([`super::field_auth::resolved_mode`]).
+    ///
+    /// Kept rather than resolved into [`Self::unauthorized`] up front for the reason the
+    /// groups above are: an API that set up more than one mode says which of them may reach a
+    /// field of ANY type ([`super::field_auth::refuses_field`]), which is every depth the
+    /// selection reaches and not only the operation's root.
+    pub auth_mode: Option<String>,
 }
 
 /// What executing one request came to: the data it resolved, and the errors of the fields
@@ -758,6 +767,19 @@ impl Execution<'_> {
                 return Json::Null;
             }
         }
+        // And so does one the SCHEMA reserves for ANOTHER of the API's authorization modes:
+        // on an API that set up more than one, a field's own `@aws_*` directives say which
+        // modes may reach it ([`super::field_auth::refuses_field`]). Judged HERE for the
+        // reason the group guard above is: a directive is written on a field of any type.
+        if super::field_auth::refuses_field(
+            self.context,
+            type_name,
+            &field.name,
+            self.request.auth_mode.as_deref(),
+        ) {
+            self.fault(unauthorized_field(path, type_name, &field.name));
+            return Json::Null;
+        }
         // The fields GraphQL's INTROSPECTION SYSTEM adds to every schema are answered from
         // the API's own type system, before any resolver is looked for: no resolver can be
         // attached to one, because each belongs to no type the schema declares
@@ -842,7 +864,16 @@ impl Execution<'_> {
         let value = match resolved {
             Ok(value) => value,
             Err(failure) => {
-                self.fault(failure.document(path));
+                // A resolution that REFUSED the field — `util.unauthorized`, "throws
+                // Unauthorized for the field being resolved" — is reported as the error
+                // AppSync words that refusal with, whatever language the resolver is written
+                // in: the class is the resolver's own, and the sentence names the field and
+                // the type that declares it, which the code that refused cannot name itself.
+                let reported = match failure.refuses_the_field() {
+                    true => unauthorized_field(path, type_name, &field.name),
+                    false => failure.document(path),
+                };
+                self.fault(reported);
                 return Json::Null;
             }
         };
@@ -2345,6 +2376,14 @@ impl Failure {
         }
     }
 
+    /// Whether this failure is a resolution REFUSING the field it was resolving:
+    /// `util.unauthorized`, in either language a resolver is written in, which raises that
+    /// refusal and nothing else. An error the resolver worded ITSELF is not one, whatever
+    /// class it names — `util.error("…", "Unauthorized")` keeps its own sentence.
+    fn refuses_the_field(&self) -> bool {
+        matches!(self, Self::Raised(raised) if raised.refuses_the_field)
+    }
+
     /// This failure as one a NAMED step of a pipeline produced.
     fn prefixed(self, name: &str) -> Self {
         match self {
@@ -2852,9 +2891,11 @@ async fn returned(
         Outcome::Raised {
             message,
             error_type: Some(error_type),
+            refused_the_field,
         } => Err(Failure::Raised(Box::new(Raised {
             message,
             error_type: Some(error_type),
+            refuses_the_field: refused_the_field,
             ..Raised::default()
         }))),
         Outcome::Raised { message, .. } | Outcome::Stopped(message) => {
@@ -2876,18 +2917,17 @@ fn field_error(path: &[Json], message: &str) -> Json {
 }
 
 /// The error AppSync reports for a field the caller may not access: its own path, the
-/// `Unauthorized` error type and the sentence naming the field and the type it belongs to.
+/// `Unauthorized` error type and the sentence naming the field and the TYPE THAT DECLARES it
+/// — one wording for every way a field is refused, through the plane's one reading of it
+/// ([`super::field_auth::unauthorized_field_message`]), which a template's own
+/// `$util.unauthorized` states as well.
 fn unauthorized_field(path: &[Json], type_name: &str, field_name: &str) -> Json {
     json!({
         "path": path.to_vec(),
-        "errorType": UNAUTHORIZED_FIELD_ERROR_TYPE,
-        "message": format!("{UNAUTHORIZED_FIELD} {field_name} on type {type_name}"),
+        "errorType": super::field_auth::UNAUTHORIZED_FIELD_ERROR_TYPE,
+        "message": super::field_auth::unauthorized_field_message(type_name, field_name),
     })
 }
-
-/// The `errorType` and the fixed part of the sentence that error states.
-const UNAUTHORIZED_FIELD_ERROR_TYPE: &str = "Unauthorized";
-const UNAUTHORIZED_FIELD: &str = "Not Authorized to access";
 
 /// The named type a reference resolves to, whatever it is wrapped in: a list of non-null
 /// `Post`s is still a reference to `Post`.

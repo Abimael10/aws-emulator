@@ -264,18 +264,18 @@ pub fn refused_fields(
     selected
         .iter()
         .filter(|(type_name, field_name)| {
-            let Some(record) = api.types.get(type_name) else {
+            // WHERE a directive about the field is written is the plane's one reading of that
+            // question ([`super::field_auth::written_directives`]), which the authorization
+            // modes a field is reserved for are judged over too; what differs here is only
+            // the predicate, the GROUPS a guard names.
+            let Some((on_field, on_type)) =
+                super::field_auth::written_directives(api, type_name, field_name)
+            else {
                 return false;
             };
-            let field_guard = record
-                .parsed
-                .fields
-                .iter()
-                .find(|field| field.name == *field_name)
-                .and_then(|field| required_groups(&field.directives));
-            let required = match field_guard {
+            let required = match required_groups(on_field) {
                 Some(required) => required,
-                None => match required_groups(&record.parsed.directives) {
+                None => match required_groups(on_type) {
                     Some(required) => required,
                     None => return false,
                 },

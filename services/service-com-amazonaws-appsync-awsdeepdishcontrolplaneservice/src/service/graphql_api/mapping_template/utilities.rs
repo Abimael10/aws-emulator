@@ -17,6 +17,11 @@
 use ::serde_json::{Map as JsonMap, Value as Json};
 
 use super::values;
+// The plane's ONE reading of the refusal `$util.unauthorized` raises, so a template and the
+// executor cannot word it differently.
+use crate::service::graphql_api::field_auth::{
+    unauthorized_field_message, UNAUTHORIZED_FIELD_ERROR_TYPE,
+};
 
 pub mod dynamodb;
 
@@ -43,6 +48,12 @@ pub struct Raised {
     pub error_type: Option<String>,
     pub data: Option<Json>,
     pub error_info: Option<Json>,
+    /// Set only by `$util.unauthorized` — "throws Unauthorized for the field being resolved"
+    /// — which REFUSES the field rather than reporting an error the author worded: the caller
+    /// that resolves a field words that refusal itself, because it alone knows the field and
+    /// the type it is of. An error of the author's own carries `false`, whatever class it
+    /// names, so `$util.error("…", "Unauthorized")` keeps its own sentence.
+    pub refuses_the_field: bool,
 }
 
 impl Raised {
@@ -64,12 +75,6 @@ impl Raised {
         Json::Object(entry)
     }
 }
-
-/// The `errorType` AppSync gives the refusal `$util.unauthorized` raises, and the fixed
-/// part of the sentence it states, which names the field being resolved and the type it
-/// belongs to.
-const UNAUTHORIZED_ERROR_TYPE: &str = "Unauthorized";
-const UNAUTHORIZED_MESSAGE: &str = "Not Authorized to access";
 
 /// Call the `$util` helper `path` names with `args`.
 ///
@@ -112,12 +117,12 @@ pub fn call(path: &[String], args: &[Json], context: &Json) -> Result<Answer, St
                     .to_string()
             };
             Ok(Answer::Raised(Raised {
-                message: format!(
-                    "{UNAUTHORIZED_MESSAGE} {} on type {}",
-                    named("fieldName"),
-                    named("parentTypeName")
+                message: unauthorized_field_message(
+                    &named("parentTypeName"),
+                    &named("fieldName"),
                 ),
-                error_type: Some(UNAUTHORIZED_ERROR_TYPE.to_string()),
+                error_type: Some(UNAUTHORIZED_FIELD_ERROR_TYPE.to_string()),
+                refuses_the_field: true,
                 ..Raised::default()
             }))
         }
@@ -217,6 +222,9 @@ fn raised(args: &[Json]) -> Raised {
         error_type: text(1),
         data: args.get(2).cloned().filter(|data| !data.is_null()),
         error_info: args.get(3).cloned().filter(|info| !info.is_null()),
+        // An error the TEMPLATE worded, whatever class it names: only
+        // `$util.unauthorized`'s own refusal of the field is that.
+        refuses_the_field: false,
     }
 }
 

@@ -663,7 +663,7 @@ fn started(
     // none of those groups may not reach, on this endpoint as on the API's GraphQL one
     // ([`super::user_pool::refused_fields`]). The root type is read under a lock of its own,
     // because the guard reads the store too.
-    if let Some(groups) = admitted_groups {
+    if let Some(groups) = admitted_groups.clone() {
         let root = context
             .state
             .lock()
@@ -686,6 +686,54 @@ fn started(
                 event_api::UNAUTHORIZED_MESSAGE,
             );
         }
+    }
+    // And the field's OWN authorization MODE, on an API that set up more than one: a field
+    // the schema reserves for another of them with an `@aws_*` directive is one this
+    // subscriber may not reach either, on this endpoint as on the API's GraphQL one
+    // ([`super::field_auth::refuses_declared_field`]). The mode this `start` is of and the
+    // subscription root its field belongs to are read under ONE lock, and the decision is
+    // taken there, so the frame locks the store once for all three.
+    let reserved_for_another_mode = {
+        let store = context.state.lock();
+        store
+            .graphql_apis
+            .get(&context.api_id)
+            .is_some_and(|api| {
+                let mode = super::field_auth::resolved_mode(
+                    api,
+                    &super::field_auth::Presented {
+                        api_key: auth.api_key.as_deref(),
+                        authorization: auth.authorization.as_deref(),
+                        signed: auth
+                            .authorization
+                            .as_deref()
+                            .is_some_and(super::caller::presents_sigv4),
+                        user_pool_admitted: admitted_groups.is_some(),
+                        // This endpoint invokes no Lambda AUTHORIZER: a `start` is decided by
+                        // the material it presents and by the token modes above
+                        // ([`token_decision`]), so it reports no decision of that mode.
+                        lambda_admitted: false,
+                    },
+                );
+                super::field_auth::refuses_declared_field(
+                    api,
+                    &api.subscription_root_type(),
+                    &field,
+                    mode.as_deref(),
+                )
+            })
+    };
+    if reserved_for_another_mode {
+        ::tracing::info!(
+            api_id = %context.api_id,
+            %field,
+            "this API's schema reserves the field for another of its authorization modes"
+        );
+        return error_frame(
+            subscription_id,
+            event_api::UNAUTHORIZED_ERROR_TYPE,
+            event_api::UNAUTHORIZED_MESSAGE,
+        );
     }
     let recorded = {
         let mut store = context.state.lock();

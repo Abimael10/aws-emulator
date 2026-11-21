@@ -192,9 +192,15 @@ pub enum Outcome {
     /// the error's own, and `error_type` the `errorType` the raise named — `util.error`'s
     /// second argument, which an error of a resolved field reports as its own `errorType` —
     /// or `None` for a raise that named none.
+    ///
+    /// `refused_the_field` is set only by `util.unauthorized`, which REFUSES the field being
+    /// resolved rather than reporting an error the code worded: the caller that resolves a
+    /// field words that refusal itself. An error of the code's own carries `false`, whatever
+    /// class it names.
     Raised {
         message: String,
         error_type: Option<String>,
+        refused_the_field: bool,
     },
     /// A bound of this module stopped the run. The text says which.
     Stopped(String),
@@ -526,6 +532,7 @@ fn evaluate_in(
                 Outcome::Raised {
                     message: raised_message(&caught),
                     error_type: None,
+                    refused_the_field: false,
                 },
                 None,
             );
@@ -564,6 +571,7 @@ fn evaluate_in(
                 Outcome::Raised {
                     message: raised_message(&caught),
                     error_type: None,
+                    refused_the_field: false,
                 },
                 None,
             )
@@ -614,6 +622,12 @@ fn read_answer(answered: &str) -> (Outcome, Option<String>) {
                 .and_then(Json::as_str)
                 .filter(|named| !named.is_empty())
                 .map(str::to_string),
+            // Whether the raise is `util.unauthorized`'s refusal of the field being resolved,
+            // which the invoker reports from the marker that call raises with.
+            refused_the_field: document
+                .get("refusedTheField")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
         },
         _ => Outcome::Stopped("the sandbox answered with no outcome".to_string()),
     };
@@ -896,6 +910,16 @@ const INVOKER_SOURCE: &str = r#"
             return null;
         }
     };
+    // The marker `util.unauthorized` raises with, which tells the REFUSAL of the field being
+    // resolved apart from an error the code worded itself under the same class.
+    const refusedTheField = function (error) {
+        try {
+            return error !== null && typeof error === "object"
+                && error.__appsyncUnauthorized === true;
+        } catch (ignored) {
+            return false;
+        }
+    };
     const stashed = function (context) {
         try {
             if (context === null || typeof context !== "object") {
@@ -926,6 +950,7 @@ const INVOKER_SOURCE: &str = r#"
                 outcome: "raised",
                 message: described(error),
                 errorType: typed(error),
+                refusedTheField: refusedTheField(error),
                 stash: stashed(context),
             });
         }
@@ -940,6 +965,7 @@ const INVOKER_SOURCE: &str = r#"
                 outcome: "unreadable",
                 message: described(error),
                 errorType: typed(error),
+                refusedTheField: refusedTheField(error),
                 stash: stashed(context),
             });
         }
@@ -1037,6 +1063,10 @@ export const util = {
     unauthorized: function () {
         const error = new Error("Unauthorized");
         error.name = "Unauthorized";
+        // The marker that tells this REFUSAL of the field being resolved apart from an error
+        // the code worded itself, which `util.error` may give the very same class: the host
+        // that resolves a field words the refusal, because it alone knows the field.
+        error.__appsyncUnauthorized = true;
         throw error;
     },
     autoId: function () {

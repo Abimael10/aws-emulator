@@ -110,6 +110,18 @@ struct SessionFacts {
     claims: Vec<(String, String)>,
 }
 
+/// Whether `presented` — the value of a call's own `authorization` field — is SigV4
+/// material, which is what says the call is one the `AWS_IAM` mode decides at all.
+///
+/// The one reading of that question, so every endpoint of this plane places a call under the
+/// same mode: this one resolves the principal with it ([`presented_caller`]), and the API's
+/// real-time endpoint judges a subscription's field against it
+/// ([`super::field_auth::resolved_mode`]).
+#[must_use]
+pub fn presents_sigv4(presented: &str) -> bool {
+    presented.starts_with(SIGV4_SCHEME)
+}
+
 /// Who the request `headers` present, or `None` for a request that presents no SigV4
 /// material at all — which is every call made under another authorization mode, and which
 /// `AWS_IAM` has nothing to decide about.
@@ -125,7 +137,7 @@ pub fn presented_caller(
     let presented = headers
         .get(::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())?;
-    if !presented.starts_with(SIGV4_SCHEME) {
+    if !presents_sigv4(presented) {
         return None;
     }
     let access_key_id = ::engine::extract_akid(headers);
