@@ -111,6 +111,11 @@ pub mod audit;
 /// gauge reads, and the cadence they are observed on.
 pub mod cluster_metrics;
 
+/// The SHARD ALLOCATION of a domain's cluster — which shard copies the nodes it provisions
+/// can hold — and the health colour it leaves the cluster in: the ONE reading every reader of
+/// that allocation is computed from.
+pub mod cluster_health;
+
 /// The ALERTING plugin's records a domain holds: the monitors a client writes, the legacy
 /// destinations their actions can address, and the alerts their triggers left behind.
 pub mod alerting;

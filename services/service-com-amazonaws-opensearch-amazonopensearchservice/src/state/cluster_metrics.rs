@@ -3,22 +3,27 @@
 //! The `AWS/ES` METRICS a provisioned domain's cluster publishes about itself.
 //!
 //! A client that provisions a domain reads what its cluster holds through CloudWatch: the
-//! documents it can search, the nodes it runs. Amazon OpenSearch Service publishes those
-//! quantities as its own `AWS/ES` series, dimensioned on the account the domain belongs to
+//! documents it can search, the nodes it runs, the health colour its shard allocation leaves
+//! it in. Amazon OpenSearch Service publishes those quantities as its own `AWS/ES` series,
+//! dimensioned on the account the domain belongs to
 //! ([`CLIENT_ID_DIMENSION`]) and the domain itself ([`DOMAIN_NAME_DIMENSION`]) — the pair
 //! every cluster-level series of that namespace carries — and an alarm, a dashboard or an
 //! on-call rule over the series is the only way the quantity is observable at all: no
 //! operation of this control plane reports how many documents a domain's indexes hold.
 //!
 //! WHAT is published is computed from this service's own records and from nothing else
-//! ([`cluster_gauges`]): the documents the domain's indexes really hold, and the nodes its
+//! ([`cluster_gauges`]): the documents the domain's indexes really hold, the nodes its
 //! stored `ClusterConfig` really provisions — the same census `DescribeDomainNodes`
-//! reports, read through that operation's own projection so the two cannot disagree. A
+//! reports, read through that operation's own projection so the two cannot disagree — and
+//! the health its shard allocation really leaves the cluster in, read through the same
+//! allocation its own `_cluster/health` answers with ([`super::cluster_health`]). A
 //! quantity this emulator holds no state for is published as no series at all rather than
 //! as a number nothing measured.
 //!
 //! EACH OF THEM IS A GAUGE, not a count of events: the quantity has a value at every
-//! instant, so a reader laying periods over the series expects a reading IN each period —
+//! instant — a health colour the cluster is or is not of is one too, published as the 0/1
+//! indicator per colour that AWS reports it as — so a reader laying periods over the series
+//! expects a reading IN each period —
 //! including every period after the quantity last changed. A series written only on change
 //! cannot answer that, so the gauges are OBSERVED ON A CADENCE ([`SAMPLE_INTERVAL`]) for as
 //! long as this account holds a domain ([`drive_metric_sampling`]), which is what makes a
@@ -62,6 +67,7 @@ use ::std::time::{Duration, SystemTime};
 
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
 
+use super::cluster_health::{ClusterStatus, ShardAllocation};
 use super::{service_state, Domain};
 
 /// The namespace Amazon OpenSearch Service publishes its own metrics to.
@@ -78,6 +84,22 @@ pub const SEARCHABLE_DOCUMENTS_METRIC: &str = "SearchableDocuments";
 
 /// The number of nodes the cluster runs.
 pub const NODES_METRIC: &str = "Nodes";
+
+/// The INDICATOR series of one cluster health colour: `ClusterStatus.green`,
+/// `ClusterStatus.yellow` or `ClusterStatus.red`.
+///
+/// A cluster has one health colour at a time and publishes one series per colour, each
+/// reading 1 while the cluster is of that colour and 0 while it is not — so a client alarms
+/// on the colour it cares about (`ClusterStatus.red` at a maximum of 1) instead of comparing
+/// a single enumerated value. The names are the colour the engine reports
+/// ([`ClusterStatus::as_str`]) behind the family's own prefix, so no colour's series name is
+/// spelled twice.
+pub fn cluster_status_metric(status: ClusterStatus) -> String {
+    format!("{CLUSTER_STATUS_METRIC_PREFIX}{}", status.as_str())
+}
+
+/// The prefix the cluster-status indicator series share — see [`cluster_status_metric`].
+pub const CLUSTER_STATUS_METRIC_PREFIX: &str = "ClusterStatus.";
 
 /// The `StandardUnit` a bare count of things carries: `Count`.
 const COUNT_UNIT: &str = "Count";
@@ -161,26 +183,46 @@ pub struct ClusterGauges {
     pub searchable_documents: f64,
     /// How many nodes its cluster configuration provisions — [`NODES_METRIC`].
     pub nodes: f64,
+    /// The health colour its shard allocation leaves the cluster in, which the three
+    /// cluster-status indicator series report ([`cluster_status_metric`]).
+    pub status: ClusterStatus,
 }
 
 impl ClusterGauges {
     /// The series this reading publishes, each with the value it took.
-    fn series(&self) -> [(&'static str, f64); 2] {
-        [
-            (SEARCHABLE_DOCUMENTS_METRIC, self.searchable_documents),
-            (NODES_METRIC, self.nodes),
-        ]
+    ///
+    /// The two counts, plus one INDICATOR per health colour: every colour is published on
+    /// every sample — the cluster has a health at every instant, and a reader asking about
+    /// the colour the cluster is not in is answered 0 rather than an empty series — and
+    /// exactly one of them reads 1.
+    fn series(&self) -> Vec<(String, f64)> {
+        let mut series = vec![
+            (
+                SEARCHABLE_DOCUMENTS_METRIC.to_string(),
+                self.searchable_documents,
+            ),
+            (NODES_METRIC.to_string(), self.nodes),
+        ];
+        series.extend(
+            ClusterStatus::ALL
+                .into_iter()
+                .map(|colour| (cluster_status_metric(colour), colour.indicator(self.status))),
+        );
+        series
     }
 }
 
 /// The gauges `domain`'s cluster reads AT THIS MOMENT, computed from its own records.
 ///
-/// The documents are the ones its indexes really hold ([`Domain::indexes`]), and the nodes
-/// are the census its stored `ClusterConfig` provisions — read through the projection
-/// `DescribeDomainNodes` reports (`crate::ops::describe_domain_nodes::domain_nodes`), so
-/// the series and that operation cannot describe one cluster differently. Both counts are
-/// bounded by this store's own quotas (the indexes a domain may hold, the documents an
-/// index may hold and the node census bound), so neither loses anything as a metric value.
+/// The documents are the ones its indexes really hold ([`Domain::indexes`]), the nodes are
+/// the census its stored `ClusterConfig` provisions — read through the projection
+/// `DescribeDomainNodes` reports (`crate::ops::describe_domain_nodes::domain_nodes`), so the
+/// series and that operation cannot describe one cluster differently — and the health colour
+/// is the one its SHARD ALLOCATION leaves it in
+/// ([`ShardAllocation`](super::cluster_health::ShardAllocation)), the same reading its own
+/// `_cluster/health` answers with. Both counts are bounded by this store's own quotas (the
+/// indexes a domain may hold, the documents an index may hold and the node census bound), so
+/// neither loses anything as a metric value.
 pub fn cluster_gauges(domain: &Domain) -> ClusterGauges {
     let documents: usize = domain
         .indexes
@@ -192,6 +234,7 @@ pub fn cluster_gauges(domain: &Domain) -> ClusterGauges {
         domain_name: domain.domain_name.clone(),
         searchable_documents: metric_value(documents),
         nodes: metric_value(nodes),
+        status: ShardAllocation::of_cluster(domain).status(),
     }
 }
 
@@ -315,7 +358,7 @@ pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng, observed: &[ClusterGaug
         for (metric, value) in gauges.series() {
             let key = cloudwatch::MetricKey {
                 namespace: METRIC_NAMESPACE.to_string(),
-                metric_name: metric.to_string(),
+                metric_name: metric,
                 dimensions: dimensions(&gauges.domain_name),
             };
             let datum = cloudwatch::StoredDatum {

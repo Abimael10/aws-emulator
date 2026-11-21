@@ -148,6 +148,15 @@ use crate::state::{
     ComAmazonawsOpensearchAmazonopensearchserviceState as Store, Domain, IndexTemplate,
 };
 
+// The ONE reading of a cluster's shard allocation, which the cluster health, an index's
+// `_cat` row, a write's `_shards` and a refresh's are all computed from
+// ([`state::cluster_health`]) — so none of them can describe one cluster differently, and the
+// `AWS/ES` cluster-status series the domain publishes reads the same allocation.
+use crate::state::cluster_health::{
+    assigned_replica_copies as assigned_replicas, data_nodes, health_of, setting_number,
+    ClusterStatus, ShardAllocation, MAX_SHARDS_PER_INDEX, NUMBER_OF_REPLICAS, NUMBER_OF_SHARDS,
+};
+
 /// The segment that names THIS service's data plane behind `EMULATOR_PATH_NAMESPACE`: the
 /// `arnNamespace`/`endpointPrefix` this service publishes.
 const DATA_PLANE_SEGMENT: &str = state::ARN_NAMESPACE;
@@ -321,12 +330,6 @@ const TOO_MANY_CLAUSES: &str = "too_many_clauses";
 /// is what keeps one clause's own breadth from sizing the work; past it the query is
 /// refused, as the engine refuses it.
 const MAX_TERMS_COUNT: usize = 65_536;
-
-/// The most shards and replica copies one index's settings may ask for, as the engine's
-/// own `index.number_of_shards` limit (`cluster.max_shards_per_node` times a node) bounds
-/// them. A settings value past this is clamped for the health arithmetic rather than
-/// multiplied out.
-const MAX_SHARDS_PER_INDEX: i64 = 1_024;
 
 /// The engine's error type for a request whose body is not the JSON the handler expects.
 const PARSE_EXCEPTION: &str = "parse_exception";
@@ -2128,36 +2131,6 @@ fn apply_pipeline(domain: &Domain, id: &str, source: &mut Value) -> Result<(), R
     Ok(())
 }
 
-/// How many DATA nodes the domain's cluster has, which is what decides how many copies of
-/// a shard can be assigned: one node holds at most one copy of a shard.
-fn data_nodes(domain: &Domain) -> i32 {
-    domain.cluster_config.instance_count.unwrap_or(1).max(1)
-}
-
-/// How many of an index's `copies` replica copies per shard the cluster can ASSIGN: a
-/// replica needs a node other than the one holding its primary, so the primary's node
-/// leaves `data_nodes - 1` nodes for them and a copy past that has nowhere to go.
-///
-/// The ONE arithmetic every reader of the cluster's allocation uses — the cluster health,
-/// an index's `_cat` row, a write's `_shards` and a refresh's — so no two of them can
-/// report one index's allocation differently.
-fn assigned_replicas(copies: i64, data_nodes: i32) -> i64 {
-    copies.min(i64::from(data_nodes).saturating_sub(1).max(0))
-}
-
-/// The health `unassigned` unassigned shard copies leave the indexes they belong to in:
-/// `yellow` while a copy has nowhere to go, `green` with every copy assigned.
-///
-/// A primary is always assignable here — there is always a data node to hold it — so no
-/// index of this cluster is `red`.
-fn health_of(unassigned: i64) -> &'static str {
-    if unassigned > 0 {
-        "yellow"
-    } else {
-        "green"
-    }
-}
-
 /// What `op_type` asks of a `_doc` write: `create` is the one value that forbids a
 /// replacement, and every other (including none) leaves the write an upsert.
 fn requested_op_type(request: &Request<'_>) -> Creates {
@@ -2300,8 +2273,8 @@ fn stable_uuid(seed: &str) -> String {
 /// the cluster has nodes to put them on leaves copies unassigned and the cluster is
 /// `yellow` — which is the health such a domain really reports. With every copy assigned
 /// it is `green`. Lowering the replica count to what the topology can hold is what turns
-/// it green again, which is why the arithmetic is the one shared
-/// [`assigned_replicas`] and not a test for a single node.
+/// it green again, which is why the allocation is the one shared
+/// [`ShardAllocation`] and not a test for a single node.
 ///
 /// `wait_for_status` is the one wait this emulator can answer without waiting: the cluster
 /// is already settled, so the status it has is the status it will have — a request asking
@@ -2331,34 +2304,20 @@ fn cluster_health(
     } else {
         0
     };
-    let mut primaries = 0_i64;
-    let mut replicas = 0_i64;
-    let mut assignable = 0_i64;
-    for index in named {
-        // Both come from the index's own settings, which a caller wrote, so both are
-        // clamped before they are multiplied out.
-        let shards = setting_number(&index.schema, NUMBER_OF_SHARDS)
-            .unwrap_or(1)
-            .clamp(1, MAX_SHARDS_PER_INDEX);
-        let copies = setting_number(&index.schema, NUMBER_OF_REPLICAS)
-            .unwrap_or(1)
-            .clamp(0, MAX_SHARDS_PER_INDEX);
-        primaries = primaries.saturating_add(shards);
-        replicas = replicas.saturating_add(shards.saturating_mul(copies));
-        assignable = assignable
-            .saturating_add(shards.saturating_mul(assigned_replicas(copies, data_nodes)));
-    }
-    // Each replica copy needs a node other than the one holding its primary, so the
-    // copies past what the topology can hold are the unassigned ones.
-    let unassigned = replicas.saturating_sub(assignable);
-    let active = primaries.saturating_add(assignable);
-    let total = primaries.saturating_add(replicas);
-    let status = health_of(unassigned);
+    // Each replica copy needs a node other than the one holding its primary, so the copies
+    // past what the topology can hold are the unassigned ones — the one allocation reading.
+    let allocation = ShardAllocation::of(domain, named);
+    let primaries = allocation.primaries();
+    let unassigned = allocation.unassigned();
+    let active = allocation.active();
+    let total = allocation.total();
+    let reached = allocation.status();
+    let status = reached.as_str();
     let timed_out = request
         .parameter("wait_for_status")
         .as_deref()
-        .and_then(health_rank)
-        .is_some_and(|wanted| health_rank(status).is_some_and(|reached| reached > wanted));
+        .and_then(ClusterStatus::parse)
+        .is_some_and(|wanted| reached.rank() > wanted.rank());
     let percent = if total == 0 {
         100.0
     } else {
@@ -2385,17 +2344,6 @@ fn cluster_health(
         "task_max_waiting_in_queue_millis": 0,
         "active_shards_percent_as_number": percent,
     }))
-}
-
-/// How the three cluster health statuses order, worst last — what `wait_for_status`
-/// compares against. `None` for a value that names none of them.
-fn health_rank(status: &str) -> Option<u8> {
-    match status {
-        "green" => Some(0),
-        "yellow" => Some(1),
-        "red" => Some(2),
-        _ => None,
-    }
 }
 
 /// A `GET` or `PUT` on the cluster's own settings.
@@ -2925,28 +2873,6 @@ fn simulated(index: &str, id: &str, source: &Value, timestamp: &str) -> Value {
         "_ingest": { "timestamp": timestamp },
     })
 }
-
-/// The number an index's `settings` section gives `name`, under the `index` sub-section or
-/// directly, as both spellings a client writes it with.
-fn setting_number(schema: &::aws_smithy_types::Document, name: &str) -> Option<i64> {
-    let settings = state::json_from_document(schema);
-    let section = settings.get("settings")?;
-    let value = section
-        .get("index")
-        .and_then(|nested| nested.get(name))
-        .or_else(|| section.get(name))?;
-    value
-        .as_i64()
-        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-}
-
-/// The setting naming how many primary shards an index has, and the one naming how many
-/// replica copies of each — the two the shard arithmetic reads ([`setting_number`]), named
-/// once so no reader of the cluster's allocation spells them for itself.
-const NUMBER_OF_SHARDS: &str = "number_of_shards";
-
-/// See [`NUMBER_OF_SHARDS`].
-const NUMBER_OF_REPLICAS: &str = "number_of_replicas";
 
 /// A `PUT`, `GET`, `HEAD` or `DELETE` on an index itself.
 fn index_request(domain: &mut Domain, request: &Request<'_>, index_name: &str) -> RtResponse {

@@ -5,11 +5,12 @@
 //! `GetMetricStatistics`, `PutMetricAlarm` and `DescribeAlarms`, with CloudWatch mounted
 //! beside this service on ONE shared engine.
 //!
-//! ONE rule, over a SET of clusters and both gauges rather than one recorded call:
+//! ONE rule, over a SET of clusters and every gauge rather than one recorded call:
 //!
 //! > a domain whose cluster is up publishes the `AWS/ES` cluster gauges this service holds
-//! > the records to compute — the searchable documents its indexes hold and the nodes its
-//! > cluster configuration provisions — dimensioned on the account (`ClientId`) and the
+//! > the records to compute — the searchable documents its indexes hold, the nodes its
+//! > cluster configuration provisions and one 0/1 indicator per health colour its shard
+//! > allocation leaves it in — dimensioned on the account (`ClientId`) and the
 //! > domain (`DomainName`), as GAUGES observed on a cadence while the domain exists: so the
 //! > series is readable before anything is indexed (the reading is then zero, which is a
 //! > measurement), it follows the quantity up AND down as the cluster's contents change,
@@ -19,7 +20,9 @@
 //! (none, one, several spread over two indexes), how those documents arrive and leave (a
 //! bulk load, a bulk delete, an index dropped), how many nodes the configuration provisions
 //! (one data node, two, and a cluster with dedicated master nodes beside its data nodes),
-//! and which of the two series is read. The recorded case the issue was filed about — ten
+//! how many shards and replica copies its indexes ask for — and so which health colour the
+//! allocation leaves it in — and which of the series is read. The recorded case the issue was
+//! filed about — ten
 //! documents bulk-loaded into one domain, with an alarm at a threshold of ten over
 //! `SearchableDocuments` — is one row of it.
 //!
@@ -67,6 +70,16 @@ const LOOKBACK_SECS: f64 = 600.0;
 /// How far PAST now a reading's range reaches, in seconds: one period, so the window the
 /// newest datapoint falls in is covered whole.
 const PERIOD_ROOM_SECS: f64 = 60.0;
+
+/// How long a wait for a WHOLE window of readings to carry one value may take at most.
+///
+/// Longer than [`DEADLINE`] because such a window is one that OPENED after the change being
+/// waited for: the readings taken before it fall in the window the change happened in, so the
+/// wait is for the next window of the period these datapoints are stored at
+/// ([`PERIOD_SECS`]) — a span the suite waits out rather than asserts on. Generous on top of
+/// that, so a loaded machine cannot fail the suite, and nothing here reads the clock to
+/// decide anything.
+const SETTLED_DEADLINE: Duration = Duration::from_secs(240);
 
 /// Which bound of a window's readings a changed quantity shows up as.
 ///
@@ -488,6 +501,252 @@ async fn the_published_gauge_follows_the_documents_the_cluster_holds() {
         Bound::Lowest,
     )
     .await;
+}
+
+/// The `AWS/ES` cluster-status INDICATOR series, each beside the health colour the engine
+/// reports for it.
+///
+/// Written out here rather than taken from the crate, so the test pins the names a client
+/// subscribes to: the cluster metrics of the Amazon OpenSearch Service developer guide
+/// (`managedomains-cloudwatchmetrics`) name them `ClusterStatus.green`,
+/// `ClusterStatus.yellow` and `ClusterStatus.red`, and the colours are the ones the engine's
+/// own `_cluster/health` answers with.
+const CLUSTER_STATUS_SERIES: [(&str, &str); 3] = [
+    ("ClusterStatus.green", "green"),
+    ("ClusterStatus.yellow", "yellow"),
+    ("ClusterStatus.red", "red"),
+];
+
+/// One cluster of the cluster-status table: what it is, how many data nodes it is
+/// provisioned with, the settings of the one index it is given (none at all for a cluster
+/// holding no index), and the health colour that allocation leaves it in.
+struct StatusRow {
+    case: &'static str,
+    domain: &'static str,
+    nodes: i64,
+    /// The `settings` section the index is created with, or `None` for a cluster that is
+    /// given no index at all.
+    index_settings: Option<Value>,
+    /// The colour of [`CLUSTER_STATUS_SERIES`] whose indicator reads 1.
+    status: &'static str,
+}
+
+/// The cluster-status table: the allocations the rule is asserted over.
+///
+/// The rows differ along what the rule generalises over — how many data nodes the cluster
+/// provisions, how many shards and replica COPIES of each its index asks for, and whether it
+/// holds an index at all — and so over both colours a cluster of this emulator reaches: a
+/// replica copy needs a node other than the one holding its primary, so an index asking for
+/// more copies than the topology can hold leaves copies unassigned (`yellow`) and one whose
+/// copies all fit is fully allocated (`green`).
+fn status_rows() -> Vec<StatusRow> {
+    vec![
+        StatusRow {
+            case: "a cluster holding no index at all",
+            domain: "status-bare",
+            nodes: 1,
+            index_settings: None,
+            status: "green",
+        },
+        StatusRow {
+            case: "one node and an index asking for the default replica copy",
+            domain: "status-default",
+            nodes: 1,
+            index_settings: Some(json!({})),
+            status: "yellow",
+        },
+        StatusRow {
+            case: "one node and an index asking for no replica copy",
+            domain: "status-unreplicated",
+            nodes: 1,
+            index_settings: Some(json!({ "number_of_shards": 3, "number_of_replicas": 0 })),
+            status: "green",
+        },
+        StatusRow {
+            case: "two nodes and an index whose single copy they can hold",
+            domain: "status-fitting",
+            nodes: 2,
+            index_settings: Some(json!({ "number_of_shards": 2, "number_of_replicas": 1 })),
+            status: "green",
+        },
+        StatusRow {
+            case: "two nodes and more replica copies than they can hold",
+            domain: "status-over",
+            nodes: 2,
+            index_settings: Some(json!({ "number_of_shards": 1, "number_of_replicas": 2 })),
+            status: "yellow",
+        },
+    ]
+}
+
+/// The cluster configuration of a row: `nodes` data nodes of the instance type every row
+/// uses.
+fn cluster_of(nodes: i64) -> Value {
+    json!({ "InstanceType": "t3.small.search", "InstanceCount": nodes })
+}
+
+/// The status the cluster's OWN `GET /_cluster/health` reports for `domain`.
+async fn reported_health(emulator: &Emulator, case: &str, domain: &str) -> String {
+    let answer = rest_prefixed(emulator, domain, "GET", "/_cluster/health", None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected 200 from GET /_cluster/health, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["status"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Wait until a WHOLE window of the series reads `expected` — its lowest and its highest
+/// reading alike — and fail with the readings it did carry when it never does.
+///
+/// A window every reading of which is `expected` is one that OPENED after the change being
+/// waited for, since the readings taken before it fall in the window the change happened in.
+/// That is what makes a value which changed BACK to one the series already carried
+/// observable, rather than hidden under the earlier readings of the window it changed in: the
+/// series is read at the period its datapoints are stored at ([`PERIOD_SECS`]) — the only
+/// granularity a standard-resolution series is served at — and the wait is for the next such
+/// window to fill ([`SETTLED_DEADLINE`]).
+async fn settled_at(emulator: &Emulator, case: &str, domain: &str, metric: &str, expected: f64) {
+    let deadline = Instant::now() + SETTLED_DEADLINE;
+    loop {
+        let window = newest_window(emulator, domain, metric).await;
+        if window == Some((expected, expected)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected every reading of {domain:?}'s newest {metric} window to be \
+             {expected}, got {window:?}"
+        );
+        ::tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// Wait until every cluster-status series of `domain` carries the indicator the colour
+/// `status` implies: 1 for that colour and 0 for the other two.
+async fn status_indicators(emulator: &Emulator, case: &str, domain: &str, status: &str) {
+    for (metric, colour) in CLUSTER_STATUS_SERIES {
+        let expected = if colour == status { 1.0 } else { 0.0 };
+        settled_at(emulator, case, domain, metric, expected).await;
+    }
+}
+
+/// RULE: a domain whose cluster is up publishes one `AWS/ES` cluster-status series per health
+/// colour, each a 0/1 indicator of whether the cluster's own shard allocation leaves it in
+/// that colour — the same allocation its `_cluster/health` reports — dimensioned on the
+/// account (`ClientId`) and the domain (`DomainName`).
+#[tokio::test]
+async fn every_provisioned_cluster_publishes_the_status_indicator_of_its_own_allocation() {
+    let emulator = Emulator::with_metrics();
+    let table = status_rows();
+
+    // Every domain is created first, so the one span the clock owes a provisioning runs for
+    // all of them at once rather than once per row.
+    for row in &table {
+        given_domain(&emulator, row.domain, &cluster_of(row.nodes)).await;
+    }
+    for row in &table {
+        let host = provisioned(&emulator, row.domain).await;
+        if let Some(settings) = &row.index_settings {
+            created_index(
+                &emulator,
+                &host,
+                "catalog",
+                json!({ "settings": settings.clone() }),
+            )
+            .await;
+        }
+    }
+
+    for row in &table {
+        // The colour the cluster's own health read reports, which is what the indicators are
+        // the published reading of.
+        let health = reported_health(&emulator, row.case, row.domain).await;
+        assert_eq!(
+            health, row.status,
+            "case {:?}: expected the cluster's own health to be {:?}, got {health:?}",
+            row.case, row.status
+        );
+        status_indicators(&emulator, row.case, row.domain, row.status).await;
+    }
+
+    // And every colour's series is one CloudWatch LISTS for the namespace, one per domain,
+    // each under the account and domain dimensions and no others.
+    for (metric, _) in CLUSTER_STATUS_SERIES {
+        let listed = listed_dimensions(&emulator, metric).await;
+        let mut expected: Vec<Vec<(String, String)>> = table
+            .iter()
+            .map(|row| expected_dimensions(row.domain))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "case ListMetrics({metric}): expected one series per provisioned domain under the \
+             account and domain dimensions, got {listed:?}"
+        );
+    }
+}
+
+/// RULE (the gauge half): the cluster-status indicators FOLLOW the allocation, in both
+/// directions — an index asking for more replica copies than the topology can hold turns the
+/// cluster yellow, and lowering the count to what fits turns it green again.
+#[tokio::test]
+async fn the_published_cluster_status_follows_the_allocation_in_both_directions() {
+    let emulator = Emulator::with_metrics();
+    let domain = "status-changing";
+    let index = "orders";
+    given_domain(&emulator, domain, &cluster_of(2)).await;
+    let host = provisioned(&emulator, domain).await;
+
+    // Nothing indexed yet: every copy of nothing is allocated, which is a green cluster and
+    // a reading rather than an absent series.
+    status_indicators(&emulator, "a cluster holding no index", domain, "green").await;
+
+    // An index asking for two copies of its shard on a cluster of two nodes: one copy has
+    // nowhere to go, so the cluster is yellow.
+    created_index(
+        &emulator,
+        &host,
+        index,
+        json!({ "settings": { "number_of_shards": 1, "number_of_replicas": 2 } }),
+    )
+    .await;
+    let yellow = reported_health(&emulator, "an over-replicated index", domain).await;
+    assert_eq!(
+        yellow, "yellow",
+        "case \"an over-replicated index\": expected the cluster's own health to be yellow, \
+         got {yellow:?}"
+    );
+    status_indicators(&emulator, "an over-replicated index", domain, "yellow").await;
+
+    // Lowered to what the topology can hold: every copy is assigned again, so the cluster is
+    // green — the transition a client waits for, observable on the series.
+    let lowered = rest_prefixed(
+        &emulator,
+        domain,
+        "PUT",
+        &format!("/{index}/_settings"),
+        Some(json!({ "index": { "number_of_replicas": 1 } })),
+    )
+    .await;
+    assert_eq!(
+        (lowered.status, lowered.body["acknowledged"].as_bool()),
+        (200, Some(true)),
+        "case \"lowering the replica count\": expected the settings update to be acknowledged, \
+         got {} with {:?}",
+        lowered.status,
+        lowered.body
+    );
+    let green = reported_health(&emulator, "the replica count lowered", domain).await;
+    assert_eq!(
+        green, "green",
+        "case \"the replica count lowered\": expected the cluster's own health to be green, \
+         got {green:?}"
+    );
+    status_indicators(&emulator, "the replica count lowered", domain, "green").await;
 }
 
 /// One alarm of the alarm table: what it watches, the threshold and comparison it is
