@@ -207,6 +207,12 @@ pub use code_interpreter_tasks::*;
 mod code_interpreter_python;
 pub use code_interpreter_python::*;
 
+/// What the built-in tools publish about the sessions a caller holds open:
+/// [`report_active_sessions`], the `AWS/Bedrock-AgentCore` gauge every call that opens or
+/// closes a session samples, and the clock that keeps sampling it while one is open.
+mod session_metrics;
+pub use session_metrics::*;
+
 use crate::ops::types::{
     Branch, Certificate, Event, ExtractionConfig, IngestPayloadType, MemoryContent, MemoryRecord,
     MemoryRecordMetadataValue, MemoryRecordOutput, MetadataValue, PayloadType, SessionSummary,
@@ -525,6 +531,23 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// token used under two managers remembers both. Bounded by
     /// [`MAX_PAYMENT_INSTRUMENT_IDEMPOTENCY_RECORDS`].
     pub payment_instrument_idempotency: BTreeMap<(String, String), String>,
+    /// When each built-in tool's `ActiveSessionCount` was last sampled and what it read,
+    /// keyed by the `Service` dimension value that tool publishes under: one reading per
+    /// tool per minute plus one whenever the count changes, which is what decides whether
+    /// another is owed ([`session_metrics::publish_active_session_counts`]). At most one
+    /// entry per built-in tool ([`BuiltInTool::ALL`]).
+    pub session_samples: BTreeMap<String, SessionSample>,
+    /// Until when the one session-gauge clock running over this store holds its claim, or
+    /// `None` when no clock holds one — see
+    /// [`session_metrics::drive_session_metric_clock`].
+    pub session_clock_until: Option<SystemTime>,
+    /// How many clock claims this store has handed out, which NUMBERS them: a clock writes
+    /// its task back only while its own claim is still the current one, so a clock that stood
+    /// down cannot take the slot of the one that replaced it.
+    pub session_clock_claims: u64,
+    /// The task of that clock, so it can be stopped: a clock that outlives its claim is
+    /// aborted when the next one takes it over.
+    pub session_clock: Option<::tokio::task::JoinHandle<()>>,
 }
 
 impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {

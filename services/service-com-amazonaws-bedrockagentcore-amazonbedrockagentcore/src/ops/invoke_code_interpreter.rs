@@ -373,6 +373,10 @@ impl<Eng: Send + Sync + 'static> InvokeCodeInterpreter<Eng> {
                 }
             }
         };
+        // A call that named no session has opened one, so the gauge that reports the
+        // caller's live sessions is sampled now, with no store lock held; a call that named
+        // one left the count where it was and the sampler publishes nothing new.
+        crate::state::report_active_sessions(&self.engine);
 
         let arguments = input.arguments.clone().unwrap_or_default();
         // Every task of this session whose command the CLOCK has made due is performed

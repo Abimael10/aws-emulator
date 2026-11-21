@@ -24,8 +24,9 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// The region every request here is signed for.
-const REGION: &str = "us-east-1";
+/// The region every request here is signed for. `pub(crate)` for the sibling cross-plane
+/// suites, which address other services in the SAME Region as the calls below.
+pub(crate) const REGION: &str = "us-east-1";
 
 /// An id of the modelled shape that no create ever mints here.
 const GHOST_MEMORY: &str = "ghost-memory-9876543210";
@@ -96,8 +97,9 @@ pub(crate) async fn call(
     (status, parsed)
 }
 
-/// Percent-encode one `@httpLabel` value the way an AWS SDK does.
-fn label(value: &str) -> String {
+/// Percent-encode one `@httpLabel` value the way an AWS SDK does. Shared with the sibling
+/// cross-plane suites, for the same reason [`call`] is.
+pub(crate) fn label(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {

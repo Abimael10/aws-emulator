@@ -10712,6 +10712,7 @@ dependencies = [
  "rquickjs",
  "serde_json",
  "service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol",
+ "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",

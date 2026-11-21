@@ -301,6 +301,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Registers the browser and holds every bound the store declares, so no caller
         // can grow it without limit.
         store.insert_browser_session(session, input.client_token);
+        // The caller now holds one more open session, so the gauge that reports its live
+        // sessions is sampled off this answer, with no store lock held.
+        drop(store);
+        crate::state::report_active_sessions(&self.engine);
 
         Ok(output)
     }

@@ -240,10 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         session.stop(now, input.client_token.as_deref());
-        Ok(StopCodeInterpreterSessionOutput {
+        let output = StopCodeInterpreterSessionOutput {
             code_interpreter_identifier: session.code_interpreter_identifier.clone(),
             session_id: session.session_id.clone(),
             last_updated_at: ::aws_smithy_types::DateTime::from(session.last_updated_at),
-        })
+        };
+        // The caller holds one fewer open session, so the gauge that reports its live
+        // sessions is sampled off this answer, with no store lock held.
+        drop(store);
+        crate::state::report_active_sessions(&self.engine);
+        Ok(output)
     }
 }

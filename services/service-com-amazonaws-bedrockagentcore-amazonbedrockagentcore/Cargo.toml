@@ -89,6 +89,13 @@ aws-sdk-secretsmanager = { version = "1", default-features = false }
 # `service-common`'s one shared evaluation.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# Amazon CloudWatch, whose metric store is the ONE home of every series this emulator
+# publishes: the built-in tools report how many sessions a caller holds open as the
+# `AWS/Bedrock-AgentCore` `ActiveSessionCount` gauge, and a reader of that gauge
+# (`ListMetrics`, `GetMetricStatistics`, an alarm) reads CloudWatch's own store, so the
+# samples are appended there rather than kept in a copy of this plane's own
+# (src/state/session_metrics.rs). Only its `state` accessor is used.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
