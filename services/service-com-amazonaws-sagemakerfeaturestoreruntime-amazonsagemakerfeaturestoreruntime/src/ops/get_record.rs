@@ -16,6 +16,10 @@
 //!
 //! Authorization is not emulated, so the modelled `AccessForbidden` is unreachable.
 //!
+//! The two output members are INDEPENDENT: `FeatureNames` restricts `Record` only, so a
+//! record that resolves answers with its `ExpiresAt` (when the caller enabled it and the
+//! stored value is not null) whether or not the projection selected any feature value.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -212,21 +216,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(GetRecordOutput::default());
         };
 
-        let projected = record.project(input.feature_names.as_deref());
-        if projected.is_empty() {
-            // `Record` is modelled `len 1..`, so "no feature matched" is the same
-            // empty result an absent identifier gives, never an empty list.
-            return Ok(GetRecordOutput::default());
-        }
-
         // "Parameter to request ExpiresAt in response. If Enabled, GetRecord will
-        // return the value of ExpiresAt, if it is not null."
+        // return the value of ExpiresAt, if it is not null." The record this names is
+        // the one the identifier resolved to, so its expiry is decided by that record
+        // and by `ExpirationTimeResponse` ALONE: `ExpiresAt` and `Record` are
+        // independent output members, and `FeatureNames` projects the feature values
+        // only. It is computed before the projection for exactly that reason.
         let expires_at = expiration_enabled
             .then(|| record.expires_at.clone())
             .flatten();
 
+        let projected = record.project(input.feature_names.as_deref());
+
         Ok(GetRecordOutput {
-            record: Some(projected),
+            // `Record` is modelled `len 1..`, so "no feature matched" carries no
+            // record at all rather than an empty list — the same omission an absent
+            // identifier gives. It takes the expiry with it only when the record
+            // itself is absent, which is the branch above.
+            record: (!projected.is_empty()).then_some(projected),
             expires_at,
         })
     }

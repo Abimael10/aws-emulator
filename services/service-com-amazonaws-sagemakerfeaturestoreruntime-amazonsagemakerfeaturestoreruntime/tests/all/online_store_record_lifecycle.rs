@@ -1961,3 +1961,196 @@ async fn a_cursor_at_an_identifier_too_long_for_a_token_still_names_its_record()
     }
 }
 
+/// `Record` and `ExpiresAt` are INDEPENDENT members of `GetRecordResponse`
+/// (`smithy_query(query="shape", shape="GetRecordResponse")`: neither is required, and
+/// only `Record` is the `len 1..` list), and `FeatureNames` is "List of names of
+/// Features to be retrieved" — the feature VALUES. So a record the identifier resolves
+/// to answers with its stored `ExpiresAt` whenever the caller enabled it and the stored
+/// value is not null, whatever the projection selected — down to no feature value at all.
+#[tokio::test]
+async fn get_record_answers_expires_at_for_every_projection_of_a_record_that_exists() {
+    let emulator = Emulator::new();
+    let event_time = tomorrow_iso();
+
+    // One record under a TTL, so its stored `ExpiresAt` is not null, and one under no
+    // TTL at all, whose `ExpiresAt` is null: "If Enabled, GetRecord will return the
+    // value of ExpiresAt, if it is not null."
+    let (status, body) = emulator
+        .put_record(
+            "ttlgroup",
+            json!({
+                "Record": [
+                    feature("customer_id", "C1"),
+                    feature("event_time", &event_time),
+                    feature("city", "Seattle"),
+                    feature("plan", "gold")
+                ],
+                "TtlDuration": { "Unit": "Weeks", "Value": 1 }
+            }),
+        )
+        .await;
+    assert_eq!(status, 200, "expected PutRecord 200, got {status} with {body}");
+    let (status, body) = emulator
+        .put_record(
+            "customers",
+            json!({ "Record": [
+                feature("customer_id", "C1"),
+                feature("event_time", &event_time),
+                feature("city", "Seattle"),
+                feature("plan", "gold")
+            ] }),
+        )
+        .await;
+    assert_eq!(status, 200, "expected PutRecord 200, got {status} with {body}");
+
+    // The class the rule spans: every shape a projection of ONE stored record can take
+    // — all of its features, every feature named explicitly, one, a stored name mixed
+    // with one the record does not carry, and names that match nothing. Each row names
+    // the feature values it expects back; the expiry is expected on every row.
+    let projections: Vec<(&str, &str, Vec<&str>)> = vec![
+        (
+            "no projection",
+            "",
+            vec!["customer_id", "event_time", "city", "plan"],
+        ),
+        ("one stored feature", "&FeatureName=city", vec!["city"]),
+        (
+            "every stored feature named",
+            "&FeatureName=customer_id&FeatureName=event_time&FeatureName=city&FeatureName=plan",
+            vec!["customer_id", "event_time", "city", "plan"],
+        ),
+        (
+            "a stored feature beside one the record has not",
+            "&FeatureName=nosuch&FeatureName=plan",
+            vec!["plan"],
+        ),
+        ("one name the record has not", "&FeatureName=nosuch", vec![]),
+        (
+            "several names, none of them the record's",
+            "&FeatureName=nosuch&FeatureName=neither&FeatureName=alsonot",
+            vec![],
+        ),
+    ];
+
+    // `TtlDuration` {Weeks, 1} on the written record, in seconds.
+    let expected_delta = 7.0 * 86_400.0;
+    for (case, projection, expected_features) in &projections {
+        let (status, body) = emulator
+            .get_record(
+                "ttlgroup",
+                &format!(
+                    "RecordIdentifierValueAsString=C1&ExpirationTimeResponse=Enabled{projection}"
+                ),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetRecord 200, got {status} with {body}"
+        );
+        let actual_features: Vec<String> = record_pairs(&body)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            actual_features, *expected_features,
+            "case {case:?}: expected features {expected_features:?}, got {actual_features:?}"
+        );
+        // `Record` is modelled `len 1..`, so a projection that matched nothing carries
+        // no `Record` member at all rather than an empty list.
+        let record = body.get("Record").cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            !record.is_null(),
+            !expected_features.is_empty(),
+            "case {case:?}: expected Record present={}, got {record:?}",
+            !expected_features.is_empty()
+        );
+        let expires_at = body
+            .get("ExpiresAt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            DateTime::from_str(&expires_at, Format::DateTime).is_ok(),
+            "case {case:?}: expected the record's ISO-8601 ExpiresAt, got {expires_at:?} \
+             (body {body})"
+        );
+        let delta = secs(&expires_at) - secs(&event_time);
+        assert!(
+            (delta - expected_delta).abs() < 0.001,
+            "case {case:?}: expected ExpiresAt {expected_delta} s after the event time, \
+             got {delta} s (ExpiresAt {expires_at:?})"
+        );
+
+        // The expiry is withheld for the two reasons the member's own doc gives, and
+        // the projection changes neither: the caller did not enable it, or the stored
+        // value is null (the record written under no TTL, in `customers`).
+        for (sub_case, group, expiration) in [
+            ("not enabled", "ttlgroup", ""),
+            ("Disabled", "ttlgroup", "&ExpirationTimeResponse=Disabled"),
+            ("null expiry", "customers", "&ExpirationTimeResponse=Enabled"),
+        ] {
+            let (status, body) = emulator
+                .get_record(
+                    group,
+                    &format!(
+                        "RecordIdentifierValueAsString=C1{expiration}{projection}"
+                    ),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}/{sub_case:?}: expected GetRecord 200, got {status} with {body}"
+            );
+            let actual = body.get("ExpiresAt").cloned().unwrap_or(Value::Null);
+            assert!(
+                actual.is_null(),
+                "case {case:?}/{sub_case:?}: expected no ExpiresAt, got {actual:?}"
+            );
+            let actual_features: Vec<String> = record_pairs(&body)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(
+                actual_features, *expected_features,
+                "case {case:?}/{sub_case:?}: expected features {expected_features:?}, \
+                 got {actual_features:?}"
+            );
+        }
+    }
+
+    // "If no Record with RecordIdentifierValue is found, then an empty result is
+    // returned": no record, so there is no expiry of one to report either — the one
+    // path that clears BOTH members.
+    for (case, projection) in [
+        ("an identifier never written", ""),
+        (
+            "an identifier never written, with a projection",
+            "&FeatureName=city",
+        ),
+        (
+            "an identifier never written, projecting nothing it could carry",
+            "&FeatureName=nosuch",
+        ),
+    ] {
+        let (status, body) = emulator
+            .get_record(
+                "ttlgroup",
+                &format!(
+                    "RecordIdentifierValueAsString=absent&ExpirationTimeResponse=Enabled{projection}"
+                ),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetRecord 200, got {status} with {body}"
+        );
+        let record = body.get("Record").cloned().unwrap_or(Value::Null);
+        let expires_at = body.get("ExpiresAt").cloned().unwrap_or(Value::Null);
+        assert!(
+            record.is_null() && expires_at.is_null(),
+            "case {case:?}: expected an empty result, got Record {record:?} and \
+             ExpiresAt {expires_at:?}"
+        );
+    }
+}
+
