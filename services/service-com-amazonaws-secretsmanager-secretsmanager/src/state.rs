@@ -1956,6 +1956,26 @@ pub struct Secret {
     ///
     /// [`start_rotation`]: Secret::start_rotation
     pub rotation_generation: u64,
+    /// Whether the rotation this secret is staked on ENDED without finishing: its rotation
+    /// function RAN a step and did not complete it, so that rotation reached a terminal outcome
+    /// and nothing is driving it any more ([`stop_rotation`]).
+    ///
+    /// It is what tells the state the in-progress refusal is for from the state it is not: "any
+    /// later invocation of RotateSecret assumes that a previous rotation request is still in
+    /// progress" (`RotateSecret`, this service's Smithy model) — a rotation whose function
+    /// answered a step without completing it is not still in progress, so the call that RE-DRIVES
+    /// it, naming its own candidate by `ClientRequestToken`, is served
+    /// (`crate::ops::rotate_secret`). It says nothing about a rotation whose invocations reached
+    /// no function at all, which is one this service is still attempting.
+    ///
+    /// Cleared by every event that gives this secret a rotation to drive or ends it:
+    /// [`start_rotation`], [`finish_rotation`] and [`cancel_rotation`].
+    ///
+    /// [`stop_rotation`]: Secret::stop_rotation
+    /// [`start_rotation`]: Secret::start_rotation
+    /// [`finish_rotation`]: Secret::finish_rotation
+    /// [`cancel_rotation`]: Secret::cancel_rotation
+    pub rotation_stopped: bool,
     /// The replicas of this secret, in the order their Regions were first
     /// replicated to. Empty for a secret that does not participate in
     /// cross-region replication.
@@ -2015,6 +2035,7 @@ impl Secret {
             pending_rotation_version_id: None,
             cancelled_rotation_version_id: None,
             rotation_generation: 0,
+            rotation_stopped: false,
             replicas: Vec::new(),
             replica_of: None,
             sealed_under: None,
@@ -2828,6 +2849,7 @@ impl Secret {
     /// [`rotation_generation`]: Secret::rotation_generation
     pub fn start_rotation(&mut self, version_id: String, at: SystemTime) -> u64 {
         self.cancelled_rotation_version_id = None;
+        self.rotation_stopped = false;
         self.rotation_generation = self.rotation_generation.saturating_add(1);
         for existing in &mut self.versions {
             existing.version_stages.retain(|held| held != STAGE_PENDING);
@@ -2861,9 +2883,29 @@ impl Secret {
     /// FUNCTION's own work, written through this service's operations while the rotation
     /// ran, so nothing here moves a label or mints a version.
     pub fn finish_rotation(&mut self, at: SystemTime) {
+        self.rotation_stopped = false;
         self.last_rotated_date = Some(at);
         self.reschedule_next_rotation(at);
         self.last_changed_date = at;
+    }
+
+    /// Record that the rotation of generation `generation` ENDED without finishing, because its
+    /// rotation function ran a step and did not complete it ([`rotation_stopped`]).
+    ///
+    /// Nothing else moves: the staging labels are where that function left them — the candidate
+    /// still `AWSPENDING`, `AWSCURRENT` on the version it was on — and `LastRotatedDate` stays
+    /// unset, because no rotation completed. What this records is that there is no longer a
+    /// rotation of this secret in flight, which is what lets the call that re-drives that
+    /// rotation be served rather than refused for it.
+    ///
+    /// A generation that is no longer this secret's current one is a rotation it has already
+    /// moved on from (cancelled, resumed or replaced), and records nothing.
+    ///
+    /// [`rotation_stopped`]: Secret::rotation_stopped
+    pub fn stop_rotation(&mut self, generation: u64) {
+        if self.rotation_generation == generation {
+            self.rotation_stopped = true;
+        }
     }
 
     /// Turn automatic rotation off and cancel a rotation that is still in
@@ -2905,6 +2947,7 @@ impl Secret {
         if cancelled.is_some() {
             self.cancelled_rotation_version_id = cancelled.clone();
         }
+        self.rotation_stopped = false;
         if self.rotation_enabled.is_some() {
             self.rotation_enabled = Some(false);
         }

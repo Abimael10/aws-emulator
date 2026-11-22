@@ -54,16 +54,20 @@
 //! is the customer's own code's, so the steps before it are not run through a second time
 //! behind a client watching the function — what is left is the state the real service leaves a
 //! failed rotation in (the current value still readable, `AWSPENDING` still staked,
-//! `LastRotatedDate` unset), and the reattempt the refusal of the next call speaks of is the
-//! SCHEDULE's: "if rotation fails, Secrets Manager retries the entire rotation process multiple
-//! times. If rotation is unsuccessful, this date may be in the past"
+//! `LastRotatedDate` unset), and that END is RECORDED on the secret
+//! ([`super::Secret::stop_rotation`]), which is what makes the rotation one a later call may
+//! re-drive by naming its candidate rather than one every later call is refused for
+//! (`crate::ops::rotate_secret`). The reattempt the refusal of a call asking for a FURTHER
+//! rotation speaks of is the SCHEDULE's: "if rotation fails, Secrets Manager retries the entire
+//! rotation process multiple times. If rotation is unsuccessful, this date may be in the past"
 //! (`DescribeSecretResponse$NextRotationDate`, this service's Smithy model) — a date, not a
 //! span inside the call's own window. An invocation that reached NO function at all is the one
-//! thing attempted again ([`ROTATION_ATTEMPTS`]), because it says nothing about the function.
-//! That one attempt starts at the FIRST step, since "Secrets Manager retries the entire rotation
-//! process": a function that could not be reached at a later step is therefore invoked again for
-//! the steps it had answered — the once-per-step reading above is about a function that ANSWERED,
-//! and an unreachable function has not.
+//! thing attempted again ([`ROTATION_ATTEMPTS`]), because it says nothing about the function,
+//! and it records no end for the same reason: such a rotation is one this service is still
+//! attempting. That one attempt starts at the FIRST step, since "Secrets Manager retries the
+//! entire rotation process": a function that could not be reached at a later step is therefore
+//! invoked again for the steps it had answered — the once-per-step reading above is about a
+//! function that ANSWERED, and an unreachable function has not.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -486,9 +490,17 @@ async fn run<Eng: Send + Sync + 'static>(
                 stamp_rotated(engine, rotation);
                 return;
             }
-            // The function ANSWERED a step and did not complete it, or the secret stopped
-            // awaiting this rotation: either way nothing further is this task's to do.
-            Attempt::Answered | Attempt::Abandoned => return,
+            // The function ANSWERED a step and did not complete it: that step's answer is the
+            // customer's own code's, so the rotation ENDS there with the terminal outcome
+            // recorded ([`stamp_stopped`]) — the labels stay where that function left them, and
+            // what the record says is that no rotation of this secret is in flight any more.
+            Attempt::Answered => {
+                stamp_stopped(engine, rotation);
+                return;
+            }
+            // The secret stopped awaiting this rotation (cancelled, resumed or gone), so
+            // nothing further is this task's to do and nothing of it is this task's to record.
+            Attempt::Abandoned => return,
             // The invocation reached no function at all, which says nothing about the
             // function: the whole rotation is driven again.
             Attempt::Unreached => {
@@ -574,6 +586,22 @@ fn stamp_rotated<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, rotation: &Rotat
     let mut store = state.lock();
     if let Some(secret) = store.get_mut(&rotation.region, &rotation.secret_arn) {
         secret.finish_rotation(now);
+    }
+}
+
+/// Record that this rotation ENDED without finishing, because its function answered a step it
+/// did not complete ([`super::Secret::stop_rotation`]).
+///
+/// It is recorded against the rotation's own generation, so a secret that has since moved on to
+/// another rotation keeps what that one is doing. Nothing else about the secret moves: the state
+/// a failed rotation leaves is the one its function left.
+fn stamp_stopped<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, rotation: &Rotation) {
+    let Some(state) = super::service_state(&**engine) else {
+        return;
+    };
+    let mut store = state.lock();
+    if let Some(secret) = store.get_mut(&rotation.region, &rotation.secret_arn) {
+        secret.stop_rotation(rotation.generation);
     }
 }
 

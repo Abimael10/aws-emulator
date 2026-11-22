@@ -13,9 +13,12 @@
 //! once per step and stamps the secret as rotated when the last one returns
 //! (`crate::state::rotation`). The call ANSWERS while that is in flight, which is why
 //! it reports the id of a version the function has not created yet and why a second
-//! `RotateSecret` is refused while `AWSPENDING` names a version other than the
-//! `AWSCURRENT` one — until `CancelRotateSecret` has cancelled that rotation, after which
-//! the next call RESUMES the candidate it left rather than refusing. A call that asks not to
+//! `RotateSecret` asking for a FURTHER rotation is refused while `AWSPENDING` names a
+//! version other than the `AWSCURRENT` one. Two calls are not that: one carrying the
+//! `ClientRequestToken` of the candidate of a rotation that ENDED when its function could
+//! not complete a step, which re-drives that rotation, and any call after
+//! `CancelRotateSecret` has cancelled it, which RESUMES the candidate it left. Both are
+//! served on the version already staked. A call that asks not to
 //! rotate now starts no rotation and tests the configuration it applied instead, invoking
 //! the same function once with the `testSecret` step.
 //!
@@ -472,7 +475,8 @@ struct Planned {
     arn: String,
     /// The id of the version this rotation creates, which is the `ClientRequestToken` the
     /// call carried or the one minted for it — or, where this call RESUMES the candidate a
-    /// cancelled rotation left outstanding, that candidate's own id.
+    /// cancelled rotation left outstanding, or RE-DRIVES the rotation its own token names,
+    /// that candidate's own id.
     version_id: String,
     /// Whether the rotation starts now: "The default for RotateImmediately is true. If you
     /// don't specify this value, Secrets Manager rotates the secret immediately."
@@ -613,15 +617,19 @@ fn plan(
     // fixed: it names no version, because what it reports is that a rotation of
     // this secret has not finished and will be tried again.
     //
-    // It is that reattempt the refusal stands for, so the one candidate it does NOT stand
-    // for is the one whose rotation was CANCELLED (`resumable_rotation_version_id`): nothing
-    // will reattempt that rotation, so this call RESUMES it instead — the rotation it starts
-    // is the cancelled one, staked on the id that rotation already holds, which is why the
-    // call reports that id rather than minting a version under the token it carried. Every
-    // other outstanding candidate keeps the refusal.
+    // It is a LATER invocation — one asking for a rotation beside the outstanding one — that
+    // the refusal stands for, so two calls do not earn it. The first is the one whose rotation
+    // was CANCELLED (`resumable_rotation_version_id`): nothing will reattempt that rotation, so
+    // this call RESUMES it instead — the rotation it starts is the cancelled one, staked on the
+    // id that rotation already holds, which is why the call reports that id rather than minting
+    // a version under the token it carried. The second is the one that NAMES the candidate of a
+    // rotation that has ENDED unfinished ([`re_driven_candidate`]), which is that same rotation
+    // being driven again rather than a further one. Every other outstanding candidate keeps the
+    // refusal.
     let resumed = secret
         .resumable_rotation_version_id()
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| re_driven_candidate(secret, input));
     if resumed.is_none() && secret.rotation_in_progress() {
         return Err(invalid_request(crate::state::ROTATION_IN_PROGRESS_MESSAGE));
     }
@@ -649,6 +657,39 @@ fn plan(
         configured_lambda_arn,
         role_arn,
     })
+}
+
+/// The outstanding candidate this call RE-DRIVES the rotation of, rather than being refused
+/// for it: the one its own `ClientRequestToken` names, once that rotation has ENDED.
+/// `None` for every other call, which includes every call that carries no token of its own.
+///
+/// Two sentences of the model decide this together. The refusal is for a rotation STILL IN
+/// PROGRESS — "any later invocation of RotateSecret assumes that a previous rotation request is
+/// still in progress and returns an error" — and a rotation whose function ran a step and did
+/// not complete it is not in progress any more: it reached a terminal outcome, recorded as such
+/// (`crate::state::Secret::rotation_stopped`), and nothing is driving it. What a call may then
+/// do with that rotation is what its token says: "a unique identifier for the new version of
+/// the secret. You only need to specify this value if you implement your own retry logic and
+/// you want to ensure that Secrets Manager doesn't attempt to create a secret version twice.
+/// [...] This value helps ensure idempotency. Secrets Manager uses this value to prevent the
+/// accidental creation of duplicate versions if there are failures and retries during a
+/// rotation" (`RotateSecretRequest$ClientRequestToken`, `@idempotencyToken`) — so a call naming
+/// the stopped rotation's own version IS that rotation being retried, which is the recovery a
+/// client whose rotation function failed part-way makes once that function is repaired. It is
+/// served on the version already staked, and mints no second one. A call naming any other
+/// version asks for a rotation BESIDE the outstanding candidate, and keeps the refusal.
+fn re_driven_candidate(
+    secret: &crate::state::Secret,
+    input: &RotateSecretInput,
+) -> Option<String> {
+    if !secret.rotation_stopped {
+        return None;
+    }
+    let token = input.client_request_token.as_deref()?;
+    secret
+        .pending_version_id()
+        .filter(|pending| *pending == token)
+        .map(str::to_string)
 }
 
 /// Whether this call would CONFIGURE rotation for the secret, rather than only ask for a

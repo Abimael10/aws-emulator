@@ -31,3 +31,32 @@ Cause 1 — Expected: with a rotation function that raises in testSecret, AWSCUR
 3. RotateSecret and poll DescribeSecret / ListSecretVersionIds for AWSCURRENT and AWSPENDING until the rotation reaches a terminal outcome.
 4. Flip the environment variable and RotateSecret again as the positive control.
 Observed: neither arm settles; the check is killed at its budget. Expected: the failing arm leaves AWSCURRENT on the original version with the candidate at AWSPENDING, and the control arm promotes.
+
+## Resolution
+
+What landed: a rotation whose function RAN a step and did not complete it now RECORDS that
+terminal outcome on the secret (`Secret::rotation_stopped`, written by the driver in
+`services/service-com-amazonaws-secretsmanager-secretsmanager/src/state/rotation.rs`), and
+`RotateSecret` reads it: the "A previous rotation isn't complete. That rotation will be
+reattempted." refusal is for a call asking for a rotation BESIDE the outstanding one, so a call
+whose `ClientRequestToken` names the ended rotation's own candidate is served and RE-DRIVES that
+rotation on the version already staked, minting no second version
+(`src/ops/rotate_secret.rs::re_driven_candidate`). That is the "a later RotateSecret is accepted
+rather than refused" half of this report, narrowed to the call the model's `@idempotencyToken`
+`ClientRequestToken` identifies — a call carrying any other token still gets the refusal, which is
+what the recorded trace of the sibling check
+(`lambda__logs__secretsmanager.deep-secrets-and-params-failed-finishsecret-leaves-candidate-awspending-and-rejects-new-rotation`)
+shows AWS answering. Pinned by
+`core/router/tests/all/secretsmanager_rotation_is_re_driven_by_its_own_token.rs`, a table over
+which step the earlier rotation stopped at.
+
+What this record does NOT claim: the reported symptom — "a rotation whose testSecret step fails
+never reaches a terminal state" — could not be reproduced, and the recorded check's replay verdict
+is still `Timeout`. Instrumenting the emulator while the recorded check ran showed it serving every
+observable this report names, in order: the rotation function is invoked once per step, its log
+group holds `createSecret`, `setSecret`, `testSecret` and the `[ERROR] RuntimeError` of the step it
+raised in and nothing past it, `DescribeSecret` reports `{original: [AWSCURRENT], candidate:
+[AWSPENDING]}` with no `LastRotatedDate`, and `GetSecretValue` keeps serving the original version.
+The check then spends the rest of its 60-second cap in a fixed grace window that re-reads that same
+(correct) state every 5 seconds, so it is killed before it reaches its positive control: the
+rotation settles, but the check has no budget left to say so.
