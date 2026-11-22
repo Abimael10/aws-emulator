@@ -1135,6 +1135,18 @@ pub const CANCELLATION_CODE_VALIDATION_ERROR: &str = "ValidationError";
 /// than answered a top-level lookup failure ([`cancelled_element_reasons`]).
 pub const CANCELLATION_CODE_RESOURCE_NOT_FOUND: &str = "ResourceNotFound";
 
+/// The code a statement that would store an item at a key ALREADY HOLDING one reports:
+/// a PartiQL `INSERT` is a put that must not replace, so its failure is a duplicate
+/// primary key rather than a condition the statement stated.
+///
+/// It is the code whichever PartiQL surface ran the statement — a slot's
+/// `BatchStatementError$Code` in a batch and a `CancellationReason$Code` in a transaction
+/// — so the two cannot disagree about what a key collision IS.
+pub const DUPLICATE_ITEM_CODE: &str = "DuplicateItem";
+
+/// The sentence that collision is stated with, beside [`DUPLICATE_ITEM_CODE`].
+pub const DUPLICATE_ITEM_MESSAGE: &str = "Duplicate primary key exists in table";
+
 /// The clause every refusal of a parameter value in this service opens with, which the
 /// documented `ValidationError` cancellation reason also states ("Message: One or more
 /// parameter values were invalid").

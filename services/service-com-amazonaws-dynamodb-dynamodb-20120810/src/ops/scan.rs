@@ -737,8 +737,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ([`crate::state::fetch_capacity_units`]); what it spends on the INDEX is
             // what the index holds for the item, which is what `page_units` above sums.
             if fetches_from_table {
-                fetched_units +=
-                    crate::state::fetch_capacity_units(table.metered_item_size(read.seen()));
+                fetched_units += crate::state::fetch_capacity_units(
+                    table.metered_item_size(read.seen()),
+                    consistent_read,
+                );
             }
             page.push(read);
         }

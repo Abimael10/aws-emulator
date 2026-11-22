@@ -552,12 +552,13 @@ async fn a_batch_the_request_itself_is_wrong_about_is_refused_whole() {
 }
 
 #[tokio::test]
-async fn consumed_capacity_is_reported_per_statement_as_the_request_asked() {
+async fn consumed_capacity_is_reported_per_table_as_the_request_asked() {
     let router = emulator();
     create_read_table(&router).await;
 
-    // Two statements that read an item and one the emulator refuses in its own slot,
-    // which consumed nothing because it reached no table.
+    // Two statements that read an item of ONE table and one the emulator refuses in its
+    // own slot, which consumed nothing because it reached no table — so the whole batch
+    // reports that one table's own entry.
     let statements = json!([
         statement("SELECT * FROM items WHERE pk = 'a' AND sk = 1"),
         statement("SELECT * FROM items WHERE pk = 'b' AND sk = 7"),
@@ -567,8 +568,8 @@ async fn consumed_capacity_is_reported_per_statement_as_the_request_asked() {
     for (case, requested, entries, detailed) in [
         ("no ReturnConsumedCapacity", Value::Null, 0usize, false),
         ("NONE", json!("NONE"), 0, false),
-        ("TOTAL", json!("TOTAL"), 2, false),
-        ("INDEXES", json!("INDEXES"), 2, true),
+        ("TOTAL", json!("TOTAL"), 1, false),
+        ("INDEXES", json!("INDEXES"), 1, true),
     ] {
         let mut body = json!({"Statements": statements.clone()});
         if !requested.is_null() {
@@ -582,18 +583,18 @@ async fn consumed_capacity_is_reported_per_statement_as_the_request_asked() {
         assert_eq!(
             reported.len(),
             entries,
-            "case {case}: expected {entries} ConsumedCapacity entries, one per statement that \
-             consumed capacity, got {answered}"
+            "case {case}: expected {entries} ConsumedCapacity entries, one per TABLE the \
+             batch reached, got {answered}"
         );
         for entry in &reported {
             assert_eq!(
                 entry["TableName"],
                 json!("items"),
-                "case {case}: each entry names the table its statement read, got {entry}"
+                "case {case}: each entry names the table its statements read, got {entry}"
             );
             assert!(
                 entry["CapacityUnits"].as_f64().unwrap_or_default() > 0.0,
-                "case {case}: each entry reports the units its statement consumed, got {entry}"
+                "case {case}: each entry reports the units its statements consumed, got {entry}"
             );
             assert_eq!(
                 entry.get("Table").is_some(),

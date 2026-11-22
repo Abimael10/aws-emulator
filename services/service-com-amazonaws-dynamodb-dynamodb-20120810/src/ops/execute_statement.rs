@@ -36,9 +36,10 @@
 //!   orders by a key attribute when `ORDER BY` names one, and pages at `Limit` and at
 //!   the documented 1 MB — reporting `NextToken` and `LastEvaluatedKey` when it
 //!   stopped early. Which low-level PLAN serves it follows what its `WHERE` clause
-//!   pins: a partition-key equality is a query of that one partition (narrowed to the
-//!   single item when the sort key is pinned too) and a clause that pins no partition
-//!   key is a full table scan. The plan decides what is read, so the
+//!   pins: an equality on the partition key of the SOURCE it reads — the index's own
+//!   where its `FROM` target names an index — is a query of that one partition (narrowed
+//!   to the single entry when the range key is pinned too) and a clause that pins no
+//!   partition key is a full scan of the source. The plan decides what is read, so the
 //!   `ConsumedCapacity` is the bytes it read and a predicate on a non-key attribute
 //!   never makes a statement cheaper.
 //!
@@ -443,12 +444,13 @@ fn select_items(
     }
     // Which low-level plan the statement is served by is decided HERE, from what its
     // `WHERE` clause pins: "a WHERE clause on the partition key" is planned as a Query
-    // over that one partition — one partition's items are contiguous in the store, so
-    // that is a range read — narrowed again to the single item when the sort key is
-    // pinned too, and a clause that pins no partition key is planned as a full table
-    // scan. The plan decides what is READ, and therefore what the statement is charged
-    // for; the predicate is applied to each row the plan read, and never narrows the
-    // read itself.
+    // over that one partition of the SOURCE the statement reads — one partition of the
+    // table's items is contiguous in the store, so that is a range read, and one of an
+    // index is the entries its own partition key selects — narrowed again to the single
+    // entry when the range key is pinned too, and a clause that pins no partition key is
+    // planned as a full scan of the source. The plan decides what is READ, and therefore
+    // what the statement is charged for; the predicate is applied to each row the plan
+    // read, and never narrows the read itself.
     //
     // An equality the clause pins on a key attribute is held to the type the table
     // declared for it FIRST: a value of another type addresses nothing the table can
@@ -473,15 +475,28 @@ fn select_items(
         .as_ref()
         .map(crate::state::pinned_equalities)
         .unwrap_or_default();
+    // The PARTITION of the source the clause pins, with the attribute that pins it: the
+    // index's own partition key where the `FROM` target names an index, the table's
+    // otherwise ([`crate::state::source_partition_key_name`]) — the same question that
+    // decides whether a statement reads every entry of its source
+    // ([`crate::state::statement_scans_whole_source`]). A statement that pins it is served
+    // as a query of that one partition, whichever source it names, and one that pins none
+    // walks the whole source.
+    let keyed: Option<(String, crate::state::AttributeValueKey)> =
+        crate::state::source_partition_key_name(table, select.index.as_deref()).and_then(
+            |attribute| {
+                let value = pinned.get(&attribute)?;
+                let key = table.key_value(&attribute, value).ok()?;
+                Some((attribute, key))
+            },
+        );
+    // Where the source is the table ITSELF, that partition is a range of the store's own
+    // keys, which is what the walk below is bounded by; an index's entries are keyed by
+    // the index's schema, so its partition is selected by the attribute instead.
     let partition = select
         .index
         .is_none()
-        .then(|| {
-            let attribute = table.partition_key_name();
-            pinned
-                .get(attribute)
-                .and_then(|value| table.key_value(attribute, value).ok())
-        })
+        .then(|| keyed.as_ref().map(|(_, key)| key.clone()))
         .flatten();
     // A sort key pinned by equality addresses ONE item of that partition, which is the
     // narrowest plan there is; without a partition key it narrows nothing, because the
@@ -497,11 +512,12 @@ fn select_items(
 
     // "ORDER BY clause can only be used on a key attribute" — a statement that asks
     // for any other order is refused rather than served in a different one. An order
-    // is also only served over ONE partition: inside a partition the store already
-    // holds the items in sort-key order, so the order asked for is that order or its
-    // reverse, and a page resumed from a `NextToken` continues in exactly it. Across
+    // is also only served over ONE partition of the source: inside a partition the
+    // entries already stand in sort-key order, so the order asked for is that order or
+    // its reverse, and a page resumed from a `NextToken` continues in exactly it. Across
     // partitions the two orders differ, so a statement that asks for one without
-    // pinning its partition key is refused instead of answered in another order.
+    // pinning the partition key of the source it reads is refused instead of answered in
+    // another order.
     if let Some((attribute, _)) = select.order_by.as_ref() {
         if !crate::state::orderable_attributes(table, select.index.as_deref())
             .contains(attribute.as_str())
@@ -510,10 +526,10 @@ fn select_items(
                 "ORDER BY is supported only on a key attribute of the source",
             ));
         }
-        if partition.is_none() {
+        if keyed.is_none() {
             return Err(crate::scaffolded::Scaffolded::validation(
                 "ORDER BY is supported only for a statement whose WHERE clause states an \
-                 equality on the table's partition key",
+                 equality on the partition key of the source it reads",
             ));
         }
     }
@@ -536,6 +552,28 @@ fn select_items(
     // hold is not there to be read, let alone charged for.
     if let Some(index) = select.index.as_deref() {
         candidates.retain(|(_, item)| crate::state::index_holds(table, index, item));
+        // An index's entries are keyed by the index's own schema, so a clause that pins
+        // that schema's partition key — and, inside it, its range key — addresses those
+        // entries and nothing else: the plan READS that partition of the index, exactly as
+        // a base-table query reads one partition of the store, so no other entry is
+        // evaluated or charged for.
+        for (attribute, value) in keyed.iter().cloned().chain(
+            crate::state::source_sort_key_name(table, Some(index))
+                .and_then(|attribute| {
+                    let value = pinned.get(&attribute)?;
+                    let key = table.key_value(&attribute, value).ok()?;
+                    Some((attribute, key))
+                })
+                // A range key narrows a partition; on its own it narrows nothing, because
+                // the index is partitioned first.
+                .filter(|_| keyed.is_some()),
+        ) {
+            candidates.retain(|(_, item)| {
+                item.get(&attribute)
+                    .and_then(|held| table.key_value(&attribute, held).ok())
+                    .is_some_and(|held| held == value)
+            });
+        }
     }
     if let Some((attribute, descending)) = select.order_by.as_ref() {
         candidates.sort_by(|(_, left), (_, right)| {
@@ -595,13 +633,29 @@ fn select_items(
     // projected into the index are reported" — so an index is also what the statement
     // READ: the bytes a row costs are the bytes its source holds for that row, which for
     // a statement whose source is a secondary index are the attributes that index
-    // projects and not the whole stored item.
+    // projects and not the whole stored item. A statement that names an attribute a LOCAL
+    // index does not project is served the whole stored item instead, FETCHED from the
+    // parent table ([`crate::state::statement_source_attributes`] answers `None` for it).
     let projected = crate::state::statement_source_attributes(
         table,
         select.index.as_deref(),
         select.projection.as_ref(),
         select.filter.as_ref(),
     );
+    // What the INDEX itself holds for a row, which is what reading the index costs
+    // whatever the read went on to fetch from the table
+    // ([`crate::state::projected_attributes`]).
+    let entry = crate::state::projected_attributes(table, select.index.as_deref());
+    // "If any of the requested attributes are not projected into the local secondary
+    // index, DynamoDB fetches each of these attributes from the parent table"
+    // (`Query$Select`): the statement then reports more than its index holds, and each of
+    // those fetches is a read of THAT item on the TABLE's own arm
+    // ([`crate::state::fetch_capacity_units`]) — the same two arms the `Query` of the same
+    // index is billed in.
+    let fetches_from_table = select.index.is_some() && projected.is_none() && entry.is_some();
+    // What this read spends on the TABLE rather than on the index it read: the base-table
+    // fetches it made, charged per item.
+    let mut fetched_units: f64 = 0.0;
     let mut evaluated = 0usize;
     // What each row the page KEPT reports: the attributes its source held for it.
     let mut rows: Vec<crate::state::Item> = Vec::new();
@@ -622,11 +676,13 @@ fn select_items(
             .map(|allowed| held_item(item, Some(allowed)));
         let held: &crate::state::Item = narrowed.as_ref().unwrap_or(item);
         page_size = page_size.saturating_add(crate::state::item_size(held));
-        // What the row is BILLED for is what its source holds for it, weighed as this
-        // table meters an item ([`crate::state::Table::metered_item_size`]) — a vector at
-        // the four bytes per dimension it is held as — while the page's own budget above
-        // stays the bytes the response carries.
-        let metered = table.metered_item_size(held);
+        // What the row is BILLED for ON ITS SOURCE is what the INDEX holds for it — the
+        // stored item itself where the source is the table — weighed as this table meters
+        // an item ([`crate::state::Table::metered_item_size`]): a vector at the four bytes
+        // per dimension it is held as, while the page's own budget above stays the bytes
+        // the response carries.
+        let in_index = entry.as_ref().map(|allowed| held_item(item, Some(allowed)));
+        let metered = table.metered_item_size(in_index.as_ref().unwrap_or(held));
         metered_size = metered_size.saturating_add(metered);
         // A plan that walks a SECONDARY INDEX is charged over what that index holds for
         // each row, in whole read units, exactly as the `Scan` of the same index is — one
@@ -638,6 +694,14 @@ fn select_items(
             metered,
             input.consistent_read.unwrap_or(false),
         );
+        // A row the read had to fetch from the table cost that item's own read beside the
+        // index's, charged per item in whole units.
+        if fetches_from_table {
+            fetched_units += crate::state::fetch_capacity_units(
+                table.metered_item_size(held),
+                input.consistent_read.unwrap_or(false),
+            );
+        }
         evaluated += 1;
         // The predicate is judged against what the source REPORTS for the row — the
         // index's entry where the statement reads an index, which is the same item a
@@ -682,11 +746,13 @@ fn select_items(
         _ => (None, None),
     };
     // What this statement is charged is what the plan it ran READ, charged as the native
-    // read that IS that plan: a plan that pins a partition key is a query (or, with the
-    // sort key pinned too, a single-item read), charged once over the bytes it read; a plan
-    // that walks the whole source is a scan, charged per row it evaluated. A plan that
-    // evaluated nothing spends the one unit a read takes at least.
-    let units = if partition.is_some() || evaluated == 0 {
+    // read that IS that plan: a plan that pins the partition key of the source it reads —
+    // the index's own where its `FROM` target names one — is a query (or, with the range
+    // key pinned too, a single-entry read), charged once over the bytes it read at the
+    // rate the statement asked for, exactly as the `Query` of the same source is charged;
+    // a plan that walks the whole source is a scan, charged per row it evaluated. A plan
+    // that evaluated nothing spends the one unit a read takes at least.
+    let units = if keyed.is_some() || evaluated == 0 {
         crate::state::read_capacity_units(metered_size, input.consistent_read.unwrap_or(false))
     } else {
         page_units
@@ -694,8 +760,9 @@ fn select_items(
     // WHERE those units were spent: a statement whose source is a secondary index read
     // that INDEX, so they are billed to it exactly as the `Query` or `Scan` of the same
     // index bills them ([`crate::state::consumed_read_capacity`]) — and the table's own
-    // arm carries only what the read spent on the table, which for this plan is nothing:
-    // it reads what the index holds for each row and never goes on to the table for more.
+    // arm carries what the read spent ON THE TABLE, which is nothing for a read the index
+    // answered on its own and the base-table fetches where it had to go on to the table
+    // for an attribute the index does not project.
     // Projected while the index is still borrowed from the table, before the admission
     // below reaches for the table again.
     let consumed_capacity = crate::state::consumed_read_capacity(
@@ -707,7 +774,7 @@ fn select_items(
             .and_then(|index| table.secondary_index(index))
             .as_ref(),
         units,
-        0.0,
+        fetched_units,
     );
     // The read is ADMITTED against the read capacity the table is provisioned for, the
     // same as the item API's reads: a statement past that capacity is refused rather
@@ -715,7 +782,7 @@ fn select_items(
     if let Err(throttle) = store
         .active_table_mut(region, name, now)
         .map_err(lift)?
-        .admit_read(units, now)
+        .admit_read(units + fetched_units, now)
     {
         return Err(
             ExecuteStatementErrorModeled::ProvisionedThroughputExceededException(

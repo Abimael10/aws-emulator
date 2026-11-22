@@ -44,8 +44,9 @@
 //!   the error alone. A statement the STORED item refused — an operand of the wrong type
 //!   for the value an attribute holds, an item the change would leave too large — reached
 //!   its table as surely as one that ran, so its slot names that table too
-//!   ([`at_table`]) — and `ConsumedCapacity` carries one entry per statement that
-//!   consumed capacity, "ordered according to the ordering of the statements".
+//!   ([`at_table`]) — while `ConsumedCapacity` is reported per TABLE rather than per
+//!   statement: `ConsumedCapacityMultiple` carries one entry per table the batch reached,
+//!   whose figure is the SUM over the statements that reached it ([`Totals`]).
 //! * A statement's write is admitted from the capacity its table is provisioned for
 //!   ([`crate::state::Table::admit_write`]): one past that budget is throttled in its
 //!   own slot, with the `ProvisionedThroughputExceeded` code, rather than applied.
@@ -260,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // slot. A write lands before the next statement runs, so a later `SELECT` in
         // another batch — or a classic read — sees it.
         let mut responses: Vec<BatchStatementResponse> = Vec::with_capacity(parsed.len());
-        let mut consumed: Vec<ConsumedCapacity> = Vec::new();
+        let mut totals = Totals::default();
         for (request, statement) in input.statements.iter().zip(parsed) {
             let served = statement.map_err(SlotFailure::from).and_then(|statement| {
                 run_slot(
@@ -271,13 +272,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     now,
                     request,
                     statement,
-                    requested_capacity,
                 )
             });
             match served {
                 Ok((response, capacity)) => {
                     responses.push(response);
-                    consumed.extend(capacity);
+                    totals.record(&capacity);
                 }
                 Err(failure) => responses.push(failure.into_response()),
             }
@@ -288,11 +288,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(BatchExecuteStatementOutput {
             responses: Some(responses),
-            // "The capacity units consumed by the entire operation. The values of the
-            // list are ordered according to the ordering of the statements": one entry
-            // per statement that consumed capacity, in statement order, and no member
-            // at all when the request asked for no capacity detail.
-            consumed_capacity: (!consumed.is_empty()).then_some(consumed),
+            // "The capacity units consumed by the entire operation": one entry per TABLE
+            // the batch reached, whose figure is the sum over the statements that reached
+            // it, and no member at all when the request asked for no capacity detail
+            // ([`Totals`]).
+            consumed_capacity: totals.consumed_capacity(requested_capacity),
         })
     }
 }
@@ -323,8 +323,10 @@ const KEY_EQUALITY_MESSAGE: &str = "Select statements within BatchExecuteStateme
                                     the primary key in the where clause.";
 
 /// How an `INSERT` whose primary key is already stored is reported, the way the
-/// single-statement path reports the same collision.
-const DUPLICATE_ITEM_MESSAGE: &str = "Duplicate primary key exists in table";
+/// single-statement path reports the same collision
+/// ([`crate::state::DUPLICATE_ITEM_MESSAGE`] is the sentence, shared with the
+/// transactional PartiQL surface).
+const DUPLICATE_ITEM_MESSAGE: &str = crate::state::DUPLICATE_ITEM_MESSAGE;
 
 // The `BatchStatementError$Code` values this operation reports, each one of
 // `BatchStatementErrorCodeEnum` (`super::types::BATCH_STATEMENT_ERROR_CODE_ENUM_VALUES`).
@@ -339,8 +341,10 @@ const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFound";
 /// The code for a statement the table's resource-based policy denies the caller.
 const ACCESS_DENIED_CODE: &str = "AccessDenied";
 
-/// The code for an `INSERT` whose primary key is already stored.
-const DUPLICATE_ITEM_CODE: &str = "DuplicateItem";
+/// The code for an `INSERT` whose primary key is already stored
+/// ([`crate::state::DUPLICATE_ITEM_CODE`], shared with the transactional PartiQL
+/// surface).
+const DUPLICATE_ITEM_CODE: &str = crate::state::DUPLICATE_ITEM_CODE;
 
 /// The code for a write whose `WHERE` clause the stored item does not satisfy.
 const CONDITIONAL_CHECK_FAILED_CODE: &str = "ConditionalCheckFailed";
@@ -445,9 +449,79 @@ fn at_table(name: &str) -> impl Fn(crate::state::RequestError) -> SlotFailure + 
     move |error| SlotFailure::from(error).at(name)
 }
 
-/// What one slot answers: its response, and the capacity that statement consumed when
-/// the request asked for capacity detail.
-type SlotOutcome = (BatchStatementResponse, Option<ConsumedCapacity>);
+/// What one slot answers: its response, and what that statement consumed on the table it
+/// ran against.
+type SlotOutcome = (BatchStatementResponse, SlotCapacity);
+
+/// What ONE statement of the batch consumed, and where.
+///
+/// A slot reports the figure it consumed rather than the `ConsumedCapacity` entry for it:
+/// "The capacity units consumed by the entire operation" is reported per TABLE
+/// (`ConsumedCapacityMultiple`), so what each statement spent is totalled into its
+/// table's entry ([`Totals`]) and the response is projected once, from the totals.
+struct SlotCapacity {
+    /// The table the statement ran against, which the figure is totalled under.
+    table: String,
+    consumed: SlotConsumption,
+}
+
+/// The figure a slot consumed, in the kind of capacity its statement spends: a `SELECT`
+/// reads and every other statement writes.
+enum SlotConsumption {
+    /// The read units a `SELECT` consumed.
+    Read(f64),
+    /// What a write consumed, broken down the way a write's `ConsumedCapacity` is.
+    Write(crate::state::WriteCapacity),
+}
+
+/// What the whole batch consumed, totalled per table: one `ConsumedCapacity` entry per
+/// table the batch reached, whose figure is the sum over the statements that reached it.
+///
+/// A batch is either all reads or all writes — a mixed one is refused
+/// ([`MIXED_BATCH_MESSAGE`]) — so in practice one of these ledgers is filled; each is the
+/// one the classic multi-item surfaces total the same answer with
+/// ([`crate::state::ReadLedger`], [`crate::state::WriteLedger`]), and both are reported,
+/// so nothing a batch consumed is left out whatever it consumed it on.
+#[derive(Debug, Default)]
+struct Totals {
+    reads: crate::state::ReadLedger,
+    writes: crate::state::WriteLedger,
+}
+
+impl Totals {
+    /// Add what one slot consumed to its table's running total.
+    fn record(&mut self, slot: &SlotCapacity) {
+        match &slot.consumed {
+            SlotConsumption::Read(units) => self.reads.record(&slot.table, *units),
+            SlotConsumption::Write(capacity) => self.writes.record(&slot.table, capacity),
+        }
+    }
+
+    /// The `ConsumedCapacity` list the operation reports, or `None` when the request asked
+    /// for no capacity detail — or when no statement of the batch reached a table at all.
+    ///
+    /// Both ledgers are reported, so a batch that somehow consumed capacity of both kinds
+    /// would under-report nothing: a read's figures and a write's are entries of the same
+    /// list, each naming the table it was spent on.
+    fn consumed_capacity(&self, requested: Option<&str>) -> Option<Vec<ConsumedCapacity>> {
+        let reads = self
+            .reads
+            .consumed_capacity(requested, crate::state::KindReport::Itemised);
+        let writes = self.writes.consumed_capacity(
+            requested,
+            crate::state::CapacityKind::Write,
+            crate::state::KindReport::Itemised,
+        );
+        match (reads, writes) {
+            (None, None) => None,
+            (Some(entries), None) | (None, Some(entries)) => Some(entries),
+            (Some(mut reads), Some(writes)) => {
+                reads.extend(writes);
+                Some(reads)
+            }
+        }
+    }
+}
 
 /// Serve one statement of the batch.
 // One parameter per piece of request context this slot is served against, as
@@ -462,7 +536,6 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     now: ::std::time::SystemTime,
     request: &BatchStatementRequest,
     statement: crate::state::PartiqlStatement,
-    requested_capacity: Option<&str>,
 ) -> Result<SlotOutcome, SlotFailure> {
     let name = crate::state::resolve_table_name_in(statement.table(), region)?;
     {
@@ -507,10 +580,9 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             now,
             &select,
             request.consistent_read.unwrap_or(false),
-            requested_capacity,
         ),
         crate::state::PartiqlStatement::Insert(insert) => {
-            insert_item(store, region, &name, now, &insert, requested_capacity)
+            insert_item(store, region, &name, now, &insert)
         }
         crate::state::PartiqlStatement::Update(update) => update_item(
             store,
@@ -518,7 +590,6 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             &name,
             now,
             &update,
-            requested_capacity,
             return_old_on_failure,
         ),
         crate::state::PartiqlStatement::Delete(delete) => delete_item(
@@ -527,7 +598,6 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             &name,
             now,
             &delete,
-            requested_capacity,
             return_old_on_failure,
         ),
         // A check guards a write it is applied WITH, and a batch applies each statement
@@ -612,7 +682,6 @@ fn read_item(
     now: ::std::time::SystemTime,
     select: &crate::state::SelectStatement,
     consistent_read: bool,
-    requested_capacity: Option<&str>,
 ) -> Result<SlotOutcome, SlotFailure> {
     // An index is not keyed by the table's primary key, so no `WHERE` clause over it
     // addresses one item of the table — which is what a batch read must do.
@@ -692,12 +761,10 @@ fn read_item(
             item: found.map(|item| crate::state::project_item(&item, select.projection.as_ref())),
             ..BatchStatementResponse::default()
         },
-        crate::state::consumed_capacity(
-            requested_capacity,
-            name,
-            units,
-            crate::state::KindReport::Itemised,
-        ),
+        SlotCapacity {
+            table: name.to_string(),
+            consumed: SlotConsumption::Read(units),
+        },
     ))
 }
 
@@ -728,7 +795,6 @@ fn insert_item(
     name: &str,
     now: ::std::time::SystemTime,
     insert: &crate::state::InsertStatement,
-    requested_capacity: Option<&str>,
 ) -> Result<SlotOutcome, SlotFailure> {
     let mut item = insert.item.clone();
     for (attribute, value) in &item {
@@ -769,13 +835,10 @@ fn insert_item(
         // An `INSERT` states no `RETURNING` clause, so its slot reports the write and
         // no item.
         BatchStatementResponse::default(),
-        crate::state::consumed_write_capacity(
-            requested_capacity,
-            name,
-            &capacity,
-            crate::state::CapacityKind::Write,
-            crate::state::KindReport::Itemised,
-        ),
+        SlotCapacity {
+            table: name.to_string(),
+            consumed: SlotConsumption::Write(capacity),
+        },
     ))
 }
 
@@ -786,7 +849,6 @@ fn update_item(
     name: &str,
     now: ::std::time::SystemTime,
     update: &crate::state::UpdateStatement,
-    requested_capacity: Option<&str>,
     return_old_on_failure: bool,
 ) -> Result<SlotOutcome, SlotFailure> {
     let condition = crate::state::parsed_condition(&update.filter)?;
@@ -893,13 +955,10 @@ fn update_item(
             item: reported,
             ..BatchStatementResponse::default()
         },
-        crate::state::consumed_write_capacity(
-            requested_capacity,
-            name,
-            &capacity,
-            crate::state::CapacityKind::Write,
-            crate::state::KindReport::Itemised,
-        ),
+        SlotCapacity {
+            table: name.to_string(),
+            consumed: SlotConsumption::Write(capacity),
+        },
     ))
 }
 
@@ -910,7 +969,6 @@ fn delete_item(
     name: &str,
     now: ::std::time::SystemTime,
     delete: &crate::state::DeleteStatement,
-    requested_capacity: Option<&str>,
     return_old_on_failure: bool,
 ) -> Result<SlotOutcome, SlotFailure> {
     let (key, condition) = {
@@ -965,13 +1023,10 @@ fn delete_item(
             item: reported,
             ..BatchStatementResponse::default()
         },
-        crate::state::consumed_write_capacity(
-            requested_capacity,
-            name,
-            &capacity,
-            crate::state::CapacityKind::Write,
-            crate::state::KindReport::Itemised,
-        ),
+        SlotCapacity {
+            table: name.to_string(),
+            consumed: SlotConsumption::Write(capacity),
+        },
     ))
 }
 

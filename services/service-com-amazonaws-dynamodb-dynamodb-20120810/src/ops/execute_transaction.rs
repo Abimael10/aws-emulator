@@ -25,7 +25,9 @@
 //!   `ConditionalCheckFailed` for each predicate that was not met (with that statement's
 //!   item when its `ReturnValuesOnConditionCheckFailure` is `ALL_OLD`) and `None` for
 //!   the rest. An `INSERT` is a put that must not replace, so a primary key that already
-//!   holds an item is such an unmet condition.
+//!   holds an item is a collision on that key and reports `DuplicateItem` — the code the
+//!   batch surface reports for the same collision — rather than a condition the statement
+//!   never stated.
 //!
 //! The statements are parsed by [`crate::state::partiql`] and the writes land through
 //! the same store write sites `PutItem`, `UpdateItem` and `DeleteItem` use, so the
@@ -56,8 +58,9 @@
 //!
 //! A transactional read or write costs twice what the same single-item one costs
 //! ([`crate::state::TRANSACTIONAL_CAPACITY_FACTOR`]); `ReturnConsumedCapacity` reports
-//! it as one entry per statement, "ordered according to the ordering of the statements",
-//! each figure read back from the table the statement reached.
+//! it as `ConsumedCapacityMultiple` does — ONE entry per table the transaction reached,
+//! whose figure is the SUM over the statements that reached it, each figure read back
+//! from that table.
 //!
 //! ## Shape of an operation
 //!
@@ -540,12 +543,13 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     requested_capacity: Option<&str>,
 ) -> Result<ExecuteTransactionOutput, ExecuteTransactionError> {
     let mut responses: Vec<ItemResponse> = Vec::with_capacity(parsed.len());
-    let mut consumed: Vec<ConsumedCapacity> = Vec::new();
     let mut keyed: ::std::collections::BTreeSet<(String, crate::state::ItemKey)> =
         ::std::collections::BTreeSet::new();
-    // What each table this transaction reads would consume, totalled: the read is admitted
-    // ALL-OR-NOTHING below, once every table's share is known, because a transaction that
-    // is refused consumed nothing anywhere.
+    // What each table this transaction reads consumed, totalled per table: what the
+    // response REPORTS ([`ConsumedCapacityMultiple`] carries one entry per table, summed
+    // over the statements that reached it), and what the read is admitted
+    // ALL-OR-NOTHING against below, once every table's share is known, because a
+    // transaction that is refused consumed nothing anywhere.
     let mut per_table: ::std::collections::BTreeMap<String, f64> =
         ::std::collections::BTreeMap::new();
     for (at, statement) in parsed.iter().enumerate() {
@@ -632,12 +636,6 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 .map_or(0, |item| table.metered_item_size(item)),
             true,
         ) * crate::state::TRANSACTIONAL_CAPACITY_FACTOR;
-        consumed.extend(crate::state::consumed_capacity(
-            requested_capacity,
-            &name,
-            units,
-            crate::state::KindReport::Named,
-        ));
         *per_table.entry(name.clone()).or_default() += units;
         responses.push(ItemResponse {
             // What a statement reports is the `ItemResponse` object, which carries the
@@ -678,11 +676,23 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             .map_err(lift)?
             .admit_read(*units, now);
     }
+    // "The capacity units consumed by the entire operation": `ConsumedCapacityMultiple`
+    // carries ONE entry per table the transaction reached, whose figure is the sum over
+    // the statements that reached it — not one entry per statement — and no member at all
+    // when the request asked for no capacity detail.
+    let consumed: Vec<ConsumedCapacity> = per_table
+        .iter()
+        .filter_map(|(name, units)| {
+            crate::state::consumed_capacity(
+                requested_capacity,
+                name,
+                *units,
+                crate::state::KindReport::Named,
+            )
+        })
+        .collect();
     Ok(ExecuteTransactionOutput {
         responses: Some(responses),
-        // "The values of the list are ordered according to the ordering of the
-        // statements": one entry per statement, and no member at all when the request
-        // asked for no capacity detail.
         consumed_capacity: (!consumed.is_empty()).then_some(consumed),
     })
 }
@@ -796,8 +806,10 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 let key = table.key_of_item(&item).map_err(keying)?;
                 let before = table.items.get(&key).cloned();
                 // An `INSERT` is a put that must not replace, so a primary key that
-                // already holds an item is a condition this statement did not meet —
-                // which cancels the transaction rather than overwriting that item.
+                // already holds an item is a KEY COLLISION this statement cannot get
+                // past — which cancels the transaction, reporting the duplicate key
+                // rather than a condition the statement never stated
+                // ([`Planned::cancellation_code`]), instead of overwriting that item.
                 let satisfied = before.is_none();
                 Planned {
                     table: name,
@@ -809,6 +821,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     },
                     before,
                     satisfied,
+                    duplicate_key: !satisfied,
                     returns_old_on_failure,
                 }
             }
@@ -847,6 +860,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                         write: PlannedWrite::Nothing,
                         before,
                         satisfied,
+                        duplicate_key: false,
                         returns_old_on_failure,
                     }
                 } else {
@@ -905,6 +919,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                         write: PlannedWrite::Put(item),
                         before,
                         satisfied,
+                        duplicate_key: false,
                         returns_old_on_failure,
                     }
                 }
@@ -943,6 +958,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     },
                     before,
                     satisfied,
+                    duplicate_key: false,
                     returns_old_on_failure,
                 }
             }
@@ -1007,6 +1023,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     write: PlannedWrite::Check,
                     before,
                     satisfied,
+                    duplicate_key: false,
                     returns_old_on_failure,
                 }
             }
@@ -1043,8 +1060,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             .iter()
             .map(|statement| CancellationReason {
                 code: Some(statement.cancellation_code().to_string()),
-                message: (!statement.satisfied)
-                    .then(|| crate::state::CONDITION_FAILED_MESSAGE.to_string()),
+                message: statement.cancellation_detail().map(ToString::to_string),
                 item: (!statement.satisfied && statement.returns_old_on_failure)
                     .then(|| statement.before.clone())
                     .flatten(),
@@ -1063,8 +1079,8 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
 
     // Pass two applies them. Each figure is read back from the table the write landed
     // in, so the capacity fan-out is computed from stored state rather than from the
-    // request.
-    let mut consumed: Vec<ConsumedCapacity> = Vec::new();
+    // request, and it is totalled PER TABLE: `ConsumedCapacityMultiple` carries one entry
+    // per table the transaction reached ([`crate::state::WriteLedger`]).
     let mut recorded = crate::state::WriteLedger::default();
     let mut undo: Vec<(String, crate::state::ItemKey, Option<crate::state::Item>)> = Vec::new();
     let mut refused: Option<ExecuteTransactionError> = None;
@@ -1088,18 +1104,6 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                 ),
                 ..crate::state::WriteCapacity::default()
             };
-            let mut per_statement = crate::state::WriteLedger::default();
-            per_statement.record(&statement.table, &capacity);
-            per_statement.scale_table_units(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
-            consumed.extend(
-                per_statement
-                    .consumed_capacity(
-                        requested_capacity,
-                        crate::state::CapacityKind::Write,
-                        crate::state::KindReport::Named,
-                    )
-                    .unwrap_or_default(),
-            );
             recorded.record(&statement.table, &capacity);
             continue;
         }
@@ -1132,20 +1136,9 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
             Ok(table) => {
                 let capacity = table.write_capacity(statement.before.as_ref(), after.as_ref());
                 // "Transactional write requests require two write capacity units": what
-                // this statement consumed is twice the same single-item write, reported
-                // in its own entry.
-                let mut per_statement = crate::state::WriteLedger::default();
-                per_statement.record(&statement.table, &capacity);
-                per_statement.scale_table_units(crate::state::TRANSACTIONAL_CAPACITY_FACTOR);
-                consumed.extend(
-                    per_statement
-                        .consumed_capacity(
-                            requested_capacity,
-                            crate::state::CapacityKind::Write,
-                            crate::state::KindReport::Named,
-                        )
-                        .unwrap_or_default(),
-                );
+                // this statement consumed is twice the same single-item write, totalled
+                // into its table's own entry below
+                // ([`crate::state::WriteLedger::scale_table_units`]).
                 recorded.record(&statement.table, &capacity);
             }
             Err(error) => {
@@ -1192,6 +1185,15 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         crate::state::Consumed::Write,
         now,
     );
+    // "The capacity units consumed by the entire operation": ONE entry per table the
+    // transaction wrote to, whose figure is the sum over the statements that reached it,
+    // and no member at all when the request asked for no capacity detail. Projected here,
+    // before the ledger is handed to the token's record below.
+    let consumed_capacity = recorded.consumed_capacity(
+        requested_capacity,
+        crate::state::CapacityKind::Write,
+        crate::state::KindReport::Named,
+    );
     if let Some(token) = token {
         store.record_transaction(
             region,
@@ -1210,7 +1212,7 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // that would ask for one is refused before anything is applied
         // ([`RETURNING_IN_TRANSACTION_MESSAGE`]).
         responses: reported_responses(planned.iter().map(|_| None)),
-        consumed_capacity: (!consumed.is_empty()).then_some(consumed),
+        consumed_capacity,
     })
 }
 
@@ -1244,18 +1246,38 @@ struct Planned {
     /// against, what the capacity weighs, and what an unmet predicate reports.
     before: Option<crate::state::Item>,
     satisfied: bool,
+    /// Whether what this statement asked for was a key holding NO item — an `INSERT`,
+    /// which is a put that must not replace — rather than a condition the stored item
+    /// had to satisfy. The two are different failures and report different reasons.
+    duplicate_key: bool,
     returns_old_on_failure: bool,
 }
 
 impl Planned {
     /// The `CancellationReason$Code` this statement reports when the transaction is
-    /// cancelled: the predicate it failed, or `None` for a statement nothing was wrong
-    /// with.
+    /// cancelled: the failure it had, or `None` for a statement nothing was wrong with.
+    ///
+    /// A statement that would store an item where one already stands collided on the
+    /// primary key, which is a different failure from a condition the stored item did not
+    /// satisfy — so it reports the key collision's own code
+    /// ([`crate::state::DUPLICATE_ITEM_CODE`]), the one the batch surface reports for the
+    /// same collision.
     fn cancellation_code(&self) -> &'static str {
-        if self.satisfied {
-            crate::state::CANCELLATION_CODE_NONE
-        } else {
-            crate::state::CANCELLATION_CODE_CONDITION_FAILED
+        match (self.satisfied, self.duplicate_key) {
+            (true, _) => crate::state::CANCELLATION_CODE_NONE,
+            (false, true) => crate::state::DUPLICATE_ITEM_CODE,
+            (false, false) => crate::state::CANCELLATION_CODE_CONDITION_FAILED,
+        }
+    }
+
+    /// The sentence that reason carries, or `None` for a statement nothing was wrong
+    /// with: each failure is stated in its own words, the same words the single-statement
+    /// and batch paths state it in.
+    fn cancellation_detail(&self) -> Option<&'static str> {
+        match (self.satisfied, self.duplicate_key) {
+            (true, _) => None,
+            (false, true) => Some(crate::state::DUPLICATE_ITEM_MESSAGE),
+            (false, false) => Some(crate::state::CONDITION_FAILED_MESSAGE),
         }
     }
 }

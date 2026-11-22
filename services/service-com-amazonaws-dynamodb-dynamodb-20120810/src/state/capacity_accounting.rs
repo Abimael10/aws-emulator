@@ -25,18 +25,23 @@ pub fn read_capacity_units(size: i64, consistent_read: bool) -> f64 {
 }
 
 /// The capacity units a base-table FETCH of ONE item costs: that item's own size rounded up
-/// to the read unit, at the strongly consistent rate.
+/// to the read unit, at the rate the read asked for.
 ///
 /// "If any of the requested attributes are not projected into the local secondary index,
 /// DynamoDB fetches each of these attributes from the parent table" (`Query$Select`), and
 /// each of those fetches is a read of THAT item in its own right — so the rounding is per
-/// item rather than over the page, and it is the whole unit however the request asked to
-/// read the INDEX: the recorded answer for an eventually consistent index query bills the
-/// parent-table fetches of items of 1,024 / 5,120 and 9,216 bytes as 1 + 2 + 3 units, which
-/// is the unhalved per-item rounding. The index read beside it keeps the consistency the
-/// request asked for, which is what [`read_capacity_units`] applies.
-pub fn fetch_capacity_units(size: i64) -> f64 {
-    read_capacity_units(size, true)
+/// item rather than over the page. What a read of that size COSTS is the rate the request
+/// asked to read with, the same rate the index read beside it is charged at
+/// ([`read_capacity_units`]): "one read capacity unit represents one strongly consistent
+/// read per second, or two eventually consistent reads per second, for an item up to 4 KB"
+/// ("Read/write capacity mode", Amazon DynamoDB Developer Guide) — a statement about any
+/// item a read reads, so a fetch is halved exactly as every other eventually consistent
+/// read is. The recorded answer that settles it charges BOTH arms of one such read in the
+/// same run: a keyed local-index `SELECT` naming an attribute the index does not project
+/// bills one whole unit per fetched item read strongly consistently, and half of that
+/// figure for the same statement read eventually consistently.
+pub fn fetch_capacity_units(size: i64, consistent_read: bool) -> f64 {
+    read_capacity_units(size, consistent_read)
 }
 
 /// The capacity units SCANNING one entry of a secondary index costs: that entry's own size
@@ -44,13 +49,11 @@ pub fn fetch_capacity_units(size: i64) -> f64 {
 ///
 /// A scan of an index is charged over what the index HOLDS for each row it evaluated, and
 /// the recorded answer for such a scan charges a WHOLE unit for each entry inside one 4 KB
-/// read unit — the same per-row, unhalved rounding the base-table arm of an index read is
-/// charged in, which is why this answers through [`fetch_capacity_units`]: one computation,
-/// so a change to the unhalved per-row rounding cannot reach one arm and not the other. The
-/// halving an eventually consistent read takes off ([`read_capacity_units`]) is what a read
-/// of the TABLE's own items is charged at.
+/// read unit — the unhalved per-row rounding. The halving an eventually consistent read
+/// takes off ([`read_capacity_units`]) is what a read of the TABLE's own items is charged
+/// in.
 pub fn index_scan_capacity_units(size: i64) -> f64 {
-    fetch_capacity_units(size)
+    read_capacity_units(size, true)
 }
 
 /// What ONE ROW of a walk is charged, which follows what the WALK reads rather than the

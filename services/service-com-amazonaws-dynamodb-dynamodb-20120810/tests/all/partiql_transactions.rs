@@ -11,7 +11,7 @@
 //!    against the state as it stood BEFORE the transaction, and one unmet predicate
 //!    leaves the store untouched and answers `TransactionCanceledException` with one
 //!    reason per statement, in request order. The rows span the ways one statement can
-//!    fail (a key an `INSERT` would replace, an `UPDATE` or a `DELETE` of a key holding
+//!    fail (a key an `INSERT` collides with, an `UPDATE` or a `DELETE` of a key holding
 //!    no item, a further predicate the stored item does not satisfy), which POSITION it
 //!    fails in, and which of the two tables it addresses.
 //! 2. A READ transaction reports the ONE item each `SELECT` addresses, in statement
@@ -23,7 +23,8 @@
 //!    same statements applies nothing, and a repeat carrying different statements is
 //!    `IdempotentParameterMismatchException`.
 //! 5. A transactional read or write consumes twice what the same single-item one does,
-//!    reported one entry per statement.
+//!    reported one entry per TABLE the transaction reached, summed over the statements
+//!    that reached it.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -134,7 +135,7 @@ struct CancelRow {
     codes: Vec<&'static str>,
 }
 
-/// The rows differ in HOW one statement fails (a key an `INSERT` would replace, an
+/// The rows differ in HOW one statement fails (a key an `INSERT` would collide with, an
 /// `UPDATE` of a key holding no item, a further predicate the stored item does not
 /// satisfy, a `DELETE` whose further predicate it does not satisfy), in WHICH position in
 /// the list fails, in which of the two tables that statement addresses, and in how many
@@ -142,12 +143,15 @@ struct CancelRow {
 fn cancel_table() -> Vec<CancelRow> {
     vec![
         CancelRow {
+            // An `INSERT` is a put that must not replace, so a key that already holds an
+            // item is a collision on that key rather than a condition the statement
+            // stated: it reports `DuplicateItem`.
             case: "an INSERT of a key the table already holds, first of two",
             statements: vec![
                 statement("INSERT INTO accounts VALUE {'id': 'a1', 'balance': 1}"),
                 statement("INSERT INTO audit VALUE {'id': 'fresh', 'note': 'unwritten'}"),
             ],
-            codes: vec!["ConditionalCheckFailed", "None"],
+            codes: vec!["DuplicateItem", "None"],
         },
         CancelRow {
             case: "an UPDATE of a key that holds no item, second of two",
@@ -182,7 +186,7 @@ fn cancel_table() -> Vec<CancelRow> {
                 statement("DELETE FROM accounts WHERE id = 'a1' AND balance = 999"),
                 statement("INSERT INTO audit VALUE {'id': 'e1', 'note': 'replaced'}"),
             ],
-            codes: vec!["ConditionalCheckFailed", "ConditionalCheckFailed"],
+            codes: vec!["ConditionalCheckFailed", "DuplicateItem"],
         },
     ]
 }
@@ -445,15 +449,22 @@ async fn a_read_transaction_reports_the_item_each_statement_addresses() {
         );
     }
     // "Transactional read requests require two read capacity units": each statement
-    // reads one item well under the 4 KB a read unit covers.
+    // reads one item well under the 4 KB a read unit covers, and the entries are one per
+    // TABLE — the four statements that read `accounts` sum into its entry, the one that
+    // reads `audit` into its own, in table-name order.
+    let accounts_statements = 4.0;
     assert_eq!(
         capacity_units(&read),
-        vec![2.0; rows.len()],
-        "case read transaction: each statement consumes twice a single-item read, got {read}"
+        vec![2.0 * accounts_statements, 2.0],
+        "case read transaction: each table's entry sums what its statements consumed, got \
+         {read}"
     );
     assert_eq!(
         units_by_kind(&read),
-        vec![(None, Some(2.0)); rows.len()],
+        vec![
+            (None, Some(2.0 * accounts_statements)),
+            (None, Some(2.0)),
+        ],
         "case read transaction: a read transaction bills read capacity only, got {read}"
     );
 

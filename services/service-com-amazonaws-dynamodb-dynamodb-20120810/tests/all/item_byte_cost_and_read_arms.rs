@@ -25,7 +25,8 @@
 //!    the store holds it — attribute names as well as values;
 //! 4. a read served from a secondary index spends its units ON THAT INDEX, and the
 //!    table's own arm carries what the read spent on the TABLE: nothing for a read the
-//!    index answered on its own, and each fetched item's own 4 KB-rounded size where the
+//!    index answered on its own, and each fetched item's own 4 KB-rounded size — at the
+//!    rate the read asked for, halved when it is eventually consistent — where the
 //!    read had to go on to the table for attributes the index does not project ("If any
 //!    of the requested attributes are not projected into the local secondary index,
 //!    DynamoDB fetches each of these attributes from the parent table" — `Query$Select`).
@@ -537,15 +538,18 @@ async fn an_index_read_bills_the_table_arm_for_what_it_fetched_from_the_table() 
 
     let rows = vec![
         ArmCase {
+            // Each fetch is a read of ONE item, rounded to the read unit on its own, and
+            // this read asked for no consistency — so each of those reads is the half unit
+            // an eventually consistent read of that size costs.
             case: "a keys-only index asked for every attribute, which it must fetch",
             index: "Keys",
             select: json!({"Select": "ALL_ATTRIBUTES"}),
-            table_arm: per_item,
+            table_arm: per_item / 2.0,
         },
         ArmCase {
-            // The fetch is a read of the table's own copy of each item, so what it costs
-            // does not follow how the INDEX was read: the same rows cost the same on the
-            // table arm strongly consistently.
+            // The same rows, read strongly consistently: a fetch is charged at the rate
+            // the read asked for, like every other read of an item, so the arm is the
+            // whole per-item rounding here.
             case: "the same fetch, read strongly consistently",
             index: "Keys",
             select: json!({"Select": "ALL_ATTRIBUTES", "ConsistentRead": true}),

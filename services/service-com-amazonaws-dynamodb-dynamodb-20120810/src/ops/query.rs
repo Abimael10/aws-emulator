@@ -776,8 +776,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // per dimension it is held as — while the page's own budget above stays the
             // bytes the response carries.
             if fetches_from_table {
-                fetched_units +=
-                    crate::state::fetch_capacity_units(table.metered_item_size(read.seen()));
+                fetched_units += crate::state::fetch_capacity_units(
+                    table.metered_item_size(read.seen()),
+                    consistent_read,
+                );
             }
             index_bytes = index_bytes.saturating_add(table.metered_item_size(read.projected()));
             page.push(read);
