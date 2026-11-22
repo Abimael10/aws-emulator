@@ -32,7 +32,12 @@
 //!   all, carrying the reason as the record's `errorMessage`.
 //!
 //! WHERE the results go follows the query's `destinationConfiguration`, and a destination is
-//! reported as processed only once the delivery really happened:
+//! reported as processed only once the delivery really happened — and a delivery happens only
+//! where the ROLE that destination names is allowed to make it
+//! ([`super::scheduled_query_delivery_authorization`]): each destination's `roleArn` is the
+//! role "that grants permissions" for that write, so the write is the role's rather than this
+//! service's, and a role IAM does not allow it writes nothing and carries the refusal as that
+//! destination's own `errorMessage`:
 //!
 //! * a lookup-table destination "automatically populate[s] or refresh[es] the specified lookup
 //!   table with query results on each scheduled execution", which is a resource of THIS
@@ -90,6 +95,12 @@ pub const DESTINATION_STATUS_COMPLETE: &str = "COMPLETE";
 
 /// A destination the results could not be delivered to, from the model's `ActionStatus` enum.
 pub const DESTINATION_STATUS_FAILED: &str = "FAILED";
+
+/// A destination whose delivery was REFUSED — the role it names is not allowed the write — as
+/// the service reports such a destination. The recorded refusal of a delivery reports this
+/// value, which the model's `ActionStatus` does not declare; the statuses above are the ones
+/// it does.
+pub const DESTINATION_STATUS_ERROR: &str = "ERROR";
 
 /// An Amazon S3 destination, from the model's `ScheduledQueryDestinationType` enum (`S3` |
 /// `LOOKUP_TABLE`).
@@ -285,6 +296,19 @@ impl DeliveryOutcome {
     fn failed(error_message: String) -> Self {
         Self {
             status: DESTINATION_STATUS_FAILED,
+            processed_identifier: None,
+            error_message: Some(error_message),
+        }
+    }
+
+    /// A delivery the destination's own role is not allowed to make, carrying the refusal.
+    ///
+    /// Nothing was written and nothing was produced at the destination, so the entry names no
+    /// processed result at all — the member is reported by nothing rather than as a value a
+    /// client could read as an object that exists.
+    fn denied(error_message: String) -> Self {
+        Self {
+            status: DESTINATION_STATUS_ERROR,
             processed_identifier: None,
             error_message: Some(error_message),
         }
@@ -577,6 +601,31 @@ pub async fn settle<Eng: Send + Sync + 'static>(
         let table_body = results_csv(&execution);
         let object_body = results_json(&execution);
 
+        // The lookup table a run refreshes is written under the role that destination's own
+        // configuration names, so whether that write may happen at all is decided BEFORE the
+        // store's guard is taken: the decision is IAM's, over the in-process hop, and the
+        // refresh itself then happens under the guard
+        // ([`super::scheduled_query_delivery_authorization`]).
+        let lookup_target = {
+            let store = state.lock();
+            lookup_table_delivery(&store, identifier, region)
+        };
+        let lookup_refusal = match (&execution.failed, &lookup_target) {
+            (None, Some(target)) => {
+                super::scheduled_query_delivery_authorization::withheld(
+                    callback,
+                    region,
+                    &target.role_arn,
+                    target.action(),
+                    &target.table_arn,
+                )
+                .await
+            }
+            // A run that could not run at all delivered nothing, so there is no write to
+            // authorize; a query configured with no lookup table has no such delivery either.
+            _ => None,
+        };
+
         let deliveries = {
             let mut store = state.lock();
             // "Returns the results FROM the specified query": what this run produced is
@@ -589,17 +638,39 @@ pub async fn settle<Eng: Send + Sync + 'static>(
                 &mut store,
                 identifier,
                 &query_id,
-                execution.failed.as_deref(),
-                table_body.as_deref(),
-                &object_body,
                 region,
+                RunProduct {
+                    failed: execution.failed.as_deref(),
+                    table_body: table_body.as_deref(),
+                    object_body: &object_body,
+                    lookup_refusal,
+                },
             )
         };
 
         // An Amazon S3 destination belongs to the object store rather than to this service,
         // so the write happens with this store's guard released.
         for delivery in deliveries {
-            let outcome = deliver_to_s3(callback, region, &delivery).await;
+            // The object is written under the role the destination names, so the write happens
+            // only where the permissions in force on that role allow it: a delivery the role is
+            // not allowed to make writes NOTHING and carries the refusal instead of naming an
+            // object that would never have been there.
+            let refusal = super::scheduled_query_delivery_authorization::withheld(
+                callback,
+                region,
+                &delivery.role_arn,
+                super::scheduled_query_delivery_authorization::S3_DELIVERY_ACTION,
+                &super::scheduled_query_delivery_authorization::object_arn(
+                    &delivery.role_arn,
+                    &delivery.bucket,
+                    &delivery.key,
+                ),
+            )
+            .await;
+            let outcome = match refusal {
+                Some(refusal) => DeliveryOutcome::denied(refusal),
+                None => deliver_to_s3(callback, region, &delivery).await,
+            };
             let mut store = state.lock();
             if let Some(execution) = store
                 .scheduled_query_mut(identifier)
@@ -625,18 +696,20 @@ pub async fn settle<Eng: Send + Sync + 'static>(
 /// destination this service OWNS — the lookup table — and answer the Amazon S3 deliveries the
 /// execution still owes.
 ///
-/// `failed` is why the run could not run at all, for a query string this service cannot
-/// execute; `table_body` the rows it produced as the CSV a lookup table holds, and
-/// `object_body` the same rows as the JSON document an Amazon S3 destination is handed.
+/// What the run produced, and what is already known about its deliveries, is [`RunProduct`].
 fn record_run(
     store: &mut State,
     identifier: &str,
     query_id: &str,
-    failed: Option<&str>,
-    table_body: Option<&str>,
-    object_body: &str,
     region: &str,
+    product: RunProduct<'_>,
 ) -> Vec<S3Delivery> {
+    let RunProduct {
+        failed,
+        table_body,
+        object_body,
+        lookup_refusal,
+    } = product;
     let Some(configuration) = store
         .scheduled_query(identifier)
         .map(|record| record.destination_configuration.clone())
@@ -645,13 +718,16 @@ fn record_run(
     };
 
     // A query this service cannot run produced nothing to deliver, so every destination it is
-    // configured with reports that same reason rather than a delivery that did not happen.
+    // configured with reports that same reason rather than a delivery that did not happen; a
+    // table the destination's role may not write is not written either, and carries the
+    // refusal.
     let lookup_outcome = configuration
         .as_ref()
         .and_then(|configuration| configuration.lookup_table_configuration.as_ref())
-        .map(|table| match failed {
-            Some(reason) => DeliveryOutcome::failed(reason.to_string()),
-            None => refresh_lookup_table(store, table, table_body, region),
+        .map(|table| match (failed, lookup_refusal) {
+            (Some(reason), _) => DeliveryOutcome::failed(reason.to_string()),
+            (None, Some(refusal)) => DeliveryOutcome::denied(refusal),
+            (None, None) => refresh_lookup_table(store, table, table_body, region),
         });
 
     if let Some(execution) = store
@@ -699,6 +775,10 @@ fn record_run(
                     bucket,
                     key: results_object_key(&prefix, &name, query_id),
                     body: object_body.to_string(),
+                    // The role "that grants permissions to write query results to the
+                    // specified Amazon S3 destination": the write is made under it, so it
+                    // travels with the delivery it authorizes.
+                    role_arn: s3.role_arn.clone(),
                 })
             }
             // A destination that is no Amazon S3 URI addresses no bucket, so there is nowhere
@@ -723,6 +803,20 @@ fn record_run(
     }
 }
 
+/// What one run produced, as [`record_run`] is handed it.
+struct RunProduct<'a> {
+    /// Why the run could not run at all, for a query string this service cannot execute.
+    failed: Option<&'a str>,
+    /// The rows it produced as the CSV a lookup table holds.
+    table_body: Option<&'a str>,
+    /// The same rows as the JSON document an Amazon S3 destination is handed.
+    object_body: &'a str,
+    /// Why the lookup-table destination's own role may not make that write
+    /// ([`super::scheduled_query_delivery_authorization`]), decided before the store's guard
+    /// was taken: such a delivery does not happen at all.
+    lookup_refusal: Option<String>,
+}
+
 /// One object a run writes to its Amazon S3 destination.
 #[derive(Debug)]
 struct S3Delivery {
@@ -735,6 +829,60 @@ struct S3Delivery {
     key: String,
     /// The results, as the JSON document the destination is handed.
     body: String,
+    /// The role the write is made under, whose permissions decide whether it happens at all
+    /// ([`super::scheduled_query_delivery_authorization`]).
+    role_arn: String,
+}
+
+/// The lookup-table write one run owes, as the decision about it is taken with no store guard
+/// held.
+#[derive(Debug)]
+struct LookupTableDelivery {
+    /// The role the table is created or updated under (`LookupTableConfiguration$roleArn`).
+    role_arn: String,
+    /// The table the rows are written to, which is the resource that write is authorized
+    /// against.
+    table_arn: String,
+    /// Whether this account already holds that table, which is what decides WHICH of the two
+    /// calls the refresh makes.
+    held: bool,
+}
+
+impl LookupTableDelivery {
+    /// The IAM action this delivery performs: the role's permissions are the ones to "create
+    /// or update the lookup table with query results", and which of the two the refresh makes
+    /// follows whether the table is there to update.
+    fn action(&self) -> &'static str {
+        if self.held {
+            super::scheduled_query_delivery_authorization::LOOKUP_TABLE_UPDATE_ACTION
+        } else {
+            super::scheduled_query_delivery_authorization::LOOKUP_TABLE_CREATE_ACTION
+        }
+    }
+}
+
+/// The lookup-table write the scheduled query `identifier` names owes, or `None` when it is
+/// configured with no such destination.
+///
+/// Read under the store's guard and answered as owned values, so the authorization decision it
+/// feeds is taken with that guard released.
+fn lookup_table_delivery(
+    store: &State,
+    identifier: &str,
+    region: &str,
+) -> Option<LookupTableDelivery> {
+    let table = store
+        .scheduled_query(identifier)?
+        .destination_configuration
+        .as_ref()?
+        .lookup_table_configuration
+        .clone()?;
+    let held = store.lookup_tables.contains_key(&table.table_name);
+    Some(LookupTableDelivery {
+        role_arn: table.role_arn,
+        table_arn: super::lookup_table_arn(region, &table.table_name),
+        held,
+    })
 }
 
 /// The bucket and the key prefix an `s3://bucket/prefix` URI names, or `None` for a value that

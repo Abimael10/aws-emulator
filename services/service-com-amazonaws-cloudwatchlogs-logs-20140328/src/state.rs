@@ -270,6 +270,10 @@ pub use scheduled_query_rules::*;
 pub mod scheduled_query_executions;
 pub use scheduled_query_executions::*;
 
+/// Whether the role a scheduled query's destination names may make the write its delivery
+/// performs.
+pub mod scheduled_query_delivery_authorization;
+
 /// The log anomaly detectors this account holds, as they are stored.
 mod anomaly_detectors;
 pub use anomaly_detectors::*;
