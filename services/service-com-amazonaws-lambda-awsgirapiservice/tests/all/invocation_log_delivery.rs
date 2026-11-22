@@ -1234,6 +1234,7 @@ async fn every_function_of_these_suites_is_created_with_room_for_the_hosts_own_l
             timeout,
             memory_size,
             service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+            false,
         );
         let least = HOST_WAIT_CEILING.saturating_sub(ABANDON_GRACE);
         assert!(

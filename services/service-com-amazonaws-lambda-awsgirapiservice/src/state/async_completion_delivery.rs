@@ -835,6 +835,7 @@ mod tests {
             aws: None,
             logs: None,
             metrics: None,
+            streamed: false,
         }
     }
 

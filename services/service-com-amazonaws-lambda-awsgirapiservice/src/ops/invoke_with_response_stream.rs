@@ -511,6 +511,10 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
                 &*self.engine,
                 &metered,
             )),
+            // This operation IS the response-streaming delivery, so the run answers under
+            // that delivery's own quota rather than the buffered one
+            // (`crate::state::execution::MAX_STREAMED_RESPONSE_BYTES`).
+            streamed: true,
         };
         let kms_key_arn = resolved_config.kms_key_arn.clone();
             (

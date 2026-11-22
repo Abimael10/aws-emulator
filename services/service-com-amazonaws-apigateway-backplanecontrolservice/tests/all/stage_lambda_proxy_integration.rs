@@ -82,8 +82,11 @@ const BAD_GATEWAY: (u16, &str) = (502, r#"{"message": "Internal server error"}"#
 
 /// The status and body an uncustomized `INTEGRATION_TIMEOUT` gateway response carries, which
 /// is what a call whose backend had not answered by the integration's own `timeoutInMillis`
-/// is answered with.
-const INTEGRATION_TIMEOUT: (u16, &str) = (504, r#"{"message":"Endpoint request timed out"}"#);
+/// is answered with — recorded behaviour of the `execute-api` endpoint, whose default body is
+/// one API Gateway serializes ITSELF (a space after the member separator), as every answer it
+/// renders for a failure of the integration stage is, rather than the compact body a gateway
+/// response's own default template produces.
+const INTEGRATION_TIMEOUT: (u16, &str) = (504, r#"{"message": "Endpoint request timed out"}"#);
 
 /// The `timeoutInMillis` the slow method's integration carries: the lowest value
 /// `Integration$timeoutInMillis` admits ("custom timeout between 50 and 29,000

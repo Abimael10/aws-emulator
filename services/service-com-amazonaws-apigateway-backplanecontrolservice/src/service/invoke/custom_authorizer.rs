@@ -31,7 +31,10 @@
 //! the method the request addressed — so the document admits the methods it names and no
 //! others, and an explicit `Deny` in it refuses whatever else it allows. A `context` map the
 //! output carries is published to the integration, each entry under the `$context.authorizer`
-//! member path a mapping template reads it by.
+//! member path a mapping template reads it by — and only scalars can be: "you cannot set a
+//! JSON object or array as a valid value of any key in the `context` map", so an output
+//! publishing one is no usable authorizer response at all and the call it decided is refused
+//! rather than served without it.
 //!
 //! # What is held, and for how long
 //!
@@ -499,6 +502,12 @@ fn error_message(payload: &[u8]) -> Option<String> {
 /// The authorizer output `returned` is, as the stage holds one, or why it is not an
 /// authorizer output at all.
 ///
+/// An output is the two members such an output declares and the values they are documented
+/// to carry: a return value missing either, carrying a `policyDocument` that is no document,
+/// or publishing a `context` entry that is not a scalar ([`context_of`]) is not a usable
+/// authorizer response, and the call it decided is refused rather than served from part of
+/// it.
+///
 /// `ttl` is the authorizer's own `authorizerResultTtlInSeconds`, which is how long the
 /// result stays usable; a result obtained under a TTL of zero expires at the instant it was
 /// obtained, so nothing reads it again.
@@ -525,7 +534,7 @@ fn authorizer_output(returned: &[u8], ttl: Duration) -> Result<CachedAuthorizerR
     Ok(CachedAuthorizerResult {
         principal_id,
         policy_document: policy.to_string(),
-        context: context_of(document.get(CONTEXT_MEMBER)),
+        context: context_of(document.get(CONTEXT_MEMBER))?,
         // The key an api metering by its authorizer admits the call with, as the authorizer
         // spelled it: a value that is not text is no API key value, and an absent member is
         // an authorizer that identified no usage at all.
@@ -538,27 +547,41 @@ fn authorizer_output(returned: &[u8], ttl: Duration) -> Result<CachedAuthorizerR
     })
 }
 
-/// The `context` map the output published, as the string values a mapping template reads.
+/// The `context` map the output published, as the string values a mapping template reads, or
+/// why the output is not one API Gateway can use.
 ///
 /// "You cannot set a JSON object or array as a valid value of any key in the `context` map",
-/// so an entry carrying one is not a value the integration can read and is left out; every
-/// scalar is published as the text it renders to, which is what a template substitutes.
-fn context_of(published: Option<&Value>) -> BTreeMap<String, String> {
-    let Some(Value::Object(entries)) = published else {
-        return BTreeMap::new();
+/// so an entry carrying one is a value no integration can be handed: the authorizer's
+/// RESPONSE is unusable, and a call it decided is refused rather than served with the entry
+/// dropped. Every scalar is published as the text it renders to, which is what a template
+/// substitutes, and a `null` entry carries no value to publish at all.
+fn context_of(published: Option<&Value>) -> Result<BTreeMap<String, String>, String> {
+    let Some(published) = published.filter(|value| !value.is_null()) else {
+        return Ok(BTreeMap::new());
     };
-    entries
-        .iter()
-        .filter_map(|(key, value)| {
-            let text = match value {
-                Value::String(text) => text.clone(),
-                Value::Number(number) => number.to_string(),
-                Value::Bool(flag) => flag.to_string(),
-                _ => return None,
-            };
-            Some((key.clone(), text))
-        })
-        .collect()
+    let Value::Object(entries) = published else {
+        return Err(format!(
+            "the authorizer's function returned a {CONTEXT_MEMBER} that is not a map of \
+             values"
+        ));
+    };
+    let mut published = BTreeMap::new();
+    for (key, value) in entries {
+        let text = match value {
+            Value::String(text) => text.clone(),
+            Value::Number(number) => number.to_string(),
+            Value::Bool(flag) => flag.to_string(),
+            Value::Null => continue,
+            Value::Object(_) | Value::Array(_) => {
+                return Err(format!(
+                    "the authorizer's function returned a {CONTEXT_MEMBER} whose {key} entry \
+                     carries a JSON object or array, which is no value of that map"
+                ))
+            }
+        };
+        published.insert(key.clone(), text);
+    }
+    Ok(published)
 }
 
 #[cfg(test)]
@@ -644,8 +667,9 @@ mod tests {
         }
     }
 
-    /// RULE: an authorizer output is the two members such an output declares; a return value
-    /// missing either is not one, and only scalar `context` entries are published.
+    /// RULE: an authorizer output is the two members such an output declares carrying the
+    /// values they are documented to carry; a return value missing either, or publishing a
+    /// `context` entry that is not a scalar, is not one.
     #[test]
     fn an_authorizer_output_is_read_as_the_members_it_declares() {
         let ttl = Duration::from_secs(300);
@@ -659,13 +683,28 @@ mod tests {
                 true,
             ),
             (
-                "both members and a context map",
+                "both members and a context map of scalars",
                 format!(
                     "{{\"principalId\":\"u\",\"policyDocument\":{allow},\
-                     \"context\":{{\"tier\":\"gold\",\"calls\":3,\"ok\":true,\
-                     \"nested\":{{\"a\":1}}}}}}"
+                     \"context\":{{\"tier\":\"gold\",\"calls\":3,\"ok\":true}}}}"
                 ),
                 true,
+            ),
+            (
+                "a context entry carrying a nested map",
+                format!(
+                    "{{\"principalId\":\"u\",\"policyDocument\":{allow},\
+                     \"context\":{{\"tier\":\"gold\",\"nested\":{{\"a\":1}}}}}}"
+                ),
+                false,
+            ),
+            (
+                "a context entry carrying an array",
+                format!(
+                    "{{\"principalId\":\"u\",\"policyDocument\":{allow},\
+                     \"context\":{{\"tiers\":[\"gold\"]}}}}"
+                ),
+                false,
             ),
             (
                 "no principalId",
@@ -688,12 +727,12 @@ mod tests {
                 "case {case:?}: expected readable={readable}, got {read:?}"
             );
         }
-        // The context map's scalars are published and its non-scalar is not.
+        // Every scalar the context map carries is published under the authorizer's own
+        // member path.
         let with_context = authorizer_output(
             format!(
                 "{{\"principalId\":\"u\",\"policyDocument\":{allow},\
-                 \"context\":{{\"tier\":\"gold\",\"calls\":3,\"ok\":true,\
-                 \"nested\":{{\"a\":1}}}}}}"
+                 \"context\":{{\"tier\":\"gold\",\"calls\":3,\"ok\":true}}}}"
             )
             .as_bytes(),
             ttl,
@@ -713,9 +752,5 @@ mod tests {
                 "case {member:?}: expected {value:?}, got {published:?}"
             );
         }
-        assert!(
-            !published.contains_key("authorizer.nested"),
-            "case \"a non-scalar context value\": expected it left out, got {published:?}"
-        );
     }
 }

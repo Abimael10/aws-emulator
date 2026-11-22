@@ -460,6 +460,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &*self.engine,
                     &metered,
                 )),
+                // An event delivery is the BUFFERED delivery: nothing streams a queued
+                // event's answer anywhere, so the run answers under that quota.
+                streamed: false,
             };
             record.queue_async_invocation(&version, &request_id, input.invoke_args, now);
             Some(invocation)

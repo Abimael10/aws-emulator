@@ -596,7 +596,17 @@ const MAX_RUN_LOG_BYTES: usize = 256 * 1024;
 /// How large a handler's response may be, which is the quota Lambda names in its own
 /// refusal for a response past it ([`RESPONSE_SIZE_TOO_LARGE`]) — a response of exactly
 /// this many bytes is delivered, and one byte more is not.
+///
+/// This is the BUFFERED delivery's quota, which `InvokeMode` states as "BUFFERED … The
+/// maximum payload size is 6 MB"; a run whose answer is delivered as a STREAM carries the
+/// other one ([`MAX_STREAMED_RESPONSE_BYTES`]).
 const MAX_RESPONSE_BYTES: usize = 6_291_556;
+
+/// How large the answer of a run DELIVERED AS A STREAM may be: `InvokeMode` states it for
+/// the response-streaming mode — "RESPONSE_STREAM … The maximum response payload size is
+/// 200 MB" — which is the quota a caller that asked for that delivery gets, whichever
+/// seam asked for it ([`Invocation::streamed`]).
+pub const MAX_STREAMED_RESPONSE_BYTES: usize = 200 * 1024 * 1024;
 
 /// The bytes of a run's log the model reports on `LogResult`: "The last 4 KB of the
 /// execution log, which is base64-encoded."
@@ -714,6 +724,16 @@ pub struct Invocation {
     /// in which case the run's log is still its answer's log tail and simply reaches no log
     /// group.
     pub logs: Option<LogTarget>,
+    /// Whether this invocation's answer is DELIVERED AS A STREAM: the caller asked for the
+    /// response-streaming delivery (`InvokeWithResponseStream`, or a function URL whose
+    /// `InvokeMode` is `RESPONSE_STREAM`) rather than the buffered one.
+    ///
+    /// It is what decides how much the run may answer: `InvokeMode` gives "BUFFERED … The
+    /// maximum payload size is 6 MB" against "RESPONSE_STREAM … The maximum response
+    /// payload size is 200 MB", so the quota is the DELIVERY's
+    /// ([`MAX_STREAMED_RESPONSE_BYTES`]) and a streamed answer is not bounded by what one
+    /// buffered response carries.
+    pub streamed: bool,
     /// The AWS/Lambda series this invocation is metered on once it has RUN — what its run
     /// took, and the failure it came to ([`super::metrics::InvocationMetrics`]) — or `None`
     /// for a run metered nowhere.
@@ -1038,6 +1058,9 @@ pub async fn run_invocation(
         invocation.timeout,
         invocation.memory_size,
         invocation.ephemeral_storage_mb,
+        // The DELIVERY this invocation was made for, which is what its answer is bounded by
+        // ([`Invocation::streamed`]).
+        invocation.streamed,
     );
     let heap_bytes = run_heap_bytes(invocation.memory_size);
     let started = SystemTime::now();
@@ -1961,8 +1984,19 @@ pub(crate) fn epoch_millis(at: SystemTime) -> i64 {
 /// is a disk the function's `EphemeralStorage.Size` sizes, so what a run writes there is
 /// bounded by that size and charged against no memory bound
 /// ([`ephemeral_storage_bytes`]).
+///
+/// `streamed` is the DELIVERY the caller asked for ([`Invocation::streamed`]), which is what
+/// decides how much the run may answer: the response-streaming quota
+/// ([`MAX_STREAMED_RESPONSE_BYTES`]) or the buffered one ([`MAX_RESPONSE_BYTES`]). It is a
+/// parameter of the one function that builds a budget, so no caller can construct one whose
+/// response bound belongs to the other delivery.
 #[must_use]
-pub fn run_budget(timeout_seconds: i32, memory_size: i32, ephemeral_storage_mb: i32) -> Budget {
+pub fn run_budget(
+    timeout_seconds: i32,
+    memory_size: i32,
+    ephemeral_storage_mb: i32,
+    streamed: bool,
+) -> Budget {
     let clamped = i64::from(timeout_seconds).clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
     let wall_clock = Duration::from_secs(u64::try_from(clamped).unwrap_or(1));
     Budget {
@@ -1971,7 +2005,13 @@ pub fn run_budget(timeout_seconds: i32, memory_size: i32, ephemeral_storage_mb: 
         memory_bytes: u64::try_from(run_heap_bytes(memory_size)).unwrap_or(MAX_RUN_MEMORY_BYTES),
         ephemeral_bytes: ephemeral_storage_bytes(ephemeral_storage_mb),
         log_bytes: MAX_RUN_LOG_BYTES,
-        response_bytes: MAX_RESPONSE_BYTES,
+        // What the run may ANSWER is the quota of the delivery the caller asked for: a
+        // streamed answer is not bounded by what one buffered response carries.
+        response_bytes: if streamed {
+            MAX_STREAMED_RESPONSE_BYTES
+        } else {
+            MAX_RESPONSE_BYTES
+        },
         recursion_limit: MAX_RUN_RECURSION,
     }
 }
@@ -2377,6 +2417,7 @@ mod tests {
             aws: None,
             logs: None,
             metrics: None,
+            streamed: false,
         }
     }
 
@@ -2541,6 +2582,7 @@ mod tests {
                 *timeout,
                 MIN_MEMORY_SIZE_MB as i32,
                 crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                false,
             );
             let finished = Finished {
                 completion: Completion::Stopped(Stop::Deadline),
@@ -2611,6 +2653,7 @@ mod tests {
                     3,
                     MIN_MEMORY_SIZE_MB as i32,
                     crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                    false,
                 );
                 let finished = Finished {
                     completion: Completion::Stopped(*stop),
@@ -2708,6 +2751,7 @@ mod tests {
                         3,
                         MIN_MEMORY_SIZE_MB as i32,
                         crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                        false,
                     ),
                     engine,
                     SystemTime::UNIX_EPOCH,
@@ -2761,6 +2805,7 @@ mod tests {
                         3,
                         MIN_MEMORY_SIZE_MB as i32,
                         crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                        false,
                     ),
                     Engine::Python,
                     SystemTime::UNIX_EPOCH,
@@ -2797,6 +2842,7 @@ mod tests {
             3,
             MIN_MEMORY_SIZE_MB as i32,
             crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+            false,
         );
         let quota = budget.response_bytes;
         // What the document's own members cost, beside the message: the builder's own answer
@@ -2983,6 +3029,7 @@ mod tests {
                         5,
                         MIN_MEMORY_SIZE_MB as i32,
                         crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                        false,
                     ),
                     aws: None,
                     durable: None,
@@ -3019,12 +3066,66 @@ mod tests {
                 *configured,
                 MIN_MEMORY_SIZE_MB as i32,
                 crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                false,
             )
                 .wall_clock
                 .as_secs();
             assert_eq!(
                 actual, *expected,
                 "case {configured} s configured: expected a {expected} s run budget, got {actual}"
+            );
+        }
+    }
+
+    /// RULE: what a run may ANSWER is the quota of the DELIVERY the caller asked for —
+    /// `InvokeMode` states "BUFFERED … The maximum payload size is 6 MB" against
+    /// "RESPONSE_STREAM … The maximum response payload size is 200 MB" — and nothing else
+    /// the function is configured for decides it.
+    #[test]
+    fn the_response_quota_is_the_one_of_the_delivery_asked_for() {
+        // Rows differ along the delivery and along the other bounds the function carries,
+        // which decide no part of this one.
+        let rows: &[(&str, bool, i32, i32, usize)] = &[
+            (
+                "a buffered delivery of the smallest function",
+                false,
+                1,
+                MIN_MEMORY_SIZE_MB as i32,
+                MAX_RESPONSE_BYTES,
+            ),
+            (
+                "a buffered delivery of a long-running, large function",
+                false,
+                900,
+                2048,
+                MAX_RESPONSE_BYTES,
+            ),
+            (
+                "a streamed delivery of the smallest function",
+                true,
+                1,
+                MIN_MEMORY_SIZE_MB as i32,
+                MAX_STREAMED_RESPONSE_BYTES,
+            ),
+            (
+                "a streamed delivery of a long-running, large function",
+                true,
+                900,
+                2048,
+                MAX_STREAMED_RESPONSE_BYTES,
+            ),
+        ];
+        for (case, streamed, timeout, memory_size, expected) in rows {
+            let budget = run_budget(
+                *timeout,
+                *memory_size,
+                crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                *streamed,
+            );
+            assert_eq!(
+                budget.response_bytes, *expected,
+                "case {case:?}: expected a response quota of {expected} bytes, got {}",
+                budget.response_bytes
             );
         }
     }

@@ -713,6 +713,11 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             // the time the run took and the failure it came to
             // (`crate::state::metrics`).
             metrics: Some(crate::state::InvocationMetrics::new(&*self.engine, &metered)),
+            // The DELIVERY this URL serves in, which is what the run's answer is bounded by:
+            // a `RESPONSE_STREAM` URL answers the bytes the handler wrote
+            // ([`served_as_a_stream`]), under the response-streaming quota rather than the
+            // buffered one.
+            streamed: served_as_a_stream(target),
         };
         Ok(Prepared {
             metered,

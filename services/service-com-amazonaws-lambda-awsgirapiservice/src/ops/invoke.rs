@@ -811,6 +811,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &*self.engine,
                         &metered,
                     )),
+                    // An event delivery is the BUFFERED delivery: nothing streams a queued
+                    // event's answer anywhere, so the run answers under that quota.
+                    streamed: false,
                 };
                 record.queue_async_invocation(&version, &invocation.request_id, payload, now);
                 invocation
@@ -993,6 +996,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &*self.engine,
                 &metered,
             )),
+            // `Invoke` IS the buffered delivery — "BUFFERED … Invocation results are
+            // available when the payload is complete" (`InvokeMode`) — so the run answers
+            // under that quota and not the response-streaming one.
+            streamed: false,
         };
             (
                 invocation,

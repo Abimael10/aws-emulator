@@ -90,6 +90,11 @@
 //!   this stage cannot perform is, through the api's own `API_CONFIGURATION_ERROR` gateway
 //!   response ([`super::API_CONFIGURATION_ERROR`], `500` with
 //!   `{"message":"Internal server error"}`);
+//! * LAMBDA ANSWERED the invocation with a failure of its own — a throttle, a fault of the
+//!   service — so the function never ran and the BACKEND, rather than the api's
+//!   configuration, failed the call: API Gateway answers its own server fault, `500` with
+//!   the `{"message": "Internal server error"}` body it serializes itself
+//!   ([`invocation_failed`]);
 //! * the invocation was made and the function had not answered by the integration's own
 //!   `timeoutInMillis` ([`waited_for`]): the wait is the api's stored number, so a request to
 //!   a deployed stage is answered whatever the function does with its own time — through the
@@ -157,9 +162,17 @@ const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
 /// returns a 502 Bad Gateway error response."
 const BAD_GATEWAY_STATUS: u16 = 502;
 
+/// The status API Gateway answers a proxy integration whose INVOCATION Lambda answered with
+/// a failure of its own — a throttle, or a fault of the service — with: the function never
+/// ran, so there is no proxy response to pass through, and the call is answered the server
+/// fault the gateway words every call it could not pass on with ([`invocation_failed`]).
+const INVOCATION_FAILED_STATUS: u16 = 500;
+
 /// The sentence that response carries, which is the one API Gateway words every
-/// server-side failure of a call it could not pass on with.
-const BAD_GATEWAY_MESSAGE: &str = "Internal server error";
+/// server-side failure of a call it could not pass on with — the `502` of an answer it
+/// cannot use ([`bad_gateway`]) and the `500` of an invocation Lambda failed
+/// ([`invocation_failed`]) alike.
+const INTEGRATION_FAULT_MESSAGE: &str = "Internal server error";
 
 /// The CONFIGURATION ERROR a function's answer that is not a proxy response IS, as API
 /// Gateway words it in the execution log of the request it answered `502`: a proxy
@@ -586,22 +599,37 @@ async fn invoked(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "the proxy integration's function was not invoked"
             );
+            // LAMBDA ANSWERING the invocation with a failure of its own — a throttle, a
+            // fault of the service — is the BACKEND failing this call rather than the api's
+            // configuration being unable to perform it: the function never ran, so there is
+            // no proxy response to pass through, and API Gateway answers its own server
+            // fault ([`invocation_failed`]) instead of the api's `API_CONFIGURATION_ERROR`
+            // gateway response. What the api's configuration IS answerable for is the one
+            // answer that says this function may not be invoked at all
+            // ([`invocation_refused`], worded with [`INVALID_PERMISSIONS_REASON`]); an
+            // invocation NOTHING answered is neither, and stays the configuration error a
+            // call this stage could not perform earns.
+            if invocation_refused(&error) {
+                return Err(UnservedIntegration {
+                    refusal: API_CONFIGURATION_ERROR,
+                    reason: INVALID_PERMISSIONS_REASON.to_string(),
+                });
+            }
+            if refused_by_lambda(&error) {
+                return Ok(ProxyAnswer {
+                    response: invocation_failed(),
+                    configuration_error: None,
+                    exchanged: Some(super::stage_logs::Exchanged {
+                        sent,
+                        received: Vec::new(),
+                    }),
+                });
+            }
             return Err(UnservedIntegration {
                 refusal: API_CONFIGURATION_ERROR,
-                // LAMBDA refusing the invocation it was issued — a spelling it holds no
-                // record for, a call its own records do not admit — is the answer to
-                // whether this function may be invoked at all, so it is the configuration
-                // error API Gateway words with its one permissions sentence
-                // ([`INVALID_PERMISSIONS_REASON`]). Every other outcome is a different
-                // story: an invocation nothing answered, or one Lambda answered something
-                // else about.
-                reason: if invocation_refused(&error) {
-                    INVALID_PERMISSIONS_REASON.to_string()
-                } else {
-                    "the AWS_PROXY integration's function did not answer the \
-                     invocation, so there is no function answer to pass through"
-                        .to_string()
-                },
+                reason: "the AWS_PROXY integration's function did not answer the \
+                         invocation, so there is no function answer to pass through"
+                    .to_string(),
             });
         }
     };
@@ -708,7 +736,7 @@ fn bad_gateway() -> IntegratedResponse {
         status: BAD_GATEWAY_STATUS,
         content_type: JSON_CONTENT_TYPE.to_string(),
         // Under the member every refusal of this endpoint carries its sentence in.
-        body: super::serialized_envelope(super::MESSAGE_MEMBER, BAD_GATEWAY_MESSAGE),
+        body: super::serialized_envelope(super::MESSAGE_MEMBER, INTEGRATION_FAULT_MESSAGE),
         headers: BTreeMap::new(),
     }
 }
@@ -723,6 +751,32 @@ fn accepted() -> IntegratedResponse {
         content_type: JSON_CONTENT_TYPE.to_string(),
         body: Vec::new(),
         headers: BTreeMap::new(),
+    }
+}
+
+/// The response API Gateway answers a proxy integration whose invocation LAMBDA answered
+/// with a failure of its own with: `500` under the sentence the gateway words a call it
+/// could not pass on with, naming the exception class the endpoint reports a server-side
+/// fault in ([`super::ERROR_TYPE_HEADER`], [`super::INTERNAL_SERVER_ERROR_EXCEPTION`] — the
+/// class an integration that did not answer in time carries too).
+///
+/// The backend answered the gateway rather than the caller, and what it answered is no
+/// response to pass through — the function never ran — so this is a failure of the
+/// INTEGRATION rather than of the api's own configuration: it is API Gateway's own answer,
+/// like the `502` an answer the gateway cannot use earns ([`bad_gateway`]), and its body is
+/// the envelope the service renders ITSELF, with the space after the member separator every
+/// answer of the integration stage carries
+/// ([`super::SERVICE_SERIALIZED_RESPONSE_TYPES`]).
+fn invocation_failed() -> IntegratedResponse {
+    IntegratedResponse {
+        status: INVOCATION_FAILED_STATUS,
+        content_type: JSON_CONTENT_TYPE.to_string(),
+        // Under the member every refusal of this endpoint carries its sentence in.
+        body: super::serialized_envelope(super::MESSAGE_MEMBER, INTEGRATION_FAULT_MESSAGE),
+        headers: BTreeMap::from([(
+            super::ERROR_TYPE_HEADER.to_string(),
+            vec![super::INTERNAL_SERVER_ERROR_EXCEPTION.to_string()],
+        )]),
     }
 }
 

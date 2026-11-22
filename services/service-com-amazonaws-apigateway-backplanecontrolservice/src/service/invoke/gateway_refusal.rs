@@ -192,16 +192,22 @@ pub(super) const API_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
 /// ("custom timeout between 50 and 29,000 milliseconds", `Integration$timeoutInMillis`), so
 /// the call has no backend answer to map: `504` through `INTEGRATION_TIMEOUT`
 /// ([`crate::state::default_gateway_status_code`] gives that type's own status), carrying
-/// the sentence API Gateway answers an integration that ran out of time with.
+/// the sentence API Gateway answers an integration that ran out of time with and the
+/// exception class the endpoint reports a server-side fault of a call it could not pass on in
+/// ([`INTERNAL_SERVER_ERROR_EXCEPTION`]).
 ///
 /// This is what bounds a request to a deployed stage whose integration reaches a backend
 /// that runs for its own time ([`lambda_proxy`]): the wait is the api's own stored number
 /// rather than anything a request chooses, and a request that reaches it is ANSWERED rather
 /// than held open.
+///
+/// Its default body is one API Gateway serializes ITSELF, with the space after the member
+/// separator every answer the service renders for a failure of the INTEGRATION stage carries
+/// ([`SERVICE_SERIALIZED_RESPONSE_TYPES`]).
 pub(super) const INTEGRATION_TIMEOUT: GatewayRefusal = GatewayRefusal {
-    response_type: "INTEGRATION_TIMEOUT",
+    response_type: INTEGRATION_TIMEOUT_TYPE,
     message: Some(Cow::Borrowed("Endpoint request timed out")),
-    error_type: None,
+    error_type: Some(INTERNAL_SERVER_ERROR_EXCEPTION),
     validation_detail: Cow::Borrowed(""),
     message_member: MESSAGE_MEMBER,
 };
@@ -306,16 +312,33 @@ pub(super) const BAD_REQUEST_BODY_TYPE: &str = "BAD_REQUEST_BODY";
 /// answered through; see [`bad_request_parameters`].
 pub(super) const BAD_REQUEST_PARAMETERS_TYPE: &str = "BAD_REQUEST_PARAMETERS";
 
-/// The two gateway response types the method's REQUEST VALIDATOR produces.
+/// The gateway response type an integration that ran out of time is answered through; see
+/// [`INTEGRATION_TIMEOUT`].
+pub(super) const INTEGRATION_TIMEOUT_TYPE: &str = "INTEGRATION_TIMEOUT";
+
+/// The gateway response types whose default body API Gateway serializes ITSELF rather than
+/// rendering from the response type's own default template.
 ///
-/// Their default bodies are the VALIDATOR's own serialization, which writes a SPACE after
-/// the member separator — `{"message": "Invalid request body"}`, as the Developer Guide's
-/// request-validation walkthrough shows both of them — where every OTHER default body is
-/// what a gateway response's own default template produces
+/// Two classes of answer are the service's own serialization, and both write a SPACE after
+/// the member separator:
+///
+/// * the two refusals the method's REQUEST VALIDATOR produces —
+///   `{"message": "Invalid request body"}`, as the Developer Guide's request-validation
+///   walkthrough shows both of them;
+/// * the refusals of the INTEGRATION stage, where the backend rather than the api's own
+///   configuration is what failed the call: an integration that did not answer in time
+///   ([`INTEGRATION_TIMEOUT`]) is answered `{"message": "Endpoint request timed out"}`, and
+///   an integration whose backend answered a failure of its own is answered the service's own
+///   `Internal server error` envelope beside it ([`lambda_proxy`] renders it, in the same
+///   serialization as the `502` an answer the gateway cannot use earns).
+///
+/// Every OTHER default body is what a gateway response's own default template produces
 /// ([`crate::state::DEFAULT_GATEWAY_RESPONSE_TEMPLATE`],
-/// `{"message":$context.error.messageString}`), which is compact. One list, read by
-/// [`default_refusal_body`], so the two renderings cannot drift apart.
-pub(super) const VALIDATION_RESPONSE_TYPES: [&str; 2] = [BAD_REQUEST_BODY_TYPE, BAD_REQUEST_PARAMETERS_TYPE];
+/// `{"message":$context.error.messageString}`), which is compact and renders JSON `null` for
+/// a class the gateway sets no message for. One list, read by [`default_refusal_body`], so
+/// the two renderings cannot drift apart.
+pub(super) const SERVICE_SERIALIZED_RESPONSE_TYPES: [&str; 3] =
+    [BAD_REQUEST_BODY_TYPE, BAD_REQUEST_PARAMETERS_TYPE, INTEGRATION_TIMEOUT_TYPE];
 
 /// The gateway response type an over-sized payload is refused through; see
 /// [`request_too_large`].
@@ -466,7 +489,10 @@ pub(super) const AUTHORIZER_CONFIGURATION_EXCEPTION: &str = "AuthorizerConfigura
 
 /// The exception class the endpoint reports a refusal whose cause is the method's own
 /// configuration rather than its authorizer: an integration the stage cannot perform
-/// ([`API_CONFIGURATION_ERROR`]). A client's retry and alarm handling keys off this header,
+/// ([`API_CONFIGURATION_ERROR`]). It is the class of every SERVER-side fault of a call this
+/// endpoint could not pass on — an integration that did not answer in time
+/// ([`INTEGRATION_TIMEOUT`]) and an invocation the backend answered a failure of its own
+/// carry it too. A client's retry and alarm handling keys off this header,
 /// so a 5xx left without it is an untyped failure a caller can read only as prose.
 pub(super) const INTERNAL_SERVER_ERROR_EXCEPTION: &str = "InternalServerErrorException";
 
@@ -678,10 +704,10 @@ pub(super) fn gateway_response_headers(
 /// produces rather than a sentence ([`GatewayRefusal::message`]).
 ///
 /// Serialized by hand rather than through a JSON writer because the SEPARATOR is part of
-/// what API Gateway sends: the two bodies its request validator serializes itself carry a
-/// space after it ([`VALIDATION_RESPONSE_TYPES`], written by [`serialized_envelope`]) and
-/// the ones its gateway-response template renders carry none, so a client comparing or
-/// hashing the payload sees the bytes the service sends.
+/// what API Gateway sends: the bodies the service serializes itself carry a space after it
+/// ([`SERVICE_SERIALIZED_RESPONSE_TYPES`], written by [`serialized_envelope`]) and the ones
+/// its gateway-response template renders carry none, so a client comparing or hashing the
+/// payload sees the bytes the service sends.
 /// The member name and the sentence are both written as JSON strings, so a sentence
 /// carrying a quote or a backslash is escaped as the format requires.
 pub(super) fn default_refusal_body(refusal: &GatewayRefusal) -> Vec<u8> {
@@ -692,7 +718,7 @@ pub(super) fn default_refusal_body(refusal: &GatewayRefusal) -> Vec<u8> {
     if refusal.content_type() != JSON_CONTENT_TYPE {
         return refusal.message_text().as_bytes().to_vec();
     }
-    if VALIDATION_RESPONSE_TYPES.contains(&refusal.response_type) {
+    if SERVICE_SERIALIZED_RESPONSE_TYPES.contains(&refusal.response_type) {
         return serialized_envelope(refusal.message_member, refusal.message_text());
     }
     let member = ::serde_json::Value::String(refusal.message_member.to_string()).to_string();
