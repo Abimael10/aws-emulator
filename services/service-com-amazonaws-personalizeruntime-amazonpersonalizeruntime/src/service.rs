@@ -51,32 +51,6 @@ use std::sync::Arc;
 /// together, and only the message changes below.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
-/// A `@pattern` expression without the anchors the model spells it with. A `$` escaped
-/// by a backslash is a literal dollar sign inside the expression, not the end anchor,
-/// so it stays.
-///
-/// MIGRATION NOTE (the one `services/common/src/validation.rs` asks every new inliner
-/// to leave): the unanchored-pattern rule and the value-free subject below are the same
-/// in ~24 service crates (`grep -rln 'fn unanchored' services/*/src`). They are inlined
-/// here rather than called because `Violation::requirement` is private to the vendored
-/// framework and `vendor/` is read-only from inside the emulator, so there is no public
-/// seam to call; the fix that owns the migration declares the shared helper and replaces
-/// every copy, this one included, with a call to it.
-fn unanchored(pattern: &str) -> &str {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
-    match body.strip_suffix('$') {
-        Some(trimmed) => {
-            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
-            if backslashes % 2 == 0 {
-                trimmed
-            } else {
-                body
-            }
-        }
-        None => body,
-    }
-}
-
 /// Whether `violation` is the class this service words itself: a violated `@pattern`.
 fn is_pattern(violation: &Violation) -> bool {
     matches!(violation.kind, ViolationKind::Pattern(_))
@@ -84,20 +58,24 @@ fn is_pattern(violation: &Violation) -> bool {
 
 /// One clause of this service's `ValidationException` message.
 ///
-/// A violated `@pattern` is stated the way the Personalize data plane states it: the
-/// member path and the expression a value has to satisfy, WITHOUT the `^`/`$` anchors
-/// the model writes to make the match total, and WITHOUT echoing the rejected value —
-/// every patterned member of this service is a resource ARN, which the service does not
-/// quote back. Every other class keeps the framework's own clause, which already reads
-/// the way AWS words it.
+/// A clause states WHICH value was refused and WHAT it had to satisfy, and this service
+/// changes exactly ONE thing about the framework's own sentence: a violated `@pattern` is
+/// quoted WITHOUT the `^`/`$` anchors the model writes to make the match total. The SUBJECT
+/// half is not this service's to choose — a validation message is the only place a service
+/// reports the offending input back, so the clause echoes the value the caller submitted
+/// whatever class that value failed, and names no value only where the model marks the value
+/// `@sensitive` (`Context`'s and `FilterValues`'s map values are the only sensitive shapes
+/// this service's inputs reach; the framework's walk hides a sensitive value for every
+/// class). The requirement is restated here, not rewritten, by handing the unanchored
+/// expression back to the framework's own clause builder, so no class of violation and no
+/// member can drift into a different sentence for being one shape rather than another.
 fn clause(violation: &Violation) -> String {
     match &violation.kind {
-        ViolationKind::Pattern(pattern) => format!(
-            "Value at '{}' failed to satisfy constraint: Member must satisfy regular expression \
-             pattern: {}",
-            violation.path,
-            unanchored(pattern)
-        ),
+        ViolationKind::Pattern(pattern) => {
+            let mut stated = violation.clone();
+            stated.kind = ViolationKind::Pattern(::service_common::validation::unanchored(pattern));
+            stated.message()
+        }
         _ => violation.message(),
     }
 }
@@ -108,8 +86,9 @@ fn clause(violation: &Violation) -> String {
 /// `None` declines the refusal — leaving the framework's wording untouched — for a
 /// request with no `@pattern` violation in it, since that is the only class this file
 /// words differently. A request that mixes one with another class IS reworded, so the
-/// pattern clause loses its anchors and its value echo while every other clause reads
-/// exactly as the framework would have stated it.
+/// pattern clause loses its anchors while every other clause reads exactly as the
+/// framework would have stated it — and every clause of the envelope, pattern clause
+/// included, names the value its own member carried.
 fn pattern_envelope(violations: &[Violation]) -> Option<String> {
     if !violations.iter().any(is_pattern) {
         return None;
@@ -224,11 +203,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service reword it.
         //
         // Amazon Personalize Runtime states a violated `@pattern` without the model's
-        // anchors and without echoing the rejected value; the code stays the
-        // `ValidationException` (HTTP 400) the framework would have answered, so only
-        // the wording changes, and only for that class — every other refusal,
-        // authentication included, keeps the framework's wording because
-        // `pattern_envelope` declines it.
+        // anchors; the code stays the `ValidationException` (HTTP 400) the framework would
+        // have answered, so only the expression a clause quotes changes, and only for that
+        // class — every other refusal, authentication included, keeps the framework's
+        // wording because `pattern_envelope` declines it.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: VALIDATION_EXCEPTION.to_string(),

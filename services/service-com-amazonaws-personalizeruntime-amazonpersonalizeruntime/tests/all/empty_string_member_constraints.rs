@@ -12,9 +12,9 @@
 //!   `pattern ^arn:([a-z\d-]+):personalize:.*:.*:.+$`. The empty string satisfies the
 //!   length bound and misses the pattern, so an empty (or blank, or truncated) ARN is a
 //!   BOUNDARY `@pattern` violation: HTTP 400 `ValidationException` whose clause names the
-//!   member and the expression the value has to satisfy. No handler ever runs, so no
-//!   handler resolves an empty ARN and no refusal claims that a resource the request
-//!   never named "does not exist or is not active yet".
+//!   member, the value the request carried and the expression that value has to satisfy. No
+//!   handler ever runs, so no handler resolves an empty ARN and no refusal claims that a
+//!   resource the request never named "does not exist or is not active yet".
 //! * `UserID` / `ItemID` — `length 0..256` and no pattern. The empty string satisfies
 //!   every constraint they carry, so it reaches the handler, which reads it as the member
 //!   not being supplied (`crate::state::present`) and refuses NAMING THE MEMBER.
@@ -102,11 +102,12 @@ fn seeded() -> Emulator {
     emulator
 }
 
-/// The clause this service states for a value at `member` that misses [`ARN_PATTERN`].
-fn pattern_clause(member: &str) -> String {
+/// The clause this service states for `value` at `member` when it misses [`ARN_PATTERN`]:
+/// the member, the value the request carried and the expression it has to satisfy.
+fn pattern_clause(member: &str, value: &str) -> String {
     format!(
-        "1 validation error detected: Value at '{member}' failed to satisfy constraint: Member \
-         must satisfy regular expression pattern: {ARN_PATTERN_UNANCHORED}"
+        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy constraint: \
+         Member must satisfy regular expression pattern: {ARN_PATTERN_UNANCHORED}"
     )
 }
 
@@ -289,8 +290,9 @@ async fn a_value_the_length_bound_admits_and_the_pattern_refuses_names_the_membe
             );
             assert_eq!(
                 refusal.message,
-                pattern_clause(member.path),
-                "case {case}: expected the clause to name the member and the expression, got {:?}",
+                pattern_clause(member.path, &value),
+                "case {case}: expected the clause to name the member, the value and the \
+                 expression, got {:?}",
                 refusal.message
             );
             assert_ne!(
