@@ -67,16 +67,65 @@ pub fn message_content_checksum_mismatch(content_sha256: &str) -> String {
     )
 }
 
-/// The sentence a request whose resource label carries a version qualifier, on an
-/// operation whose own documentation says it may not, is refused with.
+/// The expression this endpoint ENFORCES for a message-template label on an operation whose
+/// own documentation says it "cannot contain any qualifier": the model's `UuidOrArn` shape
+/// (`smithy_query(query="shape",shape="UuidOrArn")`), which admits a uuid or an ARN and no
+/// `:<QUALIFIER>` group at all.
+///
+/// The member itself targets `UuidOrArnOrEitherWithQualifier`, whose own expression DOES
+/// admit `(:[A-Z0-9_$]+){0,1}`, so the stricter requirement is the service's rather than the
+/// model's — and it is the one a refusal of such a label states, as the expression that
+/// member's value had to satisfy.
+const MESSAGE_TEMPLATE_ID_WITHOUT_QUALIFIER_PATTERN: &str = concat!(
+    "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$|",
+    "^arn:[a-z-]*?:wisdom:[a-z0-9-]*?:[0-9]{12}:[a-z-]*?/",
+    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
+    "(?:/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}){0,2}$",
+);
+
+/// The message a request whose resource label carries a version qualifier, on an operation
+/// whose own documentation says it may not, is refused with.
 ///
 /// Those operations address the working copy (or name the version in a member of their
 /// own), and each documents the label as one that "cannot contain any qualifier"
 /// (`smithy_query(query="operation",operation="ActivateMessageTemplate")` and the other
-/// message-template writes), so a label that carries one is refused rather than read as if
-/// it named something. Its one variable part is the member the request carried it in.
+/// message-template writes), so the label is held to the expression that admits no
+/// qualifier ([`MESSAGE_TEMPLATE_ID_WITHOUT_QUALIFIER_PATTERN`]) and a value carrying one is
+/// refused as that member's PATTERN-constraint violation — the same clause, envelope and
+/// `@pattern` rendering this endpoint states for every other constrained member
+/// (`service_common::validation_message`, `service_common::validation::unanchored`), rather
+/// than prose of its own. Its variable parts are the member the request carried the value in
+/// and the expression that member's value had to satisfy.
+///
+/// The value half is DROPPED: the requirement is the expression the label had to match, and
+/// a clause that states it names the member and the constraint alone.
 pub fn message_qualifier_not_accepted(member: &str) -> String {
-    format!("The {member} cannot contain a qualifier.")
+    let violation = ::smithy_server_runtime::Violation {
+        path: member.to_string(),
+        kind: ::smithy_server_runtime::ViolationKind::Pattern(::service_common::validation::unanchored(
+            MESSAGE_TEMPLATE_ID_WITHOUT_QUALIFIER_PATTERN,
+        )),
+        value: None,
+        sensitive: false,
+    };
+    let clause = ::service_common::validation_message::valueless_clause(&violation)
+        .unwrap_or_else(|| violation.message());
+    ::service_common::validation_message::envelope_over(std::slice::from_ref(&clause))
+        .unwrap_or(clause)
+}
+
+/// The sentence a `DeactivateMessageTemplate` naming a version that is not the template's
+/// ACTIVE one is refused with.
+///
+/// The operation deactivates "a specific version of the Amazon Q in Connect message
+/// template" whose status is active — the counterpart of `ActivateMessageTemplate`, after
+/// which "you can no longer use the $ACTIVE_VERSION qualifier to reference the version in
+/// active status" (`smithy_query(query="doc",shape="DeactivateMessageTemplate")`) — so a
+/// version the template never activated, or one a later activation deactivated, is not a
+/// version this call can deactivate. Its one variable part is the `versionNumber` the
+/// request named.
+pub fn message_message_template_version_not_active(version_number: i64) -> String {
+    format!("Version {version_number} is not an active version")
 }
 
 /// One published version of a message template: the snapshot that was taken of the working
@@ -146,6 +195,24 @@ impl MessageTemplateVersion {
 /// in ascending `versionNumber` order — the order a publish appends in, so what a listing
 /// reports does not depend on map iteration order.
 pub type MessageTemplateVersions = HashMap<String, Vec<MessageTemplateVersion>>;
+
+/// What the store found when `DeactivateMessageTemplate` asked it to deactivate one
+/// published version of a template.
+///
+/// The three answers are what the operation's two refusals and its success are decided
+/// from, so the handler never has to re-read the record to tell them apart: a version the
+/// template never published names no resource, and one it published but did not activate is
+/// not a version in active status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageTemplateDeactivation {
+    /// The version was the template's ACTIVE one, and is active no longer.
+    Deactivated,
+    /// The template published this version, but it was not the active one: nothing was
+    /// written.
+    NotActive,
+    /// The template published no version under that number: nothing was written.
+    NoSuchVersion,
+}
 
 impl ComAmazonawsQconnectWisdomserviceState {
     /// Every published version of one message template, in ascending `versionNumber`
@@ -237,26 +304,30 @@ impl ComAmazonawsQconnectWisdomserviceState {
         true
     }
 
-    /// Deactivate one published version of a template, answering whether the template
-    /// published a version under that number — what `DeactivateMessageTemplate` calls, so
-    /// that after it no version of the template is the activated one. A version that was
-    /// not activated stays inactive, and the other versions are left as they were.
+    /// Deactivate one published version of a template, answering what the store found —
+    /// whether the template published a version under that number at all, and whether that
+    /// version was the ACTIVE one, which is the only version this call deactivates
+    /// ([`MessageTemplateDeactivation`]). Nothing is written unless the version was active,
+    /// and the other versions are left as they were either way.
     pub fn deactivate_message_template_version(
         &mut self,
         message_template_id: &str,
         version_number: i64,
-    ) -> bool {
+    ) -> MessageTemplateDeactivation {
         let Some(versions) = self.message_template_versions.get_mut(message_template_id) else {
-            return false;
+            return MessageTemplateDeactivation::NoSuchVersion;
         };
         let Some(version) = versions
             .iter_mut()
             .find(|version| version.version_number == version_number)
         else {
-            return false;
+            return MessageTemplateDeactivation::NoSuchVersion;
         };
+        if !version.is_active {
+            return MessageTemplateDeactivation::NotActive;
+        }
         version.is_active = false;
-        true
+        MessageTemplateDeactivation::Deactivated
     }
 
     /// Forget every published version of one message template — what the delete of the

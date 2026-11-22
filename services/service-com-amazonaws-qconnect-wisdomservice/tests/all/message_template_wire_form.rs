@@ -52,9 +52,20 @@ const CONTENT_TYPE_PLAIN: &str = "application/x.quickresponse;format=plain";
 /// The managed qualifier that names a template's working copy.
 const QUALIFIER_LATEST: &str = "$LATEST";
 
-/// The sentence a label that carries a version qualifier is refused with, on an operation
-/// whose own documentation says it may not carry one.
-const MESSAGE_QUALIFIER_NOT_ACCEPTED: &str = "The messageTemplateId cannot contain a qualifier.";
+/// The message a label that carries a version qualifier is refused with, on an operation
+/// whose own documentation says it may not carry one: AWS's constraint-violation report for
+/// the member, stating the expression the service enforces for it — the model's `UuidOrArn`
+/// (`smithy_query(query="shape",shape="UuidOrArn")`), which admits no qualifier group, quoted
+/// without the anchors a whole-value pattern is wrapped in. Written out here rather than
+/// imported from the implementation, so the assertion pins the message a client sees.
+const MESSAGE_QUALIFIER_NOT_ACCEPTED: &str = concat!(
+    "1 validation error detected: Value at 'messageTemplateId' failed to satisfy constraint: ",
+    "Member must satisfy regular expression pattern: ",
+    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$|",
+    "^arn:[a-z-]*?:wisdom:[a-z0-9-]*?:[0-9]{12}:[a-z-]*?/",
+    "[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}",
+    "(?:/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}){0,2}",
+);
 
 /// The sentence a create (or a rename) claiming a name a live template of the knowledge base
 /// already holds is refused with.

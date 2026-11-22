@@ -26,7 +26,8 @@
 //! * activating a version makes it the activated one and deactivates the version that was
 //!   active, so at most one version of a template reports `isActive: true` and
 //!   `$ACTIVE_VERSION` resolves to it; deactivating the activated version leaves none
-//!   activated, so `$ACTIVE_VERSION` then names nothing;
+//!   activated, so `$ACTIVE_VERSION` then names nothing, and only the version in ACTIVE
+//!   status can be deactivated at all (see `message_template_version_refusals`);
 //! * a published version is IMMUTABLE: a later `UpdateMessageTemplate` applies to the
 //!   working copy (`$LATEST`) alone and leaves every published version's content, language,
 //!   attributes and checksum as they were;
@@ -44,6 +45,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_qconnect_wisdomservice::state::MAX_MESSAGE_TEMPLATE_VERSIONS_PER_TEMPLATE;
 
 use super::message_template::{content_for, CHANNEL_SUBTYPES, DEFAULT_LANGUAGE};
+use super::message_template_version_refusals::message_version_not_active;
 use super::resource_tags::{label, wisdom_arn, Emulator, Reply, ABSENT_UUID, OTHER_ACCOUNT, REGION};
 
 /// The sentence a request addressed to a message-template version that was never published
@@ -89,7 +91,7 @@ fn expected_version_arn(knowledge_base_id: &str, message_template_id: &str, qual
 
 /// `CreateKnowledgeBase` of the type that holds message templates, answering with the id
 /// its create minted.
-async fn knowledge_base(emulator: &Emulator, name: &str) -> String {
+pub(crate) async fn knowledge_base(emulator: &Emulator, name: &str) -> String {
     let reply = emulator
         .send(
             "POST",
@@ -107,7 +109,7 @@ async fn knowledge_base(emulator: &Emulator, name: &str) -> String {
 }
 
 /// `CreateMessageTemplate`, answering with the `messageTemplateId` its create minted.
-async fn message_template(
+pub(crate) async fn message_template(
     emulator: &Emulator,
     knowledge_base_id: &str,
     name: &str,
@@ -139,7 +141,7 @@ async fn message_template(
 
 /// `CreateMessageTemplateVersion`, optionally carrying the caller's
 /// `messageTemplateContentSha256` precondition.
-async fn publish(
+pub(crate) async fn publish(
     emulator: &Emulator,
     knowledge_base_id: &str,
     message_template: &str,
@@ -163,7 +165,7 @@ async fn publish(
 }
 
 /// `ActivateMessageTemplate` for one `versionNumber`.
-async fn activate(
+pub(crate) async fn activate(
     emulator: &Emulator,
     knowledge_base_id: &str,
     message_template: &str,
@@ -183,7 +185,7 @@ async fn activate(
 }
 
 /// `DeactivateMessageTemplate` for one `versionNumber`.
-async fn deactivate(
+pub(crate) async fn deactivate(
     emulator: &Emulator,
     knowledge_base_id: &str,
     message_template: &str,
@@ -203,7 +205,7 @@ async fn deactivate(
 }
 
 /// `ListMessageTemplateVersions`, with whatever query string the row pages with.
-async fn list_versions(
+pub(crate) async fn list_versions(
     emulator: &Emulator,
     knowledge_base_id: &str,
     message_template: &str,
@@ -223,7 +225,11 @@ async fn list_versions(
 }
 
 /// `GetMessageTemplate`, whose label may carry a version qualifier.
-async fn read(emulator: &Emulator, knowledge_base_id: &str, message_template: &str) -> Reply {
+pub(crate) async fn read(
+    emulator: &Emulator,
+    knowledge_base_id: &str,
+    message_template: &str,
+) -> Reply {
     emulator
         .send(
             "GET",
@@ -238,7 +244,7 @@ async fn read(emulator: &Emulator, knowledge_base_id: &str, message_template: &s
 }
 
 /// `UpdateMessageTemplate` with whatever members the row changes.
-async fn update(
+pub(crate) async fn update(
     emulator: &Emulator,
     knowledge_base_id: &str,
     message_template: &str,
@@ -259,12 +265,12 @@ async fn update(
 
 /// An `sms` content union member carrying `body`, so two rows differ in exactly the
 /// content the checksum is calculated over.
-fn sms_content(body: &str) -> Value {
+pub(crate) fn sms_content(body: &str) -> Value {
     json!({ "sms": { "body": { "plainText": { "content": body } } } })
 }
 
 /// The integer at `pointer`, or `None` when the response does not carry it.
-fn integer(reply: &Reply, pointer: &str) -> Option<i64> {
+pub(crate) fn integer(reply: &Reply, pointer: &str) -> Option<i64> {
     reply.field(pointer).and_then(Value::as_i64)
 }
 
@@ -274,7 +280,7 @@ fn boolean(reply: &Reply, pointer: &str) -> Option<bool> {
 }
 
 /// The `versionNumber`s one listing reports, in the order it reported them.
-fn listed_versions(reply: &Reply) -> Vec<i64> {
+pub(crate) fn listed_versions(reply: &Reply) -> Vec<i64> {
     reply
         .field("/messageTemplateVersionSummaries")
         .and_then(Value::as_array)
@@ -293,7 +299,7 @@ fn listed_versions(reply: &Reply) -> Vec<i64> {
 }
 
 /// The `versionNumber`s one listing reports as ACTIVATED.
-fn listed_active_versions(reply: &Reply) -> Vec<i64> {
+pub(crate) fn listed_active_versions(reply: &Reply) -> Vec<i64> {
     reply
         .field("/messageTemplateVersionSummaries")
         .and_then(Value::as_array)
@@ -314,7 +320,7 @@ fn listed_active_versions(reply: &Reply) -> Vec<i64> {
 
 /// Publish `count` versions of one template, each from a working copy the previous version
 /// does not hold, answering with the version numbers that were published.
-async fn publish_versions(
+pub(crate) async fn publish_versions(
     emulator: &Emulator,
     knowledge_base_id: &str,
     message_template: &str,
@@ -795,31 +801,56 @@ async fn activating_a_version_deactivates_the_one_that_was_active() {
     }
 
     // The other half of the pair: "After the version is deactivated, you can no longer use
-    // the $ACTIVE_VERSION qualifier to reference the version in active status." The rows
-    // differ along whether the version deactivated is the activated one.
-    let active_version = 3_i64;
-    for asked in [1_i64, active_version, active_version] {
-        let still_active = (asked != active_version).then_some(active_version);
+    // the $ACTIVE_VERSION qualifier to reference the version in active status." Only the
+    // version in ACTIVE status can be deactivated, so the rows differ along whether the
+    // version asked for is the activated one: a version that is not is refused and leaves
+    // the activation exactly where it was.
+    let mut active_version = Some(3_i64);
+    for asked in [1_i64, 3, 3] {
+        let deactivates = active_version == Some(asked);
         let reply = deactivate(&emulator, &knowledge_base_id, &message_template_id, asked).await;
-        assert_eq!(
-            reply.status, 200,
-            "case \"deactivate {asked}\": expected HTTP 200, got HTTP {} with body {}",
-            reply.status, reply.body
-        );
-        assert_eq!(
-            integer(&reply, "/versionNumber"),
-            Some(asked),
-            "case \"deactivate {asked}\": the deactivation reports the version it deactivated, \
-             got {:?}",
-            integer(&reply, "/versionNumber")
-        );
+        if deactivates {
+            assert_eq!(
+                reply.status, 200,
+                "case \"deactivate {asked}\": the activated version deactivates; expected HTTP \
+                 200, got HTTP {} with body {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                integer(&reply, "/versionNumber"),
+                Some(asked),
+                "case \"deactivate {asked}\": the deactivation reports the version it \
+                 deactivated, got {:?}",
+                integer(&reply, "/versionNumber")
+            );
+            active_version = None;
+        } else {
+            assert_eq!(
+                reply.status, 400,
+                "case \"deactivate {asked}\": a version that is not the activated one cannot be \
+                 deactivated; expected HTTP 400, got HTTP {} with body {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_type, "ValidationException",
+                "case \"deactivate {asked}\": expected error type ValidationException, got {:?}",
+                reply.error_type
+            );
+            assert_eq!(
+                reply.string("/message"),
+                message_version_not_active(asked),
+                "case \"deactivate {asked}\": expected the message {:?}, got {:?}",
+                message_version_not_active(asked),
+                reply.string("/message")
+            );
+        }
 
         let listing = list_versions(&emulator, &knowledge_base_id, &message_template_id, "").await;
         assert_eq!(
             listed_active_versions(&listing),
-            still_active.into_iter().collect::<Vec<i64>>(),
-            "case \"deactivate {asked}\": deactivating a version that was not the activated one \
-             leaves that one active, got {:?}",
+            active_version.into_iter().collect::<Vec<i64>>(),
+            "case \"deactivate {asked}\": only deactivating the activated version changes which \
+             version is active, got {:?}",
             listed_active_versions(&listing)
         );
 
@@ -829,7 +860,7 @@ async fn activating_a_version_deactivates_the_one_that_was_active() {
             &format!("{message_template_id}:{QUALIFIER_ACTIVE}"),
         )
         .await;
-        let expected_status = if still_active.is_some() { 200 } else { 404 };
+        let expected_status = if active_version.is_some() { 200 } else { 404 };
         assert_eq!(
             active.status, expected_status,
             "case \"deactivate {asked}\": {QUALIFIER_ACTIVE} names the activated version while \

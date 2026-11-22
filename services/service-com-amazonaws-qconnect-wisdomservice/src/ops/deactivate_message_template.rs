@@ -2,10 +2,11 @@
 
 //! @op DeactivateMessageTemplate
 //!
-//! Deactivates one PUBLISHED version of a message template, so that afterwards no version
-//! of it is the activated one and `$ACTIVE_VERSION` names nothing — the other half of
-//! `ActivateMessageTemplate`. A `versionNumber` the template never published names
-//! nothing, so the request is refused and nothing is written.
+//! Deactivates the version of a message template that is in ACTIVE status, so that
+//! afterwards no version of it is the activated one and `$ACTIVE_VERSION` names nothing —
+//! the other half of `ActivateMessageTemplate`. A `versionNumber` the template never
+//! published names nothing, and one it published but never activated is not a version in
+//! active status, so either request is refused and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -226,15 +227,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // A version exists only once `CreateMessageTemplateVersion` published it, so a
-        // `versionNumber` this template never published names no resource: the request is
-        // refused and the store is left exactly as it was. The resource named is the
-        // version, which the API addresses as `<message-template-id>:<versionNumber>`.
-        if !store.deactivate_message_template_version(&message_template_id, input.version_number) {
-            return Err(not_found(
-                crate::state::MESSAGE_MESSAGE_TEMPLATE_VERSION_NOT_FOUND,
-                &format!("{message_template_id}:{}", input.version_number),
-            ));
+        // Only the version in ACTIVE status can be deactivated — this operation is the
+        // counterpart of `ActivateMessageTemplate`, after which `$ACTIVE_VERSION` names
+        // nothing. A `versionNumber` this template never published names no resource at
+        // all, and one it published but did not activate is refused with the modelled
+        // input failure; either way the store is left exactly as it was. The resource a
+        // not-found names is the version, which the API addresses as
+        // `<message-template-id>:<versionNumber>`.
+        match store.deactivate_message_template_version(&message_template_id, input.version_number) {
+            crate::state::MessageTemplateDeactivation::Deactivated => {}
+            crate::state::MessageTemplateDeactivation::NotActive => {
+                return Err(validation(
+                    crate::state::message_message_template_version_not_active(input.version_number),
+                ));
+            }
+            crate::state::MessageTemplateDeactivation::NoSuchVersion => {
+                return Err(not_found(
+                    crate::state::MESSAGE_MESSAGE_TEMPLATE_VERSION_NOT_FOUND,
+                    &format!("{message_template_id}:{}", input.version_number),
+                ));
+            }
         }
 
         // Answer out of the record the deactivation wrote rather than out of the request,
