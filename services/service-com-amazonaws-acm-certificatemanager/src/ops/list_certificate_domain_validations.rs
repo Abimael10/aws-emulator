@@ -10,12 +10,14 @@
 //! the certificate it names — `RequestCertificate` wrote those records, and this
 //! operation reads them.
 //!
-//! The challenge names the evidence the method asks for; the per-name evidence itself —
-//! the DNS record to publish and the mail suffix ACM writes to — is
-//! `DescribeCertificate`'s to report
-//! (`CertificateDetail$DomainValidationOptions[*].ResourceRecord` /
-//! `[*].ValidationDomain`), so the DNS arm here carries no record of its own and the
-//! email arm's `ValidationDomain` is the covered name this summary is about.
+//! The challenge CARRIES the evidence the requested method asks for, read off that same
+//! stored record: the DNS arm carries this domain's minted CNAME — the operation's own
+//! doc names retrieving "the CNAME records required for DNS validation" as what its
+//! results are for — and it is the very record
+//! `CertificateDetail$DomainValidationOptions[*].ResourceRecord` projects, so the two
+//! readers of one store cannot disagree. The email arm carries the addresses ACM has
+//! mailed and names the covered name this summary is about, while the mail SUFFIX ACM
+//! writes to for that name stays the certificate detail's `[*].ValidationDomain`.
 //!
 //! The summaries are reported in DOMAIN-NAME order, the total order this paginated read
 //! cuts and resumes its pages in.
@@ -365,19 +367,20 @@ fn requested_configuration(
 /// so an HTTP-validated domain carries no challenge here rather than one of the two
 /// shapes that would describe evidence it does not use.
 ///
-/// Each arm is about THIS domain and carries no evidence another projection owns, which
-/// is what the recorded responses of this operation serve:
+/// Each arm carries the evidence its own method asks for, as this domain's stored record
+/// holds it — never a value synthesised here:
 ///
 /// * the email arm names the addresses ACM has used — the empty list until a dispatch
 ///   has used one — and `ValidationDomain` is the name this summary is about: the
 ///   covered domain name as the request wrote it, its wildcard label included. The mail
 ///   SUFFIX ACM writes to for that name is the certificate's own record to report,
 ///   on `CertificateDetail$DomainValidationOptions[*].ValidationDomain`;
-/// * the DNS arm carries no resource record at all, because the record to publish is
-///   likewise reported by `DescribeCertificate`, on
-///   `CertificateDetail$DomainValidationOptions[*].ResourceRecord`, and a client that
-///   published a CNAME taken from here would publish one this operation is not the
-///   source of.
+/// * the DNS arm carries `ResourceRecord` — the CNAME this domain's validation minted,
+///   `{Name, Type: CNAME, Value}` — because retrieving "the CNAME records required for
+///   DNS validation" is what this operation's own doc says its results are for, and a
+///   client that publishes the record this challenge hands it publishes exactly the one
+///   `CertificateDetail$DomainValidationOptions[*].ResourceRecord` reports for the same
+///   name.
 fn validation_challenge(
     record: &crate::state::DomainValidationRecord,
 ) -> Option<ValidationChallenge> {
@@ -388,10 +391,12 @@ fn validation_challenge(
                 validation_domain: Some(record.domain_name.clone()),
             }),
         ),
-        // The DNS challenge this domain stands under, named as the challenge it is;
-        // the CNAME itself belongs to `DescribeCertificate`'s projection.
+        // The DNS challenge this domain stands under, carrying the CNAME the stored
+        // validation minted for it — the one record `DescribeCertificate` reports too.
         crate::state::VALIDATION_METHOD_DNS => Some(
-            ValidationChallenge::DnsValidationChallenge(DnsValidationChallenge::default()),
+            ValidationChallenge::DnsValidationChallenge(DnsValidationChallenge {
+                resource_record: record.resource_record.clone(),
+            }),
         ),
         // `HTTP`: the union models no member for it, so there is no challenge to
         // report rather than one describing evidence the method does not use.

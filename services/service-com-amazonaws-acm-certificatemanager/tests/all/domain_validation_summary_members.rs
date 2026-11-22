@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::certificate_domain_validations::{
-    assert_summary_matches_record, described_validations, names, summaries,
+    assert_resource_record, assert_summary_matches_record, described_validations, names, summaries,
     CONFIGURATION_MEMBER, DEFAULT_VALIDATION_METHOD, FAILED, PENDING_VALIDATION, PRIVATE_CA_ARN,
     UNREPORTED_CONFIGURATION_MEMBER, VALIDATION_METHODS,
 };
@@ -121,12 +121,12 @@ fn assert_configuration_member(case: &str, summary: &Value, method: &str, status
                 "case {case}: a DNS-validated domain carries the DnsValidationChallenge arm, \
                  got {summary}"
             );
-            // The CNAME to publish is `DescribeCertificate`'s to report, on
-            // `CertificateDetail$DomainValidationOptions[*].ResourceRecord`; this arm
-            // names the challenge and carries no record of its own.
-            assert!(
-                challenge["DnsValidationChallenge"]["ResourceRecord"].is_null(),
-                "case {case}: the DNS challenge here carries no resource record, got {summary}"
+            // The challenge carries the CNAME to publish, which is what the operation's
+            // own doc says its results are for.
+            assert_resource_record(
+                case,
+                &challenge["DnsValidationChallenge"]["ResourceRecord"],
+                &summary["DomainName"],
             );
         }
         "HTTP" => assert!(

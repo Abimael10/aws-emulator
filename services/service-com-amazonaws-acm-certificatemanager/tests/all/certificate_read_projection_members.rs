@@ -5,13 +5,13 @@
 //!
 //! RULES under test, each asserted over a table that spans what it generalises over:
 //!
-//! 1. `ListCertificateDomainValidations` reports the KIND of challenge a domain's
-//!    validation stands under and not the per-name evidence another projection owns: the
-//!    DNS arm carries no resource record, because the record to publish is
-//!    `DescribeCertificate`'s to report on
-//!    `CertificateDetail$DomainValidationOptions[*].ResourceRecord`, and the email arm's
-//!    `ValidationDomain` is the covered name the summary is about, while the mail SUFFIX
-//!    ACM writes to for that name is the detail's `[*].ValidationDomain`.
+//! 1. `ListCertificateDomainValidations` reports the evidence a domain's validation
+//!    stands under, read off the same stored record the certificate detail projects: the
+//!    DNS arm carries that name's CNAME `ResourceRecord`, the record
+//!    `CertificateDetail$DomainValidationOptions[*].ResourceRecord` reports for the same
+//!    name, and the email arm's `ValidationDomain` is the covered name the summary is
+//!    about, while the mail SUFFIX ACM writes to for that name is the detail's
+//!    `[*].ValidationDomain`.
 //! 2. `ValidationEmails` is "a list of email addresses that ACM used to send domain
 //!    validation emails" (`smithy_query(query="doc",
 //!    shape="com.amazonaws.acm#DomainValidation", member="ValidationEmails")`), so an
@@ -166,10 +166,10 @@ fn reported_mailboxes(carrier: &Value) -> Option<Vec<String>> {
     Some(mailboxes)
 }
 
-/// RULE 1: for every DNS-validated name, the summary's challenge is the DNS arm with no
-/// resource record, while the detail of the same certificate carries that name's CNAME.
+/// RULE 1: for every DNS-validated name, the summary's challenge is the DNS arm carrying
+/// that name's CNAME, the very record the detail of the same certificate reports.
 #[tokio::test]
-async fn the_dns_challenge_names_the_arm_and_the_record_lives_on_the_detail() {
+async fn the_dns_challenge_carries_the_cname_the_detail_reports() {
     // Rows differ along the number of names covered (one, an apex with a `www.` name,
     // three) and the form of each name (apex, subdomain, wildcard).
     let cases: &[(&str, Value, &[&str])] = &[
@@ -217,18 +217,23 @@ async fn the_dns_challenge_names_the_arm_and_the_record_lives_on_the_detail() {
             );
             assert_eq!(
                 challenge.as_object().map(|arm| arm.len()),
-                Some(0),
-                "case {row}: the DNS challenge here carries no member of its own, got {challenge}"
+                Some(1),
+                "case {row}: the DNS challenge carries exactly its ResourceRecord, got {challenge}"
             );
 
-            // The record itself is the detail's to report, and it is a real CNAME under
-            // the name being proven.
+            // The record is a real CNAME under the name being proven, and it is the same
+            // record the certificate's detail reports for that name.
             let entry = described(&row, &detail, name);
             let record = &entry["ResourceRecord"];
             assert_eq!(
+                &challenge["ResourceRecord"],
+                record,
+                "case {row}: both readers of one stored record report one CNAME, got {challenge}"
+            );
+            assert_eq!(
                 record["Type"].as_str(),
                 Some("CNAME"),
-                "case {row}: the detail reports the CNAME to publish, got {entry}"
+                "case {row}: the CNAME to publish is reported, got {entry}"
             );
             let proven = name.strip_prefix("*.").unwrap_or(name);
             let record_name = record["Name"].as_str().unwrap_or_default();

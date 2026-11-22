@@ -133,6 +133,36 @@ pub(crate) fn names(list: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Assert a DNS challenge's `ResourceRecord` is a fully populated CNAME for `domain`:
+/// all three required members present (`ResourceRecord{Name required, Type required,
+/// Value required}`), `Type` the single modelled enum value `CNAME`
+/// (`smithy_query(query="shape", shape="com.amazonaws.acm#RecordType")`), and `Name` a
+/// validation label under the name being proven (a wildcard is proven through the
+/// domain it covers).
+pub(crate) fn assert_resource_record(case: &str, record: &Value, domain: &Value) {
+    assert!(
+        record.is_object(),
+        "case {case}: expected a ResourceRecord structure, got {record}"
+    );
+    assert_eq!(
+        record["Type"].as_str(),
+        Some("CNAME"),
+        "case {case}: expected the one modelled record type CNAME, got {record}"
+    );
+    let name = record["Name"].as_str().unwrap_or_default();
+    let value = record["Value"].as_str().unwrap_or_default();
+    assert!(
+        !name.is_empty() && !value.is_empty(),
+        "case {case}: Name and Value are required members, got {record}"
+    );
+    let covered = domain.as_str().unwrap_or_default();
+    let proven = covered.strip_prefix("*.").unwrap_or(covered);
+    assert!(
+        name.starts_with('_') && name.ends_with(&format!(".{proven}.")),
+        "case {case}: expected a validation label under {proven}, got {name:?}"
+    );
+}
+
 /// Assert one summary against the `DescribeCertificate` record of the same domain:
 /// same method, same status, and the challenge the model describes for that method,
 /// naming the evidence that method asks for.
@@ -169,22 +199,20 @@ pub(crate) fn assert_summary_matches_record(
 
     let challenge = &requested["ValidationChallenge"];
     match method {
-        // `DnsValidationChallenge` names the challenge the domain stands under; the
-        // CNAME to publish is `DescribeCertificate`'s to report, on
-        // `DomainValidationOptions[*].ResourceRecord`, so this arm carries no record
-        // of its own.
+        // `DnsValidationChallenge` carries the CNAME this domain's validation minted,
+        // which is the record `DescribeCertificate` reports for the same name on
+        // `DomainValidationOptions[*].ResourceRecord`: one store, two readers, one
+        // record.
         "DNS" => {
             assert!(
                 challenge["DnsValidationChallenge"].is_object(),
                 "case {case}: a DNS-validated domain carries the DnsValidationChallenge arm, got {summary}"
             );
-            assert!(
-                challenge["DnsValidationChallenge"]["ResourceRecord"].is_null(),
-                "case {case}: the CNAME is reported by DescribeCertificate, not here, got {summary}"
-            );
-            assert!(
-                !described["ResourceRecord"].is_null(),
-                "case {case}: the stored record must still carry the CNAME, got {described}"
+            assert_resource_record(case, &challenge["DnsValidationChallenge"]["ResourceRecord"], &summary["DomainName"]);
+            assert_eq!(
+                challenge["DnsValidationChallenge"]["ResourceRecord"],
+                described["ResourceRecord"],
+                "case {case}: the challenge must carry the stored CNAME DescribeCertificate reports, got {summary}"
             );
         }
         // `EmailValidationChallenge` carries the addresses ACM used and the domain this

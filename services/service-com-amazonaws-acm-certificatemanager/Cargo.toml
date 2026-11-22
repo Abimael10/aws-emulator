@@ -71,6 +71,9 @@ sec1 = "0.7"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so this
+# crate's suites are one cargo target and a new suite needs no declaration.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The CLIENT half of the ACME wire: the tests generate account key pairs and sign the JWS
