@@ -9,28 +9,36 @@
 //!
 //! ## Decision order
 //!
-//! 1. the request's credential is one the identity store holds as valid, else the modelled
+//! 1. `SerialPort` is the one port the model admits, else `InvalidArgsException` — decided
+//!    from the request ALONE, before any state is read and before the owner of the instance
+//!    is asked anything;
+//! 2. the request's credential is one the identity store holds as valid, else the modelled
 //!    `AuthException` — a credential that is not valid speaks for no principal, so no policy
-//!    is consulted at all;
-//! 2. the caller's IAM identity-based policies allow
+//!    is consulted at all, and nothing is looked up for it either
+//!    ([`crate::state::authorization::authenticate`]);
+//! 3. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
+//!    no EC2 can be asked), resolved HERE rather than later because the instance's tags are
+//!    part of the condition context the next decision is taken in;
+//! 4. the caller's IAM identity-based policies allow
 //!    `ec2-instance-connect:SendSerialConsoleSSHPublicKey` on the instance's ARN, else
-//!    `AccessDeniedException` (HTTP 403) — both decisions are taken BEFORE anything about the
-//!    account or the instance is reported ([`crate::state::authorization`]);
-//! 3. the account has serial-console access, else `SerialConsoleAccessDisabledException`;
-//! 4. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
-//!    no EC2 can be asked), else `EC2InstanceNotFoundException`;
-//! 5. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
+//!    `AccessDeniedException` (HTTP 403) — taken before anything about the account or the
+//!    instance is reported and before any key is stored
+//!    ([`crate::state::authorization::withheld`]);
+//! 5. the account has serial-console access, else `SerialConsoleAccessDisabledException`;
+//! 6. the instance EC2 was asked about exists, else `EC2InstanceNotFoundException`;
+//! 7. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
 //!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
-//! 6. its instance type supports the serial console, else `EC2InstanceTypeInvalidException`;
-//! 7. the key is stored against (instance id, serial port), replacing whatever was there and
+//! 8. its instance type supports the serial console, else `EC2InstanceTypeInvalidException`;
+//! 9. the key is stored against (instance id, serial port), replacing whatever was there and
 //!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
 //!    `RequestId`.
 //!
 //! Every member this operation carries (`InstanceId`, `SSHPublicKey`, `SerialPort`) has its
 //! modelled constraints enforced by the framework before this handler runs, and
 //! `crate::service` words that refusal as the modelled `InvalidArgsException`; there is no
-//! constraint here the framework cannot evaluate, so the handler adds none.
+//! constraint here the framework cannot evaluate, so the handler's own port check only
+//! restates the modelled range rather than adding a constraint.
 //!
 //! Every client error above is served with HTTP 400 whatever `@httpError` the shape
 //! carries — see [`crate::scaffolded::client_error_status`], which owns that mapping for
@@ -199,6 +207,27 @@ impl<Eng> SendSerialConsoleSSHPublicKey<Eng> {
     }
 }
 
+/// This operation's answer for a push IAM withheld, so the two steps of the gate word the
+/// same refusal the same way. Same rule, and the same two answers, as `SendSSHPublicKey`.
+fn refused(refusal: crate::state::authorization::Refusal) -> SendSerialConsoleSSHPublicKeyError {
+    match refusal {
+        // The credential the request presented is not one the identity store holds as valid,
+        // so it speaks for no principal and no policy was consulted: the modelled error this
+        // service declares for a credential that is not valid.
+        crate::state::authorization::Refusal::InvalidCredential(message) => {
+            SendSerialConsoleSSHPublicKeyErrorModeled::AuthException(AuthException {
+                message: Some(message),
+            })
+            .into()
+        }
+        // A principal whose policies do not allow the call: AWS's own authorization answer,
+        // which this service's model declares no shape for.
+        crate::state::authorization::Refusal::NotAuthorized(message) => {
+            crate::scaffolded::Scaffolded::access_denied(message)
+        }
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for SendSerialConsoleSSHPublicKey<Eng>
 {
@@ -216,6 +245,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The model gives `SerialPort` the range 0..0, so the boundary validator has already
+        // refused any other port before this handler runs. Restated here as the modelled
+        // `InvalidArgsException` rather than a panic, so the handler stands on its own — and
+        // decided from the REQUEST alone, before any state is read and before the owner of
+        // the instance is asked anything, because a request is not a resource lookup until
+        // its own values are legal.
+        if input.serial_port != crate::state::SERIAL_CONSOLE_PORT {
+            return Err(SendSerialConsoleSSHPublicKeyErrorModeled::InvalidArgsException(
+                InvalidArgsException {
+                    message: Some(format!(
+                        "SerialPort {} is not supported; only port {} is supported",
+                        input.serial_port,
+                        crate::state::SERIAL_CONSOLE_PORT
+                    )),
+                },
+            )
+            .into());
+        }
+
         let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
             SendSerialConsoleSSHPublicKeyErrorModeled::ServiceException(ServiceException {
                 message: Some(
@@ -224,56 +272,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Whether the caller may push a serial-console key at that instance at all is IAM's
+        // decision, and its first step needs nothing but the request: a credential the
+        // identity store does not hold as valid speaks for no principal, so no policy is
+        // consulted for it and neither the account's status nor the instance is looked up for
+        // it. Same rule, and the same gate, as `SendSSHPublicKey`.
+        let region = crate::state::request_region(ctx.parts());
+        let resource = crate::state::authorization::instance_resource(&region, &input.instance_id);
+        let caller =
+            crate::state::authorization::authenticate(&*self.engine, ctx, Self::NAME, &resource)
+                .map_err(refused)?;
+
         // The instance and the account's serial-console status are both EC2's to report, so
         // EC2 is asked for them BEFORE this service's store is locked: nothing of this
         // service is held while another service answers, and both hops stay in the Region
-        // this request was signed for.
-        let region = crate::state::request_region(ctx.parts());
+        // this request was signed for. This service's own registry is read only when no EC2
+        // could be asked at all — same rule, and the same helper, as `SendSSHPublicKey`
+        // (`crate::state::ec2::InstanceLookup::resolve`).
         let owner_access = crate::state::ec2::serial_console_access_enabled(ctx, &region).await;
         let owner_says = crate::state::ec2::instance(ctx, &region, &input.instance_id).await;
-
-        // The instance, as the service that owns instances reports it: this service's own
-        // registry is read only when no EC2 could be asked at all. Same rule, and the same
-        // helper, as `SendSSHPublicKey` (`crate::state::ec2::InstanceLookup::resolve`).
-        // Resolved before the decision below, because the instance's tags are part of the
-        // request's condition context.
         let found = owner_says.resolve(&input.instance_id, &store);
 
-        // Whether the caller may push a serial-console key at that instance at all is IAM's
-        // decision, taken before anything about the account or the instance is reported, and
-        // with no store guard of this service held. A serial-console push names no OS user, so
-        // it publishes no value for that condition key, and the tag families are published
-        // only for a tag set the owner of the instance answered with in full
-        // (`Instance::known_tags`). Same rule, and the same gate, as `SendSSHPublicKey`.
-        let resource = crate::state::authorization::instance_resource(&region, &input.instance_id);
+        // The second step of IAM's decision: the principal's identity-based policies, taken
+        // in the request's condition context — which carries the TAGS of the instance the
+        // push names, a fact only the owner of the instance can report, so the instance has
+        // to be resolved before this decision can be taken at all. A serial-console push
+        // names no OS user, so it publishes no value for that condition key, and the tag
+        // families are published only for a tag set the owner of the instance answered with
+        // in full (`Instance::known_tags`). Nothing about the account or the instance has been
+        // REPORTED yet, no key is stored, and no store guard of this service is held. Same
+        // rule, and the same gate, as `SendSSHPublicKey`.
         let conditions = crate::state::authorization::Conditions::new(
             None,
             found.as_ref().and_then(crate::state::Instance::known_tags),
         );
-        if let Some(refusal) = crate::state::authorization::refusal(
-            &*self.engine,
+        if let Some(refusal) = crate::state::authorization::withheld(
+            &caller,
             ctx,
             Self::NAME,
             &resource,
             &conditions,
         ) {
-            return Err(match refusal {
-                // The credential the request presented is not one the identity store holds as
-                // valid, so it speaks for no principal and no policy was consulted: the
-                // modelled error this service declares for a credential that is not valid.
-                // Same rule, and the same gate, as `SendSSHPublicKey`.
-                crate::state::authorization::Refusal::InvalidCredential(message) => {
-                    SendSerialConsoleSSHPublicKeyErrorModeled::AuthException(AuthException {
-                        message: Some(message),
-                    })
-                    .into()
-                }
-                // A principal whose policies do not allow the call: AWS's own authorization
-                // answer, which this service's model declares no shape for.
-                crate::state::authorization::Refusal::NotAuthorized(message) => {
-                    crate::scaffolded::Scaffolded::access_denied(message)
-                }
-            });
+            return Err(refused(refusal));
         }
 
         let mut state = store.lock();
@@ -282,10 +322,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pruning cutoff cannot disagree with each other.
         let now = ::std::time::Instant::now();
 
-        // The account-level toggle EC2's `EnableSerialConsoleAccess` sets, checked before the
-        // instance is looked up: an account without serial-console access may not ask about
-        // any instance. The message names the account the call was made under — AWS's own
-        // construction for this error — which is the emulator's account id
+        // The account-level toggle EC2's `EnableSerialConsoleAccess` sets, decided before
+        // anything about the INSTANCE is reported: an account without serial-console access
+        // may not ask about any instance, so this is the answer whether or not the id names
+        // an instance anything holds. The message names the account the call was made under
+        // — AWS's own construction for this error — which is the emulator's account id
         // (`engine::emulator_account_id`), never a literal.
         // Granting it is EC2's own `EnableSerialConsoleAccess`, so EC2's status is what
         // decides wherever EC2 can be asked; the toggle this service keeps answers only for
@@ -363,22 +404,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
-
-        // The model gives `SerialPort` the range 0..0, so the boundary validator has already
-        // refused any other port before this handler runs. Checked anyway, as the modelled
-        // `InvalidArgsException` rather than a panic, so the handler stands on its own.
-        if input.serial_port != crate::state::SERIAL_CONSOLE_PORT {
-            return Err(SendSerialConsoleSSHPublicKeyErrorModeled::InvalidArgsException(
-                InvalidArgsException {
-                    message: Some(format!(
-                        "SerialPort {} is not supported; only port {} is supported",
-                        input.serial_port,
-                        crate::state::SERIAL_CONSOLE_PORT
-                    )),
-                },
-            )
-            .into());
         }
 
         // A fresh id per call, stored with the key it pushed and in the request log.

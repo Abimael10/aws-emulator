@@ -4,11 +4,20 @@
 //!
 //! Both operations of this service are signed calls (`sigv4`,
 //! `smithy_query(query="service_info")`, with no `@optionalAuth` operation in the model), and
-//! AWS decides such a call against the CALLER's identity-based policies BEFORE the operation
-//! resolves anything: a caller holding no grant is told it is not authorized rather than told
-//! whether the instance it named exists, and a refused push stores no key. So the decision is
-//! taken in front of the instance lookup, and only a caller the policies in force allow
-//! reaches it.
+//! AWS decides such a call against the CALLER's identity-based policies BEFORE it reports
+//! anything about the resource: a caller holding no grant is told it is not authorized rather
+//! than told whether the instance it named exists, and a refused push stores no key.
+//!
+//! The decision comes in the two steps a handler takes it in, because they need different
+//! things:
+//!
+//! * [`authenticate`] needs only the REQUEST, so a handler takes it before it reads any state
+//!   or asks the owner of the instance anything: a credential the identity store does not hold
+//!   as valid speaks for no principal, and there is no policy to consult for it;
+//! * [`withheld`] is the policy decision, and it is taken in the request's condition context,
+//!   which carries the TAGS of the instance the push names — a fact only the owner of the
+//!   instance can report. So the instance is resolved first, and the decision still comes
+//!   before anything about it is reported and before any key is stored.
 //!
 //! The three pieces, each held in exactly one place:
 //!
@@ -62,7 +71,7 @@
 //! never with the policy refusal, whose message would blame a document that was never read.
 //! Which of the two a decision came to is what [`Refusal`] carries out to the handler.
 //!
-//! Either withheld push leaves a structured audit record ([`refusal`]).
+//! Either withheld push leaves a structured audit record ([`audit_withheld`]).
 //!
 //! ## The two callers the decision cannot refuse
 //!
@@ -271,59 +280,81 @@ impl Refusal {
 #[derive(Debug, Clone, Copy)]
 pub struct InvalidCredential;
 
-/// `Some(refusal)` when this request may not push the key it asks to push — the refusal to
-/// answer it with — and `None` when it may.
+/// Step one of the gate, which needs NOTHING but the request: the principal it speaks for, or
+/// [`Refusal::InvalidCredential`] when the credential it presented is not one the identity
+/// store holds as valid.
 ///
-/// Two things can withhold a push, and they are told apart: a credential the identity store
-/// does not hold as valid speaks for no principal, so it is refused as an invalid credential
-/// before any policy is read ([`Refusal::InvalidCredential`]); otherwise the principal's
-/// identity-based policies decide, and a call they do not allow is refused as not authorized
-/// ([`Refusal::NotAuthorized`]).
+/// Such a credential speaks for nobody, so there is no principal to read policies for and no
+/// policy is consulted. Nothing about the resource the request names is needed to decide it,
+/// which is why a handler takes this step before it reads any state of its own and before it
+/// asks the owner of the instance anything.
 ///
-/// A refusal leaves a structured audit record: the operation asked for, the access key id the
-/// request presented, the principal it resolved to, the action and the resource decided about,
-/// and the outcome — so a push that was withheld is recorded locally. Only wire metadata and
-/// stored identifiers; no credential material and no part of the key material the request
-/// carried.
-///
-/// Asked with NO store guard held, and before the operation reads or writes anything of its
-/// own.
-pub fn refusal<Eng: Send + Sync + 'static>(
+/// Asked with NO store guard held. A refusal leaves the audit record [`audit_withheld`]
+/// describes.
+pub fn authenticate<Eng: Send + Sync + 'static>(
     engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    resource: &str,
+) -> Result<Caller, Refusal> {
+    match caller(engine, ctx) {
+        Ok(caller) => Ok(caller),
+        // The credential speaks for nobody, so there is no principal to blame and no policy to
+        // consult: the failure is the credential itself.
+        Err(InvalidCredential) => {
+            let refusal = Refusal::InvalidCredential(INVALID_CREDENTIAL_MESSAGE.to_string());
+            audit_withheld(ctx, operation, &refusal, NO_PRINCIPAL, resource);
+            Err(refusal)
+        }
+    }
+}
+
+/// Step two: `Some(`[`Refusal::NotAuthorized`]`)` when `caller`'s identity-based policies do
+/// not allow the push, and `None` when they do.
+///
+/// Taken in the request's condition context, which carries the tags of the instance the push
+/// names ([`Conditions::new`]) — so the caller resolves the instance first, and still takes
+/// this decision before it reports anything about that instance and before it stores any key.
+///
+/// Asked with NO store guard held. A refusal leaves the audit record [`audit_withheld`]
+/// describes.
+pub fn withheld(
+    caller: &Caller,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     operation: &str,
     resource: &str,
     conditions: &Conditions,
 ) -> Option<Refusal> {
     let action = action_for(operation);
-    let (withheld, principal) = match caller(engine, ctx) {
-        Ok(caller) => {
-            let withheld = withheld_grant(&caller, &action, resource, conditions)
-                .map(Refusal::NotAuthorized);
-            (withheld, caller.arn)
-        }
-        // The credential speaks for nobody, so there is no principal to blame and no policy to
-        // consult: the failure is the credential itself.
-        Err(InvalidCredential) => (
-            Some(Refusal::InvalidCredential(
-                INVALID_CREDENTIAL_MESSAGE.to_string(),
-            )),
-            NO_PRINCIPAL.to_string(),
-        ),
-    };
-    if let Some(refusal) = &withheld {
-        ::tracing::info!(
-            audit = true,
-            operation = %operation,
-            outcome = refusal.outcome(),
-            caller_akid = %::emulator_server::extract_akid(&ctx.parts().headers),
-            principal = %principal,
-            action = %action,
-            resource = %resource,
-            "no key was pushed"
-        );
-    }
-    withheld
+    let refusal = Refusal::NotAuthorized(withheld_grant(caller, &action, resource, conditions)?);
+    audit_withheld(ctx, operation, &refusal, &caller.arn, resource);
+    Some(refusal)
+}
+
+/// The structured audit record a withheld push leaves: the operation asked for, the access key
+/// id the request presented, the principal it resolved to, the action and the resource decided
+/// about, and which of the two refusals it was — so a push that was withheld is recorded
+/// locally.
+///
+/// Only wire metadata and stored identifiers; no credential material and no part of the key
+/// material the request carried.
+fn audit_withheld(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    operation: &str,
+    refusal: &Refusal,
+    principal: &str,
+    resource: &str,
+) {
+    ::tracing::info!(
+        audit = true,
+        operation = %operation,
+        outcome = refusal.outcome(),
+        caller_akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+        principal = %principal,
+        action = %action_for(operation),
+        resource = %resource,
+        "no key was pushed"
+    );
 }
 
 /// The decision itself, in IAM's own order: an explicit `Deny` in a document that CAN be read

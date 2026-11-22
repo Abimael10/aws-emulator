@@ -13,23 +13,28 @@
 //! ## Decision order
 //!
 //! 1. `InstanceOSUser` satisfies the `@pattern` the model declares for it — the one
-//!    constraint the framework cannot evaluate — else `InvalidArgsException`;
+//!    constraint the framework cannot evaluate — else `InvalidArgsException`. Decided from
+//!    the request ALONE, so it is answered before this service reads any state and before
+//!    the owner of the instance is asked anything;
 //! 2. the request's credential is one the identity store holds as valid, else the modelled
 //!    `AuthException` — a credential that is not valid speaks for no principal, so no policy
-//!    is consulted at all;
-//! 3. the caller's IAM identity-based policies allow
+//!    is consulted at all, and nothing is looked up for it either
+//!    ([`crate::state::authorization::authenticate`]);
+//! 3. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
+//!    no EC2 can be asked), resolved HERE rather than later because the instance's tags are
+//!    part of the condition context the next decision is taken in;
+//! 4. the caller's IAM identity-based policies allow
 //!    `ec2-instance-connect:SendSSHPublicKey` on the instance's ARN, else
-//!    `AccessDeniedException` (HTTP 403) — both decisions are taken BEFORE the instance is
-//!    resolved, so a caller holding no grant learns nothing about what the account holds
-//!    ([`crate::state::authorization`]);
-//! 4. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
-//!    no EC2 can be asked), else `EC2InstanceNotFoundException`;
-//! 5. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
+//!    `AccessDeniedException` (HTTP 403) — taken before anything about the instance is
+//!    REPORTED and before any key is stored, so a caller holding no grant learns nothing
+//!    about what the account holds ([`crate::state::authorization::withheld`]);
+//! 5. the instance EC2 was asked about exists, else `EC2InstanceNotFoundException`;
+//! 6. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
 //!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
-//! 6. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
+//! 7. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
 //!    `InvalidArgsException`;
-//! 7. the key is stored against (instance id, OS user), replacing whatever was there and
+//! 8. the key is stored against (instance id, OS user), replacing whatever was there and
 //!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
 //!    `RequestId`.
 //!
@@ -182,6 +187,27 @@ impl<Eng> SendSSHPublicKey<Eng> {
     }
 }
 
+/// This operation's answer for a push IAM withheld, so the two steps of the gate word the
+/// same refusal the same way.
+fn refused(refusal: crate::state::authorization::Refusal) -> SendSSHPublicKeyError {
+    match refusal {
+        // The credential the request presented is not one the identity store holds as valid,
+        // so it speaks for no principal and no policy was consulted: the modelled error this
+        // service declares for a credential that is not valid.
+        crate::state::authorization::Refusal::InvalidCredential(message) => {
+            SendSSHPublicKeyErrorModeled::AuthException(AuthException {
+                message: Some(message),
+            })
+            .into()
+        }
+        // A principal whose policies do not allow the call: AWS's own authorization answer,
+        // which this service's model declares no shape for.
+        crate::state::authorization::Refusal::NotAuthorized(message) => {
+            crate::scaffolded::Scaffolded::access_denied(message)
+        }
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for SendSSHPublicKey<Eng>
 {
@@ -199,27 +225,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            SendSSHPublicKeyErrorModeled::ServiceException(ServiceException {
-                message: Some(
-                    "the EC2 Instance Connect instance registry is unavailable".to_string(),
-                ),
-            })
-        })?;
-
-        // The instance is EC2's resource, so EC2 is asked about it BEFORE this service's
-        // store is locked: nothing of this service is held while another service answers,
-        // and the hop stays in the Region this request was signed for.
-        let region = crate::state::request_region(ctx.parts());
-        let owner_says = crate::state::ec2::instance(ctx, &region, &input.instance_id).await;
-
         // The one modelled constraint the framework's boundary validator cannot enforce:
         // `InstanceOSUser`'s `@pattern`, whose lookahead the `regex` crate cannot compile
-        // (see `crate::state::INSTANCE_OS_USER_PATTERN`). Enforced BEFORE any state is read
-        // — a request is not a resource lookup until its own values are legal — and refused
-        // as the modelled `InvalidArgsException`, naming the member and the constraint it
-        // broke. Every other member's bounds and patterns the boundary already enforced,
-        // and `crate::service` words those refusals as the same error.
+        // (see `crate::state::INSTANCE_OS_USER_PATTERN`). Decided from the REQUEST alone, so
+        // it is answered before any state of this service is read and before the owner of the
+        // instance is asked anything — a request is not a resource lookup until its own values
+        // are legal — and refused as the modelled `InvalidArgsException`, naming the member
+        // and the constraint it broke. Every other member's bounds and patterns the boundary
+        // already enforced, and `crate::service` words those refusals as the same error.
         if let Some(violation) = crate::state::instance_os_user_violation(&input.instance_os_user)
         {
             let message = crate::state::invalid_args_message(&[violation])
@@ -232,48 +245,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The instance, as the service that OWNS instances reports it: what EC2 answered
-        // about the id decides the push, and this service's own registry is read only when no
-        // EC2 could be asked at all. That rule is applied in one place for both pushes
-        // (`crate::state::ec2::InstanceLookup::resolve`). Resolved before the decision below,
-        // because the instance's tags are part of the request's condition context.
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SendSSHPublicKeyErrorModeled::ServiceException(ServiceException {
+                message: Some(
+                    "the EC2 Instance Connect instance registry is unavailable".to_string(),
+                ),
+            })
+        })?;
+
+        // Whether the caller may push a key at that instance at all is IAM's decision, and its
+        // first step needs nothing but the request: a credential the identity store does not
+        // hold as valid speaks for no principal, so no policy is consulted for it and no
+        // instance is resolved for it either. The resource the whole decision is made about is
+        // built from the id the REQUEST carried, in the Region it was signed for, so it does
+        // not depend on whether that instance exists.
+        let region = crate::state::request_region(ctx.parts());
+        let resource = crate::state::authorization::instance_resource(&region, &input.instance_id);
+        let caller =
+            crate::state::authorization::authenticate(&*self.engine, ctx, Self::NAME, &resource)
+                .map_err(refused)?;
+
+        // The instance is EC2's resource, so EC2 is asked about it BEFORE this service's
+        // store is locked: nothing of this service is held while another service answers,
+        // and the hop stays in the Region this request was signed for. What EC2 answered is
+        // what decides the push, and this service's own registry is read only when no EC2
+        // could be asked at all — that rule is applied in one place for both pushes
+        // (`crate::state::ec2::InstanceLookup::resolve`).
+        let owner_says = crate::state::ec2::instance(ctx, &region, &input.instance_id).await;
         let found = owner_says.resolve(&input.instance_id, &store);
 
-        // Whether the caller may push a key at that instance at all is IAM's decision, and it
-        // is taken BEFORE anything about the instance is reported: a caller holding no grant is
-        // told it is not authorized rather than told what the account holds, and the decision
-        // is taken with no store guard of this service held. The tag families are published
-        // only for a tag set the owner of the instance answered with in full
-        // (`Instance::known_tags`): for a record whose tags nothing reported they stay
-        // undeclared, so a clause over one of them leaves its statement undecided.
-        let resource = crate::state::authorization::instance_resource(&region, &input.instance_id);
+        // The second step of IAM's decision: the principal's identity-based policies, taken in
+        // the request's condition context — which carries the TAGS of the instance the push
+        // names, a fact only the owner of the instance can report, so the instance has to be
+        // resolved before this decision can be taken at all. Nothing about it has been
+        // REPORTED yet: a caller holding no grant is told it is not authorized rather than told
+        // what the account holds, no key is stored, and no store guard of this service is held.
+        // The tag families are published only for a tag set the owner of the instance answered
+        // with in full (`Instance::known_tags`): for a record whose tags nothing reported they
+        // stay undeclared, so a clause over one of them leaves its statement undecided.
         let conditions = crate::state::authorization::Conditions::new(
             Some(&input.instance_os_user),
             found.as_ref().and_then(crate::state::Instance::known_tags),
         );
-        if let Some(refusal) = crate::state::authorization::refusal(
-            &*self.engine,
+        if let Some(refusal) = crate::state::authorization::withheld(
+            &caller,
             ctx,
             Self::NAME,
             &resource,
             &conditions,
         ) {
-            return Err(match refusal {
-                // The credential the request presented is not one the identity store holds as
-                // valid, so it speaks for no principal and no policy was consulted: the
-                // modelled error this service declares for a credential that is not valid.
-                crate::state::authorization::Refusal::InvalidCredential(message) => {
-                    SendSSHPublicKeyErrorModeled::AuthException(AuthException {
-                        message: Some(message),
-                    })
-                    .into()
-                }
-                // A principal whose policies do not allow the call: AWS's own authorization
-                // answer, which this service's model declares no shape for.
-                crate::state::authorization::Refusal::NotAuthorized(message) => {
-                    crate::scaffolded::Scaffolded::access_denied(message)
-                }
-            });
+            return Err(refused(refusal));
         }
 
         let mut state = store.lock();

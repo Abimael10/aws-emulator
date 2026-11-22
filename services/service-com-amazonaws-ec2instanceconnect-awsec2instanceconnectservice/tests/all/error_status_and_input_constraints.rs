@@ -14,15 +14,26 @@
 //!    validator cannot evaluate;
 //! 3. serial-console access is an account-level grant that starts absent, so a fresh
 //!    account's serial-console push is refused with `SerialConsoleAccessDisabledException`
-//!    before the instance registry is consulted.
+//!    before anything about the instance is reported.
+//!
+//! Rule 2 is pinned twice: once on the ANSWER (the error type and the clause it carries) and
+//! once on the ORDER — `a_request_refused_from_its_own_values_asks_the_owner_of_the_instance_nothing`
+//! captures this service's `tracing` events and shows that a request refused from its own
+//! values makes no hop into the owner of the instance at all, while a request whose values
+//! are all legal makes one.
 //!
 //! Every case drives a real `POST /` through the router and then reads the service's own
 //! state back, so a canned answer could not pass. The harness (`Emulator`, `ssh_key`,
 //! `error_code`, `running_instance`) is the one `instance_connect_key_push` already owns.
 
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::{json, Value};
+use tracing::field::{Field, Visit};
+use tracing::span::{Attributes, Id, Record};
+use tracing::{Event, Metadata, Subscriber};
 
 use service_com_amazonaws_ec2instanceconnect_awsec2instanceconnectservice as ec2ic;
 
@@ -572,4 +583,254 @@ async fn serial_console_access_starts_absent_and_is_decided_before_the_instance_
         "EC2InstanceNotFoundException",
         "with access granted an unknown instance is not found, got {response}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 2, on the ORDER: a request refused from its own values asks nobody about
+// the instance it named
+// ---------------------------------------------------------------------------
+//
+// The hop into the owner of the instance is observable in this service's own `tracing`
+// events: an emulator with no EC2 mounted (the harness here) cannot answer
+// `DescribeInstances`, and `state::ec2::instance` records the id it asked about when the hop
+// goes unanswered. That event is the only place this crate records an `instance_id` field, so
+// one carrying the id a row named means the lookup RAN, and none means it did not. The rows
+// that carry a legal request are the control: they must produce it, or the table would pass
+// against a service that never looks anything up.
+
+/// One captured `tracing` event: the fields it carried, rendered as strings.
+#[derive(Clone, Debug, Default)]
+struct CapturedEvent {
+    fields: BTreeMap<String, String>,
+}
+
+impl CapturedEvent {
+    fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+}
+
+/// Collects an event's fields into strings, whatever type each was recorded as.
+struct FieldCollector<'a>(&'a mut BTreeMap<String, String>);
+
+impl Visit for FieldCollector<'_> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
+
+/// A `tracing` subscriber that keeps every event it is handed, so a test can tell which hops
+/// a call made. Scoped to the calling thread; nothing global is installed and nothing is
+/// written to disk.
+///
+/// A crate's integration tests are their own target, so a harness living in another crate's
+/// `tests/` cannot be imported here; this is the smallest subscriber that answers the one
+/// question the table asks, and the rows carrying legal values are what shows it is still
+/// seeing the events at all.
+#[derive(Clone, Default)]
+struct Capture {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl Capture {
+    /// Whether anything asked the owner of the instance about `instance_id`.
+    fn asked_about(&self, instance_id: &str) -> bool {
+        self.events
+            .lock()
+            .expect("the capture buffer")
+            .iter()
+            .any(|event| event.field("instance_id") == Some(instance_id))
+    }
+}
+
+impl Subscriber for Capture {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &Attributes<'_>) -> Id {
+        // This table asserts on events, not spans; one id for every span is enough.
+        Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, event: &Event<'_>) {
+        let mut fields = BTreeMap::new();
+        event.record(&mut FieldCollector(&mut fields));
+        self.events
+            .lock()
+            .expect("the capture buffer")
+            .push(CapturedEvent { fields });
+    }
+
+    fn enter(&self, _span: &Id) {}
+
+    fn exit(&self, _span: &Id) {}
+}
+
+/// Capture this thread's `tracing` events for the life of the returned guard.
+fn capture_events() -> (Capture, tracing::subscriber::DefaultGuard) {
+    let capture = Capture::default();
+    let guard = tracing::subscriber::set_default(capture.clone());
+    (capture, guard)
+}
+
+#[tokio::test]
+async fn a_request_refused_from_its_own_values_asks_the_owner_of_the_instance_nothing() {
+    let valid_key = ssh_key("order");
+    // (case, target, body, fixture, expected status, expected __type, whether the owner of the
+    // instance may have been asked about the id). The rows span what the rule generalises
+    // over: the member whose constraint is broken (`InstanceOSUser`'s pattern, which only the
+    // handler can evaluate, its modelled length, `SSHPublicKey`'s length, `SerialPort`'s
+    // range), both operations, and what the registry holds for the id (nothing, a running
+    // instance, a stopped one, one still launching) — which cannot matter for a request that
+    // is refused for its own values. The last three rows carry nothing illegal, so the lookup
+    // they make is what shows the capture sees a hop at all.
+    let rows: [(&str, &str, Value, Fixture, u16, &str, bool); 10] = [
+        (
+            "InstanceOSUser with a space, which neither branch of the pattern admits",
+            SEND_SSH,
+            json!({"InstanceId": INSTANCE_ID, "InstanceOSUser": "ec2 user", "SSHPublicKey": valid_key}),
+            Fixture::RunningNitro,
+            400,
+            "InvalidArgsException",
+            false,
+        ),
+        (
+            "InstanceOSUser ending in punctuation the pattern forbids",
+            SEND_SSH,
+            json!({"InstanceId": INSTANCE_ID, "InstanceOSUser": "user!", "SSHPublicKey": valid_key}),
+            Fixture::Unregistered,
+            400,
+            "InvalidArgsException",
+            false,
+        ),
+        (
+            "InstanceOSUser a single digit, which the second branch's lookahead refuses",
+            SEND_SSH,
+            json!({"InstanceId": INSTANCE_ID, "InstanceOSUser": "1", "SSHPublicKey": valid_key}),
+            Fixture::Stopped,
+            400,
+            "InvalidArgsException",
+            false,
+        ),
+        (
+            "InstanceOSUser opening with a hyphen, which the first branch refuses",
+            SEND_SSH,
+            json!({"InstanceId": INSTANCE_ID, "InstanceOSUser": "-user", "SSHPublicKey": valid_key}),
+            Fixture::Pending,
+            400,
+            "InvalidArgsException",
+            false,
+        ),
+        (
+            "InstanceOSUser empty, under the modelled minimum length",
+            SEND_SSH,
+            json!({"InstanceId": INSTANCE_ID, "InstanceOSUser": "", "SSHPublicKey": valid_key}),
+            Fixture::RunningNitro,
+            400,
+            "InvalidArgsException",
+            false,
+        ),
+        (
+            "SSHPublicKey one character under the modelled minimum length",
+            SEND_SSH,
+            json!({"InstanceId": INSTANCE_ID, "InstanceOSUser": "ec2-user", "SSHPublicKey": "k".repeat(79)}),
+            Fixture::RunningNitro,
+            400,
+            "InvalidArgsException",
+            false,
+        ),
+        (
+            "SerialPort outside the modelled range",
+            SEND_SERIAL,
+            json!({"InstanceId": INSTANCE_ID, "SerialPort": 1, "SSHPublicKey": valid_key}),
+            Fixture::RunningNitro,
+            400,
+            "InvalidArgsException",
+            false,
+        ),
+        (
+            "every value legal, and the id names no instance",
+            SEND_SSH,
+            json!({"InstanceId": INSTANCE_ID, "InstanceOSUser": "ec2-user", "SSHPublicKey": valid_key}),
+            Fixture::Unregistered,
+            400,
+            "EC2InstanceNotFoundException",
+            true,
+        ),
+        (
+            "every value legal, and the id names a running instance",
+            SEND_SSH,
+            json!({"InstanceId": INSTANCE_ID, "InstanceOSUser": "ec2-user", "SSHPublicKey": valid_key}),
+            Fixture::RunningNitro,
+            200,
+            "",
+            true,
+        ),
+        (
+            "every value legal on the serial-console push",
+            SEND_SERIAL,
+            json!({"InstanceId": INSTANCE_ID, "SerialPort": SERIAL_CONSOLE_PORT, "SSHPublicKey": valid_key}),
+            Fixture::RunningNitro,
+            200,
+            "",
+            true,
+        ),
+    ];
+
+    for (case, target, body, fixture, expected_status, expected_code, asked) in rows {
+        let emulator = Emulator::new();
+        // Neither the account grant nor the caller's identity is what these rows are about.
+        emulator.enable_serial_console();
+        fixture.register(&emulator);
+
+        // One capture per row, so what a row observes is only what that row's call did.
+        let (capture, guard) = capture_events();
+        let (status, response) = emulator.call(target, &body).await;
+        drop(guard);
+
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} ({response})"
+        );
+        assert_eq!(
+            error_code(&response),
+            expected_code,
+            "case {case:?}: expected __type {expected_code:?}, got {response}"
+        );
+        assert_eq!(
+            capture.asked_about(INSTANCE_ID),
+            asked,
+            "case {case:?}: expected the owner of the instance to be asked about \
+             {INSTANCE_ID}: {asked}, but it was asked: {}",
+            capture.asked_about(INSTANCE_ID)
+        );
+        let expected_stored = usize::from(expected_status == 200);
+        assert_eq!(
+            emulator.stored_key_count(),
+            expected_stored,
+            "case {case:?}: expected {expected_stored} stored key(s), state holds {}",
+            emulator.stored_key_count()
+        );
+    }
 }

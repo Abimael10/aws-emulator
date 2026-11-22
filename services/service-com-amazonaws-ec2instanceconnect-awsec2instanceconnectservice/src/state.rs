@@ -24,7 +24,7 @@
 //! it and `service.rs`, which words the boundary's own refusals, state it the same way.
 //!
 //! Whether the caller may push at all is [`authorization`]: the IAM decision both operations
-//! take before they resolve anything.
+//! take before they report anything about the instance and before either stores a key.
 
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap};
