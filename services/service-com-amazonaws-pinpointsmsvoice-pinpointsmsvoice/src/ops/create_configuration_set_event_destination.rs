@@ -151,41 +151,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
+        // BOTH parameters this handler's own validation can reject are read before
+        // anything is refused, and a finding is recorded in the order the input binds them
+        // (`ConfigurationSetName`, then `EventDestinationName` —
+        // `smithy_query(query="operation",operation="CreateConfigurationSetEventDestination",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`),
+        // so the ONE refusal reports every parameter the refusing layer cannot use rather
+        // than whichever was looked at first.
+        //
         // A `{ConfigurationSetName}` path label the request binds no usable value to names
         // no configuration set to attach a destination to, so it is refused ahead of any
         // lookup — which is why this is a 400 and not the 404 a name that merely does not
         // exist gets. The layer, and so the sentence, is `refusal_wording`'s to decide.
-        if let Some(message) = super::types::refusal_wording::unusable_required_labels(&[(
-            "ConfigurationSetName",
-            input.configuration_set_name.as_str(),
-        )]) {
-            return Err(
-                CreateConfigurationSetEventDestinationErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // The destination is filed under `EventDestinationName`, so a blank or absent
-        // one names nothing to create: a parameter this service's validation cannot
-        // use. The name is stored EXACTLY as sent — trimming is only how blankness is
-        // detected, because `Update`/`Delete` resolve the destination by the raw
+        //
+        // The destination is filed under `EventDestinationName`, so a blank or absent one
+        // names nothing to create: a parameter this service's validation cannot use. The
+        // name is stored EXACTLY as sent — trimming is only how blankness is detected,
+        // because `Update`/`Delete` resolve the destination by the raw
         // `{EventDestinationName}` path label.
-        let destination_name = input
+        let named_destination = input
             .event_destination_name
-            .filter(|name| !name.trim().is_empty())
-            .ok_or_else(|| {
-                CreateConfigurationSetEventDestinationErrorModeled::BadRequestException(
-                    BadRequestException {
-                        message: Some(super::types::refusal_wording::invalid_parameters(&[
-                            "EventDestinationName",
-                        ])),
-                    },
-                )
-            })?;
+            .filter(|name| !name.trim().is_empty());
+        let unusable: Vec<(&str, super::types::refusal_wording::Unusable)> = [
+            super::types::refusal_wording::unusable_label(input.configuration_set_name.as_str())
+                .map(|why| ("ConfigurationSetName", why)),
+            named_destination.is_none().then_some((
+                "EventDestinationName",
+                super::types::refusal_wording::Unusable::Unreadable,
+            )),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let destination_name = match named_destination {
+            Some(name) if unusable.is_empty() => name,
+            // Either parameter unusable: ONE refusal, naming every one of them. Both arms
+            // that reach here recorded a finding, so a sentence is always worded.
+            _ => {
+                let message = super::types::refusal_wording::unusable_parameters(&unusable)
+                    .and_then(|refusal| refusal.message);
+                return Err(
+                    CreateConfigurationSetEventDestinationErrorModeled::BadRequestException(
+                        BadRequestException { message },
+                    )
+                    .into(),
+                );
+            }
+        };
 
         // Every member of `EventDestinationDefinition` is optional, so an absent
         // definition defines a destination with no members rather than a refusal. Its

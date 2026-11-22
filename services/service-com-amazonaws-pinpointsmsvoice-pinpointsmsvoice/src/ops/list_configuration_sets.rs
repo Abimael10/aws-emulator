@@ -169,13 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
 
-        // `PageSize` is modelled as a string, so a value that is not a positive
-        // decimal count is a client error, not a count to clamp. Absent, the server's
-        // own `DEFAULT_PAGE_SIZE` applies; present, it is clamped to `MAX_PAGE_SIZE`.
-        let page_size = match input.page_size.as_deref().map(str::trim) {
-            None | Some("") => DEFAULT_PAGE_SIZE,
-            Some(raw) => parse_page_size(raw)?,
-        };
+        // BOTH parameters this handler's own validation can reject are read before
+        // anything is refused, and a finding is recorded in the order the input binds them
+        // (`NextToken`, then `PageSize` —
+        // `smithy_query(query="operation",operation="ListConfigurationSets",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`),
+        // so the ONE refusal reports every parameter this layer cannot use rather than
+        // whichever was looked at first. `refusal_wording` words it.
+        let mut unusable: Vec<(&str, super::types::refusal_wording::Unusable)> = Vec::new();
 
         // `NextToken` is opaque to the caller but it is OURS: one this service did not
         // mint cannot name a position in the listing, so it is a parameter this
@@ -183,14 +183,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // caller can only have got a usable token from this service.
         let resume_after = match input.next_token.as_deref().map(str::trim) {
             None | Some("") => None,
-            Some(raw) => Some(decode_token(raw).ok_or_else(|| {
-                ListConfigurationSetsErrorModeled::BadRequestException(BadRequestException {
-                    message: Some(super::types::refusal_wording::invalid_parameters(&[
+            Some(raw) => match decode_token(raw) {
+                Some(after) => Some(after),
+                None => {
+                    unusable.push((
                         "NextToken",
-                    ])),
-                })
-            })?),
+                        super::types::refusal_wording::Unusable::Unreadable,
+                    ));
+                    None
+                }
+            },
         };
+
+        // `PageSize` is modelled as a string, so a value that is not a positive
+        // decimal count is a client error, not a count to clamp. Absent, the server's
+        // own `DEFAULT_PAGE_SIZE` applies; present, it is clamped to `MAX_PAGE_SIZE`.
+        // It is this service's one refusal that carries NO sentence, so it contributes no
+        // name to one — see [`parse_page_size`].
+        let page_size = match input.page_size.as_deref().map(str::trim) {
+            None | Some("") => DEFAULT_PAGE_SIZE,
+            Some(raw) => match parse_page_size(raw) {
+                Some(size) => size,
+                None => {
+                    unusable.push((
+                        "PageSize",
+                        super::types::refusal_wording::Unusable::Unworded,
+                    ));
+                    // Never served: the finding above refuses the request.
+                    DEFAULT_PAGE_SIZE
+                }
+            },
+        };
+
+        if let Some(refusal) = super::types::refusal_wording::unusable_parameters(&unusable) {
+            return Err(
+                ListConfigurationSetsErrorModeled::BadRequestException(BadRequestException {
+                    message: refusal.message,
+                })
+                .into(),
+            );
+        }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListConfigurationSetsErrorModeled::InternalServiceErrorException(
@@ -231,29 +263,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Read `PageSize` as the page bound, refusing anything that is not a positive count
-/// and clamping what is left to [`MAX_PAGE_SIZE`].
+/// Read `PageSize` as the page bound, clamped to [`MAX_PAGE_SIZE`] — `None` for anything
+/// that is not a positive count, which the caller records as a finding against the request.
 ///
 /// A page of zero items would make a paginating client loop forever, so it is refused
 /// alongside a negative, fractional or non-numeric value. A count above the maximum is
 /// clamped rather than refused: the caller asked for at most that many, and it gets a
 /// `NextToken` for the remainder.
 ///
-/// The refusal carries NO detail text. `BadRequestException$Message` is optional in the
-/// model (`smithy_query(query="shape",shape="BadRequestException",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`)
+/// The refusal carries NO detail text of its own — it is this service's one
+/// `refusal_wording::Unusable::Unworded` class. `BadRequestException$Message` is optional in
+/// the model (`smithy_query(query="shape",shape="BadRequestException",model_path="services/service-com-amazonaws-pinpointsmsvoice-pinpointsmsvoice/smithy-model/com-amazonaws-pinpointsmsvoice-pinpointsmsvoice.json")`)
 /// and the service sends none for this parameter, so none is written: writing one would
 /// put a sentence on the wire the real response does not carry, and a client that reads a
 /// present detail as "the service explained the problem" would branch on it. The code and
-/// the status are the whole answer. The member itself still travels, as JSON `null` — the
-/// one value an SDK reports as unset, the rule and the reason being
-/// `crate::service::WIRE_DETAIL_MEMBER`'s. (`NextToken`, which this service MINTS, is
-/// refused with the sentence that names it — see the caller.)
-fn parse_page_size(raw: &str) -> Result<usize, ListConfigurationSetsErrorModeled> {
+/// the status are the whole answer where this is the ONLY parameter the request failed on;
+/// the member itself still travels, as JSON `null` — the one value an SDK reports as unset,
+/// the rule and the reason being `crate::service::WIRE_DETAIL_MEMBER`'s. Carrying no
+/// sentence is not silencing one, so a request that ALSO carried an unusable `NextToken` —
+/// which this service mints and therefore names — is answered with that sentence (see the
+/// caller).
+fn parse_page_size(raw: &str) -> Option<usize> {
     match raw.parse::<usize>() {
-        Ok(size) if size > 0 => Ok(size.min(MAX_PAGE_SIZE)),
-        _ => Err(ListConfigurationSetsErrorModeled::BadRequestException(
-            BadRequestException { message: None },
-        )),
+        Ok(size) if size > 0 => Some(size.min(MAX_PAGE_SIZE)),
+        _ => None,
     }
 }
 

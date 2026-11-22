@@ -21,11 +21,14 @@
 //! One parameter is the exception that the member carries no SENTENCE for: a `PageSize` this
 //! service cannot read as a page bound is refused with the same code and status and no detail
 //! text at all — the member travels as JSON `null`, which is the one value an SDK reports as
-//! unset, so the rows for it assert that null rather than an absent key.
+//! unset, so the rows for it assert that null rather than an absent key. Carrying no sentence
+//! is not silencing one: a request that also failed on a parameter this service DOES name is
+//! answered with that name.
 //!
 //! A request is refused ONCE, so where SEVERAL parameters are unusable the one sentence names
 //! every one of them that the refusing layer cannot use, in the order the input binds them —
-//! which the two-label operations are where this can be seen.
+//! which the two-label operations, and the operations whose own validation reads more than one
+//! parameter, are where this can be seen.
 //!
 //! The same member carries the text for EVERY error this service's model declares, which
 //! the `NotFoundException` rows pin, and a refused request changes nothing — the listing
@@ -830,4 +833,312 @@ async fn a_listing_after_a_refused_request_still_answers_with_its_sets() {
             listed.body
         );
     }
+}
+
+/// One request carrying SEVERAL unusable parameters at once, and the ONE sentence it must be
+/// refused with.
+struct Several {
+    /// What makes this row different from the others.
+    name: &'static str,
+    method: &'static str,
+    path: &'static str,
+    body: Option<fn() -> Value>,
+    /// The sentence the one refusal carries, or `None` where EVERY unusable parameter of the
+    /// request belongs to the class this service states no sentence for, so the detail
+    /// member travels as JSON `null`.
+    message: Option<&'static str>,
+}
+
+/// The sentence that names BOTH of `CreateConfigurationSetEventDestination`'s own-validation
+/// parameters, in the order its input binds them (`ConfigurationSetName`, then
+/// `EventDestinationName`).
+const INVALID_SET_AND_DESTINATION_NAME: &str = "The following parameter is null, empty or \
+     invalid: ['configurationSetName', 'eventDestinationName']";
+
+/// Every row sends ONE request in which MORE THAN ONE parameter of the refusing layer is
+/// unusable, and states the single sentence that names exactly the ones that layer can name.
+///
+/// The rows differ along what the rule generalises over: the operation, the HTTP method,
+/// where each parameter travels (a query parameter, a URI path label, a body member), the
+/// FORM of each unusable value, which CLASS each belongs to (one this service names, one it
+/// states no sentence for, one the request-binding layer answers for), and — for the query
+/// parameters — the order they arrive in on the wire, which is not the order the input binds
+/// them in.
+const SEVERAL_UNUSABLE_CASES: &[Several] = &[
+    // ---- two unusable query parameters, one of them the sentence-less class -------------
+    Several {
+        name: "ListConfigurationSets with an unminted NextToken and a PageSize of zero",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets?NextToken=not-a-token&PageSize=0",
+        body: None,
+        message: Some(INVALID_NEXT_TOKEN),
+    },
+    Several {
+        name: "ListConfigurationSets with an unmarked NextToken and a non-numeric PageSize",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets\
+               ?NextToken=6e6f70652d6e6f742d6d696e65&PageSize=not-a-number",
+        body: None,
+        message: Some(INVALID_NEXT_TOKEN),
+    },
+    Several {
+        name: "ListConfigurationSets with the unusable PageSize sent FIRST on the wire",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets?PageSize=-5&NextToken=not-a-token",
+        body: None,
+        message: Some(INVALID_NEXT_TOKEN),
+    },
+    Several {
+        name: "ListConfigurationSets with an unminted NextToken and a fractional PageSize",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets?NextToken=not-a-token&PageSize=2.5",
+        body: None,
+        message: Some(INVALID_NEXT_TOKEN),
+    },
+    Several {
+        name: "ListConfigurationSets with an unminted NextToken and a PageSize no count holds",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets\
+               ?NextToken=not-a-token&PageSize=99999999999999999999999999",
+        body: None,
+        message: Some(INVALID_NEXT_TOKEN),
+    },
+    // ---- only the sentence-less class is unusable, so no sentence is worded -------------
+    // A BLANK `NextToken` names no position this service needs one for, so it is read as
+    // absent rather than unusable: the `PageSize` beside it is the only parameter refused.
+    Several {
+        name: "ListConfigurationSets with a blank NextToken and a PageSize of zero",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets?NextToken=%20&PageSize=0",
+        body: None,
+        message: None,
+    },
+    Several {
+        name: "ListConfigurationSets with a blank NextToken and a PageSize in exponent form",
+        method: "GET",
+        path: "/v1/sms-voice/configuration-sets?NextToken=%20%09&PageSize=1e3",
+        body: None,
+        message: None,
+    },
+    // ---- a path label and a body member, both this service's own validation -------------
+    Several {
+        name: "CreateConfigurationSetEventDestination with a blank label and a blank name",
+        method: "POST",
+        path: "/v1/sms-voice/configuration-sets/%20/event-destinations",
+        body: Some(blank_destination_name),
+        message: Some(INVALID_SET_AND_DESTINATION_NAME),
+    },
+    Several {
+        name: "CreateConfigurationSetEventDestination with a blank label and NO name",
+        method: "POST",
+        path: "/v1/sms-voice/configuration-sets/%20%09/event-destinations",
+        body: Some(empty_object),
+        message: Some(INVALID_SET_AND_DESTINATION_NAME),
+    },
+    Several {
+        name: "CreateConfigurationSetEventDestination with an EMPTY label and no name: \
+               the earlier layer answers alone",
+        method: "POST",
+        path: "/v1/sms-voice/configuration-sets//event-destinations",
+        body: Some(empty_object),
+        message: Some(MISSING_CONFIGURATION_SET_NAME),
+    },
+];
+
+/// RULE: a request is refused ONCE, so the one refusal reports every parameter the refusing
+/// layer cannot use, in the order the input binds them — not merely the first one the handler
+/// looked at. A parameter of the one class this service states NO sentence for contributes no
+/// name, so it can never silence the sentence another parameter of the same request earned;
+/// the refusal carries no sentence only when every unusable parameter is of that class.
+///
+/// `ListConfigurationSets` is where the two classes meet — a `NextToken` this service did not
+/// mint, which it names, beside a `PageSize` it cannot read, which it states no sentence for
+/// — and `CreateConfigurationSetEventDestination` is where a path label meets a body member
+/// in that same layer.
+#[tokio::test]
+async fn one_refusal_keeps_the_sentence_a_parameter_of_the_same_request_earned() {
+    let harness = Harness::new();
+
+    for case in SEVERAL_UNUSABLE_CASES {
+        let answer = harness
+            .call(case.method, case.path, case.body.map(|build| build()))
+            .await;
+
+        assert_eq!(
+            answer.status, 400,
+            "case {:?}: expected HTTP 400, got {} {:?}",
+            case.name, answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "BadRequestException",
+            "case {:?}: expected the modelled BadRequestException, got {:?}",
+            case.name,
+            answer.body
+        );
+        match case.message {
+            Some(expected) => assert_eq!(
+                answer.message(),
+                expected,
+                "case {:?}: expected the message {expected:?}, got {:?}",
+                case.name,
+                answer.body
+            ),
+            // No SENTENCE: the member is present and JSON null, which is what "this class
+            // carries no sentence" reads as — and is only correct when no parameter of the
+            // request earned one.
+            None => assert_eq!(
+                answer.body.get("message"),
+                Some(&Value::Null),
+                "case {:?}: expected the detail member as JSON null, got {:?}",
+                case.name,
+                answer.body
+            ),
+        }
+        assert!(
+            !answer.has_modelled_member(),
+            "case {:?}: the detail text must travel in `message` alone, got {:?}",
+            case.name,
+            answer.body
+        );
+    }
+
+    // Every row above was refused, so nothing was stored.
+    assert!(
+        harness.stored_set_names().is_empty(),
+        "a refusal must store nothing, got {:?}",
+        harness.stored_set_names()
+    );
+}
+
+/// The configuration-set names a listing answered with, in the order it reported them.
+fn listed_set_names(answer: &Answer) -> Vec<String> {
+    answer
+        .body
+        .get("ConfigurationSets")
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|entry| entry.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// RULE (the control the rows above lean on): the same two parameters, both usable, are no
+/// refusal at all — a `NextToken` this service MINTED resumes the listing and the `PageSize`
+/// beside it bounds the page — and a request pairing that usable token with a `PageSize` this
+/// service cannot read is refused with no sentence, because then nothing names a parameter.
+///
+/// So no row above can be passing merely because the handler stopped reading its parameters,
+/// and the sentence-less refusal is still answered where it is the whole story.
+#[tokio::test]
+async fn a_minted_next_token_is_served_beside_the_page_size_sent_with_it() {
+    let harness = Harness::new();
+    for name in ["alpha", "beta", "gamma"] {
+        let created = harness
+            .call(
+                "POST",
+                "/v1/sms-voice/configuration-sets",
+                Some(json!({ "ConfigurationSetName": name })),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: the set must be created, got {} {:?}",
+            created.status, created.body
+        );
+    }
+
+    let first = harness
+        .call("GET", "/v1/sms-voice/configuration-sets?PageSize=1", None)
+        .await;
+    assert_eq!(
+        first.status, 200,
+        "case \"the first page\": expected HTTP 200, got {} {:?}",
+        first.status, first.body
+    );
+    assert_eq!(
+        listed_set_names(&first),
+        vec!["alpha".to_string()],
+        "case \"the first page\": expected the first set alone, got {:?}",
+        first.body
+    );
+    let token = first
+        .body
+        .get("NextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !token.is_empty(),
+        "case \"the first page\": expected a NextToken for the rest, got {:?}",
+        first.body
+    );
+
+    let resumed = harness
+        .call(
+            "GET",
+            &format!("/v1/sms-voice/configuration-sets?NextToken={token}&PageSize=1"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        resumed.status, 200,
+        "case \"a minted NextToken with a usable PageSize\": expected HTTP 200, got {} {:?}",
+        resumed.status, resumed.body
+    );
+    assert_eq!(
+        listed_set_names(&resumed),
+        vec!["beta".to_string()],
+        "case \"a minted NextToken with a usable PageSize\": expected the second set, got {:?}",
+        resumed.body
+    );
+
+    for (case, page_size) in [
+        ("a minted NextToken with a PageSize of zero", "0"),
+        ("a minted NextToken with a non-numeric PageSize", "not-a-number"),
+    ] {
+        let refused = harness
+            .call(
+                "GET",
+                &format!("/v1/sms-voice/configuration-sets?NextToken={token}&PageSize={page_size}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "BadRequestException",
+            "case {case:?}: expected the modelled BadRequestException, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body.get("message"),
+            Some(&Value::Null),
+            "case {case:?}: the token is usable, so nothing names a parameter and the detail \
+             member must be JSON null, got {:?}",
+            refused.body
+        );
+    }
+
+    // The listing is unchanged by either refusal: every set is still reported.
+    let listed = harness
+        .call("GET", "/v1/sms-voice/configuration-sets", None)
+        .await;
+    assert_eq!(
+        listed_set_names(&listed),
+        vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string()
+        ],
+        "case \"after the refusals\": expected every stored set, got {:?}",
+        listed.body
+    );
 }
