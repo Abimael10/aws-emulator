@@ -258,7 +258,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own record for the same reason: a forced delete's terminations are the group's
         // terminations, and its configurations are gone once the group is.
         let notification_topics = group.notification_topics(
-            crate::state::InstanceLifecycle::Terminated.notification_event(),
+            crate::state::InstanceLifecycle::Terminated
+                .notification_event(crate::state::StepOutcome::Completed),
         );
 
         // Deletion protection controls whether this operation is allowed at all:
@@ -372,6 +373,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let subnet_id = crate::state::ec2_instances::subnet_of(&*self.engine, instance_id);
             state.queue_lifecycle_event(crate::state::PendingLifecycleEvent {
                 kind: crate::state::InstanceLifecycle::Terminated,
+                // The delete shut them down as it ran, so each of these terminations is a
+                // step that carried through.
+                outcome: crate::state::StepOutcome::Completed,
                 notification_topics: notification_topics.clone(),
                 group_name: name.clone(),
                 group_arn: arn.clone(),
@@ -382,6 +386,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 activity_id: activity_id.clone(),
                 description: crate::state::InstanceLifecycle::Terminated.description(instance_id),
                 cause: cause.clone(),
+                // The delete carried every one of them out, so none states a reason.
+                status_message: None,
                 start_time: now,
                 // The delete terminated them as it ran, so there is nothing further the
                 // clock owes before the terminations are a fact.

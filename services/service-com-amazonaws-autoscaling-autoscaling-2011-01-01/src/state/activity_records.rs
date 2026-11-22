@@ -274,6 +274,10 @@ impl AutoScalingState {
             details,
             auto_scaling_group_state: Some(record.group_state.to_string()),
             completes_at: record.completes_at,
+            // A step that is under way is going to complete: a step that turns out not to
+            // have is settled with the terminal code it ends in instead
+            // ([`AutoScalingState::settle_held_step`]).
+            completes_as: None,
         })
     }
 
@@ -316,6 +320,8 @@ impl AutoScalingState {
             details: None,
             auto_scaling_group_state: Some(GROUP_STATE_IN_SERVICE.to_string()),
             completes_at: None,
+            // Nothing is owed on it, so there is no later completion to state a code for.
+            completes_as: None,
         })
     }
 

@@ -193,10 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         state.resolve_lifecycle_action(
             &*self.engine,
-            &group_name,
-            &instance_id,
-            &token,
-            &result,
+            &crate::state::LifecycleActionResolution {
+                group_name: &group_name,
+                instance_id: &instance_id,
+                token: &token,
+                result: &result,
+                // This call IS the callback the hold exists for, which is what the step
+                // reports when the result it carried abandoned the instance.
+                ending: crate::state::LifecycleActionEnding::Callback,
+            },
             now,
         );
 

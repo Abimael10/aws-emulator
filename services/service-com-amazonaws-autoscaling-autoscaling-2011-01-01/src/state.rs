@@ -139,11 +139,13 @@ pub use lifecycle_hooks::{
 pub mod lifecycle_actions;
 
 pub use lifecycle_actions::{
-    abandoned_launch_cause, no_active_action_by_instance_message, no_active_action_by_token_message,
+    abandoned_launch_cause, abandoned_lifecycle_action_message,
+    no_active_action_by_instance_message, no_active_action_by_token_message,
     no_active_action_under_hook_message, not_addressed_message, HeldStep, HeldTransition,
-    LifecycleActionKey, LifecycleActionRefusal, PendingLifecycleActionEvent, StoredLifecycleAction,
-    LAUNCH_LIFECYCLE_ACTION, LIFECYCLE_PENDING_PROCEED, LIFECYCLE_PENDING_WAIT,
-    LIFECYCLE_TERMINATING_PROCEED, LIFECYCLE_TERMINATING_RETAINED, LIFECYCLE_TERMINATING_WAIT,
+    LifecycleActionEnding, LifecycleActionKey, LifecycleActionRefusal, LifecycleActionResolution,
+    PendingLifecycleActionEvent, StoredLifecycleAction, LAUNCH_LIFECYCLE_ACTION,
+    LIFECYCLE_PENDING_PROCEED, LIFECYCLE_PENDING_WAIT, LIFECYCLE_TERMINATING_PROCEED,
+    LIFECYCLE_TERMINATING_RETAINED, LIFECYCLE_TERMINATING_WAIT,
     MAX_PENDING_LIFECYCLE_ACTION_EVENTS, MAX_RETAINED_INSTANCES_PER_GROUP,
     TERMINATE_LIFECYCLE_ACTION, TRANSITION_LAUNCHING, TRANSITION_TERMINATING,
 };
@@ -252,6 +254,7 @@ pub mod sns_notifications;
 
 pub use lifecycle_events::{
     drive_lifecycle_clock, InstanceLifecycle, InstanceLifecycleChange, PendingLifecycleEvent,
+    StepOutcome,
 };
 
 /// The instances a caller asks a group to launch outright — `LaunchInstances` — beside
@@ -1389,6 +1392,14 @@ pub struct StoredActivity {
     pub auto_scaling_group_state: Option<String>,
     /// When this activity finishes, if it has not finished yet.
     pub completes_at: Option<SystemTime>,
+    /// The terminal `ScalingActivityStatusCode` the clock finishes this activity in, for one
+    /// whose step did not do what it set out to.
+    ///
+    /// An activity the clock completes is [`ACTIVITY_SUCCESSFUL`] unless the step it records
+    /// was settled as one that did not carry through
+    /// ([`AutoScalingState::settle_held_step`]), which is what keeps the activity log and
+    /// the event announcing the same step in agreement.
+    pub completes_as: Option<&'static str>,
 }
 
 impl StoredActivity {
@@ -2112,7 +2123,10 @@ impl AutoScalingState {
             if activity.completes_at.is_some_and(|at| at <= now) {
                 activity.end_time = activity.completes_at;
                 activity.completes_at = None;
-                activity.status_code = ACTIVITY_SUCCESSFUL.to_string();
+                activity.status_code = activity
+                    .completes_as
+                    .unwrap_or(ACTIVITY_SUCCESSFUL)
+                    .to_string();
                 activity.progress = 100;
             }
         }

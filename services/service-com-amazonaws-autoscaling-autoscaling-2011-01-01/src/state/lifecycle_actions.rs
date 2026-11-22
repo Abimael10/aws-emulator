@@ -23,9 +23,10 @@
 //! * the held action is ANNOUNCED on the account's default event bus, under the `source`
 //!   this service publishes everything under and the `detail-type` of that transition
 //!   ([`HeldTransition::detail_type`]), carrying the group, the instance, the hook, the
-//!   transition, the hook's own `NotificationMetadata` and a freshly minted
-//!   `LifecycleActionToken` — the token being the only thing a client can complete the
-//!   action with, which is why it has to be published;
+//!   transition, the two ends of the move the hold stands inside ([`HeldTransition::step`]),
+//!   the hook's own `NotificationMetadata` and a freshly minted `LifecycleActionToken` — the
+//!   token being the only thing a client can complete the action with, which is why it has
+//!   to be published;
 //! * the hold ENDS when the client passes that token (or the instance id) back through
 //!   `CompleteLifecycleAction`, or when the clock times the action out — the hook's
 //!   `HeartbeatTimeout` since the hold started or since the last
@@ -174,6 +175,20 @@ impl HeldTransition {
         match self {
             Self::Launching => LAUNCH_LIFECYCLE_ACTION,
             Self::Terminating => TERMINATE_LIFECYCLE_ACTION,
+        }
+    }
+
+    /// The lifecycle STEP this transition is the wait in front of: a launch hold stands in
+    /// front of a launch and a termination hold in front of a termination.
+    ///
+    /// The reverse of [`Self::of_step`], and what reads the MOVE the hold is part of —
+    /// which of the two places the instance is travelling between it came from, and which
+    /// it is going to ([`InstanceLifecycle::origin`], [`InstanceLifecycle::destination`]).
+    #[must_use]
+    pub fn step(self) -> InstanceLifecycle {
+        match self {
+            Self::Launching => InstanceLifecycle::Launched,
+            Self::Terminating => InstanceLifecycle::Terminated,
         }
     }
 
@@ -436,6 +451,78 @@ pub fn no_active_action_under_hook_message(instance_id: &str, hook_name: &str) -
     format!(
         "No active Lifecycle Action found with instance ID {instance_id} and HookName \
          {hook_name}"
+    )
+}
+
+/// How one hold ENDED, which is what the step it was holding reports when the group gave up
+/// on that step.
+///
+/// The two ways a wait is over: the client sent the callback the hold exists for, or the
+/// clock ran the hold out — "the maximum time, in seconds, that can elapse before the
+/// lifecycle hook times out. If the lifecycle hook times out, Amazon EC2 Auto Scaling
+/// performs the action that you specified in the DefaultResult property"
+/// (`LifecycleHook$HeartbeatTimeout`). Both can abandon the instance, and a client reading
+/// the step has to be able to tell which did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleActionEnding {
+    /// `CompleteLifecycleAction` carried the result back.
+    Callback,
+    /// No callback came back inside the time the hook allows, so the hook's own
+    /// `DefaultResult` is what resolved the action.
+    Timeout,
+}
+
+impl LifecycleActionEnding {
+    /// The reason clause the abandonment sentence ends with
+    /// ([`abandoned_lifecycle_action_message`]): the result a callback carried, or the
+    /// deadline that ran out.
+    #[must_use]
+    pub fn abandonment_reason(self) -> &'static str {
+        match self {
+            Self::Callback => "Lifecycle Action Completed with ABANDON Result",
+            Self::Timeout => "Heartbeat Timeout",
+        }
+    }
+}
+
+/// ONE resolution of ONE held lifecycle action: which action, with what result, and how the
+/// wait came to be over.
+///
+/// The two doors that resolve a hold — the callback a client makes and the deadline the clock
+/// runs out — state the same five things, so the resolution travels as one value and neither
+/// can leave out what the settled step reports.
+#[derive(Debug, Clone, Copy)]
+pub struct LifecycleActionResolution<'a> {
+    /// The group holding the instance.
+    pub group_name: &'a str,
+    /// The instance being held.
+    pub instance_id: &'a str,
+    /// The token of the action being resolved.
+    pub token: &'a str,
+    /// `LifecycleActionResult`: what the group is to do with the transition it held — the
+    /// value a callback carried, or the hook's own `DefaultResult` where the clock resolved
+    /// it.
+    pub result: &'a str,
+    /// Which of the two doors this is, which is what the step the hold was in front of
+    /// reports when the group gives up on it ([`abandoned_lifecycle_action_message`]).
+    pub ending: LifecycleActionEnding,
+}
+
+/// What the step an abandoned lifecycle action was holding reports as its `StatusMessage`:
+/// that the instance did not complete the action, which action it was, and why it was
+/// abandoned.
+///
+/// `Activity$StatusMessage` is where "an attempt to launch instances failed" states "the
+/// cause of the failure" (`DescribeScalingActivities`' own documentation), and the cause here
+/// is the hold: the instance was to complete the action and did not. Two variable parts — the
+/// token of the action that was abandoned, and the reason it was
+/// ([`LifecycleActionEnding::abandonment_reason`]) — around fixed text.
+#[must_use]
+pub fn abandoned_lifecycle_action_message(token: &str, ending: LifecycleActionEnding) -> String {
+    format!(
+        "Instance failed to complete user's Lifecycle Action: Lifecycle Action with token \
+         {token} was abandoned: {}",
+        ending.abandonment_reason()
     )
 }
 
@@ -777,8 +864,8 @@ impl AutoScalingState {
         action.heartbeat_due = (now + action.heartbeat_timeout).min(action.global_due);
     }
 
-    /// Resolve the action `token` of `instance_id` with `result`, and end the wait when that
-    /// result ends it.
+    /// Resolve the action `resolution` addresses with the result it carries, and end the
+    /// wait when that result ends it.
     ///
     /// `CONTINUE` retires this one hook's hold; the instance proceeds only once no hook is
     /// still holding it. `ABANDON` ends the wait at once, whatever else is holding it — the
@@ -788,12 +875,14 @@ impl AutoScalingState {
     pub(crate) fn resolve_lifecycle_action<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
-        group_name: &str,
-        instance_id: &str,
-        token: &str,
-        result: &str,
+        resolution: &LifecycleActionResolution<'_>,
         now: SystemTime,
     ) {
+        let (group_name, instance_id, token) = (
+            resolution.group_name,
+            resolution.instance_id,
+            resolution.token,
+        );
         let Some(instance) = self
             .groups
             .get_mut(group_name)
@@ -815,14 +904,14 @@ impl AutoScalingState {
             return;
         };
         let action = instance.pending_lifecycle_actions.remove(position);
-        let abandoned = result != LIFECYCLE_ACTION_CONTINUE;
+        let abandoned = resolution.result != LIFECYCLE_ACTION_CONTINUE;
         if abandoned {
             instance.pending_lifecycle_actions.clear();
         } else if instance.is_held_by_lifecycle_hook() {
             // Another hook of the group is still holding this instance, so the wait goes on.
             return;
         }
-        self.end_lifecycle_wait(engine, group_name, instance_id, &action, abandoned, now);
+        self.end_lifecycle_wait(engine, resolution, &action, now);
     }
 
     /// Carry the instance past the wait `action` held it in.
@@ -850,12 +939,12 @@ impl AutoScalingState {
     fn end_lifecycle_wait<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
-        group_name: &str,
-        instance_id: &str,
+        resolution: &LifecycleActionResolution<'_>,
         action: &StoredLifecycleAction,
-        abandoned: bool,
         now: SystemTime,
     ) {
+        let (group_name, instance_id) = (resolution.group_name, resolution.instance_id);
+        let abandoned = resolution.result != LIFECYCLE_ACTION_CONTINUE;
         let admitted = action.transition == HeldTransition::Launching && !abandoned;
         // Whether this group's own retention trigger keeps the instance a termination hook
         // abandoned, which is read off the group as it stands at this instant.
@@ -879,10 +968,22 @@ impl AutoScalingState {
         // The step the group was mid-way through for this instance is a fact now: its
         // activity completes at this instant and the event that reports it is owed here
         // rather than at the deadline the hold stood in for. A launch the hook ABANDONED
-        // never came into service, so there is no successful launch to announce at all —
-        // and neither did the termination of an instance the group retained instead.
+        // never came into service, and neither did the termination of an instance the group
+        // retained instead — so each of those is announced as the step it is, one the group
+        // set out to take and did not carry through.
         let happened = !(action.transition == HeldTransition::Launching && abandoned) && !retained;
-        self.settle_held_step(group_name, instance_id, happened, due);
+        // Why it did not: the action the instance was to complete and did not, and what
+        // ended the wait instead. Only a step the group gave up on states a reason, and
+        // every one of those was given up on because the action was abandoned.
+        let status_message = (!happened)
+            .then(|| abandoned_lifecycle_action_message(&action.token, resolution.ending));
+        self.settle_held_step(
+            group_name,
+            instance_id,
+            happened,
+            status_message.as_deref(),
+            due,
+        );
         if retained {
             // Nothing the clock owes moves a retained instance: it waits for a caller.
             self.retain_held_instance(engine, group_name, instance_id, now);
@@ -1049,9 +1150,10 @@ impl AutoScalingState {
     ///
     /// A move in one direction ends the wait of the other: an instance a launch hook is
     /// still holding when the group takes it out of service never came into service, so its
-    /// launch hold goes, its tokens stop resolving and the launch it was waiting for is not
-    /// announced. Without this, a hold left behind on an instance another door moved would
-    /// keep that instance in the group and, at its own deadline, report it in service again.
+    /// launch hold goes, its tokens stop resolving and the launch it was waiting for is
+    /// announced as one that did not carry through. Without this, a hold left behind on an
+    /// instance another door moved would keep that instance in the group and, at its own
+    /// deadline, report it in service again.
     fn discard_holds_other_than(
         &mut self,
         group_name: &str,
@@ -1075,7 +1177,9 @@ impl AutoScalingState {
             discarded.push(instance.instance_id.clone());
         }
         for instance_id in discarded {
-            self.settle_held_step(group_name, &instance_id, false, at);
+            // Nothing but the move itself says why this step did not carry through, so it
+            // states no reason of its own.
+            self.settle_held_step(group_name, &instance_id, false, None, at);
         }
     }
 
@@ -1128,8 +1232,15 @@ impl AutoScalingState {
     }
 
     /// Settle the step the instance was held at: its activity completes at `at`, and the
-    /// event that reports it is owed at `at` when the step `happened` and dropped when it
-    /// did not.
+    /// event that reports it is owed at that same instant — under the step's own successful
+    /// detail-type when the step `happened`, and under its unsuccessful one when it did not
+    /// ([`super::StepOutcome`]).
+    ///
+    /// A step the group gave up on is still a step it took with that instance, so it is
+    /// ANNOUNCED rather than dropped: a client watching the group through the event stream
+    /// learns that the launch it was waiting for will not come, which is the whole point of
+    /// a hook that can abandon one. The activity ends in the terminal code that outcome
+    /// gives it, so the activity log and the event agree.
     ///
     /// THE ONE place a deferred step is settled, for every way a wait can end — the callback,
     /// the hook's own deadline, and a move in the other direction — so a step can neither be
@@ -1139,6 +1250,7 @@ impl AutoScalingState {
         group_name: &str,
         instance_id: &str,
         happened: bool,
+        status_message: Option<&str>,
         at: SystemTime,
     ) {
         let Some(step) = self
@@ -1154,6 +1266,11 @@ impl AutoScalingState {
         else {
             return;
         };
+        let outcome = if happened {
+            super::StepOutcome::Completed
+        } else {
+            super::StepOutcome::Unsuccessful
+        };
         if let Some(activity) = self
             .activities
             .iter_mut()
@@ -1161,20 +1278,38 @@ impl AutoScalingState {
         {
             activity.completes_at = Some(at);
             // Nothing is holding the step any more, so the activity is no longer paused at
-            // a hold: it is under way again until it completes at `at`.
+            // a hold: it is under way again until it completes at `at`, in the terminal
+            // state this outcome ends it in.
             let milestone = super::ActivityMilestone::InProgress;
             activity.status_code = milestone.status_code().to_string();
             activity.progress = milestone.progress();
+            activity.completes_as = Some(outcome.status_code());
+            // Why a step that did not carry through did not: the cause
+            // `DescribeScalingActivities` states apart from the description of what the
+            // activity set out to do. A step that carried through has none.
+            activity.status_message = status_message.map(::std::string::ToString::to_string);
         }
-        if happened {
-            for event in &mut self.pending_lifecycle_events {
-                if event.activity_id == step.activity_id {
-                    event.due = at;
+        // The topics a step that did not carry through is announced to are the ones the
+        // group's configurations select for THAT event — the `_ERROR` counterpart of the
+        // step — read off the group here, since the step was recorded as one that was going
+        // to complete.
+        let topics = (!happened)
+            .then(|| {
+                self.groups.get(group_name).map(|group| {
+                    group.notification_topics(step.kind.notification_event(outcome))
+                })
+            })
+            .flatten();
+        for event in &mut self.pending_lifecycle_events {
+            if event.activity_id == step.activity_id {
+                event.due = at;
+                event.outcome = outcome;
+                event.status_message =
+                    status_message.map(::std::string::ToString::to_string);
+                if let Some(topics) = topics.as_ref() {
+                    event.notification_topics = topics.clone();
                 }
             }
-        } else {
-            self.pending_lifecycle_events
-                .retain(|event| event.activity_id != step.activity_id);
         }
     }
 
@@ -1210,10 +1345,15 @@ impl AutoScalingState {
         for (group_name, instance_id, token, default_result) in timed_out {
             self.resolve_lifecycle_action(
                 engine,
-                &group_name,
-                &instance_id,
-                &token,
-                &default_result,
+                &LifecycleActionResolution {
+                    group_name: &group_name,
+                    instance_id: &instance_id,
+                    token: &token,
+                    result: &default_result,
+                    // No callback came back inside the time the hook allows, which is what
+                    // the step reports when that default abandons the instance.
+                    ending: LifecycleActionEnding::Timeout,
+                },
                 now,
             );
         }
@@ -1230,6 +1370,13 @@ fn seconds(value: i32) -> Duration {
 /// Every member is read off the queued hold, so the event reports the action a callback can
 /// complete and never a second, invented copy of it. `NotificationMetadata` is written only
 /// for a hook that carries one, because a hook with none adds nothing to the message.
+///
+/// Beside the hold, the detail names the two ENDS of the move the instance is MID-WAY
+/// through — `Origin` and `Destination` — exactly as the event reporting a completed step
+/// does ([`super::lifecycle_events`]): the hold stands inside that move, so a consumer
+/// branches on its direction (a rule pattern on `detail.Origin`, say) without reading it out
+/// of the transition's name. They come from the held transition's own direction alone, never
+/// from the request.
 fn lifecycle_action_detail(event: &PendingLifecycleActionEvent) -> ::serde_json::Value {
     let mut detail = ::serde_json::Map::new();
     insert_text(&mut detail, "LifecycleActionToken", &event.token);
@@ -1240,6 +1387,9 @@ fn lifecycle_action_detail(event: &PendingLifecycleActionEvent) -> ::serde_json:
     if let Some(metadata) = event.notification_metadata.as_deref() {
         insert_text(&mut detail, "NotificationMetadata", metadata);
     }
+    let step = event.transition.step();
+    insert_text(&mut detail, "Origin", step.origin());
+    insert_text(&mut detail, "Destination", step.destination());
     ::serde_json::Value::Object(detail)
 }
 

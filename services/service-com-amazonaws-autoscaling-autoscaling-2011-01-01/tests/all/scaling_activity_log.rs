@@ -809,6 +809,7 @@ fn seed_activity(
                 autoscaling::state::GROUP_STATE_IN_SERVICE.to_string(),
             ),
             completes_at: None,
+            completes_as: None,
         });
 }
 

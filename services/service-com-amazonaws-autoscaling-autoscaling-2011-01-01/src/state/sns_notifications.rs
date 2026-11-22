@@ -27,10 +27,11 @@
 //!   key-value pair: "Event": "autoscaling:TEST_NOTIFICATION""
 //!   (`PutLifecycleHookType$NotificationTargetARN`);
 //! * every instance the group LAUNCHES is published as `autoscaling:EC2_INSTANCE_LAUNCH`
-//!   and every instance it TERMINATES as `autoscaling:EC2_INSTANCE_TERMINATE`, naming the
-//!   instance that moved and the scaling activity that moved it — the same activity
-//!   `DescribeScalingActivities` reports, so a notification and the activity log are one
-//!   fact;
+//!   and every instance it TERMINATES as `autoscaling:EC2_INSTANCE_TERMINATE` — or, for a
+//!   step the group set out to take and did not carry through, as that event's `_ERROR`
+//!   counterpart ([`super::StepOutcome`]) — naming the instance that moved and the scaling
+//!   activity that moved it: the same activity `DescribeScalingActivities` reports, so a
+//!   notification and the activity log are one fact;
 //! * a topic nobody configured for an event receives nothing, which is only distinguishable
 //!   from "nothing was ever published" because the publication happens.
 //!
@@ -67,7 +68,7 @@
 
 use std::time::SystemTime;
 
-use super::{PendingLifecycleEvent, StoredGroup, ACTIVITY_SUCCESSFUL};
+use super::{PendingLifecycleEvent, StoredGroup};
 
 /// The vendor field of an Amazon SNS ARN: the service namespace Amazon SNS publishes,
 /// which is what says a `TopicARN` names a topic at all.
@@ -84,8 +85,17 @@ pub const TEST_NOTIFICATION: &str = "autoscaling:TEST_NOTIFICATION";
 /// The event an instance the group LAUNCHED is published under (same catalog).
 pub const EC2_INSTANCE_LAUNCH: &str = "autoscaling:EC2_INSTANCE_LAUNCH";
 
+/// The event a launch the group did not carry through is published under instead (same
+/// catalog): the `_ERROR` counterpart of the launch event, selected by the step's own
+/// outcome ([`super::StepOutcome`]).
+pub const EC2_INSTANCE_LAUNCH_ERROR: &str = "autoscaling:EC2_INSTANCE_LAUNCH_ERROR";
+
 /// The event an instance the group TERMINATED is published under (same catalog).
 pub const EC2_INSTANCE_TERMINATE: &str = "autoscaling:EC2_INSTANCE_TERMINATE";
+
+/// The event a termination the group did not carry through is published under instead (same
+/// catalog).
+pub const EC2_INSTANCE_TERMINATE_ERROR: &str = "autoscaling:EC2_INSTANCE_TERMINATE_ERROR";
 
 /// One notification waiting to be published: the topic it goes to and the document a
 /// subscriber of that topic receives.
@@ -152,9 +162,9 @@ pub fn test_notification(
 /// instance of, the instance, the activity's id, description, cause and span, and the
 /// placement the account's Amazon EC2 store gave the instance — so a notification reports
 /// the activity a `DescribeScalingActivities` of the same instant reports and never a
-/// second, invented copy of it. The activity has completed by the instant the step is
-/// published (that completion is what the step reports), so it carries the successful
-/// status code, the full progress and no status message.
+/// second, invented copy of it. The activity has reached a terminal state by the instant the
+/// step is published (that is what the step reports), so it carries the status code that
+/// step's outcome ends it in, the full progress and no status message.
 #[must_use]
 pub fn owed_for_lifecycle_event(event: &PendingLifecycleEvent) -> Vec<PendingNotification> {
     event
@@ -180,6 +190,10 @@ pub fn owed_for_lifecycle_event(event: &PendingLifecycleEvent) -> Vec<PendingNot
 }
 
 /// The document a subscriber of a configured topic receives for one lifecycle step.
+///
+/// The activity has reached a terminal state by the instant the step is published (that is
+/// what the step reports), so it carries the code the step's own outcome ends it in
+/// ([`super::StepOutcome::status_code`]), the full progress and no status message.
 fn lifecycle_document(event: &PendingLifecycleEvent) -> String {
     let mut placement = ::serde_json::Map::new();
     if let Some(zone) = event.availability_zone.as_ref() {
@@ -205,15 +219,19 @@ fn lifecycle_document(event: &PendingLifecycleEvent) -> String {
     insert_text(&mut document, "Service", NOTIFICATION_SERVICE);
     insert_text(&mut document, "Time", &date_time_text(event.due));
     insert_text(&mut document, "EC2InstanceId", &event.instance_id);
-    insert_text(&mut document, "StatusCode", ACTIVITY_SUCCESSFUL);
-    insert_text(&mut document, "StatusMessage", "");
+    insert_text(&mut document, "StatusCode", event.outcome.status_code());
+    insert_text(
+        &mut document,
+        "StatusMessage",
+        event.status_message.as_deref().unwrap_or_default(),
+    );
     document.insert(
         "Details".to_string(),
         ::serde_json::Value::Object(placement),
     );
     insert_text(&mut document, "AutoScalingGroupName", &event.group_name);
     insert_text(&mut document, "Cause", &event.cause);
-    insert_text(&mut document, "Event", event.kind.notification_event());
+    insert_text(&mut document, "Event", event.notification_event());
     ::serde_json::Value::Object(document).to_string()
 }
 

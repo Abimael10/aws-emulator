@@ -16,11 +16,18 @@
 //! rule whose pattern does not match receives nothing, which is only distinguishable from
 //! "nothing was ever published" because the publication happens.
 //!
+//! A step the group SET OUT to take and did not carry through is announced too, under that
+//! step's own unsuccessful detail-type ([`INSTANCE_LAUNCH_UNSUCCESSFUL`],
+//! [`INSTANCE_TERMINATE_UNSUCCESSFUL`], chosen by [`StepOutcome`]): a launch that never
+//! brought the instance into service is as much a fact about that instance as one that did,
+//! and a client watching the group through the event stream can only tell the two apart if
+//! both are published.
+//!
 //! The model's own `AutoScalingNotificationTypes` catalog
 //! (`autoscaling:EC2_INSTANCE_LAUNCH`, `autoscaling:EC2_INSTANCE_TERMINATE` and their
 //! `_ERROR` counterparts, [`super::AUTO_SCALING_NOTIFICATION_TYPES`]) is this service's own
 //! statement that an instance launch and an instance termination are the events it
-//! announces; the bus carries them under the detail types above.
+//! announces, each of them either way; the bus carries them under the detail types above.
 //!
 //! # How a lifecycle step becomes an event
 //!
@@ -58,7 +65,9 @@
 use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{AutoScalingState, StoredGroup, ACTIVITY_SUCCESSFUL, GROUP_STATE_IN_SERVICE};
+use super::{
+    AutoScalingState, StoredGroup, ACTIVITY_CANCELLED, ACTIVITY_SUCCESSFUL, GROUP_STATE_IN_SERVICE,
+};
 
 /// The `source` of every event Amazon EC2 Auto Scaling publishes.
 ///
@@ -69,8 +78,21 @@ pub const EVENT_SOURCE: &str = "aws.autoscaling";
 /// The `detail-type` of the event published when a group has LAUNCHED an instance.
 pub const INSTANCE_LAUNCH_SUCCESSFUL: &str = "EC2 Instance Launch Successful";
 
+/// The `detail-type` of the event published when a launch the group SET OUT TO MAKE did not
+/// bring the instance into service.
+///
+/// The step is announced either way — what differs is which of the two detail types reports
+/// it ([`StepOutcome`]), exactly as this service's own notification catalog carries an event
+/// and its `_ERROR` counterpart for the same step
+/// ([`super::AUTO_SCALING_NOTIFICATION_TYPES`]).
+pub const INSTANCE_LAUNCH_UNSUCCESSFUL: &str = "EC2 Instance Launch Unsuccessful";
+
 /// The `detail-type` of the event published when a group has TERMINATED one.
 pub const INSTANCE_TERMINATE_SUCCESSFUL: &str = "EC2 Instance Terminate Successful";
+
+/// The `detail-type` of the event published when a termination the group set out to make did
+/// not take the instance out of service.
+pub const INSTANCE_TERMINATE_UNSUCCESSFUL: &str = "EC2 Instance Terminate Unsuccessful";
 
 /// The event bus this service publishes onto.
 ///
@@ -138,6 +160,43 @@ const MAX_CLOCK_WAIT: Duration = Duration::from_secs(5);
 /// and the next write starts a fresh pump.
 const MAX_CLOCK_WAKE_UPS: usize = 10_000;
 
+/// Whether the lifecycle step a group set out to take CARRIED THROUGH.
+///
+/// A step the group started is reported either way: a launch that brought the instance into
+/// service and one that never did are both facts about that instance, and a client watching
+/// the group through the event stream has to be able to tell them apart. So the outcome
+/// decides which `detail-type` the step is published under
+/// ([`InstanceLifecycle::detail_type`]), which event of this service's own notification
+/// catalog it is published as ([`InstanceLifecycle::notification_event`]) and the terminal
+/// status code the activity that recorded it ends in ([`Self::status_code`]) — nothing else
+/// about the announcement changes, because it is the same step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepOutcome {
+    /// The instance made the move the step was taking it through.
+    Completed,
+    /// The group attempted the step and the instance did not make the move — a launch a
+    /// lifecycle hook abandoned, or a termination that did not happen
+    /// ([`super::lifecycle_actions`]).
+    Unsuccessful,
+}
+
+impl StepOutcome {
+    /// The terminal `ScalingActivityStatusCode` the activity of a step with this outcome
+    /// ends in, which is also the `StatusCode` the event reporting it carries.
+    ///
+    /// A step that carried through is [`ACTIVITY_SUCCESSFUL`]. One that did not is
+    /// [`ACTIVITY_CANCELLED`] — the code this service records for a launch whose "instance
+    /// … was taken back before it reached service", which is what a step the group gave up
+    /// on is.
+    #[must_use]
+    pub fn status_code(self) -> &'static str {
+        match self {
+            Self::Completed => ACTIVITY_SUCCESSFUL,
+            Self::Unsuccessful => ACTIVITY_CANCELLED,
+        }
+    }
+}
+
 /// Which lifecycle step a group took with one of its instances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstanceLifecycle {
@@ -148,23 +207,39 @@ pub enum InstanceLifecycle {
 }
 
 impl InstanceLifecycle {
-    /// The `detail-type` the event reporting this step carries.
+    /// The `detail-type` the event reporting this step carries, for a step with `outcome`.
     #[must_use]
-    pub fn detail_type(self) -> &'static str {
-        match self {
-            Self::Launched => INSTANCE_LAUNCH_SUCCESSFUL,
-            Self::Terminated => INSTANCE_TERMINATE_SUCCESSFUL,
+    pub fn detail_type(self, outcome: StepOutcome) -> &'static str {
+        match (self, outcome) {
+            (Self::Launched, StepOutcome::Completed) => INSTANCE_LAUNCH_SUCCESSFUL,
+            (Self::Launched, StepOutcome::Unsuccessful) => INSTANCE_LAUNCH_UNSUCCESSFUL,
+            (Self::Terminated, StepOutcome::Completed) => INSTANCE_TERMINATE_SUCCESSFUL,
+            (Self::Terminated, StepOutcome::Unsuccessful) => INSTANCE_TERMINATE_UNSUCCESSFUL,
         }
     }
 
     /// The event type of this service's own notification catalog
     /// ([`super::AUTO_SCALING_NOTIFICATION_TYPES`]) that a group's notification
     /// configurations select this step by, and that the notification reporting it carries.
+    ///
+    /// The catalog carries each step's event and its `_ERROR` counterpart, which is the same
+    /// distinction the detail types above draw: a step that did not carry through is the
+    /// `_ERROR` event of that step.
     #[must_use]
-    pub fn notification_event(self) -> &'static str {
-        match self {
-            Self::Launched => super::sns_notifications::EC2_INSTANCE_LAUNCH,
-            Self::Terminated => super::sns_notifications::EC2_INSTANCE_TERMINATE,
+    pub fn notification_event(self, outcome: StepOutcome) -> &'static str {
+        match (self, outcome) {
+            (Self::Launched, StepOutcome::Completed) => {
+                super::sns_notifications::EC2_INSTANCE_LAUNCH
+            }
+            (Self::Launched, StepOutcome::Unsuccessful) => {
+                super::sns_notifications::EC2_INSTANCE_LAUNCH_ERROR
+            }
+            (Self::Terminated, StepOutcome::Completed) => {
+                super::sns_notifications::EC2_INSTANCE_TERMINATE
+            }
+            (Self::Terminated, StepOutcome::Unsuccessful) => {
+                super::sns_notifications::EC2_INSTANCE_TERMINATE_ERROR
+            }
         }
     }
 
@@ -252,6 +327,10 @@ pub struct PendingLifecycleEvent {
     /// WHICH step it reports, which is what the `detail-type` it is published under and
     /// the notification event it is published as are both read from.
     pub kind: InstanceLifecycle,
+    /// Whether that step CARRIED THROUGH, the other half of both of those readings
+    /// ([`StepOutcome`]): a step is queued as one that is going to complete and re-marked
+    /// where it turns out not to have ([`AutoScalingState::settle_held_step`]).
+    pub outcome: StepOutcome,
     /// The Amazon SNS topics the group's notification configurations selected this step
     /// for when it was recorded, which is where its notifications go
     /// ([`super::sns_notifications`]). Empty for a group configured for no topic, or for
@@ -276,11 +355,30 @@ pub struct PendingLifecycleEvent {
     pub description: String,
     /// That activity's `Cause`.
     pub cause: String,
+    /// That activity's `StatusMessage`: why a step that did NOT carry through did not, and
+    /// `None` for one that did — "an activity that did not fail carries no status message".
+    pub status_message: Option<String>,
     /// That activity's `StartTime`.
     pub start_time: SystemTime,
     /// WHEN the step completed: the event's `time`, its `detail.EndTime`, and the instant
     /// from which it may be published.
     pub due: SystemTime,
+}
+
+impl PendingLifecycleEvent {
+    /// The `detail-type` this event is published under: the step it reports and how that
+    /// step turned out, together.
+    #[must_use]
+    pub fn detail_type(&self) -> &'static str {
+        self.kind.detail_type(self.outcome)
+    }
+
+    /// The event of this service's own notification catalog it is published as, read the
+    /// same way.
+    #[must_use]
+    pub fn notification_event(&self) -> &'static str {
+        self.kind.notification_event(self.outcome)
+    }
 }
 
 impl AutoScalingState {
@@ -349,10 +447,20 @@ impl AutoScalingState {
         let notification_topics = self
             .groups
             .get(change.group_name)
-            .map(|group| group.notification_topics(change.kind.notification_event()))
+            .map(|group| {
+                group.notification_topics(
+                    change
+                        .kind
+                        .notification_event(StepOutcome::Completed),
+                )
+            })
             .unwrap_or_default();
         self.queue_lifecycle_event(PendingLifecycleEvent {
             kind: change.kind,
+            // The step is under way: it is queued as one that is going to complete, and the
+            // one place a step that did NOT complete is settled re-marks it
+            // ([`Self::settle_held_step`]).
+            outcome: StepOutcome::Completed,
             notification_topics,
             group_name: change.group_name.to_string(),
             group_arn: change.group_arn.to_string(),
@@ -363,6 +471,8 @@ impl AutoScalingState {
             activity_id: activity_id.clone(),
             description,
             cause: change.cause.to_string(),
+            // A step that is under way has not failed at anything, so it states no reason.
+            status_message: None,
             start_time: change.start_time,
             due,
         });
@@ -574,9 +684,10 @@ fn group_due_instants(group: &StoredGroup) -> Vec<SystemTime> {
 ///
 /// Every member is read off the queued step, which was itself read off the activity this
 /// service recorded, so the event reports the activity a `DescribeScalingActivities` of the
-/// same instant reports and never a second, invented copy of it. The activity has completed
-/// by the instant the event is published — that completion is what the event reports — so
-/// its status is [`ACTIVITY_SUCCESSFUL`] and it carries no status message.
+/// same instant reports and never a second, invented copy of it. The activity has reached a
+/// terminal state by the instant the event is published — that is what the event reports —
+/// so its status is the code the step's own outcome ends it in
+/// ([`StepOutcome::status_code`]) and it carries no status message.
 ///
 /// Beside the activity, the detail names the two ENDS of the move the step made — `Origin`
 /// and `Destination` — so a consumer branches on the direction (a rule pattern on
@@ -599,7 +710,7 @@ fn lifecycle_event_detail(event: &PendingLifecycleEvent) -> ::serde_json::Value 
     let mut detail = ::serde_json::Map::new();
     detail.insert(
         "StatusCode".to_string(),
-        ::serde_json::Value::String(ACTIVITY_SUCCESSFUL.to_string()),
+        ::serde_json::Value::String(event.outcome.status_code().to_string()),
     );
     detail.insert(
         "Description".to_string(),
@@ -623,9 +734,12 @@ fn lifecycle_event_detail(event: &PendingLifecycleEvent) -> ::serde_json::Value 
         "RequestId".to_string(),
         ::serde_json::Value::String(event.activity_id.clone()),
     );
+    // Why the step did not do what it set out to, for one that did not: the activity's own
+    // `StatusMessage`. A step that carried through has nothing to state, which the member
+    // reports as the empty text the successful events of this service already carry.
     detail.insert(
         "StatusMessage".to_string(),
-        ::serde_json::Value::String(String::new()),
+        ::serde_json::Value::String(event.status_message.clone().unwrap_or_default()),
     );
     detail.insert(
         "EC2InstanceId".to_string(),
@@ -815,7 +929,7 @@ async fn publish_batch(
         .iter()
         .map(|event| OutboundEvent {
             region: event.region.clone(),
-            detail_type: event.kind.detail_type(),
+            detail_type: event.detail_type(),
             time: event.due,
             // The event names every resource it is about: the group, and the instance that
             // moved.
