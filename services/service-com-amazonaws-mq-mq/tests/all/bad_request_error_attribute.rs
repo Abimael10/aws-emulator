@@ -161,11 +161,21 @@ async fn a_value_outside_a_modelled_enum_is_refused_naming_the_member() {
             // subject, the rejected value in brackets, then the set it accepts.
             // The subject is the member's own documented description, so the row
             // checks the parts the rule builds from the request and the model.
+            // `engineType` is the one member Amazon MQ words without the accepted
+            // set — "Broker engine [<value>] is invalid." — so its row asserts that
+            // whole sentence instead.
             let message = string_at(&answer, "/message");
+            let expected = if member.attribute == "engineType" {
+                format!("Broker engine [{value}] is invalid.")
+            } else {
+                format!(
+                    "[{value}] is invalid. Valid values are: [{}]",
+                    member.allowed.join(", ")
+                )
+            };
             assert!(
-                message.contains(&format!("[{value}] is invalid. Valid values are: [{}]", member.allowed.join(", "))),
-                "case {case:?}: the message must name the rejected value and the accepted \
-                 set, got {message:?}"
+                message.contains(&expected),
+                "case {case:?}: the message must carry {expected:?}, got {message:?}"
             );
             rows += 1;
         }

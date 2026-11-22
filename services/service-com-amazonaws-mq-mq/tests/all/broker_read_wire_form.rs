@@ -185,8 +185,13 @@ async fn a_broker_read_answers_every_enumerated_member_in_its_wire_spelling() {
 /// line's release is the one the recorded `DescribeBroker` answer carries. Every line
 /// in `published_engine_versions` is covered, which
 /// [`every_published_version_line_resolves_to_a_release`] checks.
-const PATCH_RELEASE_OF_LINE: &[(&str, &str)] =
-    &[("5.18", "5.18.8"), ("5.19", "5.19.0"), ("3.13", "3.13.7")];
+const PATCH_RELEASE_OF_LINE: &[(&str, &str)] = &[
+    ("5.18", "5.18.8"),
+    ("5.19", "5.19.0"),
+    ("3.13", "3.13.7"),
+    ("4.2", "4.2.0"),
+    ("4.3", "4.3.0"),
+];
 
 /// The release a line runs, out of the table above.
 fn patch_release_of(line: &str) -> String {

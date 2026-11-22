@@ -210,8 +210,11 @@ pub const ACTIVEMQ_ENGINE_VERSIONS: &[&str] = &["5.18", "5.19"];
 
 /// The engine versions Amazon MQ offers for RabbitMQ, oldest first — see
 /// [`ACTIVEMQ_ENGINE_VERSIONS`] for the granularity and where it comes from (the
-/// same recorded catalog carries `["3.13"]` for RabbitMQ).
-pub const RABBITMQ_ENGINE_VERSIONS: &[&str] = &["3.13"];
+/// recorded `DescribeBrokerEngineTypes` catalog carries `["4.3", "4.2", "3.13"]`
+/// for RabbitMQ, newest first, which is also the list the recorded
+/// `DescribeBrokerInstanceOptions` entries of that engine report and the one a
+/// create's refusal quotes back).
+pub const RABBITMQ_ENGINE_VERSIONS: &[&str] = &["3.13", "4.2", "4.3"];
 
 /// The engine versions published for `engine_type`, or none for a value outside
 /// the model's `EngineType` set — a handler refuses such a value before it gets
@@ -932,20 +935,43 @@ pub fn fingerprint_of(parts: &[String]) -> String {
     parts.join("\u{1f}")
 }
 
+/// The sentence Amazon MQ states when it refuses a value outside an enumerated
+/// member's value set: fixed text per MEMBER, with the rejected value taken
+/// verbatim from the request.
+///
+/// `engineType` has its own sentence, and it names no accepted values: the
+/// recorded refusal of an engine type outside the model's set is "Broker engine
+/// [<value>] is invalid." — the subject is "Broker engine" and there is no
+/// valid-values suffix. Every other member is stated the way
+/// [`enum_subject`] describes.
+fn enum_refusal_message(attribute: &str, value: &str, allowed: &[&str]) -> String {
+    if attribute == ENGINE_TYPE_ATTRIBUTE {
+        return format!("Broker engine [{value}] is invalid.");
+    }
+    format!(
+        "{} [{value}] is invalid. Valid values are: [{}]",
+        enum_subject(attribute),
+        allowed.join(", ")
+    )
+}
+
+/// The wire name of the member that names a broker engine, the one member whose
+/// enum refusal Amazon MQ words without a valid-values list
+/// ([`enum_refusal_message`]).
+const ENGINE_TYPE_ATTRIBUTE: &str = "engineType";
+
 /// The subject Amazon MQ names when it refuses a value outside an enumerated
 /// member's value set.
 ///
 /// MQ states such a refusal as one sentence built from the request and the
 /// model: the member's documented subject, the rejected value in brackets, then
-/// the values it does accept — for `engineType`, "Broker engine type
-/// [<value>] is invalid. Valid values are: [ACTIVEMQ, RABBITMQ]". The subject is
+/// the values it does accept — for `deploymentMode`, "Broker deployment mode
+/// [<value>] is invalid. Valid values are: [SINGLE_INSTANCE, …]". The subject is
 /// the member's own documented description, so it is held per member here rather
 /// than derived from the wire name; a member with no row falls back to its wire
 /// name, which keeps the sentence well-formed for any member added later.
 fn enum_subject(attribute: &str) -> &str {
     match attribute {
-        // "Required. The type of broker engine." (`CreateBrokerRequest$EngineType`)
-        "engineType" => "Broker engine type",
         // "Required. The broker's deployment mode." (`CreateBrokerRequest$DeploymentMode`)
         "deploymentMode" => "Broker deployment mode",
         // "The broker's storage type." (`CreateBrokerRequest$StorageType`)
@@ -974,11 +1000,7 @@ pub fn validate_enum(attribute: &str, value: &str, allowed: &[&str]) -> Result<(
     }
     Err(Invalid::new(
         attribute,
-        format!(
-            "{} [{value}] is invalid. Valid values are: [{}]",
-            enum_subject(attribute),
-            allowed.join(", ")
-        ),
+        enum_refusal_message(attribute, value, allowed),
     ))
 }
 

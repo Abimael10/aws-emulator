@@ -571,10 +571,7 @@ async fn values_outside_the_published_bounds_and_sets_are_refused() {
         (
             format!("engineType={engine_outside}"),
             "engineType",
-            Some(format!(
-                "Broker engine type [{engine_outside}] is invalid. Valid values are: [{}]",
-                ENGINE_TYPE_VALUES.join(", ")
-            )),
+            Some(format!("Broker engine [{engine_outside}] is invalid.")),
         ),
         (
             format!("storageType={storage_outside}"),

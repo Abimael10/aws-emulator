@@ -400,15 +400,15 @@ fn latest_offered_version(engine_type: &str) -> String {
 /// RULE 6, catalog half: the versions Amazon MQ offers for creation are MAJOR.MINOR and
 /// the newest one is what a create defaults to.
 ///
-/// Source: the recorded `DescribeBrokerInstanceOptions` catalog, whose
-/// `supportedEngineVersions` carries `["5.19", "5.18"]` for ActiveMQ and `["3.13"]` for
-/// RabbitMQ — the versions Amazon MQ currently offers, at that granularity. RabbitMQ is
-/// the engine the reported divergence did not cite.
+/// Source: the recorded `DescribeBrokerEngineTypes` / `DescribeBrokerInstanceOptions`
+/// catalogs, whose version lists carry `["5.19", "5.18"]` for ActiveMQ and
+/// `["4.3", "4.2", "3.13"]` for RabbitMQ — the versions Amazon MQ currently offers, at
+/// that granularity. RabbitMQ is the engine the reported divergence did not cite.
 #[tokio::test]
 async fn an_engine_version_defaults_to_the_newest_version_the_engine_offers() {
     let mq = Mq::new("us-east-1");
 
-    for (engine_type, newest) in [("ACTIVEMQ", "5.19"), ("RABBITMQ", "3.13")] {
+    for (engine_type, newest) in [("ACTIVEMQ", "5.19"), ("RABBITMQ", "4.3")] {
         let case = format!("{engine_type} default version");
         assert_eq!(
             latest_offered_version(engine_type),

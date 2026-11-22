@@ -477,7 +477,9 @@ const ROWS: &[Row] = &[
         },
         expected_name: "fanout-cluster",
         expected_engine_type: "RabbitMQ",
-        expected_engine_version: "3.13.7",
+        // The create names no `EngineVersion`, so the broker runs the release of the
+        // newest RabbitMQ line Amazon MQ offers for creation.
+        expected_engine_version: "4.3.0",
         expected_deployment_mode: "CLUSTER_MULTI_AZ",
         expected_host_instance_type: "mq.m5.xlarge",
         expected_publicly_accessible: true,

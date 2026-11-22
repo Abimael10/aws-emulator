@@ -22,11 +22,15 @@ use super::*;
 /// the line it was created on: the recorded Amazon MQ answer for a broker created on
 /// the ActiveMQ `5.18` line carries `5.18.8`. The releases are the ones Amazon MQ
 /// publishes for each line (the Developer Guide's ActiveMQ and RabbitMQ version
-/// support tables); a line appears once, since no two engines share one.
+/// support tables); a line appears once, since no two engines share one. A line the
+/// guide publishes no later release for runs that line's first release (`4.2.0` for
+/// the RabbitMQ `4.2` line).
 const ENGINE_PATCH_RELEASES: &[(&str, &str)] = &[
     ("5.18", "5.18.8"),
     ("5.19", "5.19.0"),
     ("3.13", "3.13.7"),
+    ("4.2", "4.2.0"),
+    ("4.3", "4.3.0"),
 ];
 
 /// The engine version a broker created with `requested` RUNS: the patch release of the
