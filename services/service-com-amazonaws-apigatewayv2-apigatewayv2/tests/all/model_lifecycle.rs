@@ -30,6 +30,13 @@
 //!   rewrites an api or one of its children with, not the `200` the model's `@http` trait
 //!   declares.
 //!
+//! * **The record a patch leaves behind is the record a CREATE of the same values leaves**,
+//!   for every consumer of the model and not only for the readers that echo its members
+//!   back: `GetModelTemplate` GENERATES a mapping template from the schema document the
+//!   record holds, in the language the record's content type names, so it answers a patched
+//!   model exactly as it answers one created with those values — and its answer moves when,
+//!   and only when, the patch moved what the template is generated from.
+//!
 //! The rows vary what each rule generalises over: the content type (absent, JSON, a
 //! `+json` suffixed media type, one with parameters, a non-JSON one), the schema's JSON
 //! type and well-formedness, which optional members the request carries, the name's
@@ -1072,4 +1079,209 @@ async fn an_update_naming_no_model_of_this_api_is_refused() {
         "BadRequestException",
         "case {case:?}: expected BadRequestException, got {body}"
     );
+}
+
+/// The members a `Model` record carries beside the `ModelId` its api minted: the ones a
+/// create stores and a patch rewrites.
+const PATCHABLE_MEMBERS: [&str; 4] = ["name", "contentType", "description", "schema"];
+
+/// One row of the equivalence table: the record seeded, the patch applied to it, and the
+/// CREATE body that stores the record that patch has to leave behind.
+struct EquivalenceRow {
+    case: &'static str,
+    seed: Value,
+    patch: Value,
+    equivalent: Value,
+    /// Does the patch move what a template is GENERATED from — the schema document, or the
+    /// content type that says which language it is written in?
+    template_moves: bool,
+}
+
+/// The rows the equivalence is asserted over. They differ along WHICH member the patch
+/// carries (the schema, the description, the name, a content type and a schema at once, and
+/// no member at all), whether that member was already set, and whether the value it moves to
+/// leaves a record a template can be generated from at all.
+fn equivalence_rows() -> Vec<EquivalenceRow> {
+    let seeded_schema = json!({
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "type": "object",
+        "properties": { "id": { "type": "string" } }
+    })
+    .to_string();
+    let other_schema = json!({
+        "$schema": "http://json-schema.org/draft-04/schema#",
+        "type": "object",
+        "properties": { "total": { "type": "number" }, "paid": { "type": "boolean" } }
+    })
+    .to_string();
+    // An array-rooted schema: the other structure a mapping template is generated from, so
+    // the consumer's answer changes shape and not only content.
+    let list_schema = json!({ "type": "array", "items": { "type": "string" } }).to_string();
+    // A schema written in a language that is not JSON Schema, carried by a model whose
+    // content type says so.
+    let xml_schema = "<xs:schema><xs:element name=\"order\"/></xs:schema>";
+    let seed = json!({
+        "name": "Order",
+        "contentType": "application/json",
+        "schema": seeded_schema.clone()
+    });
+    vec![
+        EquivalenceRow {
+            case: "the schema replaced by one declaring other properties",
+            seed: seed.clone(),
+            patch: json!({ "schema": other_schema.clone() }),
+            equivalent: json!({
+                "name": "Order",
+                "contentType": "application/json",
+                "schema": other_schema
+            }),
+            template_moves: true,
+        },
+        EquivalenceRow {
+            case: "a description onto a model that had none",
+            seed: seed.clone(),
+            patch: json!({ "description": "the body of an order request" }),
+            equivalent: json!({
+                "name": "Order",
+                "contentType": "application/json",
+                "description": "the body of an order request",
+                "schema": seeded_schema.clone()
+            }),
+            template_moves: false,
+        },
+        EquivalenceRow {
+            case: "the name alone, which no template is generated from",
+            seed: seed.clone(),
+            patch: json!({ "name": "Renamed" }),
+            equivalent: json!({
+                "name": "Renamed",
+                "contentType": "application/json",
+                "schema": seeded_schema
+            }),
+            template_moves: false,
+        },
+        EquivalenceRow {
+            case: "a +json content type and an array-rooted schema, at once",
+            seed: seed.clone(),
+            patch: json!({
+                "contentType": "application/vnd.order+json",
+                "schema": list_schema.clone()
+            }),
+            equivalent: json!({
+                "name": "Order",
+                "contentType": "application/vnd.order+json",
+                "schema": list_schema
+            }),
+            template_moves: true,
+        },
+        EquivalenceRow {
+            // After this patch the record's schema is in a language this service generates
+            // no template from, so the consumer refuses — exactly as it refuses a model
+            // CREATED that way.
+            case: "a content type whose schema language is not JSON Schema",
+            seed: seed.clone(),
+            patch: json!({ "contentType": "application/xml", "schema": xml_schema }),
+            equivalent: json!({
+                "name": "Order",
+                "contentType": "application/xml",
+                "schema": xml_schema
+            }),
+            template_moves: true,
+        },
+        EquivalenceRow {
+            case: "a patch carrying no member at all, which leaves the seeded record",
+            seed: seed.clone(),
+            patch: json!({}),
+            equivalent: seed,
+            template_moves: false,
+        },
+    ]
+}
+
+/// Ask the consumer that COMPUTES from a model's stored record: `GetModelTemplate` generates
+/// a mapping template FROM the schema document the record holds, so its answer is evidence
+/// about what was stored rather than an echo of what was sent.
+async fn template_answer(
+    emulator: &smithy_server_runtime::MultiServiceRouter,
+    api_id: &str,
+    model_id: &str,
+) -> (u16, Value) {
+    call(
+        emulator,
+        "GET",
+        &format!("/v2/apis/{api_id}/models/{model_id}/template"),
+        None,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_patch_leaves_the_record_a_create_of_the_same_values_leaves() {
+    // RULE: a member `UpdateModel` carries replaces the stored one and a member it omits
+    // leaves the stored value as it was, so the record a patch leaves behind is the record a
+    // create of those same values leaves — for the consumer that GENERATES a template from
+    // the stored schema just as much as for the readers that report the members back, and
+    // that consumer's answer moves when, and only when, the patch moved what it is generated
+    // from.
+    let emulator = emulator();
+    for (index, row) in equivalence_rows().into_iter().enumerate() {
+        let case = row.case;
+        let patched_api =
+            create_api(&emulator, case, &format!("model-patch-equivalence-{index}")).await;
+        let created_api =
+            create_api(&emulator, case, &format!("model-create-equivalence-{index}")).await;
+
+        let model_id = create_model(&emulator, case, &patched_api, row.seed.clone()).await;
+        let before = template_answer(&emulator, &patched_api, &model_id).await;
+
+        let (status, patched) = call(
+            &emulator,
+            "PATCH",
+            &format!("/v2/apis/{patched_api}/models/{model_id}"),
+            Some(row.patch.clone()),
+        )
+        .await;
+        assert_eq!(
+            status, PATCHED,
+            "case {case:?}: expected {PATCHED} from UpdateModel, got {status} {patched}"
+        );
+
+        // The same values, taken by a CREATE on an api of its own: the record the patch was
+        // supposed to leave behind, written by the writer that was never in doubt.
+        let reference_id = create_model(&emulator, case, &created_api, row.equivalent).await;
+
+        let stored = read_model(&emulator, case, &patched_api, &model_id).await;
+        let reference = read_model(&emulator, case, &created_api, &reference_id).await;
+        for member in PATCHABLE_MEMBERS {
+            assert_eq!(
+                stored.get(member),
+                reference.get(member),
+                "case {case:?}: expected the patched model's {member} to be the created \
+                 model's {:?}, got {:?}",
+                reference.get(member),
+                stored.get(member)
+            );
+        }
+
+        let after = template_answer(&emulator, &patched_api, &model_id).await;
+        let reference_answer = template_answer(&emulator, &created_api, &reference_id).await;
+        assert_eq!(
+            after, reference_answer,
+            "case {case:?}: expected GetModelTemplate to answer the patched model as it \
+             answers the created one ({reference_answer:?}), got {after:?}"
+        );
+        if row.template_moves {
+            assert_ne!(
+                after, before,
+                "case {case:?}: expected the patch to move what GetModelTemplate generates \
+                 from, got {after:?} both before and after"
+            );
+        } else {
+            assert_eq!(
+                after, before,
+                "case {case:?}: expected the template to go on being generated from the \
+                 untouched schema ({before:?}), got {after:?}"
+            );
+        }
+    }
 }
