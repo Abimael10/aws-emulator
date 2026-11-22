@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store
                 .git_endpoint
                 .as_ref()
-                .map(|git| git.authority().to_string()),
+                .map(crate::state::git_endpoint::GitEndpoint::origin),
         );
 
         // One entry per name the request lists: a name the store holds contributes the

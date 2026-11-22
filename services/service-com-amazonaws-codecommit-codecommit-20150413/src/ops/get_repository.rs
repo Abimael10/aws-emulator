@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store
                 .git_endpoint
                 .as_ref()
-                .map(|git| git.authority().to_string()),
+                .map(crate::state::git_endpoint::GitEndpoint::origin),
         );
 
         let repository = store.repositories.get(&input.repository_name).ok_or_else(|| {

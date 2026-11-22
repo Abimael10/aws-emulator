@@ -9,27 +9,27 @@
 //! rewrite it. So the announced value has to be an origin that client reaches as it
 //! stands.
 //!
-//! The emulator's own front door is served over TLS with a certificate generated at
-//! run time, which no default trust store accepts: a git client handed an `https://`
-//! URL on it stops at the handshake, before one byte of the git protocol is
-//! exchanged, and the whole transport — and everything only reachable through it —
-//! is unusable. The core's certificate is the core's, so this service does not get
-//! to present another; what the core does offer is a listener that hands the handler
-//! the connection's first byte ([`::emulator_server::Listeners::tcp_plaintext`], the
-//! same socket, bind interface, port range, connection caps, idle timeout and
-//! teardown as its TLS sibling). The git transport is announced on one of those, as
-//! `http://host:port/v1/repos/<repositoryName>` — the same path form CodeCommit's
-//! own clone URL carries, on an origin a git client dials with no extra trust
-//! material.
+//! The address is a listener the core hands the handler the connection's first byte
+//! on ([`::emulator_server::Listeners::tcp_plaintext`], the same socket, bind
+//! interface, port range, connection caps, idle timeout and teardown as its TLS
+//! sibling), with the encryption negotiated IN BAND
+//! ([`::service_common::in_band_tls`]): a connection opened with a TLS record is
+//! handed to the core's own TLS server and read decrypted, one opened with an HTTP
+//! method is read as it stands. ONE address therefore serves both schemes, and this
+//! service never touches a key or a certificate.
+//!
+//! The announced value is the TLS half of it,
+//! `https://host:port/v1/repos/<repositoryName>` — the same scheme and path form
+//! CodeCommit's own clone URL carries, because the member is contractually the HTTPS
+//! clone URL and the flows a client drives off it (its credential helper, a policy
+//! that refuses to send a secret to a non-TLS origin) only run on an `https://`
+//! origin. The clear half of the same address stays served, and is what is announced
+//! when this emulator could prepare no TLS at all: an origin whose handshake nothing
+//! would answer is not an address.
 //!
 //! What a client sends to that port never leaves this machine: the interface is the
 //! CORE's (`EMULATOR_BIND_ADDRESS`, loopback unless the operator says otherwise, and
 //! the core owns the bind), and every request is dispatched inside this process.
-//!
-//! The encryption is still negotiated IN BAND
-//! ([`::service_common::in_band_tls`]), so a client that dials the same address with
-//! `https://` is handed to the core's own TLS server and served too: one address,
-//! both schemes, and this service never touches a key or a certificate.
 //!
 //! The listener is the ADDRESS, not the transport: everything a git request is
 //! answered BY stays in [`crate::service::git_http`], which serves the same request
@@ -60,10 +60,17 @@ use ::http_body_util::{BodyExt as _, Full, Limited};
 use ::smithy_server_runtime::EmbeddedEmulator;
 use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-/// The scheme the announced git address is published under: the one the transport
-/// its listener speaks in the clear names, so the value is an origin the git client
-/// that just read the metadata dials as it stands.
-pub const GIT_SCHEME: &str = "http";
+/// The scheme the announced git address is published under: `cloneUrlHttp` is "the
+/// URL to use for cloning the repository over HTTPS", so the announced origin is the
+/// TLS half of the address — the one the core's own TLS server terminates on this
+/// listener in band.
+pub const GIT_SCHEME_TLS: &str = "https";
+
+/// The scheme the same address answers in the clear, and the one it is announced
+/// under when this emulator has no TLS server to lend the listener at all: nothing
+/// there would complete a handshake, so the TLS half would name an origin that
+/// answers nothing.
+pub const GIT_SCHEME_CLEAR: &str = "http";
 
 /// How many git request BODIES this address reads at once: the core's own HTTP
 /// in-flight cap, one permit per request, taken before a byte of a body is read and
@@ -86,6 +93,10 @@ pub struct GitEndpoint {
     /// The `host:port` a git client dials, which is the authority of every announced
     /// clone URL.
     authority: String,
+    /// The scheme the announced clone URL names on that authority: the TLS half
+    /// ([`GIT_SCHEME_TLS`]) whenever the core lent this listener its TLS server, and
+    /// the clear half ([`GIT_SCHEME_CLEAR`]) when it could not.
+    scheme: &'static str,
     /// The listener itself. Never read: it is held because dropping it closes the
     /// port.
     _listener: ::emulator_server::ResourceListener,
@@ -97,20 +108,22 @@ impl std::fmt::Debug for GitEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitEndpoint")
             .field("authority", &self.authority)
+            .field("scheme", &self.scheme)
             .finish()
     }
 }
 
 impl GitEndpoint {
-    /// The `host:port` a git client reaches this service's git transport at.
-    pub fn authority(&self) -> &str {
-        &self.authority
+    /// The `<scheme>://<host>:<port>` an announced clone URL is built on: the
+    /// `host:port` a git client dials, under the scheme that address is served under.
+    pub fn origin(&self) -> String {
+        format!("{}://{}", self.scheme, self.authority)
     }
 }
 
-/// The `host:port` this service's git transport is served at, opening the listener on
-/// first use, or `None` when this engine vends no listener at all — in which case the
-/// caller announces the endpoint the request arrived at instead.
+/// The `<scheme>://<host>:<port>` this service's git transport is served at, opening
+/// the listener on first use, or `None` when this engine vends no listener at all — in
+/// which case the caller announces the endpoint the request arrived at instead.
 ///
 /// Opening the address changes no repository and is idempotent: the first listener is
 /// kept, so the git transport answers at the same address for every repository and for
@@ -124,10 +137,7 @@ pub async fn ensure_git_endpoint<Eng: Send + Sync + 'static>(
 ) -> Option<String> {
     let existing = {
         let store = state.lock();
-        store
-            .git_endpoint
-            .as_ref()
-            .map(|endpoint| endpoint.authority.clone())
+        store.git_endpoint.as_ref().map(GitEndpoint::origin)
     };
     if existing.is_some() {
         return existing;
@@ -139,8 +149,13 @@ pub async fn ensure_git_endpoint<Eng: Send + Sync + 'static>(
         // The core's own TLS server, lent to this plaintext listener so the
         // `https://` half of the address is terminated by the core rather than here.
         // A listener this emulator could prepare none for serves the `http://` half
-        // alone.
+        // alone, and is announced under that scheme.
         upgrader: listeners.tls_upgrader().ok(),
+    };
+    let scheme = if handler.upgrader.is_some() {
+        GIT_SCHEME_TLS
+    } else {
+        GIT_SCHEME_CLEAR
     };
     // Opened on a task of its OWN, so a runtime that cannot bind a socket at all —
     // one built with no IO driver, which is what a host driving this emulator in
@@ -155,13 +170,16 @@ pub async fn ensure_git_endpoint<Eng: Send + Sync + 'static>(
     // so an announced address never changes under a client. Dropping the loser closes
     // its port.
     if let Some(endpoint) = store.git_endpoint.as_ref() {
-        return Some(endpoint.authority.clone());
+        return Some(endpoint.origin());
     }
-    store.git_endpoint = Some(GitEndpoint {
-        authority: authority.clone(),
+    let endpoint = GitEndpoint {
+        authority,
+        scheme,
         _listener: listener,
-    });
-    Some(authority)
+    };
+    let origin = endpoint.origin();
+    store.git_endpoint = Some(endpoint);
+    Some(origin)
 }
 
 /// Serves the announced git address: it hands every request it accepts to the router
@@ -199,8 +217,17 @@ async fn serve_connection(
     upgrader: Option<TlsUpgrader>,
     conn: ListenerConn,
 ) {
-    let Some(conn) = ::service_common::in_band_tls::negotiated(conn, upgrader).await else {
+    let Some((conn, encrypted)) =
+        ::service_common::in_band_tls::negotiated_scheme(conn, upgrader).await
+    else {
         return;
+    };
+    // Which half of the one address this client dialled, so the request the router is
+    // handed names the scheme it actually arrived under rather than a fixed one.
+    let scheme = if encrypted {
+        GIT_SCHEME_TLS
+    } else {
+        GIT_SCHEME_CLEAR
     };
     let io = ::hyper_util::rt::TokioIo::new(conn);
     let service = ::hyper::service::service_fn(move |request: ::http::Request<_>| {
@@ -213,7 +240,7 @@ async fn serve_connection(
             // cannot take the connection, the listener or the process down with it.
             let facts = ::emulator_server::RequestFacts::from_request(&request);
             Ok::<_, ::std::convert::Infallible>(
-                ::emulator_server::contain_panics(facts, answer(callback, request)).await,
+                ::emulator_server::contain_panics(facts, answer(callback, scheme, request)).await,
             )
         }
     });
@@ -244,8 +271,12 @@ fn body_ceiling() -> usize {
 }
 
 /// Answer one request to the announced git address from this emulator's router.
+///
+/// `scheme` is the half of the address the connection was opened on, which the
+/// forwarded request names.
 async fn answer(
     callback: EmbeddedEmulator,
+    scheme: &'static str,
     request: ::http::Request<::hyper::body::Incoming>,
 ) -> ::http::Response<Full<Bytes>> {
     let (parts, body) = request.into_parts();
@@ -265,7 +296,7 @@ async fn answer(
         let Ok(collected) = limited.collect().await else {
             return plain(413, BODY_TOO_LARGE);
         };
-        let Some(forwarded) = forwarded(parts, collected.to_bytes()) else {
+        let Some(forwarded) = forwarded(parts, collected.to_bytes(), scheme) else {
             return plain(400, NOT_A_REQUEST);
         };
         match callback.http_connector().call(forwarded).await {
@@ -301,7 +332,7 @@ async fn answer(
 /// front door.
 ///
 /// `None` for a request that does not render as one at all, which addresses nothing.
-fn forwarded(parts: ::http::request::Parts, body: Bytes) -> Option<RtRequest> {
+fn forwarded(parts: ::http::request::Parts, body: Bytes, scheme: &str) -> Option<RtRequest> {
     let host = parts
         .headers
         .get(::http::header::HOST)
@@ -312,7 +343,7 @@ fn forwarded(parts: ::http::request::Parts, body: Bytes) -> Option<RtRequest> {
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let uri = format!("{GIT_SCHEME}://{host}{}{query}", parts.uri.path());
+    let uri = format!("{scheme}://{host}{}{query}", parts.uri.path());
     let mut builder = ::http::Request::builder()
         .method(parts.method.clone())
         .uri(uri);

@@ -308,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // opened once for the whole store and changes no repository
         // (`crate::state::git_endpoint`); the store guard is taken after it, because
         // a guard held across an await would make this future non-`Send`.
-        let git_authority = crate::state::git_endpoint::ensure_git_endpoint(
+        let git_origin = crate::state::git_endpoint::ensure_git_endpoint(
             &*self.engine,
             &state,
             ctx.callback(),
@@ -383,7 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would leave the emulator entirely.
         let metadata = repository.metadata(
             &crate::state::ServingEndpoint::from_request(ctx.parts())
-                .serving_git_at(git_authority),
+                .serving_git_at(git_origin),
         );
         store
             .repositories

@@ -5,9 +5,11 @@
 //!
 //! The rules under test:
 //!
-//! 1. `RepositoryMetadata.cloneUrlHttp` names an address THIS emulator serves the
-//!    git transport at, and that URL — not a rewritten one — is the address the git
-//!    transport answers on (`info/refs`, `git-upload-pack`, `git-receive-pack`).
+//! 1. `RepositoryMetadata.cloneUrlHttp` is the `https://` origin THIS emulator
+//!    serves the git transport at — the member is "the URL to use for cloning the
+//!    repository over HTTPS" — and that URL, not a rewritten one, is the address the
+//!    git transport answers on (`info/refs`, `git-upload-pack`, `git-receive-pack`),
+//!    dialled as it stands with a TLS handshake.
 //! 2. A push is stored as git objects and projected into the control plane: the
 //!    commits and tags a client pushes are readable through `GetBranch`/`GetFile`
 //!    at the ids the CLIENT computed.
@@ -171,8 +173,9 @@ pub(crate) async fn rpc(
 
 /// Assert that the clone URL `created` announced for `repository` is the address this
 /// emulator serves git at, in the FORM the announcement has to take — the git
-/// listener's own loopback authority under the scheme it speaks in the clear, with the
-/// repository on the path — and that `GetRepository` reports the same value.
+/// listener's own loopback authority under the `https` scheme the member is
+/// documented as, with the repository on the path — and that `GetRepository` reports
+/// the same value.
 async fn assert_announced_git_url(
     router: &MultiServiceRouter,
     label: &str,
@@ -183,9 +186,9 @@ async fn assert_announced_git_url(
         .split_once("://")
         .unwrap_or_else(|| panic!("case {label:?}: the clone URL names no origin: {clone_url:?}"));
     assert_eq!(
-        scheme, "http",
-        "case {label:?}: the git address is served in the clear, so a stock client dials \
-         it with no trust material: {clone_url:?}"
+        scheme, "https",
+        "case {label:?}: cloneUrlHttp is the URL to clone over HTTPS, so the announced \
+         origin carries that scheme: {clone_url:?}"
     );
     let (authority, path) = rest
         .split_once('/')
@@ -3224,5 +3227,358 @@ async fn a_pushed_tag_is_no_branch_name_for_any_operation_that_needs_one() {
             code, expected,
             "case {label:?}: expected {expected}, got {code}"
         );
+    }
+}
+
+// ------------------------------------------- the scheme the clone URL is announced on
+
+/// The announced clone URL, read for its parts: its origin, with the repository
+/// asserted on its path and the `https` scheme the member is documented as asserted on
+/// its origin. The returned value is `<scheme>://<authority>`.
+fn assert_https_git_origin(label: &str, announced: &str, repository: &str) -> String {
+    let (origin, path) = announced.split_once("/v1/repos/").unwrap_or_else(|| {
+        panic!("case {label:?}: cloneUrlHttp carries the repository on a /v1/repos/ path, got {announced:?}")
+    });
+    assert_eq!(
+        path, repository,
+        "case {label:?}: cloneUrlHttp must carry this repository on its path, got \
+         {announced:?}"
+    );
+    let authority = origin.strip_prefix("https://").unwrap_or_else(|| {
+        panic!(
+            "case {label:?}: cloneUrlHttp is the URL to clone over HTTPS, so its origin \
+             carries the https scheme, got {announced:?}"
+        )
+    });
+    let (host, port) = authority.rsplit_once(':').unwrap_or_else(|| {
+        panic!("case {label:?}: the announced origin names no port: {announced:?}")
+    });
+    assert_eq!(
+        host, "127.0.0.1",
+        "case {label:?}: the announced origin is this emulator's own address, got \
+         {announced:?}"
+    );
+    assert!(
+        port.parse::<u16>().is_ok_and(|port| port > 0),
+        "case {label:?}: the announced origin names the port the git listener bound, got \
+         {announced:?}"
+    );
+    origin.to_string()
+}
+
+#[tokio::test]
+async fn every_face_announces_the_clone_url_on_the_https_origin_the_transport_serves() {
+    let router = emulator();
+    // The rows span what the announced value varies with: the repository name's length
+    // and the characters `RepositoryName` admits — `[\w\.-]{1,100}`, read from the
+    // model's own constraint (smithy_query shape=RepositoryName) — including both of
+    // its published bounds.
+    let cases: Vec<(&str, String)> = vec![
+        ("a one-character name", "a".to_string()),
+        ("a plain name", "announced-repo".to_string()),
+        (
+            "every punctuation the name pattern admits",
+            "Announced_repo.v2-3".to_string(),
+        ),
+        ("a name at the 100-character maximum", "n".repeat(100)),
+    ];
+
+    let mut origins: Vec<(String, String)> = Vec::new();
+    for (label, name) in &cases {
+        let created = ok(
+            &router,
+            "CreateRepository",
+            &json!({ "repositoryName": name }),
+        )
+        .await;
+        let announced = string_at(&created, "/repositoryMetadata/cloneUrlHttp");
+        let origin = assert_https_git_origin(label, &announced, name);
+
+        // The value comes from the announced git endpoint, not from a serializer, so
+        // every face that reports a RepositoryMetadata reports the same URL.
+        let read = ok(&router, "GetRepository", &json!({ "repositoryName": name })).await;
+        assert_eq!(
+            string_at(&read, "/repositoryMetadata/cloneUrlHttp"),
+            announced,
+            "case {label:?}: GetRepository announces the one origin this emulator serves \
+             git at"
+        );
+        let batch = ok(
+            &router,
+            "BatchGetRepositories",
+            &json!({ "repositoryNames": [name] }),
+        )
+        .await;
+        assert_eq!(
+            string_at(&batch, "/repositories/0/cloneUrlHttp"),
+            announced,
+            "case {label:?}: BatchGetRepositories announces the same origin"
+        );
+
+        // The SSH clone URL is the ssh form of the same path, on the endpoint the
+        // asking request arrived at: this emulator serves no SSH transport of its own.
+        for (face, payload, pointer) in [
+            ("CreateRepository", &created, "/repositoryMetadata/cloneUrlSsh"),
+            ("GetRepository", &read, "/repositoryMetadata/cloneUrlSsh"),
+            ("BatchGetRepositories", &batch, "/repositories/0/cloneUrlSsh"),
+        ] {
+            assert_eq!(
+                string_at(payload, pointer),
+                format!("ssh://{ENDPOINT}/v1/repos/{name}"),
+                "case {label:?}: {face} cloneUrlSsh"
+            );
+        }
+        origins.push((label.to_string(), origin));
+    }
+
+    // ONE listener serves every repository, because the repository is named by the
+    // path: the origin every row announces is therefore the same one.
+    let (first_label, first) = origins
+        .first()
+        .cloned()
+        .expect("the table holds at least one row");
+    for (label, origin) in &origins {
+        assert_eq!(
+            origin, &first,
+            "case {label:?}: every repository is announced on the origin case \
+             {first_label:?} named, got {origin:?}"
+        );
+    }
+
+    // A renamed repository is announced on the same origin, under its new name: the
+    // URL is derived on every read rather than stored.
+    let renamed = "announced-repo-renamed";
+    ok(
+        &router,
+        "UpdateRepositoryName",
+        &json!({ "oldName": "announced-repo", "newName": renamed }),
+    )
+    .await;
+    let read = ok(
+        &router,
+        "GetRepository",
+        &json!({ "repositoryName": renamed }),
+    )
+    .await;
+    let announced = string_at(&read, "/repositoryMetadata/cloneUrlHttp");
+    let origin = assert_https_git_origin("a renamed repository", &announced, renamed);
+    assert_eq!(
+        origin, first,
+        "case \"a renamed repository\": the announced origin is unchanged by a rename, \
+         got {origin:?}"
+    );
+}
+
+/// What a dialled connection has to be: a plaintext socket, or the TLS stream over one.
+trait Dialled: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Dialled for T {}
+
+/// The client side of the TLS the announced `https://` origin is served under: the
+/// certificate is the one the core generated for its own listeners — self-signed, and
+/// this client is the emulator's own test dialling a port this very process opened — so
+/// there is no authority to check it against.
+#[derive(Debug)]
+struct AcceptTheEmulatorsCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Dial `authority` — opening with a TLS handshake when `encrypted`, and in the clear
+/// otherwise — send `request` as it stands and read everything the address answers.
+///
+/// The address dialled is this emulator's OWN: the announced authority is asserted to be
+/// the loopback address the core binds on before the socket is opened on it.
+async fn exchange(label: &str, authority: &str, encrypted: bool, request: &str) -> String {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let (host, port) = authority
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("case {label:?}: the origin names no port: {authority:?}"));
+    assert_eq!(
+        host, "127.0.0.1",
+        "case {label:?}: the announced origin is this machine's own address, got \
+         {authority:?}"
+    );
+    let port: u16 = port
+        .parse()
+        .unwrap_or_else(|error| panic!("case {label:?}: the port {port:?}: {error}"));
+    let socket = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap_or_else(|error| {
+            panic!("case {label:?}: {authority} must accept a connection: {error}")
+        });
+    let mut conn: Box<dyn Dialled> = if encrypted {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("the provider supports the default protocol versions")
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptTheEmulatorsCertificate(provider)))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost")
+            .expect("localhost is a server name");
+        Box::new(
+            connector
+                .connect(server_name, socket)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {label:?}: the announced https origin must complete a TLS \
+                         handshake: {error}"
+                    )
+                }),
+        )
+    } else {
+        Box::new(socket)
+    };
+    conn.write_all(request.as_bytes())
+        .await
+        .unwrap_or_else(|error| panic!("case {label:?}: the request must be sent: {error}"));
+    conn.flush()
+        .await
+        .unwrap_or_else(|error| panic!("case {label:?}: the request must be flushed: {error}"));
+    let mut answer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match conn.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => answer.extend_from_slice(&chunk[..read]),
+            // A server that closes the connection without a TLS close_notify ends the
+            // answer too, which is what `Connection: close` asked it to do.
+            Err(_) if !answer.is_empty() => break,
+            Err(error) => panic!("case {label:?}: the answer must be read: {error}"),
+        }
+    }
+    String::from_utf8_lossy(&answer).to_string()
+}
+
+#[tokio::test]
+async fn the_announced_https_origin_serves_the_git_transport_it_names() {
+    let router = emulator();
+    let created = ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": "dialled-over-tls" }),
+    )
+    .await;
+    let announced = string_at(&created, "/repositoryMetadata/cloneUrlHttp");
+    let origin = assert_https_git_origin("the announced origin", &announced, "dialled-over-tls");
+    let authority = origin
+        .strip_prefix("https://")
+        .expect("the announced origin carries the https scheme")
+        .to_string();
+
+    // The rows span which half of the ONE announced address the client dials (the
+    // `https://` origin the announcement names, and the clear half the same port still
+    // answers), which git service it asks for, and whether it presents git credentials
+    // yet — the three things the answer to a dialled clone URL varies with.
+    let cases: [(&str, bool, &str, bool, u16); 5] = [
+        (
+            "a clone over the announced https origin",
+            true,
+            "git-upload-pack",
+            true,
+            200,
+        ),
+        (
+            "a push over the announced https origin",
+            true,
+            "git-receive-pack",
+            true,
+            200,
+        ),
+        (
+            "a clone over it presenting no credential",
+            true,
+            "git-upload-pack",
+            false,
+            401,
+        ),
+        (
+            "a clone over the clear half of the same address",
+            false,
+            "git-upload-pack",
+            true,
+            200,
+        ),
+        (
+            "a push over the clear half of the same address",
+            false,
+            "git-receive-pack",
+            true,
+            200,
+        ),
+    ];
+    for (label, encrypted, service, authenticated, expected) in cases {
+        let mut request = format!(
+            "GET /v1/repos/dialled-over-tls/info/refs?service={service} HTTP/1.1\r\n\
+             Host: {authority}\r\nUser-Agent: git/2.43.0\r\nConnection: close\r\n"
+        );
+        if authenticated {
+            request.push_str(&format!("Authorization: {}\r\n", basic(GIT_USER)));
+        }
+        request.push_str("\r\n");
+        let answer = exchange(label, &authority, encrypted, &request).await;
+        assert!(
+            answer.starts_with(&format!("HTTP/1.1 {expected} ")),
+            "case {label:?}: expected HTTP {expected} from the announced origin, got \
+             {answer:?}"
+        );
+        if expected == 200 {
+            assert!(
+                answer.contains(&format!("# service={service}")),
+                "case {label:?}: the answer must be the ref advertisement of {service}, got \
+                 {answer:?}"
+            );
+        } else {
+            assert!(
+                answer.to_ascii_lowercase().contains("www-authenticate: basic"),
+                "case {label:?}: a request presenting no credential must be challenged, got \
+                 {answer:?}"
+            );
+        }
     }
 }

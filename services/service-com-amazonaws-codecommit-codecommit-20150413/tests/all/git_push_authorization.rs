@@ -383,19 +383,21 @@ async fn the_announced_clone_url_is_an_address_a_git_client_dials() {
     let session = assume_push_role(&router, "dialable", &role).await;
 
     // The announced URL is dialled AS IT STANDS: the host and port come from the value
-    // the API reported, and the exchange is plain HTTP/1.1 on a socket with no trust
-    // material configured — which is the whole requirement on a clone URL. The address
-    // an emulator announces is its own, so the host it names must be a loopback one and
-    // the socket below dials that loopback address on the announced port.
+    // the API reported — which is the whole requirement on a clone URL. The address an
+    // emulator announces is its own, so the host it names must be a loopback one and
+    // the socket below dials that loopback address on the announced port. The
+    // announcement is the HTTPS origin the member is documented as; the same address
+    // also answers the clear half, which is what this exchange speaks (the TLS half is
+    // driven in `crate::git_transport`).
     let authority = repo
         .clone_url
         .split_once("://")
         .map(|(_scheme, rest)| rest.split('/').next().unwrap_or_default().to_string())
         .unwrap_or_else(|| panic!("the announced clone URL names no origin: {}", repo.clone_url));
     assert!(
-        repo.clone_url.starts_with("http://"),
-        "the announced clone URL must name a scheme a stock git client dials without \
-         extra trust material, got {:?}",
+        repo.clone_url.starts_with("https://"),
+        "the announced clone URL must name the HTTPS origin the member is documented as, \
+         got {:?}",
         repo.clone_url
     );
     let (announced_host, announced_port) = authority

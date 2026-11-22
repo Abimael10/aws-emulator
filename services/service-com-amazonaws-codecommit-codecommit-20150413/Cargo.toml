@@ -86,8 +86,13 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 # Dials the announced clone URL in this process, exactly as a git client handed that
-# URL does: tokio's socket and byte-stream halves carry the HTTP exchange on it.
+# URL does: tokio's socket and byte-stream halves carry the HTTP exchange on it, and
+# `rustls`/`tokio-rustls` run the CLIENT side of the in-band TLS the announced
+# `https://` origin is served under (the core terminates the server side, so `src/`
+# touches no key or certificate). TEST-ONLY.
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+rustls = { workspace = true }
+tokio-rustls = "0.26"
 # Mounted BESIDE this one in `tests/all/`: EventBridge and Amazon SQS, which carry the
 # pull-request lifecycle events a rule delivers to its target. DEV-ONLY for the event
 # path — `src/` reaches EventBridge through the SDK client above.

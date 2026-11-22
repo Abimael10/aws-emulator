@@ -271,10 +271,11 @@ async fn a_written_repository_and_file_are_read_back_from_state() {
             "case {label:?}: accountId"
         );
         // The clone URL names an address of THIS emulator — the one its git transport
-        // answers on, which a stock git client dials in the clear — not the public AWS
-        // git host, which is a different server. This repository was created through
-        // `CreateRepository`, so that address is open: the URL is the git listener's
-        // own loopback authority with this repository on its path.
+        // answers on — not the public AWS git host, which is a different server. The
+        // member is the repository's HTTPS clone URL, so the scheme is `https`. This
+        // repository was created through `CreateRepository`, so that address is open:
+        // the URL is the git listener's own loopback authority with this repository on
+        // its path.
         let clone_url_http = string_at(&metadata, "/cloneUrlHttp");
         let (origin, path) = clone_url_http
             .split_once("/v1/repos/")
@@ -284,10 +285,10 @@ async fn a_written_repository_and_file_are_read_back_from_state() {
             "case {label:?}: cloneUrlHttp must carry the repository on its path, got \
              {clone_url_http:?}"
         );
-        let port = origin.strip_prefix("http://127.0.0.1:").unwrap_or_else(|| {
+        let port = origin.strip_prefix("https://127.0.0.1:").unwrap_or_else(|| {
             panic!(
-                "case {label:?}: cloneUrlHttp must name this emulator's own git address in \
-                 the clear, got {clone_url_http:?}"
+                "case {label:?}: cloneUrlHttp must be an https URL on this emulator's own \
+                 git address, got {clone_url_http:?}"
             )
         });
         assert!(
