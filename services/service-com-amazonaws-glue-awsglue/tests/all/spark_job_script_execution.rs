@@ -333,12 +333,13 @@ async fn a_spark_job_runs_output_is_computed_from_the_objects_its_source_holds()
             "case {case:?}: expected the part file to carry {:?}, got {written:?}",
             row.expected
         );
-        // A Spark write leaves the marker a reader of its output directory looks for.
+        // A Glue job's own environment leaves NO success marker: what a run leaves under its
+        // output path is the part files its write produced and nothing beside them, because
+        // that environment's output committer does not mark a completed job.
         let marker = object_body(&router, &format!("output/{label}/_SUCCESS")).await;
         assert_eq!(
-            marker.as_deref(),
-            Some(""),
-            "case {case:?}: expected the write's own marker object, got {marker:?}"
+            marker, None,
+            "case {case:?}: expected no marker object beside the output, got {marker:?}"
         );
     }
 }

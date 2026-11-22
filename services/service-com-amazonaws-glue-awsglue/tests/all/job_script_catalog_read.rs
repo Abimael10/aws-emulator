@@ -822,17 +822,19 @@ job.commit()
     );
 
     // What the unpartitioned write left: one part file holding the frame's own records, as
-    // the delimited text the write was asked for, beside the marker a finished write leaves.
+    // the delimited text the write was asked for.
     let written = object_body(&router, &format!("{flat_prefix}/part-00000.csv")).await;
     assert_eq!(
         written.as_deref(),
         Some("id,city,amount\n1,Berlin,10.5\n2,Lisbon,20.0\n3,Berlin,1.5\n"),
         "case {case:?}: expected the frame's own records as delimited text, got {written:?}"
     );
+    // A Glue job's own environment leaves no success marker beside what it wrote: its output
+    // committer does not mark a completed job.
     assert_eq!(
         object_body(&router, &format!("{flat_prefix}/_SUCCESS")).await,
-        Some(String::new()),
-        "case {case:?}: a finished write leaves its marker beside the data"
+        None,
+        "case {case:?}: expected no marker object beside the data"
     );
 
     // What the partitioned write left: one part file per value of the partition key, holding

@@ -8,6 +8,10 @@ pub(super) const RDD_SOURCE: &str = r#"
 
 from pyspark import filesystem
 
+# Whether a write leaves the marker object beside its part files: the setting of the
+# environment's OWN output committer ([`pyspark.release`]).
+from pyspark.release import MARKS_SUCCESSFUL_JOBS
+
 # The name Spark writes a successful output's marker under, beside the part files of the
 # output it wrote.
 SUCCESS_MARKER = "_SUCCESS"
@@ -382,12 +386,14 @@ class RDD(object):
 
         That is the output layout Spark writes: the path names a directory and each
         partition is a file in it, so a reader of the output reads the parts. Every write
-        goes through the filesystem the path resolves in, so the objects are real.
+        goes through the filesystem the path resolves in, so the objects are real. The marker
+        is left only where this environment's own committer leaves one.
         """
         prefix = filesystem._text(path).rstrip("/")
         for index, partition in enumerate(self._partitions):
             lines = "".join("%s\n" % (value,) for value in partition)
             filesystem.write_text("%s/part-%05d" % (prefix, index), lines)
-        filesystem.write_text("%s/%s" % (prefix, SUCCESS_MARKER), "")
+        if MARKS_SUCCESSFUL_JOBS:
+            filesystem.write_text("%s/%s" % (prefix, SUCCESS_MARKER), "")
         return None
 "#;

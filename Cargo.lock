@@ -14819,6 +14819,7 @@ dependencies = [
  "hex",
  "http",
  "miette",
+ "parquet",
  "protox-parse",
  "regex",
  "serde_json",

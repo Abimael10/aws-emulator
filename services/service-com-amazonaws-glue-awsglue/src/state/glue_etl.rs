@@ -85,8 +85,15 @@ pub fn glue_etl_modules(glue_version: &str) -> Vec<PackageModule> {
     ]
     .into_iter()
     .map(|(path, source)| (path.to_string(), source))
-    .chain(::service_common::spark_runtime::pyspark_modules(
-        spark_version_of(glue_version),
+    .chain(::service_common::spark_runtime::pyspark_modules_of(
+        // A Glue job's own environment leaves no success marker: its output committer's
+        // `mapreduce.fileoutputcommitter.marksuccessfuljobs` is off, so what a run leaves
+        // under its output path is its part files and the partition directories holding
+        // them, and nothing else.
+        ::service_common::spark_runtime::SparkEnvironment::shipping(spark_version_of(
+            glue_version,
+        ))
+        .leaving_no_success_marker(),
     ))
     .map(|(path, source)| PackageModule { path, source })
     .collect()

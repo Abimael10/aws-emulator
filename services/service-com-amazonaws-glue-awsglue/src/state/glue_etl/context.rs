@@ -298,9 +298,11 @@ class DataSource(object):
 ///
 /// What a sink WRITES are real objects of this emulator's own object store, through the
 /// shared Spark filesystem a program's own writes go through — so a later read of the path
-/// sees exactly what the frame held. A sink asked to UPDATE THE CATALOG registers the
-/// partitions it wrote with the Data Catalog's own API, so a partition a run reports as
-/// written is one the catalog answers for.
+/// sees exactly what the frame held. A frame written in the columnar format is encoded by
+/// the Spark runtime under this library ([`::service_common::spark_runtime`]), so its part
+/// files are Apache Parquet files any Parquet reader reads. A sink asked to UPDATE THE
+/// CATALOG registers the partitions it wrote with the Data Catalog's own API, so a partition
+/// a run reports as written is one the catalog answers for.
 pub(super) const DATA_SINK_SOURCE: &str = r#"
 """The sink a frame is written to, as `getSink` hands one out."""
 
@@ -309,26 +311,33 @@ import io
 import json
 
 from awsglue import _table_data
-from pyspark import filesystem
+from pyspark import filesystem, parquet
+
+# Whether a write leaves the marker object beside its part files: the setting of the
+# environment's own output committer, which for a Glue job's environment leaves none
+# ([`pyspark.release`]).
+from pyspark.release import MARKS_SUCCESSFUL_JOBS
 
 # The name one write of a frame leaves its records under, beside the marker Spark writes for
 # an output that was written in full.
 PART_NAME = "part-00000"
 SUCCESS_MARKER = "_SUCCESS"
 
-# The formats a frame is written in: the two text layouts this emulator writes. A binary
-# layout is one it cannot write faithfully, and a sink asked for one says so rather than
+# The formats a frame is written in: the two text layouts, and the columnar one the Spark
+# runtime under this library really encodes ([`pyspark.parquet`]). A layout outside these is
+# one this emulator cannot write faithfully, and a sink asked for one says so rather than
 # leaving behind an object that is not in that format.
 TEXT_FORMATS = ("csv", "tsv", "text")
 JSON_FORMATS = ("json", "jsonl")
+PARQUET_FORMATS = ("parquet", "glueparquet")
 
 # The connection options a sink HONOURS: where it writes, how it partitions what it writes,
 # and whether it registers those partitions with the Data Catalog.
 HONOURED_OPTIONS = ("path", "paths", "partitionKeys", "enableUpdateCatalog")
 
-# The format options it honours: whether delimited text carries a header line, and the
-# delimiter between its cells.
-HONOURED_FORMAT_OPTIONS = ("writeHeader", "separator", "delimiter")
+# The format options it honours: whether delimited text carries a header line, the delimiter
+# between its cells, and the codec a columnar part's pages are stored under.
+HONOURED_FORMAT_OPTIONS = ("writeHeader", "separator", "delimiter", "compression")
 
 
 class UnwritableFormat(Exception):
@@ -388,32 +397,59 @@ class DataSink(object):
         _table_data.refuse_unhonoured(
             self._format_options,
             HONOURED_FORMAT_OPTIONS,
-            "writes a frame as delimited text or as JSON documents",
+            "writes a frame as delimited text, as JSON documents or as Parquet",
         )
         if not self._path:
             raise ValueError("a sink names the Amazon S3 path it writes to")
         kind = str(self._format or "json").lower()
-        if kind in ("glueparquet", "parquet", "orc", "avro"):
-            raise UnwritableFormat(
-                "this emulator writes a frame as delimited text or JSON; %r is a layout it "
-                "cannot write" % (kind,)
-            )
         partition_keys = [
             str(key) for key in (self._options.get("partitionKeys") or []) if str(key)
         ]
         records = dynamic_frame.records
         columns = [name for name, _declared in dynamic_frame._columns]
+        declared = dict(dynamic_frame._columns)
         prefix = str(self._path).rstrip("/")
         written = []
         for values, group in _grouped(records, partition_keys):
             held = [name for name in columns if name not in partition_keys]
-            body = _rendered(group, held, kind, self._format_options)
+            # The value of a partition key is DATA — a field of the records being written —
+            # so it goes into the path through the layout's own escaping: a value spelling a
+            # path separator or a parent directory may not name an object outside the path
+            # the sink was given ([`pyspark.filesystem.escape_path_name`]).
             within = "/".join(
-                "%s=%s" % (key, values[index]) for index, key in enumerate(partition_keys)
+                "%s=%s"
+                % (
+                    filesystem.escape_path_name(key),
+                    filesystem.escape_path_name(values[index]),
+                )
+                for index, key in enumerate(partition_keys)
             )
             at = "%s/%s" % (prefix, within) if within else prefix
-            filesystem.write_text("%s/%s.%s" % (at, PART_NAME, _suffix(kind)), body)
-            filesystem.write_text("%s/%s" % (at, SUCCESS_MARKER), "")
+            if kind in PARQUET_FORMATS:
+                # The part is the Parquet file its records make: the values themselves in
+                # its pages, and the row count, the schema and each column's bounds in its
+                # footer, encoded by the Spark runtime under this library.
+                compression = self._format_options.get("compression", "snappy")
+                _codec, suffix = parquet.codec_of(compression)
+                filesystem.write_bytes(
+                    "%s/%s%s.parquet" % (at, PART_NAME, suffix),
+                    parquet.file_bytes(
+                        held,
+                        [
+                            [record.get(name) for name in held]
+                            for record in group
+                        ],
+                        declared,
+                        compression,
+                    ),
+                )
+            else:
+                body = _rendered(group, held, kind, self._format_options)
+                filesystem.write_text(
+                    "%s/%s.%s" % (at, PART_NAME, _suffix(kind)), body
+                )
+            if MARKS_SUCCESSFUL_JOBS:
+                filesystem.write_text("%s/%s" % (at, SUCCESS_MARKER), "")
             written.append((values, at))
         if self._options.get("enableUpdateCatalog") and self._catalog_table:
             _register(
@@ -459,8 +495,8 @@ def _rendered(records, columns, kind, format_options):
         )
     if kind not in TEXT_FORMATS:
         raise UnwritableFormat(
-            "this emulator writes a frame as delimited text or JSON; %r is a layout it "
-            "cannot write" % (kind,)
+            "this emulator writes a frame as delimited text, as JSON documents or as "
+            "Parquet; %r is a layout it cannot write" % (kind,)
         )
     delimiter = "\t" if kind == "tsv" else str(
         format_options.get("separator") or format_options.get("delimiter") or ","

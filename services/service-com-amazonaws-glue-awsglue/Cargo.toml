@@ -140,6 +140,12 @@ emulator-core-build-support = { workspace = true }
 # The one integration-test target of this crate is rooted at `tests/all/main.rs`, which
 # declares every `tests/all/<name>.rs` beside it as a suite of that binary.
 automod = { workspace = true }
+# Reads back the Apache Parquet objects a Spark job run's write left behind — its footer,
+# its row groups and its column statistics — so the output suite judges those objects with
+# a Parquet reader rather than with assumptions about their bytes
+# (`tests/all/job_script_parquet_output.rs`). Only the Snappy codec the write uses is
+# enabled; no arrow or async feature is.
+parquet = { version = "60", default-features = false, features = ["snap"] }
 # Writes the .zip a blueprint's archive is published as, so the layout suite stages the
 # archive a caller would publish (`tests/all/blueprint_layout_deployment.rs`).
 zip = { version = "9", default-features = false, features = ["deflate"] }

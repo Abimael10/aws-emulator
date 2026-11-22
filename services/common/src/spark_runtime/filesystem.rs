@@ -325,6 +325,54 @@ def write_text(path, text):
     return None
 
 
+def write_bytes(path, data):
+    """Store `data` as the object `path` names, through one open stream."""
+    stream = FileSystem.get(path).create(path, True)
+    stream.write(data)
+    stream.close()
+    return None
+
+
+# The characters a path segment may not carry, which the Hive layout spells as `%XX` instead:
+# the path separators and the characters its own grammar gives a meaning (the `=` between a
+# partition column and its value among them), and every control character. A segment built
+# from DATA — the value of a partition column — is written through this, so a value spelling a
+# separator or a parent directory cannot name an object outside the path the write was given.
+# The first two are given by code point: the double quote and the hash.
+ESCAPED_IN_A_PATH = chr(34) + chr(35) + "%'*/:=?\\\x7f{[]^"
+
+
+def escape_path_name(value):
+    """One path segment with every character a segment may not carry spelled as `%XX`."""
+    text = _text(value)
+    out = []
+    for character in text:
+        if character in ESCAPED_IN_A_PATH or ord(character) < 0x20:
+            out.append("%%%02X" % (ord(character),))
+        else:
+            out.append(character)
+    return "".join(out)
+
+
+def unescape_path_name(value):
+    """The value a path segment spells, with every `%XX` read back as its character."""
+    text = _text(value)
+    out = []
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "%" and index + 2 < len(text):
+            try:
+                out.append(chr(int(text[index + 1 : index + 3], 16)))
+                index += 3
+                continue
+            except ValueError:
+                pass
+        out.append(character)
+        index += 1
+    return "".join(out)
+
+
 # --- what a program's READ of a source path covers, and what a refused one raises ---------
 
 # The error codes an object store answers when the identity the call was signed as may not

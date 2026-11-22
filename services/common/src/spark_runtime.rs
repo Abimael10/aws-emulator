@@ -53,10 +53,53 @@
 //! These modules add no host surface of their own: they reach the object store through the
 //! same SDK seam any guest call uses, and nothing else.
 
+mod column;
 mod context;
 mod dataset;
 mod filesystem;
+mod functions;
+mod parquet;
 mod sql;
+mod types;
+
+/// What the environment one Spark program runs IN states about itself — the two things that
+/// are not the same for every caller of this runtime.
+///
+/// Each is a real setting of the environment, not a choice of this module: the Spark release
+/// it ships, and whether its Hadoop output committer leaves the success marker a completed
+/// write is marked by.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkEnvironment<'a> {
+    /// The version of Spark the environment ships, which is what the program is told it is
+    /// running on — `None` for an environment that bundles no Spark, where nothing is known
+    /// to tell it.
+    pub spark_version: Option<&'a str>,
+    /// Whether a write leaves the `_SUCCESS` marker object beside its part files, which is
+    /// the environment's `mapreduce.fileoutputcommitter.marksuccessfuljobs` setting.
+    pub marks_successful_jobs: bool,
+}
+
+impl<'a> SparkEnvironment<'a> {
+    /// An environment shipping `spark_version` whose committer leaves the success marker,
+    /// which is the Hadoop default.
+    #[must_use]
+    pub fn shipping(spark_version: Option<&'a str>) -> Self {
+        Self {
+            spark_version,
+            marks_successful_jobs: true,
+        }
+    }
+
+    /// The same environment, with the marker switched off — for one whose own committer
+    /// leaves none.
+    #[must_use]
+    pub fn leaving_no_success_marker(self) -> Self {
+        Self {
+            marks_successful_jobs: false,
+            ..self
+        }
+    }
+}
 
 /// The `pyspark` package this emulator puts on a Spark program's import path, as
 /// `(module path, source)` pairs — the form every embedded-interpreter caller hands its
@@ -64,12 +107,20 @@ mod sql;
 ///
 /// `spark_version` is the version of Spark the environment the program runs in ships, which
 /// is what the program is told it is running on ([`release_source`]) — `None` for an
-/// environment that bundles no Spark, where nothing is known to tell it.
+/// environment that bundles no Spark, where nothing is known to tell it. The committer of
+/// such an environment leaves the success marker; one whose own leaves none is supplied
+/// through [`pyspark_modules_of`].
 #[must_use]
 pub fn pyspark_modules(spark_version: Option<&str>) -> Vec<(String, String)> {
+    pyspark_modules_of(SparkEnvironment::shipping(spark_version))
+}
+
+/// The same package, for an environment that states what [`SparkEnvironment`] carries.
+#[must_use]
+pub fn pyspark_modules_of(environment: SparkEnvironment<'_>) -> Vec<(String, String)> {
     vec![
         ("pyspark/__init__.py".to_string(), PYSPARK_SOURCE.to_string()),
-        ("pyspark/release.py".to_string(), release_source(spark_version)),
+        ("pyspark/release.py".to_string(), release_source(environment)),
         ("pyspark/conf.py".to_string(), CONF_SOURCE.to_string()),
         (
             "pyspark/filesystem.py".to_string(),
@@ -81,27 +132,82 @@ pub fn pyspark_modules(spark_version: Option<&str>) -> Vec<(String, String)> {
             context::CONTEXT_SOURCE.to_string(),
         ),
         ("pyspark/jvm.py".to_string(), context::JVM_SOURCE.to_string()),
+        (
+            "pyspark/parquet.py".to_string(),
+            parquet::PARQUET_SOURCE.to_string(),
+        ),
         ("pyspark/sql/__init__.py".to_string(), sql::SQL_SOURCE.to_string()),
+        (
+            "pyspark/sql/types.py".to_string(),
+            types::TYPES_SOURCE.to_string(),
+        ),
+        (
+            "pyspark/sql/column.py".to_string(),
+            column::COLUMN_SOURCE.to_string(),
+        ),
+        (
+            "pyspark/sql/functions.py".to_string(),
+            functions::FUNCTIONS_SOURCE.to_string(),
+        ),
     ]
 }
 
-/// `pyspark.release`: the ONE value of this runtime that is not the same for every run — the
-/// version of Spark the environment ships, which a program reads as `spark.version`.
+/// `pyspark.release`: what this ENVIRONMENT states about itself — the version of Spark it
+/// ships, the Apache Parquet writer that release ships, and whether its output committer
+/// leaves the success marker.
 ///
-/// It is the version that environment's own catalog publishes for Spark, so a program on an
-/// older release is told that release's version rather than one spelled here. An environment
-/// that bundles no Spark tells the program nothing about a version it has none of.
-fn release_source(spark_version: Option<&str>) -> String {
-    let version = match spark_version {
+/// The version is the one that environment's own catalog publishes for Spark, so a program on
+/// an older release is told that release's version rather than one spelled here. An
+/// environment that bundles no Spark tells the program nothing about a version it has none of.
+fn release_source(environment: SparkEnvironment<'_>) -> String {
+    let version = match environment.spark_version {
         // Rendered through the JSON encoder, so the catalog's value reaches the module as a
         // string literal whatever it holds.
         Some(version) => ::serde_json::Value::String(version.to_string()).to_string(),
         None => "None".to_string(),
     };
+    let writer = match parquet_writer(environment.spark_version) {
+        Some(stamped) => ::serde_json::Value::String(stamped).to_string(),
+        None => "None".to_string(),
+    };
     format!(
         "{RELEASE_SOURCE}\n# The version of Spark this environment's own release ships.\nVERSION \
-         = {version}\n"
+         = {version}\n# The Apache Parquet writer that release ships, as it stamps the footer \
+         of a\n# file it wrote.\nPARQUET_WRITER = {writer}\n# Whether this environment's output \
+         committer leaves the marker object a completed\n# write is marked by, which is its \
+         own\n# `mapreduce.fileoutputcommitter.marksuccessfuljobs` \
+         setting.\nMARKS_SUCCESSFUL_JOBS = {marker}\n",
+        marker = if environment.marks_successful_jobs {
+            "True"
+        } else {
+            "False"
+        }
     )
+}
+
+/// The Apache Parquet writer an environment shipping `spark_version` writes its Parquet
+/// output with, as that writer stamps its own name and version into a file's footer
+/// (`FileMetaData.created_by`).
+///
+/// SOURCE: the `parquet-mr` release each Apache Spark release ships — the library Spark's
+/// Parquet writer IS, whose version is what a reader of the footer finds in `created_by` and
+/// reads a file's statistics against. A Spark release outside this table is one nothing is
+/// known about, so a file it writes is stamped with nothing rather than with a version this
+/// emulator made up.
+fn parquet_writer(spark_version: Option<&str>) -> Option<String> {
+    let version = spark_version?;
+    let mut parts = version.trim().split('.');
+    let release = (parts.next()?, parts.next()?);
+    let shipped = match release {
+        ("2", "2" | "3") => "1.8.2",
+        ("2", "4") | ("3", "0" | "1") => "1.10.1",
+        ("3", "2") => "1.12.1",
+        ("3", "3") => "1.12.2",
+        ("3", "4") => "1.12.3",
+        ("3", "5") => "1.13.1",
+        _ => return None,
+    };
+    Some(format!("parquet-mr version {shipped}"))
 }
 
 /// The doc comment [`release_source`] builds `pyspark/release.py` from.
@@ -315,19 +421,52 @@ def run(event, context):
 mod tests {
     use super::*;
 
-    /// Every module the runtime supplies is named once and carries source, and the ONE
-    /// per-run value — the Spark version the environment ships — is the one the caller
-    /// named.
+    /// Every module the runtime supplies is named once and carries source, and what the
+    /// ENVIRONMENT states — the Spark version it ships, and whether its committer leaves the
+    /// success marker — is what the caller named.
     #[test]
-    fn the_runtime_names_each_module_once_and_carries_the_environments_version() {
-        // (case, the version the environment ships, what the module must state)
-        let cases: [(&str, Option<&str>, &str); 3] = [
-            ("an environment shipping Spark 3.3", Some("3.3.0"), "VERSION = \"3.3.0\""),
-            ("an environment shipping Spark 3.5", Some("3.5.4"), "VERSION = \"3.5.4\""),
-            ("an environment bundling no Spark", None, "VERSION = None"),
+    fn the_runtime_names_each_module_once_and_carries_what_the_environment_states() {
+        // (case, the environment, what its release module must state)
+        let cases: [(&str, SparkEnvironment<'_>, [&str; 3]); 4] = [
+            (
+                "an environment shipping Spark 3.3",
+                SparkEnvironment::shipping(Some("3.3.0")),
+                [
+                    "VERSION = \"3.3.0\"",
+                    "PARQUET_WRITER = \"parquet-mr version 1.12.2\"",
+                    "MARKS_SUCCESSFUL_JOBS = True",
+                ],
+            ),
+            (
+                "an environment shipping Spark 3.5",
+                SparkEnvironment::shipping(Some("3.5.4")),
+                [
+                    "VERSION = \"3.5.4\"",
+                    "PARQUET_WRITER = \"parquet-mr version 1.13.1\"",
+                    "MARKS_SUCCESSFUL_JOBS = True",
+                ],
+            ),
+            (
+                "an environment bundling no Spark",
+                SparkEnvironment::shipping(None),
+                [
+                    "VERSION = None",
+                    "PARQUET_WRITER = None",
+                    "MARKS_SUCCESSFUL_JOBS = True",
+                ],
+            ),
+            (
+                "an environment whose committer leaves no marker",
+                SparkEnvironment::shipping(Some("2.4.3")).leaving_no_success_marker(),
+                [
+                    "VERSION = \"2.4.3\"",
+                    "PARQUET_WRITER = \"parquet-mr version 1.10.1\"",
+                    "MARKS_SUCCESSFUL_JOBS = False",
+                ],
+            ),
         ];
-        for (case, version, stated) in cases {
-            let modules = pyspark_modules(version);
+        for (case, environment, stated) in cases {
+            let modules = pyspark_modules_of(environment);
             let mut paths: Vec<&str> = modules.iter().map(|(path, _)| path.as_str()).collect();
             let listed = paths.len();
             paths.sort_unstable();
@@ -348,11 +487,13 @@ mod tests {
                 .find(|(path, _)| path == "pyspark/release.py")
                 .map(|(_, source)| source.clone())
                 .unwrap_or_default();
-            assert!(
-                release.contains(stated),
-                "case {case}: expected the release module to state {stated:?}, got \
-                 {release:?}"
-            );
+            for held in stated {
+                assert!(
+                    release.contains(held),
+                    "case {case}: expected the release module to state {held:?}, got \
+                     {release:?}"
+                );
+            }
         }
     }
 }
