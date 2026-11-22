@@ -9,24 +9,41 @@
 //! data type — `NumberAttributeConstraints` with `MinValue`/`MaxValue` for a
 //! `Number` attribute and `StringAttributeConstraints` with
 //! `MinLength`/`MaxLength` for a `String` one (`SchemaAttributeType` in this
-//! service's model) — and a value submitted for that attribute has to be within
-//! the bounds the schema declares, whichever operation submits it. A value
-//! outside one is refused with 400 `InvalidParameterException` whose message is
-//! the schema-validation report: one line per offending attribute, naming the
-//! attribute under the `user.` prefix and the bound it missed as the schema
-//! declares it, each line ending in a newline. A refused write stores nothing,
-//! so the user keeps every value it held (and a refused create leaves no user
-//! at all). Both bounds are INCLUSIVE, an undeclared bound bounds nothing, and
-//! a length is counted in characters.
+//! service's model), and a `Number` attribute's values have the FORM of a
+//! number — and a value submitted for that attribute has to satisfy them,
+//! whichever operation submits it. A value that misses one is refused with 400
+//! `InvalidParameterException`, and WHICH sentence that refusal carries is the
+//! validation STAGE that judged it:
+//!
+//! * a REGISTRATION of a new account (`SignUp`, `AdminCreateUser`) states the
+//!   schema validation's envelope, "Attributes did not conform to the schema: ",
+//!   then the attribute's SCHEMA PATH (a custom attribute under `Custom.User.`,
+//!   carrying the name it was declared with rather than the prefixed name the
+//!   request wrote) and the validation it did not satisfy — one finding, with no
+//!   trailing newline;
+//! * an UPDATE of a stored user's attributes (`AdminUpdateUserAttributes`,
+//!   `UpdateUserAttributes`, a `NEW_PASSWORD_REQUIRED` response) states the
+//!   per-attribute report: a line per offending attribute naming it under the
+//!   `user.` prefix and the bound it missed as the schema declares it, each line
+//!   ending in a newline.
+//!
+//! A value that is not of its data type's form is reported by both stages in the
+//! constraint envelope naming the pattern it failed, the registration stage
+//! stating its own prefix ahead of it. A refused write stores nothing, so the
+//! user keeps every value it held (and a refused create leaves no user at all).
+//! Both bounds are INCLUSIVE, an undeclared bound bounds nothing, and a length is
+//! counted in characters.
 //!
 //! The rows span the class the rule generalises over: both data types, both
 //! bounds of each, bounds declared singly and in pairs, values at the bound,
-//! one step past it and far past it, a non-ASCII value whose characters and
-//! bytes differ, an attribute with no constraints at all, and the standard
-//! attributes the default schema bounds (`birthdate`, exactly ten characters;
-//! `updated_at`, the standard schema's one `Number`; `name`, the 2048-character
-//! string bound) beside custom attributes declared by `CreateUserPool.Schema`
-//! and by `AddCustomAttributes`.
+//! one step past it and far past it, the forms a number may be written in
+//! (signed, fractional, exponent) and values that are no number at all, a
+//! non-ASCII value whose characters and bytes differ, an attribute with no
+//! constraints at all, and the standard attributes the default schema bounds
+//! (`birthdate`, exactly ten characters; `updated_at`, the standard schema's one
+//! `Number`; `name`, the 2048-character string bound) beside custom attributes
+//! declared by `CreateUserPool.Schema` and by `AddCustomAttributes` — every row
+//! driven through BOTH stages, so each row states both wordings.
 //!
 //! Every pool, schema and user here is real: they come from `CreateUserPool`,
 //! `AddCustomAttributes`, `AdminCreateUser` and `AdminUpdateUserAttributes`, and
@@ -39,9 +56,31 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::log_delivery_configuration::{call, error_code, error_message, ok, router};
 
+/// The constraint a row's value misses, which each stage of the schema validation
+/// states in its own words.
+enum Missed {
+    /// A bound the schema declares: the VALIDATION the registration stage names
+    /// it by, and the sentence the update stage states the declared bound in.
+    Bound {
+        validation: &'static str,
+        sentence: &'static str,
+    },
+    /// The form a `Number` attribute's values take, which both stages report in
+    /// the constraint envelope.
+    NumberForm,
+}
+
+/// A bound missed, as both stages name it.
+fn bound(validation: &'static str, sentence: &'static str) -> Missed {
+    Missed::Bound {
+        validation,
+        sentence,
+    }
+}
+
 /// One row of the table: an attribute of the pool this suite builds, a value
-/// submitted for it, and the sentence the schema validation reports for that
-/// value — `None` where the value is within every bound declared for it.
+/// submitted for it, and the constraint that value misses — `None` where the
+/// value satisfies every constraint declared for it.
 struct Row {
     /// What the row is about, named in every assertion it makes.
     case: &'static str,
@@ -49,9 +88,8 @@ struct Row {
     attribute: &'static str,
     /// The submitted value.
     value: String,
-    /// The bound the value missed, as the report states it, or `None` for a
-    /// value the schema admits.
-    refusal: Option<String>,
+    /// The constraint the value misses, or `None` for a value the schema admits.
+    missed: Option<Missed>,
 }
 
 impl Row {
@@ -61,40 +99,105 @@ impl Row {
             case,
             attribute,
             value: value.into(),
-            refusal: None,
+            missed: None,
         }
     }
 
-    /// A row whose value misses a declared bound, reported with `sentence`.
+    /// A row whose value misses `missed`.
     fn refused(
         case: &'static str,
         attribute: &'static str,
         value: impl Into<String>,
-        sentence: &str,
+        missed: Missed,
     ) -> Self {
         Self {
             case,
             attribute,
             value: value.into(),
-            refusal: Some(sentence.to_string()),
+            missed: Some(missed),
         }
     }
 
-    /// The whole report this row's refusal carries: the one line for this
-    /// attribute, under the `user.` prefix and ending in its own newline.
-    fn report(&self) -> Option<String> {
-        self.refusal
-            .as_ref()
-            .map(|sentence| report_line(self.attribute, sentence))
+    /// A row whose value is no number at all for a `Number` attribute.
+    fn not_a_number(case: &'static str, attribute: &'static str, value: impl Into<String>) -> Self {
+        Self::refused(case, attribute, value, Missed::NumberForm)
+    }
+
+    /// The message a REGISTRATION refuses this row's value with.
+    fn registration_refusal(&self) -> Option<String> {
+        self.missed.as_ref().map(|missed| match missed {
+            Missed::Bound { validation, .. } => registration_bound(self.attribute, validation),
+            Missed::NumberForm => {
+                format!("{SCHEMA_ENVELOPE}{}", constraint_envelope(self.attribute))
+            }
+        })
+    }
+
+    /// The report an UPDATE refuses this row's value with.
+    fn update_refusal(&self) -> Option<String> {
+        self.missed.as_ref().map(|missed| match missed {
+            Missed::Bound { sentence, .. } => report_line(self.attribute, sentence),
+            Missed::NumberForm => constraint_envelope(self.attribute),
+        })
     }
 }
 
-/// The schema-validation line for `attribute`: the attribute under the `user.`
-/// prefix a user's own attributes are validated under, the sentence, and the
-/// newline every line of the report ends with.
+/// The envelope every refusal of the REGISTRATION stage opens with.
+const SCHEMA_ENVELOPE: &str = "Attributes did not conform to the schema: ";
+
+/// The pattern the values of a `Number` attribute satisfy, which the refusal of a
+/// value that does not states as the constraint it failed.
+const NUMBER_PATTERN: &str = r"$|^[+-]?((\p{Nd}+(\.\p{Nd}*)?)|(\.\p{Nd}+))([eE][+-]?\p{Nd}+)?";
+
+/// The path the pool's schema holds `attribute` under, which is how a
+/// registration-stage refusal names it: a custom attribute under `Custom.User.`
+/// with the name it was declared with (`SchemaAttributeType.Name`: a `Name` of
+/// `MyAttribute` is created as `custom:MyAttribute`), a standard attribute under
+/// its own name.
+fn schema_path(attribute: &str) -> String {
+    match attribute
+        .strip_prefix("custom:")
+        .or_else(|| attribute.strip_prefix("dev:"))
+    {
+        Some(declared) => format!("Custom.User.{declared}"),
+        None => attribute.to_string(),
+    }
+}
+
+/// The refusal a REGISTRATION answers a value outside a declared bound with: the
+/// envelope, the attribute's schema path and the validation that bound is checked
+/// by.
+fn registration_bound(attribute: &str, validation: &str) -> String {
+    format!(
+        "{SCHEMA_ENVELOPE}{}: This attribute does not satisfy the {validation} validation \
+         defined in the schema.",
+        schema_path(attribute)
+    )
+}
+
+/// The line an UPDATE's report states for `attribute`: the attribute under the
+/// `user.` prefix a user's own attributes are validated under, the sentence, and
+/// the newline every line of that report ends with.
 fn report_line(attribute: &str, sentence: &str) -> String {
     format!("user.{attribute}: {sentence}\n")
 }
+
+/// The constraint envelope a value that is of the wrong FORM is refused with: the
+/// position of the value and the pattern it failed to satisfy.
+fn constraint_envelope(attribute: &str) -> String {
+    format!(
+        "1 validation error detected: Value at '{}' failed to satisfy constraint: Member must \
+         satisfy regular expression pattern: {NUMBER_PATTERN}",
+        schema_path(attribute)
+    )
+}
+
+/// The validations a declared bound is checked by, as a registration-stage refusal
+/// names them.
+const MAX_VALUE: &str = "MAX_VALUE_VALIDATION";
+const MIN_VALUE: &str = "MIN_VALUE_VALIDATION";
+const MAX_LENGTH: &str = "MAX_LENGTH_VALIDATION";
+const MIN_LENGTH: &str = "MIN_LENGTH_VALIDATION";
 
 /// The pool this suite writes to: the custom attributes its create declares,
 /// those `AddCustomAttributes` appends afterwards, and the minted pool id.
@@ -174,32 +277,43 @@ fn rows() -> Vec<Row> {
             "a number one past the declared maximum",
             "custom:rank",
             "11",
-            "Number must be less than 10",
+            bound(MAX_VALUE, "Number must be less than 10"),
         ),
         Row::refused(
             "a number far past the declared maximum",
             "custom:rank",
             "99",
-            "Number must be less than 10",
+            bound(MAX_VALUE, "Number must be less than 10"),
         ),
         Row::refused(
             "a number one under the declared minimum",
             "custom:rank",
             "0",
-            "Number must be greater than 1",
+            bound(MIN_VALUE, "Number must be greater than 1"),
         ),
         Row::refused(
             "a negative number under the declared minimum",
             "custom:rank",
             "-5",
-            "Number must be greater than 1",
+            bound(MIN_VALUE, "Number must be greater than 1"),
         ),
+        // The FORMS a number may be written in, which the pattern admits: an
+        // explicit sign, a fraction and an exponent.
+        Row::admitted("a signed number inside the declared range", "custom:rank", "+7"),
+        Row::admitted("a fractional number inside the declared range", "custom:rank", "7.5"),
+        Row::admitted("an exponent number inside the declared range", "custom:rank", "1e0"),
+        // And the values that are no number at all, which no bound can be
+        // compared against.
+        Row::not_a_number("letters where a number belongs", "custom:rank", "abc"),
+        Row::not_a_number("a number followed by a space", "custom:rank", "7 "),
+        Row::not_a_number("a number written with a thousands separator", "custom:rank", "1,5"),
+        Row::not_a_number("a number with two decimal points", "custom:rank", "7.5.1"),
         // A Number bounded above only: nothing bounds it from below.
         Row::refused(
             "a number past an attribute's only declared maximum",
             "custom:level",
             "11",
-            "Number must be less than 10",
+            bound(MAX_VALUE, "Number must be less than 10"),
         ),
         Row::admitted(
             "a number far below an attribute that declares no minimum",
@@ -211,7 +325,18 @@ fn rows() -> Vec<Row> {
             "a number under an attribute's only declared minimum",
             "custom:floor",
             "4",
-            "Number must be greater than 5",
+            bound(MIN_VALUE, "Number must be greater than 5"),
+        ),
+        Row::refused(
+            "a fraction under an attribute's only declared minimum",
+            "custom:floor",
+            ".5",
+            bound(MIN_VALUE, "Number must be greater than 5"),
+        ),
+        Row::admitted(
+            "an exponent number above the declared minimum",
+            "custom:floor",
+            "1e1",
         ),
         Row::admitted(
             "a number far above an attribute that declares no maximum",
@@ -225,19 +350,19 @@ fn rows() -> Vec<Row> {
             "a string one character past the declared maximum",
             "custom:tenant",
             "exactly89",
-            "String must be no longer than 8 characters",
+            bound(MAX_LENGTH, "String must be no longer than 8 characters"),
         ),
         Row::refused(
             "a string far past the declared maximum",
             "custom:tenant",
             "waytoolongvalue",
-            "String must be no longer than 8 characters",
+            bound(MAX_LENGTH, "String must be no longer than 8 characters"),
         ),
         Row::refused(
             "a string shorter than the declared minimum",
             "custom:tenant",
             "x",
-            "String must be no shorter than 2 characters",
+            bound(MIN_LENGTH, "String must be no shorter than 2 characters"),
         ),
         // A String bounded above only, with a non-ASCII row: the bound counts
         // characters, so a value of five two-byte characters is five long.
@@ -246,13 +371,13 @@ fn rows() -> Vec<Row> {
             "a string past an attribute's only declared maximum",
             "custom:label",
             "abcde",
-            "String must be no longer than 4 characters",
+            bound(MAX_LENGTH, "String must be no longer than 4 characters"),
         ),
         Row::refused(
             "a non-ASCII string past the declared maximum",
             "custom:label",
             "ééééé",
-            "String must be no longer than 4 characters",
+            bound(MAX_LENGTH, "String must be no longer than 4 characters"),
         ),
         Row::admitted(
             "a non-ASCII string whose characters are within the declared maximum",
@@ -275,20 +400,25 @@ fn rows() -> Vec<Row> {
             "a date one character short",
             "birthdate",
             "1990-01-0",
-            "String must be no shorter than 10 characters",
+            bound(MIN_LENGTH, "String must be no shorter than 10 characters"),
         ),
         Row::refused(
             "a date one character long",
             "birthdate",
             "1990-01-011",
-            "String must be no longer than 10 characters",
+            bound(MAX_LENGTH, "String must be no longer than 10 characters"),
         ),
         Row::admitted("a standard number at its declared minimum", "updated_at", "0"),
         Row::refused(
             "a standard number under its declared minimum",
             "updated_at",
             "-1",
-            "Number must be greater than 0",
+            bound(MIN_VALUE, "Number must be greater than 0"),
+        ),
+        Row::not_a_number(
+            "a standard number that is no number at all",
+            "updated_at",
+            "yesterday",
         ),
         Row::admitted("a standard string at its declared maximum", "name", "n".repeat(2_048)),
         // A value longer than that bound cannot be submitted at all: the
@@ -367,8 +497,8 @@ async fn a_self_service_sign_up_is_judged_against_the_declared_constraints() {
     let client_id = client_of(&router, &user_pool_id).await;
 
     // The refused registration first: a value past the declared maximum earns
-    // the same report line the administrative paths answer with, and leaves no
-    // user for the pool to hold.
+    // the registration stage's own refusal, and leaves no user for the pool to
+    // hold.
     let case = "a sign-up carrying a number past the declared maximum";
     let (status, payload) = call(
         &router,
@@ -381,7 +511,7 @@ async fn a_self_service_sign_up_is_judged_against_the_declared_constraints() {
         }),
     )
     .await;
-    let expected = report_line("custom:rank", "Number must be less than 10");
+    let expected = registration_bound("custom:rank", MAX_VALUE);
     assert_eq!(
         (
             status,
@@ -587,6 +717,8 @@ async fn a_new_password_challenge_response_is_judged_against_the_declared_constr
         }),
     )
     .await;
+    // The response writes the attributes of a user the pool already holds, so it
+    // is judged at the UPDATE stage and carries that stage's report line.
     let expected = report_line("custom:rank", "Number must be less than 10");
     assert_eq!(
         (
@@ -663,7 +795,7 @@ async fn an_update_is_judged_against_the_declared_constraints_and_writes_nothing
         )
         .await;
 
-        match row.report() {
+        match row.update_refusal() {
             Some(expected) => {
                 assert_eq!(
                     (
@@ -720,7 +852,7 @@ async fn a_create_is_judged_against_the_same_declared_constraints() {
         )
         .await;
 
-        match row.report() {
+        match row.registration_refusal() {
             Some(expected) => {
                 assert_eq!(
                     (
@@ -766,7 +898,7 @@ async fn a_create_is_judged_against_the_same_declared_constraints() {
 }
 
 #[tokio::test]
-async fn every_offending_attribute_of_one_request_is_reported_on_its_own_line() {
+async fn two_offending_attributes_of_one_request_are_reported_as_each_stage_reports_them() {
     let router = router();
     let user_pool_id = pool_with_declared_constraints(&router).await;
     let username = "multi-offender";
@@ -777,10 +909,10 @@ async fn every_offending_attribute_of_one_request_is_reported_on_its_own_line() 
     )
     .await;
 
-    // Two attributes of different data types, each outside a different bound,
-    // in one request: the report carries a line for each, so a client fixes
-    // both from one answer rather than one refusal at a time.
-    let case = "a number past its maximum beside a string past its maximum";
+    // Two attributes of different data types, each missing a different bound, in
+    // one request. At the UPDATE stage the report carries a line for each, in the
+    // order the request submitted them, so a client fixes both from one answer.
+    let case = "an update with a number past its maximum beside a string past its maximum";
     let (status, payload) = call(
         &router,
         "AdminUpdateUserAttributes",
@@ -797,10 +929,38 @@ async fn every_offending_attribute_of_one_request_is_reported_on_its_own_line() 
     let expected = format!(
         "{}{}",
         report_line("custom:rank", "Number must be less than 10"),
-        report_line(
-            "custom:tenant",
-            "String must be no longer than 8 characters"
-        )
+        report_line("custom:tenant", "String must be no longer than 8 characters")
+    );
+    assert_eq!(
+        (
+            status,
+            error_code(&payload),
+            error_message(&payload).to_string()
+        ),
+        (400, "InvalidParameterException", expected.clone()),
+        "case {case:?}: expected a 400 InvalidParameterException {expected:?}, got {status} \
+         with {payload}"
+    );
+
+    // The same two attributes in the other order: the lines follow the request.
+    let case = "the same two attributes, the string submitted first";
+    let (status, payload) = call(
+        &router,
+        "AdminUpdateUserAttributes",
+        &json!({
+            "UserPoolId": user_pool_id,
+            "Username": username,
+            "UserAttributes": [
+                { "Name": "custom:tenant", "Value": "waytoolongvalue" },
+                { "Name": "custom:rank", "Value": "99" },
+            ],
+        }),
+    )
+    .await;
+    let expected = format!(
+        "{}{}",
+        report_line("custom:tenant", "String must be no longer than 8 characters"),
+        report_line("custom:rank", "Number must be less than 10")
     );
     assert_eq!(
         (
@@ -820,6 +980,47 @@ async fn every_offending_attribute_of_one_request_is_reported_on_its_own_line() 
             .iter()
             .any(|(name, _)| name == "custom:rank" || name == "custom:tenant"),
         "case {case:?}: a refused update must write neither value, got {held:?}"
+    );
+
+    // The REGISTRATION stage's message names one attribute and one validation, so
+    // the same two attributes in one create earn the finding of the first of them,
+    // and no user is left behind.
+    let case = "a create with the same two offending attributes";
+    let created = "multi-offender-create";
+    let (status, payload) = call(
+        &router,
+        "AdminCreateUser",
+        &json!({
+            "UserPoolId": user_pool_id,
+            "Username": created,
+            "UserAttributes": [
+                { "Name": "custom:rank", "Value": "99" },
+                { "Name": "custom:tenant", "Value": "waytoolongvalue" },
+            ],
+        }),
+    )
+    .await;
+    let expected = registration_bound("custom:rank", MAX_VALUE);
+    assert_eq!(
+        (
+            status,
+            error_code(&payload),
+            error_message(&payload).to_string()
+        ),
+        (400, "InvalidParameterException", expected.clone()),
+        "case {case:?}: expected a 400 InvalidParameterException {expected:?}, got {status} \
+         with {payload}"
+    );
+    let (status, payload) = call(
+        &router,
+        "AdminGetUser",
+        &json!({ "UserPoolId": user_pool_id, "Username": created }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&payload)),
+        (400, "UserNotFoundException"),
+        "case {case:?}: a refused create must store no user, got {status} with {payload}"
     );
 }
 

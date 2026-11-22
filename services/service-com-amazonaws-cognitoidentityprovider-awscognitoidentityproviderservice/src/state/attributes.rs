@@ -27,10 +27,12 @@ use super::*;
 /// * A value whose attribute has a FORM of its own has to have that form
 ///   ([`attribute_value_defect`]), so a `phone_number` that is not a phone
 ///   number in E.164 form is refused rather than stored.
-/// * A value has to be within the bounds the pool's schema declares for its
-///   attribute ([`declared_bound_report`]), so a number outside the declared
-///   `MinValue`/`MaxValue` and a string outside the declared
-///   `MinLength`/`MaxLength` are refused rather than stored.
+/// * A value has to satisfy the constraints the pool's schema declares for its
+///   attribute ([`schema_constraint_refusal`]), so a number outside the declared
+///   `MinValue`/`MaxValue`, a string outside the declared
+///   `MinLength`/`MaxLength` and a value of a `Number` attribute that is not a
+///   number at all are refused rather than stored — this operation being an
+///   UPDATE of a stored user, with that stage's wording.
 /// * A new `email` or `phone_number` is no longer the value its verified flag
 ///   vouched for ([`verified_flag`]), so the flag goes unconfirmed unless the
 ///   request sets it itself, and a deleted one takes its flag with it.
@@ -121,15 +123,21 @@ pub fn plan_attribute_update(
                 .map(|name| (name, SchemaValidationFinding::NotUpdatable)),
         )));
     }
-    // Every value written has to be within the bounds the pool's schema declares
-    // for its attribute ([`declared_bound_report`]), and EVERY value outside one
-    // is reported, a line each, exactly as the findings above are. Decided before
-    // any attribute is planned, so a request carrying one writes nothing.
-    if let Some(report) = declared_bound_report(
+    // Every value written has to satisfy the constraints the pool's schema
+    // declares for its attribute ([`schema_constraint_refusal`]). Judged in the
+    // order the request submitted the attributes, and decided before any attribute
+    // is planned, so a request carrying such a value writes nothing.
+    if let Some(refusal) = schema_constraint_refusal(
         pool,
-        submitted.iter().map(|(name, value)| (*name, *value)),
+        SchemaValidationStage::Update,
+        requested.iter().map(|attribute| {
+            (
+                attribute.name.as_str(),
+                attribute.value.as_deref().unwrap_or_default(),
+            )
+        }),
     ) {
-        return Err(AttributeUpdateRefusal::Invalid(report));
+        return Err(AttributeUpdateRefusal::Invalid(refusal));
     }
     for (name, value) in &submitted {
         let name = (*name).to_string();
@@ -388,6 +396,104 @@ fn is_e164(value: &str) -> bool {
         && digits.bytes().all(|digit| digit.is_ascii_digit())
 }
 
+/// WHICH of Amazon Cognito's two schema validations of a user's submitted
+/// attributes judged them, which is what words the refusal.
+///
+/// The pool's schema is one boundary, but the stage that applies it is not: a
+/// REGISTRATION of a new account and an UPDATE of a stored user's attributes are
+/// validated at different stages of this service, and each states its finding in
+/// its own sentence. Both wordings are the service's own, and neither is derived
+/// from the other: a caller picks the stage its operation is, and the message
+/// follows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaValidationStage {
+    /// A registration of a new account (`SignUp`, `AdminCreateUser`): the refusal
+    /// opens with [`SCHEMA_VALIDATION_PREFIX`] and names the attribute by its
+    /// SCHEMA PATH ([`schema_path`]) and the validation its value did not satisfy.
+    Registration,
+    /// An update of the attributes of a user the pool already holds: the refusal
+    /// is the per-attribute report ([`schema_validation_report`]), a line per
+    /// offending attribute naming it under the `user.` prefix and the bound it
+    /// missed as the schema declares it.
+    Update,
+}
+
+impl SchemaValidationStage {
+    /// How this stage states that the value submitted for the attribute `name`
+    /// misses `bound`.
+    fn bound_message(self, name: &str, bound: DeclaredBound<'_>) -> String {
+        match self {
+            Self::Registration => format!(
+                "{SCHEMA_VALIDATION_PREFIX}{}: This attribute does not satisfy the {} validation \
+                 defined in the schema.",
+                schema_path(name),
+                bound.validation()
+            ),
+            Self::Update => schema_validation_report([(
+                name,
+                SchemaValidationFinding::OutsideDeclaredBound(bound.sentence()),
+            )]),
+        }
+    }
+
+    /// How this stage states that the value submitted for the attribute `name` is
+    /// not of the FORM its data type's values take.
+    ///
+    /// The form is a constraint on the value itself rather than a bound the pool's
+    /// operator declared, so both stages report it in the envelope this service
+    /// states a member's pattern constraint in, naming the value's position by the
+    /// attribute's schema path; the registration stage states its own prefix ahead
+    /// of it, as it does for every finding of its schema validation.
+    fn number_form_message(self, name: &str) -> String {
+        let envelope = format!(
+            "1 validation error detected: Value at '{}' failed to satisfy constraint: Member must \
+             satisfy regular expression pattern: {NUMBER_VALUE_PATTERN}",
+            schema_path(name)
+        );
+        match self {
+            Self::Registration => format!("{SCHEMA_VALIDATION_PREFIX}{envelope}"),
+            Self::Update => envelope,
+        }
+    }
+}
+
+/// The sentence every refusal of the REGISTRATION stage's schema validation opens
+/// with: the submitted attributes were judged against the pool's schema, and one
+/// of them did not pass it.
+pub const SCHEMA_VALIDATION_PREFIX: &str = "Attributes did not conform to the schema: ";
+
+/// The prefix the SCHEMA PATH of a custom attribute carries, under which a pool's
+/// schema holds the attributes its operator declared for its users.
+///
+/// A registration-stage finding names the attribute by that path rather than by
+/// the name the request wrote: "when you add an attribute with a `Name` value of
+/// `MyAttribute`, Amazon Cognito creates the custom attribute
+/// `custom:MyAttribute`. When `DeveloperOnlyAttribute` is `true`, Amazon Cognito
+/// creates your attribute as `dev:MyAttribute`" (`SchemaAttributeType.Name`, this
+/// service's model) — so the wire name is the declared name under one of those
+/// prefixes, and the path is the declared name under this one.
+const CUSTOM_SCHEMA_PATH: &str = "Custom.User.";
+
+/// The wire prefixes that name a CUSTOM attribute of a pool, each of which
+/// [`CUSTOM_SCHEMA_PATH`] replaces in a schema path.
+const CUSTOM_ATTRIBUTE_PREFIXES: [&str; 2] = ["custom:", "dev:"];
+
+/// The FORM the values of a `Number` attribute take, as the constraint a value
+/// that is not of that form is refused against states it: an optionally signed
+/// decimal number, written with digits of any script, carrying an optional
+/// fraction and an optional exponent — or nothing at all, a blank value being no
+/// value to store.
+const NUMBER_VALUE_PATTERN: &str =
+    r"$|^[+-]?((\p{Nd}+(\.\p{Nd}*)?)|(\.\p{Nd}+))([eE][+-]?\p{Nd}+)?";
+
+/// [`NUMBER_VALUE_PATTERN`] as a matcher of a WHOLE submitted value: the pattern
+/// is a constraint on the value, so what has to satisfy it is the value entire
+/// rather than some run inside it.
+static NUMBER_VALUE: ::std::sync::LazyLock<::regex::Regex> = ::std::sync::LazyLock::new(|| {
+    ::regex::Regex::new(&format!("^(?:{NUMBER_VALUE_PATTERN})$"))
+        .expect("the number attribute's own value pattern compiles")
+});
+
 /// The bound a submitted value missed, as the pool's schema declares it.
 ///
 /// A schema attribute carries the constraints of its OWN data type —
@@ -396,9 +502,11 @@ fn is_e164(value: &str) -> bool {
 /// minimum length of a number attribute value" and `MaxValue` the maximum) and
 /// "... of the string type" (`StringAttributeConstraints`, with `MinLength` and
 /// `MaxLength`), this service's model — so a value stored for that attribute has
-/// to be within them, and the sentence a violation is reported with states which
-/// bound was missed and that bound as the SCHEMA declares it, never the submitted
-/// value.
+/// to be within them. Which bound was missed is what a refusal states, as the
+/// VALIDATION that bound is checked by ([`DeclaredBound::validation`]) or as the
+/// bound the schema declares ([`DeclaredBound::sentence`]), one wording per
+/// validation stage ([`SchemaValidationStage`]); the submitted value itself is
+/// never quoted back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeclaredBound<'schema> {
     /// The value is a number above the declared `MaxValue`.
@@ -412,10 +520,10 @@ enum DeclaredBound<'schema> {
 }
 
 impl DeclaredBound<'_> {
-    /// The sentence this violation is reported with: the bound that was missed,
-    /// stated in the units its data type is bounded in — a number against the
-    /// value it may not pass, a string against the number of characters it may
-    /// not pass.
+    /// The sentence this violation is reported with where the bound itself is
+    /// stated: the bound that was missed, in the units its data type is bounded in
+    /// — a number against the value it may not pass, a string against the number
+    /// of characters it may not pass.
     fn sentence(self) -> String {
         match self {
             Self::NumberAbove(max_value) => format!("Number must be less than {max_value}"),
@@ -428,72 +536,135 @@ impl DeclaredBound<'_> {
             }
         }
     }
+
+    /// The VALIDATION this bound is checked by, which is what a refusal that names
+    /// the validation rather than the bound states: the constraint member that
+    /// refused the value, as this service's schema validation names it.
+    fn validation(self) -> &'static str {
+        match self {
+            Self::NumberAbove(_) => "MAX_VALUE_VALIDATION",
+            Self::NumberBelow(_) => "MIN_VALUE_VALIDATION",
+            Self::StringLonger(_) => "MAX_LENGTH_VALIDATION",
+            Self::StringShorter(_) => "MIN_LENGTH_VALIDATION",
+        }
+    }
 }
 
-/// The schema-validation report refusing every `submitted` `(attribute, value)`
-/// whose value is outside a bound `pool`'s schema declares for that attribute, or
-/// `None` when every submitted value is within the bounds declared for it.
+/// The constraint of its schema attribute that a submitted value does not satisfy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaConstraint<'schema> {
+    /// A BOUND the schema declares for the attribute.
+    Bound(DeclaredBound<'schema>),
+    /// The form a `Number` attribute's values take
+    /// ([`NUMBER_VALUE_PATTERN`]), which a value that is not a number at all
+    /// does not have.
+    NumberForm,
+}
+
+/// The path `pool`'s schema holds the attribute `name` under: a custom attribute
+/// under [`CUSTOM_SCHEMA_PATH`], carrying the name it was declared with rather
+/// than the prefixed name a request writes it by, and a standard attribute under
+/// its own name, which is the name its schema entry is declared with.
+fn schema_path(name: &str) -> String {
+    match CUSTOM_ATTRIBUTE_PREFIXES
+        .iter()
+        .find_map(|prefix| name.strip_prefix(prefix))
+    {
+        Some(declared) => format!("{CUSTOM_SCHEMA_PATH}{declared}"),
+        None => name.to_string(),
+    }
+}
+
+/// The refusal `stage` answers the `submitted` `(attribute, value)` pairs whose
+/// values do not satisfy a constraint `pool`'s schema declares for their
+/// attribute, or `None` when every submitted value satisfies the constraints of
+/// its attribute.
 ///
 /// The pool's schema is the boundary every write of a user attribute is judged
 /// against, whichever operation submitted it: the entry for an attribute declares
-/// the constraints its values take ([`DeclaredBound`]), so a value outside one is
-/// a value no user of the pool can hold and the write is refused with the report
-/// those findings make up ([`schema_validation_report`]) — a line per attribute,
-/// exactly as the other schema findings are reported.
+/// the constraints its values take ([`SchemaConstraint`]), so a value that misses
+/// one is a value no user of the pool can hold and the write is refused. WHICH
+/// sentence states that is the stage's ([`SchemaValidationStage`]), and so is how
+/// many findings it carries: the registration stage's message names one attribute
+/// and one validation, so the finding reported is the first the submitted
+/// attributes produce; the update stage's report states a line per offending
+/// attribute, in the order they were submitted.
+///
+/// A value that is not of the FORM its data type's values take is judged ahead of
+/// every declared bound, whatever attribute carries it: such a value is outside no
+/// bound, there being nothing to compare.
 ///
 /// A BLANK value is no value at all — "to delete an attribute from your user,
 /// submit the attribute in your API request with a blank value" (this service's
-/// model) — so no bound applies to it.
+/// model) — so no constraint applies to it.
 ///
 /// Bounded by the submitted list, with one lookup of the pool's schema per entry
-/// and nothing allocated for a value that is within its bounds.
-pub fn declared_bound_report<'submitted>(
+/// and nothing allocated for a value its attribute admits.
+pub fn schema_constraint_refusal<'submitted>(
     pool: &UserPool,
+    stage: SchemaValidationStage,
     submitted: impl IntoIterator<Item = (&'submitted str, &'submitted str)>,
 ) -> Option<String> {
-    let mut findings: Vec<(&'submitted str, SchemaValidationFinding)> = Vec::new();
-    for (name, value) in submitted {
-        if value.is_empty() {
-            continue;
-        }
-        if let Some(missed) = declared_bound_missed(pool, name, value) {
-            findings.push((
-                name,
-                SchemaValidationFinding::OutsideDeclaredBound(missed.sentence()),
-            ));
+    let findings: Vec<(&'submitted str, SchemaConstraint<'_>)> = submitted
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .filter_map(|(name, value)| {
+            schema_constraint_missed(pool, name, value).map(|missed| (name, missed))
+        })
+        .collect();
+    if let Some((name, _)) = findings
+        .iter()
+        .find(|(_, missed)| matches!(missed, SchemaConstraint::NumberForm))
+    {
+        return Some(stage.number_form_message(name));
+    }
+    let mut bounds = findings.iter().filter_map(|(name, missed)| match missed {
+        SchemaConstraint::Bound(bound) => Some((*name, *bound)),
+        SchemaConstraint::NumberForm => None,
+    });
+    match stage {
+        SchemaValidationStage::Registration => bounds
+            .next()
+            .map(|(name, bound)| stage.bound_message(name, bound)),
+        SchemaValidationStage::Update => {
+            let report = schema_validation_report(bounds.map(|(name, bound)| {
+                (
+                    name,
+                    SchemaValidationFinding::OutsideDeclaredBound(bound.sentence()),
+                )
+            }));
+            (!report.is_empty()).then_some(report)
         }
     }
-    if findings.is_empty() {
-        return None;
-    }
-    Some(schema_validation_report(findings))
 }
 
-/// Whether `value` is within every bound `pool`'s schema declares for the
-/// attribute `name`. [`declared_bound_report`] states the refusal a caller
+/// Whether `value` satisfies every constraint `pool`'s schema declares for the
+/// attribute `name`. [`schema_constraint_refusal`] states the refusal a caller
 /// answers with; this answers the question alone, for a caller that reports no
-/// message and so needs no report built.
-pub fn within_declared_bounds(pool: &UserPool, name: &str, value: &str) -> bool {
-    value.is_empty() || declared_bound_missed(pool, name, value).is_none()
+/// message and so needs none built.
+pub fn satisfies_schema_constraints(pool: &UserPool, name: &str, value: &str) -> bool {
+    value.is_empty() || schema_constraint_missed(pool, name, value).is_none()
 }
 
-/// The bound `pool`'s schema declares for the attribute `name` that `value` is
-/// outside, or `None` when the value is within every bound declared for it.
+/// The constraint `pool`'s schema declares for the attribute `name` that `value`
+/// does not satisfy, or `None` when the value satisfies every one of them.
 ///
 /// Which constraints apply is the attribute's `AttributeDataType` — a `Number`
-/// attribute's values are bounded by value and a `String` attribute's by length,
-/// and an attribute of any other type (a boolean) carries neither structure, so
-/// nothing bounds its values. An entry naming no data type is a `String` one, the
-/// type an attribute defaults to ([`DEFAULT_ATTRIBUTE_DATA_TYPE`]). An attribute
-/// the schema does not declare has no entry to read, and a value of a `Number`
-/// attribute that is not a number at all is outside no declared bound: neither is
-/// judged here, the first being refused as undeclared
-/// ([`plan_attribute_update`]) and the second having nothing to compare against.
-fn declared_bound_missed<'pool>(
+/// attribute's values have the form of a number and are bounded by value, a
+/// `String` attribute's are bounded by length, and an attribute of any other type
+/// (a boolean) carries neither structure, so nothing constrains its values. An
+/// entry naming no data type is a `String` one, the type an attribute defaults to
+/// ([`DEFAULT_ATTRIBUTE_DATA_TYPE`]). An attribute the schema does not declare has
+/// no entry to read and is refused as undeclared instead
+/// ([`plan_attribute_update`]).
+///
+/// A value's FORM is judged before the bounds of its own type: a value that is not
+/// a number is outside no numeric bound, there being nothing to compare.
+fn schema_constraint_missed<'pool>(
     pool: &'pool UserPool,
     name: &str,
     value: &str,
-) -> Option<DeclaredBound<'pool>> {
+) -> Option<SchemaConstraint<'pool>> {
     let entry = pool.schema_attribute(name)?;
     match entry
         .attribute_data_type
@@ -501,16 +672,19 @@ fn declared_bound_missed<'pool>(
         .unwrap_or(DEFAULT_ATTRIBUTE_DATA_TYPE)
     {
         NUMBER_ATTRIBUTE_DATA_TYPE => {
+            if !NUMBER_VALUE.is_match(value) {
+                return Some(SchemaConstraint::NumberForm);
+            }
+            let submitted: f64 = value.parse().ok()?;
             let constraints = entry.number_attribute_constraints.as_ref()?;
-            let submitted: f64 = value.trim().parse().ok()?;
             if let Some((declared, max_value)) = declared_number(constraints.max_value.as_deref()) {
                 if submitted > max_value {
-                    return Some(DeclaredBound::NumberAbove(declared));
+                    return Some(SchemaConstraint::Bound(DeclaredBound::NumberAbove(declared)));
                 }
             }
             if let Some((declared, min_value)) = declared_number(constraints.min_value.as_deref()) {
                 if submitted < min_value {
-                    return Some(DeclaredBound::NumberBelow(declared));
+                    return Some(SchemaConstraint::Bound(DeclaredBound::NumberBelow(declared)));
                 }
             }
             None
@@ -524,13 +698,15 @@ fn declared_bound_missed<'pool>(
             if let Some((declared, max_length)) = declared_length(constraints.max_length.as_deref())
             {
                 if submitted > max_length {
-                    return Some(DeclaredBound::StringLonger(declared));
+                    return Some(SchemaConstraint::Bound(DeclaredBound::StringLonger(declared)));
                 }
             }
             if let Some((declared, min_length)) = declared_length(constraints.min_length.as_deref())
             {
                 if submitted < min_length {
-                    return Some(DeclaredBound::StringShorter(declared));
+                    return Some(SchemaConstraint::Bound(DeclaredBound::StringShorter(
+                        declared,
+                    )));
                 }
             }
             None

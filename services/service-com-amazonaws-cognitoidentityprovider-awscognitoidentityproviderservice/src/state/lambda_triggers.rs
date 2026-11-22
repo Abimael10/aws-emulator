@@ -23,9 +23,11 @@
 //! outcome it could have modified — "this trigger can take custom actions after a user
 //! confirms their user account" (`LambdaConfigType$PostConfirmation`) — runs once that
 //! outcome is settled, so an invocation that reached no function leaves the operation's own
-//! answer standing. A trigger at a stage BEFORE it — one that "can evaluate and modify user
-//! sign-in events" (`LambdaConfigType$PreAuthentication`) — GATES the operation: the
-//! operation it gates continues only on a function that returned, so [`invoke_gating`]
+//! answer standing, and what a function that DID answer returned changes nothing about the
+//! outcome; it is still read far enough to say whether it answered THIS invocation at all
+//! ([`invoke_following`]). A trigger at a stage BEFORE it — one that "can evaluate and
+//! modify user sign-in events" (`LambdaConfigType$PreAuthentication`) — GATES the operation:
+//! the operation it gates continues only on a function that returned, so [`invoke_gating`]
 //! turns every other outcome into the operation's own modelled Lambda error.
 //!
 //! The function is invoked over the in-process callback into this same emulator
@@ -758,6 +760,49 @@ pub async fn invoke_gating(
     }
 }
 
+/// Invoke the function of a trigger that FOLLOWS its operation's outcome — one at a stage
+/// after the outcome it could have modified — and report what the trigger leaves the
+/// operation to answer.
+///
+/// The outcome is already settled when such a function runs: "this trigger can take custom
+/// actions after a user confirms their user account"
+/// (`LambdaConfigType$PostConfirmation`), so an invocation that reached no function leaves
+/// the operation's own answer standing, and nothing the function returns is applied to the
+/// outcome either.
+///
+/// What the function returns is still READ: a trigger is answered with the EVENT it was
+/// handed, which names the account the stage is about, so an answer that does not name that
+/// same account — one naming another, and one that is not that event at all and so names
+/// none — is not an answer to this invocation. Amazon Cognito "encounters an invalid Lambda
+/// response" (this service's model for `InvalidLambdaResponseException`) and the operation
+/// reports that, over the outcome it already wrote: a pool whose configured function answers
+/// something else is a pool whose trigger did not run, which is what the caller is told
+/// ([`USERNAME_MISMATCH_MESSAGE`]).
+pub async fn invoke_following(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    dispatch: &Dispatch,
+) -> Result<(), Failure> {
+    match invoke(ctx, dispatch).await? {
+        Verdict::Answered(answer) if !answers_the_delivered_username(dispatch, &answer) => Err(
+            Failure::Unrecognized(USERNAME_MISMATCH_MESSAGE.to_string()),
+        ),
+        Verdict::Answered(_) | Verdict::NoVerdict(_) => Ok(()),
+    }
+}
+
+/// Whether `answered` names the SAME user `dispatch`'s event was delivered for.
+///
+/// Stricter than [`answers_another_username`]: an answer that leaves the member out has not
+/// named the account either, which is what a trigger whose answer carries nothing else to
+/// read is judged by ([`invoke_following`]). An event that names no account itself —
+/// which no stage builds — has nothing for an answer to match.
+fn answers_the_delivered_username(dispatch: &Dispatch, answered: &Value) -> bool {
+    let Some(delivered) = dispatch.event.get(USERNAME_MEMBER).and_then(Value::as_str) else {
+        return true;
+    };
+    answered.get(USERNAME_MEMBER).and_then(Value::as_str) == Some(delivered)
+}
+
 /// Whether `answered` names a user other than the one `dispatch`'s event was delivered for.
 ///
 /// The event names the account the stage is about (`userName`), and a function answers that
@@ -885,8 +930,9 @@ pub async fn invoke(
         )));
     }
     // The function returned, so its answer is what it answered with: a post-confirmation
-    // function's is not read — the trigger runs after the outcome it could have modified —
-    // and a gating function's is handed back to the operation it gates.
+    // function's answer changes nothing about the outcome it followed — the trigger runs
+    // after the outcome it could have modified — and a gating function's is handed back to
+    // the operation it gates.
     Ok(Verdict::Answered(answered_event(output.payload())))
 }
 

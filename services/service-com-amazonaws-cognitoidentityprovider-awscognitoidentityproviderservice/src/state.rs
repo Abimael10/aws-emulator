@@ -3807,6 +3807,10 @@ pub fn non_mutable_attribute_message(attribute_name: &str) -> String {
 /// attribute, under the `user.` prefix the schema gives a user's own attributes,
 /// then what is wrong with it, then the newline every line of that report ends
 /// with. [`schema_validation_report`] is the report those lines make up.
+///
+/// This is the report of the UPDATE stage of that validation
+/// ([`SchemaValidationStage::Update`]); the registration stage states its findings
+/// in one sentence of its own ([`schema_constraint_refusal`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaValidationFinding {
     /// The pool's schema declares no such attribute, so there is nothing to write.
@@ -3818,7 +3822,7 @@ pub enum SchemaValidationFinding {
     /// attribute (`SchemaAttributeType.StringAttributeConstraints` /
     /// `NumberAttributeConstraints`), carrying the sentence that states which
     /// bound it missed and the bound as the schema declares it
-    /// ([`declared_bound_report`]).
+    /// ([`schema_constraint_refusal`]).
     OutsideDeclaredBound(String),
 }
 

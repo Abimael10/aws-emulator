@@ -538,11 +538,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
         }) {
             return Err(invalid_parameter(defect.to_string()));
         }
-        // A submitted value also has to be within the bounds the pool's schema
+        // A submitted value also has to satisfy the constraints the pool's schema
         // declares for its attribute, the same rule every other writer of a user
-        // attribute applies ([`crate::state::declared_bound_report`]).
-        if let Some(report) = crate::state::declared_bound_report(
+        // attribute applies ([`crate::state::schema_constraint_refusal`]) — this
+        // operation REGISTERING an account, so with that stage's own wording.
+        if let Some(refusal) = crate::state::schema_constraint_refusal(
             pool,
+            crate::state::SchemaValidationStage::Registration,
             requested_attributes.iter().map(|attribute| {
                 (
                     attribute.name.as_str(),
@@ -550,7 +552,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
                 )
             }),
         ) {
-            return Err(invalid_parameter(report));
+            return Err(invalid_parameter(refusal));
         }
         // An attribute submitted with an empty value is stored for no user
         // (`crate::state::stored_attribute_values`).

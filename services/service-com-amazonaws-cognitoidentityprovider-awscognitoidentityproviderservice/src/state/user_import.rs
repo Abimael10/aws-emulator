@@ -386,10 +386,11 @@ fn place_row(
         if attribute_value_defect(column, &value).is_some() {
             return RowResult::Failed;
         }
-        // A value outside the bounds the pool's schema declares for its attribute
-        // is a value no user of the pool can hold either
-        // ([`within_declared_bounds`]), so the row it arrived in stores nothing.
-        if !within_declared_bounds(pool, column, &value) {
+        // A value that misses a constraint the pool's schema declares for its
+        // attribute is a value no user of the pool can hold either
+        // ([`satisfies_schema_constraints`]), so the row it arrived in stores
+        // nothing.
+        if !satisfies_schema_constraints(pool, column, &value) {
             return RowResult::Failed;
         }
         attributes.insert(column.clone(), value);

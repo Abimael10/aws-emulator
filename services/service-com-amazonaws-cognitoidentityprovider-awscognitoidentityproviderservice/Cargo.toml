@@ -104,6 +104,11 @@ url = "2"
 # "displayed and set in" and decides whether a request's address lies in one of those
 # blocks (`src/state/risk_exceptions.rs`).
 ipnet = "2"
+# `regex`: a `Number` schema attribute's values have the form the pool's schema
+# validation constrains them to, and a value that does not match that pattern is
+# refused with it (`src/state/attributes.rs`) — matched by the regex engine this
+# tree already compiles patterns with rather than by scanning the value by hand.
+regex = "1.13"
 # The validity window rcgen stamps on that certificate is the one the model documents
 # for an issued signing certificate, so the two instants are converted from the pool's
 # `SystemTime`s into the date-time type rcgen takes.

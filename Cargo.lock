@@ -12309,6 +12309,7 @@ dependencies = [
  "ipnet",
  "pkcs1",
  "rcgen",
+ "regex",
  "ring",
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",

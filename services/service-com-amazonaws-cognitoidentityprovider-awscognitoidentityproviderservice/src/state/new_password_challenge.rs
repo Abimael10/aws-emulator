@@ -34,9 +34,9 @@ pub enum NewPasswordChallengeRefusal {
     /// The response submits a value for an attribute the pool's schema does not
     /// declare.
     UnknownAttribute(String),
-    /// The response submits a value outside a bound the pool's schema declares
-    /// for its attribute, carrying the report that states a line per such value
-    /// ([`declared_bound_report`]).
+    /// The response submits a value that misses a constraint the pool's schema
+    /// declares for its attribute, carrying the schema validation's own refusal
+    /// for it ([`schema_constraint_refusal`]).
     AttributeOutsideDeclaredBound(String),
     /// A required attribute the challenge asked for is still without a value
     /// after the response's own entries are applied.
@@ -142,17 +142,20 @@ pub fn answer_new_password_challenge(
     if let Some(unknown) = pool.unknown_attribute(&requested_names) {
         return Err(NewPasswordChallengeRefusal::UnknownAttribute(unknown));
     }
-    // Every value written has to be within the bounds the pool's schema declares
+    // Every value written has to satisfy the constraints the pool's schema declares
     // for its attribute, the same rule every other writer of a user attribute
-    // applies ([`declared_bound_report`]).
-    if let Some(report) = declared_bound_report(
+    // applies ([`schema_constraint_refusal`]) — this response writing the
+    // attributes of a user the pool already holds, so with the UPDATE stage's own
+    // wording.
+    if let Some(refusal) = schema_constraint_refusal(
         pool,
+        SchemaValidationStage::Update,
         requested
             .iter()
             .map(|(name, value)| (name.as_str(), value.as_str())),
     ) {
         return Err(NewPasswordChallengeRefusal::AttributeOutsideDeclaredBound(
-            report,
+            refusal,
         ));
     }
 

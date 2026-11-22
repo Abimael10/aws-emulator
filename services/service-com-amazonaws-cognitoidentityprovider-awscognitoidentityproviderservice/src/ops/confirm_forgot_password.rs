@@ -362,7 +362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if let Some(dispatch) = dispatch {
-            crate::state::lambda_triggers::invoke(ctx, &dispatch)
+            crate::state::lambda_triggers::invoke_following(ctx, &dispatch)
                 .await
                 .map_err(trigger_failed)?;
         }
