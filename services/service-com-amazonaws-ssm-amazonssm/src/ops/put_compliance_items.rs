@@ -361,14 +361,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 title: item.title.clone(),
                 severity: item.severity.clone(),
                 status: item.status.clone(),
-                details: item.details.as_ref().map(|details| {
-                    let mut entries: Vec<(String, String)> = details
+                // "A 'Key': 'Value' tag combination for the compliance item": the pairs the
+                // item carried, which is the empty set for an item that carried none and for
+                // one that carried an empty map alike — the member is a map either way, so
+                // both are held as the empty map and reported as one.
+                details: {
+                    let mut entries: Vec<(String, String)> = item
+                        .details
                         .iter()
+                        .flatten()
                         .map(|(key, value)| (key.clone(), value.clone()))
                         .collect();
                     entries.sort();
                     entries
-                }),
+                },
                 execution_summary: input.execution_summary.clone(),
                 source: compliance::ComplianceSource::Written,
             })

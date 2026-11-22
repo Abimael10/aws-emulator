@@ -339,9 +339,12 @@ pub struct ComplianceItemRecord {
     /// the item completed on the node, or the summary the put supplied as it was received.
     pub execution_summary: ComplianceExecutionSummary,
     /// "A 'Key': 'Value' tag combination for the compliance item", which for a patch is what
-    /// the patch read reports about it beside its state, in ascending key order; `None` for a
-    /// written item that carried none.
-    pub details: Option<Vec<(String, String)>>,
+    /// the patch read reports about it beside its state, in ascending key order.
+    ///
+    /// A map is what the member IS, so an item carrying no pair holds the EMPTY map rather
+    /// than no map at all — and a read reports the member for every item
+    /// ([`Self::to_compliance_item`]).
+    pub details: Vec<(String, String)>,
     /// Where this item sat in the list its put carried, which is the order a read walks the
     /// WRITTEN items of one resource and compliance type in. Zero for a gathered item, which
     /// its patch id orders instead ([`item_position`]).
@@ -403,7 +406,7 @@ impl ComplianceItemRecord {
                 execution_id: None,
                 execution_type: Some(EXECUTION_TYPE_COMMAND.to_string()),
             },
-            details: Some(details),
+            details,
             position: 0,
             source: ComplianceSource::Gathered,
         }
@@ -492,12 +495,16 @@ impl ComplianceItemRecord {
             status: Some(self.status.clone()),
             severity: Some(self.severity.clone()),
             execution_summary: Some(self.execution_summary.clone()),
-            details: self.details.as_ref().map(|details| {
-                details
+            // "A 'Key': 'Value' tag combination for the compliance item": the member is a
+            // map, so an item that holds no pair is reported as the EMPTY map and the member
+            // is reported for every item — a read never leaves it out and so never makes a
+            // caller tell an item with no details from one whose details it cannot see.
+            details: Some(
+                self.details
                     .iter()
                     .cloned()
-                    .collect::<HashMap<String, String>>()
-            }),
+                    .collect::<HashMap<String, String>>(),
+            ),
         }
     }
 }

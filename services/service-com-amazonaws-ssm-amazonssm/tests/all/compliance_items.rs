@@ -284,13 +284,21 @@ async fn a_put_is_read_back_as_the_compliance_of_that_resource_and_type() {
             "case {case:?}: expected one reported item per item the put carried, got {read:?}"
         );
         for (reported, wrote) in read.iter().zip(submitted.iter()) {
-            for member in ["Id", "Title", "Severity", "Status", "Details"] {
+            for member in ["Id", "Title", "Severity", "Status"] {
                 assert_eq!(
                     reported.get(member),
                     wrote.get(member),
                     "case {case:?}: {member} is what the put supplied, got {reported}"
                 );
             }
+            // `Details` is a MAP, so an item that carried no pair is reported as the empty
+            // map rather than without the member (see `compliance_item_details.rs`).
+            let details = wrote.get("Details").cloned().unwrap_or_else(|| json!({}));
+            assert_eq!(
+                reported.get("Details"),
+                Some(&details),
+                "case {case:?}: Details is the map the put supplied, got {reported}"
+            );
             assert_eq!(
                 (
                     reported["ComplianceType"].as_str(),
