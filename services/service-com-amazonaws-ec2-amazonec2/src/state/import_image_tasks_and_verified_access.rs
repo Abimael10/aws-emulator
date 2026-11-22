@@ -1852,9 +1852,16 @@ pub struct VerifiedAccessGroupRecord {
     pub view: crate::ops::types::VerifiedAccessGroup,
     /// "The Verified Access policy document"
     /// (`CreateVerifiedAccessGroupRequest$PolicyDocument`), which the modelled group shape
-    /// carries no member for: `GetVerifiedAccessGroupPolicy` is what reports it (still a
-    /// scaffold stub with its own open issue). Kept here so the document the create accepted
-    /// is the one that reader will answer with, rather than dropped on the floor.
+    /// carries no member for: `GetVerifiedAccessGroupPolicy` is what reports it. Kept here so
+    /// the document the create accepted is the one that reader answers with, rather than
+    /// dropped on the floor.
+    ///
+    /// The STATUS that reader answers beside it is read off this document, because a create
+    /// takes no status of its own: a group holds a policy exactly when it holds a document for
+    /// one. `ModifyVerifiedAccessGroupPolicy` takes `PolicyEnabled` and `PolicyDocument` as
+    /// SEPARATE members, so the writer that implements that operation has to keep the status
+    /// beside this document rather than let it stay derived, or a group whose policy was
+    /// disabled without its document being cleared would report the wrong status.
     pub policy_document: Option<String>,
 }
 
