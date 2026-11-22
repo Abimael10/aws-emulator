@@ -1422,8 +1422,15 @@ pub struct MemoryStore {
     /// [`MAX_IDEMPOTENCY_RECORDS_PER_MEMORY`], and a record is dropped with any of the
     /// memory records it points at.
     pub record_idempotency: HashMap<String, MemoryRecordBatchLocator>,
-    /// The sequence of the last event written into this container, which is what its
-    /// eviction order is read from.
+    /// The extraction jobs `StartMemoryExtractionJob` picked the messages of up, keyed by
+    /// the `jobId` of the (actor, session) unit each one covered: the watermark of what
+    /// the attempt took, which is what makes the messages stored after it the next unit of
+    /// work ([`StartedExtractionJob`]). Bounded by
+    /// [`MAX_STARTED_EXTRACTION_JOBS_PER_MEMORY`]; see [`extraction_jobs`].
+    pub extractions: HashMap<String, StartedExtractionJob>,
+    /// The sequence of the last write into this container — an event, an ingestion, a
+    /// memory record or an extraction-job pick-up — which is what its eviction order is
+    /// read from.
     pub last_seq: u64,
 }
 
@@ -2231,6 +2238,9 @@ pub enum NotFoundResource {
     BatchEvaluation,
     /// A payment session a payment manager owns, addressed by `paymentSessionId`.
     PaymentSession,
+    /// One long-term memory extraction job of a memory container, addressed by the
+    /// `jobId` the job is listed under.
+    ExtractionJob,
 }
 
 impl NotFoundResource {
@@ -2246,6 +2256,7 @@ impl NotFoundResource {
             Self::Browser => "Browser",
             Self::BatchEvaluation => "Batch Evaluation",
             Self::PaymentSession => "Payment session",
+            Self::ExtractionJob => "Extraction job",
         }
     }
 

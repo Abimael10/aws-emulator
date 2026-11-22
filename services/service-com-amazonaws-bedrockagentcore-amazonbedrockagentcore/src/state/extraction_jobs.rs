@@ -6,7 +6,12 @@
 //! container accepted — not an extraction result. `ListMemoryExtractionJobs` reports the
 //! units that are eligible to be started, and `StartMemoryExtractionJob` picks up the
 //! messages one of them left unprocessed, so a unit is listed for as long as no
-//! extraction has produced records from its messages.
+//! extraction attempt has picked its messages up ([`StartedExtractionJob`]).
+//!
+//! A start is therefore recorded as the WATERMARK of the session's records it covered:
+//! every message the container had accepted into that session when the job ran is picked
+//! up, and a message stored afterwards is left unprocessed and composes the session's next
+//! unit of work — which is what lets a later start "pick up and extract those as well".
 //!
 //! One unit is one SESSION of one actor: a session's conversational messages are what
 //! long-term extraction reads together, and the modelled job names the actor and session
@@ -19,7 +24,12 @@
 //! What a job does NOT carry is an outcome. Nothing in this emulator has run extraction
 //! over a stored message, so no job here reports a `status` or a `failureReason`: a unit
 //! is reported with the identity and the messages its session supports, and with nothing
-//! an attempt would have produced.
+//! an attempt would have produced. The structured memory records an extraction produces
+//! are a model's reading of a conversation under the memory strategies the CONTROL plane
+//! holds, which this plane can neither read nor run, so a start picks its messages up and
+//! reports no record it did not produce — synthesising records nothing extracted would be
+//! worse than not reporting them, exactly as `IngestData` already states for the content
+//! it stores.
 //!
 //! The work this walk does is bounded by the store's own ceilings
 //! ([`super::MAX_STORED_EVENTS`] events and [`super::MAX_STORED_INGESTIONS`] ingestions
@@ -49,6 +59,37 @@ pub fn extraction_job_id(actor_id: &str, session_id: &str) -> String {
     ::aws_smithy_types::base64::encode(format!("{session_id}:{actor_id}"))
 }
 
+/// The most extraction-job records one memory container keeps.
+///
+/// A record is keyed by the `jobId` of one (actor, session) pair, and a container holds at
+/// most [`super::MAX_ACTORS_PER_MEMORY`] times [`super::MAX_SESSIONS_PER_ACTOR`] of those,
+/// so this ceiling is that product: a caller looping on starts rewrites the record of a
+/// session it already started rather than appending one. Should a container ever pass it
+/// (a session evicted after its job was started), the least recently started record gives
+/// way, which only makes that session's messages eligible again.
+pub const MAX_STARTED_EXTRACTION_JOBS_PER_MEMORY: usize =
+    super::MAX_ACTORS_PER_MEMORY * super::MAX_SESSIONS_PER_ACTOR;
+
+/// One extraction job a `StartMemoryExtractionJob` picked the messages of up.
+///
+/// The record is the WATERMARK of that pick-up rather than a result: it says which of the
+/// session's records the attempt covered, so the messages stored after it are the ones the
+/// next unit of work is composed of.
+#[derive(Debug, Clone)]
+pub struct StartedExtractionJob {
+    /// The job's `jobId`, as [`extraction_job_id`] spells it: the id the start was asked
+    /// for and the id it answers with.
+    pub job_id: String,
+    pub actor_id: String,
+    pub session_id: String,
+    /// The highest accepted sequence this attempt picked up — every message of the
+    /// session the container had accepted by then.
+    pub extracted_through_seq: u64,
+    /// The sequence the start itself was handed: the order the container started its
+    /// jobs in, and the eviction order of this record.
+    pub seq: u64,
+}
+
 /// One unit of long-term extraction work a memory container holds: the messages of one
 /// session that no extraction has processed, with the identity a listing reports them
 /// under.
@@ -64,6 +105,9 @@ pub struct ExtractionJobUnit {
     /// container accepted this unit of work, which is the order a listing reports units
     /// in.
     pub accepted_seq: u64,
+    /// The sequence of the LATEST record the unit's messages come from: the watermark a
+    /// start of this unit records ([`StartedExtractionJob::extracted_through_seq`]).
+    pub latest_seq: u64,
 }
 
 impl ExtractionJobUnit {
@@ -148,9 +192,10 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// A session composes one unit, from the messages of the events extraction reads
     /// ([`super::StoredEvent::read_by_extraction`]) and of the content ingested into it,
     /// ordered by the write that stored each one; a session whose records compose no
-    /// message at all is no unit of work and is left out. The order of the units is the
-    /// one the container accepted them in, with the `jobId` breaking a tie, so the pages
-    /// of one listing cannot disagree about where a unit sits.
+    /// message at all is no unit of work and is left out, and so are the records an
+    /// earlier start already picked up ([`StartedExtractionJob`]). The order of the units
+    /// is the one the container accepted them in, with the `jobId` breaking a tie, so the
+    /// pages of one listing cannot disagree about where a unit sits.
     ///
     /// A container this plane has nothing stored for holds no unit — which is not a
     /// statement about whether the CONTAINER exists, resolved by
@@ -163,6 +208,13 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
         let mut units: Vec<ExtractionJobUnit> = Vec::new();
         for (actor_id, actor) in &memory.actors {
             for (session_id, session) in &actor.sessions {
+                let job_id = extraction_job_id(actor_id, session_id);
+                // What an earlier start of this unit already picked up: only the records
+                // the container accepted after it are still work.
+                let extracted_through = memory
+                    .extractions
+                    .get(&job_id)
+                    .map_or(0, |started| started.extracted_through_seq);
                 // The records of this session that carry messages for extraction, in the
                 // order the container accepted them: the engine-wide sequence totally
                 // orders the two kinds of write against each other.
@@ -177,14 +229,15 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
                             .iter()
                             .map(|ingested| (ingested.seq, ingested.extraction_messages())),
                     )
-                    .filter(|(_, messages)| !messages.is_empty())
+                    .filter(|(seq, messages)| *seq > extracted_through && !messages.is_empty())
                     .collect();
                 accepted.sort_by_key(|(seq, _)| *seq);
                 let Some(accepted_seq) = accepted.first().map(|(seq, _)| *seq) else {
                     continue;
                 };
+                let latest_seq = accepted.last().map_or(accepted_seq, |(seq, _)| *seq);
                 units.push(ExtractionJobUnit {
-                    job_id: extraction_job_id(actor_id, session_id),
+                    job_id,
                     actor_id: actor_id.clone(),
                     session_id: session_id.clone(),
                     messages: accepted
@@ -192,6 +245,7 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
                         .flat_map(|(_, messages)| messages)
                         .collect(),
                     accepted_seq,
+                    latest_seq,
                 });
             }
         }
@@ -201,5 +255,73 @@ impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
                 .then_with(|| left.job_id.cmp(&right.job_id))
         });
         units
+    }
+
+    /// The unit of extraction work the memory container `memory_id` names holds under
+    /// `job_id`, or `None` when it holds no such unit.
+    #[must_use]
+    pub fn extraction_job_unit(&self, memory_id: &str, job_id: &str) -> Option<ExtractionJobUnit> {
+        self.extraction_job_units(memory_id)
+            .into_iter()
+            .find(|unit| unit.job_id == job_id)
+    }
+
+    /// The extraction job `job_id` a start of this container already picked the messages
+    /// of up, or `None` when no start did.
+    #[must_use]
+    pub fn started_extraction_job(
+        &self,
+        memory_id: &str,
+        job_id: &str,
+    ) -> Option<&StartedExtractionJob> {
+        self.memories
+            .get(&normalize_memory_id(memory_id))?
+            .extractions
+            .get(job_id)
+    }
+
+    /// Pick up the messages the extraction job `job_id` left unprocessed, recording the
+    /// watermark of what this attempt covered.
+    ///
+    /// `None` when the container holds no unit of work under that id — the caller has
+    /// already resolved the CONTAINER itself ([`super::memory_item_container_resolved`]), so
+    /// this answers only about the job. A job that WAS started and has nothing new to
+    /// pick up is answered with the record the earlier start wrote, which is what makes
+    /// repeating the one `@idempotent` request safe: starting it again neither mints a
+    /// second job nor refuses the id the first start was given.
+    pub fn start_extraction_job(
+        &mut self,
+        memory_id: &str,
+        job_id: &str,
+    ) -> Option<StartedExtractionJob> {
+        let Some(unit) = self.extraction_job_unit(memory_id, job_id) else {
+            return self.started_extraction_job(memory_id, job_id).cloned();
+        };
+        // The unit was just resolved out of this container's own records, so the container
+        // is held. The sequence is taken only once that is established, so a lookup that
+        // somehow missed cannot consume one without writing anything.
+        if !self.memories.contains_key(&normalize_memory_id(memory_id)) {
+            return None;
+        }
+        let seq = self.next_seq();
+        let memory = self.memories.get_mut(&normalize_memory_id(memory_id))?;
+        let started = StartedExtractionJob {
+            job_id: unit.job_id.clone(),
+            actor_id: unit.actor_id,
+            session_id: unit.session_id,
+            extracted_through_seq: unit.latest_seq,
+            seq,
+        };
+        memory.last_seq = memory.last_seq.max(seq);
+        memory.extractions.insert(unit.job_id, started.clone());
+        while memory.extractions.len() > MAX_STARTED_EXTRACTION_JOBS_PER_MEMORY {
+            let Some(oldest) =
+                super::least_recently_written(&memory.extractions, |started| started.seq)
+            else {
+                break;
+            };
+            memory.extractions.remove(&oldest);
+        }
+        Some(started)
     }
 }

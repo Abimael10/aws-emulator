@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for `ListMemoryExtractionJobs`, the listing of the long-term memory
-//! extraction jobs a memory container holds.
+//! End-to-end tests for `ListMemoryExtractionJobs` and `StartMemoryExtractionJob`, the
+//! listing of the long-term memory extraction jobs a memory container holds and the start
+//! that picks one of them up.
 //!
 //! The rule under test: one job per SESSION of one actor, composed of the messages that
 //! session's records carry for long-term extraction — the conversational turns of its
@@ -13,7 +14,12 @@
 //! is bounded by `maxResults` with a `nextToken` resuming after it, and the listing
 //! reports nothing about an extraction attempt (no `status`, no `failureReason`).
 //!
-//! A listing addressing a container the account does not hold is refused at that CONTAINER
+//! A start picks the messages of the job it names up and answers with that `jobId`, so the
+//! job stops being eligible until the container accepts a further message into its session
+//! — which then composes that session's next unit of work. An id naming no job of the
+//! container it addresses is refused.
+//!
+//! A call addressing a container the account does not hold is refused at that CONTAINER
 //! level, worded the way the surfaces that address a container's stored memory ITEMS word
 //! an absent container — after the memory-item store, with no part of the request in the
 //! sentence — which is not how the same container's EVENTS word that same level.
@@ -126,6 +132,20 @@ async fn ingest_data(router: &MultiServiceRouter, memory: &str, body: Value) -> 
         router,
         "POST",
         &format!("/memories/{}/ingest", label(memory)),
+        Some(body),
+    )
+    .await
+}
+
+async fn start_extraction_job(
+    router: &MultiServiceRouter,
+    memory: &str,
+    body: Value,
+) -> (u16, Value) {
+    send(
+        router,
+        "POST",
+        &format!("/memories/{}/extractionJobs/start", label(memory)),
         Some(body),
     )
     .await
@@ -1073,5 +1093,430 @@ async fn job_ids_are_stable_for_a_session() {
         after[0].messages.last(),
         Some(&message(&added, 0)),
         "case grown: the last message must be the new event's only turn, got {after:?}"
+    );
+}
+
+/// A second container the CONTROL plane created, so a job id is checked against the
+/// container the request addresses rather than against this emulator as a whole.
+const OTHER_MEMORY: &str = "other-memory-0123456789";
+
+/// `StartMemoryExtractionJob`'s body: the job to start, and the `@idempotencyToken` when
+/// the case supplies one.
+fn start_body(job_id: &str, client_token: Option<&str>) -> Value {
+    let mut body = json!({"extractionJob": {"jobId": job_id}});
+    if let Some(token) = client_token {
+        body["clientToken"] = json!(token);
+    }
+    body
+}
+
+/// The job the container `memory` reports for `session`, or `None` when it reports none.
+async fn job_for(router: &MultiServiceRouter, memory: &str, session: &str) -> Option<Job> {
+    let (status, answer) = list_extraction_jobs(router, memory, json!({})).await;
+    assert_eq!(
+        status, 200,
+        "listing before a start must answer 200, got {status} {answer}"
+    );
+    jobs_of(&answer)
+        .into_iter()
+        .find(|job| job.session_id == session)
+}
+
+/// Submit conversational turns into one session and assert the container accepted them.
+async fn ingest_turns(
+    router: &MultiServiceRouter,
+    actor: &str,
+    session: &str,
+    turns: Vec<Value>,
+    stamp: i64,
+) {
+    let (status, answer) = ingest_data(
+        router,
+        MEMORY,
+        json!({
+            "actorId": actor,
+            "sessionId": session,
+            "contentTimestamp": stamp,
+            "source": {"inline": {"payload": turns}},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "ingesting into {session:?} must answer 202, got {status} {answer}"
+    );
+}
+
+/// Starting a job picks up the messages of ITS session and nothing else: the answer names
+/// the job the request asked to start, that session stops being eligible, and every other
+/// session's unit of work is reported unchanged — over a table of sessions whose record
+/// count, record kind and message count differ along what the rule generalises over.
+#[tokio::test]
+async fn starting_a_job_picks_up_only_its_own_sessions_messages() {
+    let router = emulator();
+
+    // (case, actor, session) — built below in acceptance order.
+    event_id(
+        &router,
+        "actor-a",
+        "session-one-event",
+        vec![conversational("USER", "hello")],
+        None,
+    )
+    .await;
+    event_id(
+        &router,
+        "actor-a",
+        "session-two-events",
+        vec![conversational("USER", "first")],
+        None,
+    )
+    .await;
+    event_id(
+        &router,
+        "actor-a",
+        "session-two-events",
+        vec![
+            conversational("ASSISTANT", "second"),
+            conversational("USER", "third"),
+        ],
+        None,
+    )
+    .await;
+    ingest_turns(
+        &router,
+        "actor-b",
+        "session-ingested",
+        vec![
+            conversational("USER", "ingested one"),
+            conversational("ASSISTANT", "ingested two"),
+        ],
+        1_762_000_000,
+    )
+    .await;
+    event_id(
+        &router,
+        "actor-b",
+        "session-event-and-ingest",
+        vec![conversational("USER", "from the event")],
+        None,
+    )
+    .await;
+    ingest_turns(
+        &router,
+        "actor-b",
+        "session-event-and-ingest",
+        vec![conversational("ASSISTANT", "from the ingest")],
+        1_762_000_001,
+    )
+    .await;
+
+    // (case, session, how many messages the job must carry)
+    let cases = [
+        ("one event, one turn", "session-one-event", 1),
+        ("two events, three turns", "session-two-events", 3),
+        ("ingested content only", "session-ingested", 2),
+        ("an event and an ingestion", "session-event-and-ingest", 2),
+    ];
+
+    let (_, before) = list_extraction_jobs(&router, MEMORY, json!({})).await;
+    let mut pending: Vec<Job> = jobs_of(&before);
+    assert_eq!(
+        pending.len(),
+        cases.len(),
+        "case setup: every session must compose one unit of work, got {pending:?}"
+    );
+
+    for (case, session, messages) in cases {
+        let job = job_for(&router, MEMORY, session)
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: expected {session:?} to compose a job"));
+        assert_eq!(
+            job.messages.len(),
+            messages,
+            "case {case:?}: expected {messages} messages before the start, got {job:?}"
+        );
+
+        let (status, answer) =
+            start_extraction_job(&router, MEMORY, start_body(&job.job_id, None)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: starting the job must answer 200, got {status} {answer}"
+        );
+        assert_eq!(
+            text(&answer, "jobId"),
+            job.job_id,
+            "case {case:?}: the answer must name the job the request started, got {answer}"
+        );
+
+        // The started session is no longer eligible; every other unit of work is reported
+        // exactly as it was.
+        pending.retain(|held| held.session_id != session);
+        let (status, after) = list_extraction_jobs(&router, MEMORY, json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: listing after the start must answer 200, got {status} {after}"
+        );
+        assert_eq!(
+            jobs_of(&after),
+            pending,
+            "case {case:?}: only {session:?} must stop being eligible, got {after}"
+        );
+    }
+
+    let (status, drained) = list_extraction_jobs(&router, MEMORY, json!({})).await;
+    assert_eq!(
+        (status, jobs_of(&drained).len()),
+        (200, 0),
+        "case all started: a container whose every unit was picked up holds no job, got \
+         {drained}"
+    );
+}
+
+/// A message the container accepts after a start is work the start did not cover, so it
+/// composes the session's next unit under the SAME job id — whichever way the container
+/// accepted it, and however many times the session is started again.
+#[tokio::test]
+async fn messages_accepted_after_a_start_compose_the_next_unit() {
+    let router = emulator();
+
+    // (case, session, how the further messages arrive, how many they are)
+    enum Arrival {
+        Event,
+        Ingestion,
+    }
+    let cases = [
+        ("a further event", "session-then-event", Arrival::Event, 2),
+        (
+            "further ingested content",
+            "session-then-ingest",
+            Arrival::Ingestion,
+            1,
+        ),
+    ];
+
+    for (case, session, arrival, further) in cases {
+        event_id(
+            &router,
+            "actor-resume",
+            session,
+            vec![
+                conversational("USER", "first"),
+                conversational("ASSISTANT", "second"),
+            ],
+            None,
+        )
+        .await;
+        let first = job_for(&router, MEMORY, session)
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: expected {session:?} to compose a job"));
+        assert_eq!(
+            first.messages.len(),
+            2,
+            "case {case:?}: the session's two turns must compose the first unit, got {first:?}"
+        );
+
+        let (status, answer) =
+            start_extraction_job(&router, MEMORY, start_body(&first.job_id, None)).await;
+        assert_eq!(
+            (status, text(&answer, "jobId")),
+            (200, first.job_id.clone()),
+            "case {case:?}: the first start must answer with its own job, got {status} {answer}"
+        );
+        assert!(
+            job_for(&router, MEMORY, session).await.is_none(),
+            "case {case:?}: the started session must stop being eligible"
+        );
+
+        let turns: Vec<Value> = (0..further)
+            .map(|index| conversational("USER", &format!("later {index}")))
+            .collect();
+        match arrival {
+            Arrival::Event => {
+                event_id(&router, "actor-resume", session, turns, None).await;
+            }
+            Arrival::Ingestion => {
+                ingest_turns(&router, "actor-resume", session, turns, 1_762_000_010).await;
+            }
+        }
+
+        let next = job_for(&router, MEMORY, session).await.unwrap_or_else(|| {
+            panic!("case {case:?}: messages left unprocessed must compose the next unit")
+        });
+        assert_eq!(
+            next.job_id, first.job_id,
+            "case {case:?}: the next unit of a session keeps its job id, got {next:?} after \
+             {first:?}"
+        );
+        assert_eq!(
+            next.messages.len(),
+            further,
+            "case {case:?}: only the {further} message(s) accepted after the start are work, \
+             got {next:?}"
+        );
+        assert!(
+            next.messages
+                .iter()
+                .all(|one| !first.messages.contains(one)),
+            "case {case:?}: no message the first start picked up may be reported again, got \
+             {next:?} after {first:?}"
+        );
+
+        let (status, answer) =
+            start_extraction_job(&router, MEMORY, start_body(&next.job_id, None)).await;
+        assert_eq!(
+            (status, text(&answer, "jobId")),
+            (200, next.job_id.clone()),
+            "case {case:?}: the second start must answer with the same job, got {status} \
+             {answer}"
+        );
+        assert!(
+            job_for(&router, MEMORY, session).await.is_none(),
+            "case {case:?}: the second start must leave nothing eligible"
+        );
+    }
+}
+
+/// `StartMemoryExtractionJob` is `@idempotent`: repeating the start of one job answers
+/// with that job rather than refusing it or picking anything up twice, whatever the
+/// request carries as its `@idempotencyToken`.
+#[tokio::test]
+async fn repeating_a_start_answers_with_the_same_job() {
+    let router = emulator();
+    event_id(
+        &router,
+        "actor-repeat",
+        "session-repeat",
+        vec![conversational("USER", "hello")],
+        None,
+    )
+    .await;
+    let job = job_for(&router, MEMORY, "session-repeat")
+        .await
+        .expect("the session composes a job");
+
+    // (case, the clientToken the repeat carries)
+    for (case, token) in [
+        ("first start, no token", None),
+        ("repeat with a token", Some("token-one")),
+        ("repeat with that same token", Some("token-one")),
+        ("repeat with a fresh token", Some("token-two")),
+        ("repeat with no token", None),
+    ] {
+        let (status, answer) =
+            start_extraction_job(&router, MEMORY, start_body(&job.job_id, token)).await;
+        assert_eq!(
+            (status, text(&answer, "jobId")),
+            (200, job.job_id.clone()),
+            "case {case:?}: expected 200 and the job the request named, got {status} {answer}"
+        );
+        let (_, listed) = list_extraction_jobs(&router, MEMORY, json!({})).await;
+        assert_eq!(
+            jobs_of(&listed).len(),
+            0,
+            "case {case:?}: a started job stays picked up, got {listed}"
+        );
+    }
+}
+
+/// A `jobId` that names no job of the container the request addresses is refused with the
+/// resource it addressed, and so is a container that was never created.
+#[tokio::test]
+async fn an_unstartable_job_is_refused() {
+    let (engine, router) = emulator_with_engine();
+    // The second container, created through the same shared inventory the CONTROL plane
+    // writes, so a job of one container can be addressed in another that really exists.
+    create_memory(&engine, OTHER_MEMORY);
+    event_id(
+        &router,
+        "actor-refused",
+        "session-refused",
+        vec![conversational("USER", "hello")],
+        None,
+    )
+    .await;
+    let held = job_for(&router, MEMORY, "session-refused")
+        .await
+        .expect("the session composes a job");
+
+    // A job id is opaque to a caller, so the cases span the forms one can be spelled in:
+    // empty, a value of no such form, an id of the form the listing issues for a session
+    // this container does not hold, and a held id with a character changed.
+    let cases = [
+        ("empty", String::new()),
+        ("not an id this listing issues", "not-a-job".to_string()),
+        (
+            "an id naming a session the container does not hold",
+            "c2Vzc2lvbi1hYnNlbnQ6YWN0b3ItYWJzZW50".to_string(),
+        ),
+        ("a held id with one character more", format!("{}x", held.job_id)),
+    ];
+    for (case, job_id) in cases {
+        let (status, answer) =
+            start_extraction_job(&router, MEMORY, start_body(&job_id, None)).await;
+        assert_eq!(
+            (status, error_code(&answer)),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: a job the container does not hold must be refused, got {status} \
+             {answer}"
+        );
+        assert_eq!(
+            text(&answer, "message"),
+            format!("Extraction job not found: {job_id}"),
+            "case {case:?}: the refusal must name the job the request addressed, got {answer}"
+        );
+    }
+
+    // The id IS startable in the container that holds it, and in either spelling of that
+    // container's `memoryId` — but it addresses no job of another container.
+    let (status, answer) =
+        start_extraction_job(&router, OTHER_MEMORY, start_body(&held.job_id, None)).await;
+    assert_eq!(
+        (status, error_code(&answer)),
+        (404, "ResourceNotFoundException"),
+        "case other container: a job of one container must not be startable in another, got \
+         {status} {answer}"
+    );
+
+    // A container the account does not hold is refused at the CONTAINER level, worded the
+    // way every surface on a container's stored memory items words that level — in either
+    // spelling of the absent id.
+    for (case, memory) in [
+        ("absent container", ABSENT_MEMORY),
+        ("absent container by arn", ABSENT_MEMORY_ARN),
+    ] {
+        let (status, answer) =
+            start_extraction_job(&router, memory, start_body(&held.job_id, None)).await;
+        assert_eq!(
+            (status, error_code(&answer)),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: a container that was never created must be refused, got {status} \
+             {answer}"
+        );
+        let reported = text(&answer, "message");
+        assert_eq!(
+            reported, CONTAINER_NOT_FOUND_MESSAGE,
+            "case {case:?}: expected message {CONTAINER_NOT_FOUND_MESSAGE:?}, got {reported:?}"
+        );
+        // The sentence has no variable part, so nothing the request spelled is in it.
+        for named in spelled_values(memory, &start_body(&held.job_id, None)) {
+            assert!(
+                !reported.contains(&named),
+                "case {case:?}: the message must not name {named:?}, got {reported:?}"
+            );
+        }
+    }
+
+    let (status, answer) =
+        start_extraction_job(&router, MEMORY_ARN, start_body(&held.job_id, None)).await;
+    assert_eq!(
+        (status, text(&answer, "jobId")),
+        (200, held.job_id.clone()),
+        "case arn spelling: the ARN spelling must start the job of the same container, got \
+         {status} {answer}"
+    );
+    assert!(
+        job_for(&router, MEMORY, "session-refused").await.is_none(),
+        "case arn spelling: the start must have picked the session's messages up"
     );
 }
