@@ -24,7 +24,9 @@ use tracing::{Event, Metadata, Subscriber};
 
 // The wire harness, the JSON walker and the refusal assertion are this test target's
 // shared ones — this suite adds only the security-configuration request shapes.
-use super::job_flow_lifecycle::{assert_refused, at, epoch_secs, Emr, REQUEST_TARGET};
+use super::job_flow_lifecycle::{
+    assert_refused, at, epoch_secs, served_epoch_secs, Emr, REQUEST_TARGET,
+};
 
 /// `CreateSecurityConfiguration$Name` targets `XmlString`, whose documented length
 /// bound is `len 0..10280`
@@ -332,7 +334,7 @@ async fn created_security_configurations_are_read_back_verbatim() {
     let emr = SecurityConfigurations::new();
     for case in &cases {
         let case_label = format!("{} ({} bytes of name)", case.label, case.name.len());
-        let before = epoch_secs(SystemTime::now());
+        let before = served_epoch_secs(SystemTime::now());
         let created = emr.create_ok(&case.name, &case.document).await;
         let after = epoch_secs(SystemTime::now()) + 1.0;
 
@@ -1146,7 +1148,7 @@ async fn creation_instants_are_current_and_reads_leave_them_alone() {
 
     for index in 0..3 {
         let name = format!("stamped-{index}");
-        let before = epoch_secs(SystemTime::now());
+        let before = served_epoch_secs(SystemTime::now());
         let created = emr.create_ok(&name, "{}").await;
         let after = epoch_secs(SystemTime::now()) + 1.0;
         let created_at = creation_secs(&name, &created);

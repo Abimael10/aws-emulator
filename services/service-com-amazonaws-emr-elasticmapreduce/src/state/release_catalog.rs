@@ -619,20 +619,125 @@ pub fn release_application_version(release_label: &str, name: &str) -> Option<&'
 }
 
 /// The Amazon Linux 2 releases offered for an Amazon EMR release built on it (Amazon
-/// EMR 5.30.0 through 6.x), oldest first. `OSRelease$Label` documents the format: "as
-/// shown in Amazon Linux 2 Release Notes. For example, 2.0.20220218.1." — the first
-/// entry here is the release that doc names, and the others are later Amazon Linux 2
-/// release-note labels.
+/// EMR 5.30.0 through 6.x), NEWEST FIRST.
 ///
-/// This is a SNAPSHOT of a catalog Amazon Linux keeps publishing to, so what the list
-/// pins is the rule — the releases of the generation the Amazon EMR release is built on,
-/// in a stable order, each in the documented dotted form — and not a count.
-pub(super) const AMAZON_LINUX_2_OS_RELEASES: &[&str] =
-    &["2.0.20220218.1", "2.0.20230808.0", "2.0.20231116.0"];
+/// CATALOG DATA, from the Amazon Linux 2 release notes, whose release labels
+/// `OSRelease$Label` documents the form of: "as shown in Amazon Linux 2 Release Notes. For
+/// example, 2.0.20220218.1." — the last entry here is the release that doc names, and the
+/// ones above it are the later Amazon Linux 2 release-note labels, each in that dotted form.
+///
+/// Amazon Linux keeps publishing to this catalog, so what the list pins is the rule — EVERY
+/// release of the generation the Amazon EMR release is built on, newest first, which is the
+/// order `DescribeReleaseLabel` serves them in and the order a client reads the current
+/// release off the top of — and not a count. The newest is also the release a cluster of that
+/// generation runs when its launch names none ([`effective_os_release_label`]).
+pub(super) const AMAZON_LINUX_2_OS_RELEASES: &[&str] = &[
+    "2.0.20241217.0",
+    "2.0.20241113.0",
+    "2.0.20241031.0",
+    "2.0.20241011.0",
+    "2.0.20240910.0",
+    "2.0.20240816.0",
+    "2.0.20240730.0",
+    "2.0.20240709.0",
+    "2.0.20240620.0",
+    "2.0.20240529.0",
+    "2.0.20240503.0",
+    "2.0.20240412.0",
+    "2.0.20240329.0",
+    "2.0.20240306.2",
+    "2.0.20240223.0",
+    "2.0.20240206.1",
+    "2.0.20240131.0",
+    "2.0.20240109.0",
+    "2.0.20231218.0",
+    "2.0.20231206.0",
+    "2.0.20231116.0",
+    "2.0.20231101.0",
+    "2.0.20231020.1",
+    "2.0.20231002.0",
+    "2.0.20230920.1",
+    "2.0.20230906.0",
+    "2.0.20230822.0",
+    "2.0.20230808.0",
+    "2.0.20230727.0",
+    "2.0.20230719.0",
+    "2.0.20230628.0",
+    "2.0.20230612.0",
+    "2.0.20230530.0",
+    "2.0.20230515.0",
+    "2.0.20230504.1",
+    "2.0.20230418.0",
+    "2.0.20230404.1",
+    "2.0.20230320.0",
+    "2.0.20230307.0",
+    "2.0.20230221.0",
+    "2.0.20230207.0",
+    "2.0.20230119.1",
+    "2.0.20221210.0",
+    "2.0.20221103.3",
+    "2.0.20221004.0",
+    "2.0.20220912.1",
+    "2.0.20220805.0",
+    "2.0.20220719.0",
+    "2.0.20220606.1",
+    "2.0.20220426.0",
+    "2.0.20220419.0",
+    "2.0.20220406.1",
+    "2.0.20220316.0",
+    "2.0.20220218.1",
+];
 
 /// The Amazon Linux 2023 releases offered for an Amazon EMR release built on it (Amazon
-/// EMR 7.x), in the same dotted release-note form.
-pub(super) const AMAZON_LINUX_2023_OS_RELEASES: &[&str] = &["2023.4.20240429.0", "2023.6.20241010.0"];
+/// EMR 7.x), newest first and in the same dotted release-note form.
+///
+/// CATALOG DATA, from the Amazon Linux 2023 release notes, read the same way as the
+/// generation above.
+pub(super) const AMAZON_LINUX_2023_OS_RELEASES: &[&str] = &[
+    "2023.6.20241121.0",
+    "2023.6.20241010.0",
+    "2023.5.20240916.0",
+    "2023.5.20240903.0",
+    "2023.5.20240819.0",
+    "2023.5.20240805.0",
+    "2023.5.20240722.0",
+    "2023.5.20240708.0",
+    "2023.4.20240611.0",
+    "2023.4.20240528.0",
+    "2023.4.20240513.0",
+    "2023.4.20240429.0",
+    "2023.4.20240416.0",
+    "2023.4.20240401.1",
+    "2023.4.20240319.1",
+    "2023.3.20240304.0",
+    "2023.3.20240219.0",
+    "2023.3.20240205.1",
+    "2023.3.20240122.0",
+    "2023.3.20240108.0",
+    "2023.2.20231230.1",
+    "2023.2.20231213.0",
+    "2023.2.20231204.0",
+    "2023.2.20231113.0",
+    "2023.2.20231030.1",
+    "2023.2.20231016.0",
+    "2023.2.20231002.0",
+    "2023.2.20230920.1",
+    "2023.1.20230912.0",
+    "2023.1.20230825.0",
+    "2023.1.20230809.1",
+    "2023.1.20230727.0",
+    "2023.1.20230719.0",
+    "2023.1.20230705.0",
+    "2023.1.20230629.0",
+    "2023.0.20230614.0",
+    "2023.0.20230607.0",
+    "2023.0.20230517.1",
+    "2023.0.20230503.0",
+    "2023.0.20230419.0",
+    "2023.0.20230404.1",
+    "2023.0.20230322.0",
+    "2023.0.20230315.0",
+];
 
 /// The first Amazon EMR major release built on Amazon Linux 2023 rather than Amazon
 /// Linux 2.
@@ -644,9 +749,9 @@ pub(super) const FIRST_AMAZON_LINUX_2023_EMR_MAJOR: u32 = 7;
 /// documented form does not name.
 pub const FIRST_AMAZON_LINUX_2_RELEASE: (u32, u32, u32) = (5, 30, 0);
 
-/// The Amazon Linux releases available for an Amazon EMR release, by the generation it is
-/// built on — and NONE for a release published before the Amazon Linux 2 generation, which
-/// offers no Amazon Linux release to choose between.
+/// The Amazon Linux releases available for an Amazon EMR release, NEWEST FIRST — by the
+/// generation it is built on, and NONE for a release published before the Amazon Linux 2
+/// generation, which offers no Amazon Linux release to choose between.
 pub(super) fn os_releases_for(release: (u32, u32, u32)) -> &'static [&'static str] {
     if release < FIRST_AMAZON_LINUX_2_RELEASE {
         &[]

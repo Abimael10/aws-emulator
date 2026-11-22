@@ -15,8 +15,10 @@
 //! `Placement.AvailabilityZones`) that Amazon EMR evaluates and then launches every
 //! instance within ONE of, so the singular member (`Ec2SubnetId`,
 //! `Ec2AvailabilityZone`) reports the entry the cluster is running in while the plural
-//! member (`RequestedEc2SubnetIds`, `RequestedEc2AvailabilityZones`) echoes the
-//! candidates the caller named. A cluster that named neither form reports no placement.
+//! member (`RequestedEc2SubnetIds`, `RequestedEc2AvailabilityZones`) reports what the
+//! launch REQUESTED — the candidates the caller named, and otherwise the one placement it
+//! named outright, which is the single candidate it asked to be launched into. A cluster
+//! that named neither form reports no placement and requested none.
 
 use serde_json::{json, Value};
 
@@ -29,11 +31,11 @@ struct Case {
     instances: Value,
     /// The subnet the cluster must report as the one it is running in.
     subnet: Option<&'static str>,
-    /// The subnet candidates it must echo back.
+    /// The subnets it must report as the ones the launch requested.
     requested_subnets: &'static [&'static str],
     /// The Availability Zone the cluster must report as the one it is running in.
     zone: Option<&'static str>,
-    /// The zone candidates it must echo back.
+    /// The zones it must report as the ones the launch requested.
     requested_zones: &'static [&'static str],
 }
 
@@ -71,7 +73,7 @@ async fn a_cluster_reports_the_one_subnet_and_zone_its_instances_were_launched_i
                 "Ec2SubnetId": "subnet-0aaa1111bbbb2222c",
             }),
             subnet: Some("subnet-0aaa1111bbbb2222c"),
-            requested_subnets: &[],
+            requested_subnets: &["subnet-0aaa1111bbbb2222c"],
             zone: None,
             requested_zones: &[],
         },
@@ -130,7 +132,7 @@ async fn a_cluster_reports_the_one_subnet_and_zone_its_instances_were_launched_i
             subnet: None,
             requested_subnets: &[],
             zone: Some("us-east-1c"),
-            requested_zones: &[],
+            requested_zones: &["us-east-1c"],
         },
         Case {
             label: "fleets, two zone candidates",
@@ -201,7 +203,7 @@ async fn a_cluster_reports_the_one_subnet_and_zone_its_instances_were_launched_i
         assert_eq!(
             list_at(&cluster, &["Ec2InstanceAttributes", "RequestedEc2SubnetIds"]),
             case.requested_subnets,
-            "case {label:?}: the subnet candidates must be echoed back, got {cluster}"
+            "case {label:?}: the requested subnets must be reported back, got {cluster}"
         );
         let zone = at(&cluster, &["Ec2InstanceAttributes", "Ec2AvailabilityZone"]);
         assert_eq!(
@@ -215,7 +217,7 @@ async fn a_cluster_reports_the_one_subnet_and_zone_its_instances_were_launched_i
                 &["Ec2InstanceAttributes", "RequestedEc2AvailabilityZones"],
             ),
             case.requested_zones,
-            "case {label:?}: the zone candidates must be echoed back, got {cluster}"
+            "case {label:?}: the requested zones must be reported back, got {cluster}"
         );
 
         // The placement a cluster launched in never moves: it was decided once, when the

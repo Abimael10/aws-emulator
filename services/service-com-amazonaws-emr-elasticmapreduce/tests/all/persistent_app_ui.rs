@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_emr_elasticmapreduce::state::MAX_PERSISTENT_APP_UIS;
 
 use super::job_flow_lifecycle::{
-    assert_minted_id, assert_refused, at, epoch_secs, kept_alive_request, Emr, REQUEST_TARGET,
+    assert_minted_id, assert_refused, at, epoch_secs, kept_alive_request, served_epoch_secs, Emr,
+    REQUEST_TARGET,
 };
 use super::security_configurations::audit_capture;
 
@@ -218,7 +219,7 @@ async fn create_persistent_app_ui_persists_each_ui_and_describe_reads_it_back() 
     }
 
     for case in &cases {
-        let before = epoch_secs(SystemTime::now());
+        let before = served_epoch_secs(SystemTime::now());
         let id = uis.create_ok(case.label, case.request.clone()).await;
         assert_minted_id(case.label, "p-", &id);
 

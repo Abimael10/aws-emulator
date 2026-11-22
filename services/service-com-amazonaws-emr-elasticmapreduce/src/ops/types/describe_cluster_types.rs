@@ -23,7 +23,14 @@ pub struct DescribeClusterOutput {
     pub cluster: Option<Cluster>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.emr#Cluster")]
+/// The detailed view of one cluster a read reports: the members `Cluster` declares, in the
+/// model's own member order, and `StepExecutionMode` and `SystemLogUploadDisabled` appended
+/// last.
+///
+/// Member set and order from `smithy_query(query="shape", shape="Cluster")`, plus those two —
+/// members the real service reports on every cluster read and the on-disk model omits, which is
+/// why the schema and the codec come from `types/recorded_member_wire.rs` rather than from the
+/// derive (see that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct Cluster {
     pub id: Option<String>,
@@ -52,7 +59,7 @@ pub struct Cluster {
     pub custom_ami_id: Option<String>,
     pub ebs_root_volume_size: Option<i32>,
     pub repo_upgrade_on_boot: Option<String>,
-    pub kerberos_attributes: Option<KerberosAttributes>,
+    pub kerberos_attributes: Option<ClusterKerberosAttributes>,
     pub cluster_arn: Option<String>,
     pub outpost_arn: Option<String>,
     pub step_concurrency_level: Option<i32>,
@@ -63,7 +70,280 @@ pub struct Cluster {
     pub extended_support: Option<bool>,
     pub monitoring_configuration: Option<MonitoringConfiguration>,
     pub session_enabled: Option<bool>,
+    pub step_execution_mode: Option<String>,
+    pub system_log_upload_disabled: Option<bool>,
 }
+
+emr_schema_and_codec!(
+    Cluster,
+    CLUSTER_SCHEMA,
+    "com.amazonaws.emr#Cluster",
+    "com.amazonaws.emr",
+    "Cluster",
+    (M_ID, id, "Id", 0, opt, string),
+    (M_NAME, name, "Name", 1, opt, string),
+    (M_STATUS, status, "Status", 2, opt, struct_of(ClusterStatus)),
+    (
+        M_EC2_INSTANCE_ATTRIBUTES,
+        ec2_instance_attributes,
+        "Ec2InstanceAttributes",
+        3,
+        opt,
+        struct_of(Ec2InstanceAttributes)
+    ),
+    (
+        M_INSTANCE_COLLECTION_TYPE,
+        instance_collection_type,
+        "InstanceCollectionType",
+        4,
+        opt,
+        string
+    ),
+    (M_LOG_URI, log_uri, "LogUri", 5, opt, string),
+    (
+        M_LOG_ENCRYPTION_KMS_KEY_ID,
+        log_encryption_kms_key_id,
+        "LogEncryptionKmsKeyId",
+        6,
+        opt,
+        string
+    ),
+    (
+        M_REQUESTED_AMI_VERSION,
+        requested_ami_version,
+        "RequestedAmiVersion",
+        7,
+        opt,
+        string
+    ),
+    (
+        M_RUNNING_AMI_VERSION,
+        running_ami_version,
+        "RunningAmiVersion",
+        8,
+        opt,
+        string
+    ),
+    (M_RELEASE_LABEL, release_label, "ReleaseLabel", 9, opt, string),
+    (M_AUTO_TERMINATE, auto_terminate, "AutoTerminate", 10, opt, boolean),
+    (
+        M_TERMINATION_PROTECTED,
+        termination_protected,
+        "TerminationProtected",
+        11,
+        opt,
+        boolean
+    ),
+    (
+        M_UNHEALTHY_NODE_REPLACEMENT,
+        unhealthy_node_replacement,
+        "UnhealthyNodeReplacement",
+        12,
+        opt,
+        boolean
+    ),
+    (
+        M_VISIBLE_TO_ALL_USERS,
+        visible_to_all_users,
+        "VisibleToAllUsers",
+        13,
+        opt,
+        boolean
+    ),
+    (
+        M_APPLICATIONS,
+        applications,
+        "Applications",
+        14,
+        opt,
+        list_of_struct(Application)
+    ),
+    (M_TAGS, tags, "Tags", 15, opt, list_of_struct(Tag)),
+    (M_SERVICE_ROLE, service_role, "ServiceRole", 16, opt, string),
+    (
+        M_NORMALIZED_INSTANCE_HOURS,
+        normalized_instance_hours,
+        "NormalizedInstanceHours",
+        17,
+        opt,
+        integer
+    ),
+    (
+        M_MASTER_PUBLIC_DNS_NAME,
+        master_public_dns_name,
+        "MasterPublicDnsName",
+        18,
+        opt,
+        string
+    ),
+    (
+        M_CONFIGURATIONS,
+        configurations,
+        "Configurations",
+        19,
+        opt,
+        list_of_struct(Configuration)
+    ),
+    (
+        M_SECURITY_CONFIGURATION,
+        security_configuration,
+        "SecurityConfiguration",
+        20,
+        opt,
+        string
+    ),
+    (
+        M_AUTO_SCALING_ROLE,
+        auto_scaling_role,
+        "AutoScalingRole",
+        21,
+        opt,
+        string
+    ),
+    (
+        M_SCALE_DOWN_BEHAVIOR,
+        scale_down_behavior,
+        "ScaleDownBehavior",
+        22,
+        opt,
+        string
+    ),
+    (M_CUSTOM_AMI_ID, custom_ami_id, "CustomAmiId", 23, opt, string),
+    (
+        M_EBS_ROOT_VOLUME_SIZE,
+        ebs_root_volume_size,
+        "EbsRootVolumeSize",
+        24,
+        opt,
+        integer
+    ),
+    (
+        M_REPO_UPGRADE_ON_BOOT,
+        repo_upgrade_on_boot,
+        "RepoUpgradeOnBoot",
+        25,
+        opt,
+        string
+    ),
+    (
+        M_KERBEROS_ATTRIBUTES,
+        kerberos_attributes,
+        "KerberosAttributes",
+        26,
+        opt,
+        struct_of(ClusterKerberosAttributes)
+    ),
+    (M_CLUSTER_ARN, cluster_arn, "ClusterArn", 27, opt, string),
+    (M_OUTPOST_ARN, outpost_arn, "OutpostArn", 28, opt, string),
+    (
+        M_STEP_CONCURRENCY_LEVEL,
+        step_concurrency_level,
+        "StepConcurrencyLevel",
+        29,
+        opt,
+        integer
+    ),
+    (
+        M_PLACEMENT_GROUPS,
+        placement_groups,
+        "PlacementGroups",
+        30,
+        opt,
+        list_of_struct(PlacementGroupConfig)
+    ),
+    (
+        M_OS_RELEASE_LABEL,
+        os_release_label,
+        "OSReleaseLabel",
+        31,
+        opt,
+        string
+    ),
+    (
+        M_EBS_ROOT_VOLUME_IOPS,
+        ebs_root_volume_iops,
+        "EbsRootVolumeIops",
+        32,
+        opt,
+        integer
+    ),
+    (
+        M_EBS_ROOT_VOLUME_THROUGHPUT,
+        ebs_root_volume_throughput,
+        "EbsRootVolumeThroughput",
+        33,
+        opt,
+        integer
+    ),
+    (
+        M_EXTENDED_SUPPORT,
+        extended_support,
+        "ExtendedSupport",
+        34,
+        opt,
+        boolean
+    ),
+    (
+        M_MONITORING_CONFIGURATION,
+        monitoring_configuration,
+        "MonitoringConfiguration",
+        35,
+        opt,
+        struct_of(MonitoringConfiguration)
+    ),
+    (M_SESSION_ENABLED, session_enabled, "SessionEnabled", 36, opt, boolean),
+    (
+        M_STEP_EXECUTION_MODE,
+        step_execution_mode,
+        "StepExecutionMode",
+        37,
+        opt,
+        recorded("com.amazonaws.emr.recorded", string)
+    ),
+    (
+        M_SYSTEM_LOG_UPLOAD_DISABLED,
+        system_log_upload_disabled,
+        "SystemLogUploadDisabled",
+        38,
+        opt,
+        recorded("com.amazonaws.emr.recorded", boolean)
+    ),
+);
+
+/// `Cluster$KerberosAttributes` as a READ reports it.
+///
+/// The modelled `KerberosAttributes` is the shape a launch SUPPLIES
+/// (`RunJobFlow$KerberosAttributes`), where `Realm` and `KdcAdminPassword` are `@required`; a
+/// read reports the attributes the cluster RUNS under, which a cluster that configured no
+/// Kerberos authentication has none of — so every member here is optional and such a cluster
+/// reports the member as the empty structure rather than inventing a realm for it. The three
+/// PASSWORD members of the modelled shape are deliberately not among them: a password is
+/// supplied to the launch and never reported back by a read.
+///
+/// Hand-written for that member set rather than derived, for the reason
+/// `types/recorded_member_wire.rs` gives; the member indices and wire names are the model's own.
+#[derive(Debug, Clone, Default)]
+pub struct ClusterKerberosAttributes {
+    pub realm: Option<String>,
+    pub ad_domain_join_user: Option<String>,
+}
+
+emr_schema_and_codec!(
+    ClusterKerberosAttributes,
+    CLUSTER_KERBEROS_ATTRIBUTES_SCHEMA,
+    "com.amazonaws.emr#KerberosAttributes",
+    "com.amazonaws.emr",
+    "KerberosAttributes",
+    (M_REALM, realm, "Realm", 0, opt, string),
+    (
+        M_AD_DOMAIN_JOIN_USER,
+        ad_domain_join_user,
+        "ADDomainJoinUser",
+        3,
+        opt,
+        string
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.emr#Ec2InstanceAttributes")]
 #[derive(Debug, Clone, Default)]

@@ -56,3 +56,22 @@ pub(crate) fn launched_in(single: Option<&str>, candidates: &[String]) -> Option
         .map(str::to_string)
         .or_else(|| candidates.first().cloned())
 }
+
+/// The placements a launch REQUESTED, out of the two forms its `JobFlowInstancesConfig` states
+/// them in — what the plural member of `Ec2InstanceAttributes` reports.
+///
+/// A launch asks for a placement either as a single value or as a list of candidates
+/// ([`launched_in`]), and the plural member reports what it asked for in BOTH forms: the
+/// candidate list where it named one, and otherwise the one placement it named outright, which
+/// is the single candidate it asked to be launched into. So a cluster launched into a subnet
+/// reports that subnet under `RequestedEc2SubnetIds` as well as under `Ec2SubnetId`, and one
+/// launched into a named zone reports it under `RequestedEc2AvailabilityZones` too.
+///
+/// A launch that named NEITHER requested no placement, and the member is the empty collection
+/// rather than one invented for it — as it is for a launch whose candidate list was empty.
+pub(crate) fn requested_placements(single: Option<&str>, candidates: Option<&[String]>) -> Vec<String> {
+    match candidates {
+        Some(candidates) => candidates.to_vec(),
+        None => single.map(str::to_string).into_iter().collect(),
+    }
+}

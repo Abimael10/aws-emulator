@@ -9,6 +9,8 @@
 
 use super::*;
 
+use ::aws_smithy_types::Document;
+
 /// One persisted step, built from a submitted `StepConfig`.
 #[derive(Debug, Clone)]
 pub struct StepRecord {
@@ -72,6 +74,14 @@ pub struct StepRecord {
     /// directory a failed step reports its log file under. `None` while nothing has been
     /// delivered for this step, including for a cluster whose launch named no `LogUri`.
     pub delivered_log_uri: Option<String>,
+    /// The applications the cluster's RESOURCE MANAGER admitted for this step, in the order it
+    /// admitted them ([`record_resource_manager_applications`]).
+    ///
+    /// A step's execution is a submission to the resource manager the cluster runs its
+    /// applications under, so a step whose execution has STARTED has an application there and
+    /// one that never started has none. The ids are recorded once, when the step starts, and
+    /// never re-derived, so every later read reports the same ones.
+    pub resource_manager_application_ids: Vec<String>,
 }
 
 impl StepRecord {
@@ -139,6 +149,7 @@ impl StepRecord {
             published_state: None,
             abandoned_runs: 0,
             delivered_log_uri: None,
+            resource_manager_application_ids: Vec::new(),
         }
     }
 
@@ -409,6 +420,32 @@ impl StepRecord {
         }
     }
 
+    /// The execution metadata a read reports for this step under `AdditionalInfo`: the resource
+    /// manager its execution was submitted to, and the applications that manager admitted for it
+    /// ([`StepRecord::resource_manager_application_ids`]).
+    ///
+    /// A step whose execution has not STARTED has reached no resource manager, so there is
+    /// nothing of one to report and the member stays absent rather than naming a manager the
+    /// step was never submitted to.
+    pub fn to_additional_info(&self) -> Option<Document> {
+        self.start_date_time?;
+        Some(Document::Object(HashMap::from([
+            (
+                RESOURCE_MANAGER_MEMBER.to_string(),
+                Document::String(CLUSTER_RESOURCE_MANAGER.to_string()),
+            ),
+            (
+                RESOURCE_MANAGER_APPLICATION_IDS_MEMBER.to_string(),
+                Document::Array(
+                    self.resource_manager_application_ids
+                        .iter()
+                        .map(|id| Document::String(id.clone()))
+                        .collect(),
+                ),
+            ),
+        ])))
+    }
+
     /// The wire `Step` for this record — what `DescribeStep` answers with.
     pub fn to_step(&self) -> Step {
         Step {
@@ -420,6 +457,7 @@ impl StepRecord {
             execution_role_arn: self.execution_role_arn.clone(),
             log_uri: self.log_uri.clone(),
             encryption_key_arn: self.encryption_key_arn.clone(),
+            additional_info: self.to_additional_info(),
         }
     }
 
@@ -433,6 +471,54 @@ impl StepRecord {
             status: Some(self.to_status()),
             log_uri: self.log_uri.clone(),
             encryption_key_arn: self.encryption_key_arn.clone(),
+            additional_info: self.to_additional_info(),
         }
+    }
+}
+
+/// The resource manager an Amazon EMR cluster runs its applications under, as a step read names
+/// it: Apache Hadoop YARN, which every Amazon EMR release of this emulator's catalog ships
+/// ([`APPLICATION_CATALOG`]) and schedules every step's execution through.
+pub const CLUSTER_RESOURCE_MANAGER: &str = "YARN";
+
+/// The member of a step's `AdditionalInfo` naming that manager.
+pub const RESOURCE_MANAGER_MEMBER: &str = "ResourceManager";
+
+/// The member of a step's `AdditionalInfo` carrying the applications the manager admitted for
+/// the step.
+pub const RESOURCE_MANAGER_APPLICATION_IDS_MEMBER: &str = "ResourceManagerApplicationIds";
+
+/// How the resource manager names one application it admitted.
+///
+/// YARN names an application after the resource manager instance that admitted it and the
+/// position of the application in that instance's own submission order:
+/// `application_<cluster timestamp>_<sequence>`, where the cluster timestamp is the instant the
+/// manager started in milliseconds since the epoch and the sequence is 1-based and padded to
+/// four digits. Both come from the cluster and its queue, so two applications of one cluster
+/// never share an id and no id is invented per call.
+fn resource_manager_application_id(epoch_millis: u128, sequence: u32) -> String {
+    format!("application_{epoch_millis}_{sequence:04}")
+}
+
+/// Record the application the cluster's resource manager admitted for every step of `steps`
+/// whose execution has STARTED and that carries none yet, for a manager that started at
+/// `epoch_millis`.
+///
+/// The sequence continues after the applications this cluster's manager has already admitted, so
+/// the ids are dense and in submission order, and a step that already carries one keeps it: the
+/// id is a fact about a submission that happened once, not a projection re-derived per read.
+pub(super) fn record_resource_manager_applications(steps: &mut [StepRecord], epoch_millis: u128) {
+    let admitted = steps
+        .iter()
+        .filter(|step| !step.resource_manager_application_ids.is_empty())
+        .count();
+    let mut sequence = u32::try_from(admitted).unwrap_or(u32::MAX);
+    for step in steps.iter_mut() {
+        if step.start_date_time.is_none() || !step.resource_manager_application_ids.is_empty() {
+            continue;
+        }
+        sequence = sequence.saturating_add(1);
+        step.resource_manager_application_ids
+            .push(resource_manager_application_id(epoch_millis, sequence));
     }
 }

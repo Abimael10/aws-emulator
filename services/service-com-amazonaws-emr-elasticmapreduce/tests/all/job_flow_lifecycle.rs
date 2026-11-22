@@ -214,6 +214,17 @@ pub(crate) fn epoch_secs(at: SystemTime) -> f64 {
         .as_secs_f64()
 }
 
+/// `at` in the units the service SERVES a `Date` in: epoch seconds truncated to the
+/// millisecond precision Amazon EMR serializes a timestamp at
+/// (`service_com_amazonaws_emr_elasticmapreduce::state::timestamp`).
+///
+/// `pub(crate)` so a case that bounds a served instant from below bounds it in the units it is
+/// served in: a stored instant carries the host clock's nanoseconds, so the served value sits
+/// up to one millisecond BELOW the instant the case read off the clock.
+pub(crate) fn served_epoch_secs(at: SystemTime) -> f64 {
+    (epoch_secs(at) * 1_000.0).floor() / 1_000.0
+}
+
 pub(crate) fn assert_refused(case: &str, status: u16, payload: &Value, expected_code: &str) {
     assert_eq!(
         status, 400,

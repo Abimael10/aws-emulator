@@ -984,7 +984,8 @@ async fn a_release_reports_the_whole_application_set_of_its_line() {
         );
 
         // And a cluster launched on the release runs the newest of them when it names
-        // none itself, which is what ties the published list to the launch path.
+        // none itself, which is what ties the published list to the launch path. The
+        // catalog is published newest first, so the newest is its first entry.
         let cluster_id = emr
             .run_job_flow({
                 let mut body = minimal_request(label);
@@ -995,7 +996,7 @@ async fn a_release_reports_the_whole_application_set_of_its_line() {
         let cluster = emr.describe_cluster(&cluster_id).await;
         assert_eq!(
             cluster["OSReleaseLabel"].as_str(),
-            os_releases.last().map(String::as_str),
+            os_releases.first().map(String::as_str),
             "case {label:?}: the default Amazon Linux release is the newest the release \
              offers, got {cluster}"
         );

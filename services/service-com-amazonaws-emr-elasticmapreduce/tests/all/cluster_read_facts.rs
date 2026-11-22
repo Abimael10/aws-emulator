@@ -402,15 +402,22 @@ async fn a_cluster_runs_in_the_zone_of_the_subnet_it_was_placed_in() {
             Some(subnet_id.as_str()),
             "case {label:?}: the cluster reports the subnet it runs in, got {cluster}"
         );
-        // The candidate lists are collections the cluster carries: this launch named one
-        // subnet outright and no candidates, so both are reported empty rather than absent.
-        for member in ["RequestedEc2SubnetIds", "RequestedEc2AvailabilityZones"] {
-            assert_eq!(
-                attributes[member].as_array(),
-                Some(&Vec::new()),
-                "case {label:?}: {member} must be reported as an empty list, got {cluster}"
-            );
-        }
+        // The candidate lists report what the launch REQUESTED: this launch asked for the one
+        // subnet it named outright, and for no zone at all — the zone is the subnet's own, which
+        // the launch did not request.
+        assert_eq!(
+            attributes["RequestedEc2SubnetIds"]
+                .as_array()
+                .map(|ids| ids.iter().filter_map(Value::as_str).collect::<Vec<&str>>()),
+            Some(vec![subnet_id.as_str()]),
+            "case {label:?}: RequestedEc2SubnetIds reports the subnet the launch asked for, \
+             got {cluster}"
+        );
+        assert_eq!(
+            attributes["RequestedEc2AvailabilityZones"].as_array(),
+            Some(&Vec::new()),
+            "case {label:?}: a launch that named no zone requested none, got {cluster}"
+        );
     }
 
     // A zone named outright is the zone, with no subnet to resolve.

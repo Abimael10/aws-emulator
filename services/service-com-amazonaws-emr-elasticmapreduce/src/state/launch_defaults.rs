@@ -42,6 +42,43 @@ pub fn effective_scale_down_behavior(requested: Option<String>) -> String {
     requested.unwrap_or_else(|| DEFAULT_SCALE_DOWN_BEHAVIOR.to_string())
 }
 
+/// How a cluster this service launches EXECUTES the steps it is given.
+///
+/// Amazon EMR reports the mode on every cluster read. Every cluster of this service runs its
+/// queue the one way `AddJobFlowSteps` documents — "Amazon EMR executes each step in the order
+/// listed", with as many running at once as `StepConcurrencyLevel` allows
+/// ([`ClusterRecord::advance_steps`]) — which is the standard mode, and no operation of this
+/// surface puts a cluster in another one.
+pub const CLUSTER_STEP_EXECUTION_MODE: &str = "STANDARD";
+/// Whether the logs a cluster's nodes produce are kept OFF Amazon S3.
+///
+/// Reported on every cluster read beside the mode above. This service uploads what a cluster's
+/// nodes produce to the `LogUri` its launch named ([`deliver_due_step_logs`]), so the upload is
+/// not disabled on any cluster it holds.
+pub const CLUSTER_SYSTEM_LOG_UPLOAD_DISABLED: bool = false;
+
+/// The Kerberos configuration a cluster read reports, out of the attributes its launch
+/// supplied.
+///
+/// A cluster that configured no Kerberos authentication runs under none, and the member is
+/// reported as the EMPTY structure rather than left out: "attributes for Kerberos configuration
+/// when Kerberos authentication is enabled using a security configuration"
+/// (`Cluster$KerberosAttributes` doc) describes a structure that is there either way, so code
+/// that dereferences it has no absent member to special-case. One that DID configure it reports
+/// the realm its nodes belong to and the Active Directory user they join the domain as; the
+/// passwords the launch supplied are not among them ([`ClusterKerberosAttributes`]).
+pub fn served_kerberos_attributes(
+    configured: Option<&KerberosAttributes>,
+) -> ClusterKerberosAttributes {
+    let Some(configured) = configured else {
+        return ClusterKerberosAttributes::default();
+    };
+    ClusterKerberosAttributes {
+        realm: Some(configured.realm.clone()),
+        ad_domain_join_user: configured.ad_domain_join_user.clone(),
+    }
+}
+
 /// Whether Amazon EMR replaces degraded core nodes of a cluster whose launch did not say.
 ///
 /// "Indicates whether Amazon EMR should gracefully replace core nodes that have degraded
@@ -83,8 +120,8 @@ pub fn effective_unhealthy_node_replacement(primary_nodes: i64, requested: Optio
 /// Linux release was specified, the default Amazon Linux release is shown in the response."
 /// (`Cluster$OSReleaseLabel` doc.) So a described cluster always states the Amazon Linux
 /// release it is running: the one the launch named, or the DEFAULT one for the generation
-/// the cluster's Amazon EMR release is built on — the newest release this emulator's catalog
-/// offers for that generation ([`os_releases_for`], the same catalog
+/// the cluster's Amazon EMR release is built on — the NEWEST release this emulator's catalog
+/// offers for that generation, which is the first of it ([`os_releases_for`], the same catalog
 /// `DescribeReleaseLabel` publishes under `AvailableOSReleases`).
 ///
 /// A launch that named no Amazon EMR release at all names no generation to resolve, and a
@@ -100,8 +137,7 @@ pub fn effective_os_release_label(
     }
     let release = release_label.and_then(catalog_release)?;
     os_releases_for(release)
-        .iter()
-        .next_back()
+        .first()
         .map(|&label| label.to_string())
 }
 
