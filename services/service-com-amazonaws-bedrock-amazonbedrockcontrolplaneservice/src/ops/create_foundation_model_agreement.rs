@@ -16,19 +16,20 @@
 //! [`crate::state::INVALID_OFFER_TOKEN_MESSAGE`].
 //!
 //! `modelId` is read exactly as the offers listing reads it, because the two operations ask
-//! the same question of it — which agreement-bearing model does this id name:
+//! the same question of it — which agreement-bearing model does this id name
+//! ([`crate::state::FoundationModelCatalog::agreement_bearing_model`]):
 //!
 //! * a model the published catalog offers under a provider's own terms
 //!   ([`crate::state::model_offered_under_agreement`]) is the one case there is an agreement
 //!   to accept;
-//! * a model this service recognises and offers no longer is a resource that is GONE, which
-//!   every read of this catalog reports as 404 `ResourceNotFoundException` carrying the
-//!   end-of-life reason ([`crate::state::FOUNDATION_MODEL_END_OF_LIFE_MESSAGE`]);
 //! * every other id — a model AWS publishes itself, which is reached under no provider's
-//!   terms, and an id naming no model of this catalog at all — is a value this operation
+//!   terms, a model this service recognises and offers no longer, which is offered under
+//!   nothing at all, and an id naming no model of this catalog — is a value this operation
 //!   cannot read as the identifier of an agreement-bearing model, which is the INPUT fault
 //!   this service states once ([`crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE`]): 400
-//!   `ValidationException`.
+//!   `ValidationException`. This surface answers about the TERMS a model is offered under
+//!   rather than about a resource, so it reports no `modelId` missing — a model's lifecycle
+//!   is what the catalogue reads report.
 //!
 //! Two further conditions decide whether the acceptance is made:
 //!
@@ -211,50 +212,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // Which agreement-bearing model this id names, read exactly as the offers listing
-        // reads it: `modelId` is a `BedrockModelId`, so it names a base model by its id
-        // alone, in the qualified form that pattern admits — the id followed by the
-        // `:`-separated qualifiers, which name a variant of the same published model.
-        let model = match store.foundation_models.resolve_base_model(&input.model_id) {
-            // A model the catalog offers under an agreement: the one case there is an
-            // agreement of it to accept.
-            crate::state::BaseModelIdentity::Offered(model)
-                if crate::state::model_offered_under_agreement(model) =>
-            {
-                *model
-            }
-            // A model this service recognises and offers no longer is a resource that is
-            // GONE, which every read of this catalog reports the same way: 404
-            // `ResourceNotFoundException` carrying the end-of-life reason, rather than a
-            // statement about the value the request carried.
-            crate::state::BaseModelIdentity::Retired => {
-                return Err(
-                    CreateFoundationModelAgreementErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(
-                                crate::state::FOUNDATION_MODEL_END_OF_LIFE_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            // Everything else names no model offered under an agreement — no model of this
-            // catalog at all, or a model AWS publishes itself, which is reached under no
-            // provider's terms and so has no agreement to accept. Neither is a value this
-            // operation can read as the identifier of an agreement-bearing model, so both
-            // are the INPUT fault this service states once.
-            _ => {
-                return Err(
-                    CreateFoundationModelAgreementErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        // reads it ([`crate::state::FoundationModelCatalog::agreement_bearing_model`]):
+        // `modelId` is a `BedrockModelId`, so it names a base model by its id alone, in the
+        // qualified form that pattern admits — the id followed by the `:`-separated
+        // qualifiers, which name a variant of the same published model. An id that names no
+        // model offered under a provider's own terms names no agreement for this request to
+        // accept, which is the INPUT fault this service states once.
+        let Some(model) = store
+            .foundation_models
+            .agreement_bearing_model(&input.model_id)
+            .copied()
+        else {
+            return Err(
+                CreateFoundationModelAgreementErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
         };
 
         // The TERMS being accepted are the terms of the offer the token names, so a token

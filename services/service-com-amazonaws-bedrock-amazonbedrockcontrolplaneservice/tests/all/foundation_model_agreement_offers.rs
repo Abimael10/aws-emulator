@@ -12,13 +12,11 @@
 //!
 //! Every other `modelId` names no model there are offers OF, and is refused rather than
 //! answered with an empty list: a model AWS publishes itself is reached without accepting
-//! another party's terms, so no agreement of it exists to be offered, and an id naming no
-//! model of the catalog at all names nothing either — neither is a value this operation can
-//! read as the identifier of an agreement-bearing model, which is the 400
-//! `ValidationException` carrying this service's fixed invalid-identifier sentence. A model
-//! the service recognises and offers no longer is a resource that is GONE instead, which
-//! every read of this catalog reports as 404 `ResourceNotFoundException` with the
-//! end-of-life reason.
+//! another party's terms, so no agreement of it exists to be offered; a model the service
+//! recognises and offers no longer is offered under nothing at all; and an id naming no
+//! model of the catalog at all names nothing either — none of the three is a value this
+//! surface can read as the identifier of an agreement-bearing model, which is the 400
+//! `ValidationException` carrying this service's fixed invalid-identifier sentence.
 //!
 //! **Accepting an offer** is the write that answers it: the `offerToken` of an offer of a
 //! model accepts THAT model's agreement for the account, which a later read of the model's
@@ -27,6 +25,12 @@
 //! model. A token that names no offer of the model, an id that names no agreement-bearing
 //! model, and a model whose agreement the account already holds each accept nothing and
 //! leave the account's standing as it was.
+//!
+//! The last two tables walk the reading of `modelId` both operations share over its WHOLE
+//! class: every id this service recognises and offers no longer, every model AWS publishes
+//! itself and ids naming no catalogued model, each in both forms `BedrockModelId` admits,
+//! against both operations — and over what else is wrong with the request, which is what
+//! shows the identifier is read before any of it.
 //!
 //! # What the tables below generalise over
 //!
@@ -368,9 +372,9 @@ async fn an_id_that_names_no_agreement_bearing_model_is_refused_as_invalid() {
     }
 }
 
-/// RULE: a model this service recognises and offers no longer is a resource that is GONE, so
-/// the offers of it are refused 404 `ResourceNotFoundException` with the end-of-life reason
-/// rather than reported as an unreadable identifier.
+/// RULE: a model this service recognises and offers no longer is offered under nothing at
+/// all, so there is no agreement of it for an offer to be an offer of: its id is refused as
+/// one naming no agreement-bearing model, exactly as every other such id is.
 #[tokio::test]
 async fn a_model_past_its_end_of_life_has_no_offers_to_report() {
     let emulator = emulator();
@@ -387,21 +391,7 @@ async fn a_model_past_its_end_of_life_has_no_offers_to_report() {
             "case {model_id}: this row must name a model the service recognises as retired"
         );
         let reply = offers(&emulator, model_id, None).await;
-        assert_eq!(
-            (reply.status, code(&reply)),
-            (404, "ResourceNotFoundException"),
-            "case {model_id}: a model past its end of life is gone rather than unreadable, got \
-             {} {} {:?}",
-            reply.status,
-            code(&reply),
-            reply.body
-        );
-        assert_eq!(
-            message(model_id, &reply),
-            bedrock::state::FOUNDATION_MODEL_END_OF_LIFE_MESSAGE,
-            "case {model_id}: the refusal must state the end-of-life reason, got {:?}",
-            reply.body
-        );
+        assert_invalid_identifier(model_id, &reply);
     }
 }
 
@@ -679,8 +669,8 @@ async fn a_request_naming_no_offer_of_an_agreement_bearing_model_accepts_nothing
             message: bedrock::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
         });
     }
-    // A model this service recognises and offers no longer is a resource that is GONE, from
-    // three different providers (`crate::state::RETIRED_FOUNDATION_MODELS`).
+    // A model this service recognises and offers no longer is offered under nothing at all,
+    // from three different providers (`crate::state::RETIRED_FOUNDATION_MODELS`).
     for retired in [
         "anthropic.claude-v2",
         "ai21.j2-ultra-v1",
@@ -694,9 +684,9 @@ async fn a_request_naming_no_offer_of_an_agreement_bearing_model_accepts_nothing
             case: format!("the retired model {retired}"),
             model_id: retired.to_string(),
             offer_token: token.clone(),
-            status: 404,
-            code: "ResourceNotFoundException",
-            message: bedrock::state::FOUNDATION_MODEL_END_OF_LIFE_MESSAGE.to_string(),
+            status: 400,
+            code: "ValidationException",
+            message: bedrock::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
         });
     }
     // The token names no offer of the model the request names: a value that is no token at
@@ -830,4 +820,178 @@ async fn an_acceptance_waits_on_the_accounts_use_case_for_model_access() {
         );
         assert_standing(&emulator, &case, model.model_id, ENTITLED).await;
     }
+}
+
+// =======================================================================================
+// The ONE reading of `modelId` both agreement operations share
+// =======================================================================================
+
+/// Every base model id this service recognises and offers NO LONGER: the ids no published
+/// resource names (`crate::state::RETIRED_FOUNDATION_MODELS`), and the ids a published row is
+/// kept for because a routing resource still names them
+/// (`crate::state::PAST_END_OF_LIFE_MODELS`) — the whole set this service knows, rather than
+/// the ids any one row of it was recorded under.
+fn ids_past_end_of_life() -> Vec<&'static str> {
+    let ids: Vec<&'static str> = bedrock::state::RETIRED_FOUNDATION_MODELS
+        .iter()
+        .copied()
+        .chain(
+            bedrock::state::PAST_END_OF_LIFE_MODELS
+                .iter()
+                .map(|model| model.model_id),
+        )
+        .collect();
+    assert!(
+        ids.len() > 1,
+        "this service must recognise models it offers no longer, or the table asserts nothing"
+    );
+    ids
+}
+
+/// The `modelId`s this surface can read as the identifier of NO agreement-bearing model, one
+/// group of rows per reason an id names none — and each id in both forms `BedrockModelId`
+/// admits, the bare id and the `:`-qualified form its pattern allows up to two qualifiers of
+/// (`smithy_query(query="operation",operation="CreateFoundationModelAgreement")`).
+fn ids_naming_no_agreement_bearing_model() -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut push = |reason: &str, model_id: &str| {
+        rows.push((format!("{reason} {model_id}"), model_id.to_string()));
+        // One more qualifier than the id already carries, while the pattern still admits it:
+        // a variant of the same model, so it names no agreement-bearing model either.
+        if model_id.matches(':').count() < 2 {
+            rows.push((
+                format!("{reason} {model_id} with a version qualifier"),
+                format!("{model_id}:24k"),
+            ));
+        }
+    };
+    // Offered no longer: the model is offered under nothing at all, so no agreement of it
+    // exists to be offered or accepted.
+    for retired in ids_past_end_of_life() {
+        push("the model offered no longer", retired);
+    }
+    // Published by AWS itself: reached under no provider's terms, so there is no agreement of
+    // it either. Read off the catalog rather than written out.
+    let aws_published: Vec<&'static str> = CATALOG
+        .iter()
+        .filter(|model| !bedrock::state::model_offered_under_agreement(model))
+        .map(|model| model.model_id)
+        .collect();
+    assert!(
+        aws_published.len() > 1,
+        "the catalog must carry models AWS publishes itself, got {}",
+        aws_published.len()
+    );
+    for published in aws_published {
+        push("the AWS-published model", published);
+    }
+    // Naming no model of this catalog at all: a provider it carries no model of, a model of a
+    // provider it does carry, and a deployment-suffixed id.
+    for unknown in [
+        "acme.model-v1",
+        "anthropic.claude-9-opus-20990101-v9:0",
+        "meta.llama3-1-8b-instruct-v1:0/abcdef123456",
+    ] {
+        rows.push((
+            format!("the id naming no catalogued model {unknown}"),
+            unknown.to_string(),
+        ));
+    }
+    rows
+}
+
+/// RULE: the foundation-model agreement surface answers about the TERMS a model is offered
+/// under, so a `modelId` that names no model this service offers under a provider's own terms
+/// — offered no longer, published by AWS itself, or naming no catalogued model at all — is a
+/// value it cannot read as the identifier of an agreement-bearing model: 400
+/// `ValidationException` with the fixed invalid-identifier sentence, from BOTH operations
+/// that take the member, and never a report that a resource is missing.
+#[tokio::test]
+async fn neither_agreement_operation_reads_an_id_that_names_no_agreement_bearing_model() {
+    let emulator = emulator();
+    // The two conditions that could otherwise decide the answer are satisfied first: the
+    // account's acknowledgement is on record, and the token carried is a real offer's.
+    submit_use_case(&emulator).await;
+    let offered = agreement_models()[0];
+    let token = offer_token_of(&emulator, offered.model_id).await;
+
+    for (case, model_id) in ids_naming_no_agreement_bearing_model() {
+        // Listing the offers of it, with every `offerType` a request can carry.
+        for offer_type in OFFER_TYPES {
+            let case = format!("{case}: offers with offerType {offer_type:?}");
+            let reply = offers(&emulator, &model_id, offer_type).await;
+            assert_invalid_identifier(&case, &reply);
+        }
+        // And accepting an agreement of it.
+        let case = format!("{case}: accepting an agreement");
+        let reply = accept(&emulator, &model_id, &token).await;
+        assert_invalid_identifier(&case, &reply);
+    }
+
+    // The same surface goes on serving the model that IS offered under a provider's terms, so
+    // the rule refuses the ids it cannot read rather than the member itself.
+    let listed = offers(&emulator, offered.model_id, None).await;
+    assert_eq!(
+        listed.status, 200,
+        "case {}: a model offered under an agreement must still be served, got {} {:?}",
+        offered.model_id, listed.status, listed.body
+    );
+    let accepted = accept(&emulator, offered.model_id, &token).await;
+    assert_eq!(
+        accepted.status, 202,
+        "case {}: the agreement of an offered model must still be accepted, got {} {:?}",
+        offered.model_id, accepted.status, accepted.body
+    );
+}
+
+/// RULE: the identifier is read BEFORE the conditions that decide whether the acceptance is
+/// made, so an id this surface cannot read as naming an agreement-bearing model is answered
+/// as that input fault whatever else the request or the account would be refused for — and
+/// such a request accepts nothing.
+#[tokio::test]
+async fn an_id_naming_no_agreement_bearing_model_is_refused_before_anything_else() {
+    let emulator = emulator();
+    // NOTHING is on record: the account has submitted no use case for model access, which is
+    // what an acceptance naming an offered model would be refused for.
+    let offered = agreement_models()[0];
+    let token = offer_token_of(&emulator, offered.model_id).await;
+    let gate = accept(&emulator, offered.model_id, &token).await;
+    assert_eq!(
+        (gate.status, code(&gate)),
+        (403, "AccessDeniedException"),
+        "case {}: without the account's use case an offered model is refused 403, or this \
+         table proves no ordering, got {} {} {:?}",
+        offered.model_id,
+        gate.status,
+        code(&gate),
+        gate.body
+    );
+
+    // The rows differ along what ELSE is wrong with the request: the token names an offer of
+    // no model, or it names an offer of a model that is not the one named.
+    for (case, model_id) in ids_naming_no_agreement_bearing_model() {
+        for (axis, carried) in [
+            ("a token that names no offer", "not-an-offer-token"),
+            ("the token of an offered model's offer", token.as_str()),
+        ] {
+            let case = format!("{case} with {axis}");
+            let reply = accept(&emulator, &model_id, carried).await;
+            assert_invalid_identifier(&case, &reply);
+        }
+    }
+
+    // None of those requests accepted anything: the offered model's terms are still
+    // outstanding, and its offer is still there to be accepted.
+    assert_standing(
+        &emulator,
+        "after every refused acceptance",
+        offered.model_id,
+        OUTSTANDING,
+    )
+    .await;
+    assert!(
+        !reported(&offers(&emulator, offered.model_id, None).await).is_empty(),
+        "case {}: the offer of a model whose terms are unaccepted is still listed",
+        offered.model_id
+    );
 }

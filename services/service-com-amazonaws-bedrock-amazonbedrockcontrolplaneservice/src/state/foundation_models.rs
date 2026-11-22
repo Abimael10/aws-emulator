@@ -1614,6 +1614,40 @@ impl FoundationModelCatalog {
         }
         BaseModelIdentity::Unknown
     }
+
+    /// The model whose AGREEMENT a `modelId` handed to the foundation-model agreement
+    /// surface names — `ListFoundationModelAgreementOffers` and
+    /// `CreateFoundationModelAgreement` — or `None` when the id names no model this service
+    /// can act on the agreement of.
+    ///
+    /// That surface asks ONE question of the member, so it is read here once: does this id
+    /// name a model the published catalog offers under a provider's own terms
+    /// ([`model_offered_under_agreement`])? Only such a model has an agreement for an offer
+    /// to be an offer of and for a request to accept.
+    ///
+    /// Every other reading is the same answer, because what the member can name here is
+    /// narrower than what the catalogue resolves: a model AWS publishes itself is reached
+    /// under no provider's terms, a model this service recognises and offers no longer is
+    /// offered under nothing at all, and an id naming no model of the catalogue names
+    /// nothing. None of the three is a value this surface can read as the identifier of an
+    /// agreement-bearing model, which is the INPUT fault this service states once
+    /// ([`INVALID_MODEL_IDENTIFIER_MESSAGE`]) — and `modelId` is a `BedrockModelId`, whose
+    /// pattern admits no ARN
+    /// (`smithy_query(query="operation",operation="ListFoundationModelAgreementOffers")`), so
+    /// no request to this surface carries the one spelling that reports a resource missing.
+    /// Telling a model that is GONE from one that was never there is what the CATALOGUE
+    /// reads report ([`Self::resolve_base_model`], [`unoffered_foundation_model`]); this
+    /// surface answers about the TERMS a model is offered under rather than about a resource,
+    /// so it reports neither.
+    #[must_use]
+    pub fn agreement_bearing_model(&self, model_id: &str) -> Option<&FoundationModel> {
+        match self.resolve_base_model(model_id) {
+            BaseModelIdentity::Offered(model) if model_offered_under_agreement(model) => {
+                Some(model)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Whether this account reaches every model the catalog offers without asking for access to
