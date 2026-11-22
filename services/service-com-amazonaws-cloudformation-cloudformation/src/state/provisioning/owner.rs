@@ -277,6 +277,14 @@ impl Owner {
             Self::SsmPatchBaseline => {
                 ssm_patch_baseline::create(ctx, region, resource, propagated).await
             }
+            // A file system and an access point are each taggable: the tag list each one's
+            // create takes is the property its own type spells them with, so the resource
+            // carries the tags CloudFormation gives it beside its own. A MOUNT TARGET is not:
+            // it publishes no tag property and the `ResourceId` of that service's tagging
+            // calls admits only the other two ([`efs_resources::create`]).
+            Self::EfsResource(kind) => {
+                efs_resources::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -341,6 +349,13 @@ impl Owner {
             Self::IotAuthorizer => Ok(iot_authorizer::ready()),
             // A patch baseline exists from the moment its create answers too.
             Self::SsmPatchBaseline => Ok(ssm_patch_baseline::ready()),
+            // Each of the three Amazon EFS resources comes up `creating` — a file system that
+            // is not `available` takes no mount target and no access point — so that arm asks,
+            // and applies the settings a file system takes only once it is available
+            // ([`efs_resources::readiness`]).
+            Self::EfsResource(kind) => {
+                efs_resources::readiness(ctx, region, kind, physical_resource_id, declared).await
+            }
             // A provisioning template and a role alias each EXIST from the moment their
             // create answers ([`iot_provisioning_resources::ready`]).
             Self::IotProvisioningResource(_) => Ok(iot_provisioning_resources::ready()),
@@ -519,6 +534,11 @@ impl Owner {
             // A patch baseline's `Id` is the id its own create minted, so there is nothing
             // left to read once it is up.
             Self::SsmPatchBaseline => Ok(BTreeMap::new()),
+            // Each Amazon EFS resource's published values — the file system's id and ARN, the
+            // access point's id and ARN, the mount target's id and the address Amazon EFS
+            // assigned it — are the ones its own create answered, so there is nothing left to
+            // read once one is up.
+            Self::EfsResource(_) => Ok(efs_resources::ready_attributes()),
             // A provisioning template's `TemplateArn` and a role alias's `RoleAliasArn` are
             // the ones their own creates answered with, so there is nothing left to read once
             // either is up.
@@ -702,6 +722,12 @@ impl Owner {
             // `DeletePatchBaseline` takes the baseline away as it answers, so there is
             // nothing to wait for either.
             Self::SsmPatchBaseline => Ok(ssm_patch_baseline::removal()),
+            // A file system and a mount target are gone as their deletes answer; an ACCESS
+            // POINT is the one Amazon EFS keeps describing while it removes it, which that arm
+            // waits out ([`efs_resources::removal`]).
+            Self::EfsResource(kind) => {
+                efs_resources::removal(ctx, region, kind, physical_resource_id).await
+            }
             Self::IotProvisioningResource(_) => Ok(iot_provisioning_resources::removal()),
             // `DeleteTopicRule` takes the rule away as it answers too
             // ([`iot_topic_rule::removal`]).
@@ -905,6 +931,14 @@ impl Owner {
             // ([`ssm_patch_baseline::update`]).
             Self::SsmPatchBaseline => {
                 ssm_patch_baseline::update(ctx, region, resource, declared).await
+            }
+            // Each Amazon EFS resource takes a changed property through the call that service
+            // publishes for changing it on the resource that exists — a file system's
+            // throughput and the four settings that are calls of their own, a mount target's
+            // security groups ([`efs_resources::update`]) — so the resource keeps the identity
+            // Amazon EFS minted. Every other property is create-only and replaces it instead.
+            Self::EfsResource(kind) => {
+                efs_resources::update(ctx, region, kind, resource, declared).await
             }
             Self::IotProvisioningResource(kind) => {
                 iot_provisioning_resources::update(ctx, region, kind, resource, declared).await
@@ -1122,6 +1156,14 @@ impl Owner {
             // The tags of a patch baseline that already exists are reconciled by no arm here
             // yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
             Self::SsmPatchBaseline => Ok(()),
+            // The tags of a file system and of an access point that already exist ARE
+            // reconciled: each create's tag list applies to the resource it created and to no
+            // resource that already exists, and no call that changes one of them carries a tag
+            // — so the set one is to end up carrying is reconciled through that service's own
+            // `TagResource` and `UntagResource` ([`efs_resources::retag`]).
+            Self::EfsResource(kind) => {
+                efs_resources::retag(ctx, region, kind, resource, declared, propagated).await
+            }
             // The tags of a provisioning template and of a role alias that already exist are
             // reconciled by no arm here yet either, so nothing is asked about them.
             Self::IotProvisioningResource(_) => Ok(()),
@@ -1288,6 +1330,13 @@ impl Owner {
             // baseline — and the registrations that hold it — with no snapshot invented for
             // it ([`ssm_patch_baseline::delete`]).
             Self::SsmPatchBaseline => ssm_patch_baseline::delete(ctx, region, resource).await,
+            // Amazon EFS takes no snapshot of a file system, an access point or a mount target
+            // on the way out: there is no such call, so a `Snapshot` deletion policy on one of
+            // them deletes the resource with no snapshot invented for it
+            // ([`efs_resources::delete`]).
+            Self::EfsResource(kind) => {
+                efs_resources::delete(ctx, region, kind, resource).await
+            }
             // Nor of a provisioning template or a role alias, for the same reason.
             Self::IotProvisioningResource(kind) => {
                 iot_provisioning_resources::delete(ctx, region, kind, resource).await
@@ -1511,6 +1560,9 @@ impl Owner {
             Self::SsmPatchBaseline => {
                 ssm_patch_baseline::actual_configuration(ctx, region, resource).await?
             }
+            Self::EfsResource(kind) => {
+                efs_resources::actual_configuration(ctx, region, kind, resource).await?
+            }
             Self::IotProvisioningResource(kind) => {
                 iot_provisioning_resources::actual_configuration(ctx, region, kind, resource)
                     .await?
@@ -1728,6 +1780,8 @@ impl Owner {
             Self::MediaConvert(_) => message.to_string(),
             // And so does AWS Systems Manager's patch-baseline provider.
             Self::SsmPatchBaseline => message.to_string(),
+            // And so do Amazon EFS's three providers.
+            Self::EfsResource(_) => message.to_string(),
         }
     }
 
@@ -1801,6 +1855,16 @@ impl Owner {
             // of a modelled error keep the class their own codes fall in.
             Self::ApiGatewayRestApi(_) if code == API_GATEWAY_VALIDATION => {
                 super::HANDLER_ERROR_SERVICE_FAILED
+            }
+            // A MOUNT TARGET's provider reports the one-mount-target-per-Availability-Zone
+            // refusal as a resource that ALREADY EXISTS: a zone that already holds this file
+            // system's mount target is the place the declaration asks for one, and that is a
+            // failure no retry of the same template clears — which is what a client branches
+            // on — rather than the transient conflict the code's own wording reads as.
+            Self::EfsResource(efs_resources::Kind::MountTarget)
+                if code == efs_resources::MOUNT_TARGET_CONFLICT =>
+            {
+                super::HANDLER_ERROR_ALREADY_EXISTS
             }
             // Every other provider here reports the class the error code itself falls in.
             _ => classified,

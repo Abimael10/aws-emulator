@@ -1520,6 +1520,67 @@ pub(crate) fn return_values(
                 attributes,
             )
         }
+        // The three Amazon EFS types, whose identity that service MINTS and whose published
+        // return values are built around it ([`crate::state::provisioning::efs_resources`]
+        // creates each one and re-points these stand-ins at what Amazon EFS answered).
+        //
+        // "Ref returns the ID of the file system"; Fn::GetAtt: Arn, FileSystemId. The id is
+        // the `fs-` + hexadecimal form every member of that service's API admits for a file
+        // system (`^(arn:aws[-a-z]*:elasticfilesystem:[0-9a-z-:]+:file-system/fs-[0-9a-f]{8,40}\
+        // |fs-[0-9a-f]{8,40})$`), never the name CloudFormation computed: the type declares no
+        // name at all and `CreateFileSystem` takes none.
+        EFS_FILE_SYSTEM => {
+            let id = generated_service_id("fs", name, EFS_ID_HEX_DIGITS);
+            attributes.insert(
+                efs_resources::ARN_ATTRIBUTE.to_string(),
+                ::emulator_server::emulator_arn(
+                    EFS_ARN_NAMESPACE,
+                    region,
+                    &format!("file-system/{id}"),
+                ),
+            );
+            attributes.insert(
+                efs_resources::FILE_SYSTEM_ID_ATTRIBUTE.to_string(),
+                id.clone(),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the ID of the EFS access point"; Fn::GetAtt: AccessPointId, Arn — the
+        // `fsap-` form that service's own `AccessPointId` admits.
+        EFS_ACCESS_POINT => {
+            let id = generated_service_id("fsap", name, EFS_ID_HEX_DIGITS);
+            attributes.insert(
+                efs_resources::ACCESS_POINT_ID_ATTRIBUTE.to_string(),
+                id.clone(),
+            );
+            attributes.insert(
+                efs_resources::ARN_ATTRIBUTE.to_string(),
+                ::emulator_server::emulator_arn(
+                    EFS_ARN_NAMESPACE,
+                    region,
+                    &format!("access-point/{id}"),
+                ),
+            );
+            (id, attributes)
+        }
+        // "Ref returns the ID of the file system's mount target"; Fn::GetAtt: Id, IpAddress —
+        // the `fsmt-` form that service's own `MountTargetId` admits, with `Id` carrying that
+        // same identity. The ADDRESS is Amazon EFS's to choose unless the declaration states
+        // one ("Otherwise, Amazon EFS assigns a free address in the subnet"), so a declaration
+        // that states none carries the stand-in every value only the owning service can
+        // produce is resolved against until its create has answered.
+        EFS_MOUNT_TARGET => {
+            let id = generated_service_id("fsmt", name, EFS_ID_HEX_DIGITS);
+            attributes.insert(efs_resources::ID_ATTRIBUTE.to_string(), id.clone());
+            let address = properties
+                .get(efs_resources::IP_ADDRESS_ATTRIBUTE)
+                .and_then(|value| text(value, scope, 0, budget))
+                .unwrap_or_else(|| {
+                    service_assigned_document(name, efs_resources::IP_ADDRESS_ATTRIBUTE)
+                });
+            attributes.insert(efs_resources::IP_ADDRESS_ATTRIBUTE.to_string(), address);
+            (id, attributes)
+        }
         // "Ref returns the Amazon Resource Name (ARN)"; Fn::GetAtt: Name. A service ARN
         // carries the CLUSTER that hosts it (`service/<cluster>/<name>`), which the
         // declaration names by short name or by cluster ARN and which defaults to the

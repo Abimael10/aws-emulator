@@ -3132,6 +3132,12 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ECS_CLUSTER,
     ECS_SERVICE,
     ECS_TASK_DEFINITION,
+    // The three Amazon EFS types, each publishing the identifier Amazon EFS minted for it and
+    // the value built around it: the file system's ARN, the access point's ARN, and the
+    // address the mount target was placed at.
+    EFS_FILE_SYSTEM,
+    EFS_ACCESS_POINT,
+    EFS_MOUNT_TARGET,
     crate::state::provisioner::ecs_task_sets::ECS_TASK_SET,
     EKS_CLUSTER,
     EKS_ADDON,

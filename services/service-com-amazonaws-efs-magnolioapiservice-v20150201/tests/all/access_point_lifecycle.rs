@@ -229,7 +229,18 @@ async fn create_access_point_stores_every_shape_and_reads_it_back() {
             "RootDirectory": shape.expected_root_directory.clone(),
             "Tags": Value::Array(shape.tags.clone()),
         });
-        expected["PosixUser"] = shape.posix_user.clone().unwrap_or(Value::Null);
+        // The POSIX identity is reported with the SECONDARY GROUP list it holds: that member
+        // is a list, so an identity created with no secondary group is reported with an EMPTY
+        // one rather than without the member at all.
+        expected["PosixUser"] = match shape.posix_user.clone() {
+            Some(mut identity) => {
+                if identity.get("SecondaryGids").is_none() {
+                    identity["SecondaryGids"] = Value::Array(Vec::new());
+                }
+                identity
+            }
+            None => Value::Null,
+        };
         expected["Name"] = match shape.expected_name {
             Some(name) => Value::String(name.to_string()),
             None => Value::Null,
@@ -452,7 +463,7 @@ async fn a_reused_client_token_never_mints_a_second_access_point() {
         &access_points(&described)[0],
         &json!({
             "RootDirectory": { "Path": "/first" },
-            "PosixUser": { "Uid": 1, "Gid": 1 },
+            "PosixUser": { "Uid": 1, "Gid": 1, "SecondaryGids": [] },
             "FileSystemId": file_system_id,
         }),
     );

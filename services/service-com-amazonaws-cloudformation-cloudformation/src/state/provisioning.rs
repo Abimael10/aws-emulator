@@ -287,6 +287,13 @@ pub(super) mod dynamodb_table;
 /// `AWS::EC2::Instance`: the instance a stack declares, launched in Amazon EC2 itself
 /// ([`ec2_instance`]).
 mod ec2_instance;
+/// The three `AWS::EFS::*` types an Amazon EFS estate is declared with — the file system, an
+/// access point of one and the mount target a VPC reaches it through: created in Amazon EFS
+/// itself ([`efs_resources`]). Visible to the rest of this service's state because the types'
+/// own NAMES live here, beside the arms that provision them (the return-value rules name all
+/// three, whose identity their creates answer, and the replacement rules the properties one
+/// cannot take anew).
+pub(in crate::state) mod efs_resources;
 /// The Amazon EC2 VPC-network types a stack declares, created in Amazon EC2 itself, beside
 /// the readers of that service's own answers that their arms are built from: visible to the
 /// rest of this service's state because the reading of a describe's RESULT SET
@@ -1413,6 +1420,10 @@ pub(super) enum Owner {
     /// Systems Manager mints for the resource, together with the patch groups the declaration
     /// registers it for.
     SsmPatchBaseline,
+    /// One of the three `AWS::EFS::*` types [`efs_resources`] creates in Amazon EFS: the file
+    /// system, an access point of one, and the mount target a VPC's subnet reaches it through.
+    /// Which of them it is travels with the owner, so the algorithm resolves the type once.
+    EfsResource(efs_resources::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -1534,6 +1545,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if resource_type == ssm_patch_baseline::SSM_PATCH_BASELINE {
         return Some(Owner::SsmPatchBaseline);
+    }
+    if let Some(kind) = efs_resources::kind_of(resource_type) {
+        return Some(Owner::EfsResource(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }

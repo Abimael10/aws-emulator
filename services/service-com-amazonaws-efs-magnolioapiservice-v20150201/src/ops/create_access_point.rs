@@ -355,7 +355,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             available_at: now + efs::CREATING_FOR,
             // No delete has been accepted for a brand-new access point.
             deleted_at: None,
-            posix_user: input.posix_user.clone(),
+            // The POSIX identity the access point is created with, with the SECONDARY GROUP
+            // list the identity holds: `PosixUser$SecondaryGids` is a list member, so a
+            // request that named none created an identity with no secondary group rather than
+            // one whose list is unknown — and that is what every read of the access point
+            // reports ([`efs::posix_identity`]).
+            posix_user: efs::posix_identity(input.posix_user.clone()),
             root_directory,
             tags,
         };

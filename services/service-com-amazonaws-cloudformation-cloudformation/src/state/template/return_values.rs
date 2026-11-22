@@ -43,6 +43,24 @@ pub(super) use crate::state::provisioner::lake_formation_permissions::{
 // cannot name the same attribute differently.
 pub(super) use crate::state::provisioner::redshift_serverless;
 
+// The three Amazon EFS types: their own NAMES and the names of the attributes each publishes
+// live beside the arms that provision them
+// ([`crate::state::provisioning::efs_resources`]), for the same reason.
+pub(super) use crate::state::provisioning::efs_resources;
+pub(super) use crate::state::provisioning::efs_resources::{
+    EFS_ACCESS_POINT, EFS_FILE_SYSTEM, EFS_MOUNT_TARGET,
+};
+
+/// Amazon EFS's ARN namespace, which its own model carries as `awsService.arnNamespace`
+/// (`elasticfilesystem`) — the service segment of a file system's and an access point's ARN.
+pub(super) const EFS_ARN_NAMESPACE: &str = "elasticfilesystem";
+
+/// How many lowercase hexadecimal characters the identifier Amazon EFS mints carries after
+/// its prefix: 17, which is the width that service mints its own ids at and which every
+/// consumer of one admits (its own members take 8 to 40 digits, and AWS Lambda accepts an
+/// access point only as `…:access-point/fsap-[a-f0-9]{17}`).
+pub(super) const EFS_ID_HEX_DIGITS: usize = 17;
+
 /// A DNS name with its terminal dot dropped, which is how CloudFormation reports the name of
 /// a resource whose return value IS a DNS record name.
 ///
@@ -182,6 +200,21 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         FIREHOSE_DELIVERY_STREAM => &["Arn"],
         KINESIS_STREAM => &["Arn"],
         ECR_REPOSITORY => &["Arn", "RepositoryUri"],
+        // The three Amazon EFS types, each publishing the values its own "Return values"
+        // section names: the file system's ARN and id, the access point's id and ARN, and the
+        // mount target's id and the address Amazon EFS placed it at.
+        EFS_FILE_SYSTEM => &[
+            efs_resources::ARN_ATTRIBUTE,
+            efs_resources::FILE_SYSTEM_ID_ATTRIBUTE,
+        ],
+        EFS_ACCESS_POINT => &[
+            efs_resources::ACCESS_POINT_ID_ATTRIBUTE,
+            efs_resources::ARN_ATTRIBUTE,
+        ],
+        EFS_MOUNT_TARGET => &[
+            efs_resources::ID_ATTRIBUTE,
+            efs_resources::IP_ADDRESS_ATTRIBUTE,
+        ],
         ECS_CLUSTER => &["Arn"],
         // A pipeline publishes the ARN CodePipeline keys it by and the VERSION that service
         // allocates for it; a webhook the URL that service generates for it.
@@ -891,6 +924,16 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         || resource_type
             == crate::state::provisioning::step_functions_versions_and_aliases::STEP_FUNCTIONS_STATE_MACHINE_ALIAS
         || resource_type == KMS_KEY
+        // All three Amazon EFS types are in the same position: `CreateFileSystem`,
+        // `CreateAccessPoint` and `CreateMountTarget` each take NO identifier for the resource
+        // they make — none of the three types declares a name at all, a file system's name
+        // being a tag of its own tag set — and each answers the identifier that service minted
+        // (`fs-`, `fsap-`, `fsmt-`), which is what the type's `Ref` returns and the handle
+        // every later Amazon EFS call on the resource takes
+        // ([`crate::state::provisioning::efs_resources`]).
+        || resource_type == EFS_FILE_SYSTEM
+        || resource_type == EFS_ACCESS_POINT
+        || resource_type == EFS_MOUNT_TARGET
         || resource_type == AOSS_COLLECTION
         // An OpenSearch Serverless managed interface ENDPOINT is the same case:
         // `CreateVpcEndpoint` takes the endpoint's `name` and no identifier for it, and

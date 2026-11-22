@@ -118,6 +118,18 @@ pub(super) const REQUIRED_PROPERTIES: &[RequiredProperties] = &[
         resource_type: super::appsync_domain_names::APPSYNC_DOMAIN_NAME_API_ASSOCIATION,
         required: &["ApiId", "DomainName"],
     },
+    // `AWS::EFS::AccessPoint` is a view INTO one file system, which `CreateAccessPoint`
+    // declares required and the type publishes "Required: Yes"; a MOUNT TARGET is the file
+    // system reached from one subnet, and `CreateMountTarget` declares both members required.
+    // Neither type declares a name CloudFormation could generate.
+    RequiredProperties {
+        resource_type: super::efs_resources::EFS_ACCESS_POINT,
+        required: &["FileSystemId"],
+    },
+    RequiredProperties {
+        resource_type: super::efs_resources::EFS_MOUNT_TARGET,
+        required: &["FileSystemId", "SubnetId"],
+    },
     // `AWS::Glue::TableOptimizer`: an optimizer is a resource OF a catalog table, so every
     // member `CreateTableOptimizer` declares required — the catalog, the database and the
     // table that identify it, the type of optimizer it is, and the configuration it runs

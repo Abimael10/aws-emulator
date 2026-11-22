@@ -1001,6 +1001,12 @@ pub(super) fn refusal_of_call(
         .get("__type")
         .or_else(|| document.get("code"))
         .or_else(|| document.get("Code"))
+        // A service whose error shapes MODEL the code as a member of their own carries it
+        // there rather than under one of the wire's conventional keys: every error of Amazon
+        // EFS declares a required `ErrorCode` beside its `Message`
+        // (`smithy_query(query="shape",shape="MountTargetConflict")`), and that member is the
+        // value a client of that service branches on.
+        .or_else(|| document.get("ErrorCode"))
         .and_then(Value::as_str)
         .map(|code| code.rsplit('#').next().unwrap_or(code).to_string())
         .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));

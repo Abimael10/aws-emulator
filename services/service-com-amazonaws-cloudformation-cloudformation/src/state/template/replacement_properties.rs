@@ -95,6 +95,30 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // and a preset's are; every other property of the three is a member of that type's own
         // update.)
         MEDIACONVERT_QUEUE => &["PricingPlan"],
+        // An Amazon EFS FILE SYSTEM keeps what it was made with: the zone a One Zone file
+        // system lives in, whether it is encrypted and under which key, and its performance
+        // mode are members of `CreateFileSystem` and of no member of `UpdateFileSystem` —
+        // which takes a file system's id with a throughput mode and a provisioned amount and
+        // nothing else — so a declaration restating one of them asks for a DIFFERENT file
+        // system, which CloudFormation replaces.
+        EFS_FILE_SYSTEM => &[
+            "AvailabilityZoneName",
+            "Encrypted",
+            "KmsKeyId",
+            "PerformanceMode",
+        ],
+        // An ACCESS POINT keeps everything it was created with: Amazon EFS publishes no call
+        // that edits one — `CreateAccessPoint` takes the file system, the POSIX user, the root
+        // directory and the client token, and the only call that changes an access point
+        // afterwards is a tagging call — so a declaration restating any of them asks for a
+        // DIFFERENT access point.
+        EFS_ACCESS_POINT => &["ClientToken", "FileSystemId", "PosixUser", "RootDirectory"],
+        // A MOUNT TARGET is placed where its create placed it: the file system it serves, the
+        // subnet it is in and the address it answers at are members of `CreateMountTarget` and
+        // of no call that changes one — `ModifyMountTargetSecurityGroups` takes the security
+        // groups and nothing else — so a declaration restating one of them asks for a
+        // DIFFERENT mount target.
+        EFS_MOUNT_TARGET => &["FileSystemId", "IpAddress", "SubnetId"],
         // A session is encrypted under the key it was created with: `encryptionKeyArn` is a
         // member of `CreateSession` and of no member of `UpdateSession` (which takes a
         // session's identifier and its metadata alone), so a declaration naming another key

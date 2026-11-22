@@ -637,10 +637,25 @@ pub struct AccessPoint {
     pub tags: Vec<Tag>,
 }
 
+/// The POSIX identity an access point is created with, as every read of it reports it: the
+/// identity the request named, with the SECONDARY GROUP list that identity holds.
+///
+/// `PosixUser$SecondaryGids` is a list member ("Secondary POSIX group IDs used for all file
+/// system operations using this access point"), so an identity the request named no secondary
+/// group for is one with NO secondary group — an empty list — rather than one whose list is
+/// unknown: a list member of a stored structure is reported as the list it holds. A request
+/// that named no `PosixUser` at all named no identity, which is a different answer and stays
+/// absent.
+pub fn posix_identity(requested: Option<PosixUser>) -> Option<PosixUser> {
+    requested.map(|identity| PosixUser {
+        secondary_gids: Some(identity.secondary_gids.unwrap_or_default()),
+        ..identity
+    })
+}
+
 impl AccessPoint {
     /// This record as the modelled `AccessPointDescription`.
-    pub fn describe(&self) -> CreateAccessPointOutput {
-        CreateAccessPointOutput {
+    pub fn describe(&self) -> CreateAccessPointOutput {        CreateAccessPointOutput {
             client_token: Some(self.client_token.clone()),
             name: self.name.clone(),
             tags: Some(self.tags.clone()),

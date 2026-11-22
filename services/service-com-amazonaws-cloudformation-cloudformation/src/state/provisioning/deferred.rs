@@ -156,11 +156,14 @@ async fn resume_pass(
             for barrier in &resumption.resumed {
                 match failure_of(&materialised.transitions, &barrier.logical_id) {
                     // The create this pass made for the resource failed, so the wait it was
-                    // held at is over with that failure — reported on the resource exactly
-                    // as a failure of the first pass is.
+                    // held at is over with that failure. The pass has already recorded the
+                    // resource's own failed event ([`reconcile`]'s transitions, scheduled just
+                    // above), so the wait ends on that event rather than on a second one
+                    // saying the same thing.
                     Some(reason) => {
-                        taken = taken
-                            .or_else(|| stack.fail_stabilisation(now, barrier, &reason));
+                        taken = taken.or_else(|| {
+                            stack.fail_reported_stabilisation(now, barrier, &reason)
+                        });
                     }
                     None => stack.release_stabilisation(barrier, now),
                 }

@@ -244,6 +244,18 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         BATCH_JOB_DEFINITION => "JobDefinitionArn",
         BATCH_SERVICE_ENVIRONMENT => "ServiceEnvironmentArn",
         ECS_TASK_DEFINITION => "TaskDefinitionArn",
+        // The three Amazon EFS types, each identified by the identifier that service minted:
+        // the `fs-` id every call naming a file system takes, the `fsap-` id of an access
+        // point, and the `fsmt-` id a mount target publishes as its `Id`.
+        crate::state::provisioning::efs_resources::EFS_FILE_SYSTEM => {
+            crate::state::provisioning::efs_resources::FILE_SYSTEM_ID_ATTRIBUTE
+        }
+        crate::state::provisioning::efs_resources::EFS_ACCESS_POINT => {
+            crate::state::provisioning::efs_resources::ACCESS_POINT_ID_ATTRIBUTE
+        }
+        crate::state::provisioning::efs_resources::EFS_MOUNT_TARGET => {
+            crate::state::provisioning::efs_resources::ID_ATTRIBUTE
+        }
         // The Elastic Load Balancing v2 types: a load balancer, a target group, a listener
         // and a listener rule are each identified by their own ARN.
         ELB_LOAD_BALANCER => "LoadBalancerArn",

@@ -185,6 +185,23 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
     // ID: …; Proxy: null)" (RequestToken: …, HandlerErrorCode: AlreadyExists)`). Every type
     // this emulator provisions over this signing name is that service's.
     ("ec2", "Ec2", SdkDiagnostic::Proxied),
+    // Amazon EFS's SDK names it `Efs` — that model's own `sdkId` (`EFS`,
+    // `smithy_query(query="service_info")` on that service's model) with only the initial
+    // capitalised, exactly as Amazon EC2's above and Amazon EMR's below are. The shape is the
+    // ATTEMPT-counting one, as the recorded `ResourceStatusReason` of an `AWS::EFS::FileSystem`
+    // whose declared policy that service refuses for its lockout safety check carries it (in the
+    // behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `cloudformation__efs.deploy-cfn-efs-file-system-policy-lockout-rejected`, whose reason
+    // reads `Resource handler returned message: "<the service's sentence> (Service: Efs, Status
+    // Code: 400, Request ID: …) (SDK Attempt Count: …)" (RequestToken: …, HandlerErrorCode:
+    // InvalidRequest)`). The file system's and the access point's providers word it; the MOUNT
+    // TARGET's words no diagnostic for a refusal of any other class, which is recorded per
+    // provider ([`SDK_PROVIDER_SHAPES`]).
+    (
+        super::efs_resources::EFS_SIGNING_NAME,
+        "Efs",
+        SdkDiagnostic::Attempts,
+    ),
     // Elastic Load Balancing v2's SDK names it `ElasticLoadBalancingV2` — that model's own
     // `awsService.cloudFormationName`, which is also the name its SDK client carries
     // (`smithy_query(query="service_info")`: `sdkId: "Elastic Load Balancing v2"`,
@@ -622,6 +639,38 @@ const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
         "ec2",
         "DescribeClientVpnAuthorizationRules",
         SdkDiagnostic::Attempts,
+    ),
+    // The MOUNT TARGET of an Amazon EFS file system ([`provisioning::efs_resources`]) is
+    // provisioned by a provider that words NO diagnostic around a refusal of any class but a
+    // refused REQUEST, where that service's entry above carries the attempt-counting shape its
+    // file system's provider words. Read from the recorded `ResourceStatusReason` of an
+    // `AWS::EFS::MountTarget` declared in a subnet whose Availability Zone the file system
+    // already has a mount target in (in the behavioral corpus `simparity-behavioral-aws-v1`,
+    // check `cloudformation__efs.deploy-cfn-efs-mount-target-second-in-same-az-rejected`, whose
+    // reason reads `Resource handler returned message: "mount target already exists in this AZ"
+    // (RequestToken: …, HandlerErrorCode: AlreadyExists)` — that service's own sentence with no
+    // SDK diagnostic after it at all). The calls the same provider makes on a mount target it
+    // already created word the shape it words; a recording of one of them is what would correct
+    // them.
+    (
+        super::efs_resources::EFS_SIGNING_NAME,
+        "CreateMountTarget",
+        SdkDiagnostic::EnvelopeOnRefusedRequest,
+    ),
+    (
+        super::efs_resources::EFS_SIGNING_NAME,
+        "DeleteMountTarget",
+        SdkDiagnostic::EnvelopeOnRefusedRequest,
+    ),
+    (
+        super::efs_resources::EFS_SIGNING_NAME,
+        "DescribeMountTargets",
+        SdkDiagnostic::EnvelopeOnRefusedRequest,
+    ),
+    (
+        super::efs_resources::EFS_SIGNING_NAME,
+        "ModifyMountTargetSecurityGroups",
+        SdkDiagnostic::EnvelopeOnRefusedRequest,
     ),
     // The calls that act on a listener's CERTIFICATE LIST are CloudFormation's own, not a
     // registry provider's: an `AWS::ElasticLoadBalancingV2::ListenerCertificate` is deployed by
