@@ -77,7 +77,11 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 }
 
 /// One Athena call, as a client makes it, and its HTTP status and parsed body.
-async fn athena(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
+pub(crate) async fn athena(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -177,7 +181,7 @@ pub(crate) async fn listed_keys(
 }
 
 /// `GET /<bucket>/<key>` — `GetObject` — answering `(status, body)`.
-async fn object(router: &MultiServiceRouter, bucket: &str, key: &str) -> (u16, String) {
+pub(crate) async fn object(router: &MultiServiceRouter, bucket: &str, key: &str) -> (u16, String) {
     s3(router, "GET", &format!("/{bucket}/{key}")).await
 }
 
@@ -249,7 +253,7 @@ pub(crate) async fn create_work_group(
 }
 
 /// Apply `updates` to the workgroup `name`.
-async fn update_work_group(router: &MultiServiceRouter, name: &str, updates: Value) {
+pub(crate) async fn update_work_group(router: &MultiServiceRouter, name: &str, updates: Value) {
     let (status, updated) = athena(
         router,
         "UpdateWorkGroup",
