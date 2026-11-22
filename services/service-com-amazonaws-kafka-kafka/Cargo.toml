@@ -30,6 +30,11 @@ java-properties = "2.0"
 # Matches a replication flow's TopicsToReplicate / TopicsToExclude patterns, which
 # the model documents as regular expressions, against a source cluster's topics.
 regex = "1.13"
+# Percent-encodes one non-greedy `@httpLabel` path segment, which is how a cluster
+# ARN travels in a topic call's URI: the data-plane authorization refusal quotes the
+# resource as the request carried it (`src/state/authorization.rs`), so the encoding
+# comes from the crate that owns it rather than a second encoder of this crate's own.
+percent-encoding = "2.3"
 # Encodes and decodes the Apache Kafka wire protocol (request/response frames, their
 # per-API versions and the older record formats), which is what the cluster's broker
 # endpoint SPEAKS (`src/state/broker_plane/`): the messages are the protocol's, so they

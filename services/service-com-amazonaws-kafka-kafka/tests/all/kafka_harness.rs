@@ -1011,6 +1011,34 @@ pub fn vpc_connection_uri(arn: &str) -> String {
     format!("/v1/vpc-connection/{}", pct(arn))
 }
 
+/// `value` as an AWS SDK writes it into ONE non-greedy `@httpLabel` path segment:
+/// every byte outside RFC 3986's unreserved set (the ASCII letters and digits plus
+/// `-`, `.`, `_` and `~`) as the uppercase `%XX` of that byte, so an ARN's every
+/// `:` and `/` is escaped and nothing else is.
+///
+/// This is the exact encoding, not the conservative over-encoding [`pct`] applies
+/// to build a URI: a suite asserting on a value the service quotes BACK — the
+/// resource an authorization refusal names — needs the bytes the request carried
+/// and no others. Written out here rather than taken from the service's own
+/// encoder, so an assertion cannot agree with an encoder that is wrong.
+pub fn http_label(value: &str) -> String {
+    use std::fmt::Write;
+
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(char::from(*byte));
+            }
+            // Infallible, for the reason `pct` states.
+            other => {
+                let _ = write!(encoded, "%{other:02X}");
+            }
+        }
+    }
+    encoded
+}
+
 /// Percent-encode a URI component. An MSK ARN is an `@httpLabel`, so its `:` and
 /// `/` must be encoded to keep it one path segment; a `NextToken` is base64,
 /// whose `+` would otherwise decode to a space. Everything that is not an ASCII

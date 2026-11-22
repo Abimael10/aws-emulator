@@ -9,8 +9,9 @@
 //! resource — so a cluster REFERENCE that identifies no MSK cluster of this account
 //! matches no permission, reaches no grant, and is refused HTTP 403
 //! `AccessDeniedException` naming the principal, the action and the resource the
-//! decision was taken over, which is the WILDCARD: the reference resolved to no
-//! resource, so there was none to decide over, and the sentence ends there. A
+//! decision was taken from, which is the submitted value as the URI carried it (the
+//! percent-encoded `@httpLabel` segment, whose own suite is
+//! `topic_plane_denial_names_the_submitted_cluster_arn`); the sentence ends there. A
 //! well-formed cluster ARN passes that gate and is answered by the resolution behind
 //! it (`NotFoundException` where this endpoint holds no such cluster). A value that
 //! names a resource of another KIND is no cluster reference at all, and one that is
@@ -28,18 +29,19 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_kafka_kafka::state::RESOURCE_NOT_FOUND_MESSAGE;
 
+use crate::kafka_harness::http_label;
 use super::kafka_harness::{pct, sleep_past_activation, ClusterRequest, Emulator, Reply, ACCOUNT, REGION};
 
 /// A cluster id of the form this service mints, for an ARN naming a cluster no
 /// registry of this emulator holds.
-const GHOST_ID: &str = "11111111-2222-4333-8444-555555555555-1";
+pub(crate) const GHOST_ID: &str = "11111111-2222-4333-8444-555555555555-1";
 
 /// The IAM action a topic call is authorized under, and the wire code and status an
 /// authorization refusal carries — spelled out here rather than read from the
 /// service, so a drift in its own constants fails this suite.
-const CLUSTER_CONNECT_ACTION: &str = "kafka-cluster:Connect";
-const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
-const ACCESS_DENIED_STATUS: u16 = 403;
+pub(crate) const CLUSTER_CONNECT_ACTION: &str = "kafka-cluster:Connect";
+pub(crate) const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// The principal the account's own published credential speaks for, which is the
 /// identity a refusal of these calls names.
@@ -48,22 +50,18 @@ fn caller() -> String {
 }
 
 /// The sentence a request that reaches no grant is refused with: fixed connectives
-/// around the principal, the action and the resource the decision was taken over,
+/// around the principal, the action and the resource the decision was taken from,
 /// and nothing after that resource — no document was reached to be named.
-fn not_authorized(resource: &str) -> String {
+pub(crate) fn not_authorized(resource: &str) -> String {
     format!(
         "User: {} is not authorized to perform: {CLUSTER_CONNECT_ACTION} on resource: {resource}",
         caller()
     )
 }
 
-/// The resource an authorization decision is taken over when the value referenced
-/// none: IAM's wildcard.
-const ANY_RESOURCE: &str = "*";
-
 /// One topic operation, as a request this suite can make for any `ClusterArn`.
-struct TopicCall {
-    name: &'static str,
+pub(crate) struct TopicCall {
+    pub(crate) name: &'static str,
     method: &'static str,
     /// The URI, built from the percent-encoded cluster ARN.
     uri: fn(&str) -> String,
@@ -72,7 +70,7 @@ struct TopicCall {
 
 /// Every operation of the Topic Management surface, with the route the model binds
 /// it to (`smithy_query(query="operation",operation="<op>")`).
-fn topic_calls() -> Vec<TopicCall> {
+pub(crate) fn topic_calls() -> Vec<TopicCall> {
     vec![
         TopicCall {
             name: "CreateTopic",
@@ -118,7 +116,7 @@ fn topic_calls() -> Vec<TopicCall> {
 }
 
 /// Make `call` for `cluster_arn`.
-async fn make(emulator: &Emulator, call: &TopicCall, cluster_arn: &str) -> Reply {
+pub(crate) async fn make(emulator: &Emulator, call: &TopicCall, cluster_arn: &str) -> Reply {
     emulator
         .call(call.method, &(call.uri)(cluster_arn), call.body.clone())
         .await
@@ -126,9 +124,9 @@ async fn make(emulator: &Emulator, call: &TopicCall, cluster_arn: &str) -> Reply
 
 /// Values that ARE cluster REFERENCES of this service and identify no cluster:
 /// nothing resolves them to a cluster a permission could be scoped to, so the
-/// authorization gate refuses every topic call carrying one — naming the wildcard as
-/// the resource the decision was taken over, there having been none.
-fn references_naming_no_cluster() -> Vec<(&'static str, String)> {
+/// authorization gate refuses every topic call carrying one — naming the submitted
+/// value as the resource the decision was taken from.
+pub(crate) fn references_naming_no_cluster() -> Vec<(&'static str, String)> {
     vec![
         (
             "a cluster resource field missing its id",
@@ -176,8 +174,8 @@ fn values_that_are_no_cluster_reference() -> Vec<(&'static str, String)> {
 
 /// RULE: every topic call carrying a cluster reference that identifies no cluster of
 /// this account is refused by authorization, with the one sentence — over the
-/// wildcard — and the one code, whichever operation answers and whatever makes the
-/// reference identify none.
+/// submitted value as the URI carried it — and the one code, whichever operation
+/// answers and whatever makes the reference identify none.
 #[tokio::test]
 async fn an_arn_that_names_no_cluster_is_refused_by_authorization_on_every_topic_call() {
     let emulator = Emulator::new();
@@ -190,7 +188,7 @@ async fn an_arn_that_names_no_cluster_is_refused_by_authorization_on_every_topic
                 (
                     ACCESS_DENIED_STATUS,
                     ACCESS_DENIED_CODE,
-                    not_authorized(ANY_RESOURCE).as_str()
+                    not_authorized(&http_label(&value)).as_str()
                 ),
                 "case {case:?}/{}: expected the authorization refusal, got {} {}",
                 call.name,
@@ -198,9 +196,10 @@ async fn an_arn_that_names_no_cluster_is_refused_by_authorization_on_every_topic
                 reply.body
             );
             assert!(
-                !reply.error_message().contains(value.as_str()),
-                "case {case:?}/{}: the decision was taken over no resource, so the refusal must \
-                 not echo the submitted value, got {:?}",
+                !reply.error_message().contains("identity-based policy")
+                    && !reply.error_message().contains("resource-based policy"),
+                "case {case:?}/{}: no document was reached, so the refusal must name none, got \
+                 {:?}",
                 call.name,
                 reply.error_message()
             );

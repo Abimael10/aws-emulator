@@ -34,8 +34,11 @@
 //! that identifies no cluster — a `cluster` resource field of the wrong arity, one
 //! carrying no id — resolves to no resource for a statement to be matched against,
 //! reaches no grant, and is refused by [`no_grant_for_cluster`] before anything the
-//! request names is resolved or any member of the body is read. The decision was
-//! taken over no resource, so that is what it names ([`ANY_RESOURCE`]).
+//! request names is resolved or any member of the body is read. A CONTROL-plane
+//! decision was taken over no resource, so that is what it names
+//! ([`ANY_RESOURCE`]); the DATA-plane one a topic call takes names the value as
+//! the request's URI carried it ([`authorize_cluster_connect`]), that call having
+//! read its cluster out of a percent-encoded path segment.
 //!
 //! A value naming a resource of ANOTHER KIND — another vendor's, or another of this
 //! service's — is no cluster reference at all, so no permission scoped to a cluster
@@ -156,6 +159,12 @@ pub const CLUSTER_CONNECT_ACTION: &str = "kafka-cluster:Connect";
 /// against either way; both are left to the operation's own refusal, which is what
 /// the service answers for a mistyped path segment.
 ///
+/// The resource such a refusal NAMES is the submitted value as the request
+/// carried it ([`http_label`]): every topic call names its cluster in a non-greedy
+/// `@httpLabel` path segment, so the value this decision was taken from arrived
+/// percent-encoded and the refusal quotes those bytes — which is what lets a
+/// client recover the offending reference by decoding the resource clause.
+///
 /// `operation` is the caller's own `Operation::NAME`, so nothing about the
 /// decision depends on which topic call took it beyond the cluster it named.
 pub fn authorize_cluster_connect<Eng: Send + Sync + 'static, E>(
@@ -163,7 +172,50 @@ pub fn authorize_cluster_connect<Eng: Send + Sync + 'static, E>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     cluster_arn: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_cluster_action(engine, ctx, CLUSTER_CONNECT_ACTION, cluster_arn)
+    authorize_cluster_action(
+        engine,
+        ctx,
+        CLUSTER_CONNECT_ACTION,
+        cluster_arn,
+        UngrantedResource::SubmittedLabel,
+    )
+}
+
+/// What a pre-resolution refusal names as the resource, for a value that
+/// REFERENCES the action's own kind of resource and identifies none of it.
+///
+/// The two readings this service takes, which is the ONLY thing its control-plane
+/// and data-plane gates differ in: both decide over the same values, through the
+/// one reading in [`ungranted_resource`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UngrantedResource {
+    /// The resource the reference RESOLVES to in the decision's context — none, so
+    /// [`ANY_RESOURCE`]: what a control-plane decision, taken after the value has
+    /// been read as a reference to a resource of this service, is taken over.
+    Resolved,
+    /// The value as the request's URI carried it ([`http_label`]): what a TOPIC
+    /// call's data-plane decision is taken from, that surface reading its cluster
+    /// out of one non-greedy `@httpLabel` path segment, so the value it decided
+    /// from arrived percent-encoded — which is what lets a client recover the
+    /// offending reference by decoding the resource clause.
+    SubmittedLabel,
+}
+
+/// The characters a non-greedy `@httpLabel` keeps as they are: RFC 3986's
+/// unreserved set (the ASCII letters and digits plus `-`, `.`, `_` and `~`).
+/// Everything else — an ARN's every `:` and `/` — travels as the `%XX` of its
+/// UTF-8 bytes, which is the encoding an AWS SDK applies to such a segment.
+const LABEL_UNRESERVED: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// `value` as the request's URI carried it in one non-greedy `@httpLabel` path
+/// segment: percent-encoded over [`LABEL_UNRESERVED`], through the crate that owns
+/// that encoding rather than a second encoder of this tree's own.
+fn http_label(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, LABEL_UNRESERVED).to_string()
 }
 
 /// The same decision for the CONTROL-plane action of `operation` on the cluster its
@@ -190,7 +242,13 @@ pub fn authorize_caller_operation<Eng: Send + Sync + 'static, E>(
     operation: &str,
     cluster_arn: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    authorize_cluster_action(engine, ctx, &control_plane_action(operation), cluster_arn)
+    authorize_cluster_action(
+        engine,
+        ctx,
+        &control_plane_action(operation),
+        cluster_arn,
+        UngrantedResource::Resolved,
+    )
 }
 
 /// The same decision for an operation whose target is one cluster OPERATION,
@@ -213,9 +271,14 @@ pub fn authorize_cluster_operation_target<Eng: Send + Sync + 'static, E>(
         ctx,
         &control_plane_action(operation),
         operation_arn,
-        crate::state::CLUSTER_OPERATION_RESOURCE_TYPE,
-        crate::state::is_cluster_operation_arn(operation_arn),
-        grantable_by_cluster_policy(&control_plane_action(operation)),
+        TargetReading {
+            resource_type: crate::state::CLUSTER_OPERATION_RESOURCE_TYPE,
+            names_the_resource: crate::state::is_cluster_operation_arn(operation_arn),
+            only_a_resource_policy_can_grant: grantable_by_cluster_policy(
+                &control_plane_action(operation),
+            ),
+            naming: UngrantedResource::Resolved,
+        },
     )
 }
 
@@ -227,29 +290,49 @@ pub fn authorize_cluster_operation_target<Eng: Send + Sync + 'static, E>(
 /// The ONE implementation behind the control-plane gate
 /// ([`authorize_caller_operation`]) and the data-plane one
 /// ([`authorize_cluster_connect`]), so the two cannot drift apart on which values
-/// reach a grant.
+/// reach a grant: they pass the same `action`-derived flags through the same
+/// reading and differ only in `naming`, the resource their refusal names.
 fn authorize_cluster_action<Eng: Send + Sync + 'static, E>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     action: &str,
     cluster_arn: &str,
+    naming: UngrantedResource,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
     authorize_named_resource(
         engine,
         ctx,
         action,
         cluster_arn,
-        crate::state::CLUSTER_RESOURCE_TYPE,
-        crate::state::is_cluster_arn(cluster_arn),
-        grantable_by_cluster_policy(action),
+        TargetReading {
+            resource_type: crate::state::CLUSTER_RESOURCE_TYPE,
+            names_the_resource: crate::state::is_cluster_arn(cluster_arn),
+            only_a_resource_policy_can_grant: grantable_by_cluster_policy(action),
+            naming,
+        },
     )
 }
 
-/// The decision for `action` on the resource `value` is meant to name, where
-/// `resource_type` is the ARN resource type of the kind the action applies to,
-/// `names_the_resource` says whether `value` names one of that kind and
-/// `only_a_resource_policy_can_grant` whether the only document that can grant the
-/// action is the RESOURCE's own.
+/// How the pre-resolution half of a decision reads the target it was given: the
+/// kind of resource the action applies to, whether the submitted value names one
+/// of that kind, which documents could have granted the action, and how a refusal
+/// names what the decision was taken from.
+///
+/// One value rather than four arguments, so every gate passes the same set and a
+/// new target kind cannot leave one of them out.
+struct TargetReading<'reading> {
+    /// The ARN resource type of the kind `action` applies to.
+    resource_type: &'reading str,
+    /// Whether the submitted value names a resource of that kind.
+    names_the_resource: bool,
+    /// Whether the only document that can grant `action` is the RESOURCE's own.
+    only_a_resource_policy_can_grant: bool,
+    /// Which reading of the submitted value a refusal quotes as the resource.
+    naming: UngrantedResource,
+}
+
+/// The decision for `action` on the resource `value` is meant to name, as
+/// `reading` reads that target ([`TargetReading`]).
 ///
 /// The ONE place the order lives, for every target this service decides over: the
 /// caller's own policies and the ARN's account first
@@ -278,17 +361,27 @@ fn authorize_named_resource<Eng: Send + Sync + 'static, E>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     action: &str,
     value: &str,
-    resource_type: &str,
-    names_the_resource: bool,
-    only_a_resource_policy_can_grant: bool,
+    reading: TargetReading<'_>,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
     authorize_caller_action(engine, ctx, action, value)?;
-    if names_the_resource {
+    if reading.names_the_resource {
         return Ok(());
     }
-    match ungranted_resource(value, resource_type, only_a_resource_policy_can_grant) {
+    match ungranted_resource(
+        value,
+        reading.resource_type,
+        reading.only_a_resource_policy_can_grant,
+    ) {
         None => Ok(()),
-        Some(resource) => Err(no_grant_for_cluster(engine, ctx, action, resource)),
+        // WHICH values reach a grant is decided above, for every target alike; the
+        // reading below decides only how the refusal names what it decided from.
+        Some(resource) => {
+            let resource = match reading.naming {
+                UngrantedResource::Resolved => resource.to_string(),
+                UngrantedResource::SubmittedLabel => http_label(value),
+            };
+            Err(no_grant_for_cluster(engine, ctx, action, &resource))
+        }
     }
 }
 

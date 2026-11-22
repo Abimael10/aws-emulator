@@ -15930,6 +15930,7 @@ dependencies = [
  "kafka-protocol",
  "lz4_flex",
  "pbkdf2 0.13.0",
+ "percent-encoding",
  "rand 0.9.5",
  "regex",
  "rustls",

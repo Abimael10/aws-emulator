@@ -11,8 +11,12 @@
 //! follows the reading:
 //!
 //! 1. a REFERENCE of the action's own kind that identifies no resource of it (a
-//!    `cluster` resource field of the wrong arity) resolves to NO resource, so the
-//!    decision is taken over IAM's wildcard and the refusal names `*`;
+//!    `cluster` resource field of the wrong arity) resolves to NO resource, so a
+//!    CONTROL-plane decision is taken over IAM's wildcard and the refusal names
+//!    `*`; the DATA-plane decision a topic call takes is taken from the `@httpLabel`
+//!    segment as the URI carried it instead, so its refusal names that value
+//!    percent-encoded (its own suite is
+//!    `topic_plane_denial_names_the_submitted_cluster_arn`);
 //! 2. a value that is no ARN at all resolves to nothing either, so where only the
 //!    resource's OWN policy could have granted the action — the four actions an MSK
 //!    cluster policy governs — the decision is taken over the value AS SUBMITTED,
@@ -41,7 +45,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_kafka_kafka::state::authorization::caller_principal;
 use service_com_amazonaws_kafka_kafka::state::{BAD_REQUEST_MESSAGE, CLUSTER_ARN_MEMBER};
 
-use crate::kafka_harness::{pct, Emulator, Reply, ACCOUNT, REGION};
+use crate::kafka_harness::{http_label, pct, Emulator, Reply, ACCOUNT, REGION};
 
 /// The status and code an authorization refusal carries, spelled out here rather
 /// than read from the service, so a drift in its own constants fails this suite.
@@ -51,6 +55,10 @@ const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 /// The resource an authorization decision is taken over when the target referenced
 /// none: IAM's wildcard.
 const ANY_RESOURCE: &str = "*";
+
+/// The IAM action a topic call — the data plane's — is authorized under, whose
+/// decision is taken from the path segment as the URI carried it.
+const CLUSTER_CONNECT_ACTION: &str = "kafka-cluster:Connect";
 
 /// A cluster id of the form this service mints, for a reference that is well formed
 /// in every part but names a cluster no registry holds.
@@ -285,9 +293,11 @@ fn values_that_are_no_arn() -> Vec<(&'static str, String)> {
 }
 
 /// RULE (reading 1): a cluster reference that identifies no cluster is refused by the
-/// gate over the WILDCARD — one sentence, ending at that token, carrying neither the
-/// submitted value nor a clause about a document — whichever operation answers, under
-/// whichever IAM action, and whatever makes the reference identify no cluster.
+/// gate over the resource the decision was taken from — one sentence, ending at that
+/// token, with no clause about a document — whichever operation answers, under
+/// whichever IAM action, and whatever makes the reference identify no cluster: the
+/// WILDCARD for a control-plane action, which resolves the reference to no resource,
+/// and the submitted value as the URI carried it for the data plane's.
 #[tokio::test]
 async fn a_cluster_reference_identifying_no_cluster_is_refused_over_the_wildcard() {
     let emulator = Emulator::new();
@@ -295,6 +305,12 @@ async fn a_cluster_reference_identifying_no_cluster_is_refused_over_the_wildcard
     for (value_case, value) in cluster_references_naming_no_cluster() {
         for call in calls() {
             let case = format!("{} / {value_case}", call.case);
+            let data_plane = call.action == CLUSTER_CONNECT_ACTION;
+            let resource = if data_plane {
+                http_label(&value)
+            } else {
+                ANY_RESOURCE.to_string()
+            };
             let reply = call.make(&emulator, &value).await;
             assert_eq!(
                 (reply.status, reply.error_code()),
@@ -305,16 +321,18 @@ async fn a_cluster_reference_identifying_no_cluster_is_refused_over_the_wildcard
             );
             assert_eq!(
                 reply.error_message(),
-                not_authorized(&call.action, ANY_RESOURCE),
-                "case {case:?}: expected the refusal over the wildcard, got {:?}",
+                not_authorized(&call.action, &resource),
+                "case {case:?}: expected the refusal over {resource:?}, got {:?}",
                 reply.error_message()
             );
-            assert!(
-                !reply.error_message().contains(value.as_str()),
-                "case {case:?}: the decision was taken over no resource, so the refusal must not \
-                 echo the submitted value, got {:?}",
-                reply.error_message()
-            );
+            if !data_plane {
+                assert!(
+                    !reply.error_message().contains(value.as_str()),
+                    "case {case:?}: the decision was taken over no resource, so the refusal must \
+                     not echo the submitted value, got {:?}",
+                    reply.error_message()
+                );
+            }
             assert!(
                 !reply.error_message().contains("because"),
                 "case {case:?}: no document was reached, so the sentence names none, got {:?}",
