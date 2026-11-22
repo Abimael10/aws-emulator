@@ -32,7 +32,8 @@
 use std::sync::Arc;
 
 use service_com_amazonaws_ssmguiconnect_ssmguiconnect::state::{
-    bucket_name_matches_model_pattern, BUCKET_NAME_PATTERN, MAX_IDEMPOTENCY_OUTCOMES,
+    bucket_name_matches_model_pattern, IdempotentOperation, BUCKET_NAME_PATTERN,
+    MAX_IDEMPOTENCY_OUTCOMES,
 };
 use service_com_amazonaws_ssmguiconnect_ssmguiconnect::{
     ComAmazonawsSsmguiconnectSsmguiconnectState, EmulatedService,
@@ -834,6 +835,196 @@ async fn the_idempotency_store_stays_bounded() {
         Some("rdp-recordings"),
         "case \"replay the newest token\": the newest outcome must survive eviction, got {replay:?}"
     );
+}
+
+/// Re-recording an outcome under a `ClientToken` the store already holds makes that
+/// outcome the NEWEST entry of the bounded store: eviction drops the outcomes in the
+/// order they were RECORDED, so it never drops a newer outcome to keep an older one,
+/// not even when the newer one reuses a token recorded long before.
+///
+/// Both mutating operations take that re-record path whenever the token's recorded
+/// outcome is no longer current (the resource changed out from under it), so the table
+/// has a row per operation that records an outcome and per eviction depth — one entry
+/// past the cap, and several. Each row drives real calls through the production router
+/// and then reads the retained set off the store, because WHICH entry eviction chose is
+/// not observable on the wire.
+#[tokio::test]
+async fn a_re_recorded_outcome_outlives_the_outcomes_recorded_before_it() {
+    /// Outcomes recorded under fresh tokens between the reused token's first recording
+    /// and its re-recording: the entries eviction has to consume before it could reach
+    /// the re-recorded one.
+    const EARLIER: usize = 4;
+    /// The token recorded twice — first, and then again after [`EARLIER`] others.
+    const REUSED: &str = "reused-token";
+
+    // (case, the operation whose token is reused, outcomes recorded past the cap)
+    let cases: [(&str, IdempotentOperation, usize); 4] = [
+        (
+            "an Update token re-recorded, one eviction",
+            IdempotentOperation::Update,
+            1,
+        ),
+        (
+            "an Update token re-recorded, several evictions",
+            IdempotentOperation::Update,
+            3,
+        ),
+        (
+            "a Delete token re-recorded, one eviction",
+            IdempotentOperation::Delete,
+            1,
+        ),
+        (
+            "a Delete token re-recorded, several evictions",
+            IdempotentOperation::Delete,
+            3,
+        ),
+    ];
+
+    for (case, reused_op, overflow) in cases {
+        assert!(
+            overflow <= EARLIER,
+            "case {case:?}: the table must not ask for more evictions ({overflow}) than there \
+             are earlier outcomes ({EARLIER})"
+        );
+        let (router, engine) = enrolled_router_with_engine();
+
+        // The request each of the two recording operations is driven with. The OTHER
+        // operation is what every fresh-token call below uses, so each of them also
+        // changes the resource out from under the reused token — which is what makes the
+        // reused token's second call re-record instead of replay.
+        let body_for = |op: IdempotentOperation, token: &str| -> (&'static str, serde_json::Value) {
+            match op {
+                IdempotentOperation::Update => (
+                    "UpdateConnectionRecordingPreferences",
+                    serde_json::json!({
+                        "ConnectionRecordingPreferences":
+                            preferences("123456789012", "rdp-recordings", KEY_ARN),
+                        "ClientToken": token,
+                    }),
+                ),
+                IdempotentOperation::Delete => (
+                    "DeleteConnectionRecordingPreferences",
+                    serde_json::json!({ "ClientToken": token }),
+                ),
+            }
+        };
+        let other_op = match reused_op {
+            IdempotentOperation::Update => IdempotentOperation::Delete,
+            IdempotentOperation::Delete => IdempotentOperation::Update,
+        };
+
+        // The reused token's FIRST recording.
+        let (op, body) = body_for(reused_op, REUSED);
+        let (status, response) = call(&router, op, body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the first call under {REUSED:?} to answer 200, got \
+             {status:?} with {response:?}"
+        );
+
+        // Outcomes recorded strictly LATER than that one, under fresh tokens.
+        for n in 0..EARLIER {
+            let (op, body) = body_for(other_op, &format!("earlier-{n}"));
+            let (status, response) = call(&router, op, body).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the earlier-{n} call to answer 200, got {status:?} \
+                 with {response:?}"
+            );
+        }
+
+        // The RE-RECORD: the same token, whose recorded outcome no longer describes the
+        // stored resource, so the call runs for real and records a fresh outcome under
+        // the key the store already holds.
+        let (op, body) = body_for(reused_op, REUSED);
+        let (status, response) = call(&router, op, body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the second call under {REUSED:?} to answer 200, got \
+             {status:?} with {response:?}"
+        );
+
+        // It RAN rather than replayed: an Update left a readable record written under
+        // the reused token, a Delete left nothing readable.
+        let (status, got) = call(
+            &router,
+            "GetConnectionRecordingPreferences",
+            serde_json::json!({}),
+        )
+        .await;
+        match reused_op {
+            IdempotentOperation::Update => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the re-recording Update must leave a readable resource, got \
+                     {status:?} with {got:?}"
+                );
+                assert_eq!(
+                    got["ClientToken"].as_str(),
+                    Some(REUSED),
+                    "case {case:?}: the readable resource must be the one the re-recording \
+                     Update wrote, got {got:?}"
+                );
+            }
+            IdempotentOperation::Delete => assert_eq!(
+                status, 404,
+                "case {case:?}: the re-recording Delete must leave nothing readable, got \
+                 {status:?} with {got:?}"
+            ),
+        }
+        let retained = engine
+            .state::<ComAmazonawsSsmguiconnectSsmguiconnectState>()
+            .lock()
+            .retained_outcome_count();
+        assert_eq!(
+            retained,
+            EARLIER + 1,
+            "case {case:?}: the re-record must REPLACE the reused token's entry rather than add \
+             a second one, got {retained} retained outcomes"
+        );
+
+        // Drive the store exactly `overflow` outcomes past its cap, all under fresh
+        // tokens, so eviction has to choose `overflow` entries to drop.
+        let later = MAX_IDEMPOTENCY_OUTCOMES + overflow - EARLIER - 1;
+        for n in 0..later {
+            let (op, body) = body_for(other_op, &format!("later-{n}"));
+            let (status, response) = call(&router, op, body).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the later-{n} call to answer 200, got {status:?} with \
+                 {response:?}"
+            );
+        }
+
+        let state = engine.state::<ComAmazonawsSsmguiconnectSsmguiconnectState>();
+        let store = state.lock();
+        let retained = store.retained_outcome_count();
+        assert_eq!(
+            retained, MAX_IDEMPOTENCY_OUTCOMES,
+            "case {case:?}: the store must stay full at its cap once passed, got {retained}"
+        );
+        let reused_key = (reused_op, REUSED.to_string());
+        assert!(
+            store.recorded_outcome(&reused_key).is_some(),
+            "case {case:?}: the outcome re-recorded under {REUSED:?} was recorded after every \
+             earlier-* one, so {overflow} eviction(s) must not reach it; the store holds \
+             {:?} for it",
+            store.recorded_outcome(&reused_key)
+        );
+        for n in 0..EARLIER {
+            let expected_retained = n >= overflow;
+            let actual_retained = store
+                .recorded_outcome(&(other_op, format!("earlier-{n}")))
+                .is_some();
+            assert_eq!(
+                actual_retained, expected_retained,
+                "case {case:?}: with {overflow} eviction(s) the least recently recorded outcomes \
+                 go first, so earlier-{n} retained should be {expected_retained}, got \
+                 {actual_retained}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

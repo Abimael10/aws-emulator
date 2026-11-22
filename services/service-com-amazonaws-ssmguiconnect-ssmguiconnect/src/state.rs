@@ -51,8 +51,10 @@ pub mod authorization;
 /// plausible in-flight retry window for a singleton that a caller configures rarely:
 /// evicting the oldest entry can only turn a replay that old into a fresh call, which
 /// is the same answer the caller would get from a service whose own idempotency window
-/// had expired. Eviction is FIFO — strictly by insertion order, tracked in
-/// `idempotency_order` — so it never drops a newer outcome to keep an older one.
+/// had expired. Eviction is FIFO — strictly by the order the retained OUTCOMES were
+/// recorded in, tracked in `idempotency_order` — so it never drops a newer outcome to
+/// keep an older one, not even when the newer one reuses a token the store already
+/// held.
 pub const MAX_IDEMPOTENCY_OUTCOMES: usize = 1024;
 
 /// Per-service state for com-amazonaws-ssmguiconnect-ssmguiconnect. A handler reaches it through [`service_state`].
@@ -86,9 +88,11 @@ pub struct ComAmazonawsSsmguiconnectSsmguiconnectState {
     /// replayed against a *different* operation is a different call. Bounded at
     /// [`MAX_IDEMPOTENCY_OUTCOMES`] entries.
     idempotency_tokens: HashMap<IdempotencyKey, StoredResponse>,
-    /// Insertion order of `idempotency_tokens`' keys, which is what makes the
-    /// eviction above FIFO. Holds exactly the map's keys, so the two are inserted
-    /// and removed together.
+    /// The order the retained outcomes were recorded in — least recently first — which
+    /// is what makes the eviction above FIFO. Holds exactly the map's keys, once each,
+    /// so the two are inserted and removed together; re-recording a key moves it to the
+    /// back, because an entry's age is the age of the OUTCOME it holds, not of the
+    /// token that keys it.
     idempotency_order: VecDeque<IdempotencyKey>,
 }
 
@@ -197,7 +201,7 @@ impl ComAmazonawsSsmguiconnectSsmguiconnectState {
     /// resource out from under the token, and answering from the cache would report a
     /// state the next reader does not see.
     pub fn replayable_outcome(&self, key: &IdempotencyKey) -> Option<&StoredResponse> {
-        let outcome = self.idempotency_tokens.get(key)?;
+        let outcome = self.recorded_outcome(key)?;
         let still_current = match outcome {
             StoredResponse::Updated(record) => {
                 self.connection_recording_preferences.as_ref() == Some(record)
@@ -207,18 +211,43 @@ impl ComAmazonawsSsmguiconnectSsmguiconnectState {
         still_current.then_some(outcome)
     }
 
+    /// The outcome still RETAINED under `key`, whether or not a replay could be
+    /// answered from it — `None` once it was evicted (or never recorded).
+    ///
+    /// Retention and replayability are two different questions: an outcome the store
+    /// still holds stops being replayable as soon as a later call changes the resource,
+    /// which is the condition [`Self::replayable_outcome`] adds on top of this one.
+    pub fn recorded_outcome(&self, key: &IdempotencyKey) -> Option<&StoredResponse> {
+        self.idempotency_tokens.get(key)
+    }
+
     /// How many idempotency outcomes are retained. Never above
     /// [`MAX_IDEMPOTENCY_OUTCOMES`].
     pub fn retained_outcome_count(&self) -> usize {
         self.idempotency_tokens.len()
     }
 
-    /// Record `outcome` under `key`, evicting the oldest entries until the store is
-    /// back inside [`MAX_IDEMPOTENCY_OUTCOMES`].
+    /// Record `outcome` under `key`, evicting the least recently recorded entries until
+    /// the store is back inside [`MAX_IDEMPOTENCY_OUTCOMES`].
+    ///
+    /// Re-recording a key the store already holds replaces its place in
+    /// `idempotency_order` as well as its outcome: the queue orders entries by when the
+    /// outcome each holds was recorded, so what is evicted is always the least recently
+    /// recorded outcome. Keeping the old place would let a fresh outcome inherit the age
+    /// of the token's first recording and be dropped ahead of outcomes recorded before
+    /// it.
     fn record_outcome(&mut self, key: IdempotencyKey, outcome: StoredResponse) {
-        if self.idempotency_tokens.insert(key.clone(), outcome).is_none() {
-            self.idempotency_order.push_back(key);
+        let replaced = self.idempotency_tokens.insert(key.clone(), outcome).is_some();
+        // A key that was already held still sits at the place its PREVIOUS outcome was
+        // recorded at; that place describes an outcome the store no longer holds, so it
+        // goes before the fresh one is queued.
+        let stale = replaced
+            .then(|| self.idempotency_order.iter().position(|held| *held == key))
+            .flatten();
+        if let Some(stale) = stale {
+            self.idempotency_order.remove(stale);
         }
+        self.idempotency_order.push_back(key);
         while self.idempotency_tokens.len() > MAX_IDEMPOTENCY_OUTCOMES {
             match self.idempotency_order.pop_front() {
                 Some(oldest) => {
