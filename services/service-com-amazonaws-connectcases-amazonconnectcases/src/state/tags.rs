@@ -340,6 +340,25 @@ impl ComAmazonawsConnectcasesAmazonconnectcasesState {
         }
         Ok(())
     }
+
+    /// Remove every key in `tag_keys` from the tag set of the resource `arn`
+    /// addresses: a key the resource carries is dropped, a key it does not
+    /// carry leaves the set as it was, and nothing else on the record is
+    /// touched.
+    ///
+    /// Resolves exactly as [`Self::merge_resource_tags`] does — a tag write of
+    /// either direction goes through [`Self::resource_tags_mut`], so the two
+    /// cannot disagree about which records a write goes through — and answers
+    /// `None` for an ARN this store holds no such resource for. Removing keys
+    /// only ever SHRINKS the set, so [`MAX_TAGS_PER_RESOURCE`] cannot be
+    /// crossed here and this write has no second way to fail.
+    pub fn remove_resource_tags(&mut self, arn: &str, tag_keys: &[String]) -> Option<()> {
+        let stored = self.resource_tags_mut(arn)?;
+        for key in tag_keys {
+            stored.remove(key);
+        }
+        Some(())
+    }
 }
 
 /// Why a tag write was refused: the resource could not be resolved, or the

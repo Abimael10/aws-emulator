@@ -6,17 +6,21 @@
 //!
 //! The rule under test: `TagResource` merges the request's `tags` into the tag
 //! set of the one resource its `arn` addresses — whatever kind of resource that
-//! ARN names — answering HTTP 200 with an empty body, and `ListTagsForResource`
-//! reports exactly the set the stored record then carries, as does a read of the
-//! resource itself; an ARN that addresses no record a call can go through is
-//! refused with `ResourceNotFoundException` (404) and nothing is written — which
+//! ARN names — answering HTTP 200 with an empty body, `UntagResource` drops
+//! exactly the keys its `tagKeys` names from that same set and leaves every
+//! other pair, and `ListTagsForResource` reports exactly the set the stored
+//! record then carries, as does a read of the resource itself; an ARN that
+//! addresses no record a call can go through is refused with
+//! `ResourceNotFoundException` (404) and nothing is written — which
 //! for a SOFT-deleted record means the tag set stays readable, exactly as the
 //! record's own read does, while a write through the tombstone is refused.
 //!
 //! The tables below are the class, not one recorded call: their rows differ
 //! along the KIND of resource the ARN addresses (every kind this service mints
 //! an ARN for), along the keys and values a tag map carries (count, length,
-//! punctuation, an empty value, a key already present), along how an ARN fails
+//! punctuation, an empty value, a key already present), along the keys one
+//! untag names (a key the resource carries, one it does not, several at once,
+//! the whole set, the same keys again), along how an ARN fails
 //! to resolve (an unknown id of each kind, another region, another account,
 //! another service, a kind this service does not address, a resource that was
 //! deleted, a string that is no ARN at all), and — for the ceiling on one
@@ -28,7 +32,7 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_connectcases_amazonconnectcases::state::MAX_TAGS_PER_RESOURCE;
 
 use crate::harness::{
-    domain, field_of_type, fields_of_every_type, string_at, tags_path, template, Emulator,
+    domain, field_of_type, fields_of_every_type, label, string_at, tags_path, template, Emulator,
 };
 
 /// The service's generic not-found sentence, written out here rather than taken
@@ -52,8 +56,25 @@ const ACCOUNT: &str = "000000000000";
 const LONGEST_TAG_VALUE: usize = 256;
 
 /// Longest key that vocabulary admits: `MutableTagKey` is `@length(1..128)`
-/// (`smithy_query(query="shape",shape="MutableTags")`).
+/// (`smithy_query(query="shape",shape="MutableTags")`), and `TagKey` — the
+/// element type of the key list one untag names — carries the same bound
+/// (`smithy_query(query="shape",shape="TagKeyList")`).
 const LONGEST_TAG_KEY: usize = 128;
+
+/// Most keys ONE untag may name: `TagKeyList` is `@length(0..50)`
+/// (`smithy_query(query="shape",shape="TagKeyList")`).
+const MOST_KEYS_PER_UNTAG: usize = 50;
+
+/// One key-value pair of a tag map, as the tables below spell it.
+type Pair<'a> = (&'a str, &'a str);
+
+/// One step of an untag walk: the case, the keys that untag names, and the
+/// pairs the resource carries once it has been answered.
+type UntagStep<'a> = (&'a str, Vec<&'a str>, Vec<Pair<'a>>);
+
+/// One row of the key-form table: the case, the pairs written first, the keys
+/// the untag names and the pairs left behind.
+type UntagForm<'a> = (&'a str, Vec<Pair<'a>>, Vec<&'a str>, Vec<Pair<'a>>);
 
 /// A tag map as a JSON object, which is how a `Tags` map travels on the wire.
 fn tag_body(tags: &[(&str, &str)]) -> Value {
@@ -108,6 +129,40 @@ async fn tag_resource(emulator: &Emulator, case: &str, arn: &str, tags: &[(&str,
         body,
         Value::Null,
         "case {case:?}: TagResource answers an empty body, got {body:?}"
+    );
+}
+
+/// The `UntagResource` path of one resource: its `tagKeys` member is
+/// `@httpQuery("tagKeys")`
+/// (`smithy_query(query="operation",operation="UntagResource")`), so the keys
+/// travel in the query string, one `tagKeys=` parameter per key, rather than in
+/// a body — the call is a `DELETE`.
+fn untag_path(arn: &str, tag_keys: &[&str]) -> String {
+    let mut path = tags_path(arn);
+    for (index, key) in tag_keys.iter().enumerate() {
+        path.push(if index == 0 { '?' } else { '&' });
+        path.push_str("tagKeys=");
+        path.push_str(&label(key));
+    }
+    path
+}
+
+/// `UntagResource` against `arn` for `tag_keys`, which must answer HTTP 200 with
+/// an EMPTY body: the operation's output shape is `Unit`, so there is nothing
+/// for a caller to parse
+/// (`smithy_query(query="operation",operation="UntagResource")`).
+async fn untag_resource(emulator: &Emulator, case: &str, arn: &str, tag_keys: &[&str]) {
+    let (status, body) = emulator
+        .send("DELETE", &untag_path(arn, tag_keys), None)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from UntagResource, got {status} with body {body:?}"
+    );
+    assert_eq!(
+        body,
+        Value::Null,
+        "case {case:?}: UntagResource answers an empty body, got {body:?}"
     );
 }
 
@@ -734,17 +789,26 @@ async fn an_arn_that_addresses_no_stored_resource_is_refused_and_writes_nothing(
     ];
 
     for (case, arn, resource_type) in &rows {
-        // Both the write and the read of a tag set resolve the same way.
-        for (operation, method, body) in [
+        // The write, the REMOVAL and the read of a tag set all resolve the same
+        // way: whichever way an ARN fails to address a record this store holds,
+        // every tagging call on it is refused alike.
+        for (operation, method, path, body) in [
             (
                 "TagResource",
                 "POST",
+                tags_path(arn),
                 Some(tag_body(&[("team", "leaked")])),
             ),
-            ("ListTagsForResource", "GET", None),
+            ("ListTagsForResource", "GET", tags_path(arn), None),
+            (
+                "UntagResource",
+                "DELETE",
+                untag_path(arn, &["team"]),
+                None,
+            ),
         ] {
             let case = format!("{operation} on {case}");
-            let (status, response) = emulator.send(method, &tags_path(arn), body).await;
+            let (status, response) = emulator.send(method, &path, body).await;
             assert_eq!(
                 (status, response.get("__type").and_then(Value::as_str)),
                 (404, Some("ResourceNotFoundException")),
@@ -769,14 +833,15 @@ async fn an_arn_that_addresses_no_stored_resource_is_refused_and_writes_nothing(
         }
     }
 
-    // Nothing the refused calls carried reached any stored record.
+    // Nothing the refused calls carried reached any stored record, and nothing
+    // the refused removals named was taken off one either.
     for kind in EVERY_KIND {
         let case = format!("{kind:?} after every refusal");
         let reported = list_tags(&emulator, &case, &kind.arn(&resources)).await;
         assert_eq!(
             reported,
             expected_set(&[("team", "support")]),
-            "case {case:?}: a refused tag write stores nothing, got {reported:?}"
+            "case {case:?}: a refused tag write stores and removes nothing, got {reported:?}"
         );
     }
 }
@@ -939,20 +1004,271 @@ async fn a_soft_deleted_resource_keeps_its_tag_set_readable_and_refuses_a_tag_wr
         );
 
         // The write does not: a tombstone is not a resource a caller can take a
-        // new reference to, so the merge is refused and nothing is stored.
+        // new reference to, so the merge is refused and nothing is stored, and
+        // the removal of a key it carries is refused the same way.
+        for (operation, method, path, body) in [
+            (
+                "TagResource",
+                "POST",
+                tags_path(arn),
+                Some(tag_body(&[("env", "prod")])),
+            ),
+            (
+                "UntagResource",
+                "DELETE",
+                untag_path(arn, &["team"]),
+                None,
+            ),
+        ] {
+            let case = format!("{operation} on {case}");
+            let (status, response) = emulator.send(method, &path, body).await;
+            assert_eq!(
+                (status, response.get("__type").and_then(Value::as_str)),
+                (404, Some("ResourceNotFoundException")),
+                "case {case:?}: a tag write through a tombstone is refused, got {status} \
+                 {response:?}"
+            );
+            let unchanged = list_tags(&emulator, &case, arn).await;
+            assert_eq!(
+                unchanged, reported,
+                "case {case:?}: the refused write changes nothing, got {unchanged:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_untag_removes_exactly_the_keys_it_names_from_the_resource_its_arn_addresses() {
+    let emulator = Emulator::new();
+    let resources = one_resource_of_every_kind(&emulator, "untag-every-kind").await;
+
+    // Every kind starts from the same four-pair set, so what one untag leaves
+    // behind is the same question of each kind of resource an ARN addresses.
+    let written = [
+        ("team", "support"),
+        ("env", "prod"),
+        ("owner", "cases-team"),
+        ("retired", ""),
+    ];
+
+    // (case, the keys one untag names, the set the resource then carries) —
+    // rows differ along what the named keys are to the stored set: one key it
+    // carries, a key it does not, several at once with one of each, a key whose
+    // value is empty, the same keys a second time, and the last key it carries.
+    let steps: Vec<UntagStep<'_>> = vec![
+        (
+            "one key the resource carries",
+            vec!["env"],
+            vec![("team", "support"), ("owner", "cases-team"), ("retired", "")],
+        ),
+        (
+            "a key the resource does not carry",
+            vec!["never-written"],
+            vec![("team", "support"), ("owner", "cases-team"), ("retired", "")],
+        ),
+        (
+            "several keys at once, one of them absent",
+            vec!["owner", "never-written"],
+            vec![("team", "support"), ("retired", "")],
+        ),
+        (
+            "a key whose stored value is empty",
+            vec!["retired"],
+            vec![("team", "support")],
+        ),
+        (
+            "the same keys a second time",
+            vec!["owner", "never-written"],
+            vec![("team", "support")],
+        ),
+        ("the last key it carries", vec!["team"], vec![]),
+    ];
+
+    for kind in EVERY_KIND {
+        let arn = kind.arn(&resources);
+        tag_resource(&emulator, &format!("{kind:?} baseline"), &arn, &written).await;
+
+        for (step, keys, remaining) in &steps {
+            let case = format!("{kind:?}: untag {step}");
+            untag_resource(&emulator, &case, &arn, keys).await;
+
+            // Both readers of the one tag set must agree, so a removal that
+            // reached some other record than the one the ARN addressed shows.
+            for (reader, reported) in [
+                ("ListTagsForResource", list_tags(&emulator, &case, &arn).await),
+                (
+                    "the resource's own reader",
+                    tags_through_the_resource(&emulator, &case, kind, &resources).await,
+                ),
+            ] {
+                assert_eq!(
+                    reported,
+                    expected_set(remaining),
+                    "case {case:?}: {reader} must report the set without the keys the untag \
+                     named, got {reported:?}"
+                );
+            }
+        }
+
+        // A tag write after an untag merges into the set the untag left, so a
+        // removed key is a key a later call can write again.
+        let case = format!("{kind:?}: tagged again after the untag");
+        tag_resource(&emulator, &case, &arn, &[("env", "staging")]).await;
+        let reported = list_tags(&emulator, &case, &arn).await;
+        assert_eq!(
+            reported,
+            expected_set(&[("env", "staging")]),
+            "case {case:?}: a removed key must be writable again, got {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_untag_takes_keys_of_every_form_the_vocabulary_admits_and_leaves_every_other_pair() {
+    let emulator = Emulator::new();
+    let longest_key = "k".repeat(LONGEST_TAG_KEY);
+    let whole_set: Vec<String> = (0..MOST_KEYS_PER_UNTAG)
+        .map(|index| format!("key-{index}"))
+        .collect();
+    let whole_set_written: Vec<(&str, &str)> = whole_set
+        .iter()
+        .map(|key| (key.as_str(), "stored"))
+        .collect();
+    let whole_set_named: Vec<&str> = whole_set.iter().map(String::as_str).collect();
+
+    // (case, the pairs written first, the keys the untag names, the pairs left)
+    // — rows differ along the FORM of the keys named: the punctuation `TagKey`
+    // admits, its longest key, as many keys as one list may carry, and keys the
+    // resource carries none of.
+    let rows: Vec<UntagForm<'_>> = vec![
+        (
+            "the punctuation a tag key admits",
+            vec![("cost.center:team/a=b+c-d_e", "team-a"), ("keep", "1")],
+            vec!["cost.center:team/a=b+c-d_e"],
+            vec![("keep", "1")],
+        ),
+        (
+            "the longest key the vocabulary admits",
+            vec![(longest_key.as_str(), "stored"), ("keep", "1")],
+            vec![longest_key.as_str()],
+            vec![("keep", "1")],
+        ),
+        (
+            "as many keys as one untag may name",
+            whole_set_written.clone(),
+            whole_set_named.clone(),
+            vec![],
+        ),
+        (
+            "keys the resource carries none of",
+            vec![("keep", "1"), ("also-keep", "2")],
+            vec!["absent-one", "absent-two"],
+            vec![("keep", "1"), ("also-keep", "2")],
+        ),
+    ];
+
+    for (case, written, named, remaining) in &rows {
+        // Each row runs against a FRESH domain, so what it leaves behind is
+        // exactly what it wrote and then removed.
+        let fresh = domain(&emulator, &format!("untag-forms-{case}")).await;
+        let arn = arn_in(HOME_REGION, ACCOUNT, &format!("domain/{fresh}"));
+        tag_resource(&emulator, case, &arn, written).await;
+        untag_resource(&emulator, case, &arn, named).await;
+        let reported = list_tags(&emulator, case, &arn).await;
+        assert_eq!(
+            reported,
+            expected_set(remaining),
+            "case {case:?}: exactly the keys the untag named must be gone, got {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_untag_is_bounded_by_the_key_list_the_model_declares() {
+    let emulator = Emulator::new();
+    let domain_id = domain(&emulator, "untag-bounds").await;
+    let arn = arn_in(HOME_REGION, ACCOUNT, &format!("domain/{domain_id}"));
+    let written = [("team", "support"), ("env", "prod")];
+    tag_resource(&emulator, "bounds baseline", &arn, &written).await;
+
+    // At the LOW end of what one call may name: a key list with a single key
+    // the resource does not carry has nothing to remove, so it succeeds and
+    // leaves the stored set exactly as it was.
+    untag_resource(&emulator, "a single absent key", &arn, &["absent"]).await;
+    let reported = list_tags(&emulator, "a single absent key", &arn).await;
+    assert_eq!(
+        reported,
+        expected_set(&written),
+        "case \"a single absent key\": an untag naming no stored key removes nothing, got \
+         {reported:?}"
+    );
+
+    // One past each published bound: a list longer than the model admits, and a
+    // key longer than one `TagKey` admits. Both are refused at the boundary
+    // with a 400 `ValidationException`, and the stored set is untouched.
+    let too_many: Vec<String> = (0..=MOST_KEYS_PER_UNTAG)
+        .map(|index| format!("key-{index}"))
+        .collect();
+    let too_many_named: Vec<&str> = too_many.iter().map(String::as_str).collect();
+    let too_long_key = "k".repeat(LONGEST_TAG_KEY + 1);
+    let rows: Vec<(&str, Vec<&str>)> = vec![
+        ("one key more than a list may name", too_many_named),
+        ("a key one character too long", vec![too_long_key.as_str()]),
+    ];
+
+    for (case, named) in &rows {
         let (status, response) = emulator
-            .send("POST", &tags_path(arn), Some(tag_body(&[("env", "prod")])))
+            .send("DELETE", &untag_path(&arn, named), None)
             .await;
         assert_eq!(
             (status, response.get("__type").and_then(Value::as_str)),
-            (404, Some("ResourceNotFoundException")),
-            "case {case:?}: a tag write through a tombstone is refused, got {status} \
-             {response:?}"
+            (400, Some("ValidationException")),
+            "case {case:?}: expected 400 ValidationException, got {status} {response:?}"
         );
-        let unchanged = list_tags(&emulator, case, arn).await;
+        let unchanged = list_tags(&emulator, case, &arn).await;
         assert_eq!(
-            unchanged, reported,
-            "case {case:?}: the refused write stores nothing, got {unchanged:?}"
+            unchanged,
+            expected_set(&written),
+            "case {case:?}: a refused untag removes nothing, got {unchanged:?}"
         );
+    }
+}
+
+#[tokio::test]
+async fn an_untag_touches_only_the_resource_its_arn_addresses() {
+    let emulator = Emulator::new();
+    let resources = one_resource_of_every_kind(&emulator, "untag-one-record").await;
+
+    // One tag set per resource, all alike, so a removal that reached a
+    // neighbouring record of another kind would be visible as a missing pair.
+    for kind in EVERY_KIND {
+        tag_resource(
+            &emulator,
+            &format!("{kind:?} baseline"),
+            &kind.arn(&resources),
+            &[("team", "support"), ("env", "prod")],
+        )
+        .await;
+    }
+
+    for (untagged_index, untagged) in EVERY_KIND.iter().enumerate() {
+        let case = format!("untag {untagged:?}");
+        untag_resource(&emulator, &case, &untagged.arn(&resources), &["env"]).await;
+
+        for (index, kind) in EVERY_KIND.iter().enumerate() {
+            let case = format!("{kind:?} after {case}");
+            let reported = list_tags(&emulator, &case, &kind.arn(&resources)).await;
+            // Only the kinds already untagged have lost the key: every other
+            // resource still carries both pairs it was given.
+            let expected = if index <= untagged_index {
+                expected_set(&[("team", "support")])
+            } else {
+                expected_set(&[("team", "support"), ("env", "prod")])
+            };
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: an untag removes the key from one record only, got {reported:?}"
+            );
+        }
     }
 }

@@ -158,9 +158,11 @@ impl Emulator {
     }
 }
 
-/// Percent-encode one path segment, so an ARN travels in the non-greedy `{arn}`
-/// label of `/tags/{arn}`.
-fn label(value: &str) -> String {
+/// Percent-encode one request value, so it travels in the non-greedy `{arn}`
+/// label of `/tags/{arn}`, or as a query-string value: every byte outside the
+/// unreserved set is escaped, which both a path segment and a query value
+/// admit.
+pub fn label(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
