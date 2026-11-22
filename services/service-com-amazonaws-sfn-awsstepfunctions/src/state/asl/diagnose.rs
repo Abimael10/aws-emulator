@@ -1230,6 +1230,146 @@ const MAP_OBJECT_FIELDS: &[(&str, &[&str])] = &[
     ("WriterConfig", &["OutputType", "Transformation"]),
 ];
 
+/// What a schema diagnostic says about a field whose value the language restricts to a
+/// NAMED SET and the definition wrote outside it: the values the field admits.
+///
+/// RECORDED text, bracketed list and ORDER included. It names no field and does not echo
+/// the rejected value — WHICH field broke the rule is what `location` carries, exactly as
+/// it is for a figure written outside its bound ([`minimum_value_message`]) — so one
+/// sentence serves every field of the schema whose values the language names. The `Type`
+/// member is the one such field the service words its own sentence for
+/// ([`STATE_TYPE_VALUES_MESSAGE`]).
+pub fn field_values_message(values: &[&str]) -> String {
+    format!("Value should be one of the following: [{}]", values.join(", "))
+}
+
+/// One field of the Amazon States Language whose value the language restricts to a
+/// NAMED SET: the field, and the values it admits in the ORDER the service's own
+/// sentence about them lists them ([`field_values_message`], which lists the set as it
+/// stands here).
+///
+/// A value outside the set is a schema error of the object that carries it, reported at
+/// the field itself ([`diagnose_named_values`]), for the reason a figure outside its
+/// bound is ([`Bounded`]): the definition declares work the service cannot do — a
+/// column separator that is no separator, an input format nothing reads, a processor
+/// mode that is neither of the two the language has — so it is refused where it is
+/// submitted rather than failing every execution of the state machine it would have
+/// created. A value of any OTHER JSON type is outside the set like any unknown name is,
+/// as the `Type` member's own reading records.
+struct NamedValues {
+    field: &'static str,
+    values: &'static [&'static str],
+}
+
+/// The fields of the objects a state carries whose values the language names
+/// ([`MAP_OBJECT_FIELDS`] declares those objects; this declares the sets their fields
+/// admit).
+///
+/// The sets are the language's own, and this emulator's data plane reads each of them
+/// in the module that serves it — which is where each entry's source is recorded:
+///
+/// * a `ReaderConfig` says how a dataset's bytes are items
+///   ([`crate::state::item_reader`]): the `InputType` of the dataset, where a CSV
+///   dataset's header row comes from (`CSVHeaderLocation`) and which column separator it
+///   is written with (`CSVDelimiter`);
+/// * a `ProcessorConfig` says how a `Map` state's processor runs — the `Mode` it runs in
+///   and, for the distributed one, the `ExecutionType` its child workflow executions run
+///   as;
+/// * a `WriterConfig` says how the results of such a state are written
+///   ([`crate::state::result_writer`]): the `OutputType` of the dataset it writes and the
+///   `Transformation` applied to the results before they are written.
+///
+/// `MANIFEST` is an `InputType` of a dataset this emulator does not READ — an Amazon S3
+/// Inventory manifest — and is in the set all the same: what the set says is which values
+/// the LANGUAGE admits, so a definition naming one is created and the state that reads it
+/// says what was not read ([`crate::state::item_reader`]), exactly as it does for every
+/// other dataset it cannot read.
+const NAMED_VALUE_FIELDS: &[NamedValues] = &[
+    NamedValues {
+        field: "InputType",
+        values: &["CSV", "JSON", "JSONL", "MANIFEST"],
+    },
+    NamedValues {
+        field: "CSVHeaderLocation",
+        values: &["FIRST_ROW", "GIVEN"],
+    },
+    NamedValues {
+        field: "CSVDelimiter",
+        // RECORDED order, which is neither the sorted one nor the one the member's
+        // documentation lists.
+        values: &["COMMA", "SEMICOLON", "PIPE", "SPACE", "TAB"],
+    },
+    NamedValues {
+        field: "Mode",
+        values: &["INLINE", DISTRIBUTED_MODE],
+    },
+    NamedValues {
+        field: "ExecutionType",
+        values: &[
+            crate::state::STATE_MACHINE_TYPE_STANDARD,
+            crate::state::STATE_MACHINE_TYPE_EXPRESS,
+        ],
+    },
+    NamedValues {
+        field: "OutputType",
+        values: &["JSON", "JSONL"],
+    },
+    NamedValues {
+        field: "Transformation",
+        values: &["NONE", "COMPACT", "FLATTEN"],
+    },
+    // A retrier spreads its waits by one of the two strategies the language names:
+    // "If you choose FULL ... If you choose NONE" (`super::JITTER_STRATEGY_FULL` is the
+    // one this emulator spreads by).
+    NamedValues {
+        field: "JitterStrategy",
+        values: &[super::JITTER_STRATEGY_FULL, "NONE"],
+    },
+];
+
+/// The values the language admits for the field `field`, or `None` for a field whose
+/// value it does not restrict to a named set ([`NAMED_VALUE_FIELDS`]).
+fn declared_field_values(field: &str) -> Option<&'static [&'static str]> {
+    NAMED_VALUE_FIELDS
+        .iter()
+        .find(|named| named.field == field)
+        .map(|named| named.values)
+}
+
+/// The NAMED-VALUE rules of ONE object of the definition: each field it writes that the
+/// language restricts to a named set and the object wrote outside that set, reported at
+/// the field itself.
+///
+/// A field is judged only where the object DECLARES it (`declared`, the object's own
+/// closed field set), exactly as a bounded figure is: a field the object cannot carry is
+/// reported as the unsupported field it is rather than twice.
+fn diagnose_named_values(
+    object: &Map<String, Value>,
+    declared: &[&str],
+    here: &str,
+    into: &mut Diagnosis,
+) {
+    for field in into.order().names(here, object) {
+        if !declared.contains(&field.as_str()) {
+            continue;
+        }
+        let Some(values) = declared_field_values(field) else {
+            continue;
+        };
+        let Some(written) = object.get(field) else {
+            continue;
+        };
+        if written.as_str().is_some_and(|written| values.contains(&written)) {
+            continue;
+        }
+        into.push(error(
+            SCHEMA_VALIDATION_FAILED,
+            at(&nested_at(here, format_args!("/{}", echoed(field))), ""),
+            field_values_message(values),
+        ));
+    }
+}
+
 /// The fields the language declares on the object `member` carries, or `None` for a
 /// member whose value is not such an object ([`MAP_OBJECT_FIELDS`]).
 fn declared_object_fields(member: &str) -> Option<&'static [&'static str]> {
@@ -2437,6 +2577,9 @@ fn diagnose_declared_objects(
                 ));
             }
         }
+        // And the values this object's own fields carry, where the language names the
+        // values one of them admits ([`NAMED_VALUE_FIELDS`]).
+        diagnose_named_values(members, fields, &at_object, into);
     }
 }
 
@@ -2654,6 +2797,11 @@ fn diagnose_error_handlers(
             // and one written there is reported as the unsupported field it is above
             // rather than twice.
             diagnose_figures(entry, RETRIER_FIGURES, fields, &at_entry, into);
+            // And its `JitterStrategy` names one of the two strategies the language
+            // has, judged by the one checker every named-value field is judged by
+            // ([`NAMED_VALUE_FIELDS`]) and only where the entry declares it — a catcher
+            // declares none of these fields.
+            diagnose_named_values(entry, fields, &at_entry, into);
         }
     }
 }

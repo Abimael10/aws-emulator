@@ -393,15 +393,21 @@ fn both_names_of_every_called_service_are_the_same_letters() {
             );
         }
         // The exception half is the answer's own error class, so it is the same through
-        // either family: only the service half may differ.
+        // either family: only the service half may differ. A service whose model declares
+        // no error SHAPE has no class for any code it answers, so every refusal of it is
+        // the base exception its client raises ([`Api::models_errors`]).
         let shape = "ResourceNotFoundException";
+        let exception = match api.models_errors {
+            true => shape,
+            false => api.sdk_exception,
+        };
         for (family, expected) in [
             (Family::Optimized, api.error_prefix),
             (Family::AwsSdk, api.sdk_error_prefix),
         ] {
             assert_eq!(
                 api.task_error(family, shape),
-                format!("{expected}.{shape}"),
+                format!("{expected}.{exception}"),
                 "case {case:?}: expected {family:?} to name the service {expected:?}"
             );
             assert_eq!(

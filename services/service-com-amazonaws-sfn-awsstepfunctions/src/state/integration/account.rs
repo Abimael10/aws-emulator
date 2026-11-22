@@ -54,6 +54,7 @@ pub(super) static ACCOUNT_API: Api = Api {
     // the wire spelling of each is the model's own.
     member_case: MemberCase::Pascal,
     query_compatible: false,
+    models_errors: true,
 };
 
 /// This service's ARN namespace, its signing name and its endpoint prefix, which are the

@@ -69,6 +69,7 @@ pub(super) static RDS_API: Api = Api {
     // modifier, so an error of it is named by its own query code and there is no second
     // name to ask for.
     query_compatible: false,
+    models_errors: true,
 };
 
 /// The Query code AWS's authorization layer answers an unauthorized call of a service

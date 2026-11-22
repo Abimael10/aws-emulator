@@ -753,6 +753,12 @@ impl Interpreter<'_> {
                             .map_or(state, |(_, rule)| rule);
                         self.jsonpath_assign(owner, &effective, &context)
                             .map_err(|failure| failure.at(at))?;
+                        // A `Choice` assigns as part of the TRANSITION its selected rule
+                        // decides, so what it assigned is in scope for the output of that
+                        // transition — the rule the other query language's `Choice`
+                        // follows too ([`Interpreter::choice_output`]), and the one node
+                        // whose own assignment its own output reads.
+                        VariableScope::reinstall(&self.variables);
                         self.output_value(state, effective.clone(), &context)
                             .map_err(|failure| failure.at(at))?
                     }
@@ -889,9 +895,16 @@ impl Interpreter<'_> {
     ///
     /// Each member is one variable and they are evaluated IN ORDER, so an assignment
     /// reads the ones written before it — the rule the other language's `Assign` follows
-    /// too ([`Interpreter::jsonata_assign`]). All of them spend from the ONE budget a
+    /// too ([`Interpreter::jsonata_output`]). All of them spend from the ONE budget a
     /// payload template is given, so a state cannot build more than one document however
     /// many variables it declares.
+    ///
+    /// What the block assigns COMMITS for the nodes AFTER this one: the scope the node's
+    /// own remaining fields are evaluated against is put back to the one it was reached
+    /// with, so a node that both reads and writes one variable reads the value the run
+    /// already held and the next state is the first to read what this block wrote. The
+    /// committed scope is the one the interpreter carries, which is what the next state's
+    /// turn installs ([`VariableScope::of`]).
     ///
     /// A block that cannot be built assigns NOTHING: the values are rendered into a copy
     /// of the scope and installed once, so no later state reads half of one state's
@@ -909,6 +922,7 @@ impl Interpreter<'_> {
             runtime(format!("'{ASSIGN_MEMBER}' must be a JSON object of variables"))
         })?;
         let built = self.build_assignments(assignments, read, context);
+        let reached_with = ::std::mem::take(&mut self.variables);
         let Assigned {
             variables,
             reported,
@@ -919,11 +933,15 @@ impl Interpreter<'_> {
                 // one that failed were installed for the members after it to read, so
                 // the scope the REST of this state's expressions read is put back as
                 // the state found it — it is the scope `self.variables` still holds.
-                VariableScope::reinstall(&self.variables);
+                VariableScope::reinstall(&reached_with);
+                self.variables = reached_with;
                 return Err(failure);
             }
         };
         self.variables = variables;
+        // And the scope this node's own remaining fields read is that same one: what
+        // the block assigned commits for the nodes AFTER this one.
+        VariableScope::reinstall(&reached_with);
         // What THIS state assigned, for the event it is left by: a state that assigns
         // nothing reports nothing, whatever the scope around it holds.
         self.assigned.extend(reported);
@@ -1009,11 +1027,16 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// A JSONata state's `Assign`, and then the `Output` those assignments feed.
+    /// A JSONata state's `Assign`, and the `Output` it is evaluated beside.
     ///
-    /// "Assign ... store values in variables": the assignments are evaluated FIRST,
-    /// so a variable this state assigns is in scope for its own `Output`, and they
-    /// outlive the state — which is what a later state reads them through.
+    /// "Assign ... store values in variables", and what a node assigns is in scope for
+    /// the nodes AFTER it: the assignments COMMIT when the node is done with its own
+    /// fields, so this node's `Output` is evaluated against the variables the run held
+    /// when the node was reached and the next state is the first to read what this
+    /// `Assign` wrote. A node that both reads and writes one variable therefore puts out
+    /// the value it was reached with, which is the value a later state no longer sees —
+    /// the rule the other query language's `Assign` follows too
+    /// ([`Interpreter::jsonpath_assign`]).
     ///
     /// A node that declares no `Output` puts out what the state's own data flow owes
     /// at that point: "when a state reports an error and it matches a catcher, the
@@ -1046,6 +1069,10 @@ impl Interpreter<'_> {
                     .cloned()
                     .unwrap_or_else(|| input.clone())),
                 Some(template) => {
+                    // Evaluated against the scope the node was REACHED with: what its
+                    // own `Assign` wrote commits for the nodes after it, so the
+                    // committed scope is put back once this field is built.
+                    let committed = ::std::mem::replace(&mut self.variables, scope.clone());
                     let rendered = {
                         let bindings = self.bindings(input, context, result, error_output);
                         super::super::jsonata::render(
@@ -1055,6 +1082,7 @@ impl Interpreter<'_> {
                             &mut budget,
                         )
                     };
+                    self.variables = committed;
                     rendered.map_err(jsonata_failure)
                 }
             });
@@ -2219,6 +2247,11 @@ impl Interpreter<'_> {
         match template {
             None => Ok(input.clone()),
             Some(template) => {
+                // Over the variables the `Assign` that applied has just written, which is
+                // what this state's own `Output` reads: a `Choice` assigns as part of the
+                // TRANSITION its selected rule decides, so the assignment is in scope for
+                // the output of that transition — unlike the `Assign` of a state whose own
+                // data flow builds its output ([`Interpreter::jsonata_output`]).
                 let rendered = {
                     let bindings = self.bindings(input, context, None, None);
                     super::super::jsonata::render(&template, &at, &bindings, &mut budget)

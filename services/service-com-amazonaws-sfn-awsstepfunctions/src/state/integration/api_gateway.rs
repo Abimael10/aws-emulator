@@ -116,6 +116,7 @@ pub(super) static API_GATEWAY_API: Api = Api {
     // and they are read here rather than put on the wire as an operation's members.
     member_case: MemberCase::Pascal,
     query_compatible: false,
+    models_errors: true,
 };
 
 /// The member that names the api's invoke endpoint: "the hostname of an API Gateway URL",

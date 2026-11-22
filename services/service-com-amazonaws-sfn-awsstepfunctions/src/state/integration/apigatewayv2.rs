@@ -60,6 +60,7 @@ pub(super) static APIGATEWAYV2_API: Api = Api {
     // spelling of every member of this model is its name lower-camelled.
     member_case: MemberCase::LowerCamel,
     query_compatible: false,
+    models_errors: true,
 };
 
 /// The operation that lists an account's apis, as that model spells it.

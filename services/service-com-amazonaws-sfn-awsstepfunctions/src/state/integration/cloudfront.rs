@@ -53,6 +53,7 @@ pub(super) static CLOUDFRONT_API: Api = Api {
     // `CreateInvalidation`'s input: `DistributionId`, `InvalidationBatch`.
     member_case: MemberCase::Pascal,
     query_compatible: false,
+    models_errors: true,
 };
 
 /// CloudFront's ARN namespace, its signing name and its endpoint prefix, which are the

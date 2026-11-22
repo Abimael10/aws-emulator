@@ -46,6 +46,7 @@ pub(super) static S3_API: Api = Api {
     // `GetObject`'s input: `Bucket`, `Key`; `ListObjectsV2`'s: `Bucket`, `Prefix`.
     member_case: MemberCase::Pascal,
     query_compatible: false,
+    models_errors: true,
 };
 
 /// S3's ARN namespace, its signing name and its endpoint prefix, which are the same

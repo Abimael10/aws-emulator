@@ -395,10 +395,13 @@ async fn what_cannot_be_run_in_process_fails_rather_than_being_faked() {
         },
         RunCase {
             // The datasets this emulator DOES read are read from S3 for real
-            // (`tests/all/map_item_reader.rs`); an `InputType` outside those is still
-            // not read, and says so.
+            // (`tests/all/map_item_reader.rs`); an `InputType` the LANGUAGE admits and
+            // this emulator does not read — an Amazon S3 Inventory `MANIFEST` — is
+            // still not read, and says so. A value the language does not admit at all
+            // never reaches a run: it is refused where the definition is submitted
+            // (`tests/all/definition_named_values.rs`).
             case: "a Distributed Map's ItemReader whose InputType is not read",
-            definition: r#"{"StartAt":"M","States":{"M":{"Type":"Map","ItemReader":{"Resource":"arn:aws:states:::s3:getObject","ReaderConfig":{"InputType":"PARQUET"},"Parameters":{"Bucket":"b","Key":"k"}},"ItemProcessor":{"ProcessorConfig":{"Mode":"DISTRIBUTED"},"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},"End":true}}}"#,
+            definition: r#"{"StartAt":"M","States":{"M":{"Type":"Map","ItemReader":{"Resource":"arn:aws:states:::s3:getObject","ReaderConfig":{"InputType":"MANIFEST"},"Parameters":{"Bucket":"b","Key":"k"}},"ItemProcessor":{"ProcessorConfig":{"Mode":"DISTRIBUTED"},"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},"End":true}}}"#,
             input: "{}",
             expected: Expected::Failure("States.Runtime"),
         },

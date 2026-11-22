@@ -54,6 +54,7 @@ pub const APIS: &[Api] = &[
         // `StartQueryExecution`'s input: `QueryString`, `WorkGroup`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-backup-cryocontrollerusermanager/smithy-model/
     // com-amazonaws-backup-cryocontrollerusermanager.json`: restJson1, sigv4Name
@@ -81,6 +82,7 @@ pub const APIS: &[Api] = &[
         // `StartBackupJob`'s input: `BackupVaultName`, `ResourceArn`, `IamRoleArn`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-dynamodb-dynamodb-20120810/smithy-model/
     // com-amazonaws-dynamodb-dynamodb-20120810.json`: awsJson1_0, sigv4Name
@@ -112,6 +114,7 @@ pub const APIS: &[Api] = &[
         // `PutItem`'s input: `TableName`, `Item`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-sqs-amazonsqs/smithy-model/
     // com-amazonaws-sqs-amazonsqs.json`: awsJson1_0, sigv4Name `sqs`,
@@ -147,6 +150,7 @@ pub const APIS: &[Api] = &[
         // legacy query codes (`AWS.SimpleQueueService.NonExistentQueue`) beside their
         // shapes.
         query_compatible: true,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-sns-amazonsimplenotificationservice/smithy-model/
     // com-amazonaws-sns-amazonsimplenotificationservice.json`: awsQuery, sigv4Name
@@ -185,6 +189,7 @@ pub const APIS: &[Api] = &[
         // compatibility modifier, so an error of it is named by its own query code and
         // there is no second name to ask for.
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-eventbridge-awsevents/smithy-model/
     // com-amazonaws-eventbridge-awsevents.json`: awsJson1_1, sigv4Name `events`,
@@ -214,6 +219,7 @@ pub const APIS: &[Api] = &[
         // `PutEvents`' input: `Entries`, `EndpointId`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
+        models_errors: true,
     },
     // This service itself, for a task that starts another execution:
     // `services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/
@@ -246,6 +252,7 @@ pub const APIS: &[Api] = &[
         // `StartExecution`'s input: `stateMachineArn`, `name`, `input`.
         member_case: MemberCase::LowerCamel,
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-kinesis-kinesis-20131202/smithy-model/
     // com-amazonaws-kinesis-kinesis-20131202.json`: awsJson1_1, sigv4Name
@@ -275,6 +282,7 @@ pub const APIS: &[Api] = &[
         // `PutRecord`'s input: `StreamName`, `Data`, `PartitionKey`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-ssm-amazonssm/smithy-model/
     // com-amazonaws-ssm-amazonssm.json`: awsJson1_1, sigv4Name `ssm`,
@@ -302,6 +310,7 @@ pub const APIS: &[Api] = &[
         // `GetParameter`'s input: `Name`, `WithDecryption`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/
     // smithy-model/com-amazonaws-ecs-amazonec2containerservicev20141113.json`:
@@ -331,6 +340,7 @@ pub const APIS: &[Api] = &[
         // `RunTask`'s input: `cluster`, `taskDefinition`, `overrides`.
         member_case: MemberCase::LowerCamel,
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-glue-awsglue/smithy-model/
     // com-amazonaws-glue-awsglue.json`: awsJson1_1, sigv4Name `glue`, endpointPrefix
@@ -358,6 +368,7 @@ pub const APIS: &[Api] = &[
         // `StartJobRun`'s input: `JobName`, `Arguments`, `Timeout`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-lambda-awsgirapiservice/smithy-model/
     // com-amazonaws-lambda-awsgirapiservice.json`: restJson1, sigv4Name `lambda`,
@@ -383,6 +394,7 @@ pub const APIS: &[Api] = &[
         // `Invoke`'s input: `FunctionName`, `Payload`, `InvocationType`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
+        models_errors: true,
     },
     // `services/service-com-amazonaws-sts-awssecuritytokenservicev20110615/
     // smithy-model/com-amazonaws-sts-awssecuritytokenservicev20110615.json`: awsQuery,
@@ -421,6 +433,7 @@ pub const APIS: &[Api] = &[
         // compatibility modifier, so an error of it is named by its own query code and
         // there is no second name to ask for.
         query_compatible: false,
+        models_errors: true,
     },
 ];
 
@@ -443,4 +456,5 @@ pub(super) static AWS_SDK_APIS: &[&Api] = &[
     &account::ACCOUNT_API,
     &apigatewayv2::APIGATEWAYV2_API,
     &rds::RDS_API,
+    &ec2::EC2_API,
 ];

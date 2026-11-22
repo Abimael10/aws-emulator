@@ -185,19 +185,31 @@ fn local_name(name: &[u8]) -> String {
 ///
 /// S3's model sets `noErrorWrapping`, so a refusal's `Code` and `Message` are the
 /// root's own children; an `awsQuery` refusal wraps the same pair in an `Error`
-/// element, which is read through to the same object. `None` for a body that is not an
+/// element, and an `ec2Query` one wraps that element in an `Errors` element inside the
+/// response — each read through to the same object. `None` for a body that is not an
 /// XML document at all.
+///
+/// The ENVELOPE's own text children are carried beside the error's, which is where a form
+/// protocol names the request it answers (`<RequestId>` in the `awsQuery` envelope,
+/// `<RequestID>` in the `ec2Query` one): an exception a client raises reports that
+/// identifier in its metadata, so it is part of the one reading of a refusal. The error's
+/// own members win, because they are what the refusal itself states.
 #[must_use]
 pub fn as_document(xml: &[u8]) -> Option<::serde_json::Value> {
     let root = read(xml).ok()?;
-    let carried = root.child(ERROR_ELEMENT).unwrap_or(&root);
+    let carried = root
+        .child(ERROR_ELEMENT)
+        .or_else(|| {
+            root.child(ERRORS_ELEMENT)
+                .and_then(|errors| errors.child(ERROR_ELEMENT))
+        })
+        .unwrap_or(&root);
     let mut members = ::serde_json::Map::new();
-    for child in &carried.children {
+    for child in carried.children.iter().chain(root.children.iter()) {
         if child.children.is_empty() {
-            members.insert(
-                child.name.clone(),
-                ::serde_json::Value::String(child.text.clone()),
-            );
+            members
+                .entry(child.name.clone())
+                .or_insert_with(|| ::serde_json::Value::String(child.text.clone()));
         }
     }
     Some(::serde_json::Value::Object(members))
@@ -205,6 +217,11 @@ pub fn as_document(xml: &[u8]) -> Option<::serde_json::Value> {
 
 /// The element an `awsQuery` refusal wraps its `Code` and `Message` in.
 const ERROR_ELEMENT: &str = "Error";
+
+/// The element an `ec2Query` refusal wraps that one in:
+/// `<Response><Errors><Error>…</Error></Errors></Response>`, which is that protocol's
+/// own error envelope.
+const ERRORS_ELEMENT: &str = "Errors";
 
 /// `element` as the JSON document its tree carries: an element with no children is the
 /// TEXT it holds, one with children is the object of those children, and a name the
@@ -369,6 +386,28 @@ mod tests {
             document.get("Code").and_then(::serde_json::Value::as_str),
             Some("ValidationError"),
             "the code is read through the Error element, got {document:?}"
+        );
+    }
+
+    #[test]
+    fn an_ec2_refusal_is_read_through_its_errors_element() {
+        let document = as_document(
+            b"<Response><Errors><Error><Code>InvalidInstanceID.NotFound</Code>\
+              <Message>The instance ID 'i-1' does not exist</Message></Error></Errors>\
+              <RequestID>r-1</RequestID></Response>",
+        )
+        .expect("the refusal reads");
+        assert_eq!(
+            document.get("Code").and_then(::serde_json::Value::as_str),
+            Some("InvalidInstanceID.NotFound"),
+            "the code is read through the Errors element, got {document:?}"
+        );
+        assert_eq!(
+            document
+                .get("Message")
+                .and_then(::serde_json::Value::as_str),
+            Some("The instance ID 'i-1' does not exist"),
+            "the message is read through the Errors element, got {document:?}"
         );
     }
 

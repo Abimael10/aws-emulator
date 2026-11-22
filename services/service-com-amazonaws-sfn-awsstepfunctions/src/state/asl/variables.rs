@@ -47,10 +47,10 @@ impl VariableScope {
         }
     }
 
-    /// Install `variables` as the scope from here on, for a state whose own `Assign`
-    /// has just written to it: "a variable this state assigns is in scope for the
-    /// state's own expressions", so what the state evaluates after its assignments
-    /// reads them.
+    /// Install `variables` as the scope from here on, for a node whose own `Assign` has
+    /// just been built: what a node assigns is read by the nodes AFTER it, so the scope
+    /// the node's own remaining fields read is put back to the one it was reached with
+    /// ([`super::Interpreter::jsonpath_assign`]).
     pub(super) fn reinstall(variables: &BTreeMap<String, Value>) {
         SCOPE.with(|scope| scope.replace(variables.clone()));
     }

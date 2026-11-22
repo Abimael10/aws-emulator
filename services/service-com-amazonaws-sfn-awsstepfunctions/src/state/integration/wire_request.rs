@@ -158,6 +158,25 @@ pub(super) fn wired(call: &Call, request: &Value) -> Result<Wired, String> {
                     media_type: None,
                 })
             }
+            // An `ec2Query` request is a FORM too, and the names its fields carry are
+            // the invoked model's per operation ([`super::ec2`]).
+            Wire::Ec2Query { version } => {
+                let form = super::ec2::form(&call.operation).ok_or_else(|| {
+                    format!(
+                        "the '{}' call of {} carries no request binding for that service's \
+                         form-field protocol",
+                        call.operation, call.api.sdk_id
+                    )
+                })?;
+                return Ok(Wired {
+                    method: "POST",
+                    uri: "/".to_string(),
+                    target: None,
+                    headers: Vec::new(),
+                    body: super::ec2::ec2_form_body(form, version, &document)?.into_bytes(),
+                    media_type: None,
+                });
+            }
             // A service whose protocol is a REST one reaches this only for a call
             // carrying no binding, which [`read`] does not produce.
             Wire::Rest(_) => {

@@ -183,6 +183,12 @@ service-com-amazonaws-xray-awsxray = { workspace = true }
 # served by that api's own `execute-api` data plane out of the records its control plane
 # stored.
 service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
+# The service a `Task` state's AWS SDK integration calls in
+# `tests/all/ec2_sdk_task_integration.rs`, whose protocol is the form one EC2 alone
+# speaks (`ec2Query`): mounted beside Step Functions on the one engine the test router
+# builds, so the instances a task launches are stored by EC2's own handler and read back
+# through its own API, and a call it refuses is refused for EC2's own reasons.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The service that holds the account's TRAILS, mounted beside Step Functions in
 # `tests/all/sync_execution_trail_data_selector.rs`: the trail there is created, given its
 # advanced event selectors and started through CloudTrail's OWN API, so what a synchronous

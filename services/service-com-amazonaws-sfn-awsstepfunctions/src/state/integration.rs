@@ -486,6 +486,15 @@ pub struct Api {
     /// exceptions report. A client asks for it with [`QUERY_MODE_HEADER`], which is why
     /// the call made for a `Task` state asks for it too.
     pub query_compatible: bool,
+    /// Whether its model declares error SHAPES at all — the `errors` list of its
+    /// operations (`smithy_query(query="operation")`).
+    ///
+    /// A service whose model declares NONE still refuses calls, with codes of its own
+    /// that no shape of that model names: no client has a class for any of them, so its
+    /// deserializer resolves EVERY refusal to the base exception
+    /// ([`Api::sdk_exception`]), which is the error name a `Task` state then reports
+    /// ([`Api::exception_of`]). True for all but one service here.
+    pub models_errors: bool,
 }
 
 /// The code the AWS-common authorization refusal names its class by — "Common Errors":
@@ -525,8 +534,8 @@ impl Api {
             // is a blob is the bytes themselves, which is what the one REST operation
             // bound here sends.
             Wire::Rest(_) => REST_CONTENT_TYPE.to_string(),
-            // `awsQuery` carries the whole request as form fields.
-            Wire::Query { .. } => FORM_CONTENT_TYPE.to_string(),
+            // `awsQuery` and `ec2Query` carry the whole request as form fields.
+            Wire::Query { .. } | Wire::Ec2Query { .. } => FORM_CONTENT_TYPE.to_string(),
         }
     }
 
@@ -536,7 +545,7 @@ impl Api {
     /// stated for.
     fn rest(&self, operation: &str) -> Option<&'static Rest> {
         match self.wire {
-            Wire::Json { .. } | Wire::Query { .. } => None,
+            Wire::Json { .. } | Wire::Query { .. } | Wire::Ec2Query { .. } => None,
             Wire::Rest(bound) => bound.iter().find(|rest| rest.operation == operation),
         }
     }
@@ -575,6 +584,12 @@ impl Api {
     /// names the shape that service's model binds the code to, which is the shape its
     /// own client resolves the answer to ([`Wire::Query`]).
     fn exception_of(&self, shape: &str) -> String {
+        // A service whose model declares no error shape at all has no class for any code
+        // it answers, so its client resolves every refusal to the base exception
+        // ([`Api::models_errors`]).
+        if !self.models_errors {
+            return self.sdk_exception.to_string();
+        }
         let namespace = shape.rsplit_once('#').map(|(namespace, _)| namespace);
         let named = bare_name(shape);
         if namespace.is_some_and(|namespace| FRAMEWORK_NAMESPACES.contains(&namespace))
@@ -600,7 +615,7 @@ impl Api {
                 .iter()
                 .find(|(code, _)| *code == named)
                 .map_or(named, |(_, shape)| *shape),
-            Wire::Json { .. } | Wire::Rest(_) => named,
+            Wire::Json { .. } | Wire::Rest(_) | Wire::Ec2Query { .. } => named,
         }
     }
 
@@ -743,6 +758,16 @@ pub enum Wire {
         /// code whose shape name is the code's is not listed, because the suffix rule
         /// already answers for it.
         exceptions: &'static [(&'static str, &'static str)],
+    },
+    /// `ec2Query`: a FORM protocol like `awsQuery` and not the same one — a list is
+    /// numbered under the field its own member goes under, the field names are the
+    /// invoked model's per operation, and an answer wraps the operation's members in no
+    /// result element. Amazon EC2's protocol, whose bindings and whose reading of an
+    /// answer are stated beside its own entry ([`ec2`]).
+    Ec2Query {
+        /// The API version its model declares (`service.version`), which every request
+        /// to such a service names beside the action.
+        version: &'static str,
     },
 }
 
@@ -2922,7 +2947,7 @@ pub fn read(resource: &str) -> Result<Call, String> {
     let rest = match api.wire {
         // An AWS JSON service's every operation takes the same request shape, and a
         // FORM one's is built from the action and the input's own members.
-        Wire::Json { .. } | Wire::Query { .. } => None,
+        Wire::Json { .. } | Wire::Query { .. } | Wire::Ec2Query { .. } => None,
         Wire::Rest(_) => Some(api.rest(&operation).ok_or_else(|| {
             format!(
                 "'{shown}' names the '{operation}' operation of {}, whose request this emulator \
@@ -2931,6 +2956,17 @@ pub fn read(resource: &str) -> Result<Call, String> {
             )
         })?),
     };
+    // The `ec2Query` protocol spreads a request over form fields under names the invoked
+    // model gives each member per operation, so a call is made only for an operation
+    // whose own bindings this emulator carries ([`ec2::form`]) — exactly as a REST
+    // service's is above.
+    if matches!(api.wire, Wire::Ec2Query { .. }) && ec2::form(&operation).is_none() {
+        return Err(format!(
+            "'{shown}' names the '{operation}' operation of {}, whose request this emulator does \
+             not bind to that service's form-field protocol, so nothing was run for it",
+            api.sdk_id
+        ));
+    }
     Ok(Call {
         api,
         // Which family the `Resource` read as is what names a refusal of this call.
@@ -4170,6 +4206,11 @@ pub async fn call_api_as(
                     Wire::Query { .. } if (200..300).contains(&answered.status) => {
                         query_result(&call.operation, &answered.payload)
                     }
+                    // An `ec2Query` answer wraps them in no result element at all, and
+                    // names each under the element its own model gives it ([`ec2`]).
+                    Wire::Ec2Query { .. } if (200..300).contains(&answered.status) => {
+                        ec2::ec2_result(&call.operation, &answered.payload)
+                    }
                     _ => answer_of(
                         Called {
                             api,
@@ -4473,10 +4514,12 @@ fn bound_field(rest: Option<&Rest>, carried: &str) -> String {
 /// raises. The cause is that exception's own message ([`sdk_exception_cause`]).
 /// A refusal with no code at all is left as ASL's own [`TASK_FAILED_ERROR`].
 ///
-/// `request_id` is the identifier the answer named the request it refused by, which
-/// the SDK reports in the exception's metadata; `None` for an answer that named none,
-/// and nothing is invented to fill the field. `query_code` is the legacy query code the
-/// answer named the class by for a service whose model is query-compatible
+/// `request_id` is the identifier the answer named the request it refused by in a HEADER,
+/// which the SDK reports in the exception's metadata; an answer that names it in the error
+/// ENVELOPE instead — which is where a form protocol carries it — is read out of the
+/// document ([`envelope_request_id`]), and a refusal naming none anywhere is reported
+/// without one rather than with an invented identifier. `query_code` is the legacy query
+/// code the answer named the class by for a service whose model is query-compatible
 /// ([`Api::query_compatible`]), which is the code such a service's own client reports.
 ///
 /// Pure, so the reading of every answer form is pinned by this module's own tests.
@@ -4508,6 +4551,9 @@ fn answer_of(
         return Ok(document.unwrap_or_else(|| Value::Object(Map::new())));
     }
     let shape = error_shape(error_type, document.as_ref());
+    let named_request = request_id
+        .map(str::to_string)
+        .or_else(|| document.as_ref().and_then(envelope_request_id));
     let message = document
         .as_ref()
         .and_then(error_message)
@@ -4535,7 +4581,7 @@ fn answer_of(
                 &message,
                 query_code.unwrap_or_else(|| bare_name(&shape)),
                 status,
-                request_id,
+                named_request.as_deref(),
             ),
         ),
         None => (
@@ -4819,6 +4865,23 @@ fn error_message(document: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The identifier a refusal's own ENVELOPE names the request it answers by, under either
+/// of the spellings a form protocol writes it in: `RequestId` in the `awsQuery` envelope
+/// and `RequestID` in the `ec2Query` one, read out of the document the refusal was read as
+/// ([`super::xml_answer::as_document`], which carries the envelope's own children beside
+/// the error's).
+///
+/// It is the identifier the SDK reports in the exception's metadata for such a service,
+/// which no header of those answers carries — so this is where the id a `Catch` path reads
+/// out of the cause comes from.
+fn envelope_request_id(document: &Value) -> Option<String> {
+    ["RequestId", "RequestID"]
+        .iter()
+        .find_map(|member| document.get(*member).and_then(Value::as_str))
+        .filter(|named| !named.is_empty())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -4856,6 +4919,10 @@ mod apigatewayv2;
 
 /// Amazon RDS's own wire facts, reached through the AWS SDK integration family alone.
 mod rds;
+
+/// Amazon EC2's own wire facts and per-operation form bindings, reached through the AWS
+/// SDK integration family alone.
+mod ec2;
 
 /// The optimized Amazon API Gateway integration: the `Task` state whose work is a
 /// request to a deployed API stage.
