@@ -28,6 +28,9 @@ tracing = { workspace = true }
 # training and tuning data, and the custom-vocabulary and vocabulary-filter creates
 # and updates store the text file their reported `DownloadUri` serves.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# Reads the audio properties out of a stored media file's own container and codec
+# headers, which is where the sample rate a finished job reports is determined from.
+lofty = { version = "0.25" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -44,6 +47,10 @@ hex = { workspace = true }
 # the data a model is trained from, and a vocabulary's and a filter's content is stored
 # in object storage by calling S3 in process and fetched back by its reported location.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# Writes the RIFF/WAVE fixtures the determined-media-properties suite uploads, so the
+# media a job is pointed at carries a real container header stating a real sample rate
+# rather than bytes shaped like one.
+hound = "3.5"
 
 [lints]
 workspace = true

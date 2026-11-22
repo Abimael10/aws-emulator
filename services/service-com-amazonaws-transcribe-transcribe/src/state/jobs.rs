@@ -47,6 +47,10 @@ pub struct TranscriptionJobRecord {
     /// determination fills it in where the request declared nothing
     /// ([`determined_media_format`]).
     pub media_format: Option<String>,
+    /// `MediaSampleRateHertz`, the rate this job's input audio is sampled at. What the
+    /// start request declared it to be, if anything, until the job FINISHES, when the
+    /// service's own determination fills it in where the request declared nothing
+    /// ([`determined_media_sample_rate`], read from [`Self::media_sample_rate`]).
     pub media_sample_rate_hertz: Option<i32>,
     pub output_bucket_name: Option<String>,
     pub output_key: Option<String>,
@@ -75,6 +79,13 @@ pub struct TranscriptionJobRecord {
     /// What automatic language identification reads
     /// ([`Self::materialise_identified_languages`]).
     pub media_language: Option<String>,
+    /// The sample rate the AUDIO of the media this job was pointed at declares in its
+    /// own header, read off the stored object when the job was started
+    /// ([`media_sample_rate_of`]); `None` where that object declared none, or where no
+    /// object store answered for it. What a finished job reports as
+    /// `MediaSampleRateHertz` where the start declared no rate of its own
+    /// ([`determined_media_sample_rate`]).
+    pub media_sample_rate: Option<i32>,
     /// `IdentifiedLanguageScore`, the confidence the single language this job
     /// identified was reported with; `None` until a job that asked for
     /// single-language identification completes, and for a job that named its own
@@ -152,6 +163,14 @@ impl TranscriptionJobRecord {
             self.status = STATUS_COMPLETED.to_string();
             self.materialise_identified_languages();
             self.media_format = determined_media_format(self.media_format.take(), &self.media);
+            // What the service determined about the audio it processed: the rate the
+            // stored media's own header declares, where the request declared none
+            // ([`determined_media_sample_rate`]) — and the settings the job RAN with,
+            // which report the options the service switched on or off for it
+            // ([`effective_settings`]).
+            self.media_sample_rate_hertz =
+                determined_media_sample_rate(self.media_sample_rate_hertz, self.media_sample_rate);
+            self.settings = Some(effective_settings(self.settings.take()));
             let transcript_uri = self.output_uri("json");
             // Which transcripts the request asked the service to produce decides
             // which of the two locations the job reports ([`transcript_outputs`]).
@@ -331,6 +350,12 @@ pub struct MedicalTranscriptionJobRecord {
     /// ([`determined_media_format`]).
     pub media_format: Option<String>,
     pub media_sample_rate_hertz: Option<i32>,
+    /// The sample rate the AUDIO of this job's media declares in its own header, read
+    /// off the stored object when the job was started, as
+    /// [`TranscriptionJobRecord::media_sample_rate`] is: the two families' start
+    /// requests carry the member alike, so one determination answers for both
+    /// ([`determined_media_sample_rate`]).
+    pub media_sample_rate: Option<i32>,
     /// `OutputBucketName`, a REQUIRED member of the start request: the bucket the
     /// reported transcript URI names, so this family has no service-managed branch as
     /// [`output_uri`] has.
@@ -396,6 +421,12 @@ impl MedicalTranscriptionJobRecord {
         }
         self.status = STATUS_COMPLETED.to_string();
         self.media_format = determined_media_format(self.media_format.take(), &self.media);
+        // What the service determined about the audio it processed, and the settings the
+        // job RAN with, exactly as the non-medical family records them
+        // ([`TranscriptionJobRecord::advance_clock`]).
+        self.media_sample_rate_hertz =
+            determined_media_sample_rate(self.media_sample_rate_hertz, self.media_sample_rate);
+        self.settings = Some(effective_medical_settings(self.settings.take()));
         self.transcript = Some(MedicalTranscript {
             // The same `OutputKey` rule the non-medical family applies, which this
             // operation documents in the same words — so one implementation
@@ -916,12 +947,17 @@ where
 /// that needs no answer is a URI of the S3 scheme that addresses no object of it
 /// ([`s3_uri_addresses_no_object`]): it names no media file for any store to hold.
 ///
-/// The read is a `HeadObject`, "the same options as a GET operation on an object"
-/// without its body: what a start has to establish is that the media it was pointed at
-/// IS there, and nothing in this service transcribes audio, so no media file's bytes are
-/// ever fetched or held. What that answer says ABOUT the object is what the language the
-/// media evidences is read from ([`media_language_evidence`]), so a start that has to
-/// identify a language takes its evidence from the same read.
+/// Whether each object IS there is established with a `HeadObject`, "the same options as
+/// a GET operation on an object" without its body: that is all the start has to know
+/// about the objects as a SET. What that answer says ABOUT the object is what the
+/// language the media evidences is read from ([`media_language_evidence`]), so a start
+/// that has to identify a language takes its evidence from the same read.
+///
+/// The INPUT AUDIO is then read once more, for what the audio itself declares: the
+/// leading [`MEDIA_HEADER_BYTES`] of it are fetched and the sample rate is parsed out of
+/// the container's own header ([`media_audio_properties`]). Nothing decodes the audio and
+/// no sample is examined — the service reads the header's declaration, which is what lets
+/// a finished job report the rate of the media it processed rather than withhold it.
 pub async fn resolve_media_objects(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -935,6 +971,7 @@ pub async fn resolve_media_objects(
     let mut asked = 0usize;
     let mut resolved = 0usize;
     let mut language: Option<String> = None;
+    let mut sample_rate: Option<i32> = None;
     for uri in uris {
         let Some((bucket, key)) = s3_object_address(uri) else {
             // A URI of the S3 scheme that addresses no object of it names no media file
@@ -955,9 +992,11 @@ pub async fn resolve_media_objects(
                 resolved += 1;
                 // The input audio is the FIRST media member the request named (the
                 // families that name two give the same audio in either), so the first
-                // object that resolved is the one a language is identified in.
-                if language.is_none() {
+                // object that resolved is the one a language is identified in and the one
+                // whose own header states the rate its audio is sampled at.
+                if resolved == 1 {
                     language = media_language_evidence(head.content_language(), uri);
+                    sample_rate = media_audio_properties(&client, bucket, key).await;
                 }
             }
             Err(error) => {
@@ -998,7 +1037,49 @@ pub async fn resolve_media_objects(
         // the store ANSWERED for, so it says what that media is whatever the set's
         // verdict is.
         language,
+        sample_rate,
     }
+}
+
+/// What the AUDIO of the object `key` in `bucket` declares about itself: the sample rate
+/// its own container header states ([`media_sample_rate_of`]), or `None` for media that
+/// declares none this member can carry.
+///
+/// A BOUNDED read: the leading [`MEDIA_HEADER_BYTES`] of the object, requested as a byte
+/// range, so what a start reads is fixed however large the stored media is and no media
+/// file is ever held whole. The object store having just answered that the object is
+/// there says nothing about this read succeeding — the range request may be refused, and
+/// a deployment with no object store to ask answers nothing at all — so a read that does
+/// not answer leaves the audio simply unknown and nothing is refused or guessed for it.
+async fn media_audio_properties(
+    client: &::aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Option<i32> {
+    let response = match client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        // An inclusive byte range, as RFC 9110 spells one: the first
+        // [`MEDIA_HEADER_BYTES`] bytes of the object.
+        .range(format!("bytes=0-{}", MEDIA_HEADER_BYTES - 1))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            ::tracing::warn!(
+                bucket = ?bucket,
+                key = ?key,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the header of the media object could not be read, so the sample rate of \
+                 its audio stays undetermined"
+            );
+            return None;
+        }
+    };
+    let bytes = response.body.collect().await.ok()?.into_bytes();
+    media_sample_rate_of(&bytes)
 }
 
 /// What the object store's answer about a stored media object says about the LANGUAGE
@@ -1031,6 +1112,12 @@ pub struct MediaResolution {
     /// language rather than being told one ([`media_language_evidence`]); `None` where
     /// the media evidenced none, or where no object of it resolved.
     pub language: Option<String>,
+    /// The sample rate the stored INPUT AUDIO declares in its own header
+    /// ([`media_sample_rate_of`]); `None` where the media declared none this member can
+    /// carry, or where its bytes could not be read. What a finished job reports as
+    /// `MediaSampleRateHertz` where the request declared no rate of its own
+    /// ([`determined_media_sample_rate`]).
+    pub sample_rate: Option<i32>,
 }
 
 impl MediaResolution {
@@ -1041,6 +1128,7 @@ impl MediaResolution {
         Self {
             verdict,
             language: None,
+            sample_rate: None,
         }
     }
 }
@@ -1078,15 +1166,17 @@ pub fn media_failure_reason(
     (detected != declared).then(|| MEDIA_FORMAT_MISMATCH_FAILURE_REASON.to_string())
 }
 
-/// The `MediaSampleRateHertz` a finished Call Analytics job reports: "The sample rate,
-/// in hertz, of the audio track in your input media file".
+/// The `MediaSampleRateHertz` a finished Call Analytics job reports where its media
+/// declares none: "The sample rate, in hertz, of the audio track in your input media
+/// file".
 ///
-/// No member of `StartCallAnalyticsJob` carries it either, and unlike the format the
-/// request says nothing at all about it, so this is a CHOSEN figure: the lowest rate
-/// the member itself models (`@range(min: 8000, max: 48000)`), which is the rate the
-/// telephone call audio this family analyses is sampled at. One value for every job of
-/// the family, fixed when the job finishes, so what a job reports never changes
-/// between reads.
+/// The rate of the audio is read out of the stored media's own header, as it is for
+/// every family that reports the member ([`determined_media_sample_rate`]). No member of
+/// `StartCallAnalyticsJob` carries the rate either, so where the media declares none
+/// there is nothing to fall back on but a CHOSEN figure: the lowest rate the member
+/// itself models (`@range(min: 8000, max: 48000)`), which is the rate the telephone call
+/// audio this family analyses is sampled at. Fixed when the job finishes, so what a job
+/// reports never changes between reads.
 pub const CALL_AUDIO_SAMPLE_RATE_HERTZ: i32 = 8_000;
 
 /// The language a job reports when the request narrowed identification to nothing.
@@ -1273,9 +1363,15 @@ pub struct CallAnalyticsJobRecord {
     /// its start request carries no `MediaFormat` member at all).
     pub media_format: Option<String>,
     /// `MediaSampleRateHertz`, the rate the service determined the input audio is
-    /// sampled at; `None` until the job completes
-    /// ([`CALL_AUDIO_SAMPLE_RATE_HERTZ`]).
+    /// sampled at; `None` until the job completes.
     pub media_sample_rate_hertz: Option<i32>,
+    /// The sample rate the AUDIO of this job's media declares in its own header, read
+    /// off the stored object when the job was started, as
+    /// [`TranscriptionJobRecord::media_sample_rate`] is. `None` where that object
+    /// declared none, or where no object store answered for it — in which case this
+    /// family's own constant answers ([`CALL_AUDIO_SAMPLE_RATE_HERTZ`]), because its
+    /// start request carries no member a caller could state the rate with.
+    pub media_sample_rate: Option<i32>,
     /// Where the transcript was written; `None` until the job completes.
     pub transcript: Option<Transcript>,
     /// Whether the documents the locations this job reports serve have already been
@@ -1332,7 +1428,10 @@ impl CallAnalyticsJobRecord {
         ));
         self.identified_language_score = Some(IDENTIFIED_LANGUAGE_SCORE);
         self.media_format = determined_media_format(self.media_format.take(), &self.media);
-        self.media_sample_rate_hertz = Some(CALL_AUDIO_SAMPLE_RATE_HERTZ);
+        self.media_sample_rate_hertz = Some(
+            determined_media_sample_rate(None, self.media_sample_rate)
+                .unwrap_or(CALL_AUDIO_SAMPLE_RATE_HERTZ),
+        );
         let transcript_uri =
             call_analytics_output_uri(self.output_location.as_deref(), &self.name, &self.region);
         // Which transcripts the request asked the service to produce decides which

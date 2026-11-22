@@ -692,6 +692,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // read off the request's option list (see
             // [`crate::state::identified_language`]).
             media_language: media_resolution.language,
+            // The rate the stored media's own header declares, read off the same object
+            // above: this is what a finished job reports as `MediaSampleRateHertz` where
+            // the request declared no rate of its own
+            // (see [`crate::state::determined_media_sample_rate`]).
+            media_sample_rate: media_resolution.sample_rate,
             // What automatic language identification determined is part of
             // processing the media, so it is filled in when the job completes —
             // nothing is identified for a job that is still queued or in progress.

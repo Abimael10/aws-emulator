@@ -58,23 +58,34 @@
 //! owns (the job, the account, the status) with an EMPTY transcript and no caption,
 //! because no engine read the audio: a transcription that produced no words, never
 //! invented speech ([`transcript_document`], [`subtitle_document`]).
-//! A member the service itself DETERMINES is reported where the request states
-//! what it is determined from, and withheld where only the media could say. The
+//! A member the service itself DETERMINES is reported where the request, the stored
+//! media's own header or the name it is stored under states what it is determined from,
+//! and withheld where only decoding the audio could say. The
 //! language a job asked the service to IDENTIFY is of the first kind: `LanguageOptions`
 //! restricts what identification may answer with, so a finished job reports the
 //! identification it asked for — the single `LanguageCode` with its
 //! `IdentifiedLanguageScore` ([`identified_language`]), or the per-language
 //! `LanguageCodes` breakdown of a multi-language request, which is every code the
 //! options allowed, because narrowing them to a subset would take the audio
-//! ([`identified_languages`]) — and the Call Analytics family determines its language,
-//! media format and sample rate the same way, from the request and this family's own
-//! constants (see [`CallAnalyticsJobRecord`]). The FORMAT of the media a job processed
+//! ([`identified_languages`]) — and the Call Analytics family determines its language
+//! and media format the same way, from the request and the address its media is stored
+//! at (see [`CallAnalyticsJobRecord`]). The FORMAT of the media a job processed
 //! is of the first kind in EVERY family that reports one: the name the media is stored
 //! under evidences it ([`media_format_of`]) and the request states that name, so a job
 //! that FINISHES reports that determination wherever the request stated no format of
 //! its own, and the format a request did state stands as the service accepted it — a
 //! completed job's media cannot contradict it, because a job whose media does ends
-//! `FAILED` instead ([`determined_media_format`], [`media_failure_reason`]).
+//! `FAILED` instead ([`determined_media_format`], [`media_failure_reason`]). The SAMPLE
+//! RATE of that media is of the first kind too, and the evidence for it is the stored
+//! file itself: every container the model enumerates declares its sampling frequency in
+//! a header at the front, so the leading bytes of the object a start was pointed at are
+//! read and the rate is taken from that declaration, which is what a finished job of
+//! every family that carries the member reports where the request declared no rate of
+//! its own (see [`media_sample_rate_of`] and [`determined_media_sample_rate`]).
+//! The SETTINGS a finished job ran with are of the first kind as well: a job that has
+//! run reports the options the service switched on or off for it, at the value they ran
+//! at, so a request that asked for neither reads them back off rather than absent
+//! ([`effective_settings`]).
 //! `LanguageCodeItem.DurationInSeconds` is
 //! of the second kind and stays absent: how long each language is SPOKEN is a
 //! measurement of media nothing reads.
@@ -124,10 +135,11 @@
 //! family's ([`store_job_outputs`]). That family's start request carries no language,
 //! media-format or sample-rate member at all, because the service DETERMINES each of
 //! them, so a finished job of it reports the determination this emulator can make
-//! without audio: the language the request narrowed identification to
+//! without decoding audio: the language the request narrowed identification to
 //! ([`identified_language`]), the format the media URI it was given names
-//! ([`media_format_of`]) and this family's own sample rate
-//! ([`CALL_AUDIO_SAMPLE_RATE_HERTZ`]). A custom
+//! ([`media_format_of`]) and the rate the stored media's own header declares
+//! ([`determined_media_sample_rate`]), with this family's own constant answering only
+//! for media that declares none ([`CALL_AUDIO_SAMPLE_RATE_HERTZ`]). A custom
 //! language model is NOT that case: its training and tuning data come from the Amazon
 //! S3 locations a create names, this emulator's own Amazon S3 answers for them in
 //! process ([`resolve_training_data`]), and no operation of that family reports
@@ -156,7 +168,10 @@
 //! and then judged by what that media is ([`media_failure_reason`]): the one per-media
 //! failure this emulator can establish without decoding audio is a `MediaFormat` the
 //! stored object's own name contradicts, and a job of it ends in the service's own
-//! modelled `FAILED` state with that `FailureReason`. With no Amazon S3 mounted to ask,
+//! modelled `FAILED` state with that `FailureReason`. What the stored audio DECLARES
+//! about itself is read from the same object at the same moment — the sample rate its
+//! container header states ([`media_sample_rate_of`]) — so a finished job reports the
+//! rate of the media it processed. With no Amazon S3 mounted to ask,
 //! nothing is known about the media and nothing is refused or failed on an assumption.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -179,6 +194,8 @@ mod jobs;
 pub use jobs::*;
 mod language_identification;
 pub use language_identification::*;
+mod media_audio;
+pub use media_audio::*;
 
 /// `TranscriptionJobStatus` values, from the model's enum
 /// (`smithy_query(query="shape", shape="TranscriptionJobStatus")`).

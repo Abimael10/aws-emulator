@@ -365,14 +365,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that is not S3 reporting an absent object refuses nothing). This family
         // identifies no language — its `LanguageCode` is a required member the
         // operation narrows to one value — so nothing here reads what the media
-        // evidences about its language.
-        let media_verdict = crate::state::resolve_media_objects(
+        // evidences about its language. What the stored audio declares about its own
+        // SAMPLE RATE is read, because a finished job of this family reports that member
+        // too (see [`crate::state::determined_media_sample_rate`]).
+        let media_resolution = crate::state::resolve_media_objects(
             ctx,
             &region,
             &[input.media.media_file_uri.as_deref().unwrap_or_default()],
         )
-        .await
-        .verdict;
+        .await;
+        let media_verdict = media_resolution.verdict;
         // The refusal states what the object store answered is absent: a BUCKET it does
         // not hold is a different failure from a key inside one that is there, and the
         // message is the only thing that tells the caller which.
@@ -495,6 +497,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             media: input.media,
             media_format: input.media_format,
             media_sample_rate_hertz: input.media_sample_rate_hertz,
+            // The rate the stored media's own header declares, read off the same object
+            // above: what a finished job reports where the request declared no rate of
+            // its own (see [`crate::state::determined_media_sample_rate`]).
+            media_sample_rate: media_resolution.sample_rate,
             output_bucket_name: input.output_bucket_name,
             output_key: input.output_key,
             output_encryption_kms_key_id: input.output_encryption_kms_key_id,

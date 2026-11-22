@@ -514,6 +514,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             identified_language_score: None,
             media_format: None,
             media_sample_rate_hertz: None,
+            // The rate the stored call audio's own header declares, read off the same
+            // object above: what a finished job reports as `MediaSampleRateHertz`
+            // (see [`crate::state::determined_media_sample_rate`]).
+            media_sample_rate: media_resolution.sample_rate,
             transcript: None,
             // A job that has not finished owes its output locations nothing, because it
             // reports none yet (see `crate::state::due_output_objects`).
