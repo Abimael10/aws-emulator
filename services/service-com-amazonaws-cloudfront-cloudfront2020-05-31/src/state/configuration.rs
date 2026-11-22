@@ -4750,14 +4750,20 @@ pub const DEFAULT_ENABLE_ACCEPT_ENCODING_BROTLI: bool = false;
 ///   configuration that maps at least one query argument to a profile is stored forwarding
 ///   the requests whose profile it cannot resolve, whatever the request asked for. Recorded
 ///   behaviour.
+/// * `QueryArgProfileConfig$QueryArgProfiles$Items` is the list that wrapper's `Quantity`
+///   counts, carried by every mapping this service stores — empty where the wrapper maps
+///   nothing ([`resolve_query_arg_profiles`]), so a read reports the empty list beside the
+///   quantity rather than leaving the member out.
 ///
 /// `ContentTypeProfileConfig` is left exactly as submitted: it is a CHOICE a configuration
 /// either made or did not, and neither the model nor the update rule makes it a member of
 /// every stored configuration — `ForwardWhenContentTypeIsUnknown` inside one it DID state is
-/// stored as stated, since the rule above is the query-argument mapping's own. A
-/// `QueryArgProfileConfig` the request DID state is otherwise stored as stated, down to its
-/// own optional `QueryArgProfiles` wrapper: what the service supplies is the whole mapping
-/// for a configuration that states none, not a member inside one it states.
+/// stored as stated, since the rules above are the query-argument mapping's own. A
+/// `QueryArgProfileConfig` the request DID state is otherwise stored as stated, down to
+/// whether it states a `QueryArgProfiles` wrapper at all: what the service supplies for a
+/// configuration that states no mapping is the whole mapping, and inside a wrapper the
+/// request DID state only that wrapper's `Items` list
+/// ([`resolve_query_arg_profiles`]).
 pub fn resolve_field_level_encryption_config(
     mut config: FieldLevelEncryptionConfig,
 ) -> FieldLevelEncryptionConfig {
@@ -4771,13 +4777,32 @@ pub fn resolve_field_level_encryption_config(
     config
 }
 
-/// Resolve the one member of a submitted `QueryArgProfileConfig` the SERVICE supplies:
+/// Resolve the members of a submitted `QueryArgProfileConfig` the SERVICE supplies:
 /// `ForwardWhenQueryArgProfileIsUnknown` where the mapping maps a query argument to a profile
-/// ([`forwards_an_unknown_query_arg_profile`]). The mapping itself is stored as submitted.
+/// ([`forwards_an_unknown_query_arg_profile`]), and the `Items` list of the wrapper the
+/// section states ([`resolve_query_arg_profiles`]). Which query arguments the mapping maps is
+/// stored as submitted.
 fn resolve_query_arg_profile_config(mut config: QueryArgProfileConfig) -> QueryArgProfileConfig {
     config.forward_when_query_arg_profile_is_unknown =
         forwards_an_unknown_query_arg_profile(&config);
+    config.query_arg_profiles = config.query_arg_profiles.map(resolve_query_arg_profiles);
     config
+}
+
+/// Resolve the `Items` list of a `QueryArgProfiles` wrapper a request states: the mapping
+/// CloudFront stores carries its list, so a wrapper that carries no entries carries the EMPTY
+/// list rather than no list member at all.
+///
+/// The wrapper is "a `Quantity` beside the `Items` the quantity counts", and the stored
+/// mapping that maps nothing is the one this service supplies for a configuration stating no
+/// mapping at all ([`empty_query_arg_profiles`]) — `Quantity` 0 beside an empty list, which is
+/// the mapping CloudFront's own answers report for such a configuration. A request that states
+/// the wrapper without its optional `Items` describes that same mapping, so it is stored as
+/// that mapping and every later read reports the empty list beside the quantity rather than
+/// turning a list the request stated as empty into a member that is absent.
+fn resolve_query_arg_profiles(mut profiles: QueryArgProfiles) -> QueryArgProfiles {
+    profiles.items = Some(profiles.items.unwrap_or_default());
+    profiles
 }
 
 /// What `ForwardWhenQueryArgProfileIsUnknown` is STORED as for the mapping `config`

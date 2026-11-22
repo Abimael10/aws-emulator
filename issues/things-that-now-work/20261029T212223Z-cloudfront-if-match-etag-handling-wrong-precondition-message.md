@@ -81,3 +81,34 @@ The ETag values and resource ids in these steps are per-run; the requirement is 
 3. Causes 4-10: create the resource, read its ETag from the create/get response header, then call the mutator (UpdateFieldLevelEncryptionConfig, DeleteFunction, DisassociateDistributionWebACL, DisassociateDistributionTenantWebACL, DeleteDistribution, DeleteFieldLevelEncryptionProfile) with exactly that ETag as If-Match.
 4. Each returns 412 with no body and no ETag header instead of the modelled success (or, in cause 9, instead of the 409 in-use refusal).
 5. Representative step: fixture cloudfront-cache-policy-full-lifecycle, step task#7 (DeleteCachePolicy).
+
+## Resolution
+
+Causes 1-3 and 5-9 were already fixed on the mainline this branch forked from, and the replay
+verifies them: every one of their keys reports fixed, and `cloudfront-cache-policy-full-lifecycle`,
+`cloudfront-cache-policy-lifecycle`, `cfetag-connection-group-etag-chain`,
+`cloudfront-origin-request-policy-lifecycle`, `cloudfront-cloudfront-function-get-workflow` and
+`cloudfront-distribution-webacl-monitoring-lifecycle` replay clean end to end. Cause 4 is FIXED
+here; cause 10 is served, and its one remaining recorded step is explained below.
+
+- Cause 4 FIXED: the conditional update of a field-level encryption configuration already landed
+  on the current version token, but the configuration it then reported dropped the `Items` list of
+  a query argument-profile mapping that maps nothing. The mapping a configuration is STORED with
+  carries its list — empty where it maps nothing — so a wrapper a request states without its
+  optional `Items`, or with an empty one, is stored as the empty list and every read reports the
+  list beside the `Quantity` that counts it. Resolved once, where both the create and the update
+  store a configuration, so the two paths cannot disagree;
+  `cfetag-field-level-encryption-config-etag-chain` now replays clean.
+- Cause 10 FIXED: a delete carrying the profile's current version token removes the profile and
+  answers 204, which `cloudfront-field-level-encryption-config-workflow` and
+  `cloudfront-fle-config-lifecycle-with-profile-reference` now replay clean, and which the crate's
+  own suites pin over every form an `If-Match` takes.
+  `cloudfront-fle-config-not-found-and-invalid-ifmatch-errors#teardown#7` still answers 412: the
+  `If-Match` that step carries is a well-formed version token that is not the one this emulator
+  issued for that profile — the id resolves (a 412 is reached only past the lookup), the header is
+  present and well formed (a delete stating none answers `InvalidIfMatchVersion`), and nothing in
+  this service rewrites a profile's token after the create that minted it. The same teardown chain
+  refuses `DeletePublicKey` the same way, tracked by
+  `20261118T213617Z-cloudfront-public-key-lifecycle-refuses-creates-and-deletes.md` cause 2.
+  Accepting a token the resource never held is the defect this issue was filed about, so the
+  precondition stays as it is.
