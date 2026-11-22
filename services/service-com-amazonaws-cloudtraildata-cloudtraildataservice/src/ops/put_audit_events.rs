@@ -14,7 +14,9 @@
 //! repeats an event id, and every event that passes per-event validation is APPENDED to
 //! the channel's ingest log under a freshly minted `eventID` which is then echoed in
 //! `successful`. Events that fail validation are reported per event in `failed`, which
-//! is a partial failure, not an operation error.
+//! is a partial failure, not an operation error; their ATTEMPT is recorded against the
+//! channel too, so what this call accepted and what it refused are both facts a later
+//! report of that channel can state.
 //!
 //! Each refusal states the message the service words for its class: the sentence the
 //! model documents for the error shape, which carries no caller value where that wording
@@ -502,19 +504,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Per-event outcome: an accepted event is appended to the channel's ingest log
-        // under a freshly minted `eventID`; a rejected one is reported in `failed` and
-        // is NOT stored. Both lists are always present, empty when that bucket is.
+        // Per-event outcome, recorded against the channel whichever way it goes: an
+        // accepted event is appended to the channel's ingest log under a freshly minted
+        // `eventID`; a refused one is reported in `failed` and its ATTEMPT is recorded,
+        // which is what later reports of this channel's ingestion read its most recent
+        // failure from. Both lists are always present, empty when that bucket is.
+        //
+        // One instant for the whole batch: the events of one request were decided by one
+        // call, so they carry the time of that call rather than of each loop iteration.
+        let decided_at = ::std::time::SystemTime::now();
         let mut successful: Vec<AuditEventResultEntry> =
             Vec::with_capacity(input.audit_events.len());
         let mut failed: Vec<ResultErrorEntry> = Vec::new();
         for (event, rejected) in input.audit_events.iter().zip(rejections) {
             match rejected {
-                Some((error_code, error_message)) => failed.push(ResultErrorEntry {
-                    id: event.id.clone(),
-                    error_code: error_code.to_string(),
-                    error_message,
-                }),
+                Some((error_code, error_message)) => {
+                    channel.record_refusal(event.id.clone(), error_code, decided_at);
+                    failed.push(ResultErrorEntry {
+                        id: event.id.clone(),
+                        error_code: error_code.to_string(),
+                        error_message,
+                    });
+                }
                 None => {
                     let event_id = crate::state::new_event_id();
                     // Appends under the channel's retention bounds, so repeated calls
@@ -524,7 +535,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         event_id: event_id.clone(),
                         event_data: event.event_data.clone(),
                         event_data_checksum: event.event_data_checksum.clone(),
-                        ingested_at: ::std::time::SystemTime::now(),
+                        ingested_at: decided_at,
                     });
                     successful.push(AuditEventResultEntry {
                         id: event.id.clone(),

@@ -2,7 +2,9 @@
 
 //! @op GetChannel
 //! Reports a CloudTrail Lake channel from the shared channel registry
-//! (`crate::state`).
+//! (`crate::state`), with its ingestion table read back from the channel's data plane
+//! (`cloudtrail-data`'s `PutAuditEvents` is what ingests onto a channel, so that service
+//! is where the attempts it reports are recorded).
 //!
 //! ## Shape of an operation
 //!
@@ -210,7 +212,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::channels::ChannelAddress::Key(key) => store.channels.get(&key),
             crate::state::channels::ChannelAddress::AnotherAccount => None,
         };
-        let channel = channel.ok_or_else(|| channel_not_found(&input.channel, &region))?;
+        let channel = channel
+            .ok_or_else(|| channel_not_found(&input.channel, &region))?
+            .clone();
+        // The data plane is asked with NO guard of this store held (see
+        // `channels::channel_ingestion_status`), so the cross-service read takes one
+        // store's lock at a time.
+        drop(store);
+
+        // `IngestionStatus` reports the most recent ingestion attempts, and ingestion
+        // happens in the CloudTrail Lake data plane (`PutAuditEvents`, a different
+        // service), which is therefore where those attempts are recorded: this reports
+        // what that service holds for this channel, and reports no table at all for a
+        // channel nothing has attempted to ingest onto — a synthesised timestamp would be
+        // a claim that events arrived.
+        let ingestion_status =
+            crate::state::channels::channel_ingestion_status(&*self.engine, &channel.channel_arn);
 
         Ok(GetChannelOutput {
             channel_arn: Some(channel.channel_arn.clone()),
@@ -228,12 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 advanced_event_selectors: Some(Vec::new()),
             }),
             destinations: Some(channel.destinations.clone()),
-            // `IngestionStatus` reports the most recent ingestion attempts, and
-            // ingestion happens in the CloudTrail Lake data plane
-            // (`PutAuditEvents`, a different service). Until this channel's ingest
-            // log is reported here there is nothing to claim, and a synthesised
-            // timestamp would be a claim that events arrived.
-            ingestion_status: None,
+            ingestion_status,
         })
     }
 }

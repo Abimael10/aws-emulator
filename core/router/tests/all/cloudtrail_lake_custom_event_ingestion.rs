@@ -37,7 +37,7 @@ const CONTROL_PLANE_SIGNING_NAME: &str = "cloudtrail";
 
 /// The signing name the data plane claims requests by (`cloudtrail-data`'s `sigv4Name`),
 /// which is what routes `PutAuditEvents` to it.
-const DATA_PLANE_SIGNING_NAME: &str = "cloudtrail-data";
+pub(crate) const DATA_PLANE_SIGNING_NAME: &str = "cloudtrail-data";
 
 /// The account every ARN this emulator mints names.
 pub(crate) const ACCOUNT_ID: &str = "000000000000";
@@ -50,7 +50,7 @@ const MAX_EVENT_ID_LEN: usize = 128;
 /// authentication is off in these tests, so the signature value is never checked, and the
 /// key id names no principal IAM or STS holds a record for, which is the position the
 /// account's own published credential is in.
-fn authorization(region: &str, signing_name: &str) -> String {
+pub(crate) fn authorization(region: &str, signing_name: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 \
          Credential=AKIDEMULATOR/20260101/{region}/{signing_name}/aws4_request, \

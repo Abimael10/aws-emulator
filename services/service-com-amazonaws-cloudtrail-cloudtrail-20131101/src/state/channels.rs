@@ -434,6 +434,42 @@ pub fn deregister_channel_in_data_plane<Eng: Send + Sync + 'static>(
     )
 }
 
+/// The channel's `IngestionStatus` — "A table showing information about the most recent
+/// successful and failed attempts to ingest events" — as the facts its DATA PLANE
+/// recorded, or `None` for a channel nothing has attempted to ingest onto.
+///
+/// Ingestion is the `cloudtrail-data` service's (`PutAuditEvents`), so the attempts are
+/// held there and this control plane REPORTS them rather than keeping a copy: the most
+/// recent accepted event gives the success time and the event id CloudTrail assigned it,
+/// the most recent attempt gives the attempt time and that attempt's event id (which
+/// exists only where the attempt was accepted), and the most recent refused attempt gives
+/// the error code. A member is absent exactly where the data plane recorded no such fact;
+/// nothing here is synthesised, so this table never claims an ingest that did not happen.
+///
+/// LOCK ORDER: as [`register_channel_in_data_plane`] — call it with NO guard of this
+/// service's store held.
+pub fn channel_ingestion_status<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    channel_arn: &str,
+) -> Option<crate::ops::types::IngestionStatus> {
+    let recorded =
+        ::service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::channel_ingestion(
+            engine,
+            channel_arn,
+        )?;
+    Some(crate::ops::types::IngestionStatus {
+        latest_ingestion_success_time: recorded
+            .latest_success_at
+            .map(::aws_smithy_types::DateTime::from),
+        latest_ingestion_success_event_id: recorded.latest_success_event_id,
+        latest_ingestion_error_code: recorded.latest_error_code,
+        latest_ingestion_attempt_time: recorded
+            .latest_attempt_at
+            .map(::aws_smithy_types::DateTime::from),
+        latest_ingestion_attempt_event_id: recorded.latest_attempt_event_id,
+    })
+}
+
 /// Whether `value` has the shape of an id CloudTrail minted: the modelled `UUID`
 /// (`com.amazonaws.cloudtrail#UUID`, `@length 36` of `^[a-f0-9\-]+$` in `8-4-4-4-12`
 /// groups), which is the `<uuid>` of `DeleteChannelRequest$Channel` ("The ARN or the

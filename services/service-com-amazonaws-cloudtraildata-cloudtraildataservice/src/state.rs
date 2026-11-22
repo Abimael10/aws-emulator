@@ -10,6 +10,10 @@
 //! it. A test that needs a channel without driving the control plane registers one the
 //! same way, or writes
 //! [`ComAmazonawsCloudtraildataCloudtraildataserviceState::register_channel`] directly.
+//!
+//! Ingestion is this service's own: every event `PutAuditEvents` decides the outcome of
+//! is recorded against its channel here, so the control plane that reports the channel
+//! reads those facts back through [`channel_ingestion`] instead of keeping a copy.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,10 +21,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// How many ingested events one channel retains.
 ///
-/// The ingest log is the emulator's own record of what it accepted, not a modelled read
-/// API, so retaining a bounded window of it changes no response this service renders —
-/// and an unbounded one would let a caller grow the emulator's memory by repeating
-/// `PutAuditEvents`. Oldest entries are evicted first.
+/// The ingest log is the emulator's own record of what it accepted, and what a reader of
+/// the channel reports of it is the MOST RECENT accepted event — which is the newest
+/// entry, never an evicted one — so retaining a bounded window of it changes no response
+/// this emulator renders, while an unbounded one would let a caller grow the emulator's
+/// memory by repeating `PutAuditEvents`. Oldest entries are evicted first.
 pub const MAX_RETAINED_EVENTS_PER_CHANNEL: usize = 1_000;
 
 /// How many `eventData` bytes one channel's ingest log retains, for the same reason as
@@ -219,6 +224,28 @@ pub fn new_event_id() -> String {
     )
 }
 
+/// One ingestion ATTEMPT this service decided the outcome of: one event of one
+/// `PutAuditEvents` batch, accepted or refused.
+///
+/// A channel keeps the most recent attempt and the most recent REFUSED attempt
+/// ([`Channel::latest_attempt`], [`Channel::latest_refusal`]), which is what the
+/// CloudTrail control plane's channel ingestion table is a view of: nothing reports an
+/// older attempt than those, so nothing older is retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestAttempt {
+    /// `AuditEvent$id`: the event id the caller supplied for this attempt.
+    pub source_id: String,
+    /// `AuditEventResultEntry$eventID`: the id CloudTrail assigned, for an attempt it
+    /// ACCEPTED. `None` for a refused one — the service assigns an event id only to an
+    /// event it ingested, which is why the response's `failed` entries carry none.
+    pub event_id: Option<String>,
+    /// `ResultErrorEntry$errorCode`: why the attempt was refused, `None` when it was
+    /// accepted.
+    pub error_code: Option<String>,
+    /// When this emulator decided the attempt.
+    pub attempted_at: SystemTime,
+}
+
 /// One audit event this emulator ingested, in the order it was accepted.
 #[derive(Debug, Clone)]
 pub struct IngestedEvent {
@@ -266,6 +293,14 @@ pub struct Channel {
     ingested: VecDeque<IngestedEvent>,
     /// The `eventData` bytes currently retained in `ingested`.
     retained_bytes: usize,
+    /// The most recent ingestion attempt on this channel, whatever its outcome. Private
+    /// so it cannot drift from the log: written by [`Channel::record_ingest`] and
+    /// [`Channel::record_refusal`], the two calls that decide an attempt, and read
+    /// through [`Channel::latest_attempt`].
+    latest_attempt: Option<IngestAttempt>,
+    /// The most recent attempt this channel REFUSED, which is a different fact from the
+    /// most recent attempt: a refusal stays reportable after later events are accepted.
+    latest_refusal: Option<IngestAttempt>,
 }
 
 impl Channel {
@@ -286,6 +321,10 @@ impl Channel {
             source: source.into(),
             ingested: VecDeque::new(),
             retained_bytes: 0,
+            // A channel nothing has ingested onto yet has attempted nothing, which is
+            // what a reader of its ingestion facts reports nothing for.
+            latest_attempt: None,
+            latest_refusal: None,
         })
     }
 
@@ -337,8 +376,15 @@ impl Channel {
 
     /// Append an accepted event to the ingest log, evicting the oldest entries until
     /// the log is back inside both retention bounds. The event just accepted is never
-    /// evicted, so the log always holds what the response acknowledged.
+    /// evicted, so the log always holds what the response acknowledged — and it is this
+    /// channel's most recent ingestion ATTEMPT too, since accepting it decided one.
     pub fn record_ingest(&mut self, event: IngestedEvent) {
+        self.latest_attempt = Some(IngestAttempt {
+            source_id: event.source_id.clone(),
+            event_id: Some(event.event_id.clone()),
+            error_code: None,
+            attempted_at: event.ingested_at,
+        });
         self.retained_bytes = self.retained_bytes.saturating_add(event.event_data.len());
         self.ingested.push_back(event);
         while self.ingested.len() > 1
@@ -353,9 +399,51 @@ impl Channel {
         }
     }
 
+    /// Record an attempt this channel REFUSED, under the `ResultErrorEntry$errorCode`
+    /// the response reports for it.
+    ///
+    /// A refused event is not ingested, so nothing of it joins the ingest log and no
+    /// event id is assigned to it; what the refusal leaves behind is the attempt itself,
+    /// which is what the channel's ingestion facts report as its most recent failure.
+    pub fn record_refusal(
+        &mut self,
+        source_id: impl Into<String>,
+        error_code: impl Into<String>,
+        attempted_at: SystemTime,
+    ) {
+        let attempt = IngestAttempt {
+            source_id: source_id.into(),
+            event_id: None,
+            error_code: Some(error_code.into()),
+            attempted_at,
+        };
+        self.latest_refusal = Some(attempt.clone());
+        self.latest_attempt = Some(attempt);
+    }
+
     /// The retained ingest log, oldest first.
     pub fn events(&self) -> impl ExactSizeIterator<Item = &IngestedEvent> {
         self.ingested.iter()
+    }
+
+    /// The most recent event this channel ACCEPTED, or `None` when it has accepted none.
+    ///
+    /// It is the newest entry of the ingest log, which retention never evicts
+    /// ([`Channel::record_ingest`] evicts from the oldest end and keeps the event it just
+    /// accepted), so the most recent accepted event stays readable however much the log
+    /// has shed.
+    pub fn latest_ingest(&self) -> Option<&IngestedEvent> {
+        self.ingested.back()
+    }
+
+    /// The most recent ingestion attempt on this channel, accepted or refused.
+    pub fn latest_attempt(&self) -> Option<&IngestAttempt> {
+        self.latest_attempt.as_ref()
+    }
+
+    /// The most recent attempt this channel refused.
+    pub fn latest_refusal(&self) -> Option<&IngestAttempt> {
+        self.latest_refusal.as_ref()
     }
 
     /// How many events the ingest log currently retains.
@@ -534,6 +622,62 @@ pub fn set_channel_resource_policy<Eng: Send + Sync + 'static>(
     };
     channel.resource_policy = policy.map(str::to_string);
     Some(true)
+}
+
+/// What this data plane recorded about ONE channel's ingestion, for the control plane
+/// that owns the channel resource to report.
+///
+/// Ingestion happens HERE (`PutAuditEvents`), so these are the facts only this service
+/// holds: the most recent event it accepted on the channel, the most recent event it
+/// attempted at all, and the error the most recent refused attempt carried. Each member
+/// is absent exactly when this service has no such fact — it is never completed with a
+/// value nothing recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelIngestion {
+    /// When the most recent ACCEPTED event was ingested.
+    pub latest_success_at: Option<SystemTime>,
+    /// The `eventID` assigned to that accepted event.
+    pub latest_success_event_id: Option<String>,
+    /// When the most recent attempt — accepted or refused — was decided.
+    pub latest_attempt_at: Option<SystemTime>,
+    /// The `eventID` assigned to that attempt, which exists only if it was accepted.
+    pub latest_attempt_event_id: Option<String>,
+    /// The per-event error code the most recent REFUSED attempt was answered with.
+    pub latest_error_code: Option<String>,
+}
+
+/// The ingestion facts this data plane holds for the channel `arn`, or `None` when there
+/// are none to report: the ARN is not a channel ARN, this store cannot be reached, no
+/// channel is registered under it, or nothing has ever attempted to ingest onto it.
+///
+/// The reporting direction of the control-plane seam: `cloudtrail:CreateChannel` makes
+/// the channel present here ([`register_channel`]) and the call that reports the channel
+/// reads back what this service then recorded for it, so a channel's ingestion table is
+/// the ingest log and the refusals of THIS service rather than a second copy kept by the
+/// caller. A READ: it reports what is stored and changes nothing.
+///
+/// LOCK ORDER: as [`register_channel`] — this takes THIS store's lock, holds no other
+/// while it does, and hands back an owned value, so the caller asks it with no guard of
+/// its own store held.
+pub fn channel_ingestion<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &str,
+) -> Option<ChannelIngestion> {
+    let parsed = parse_channel_arn(arn)?;
+    let state = service_state(engine)?;
+    let store = state.lock();
+    let channel = store.channel(&ChannelRef::Arn(parsed))?;
+    let attempt = channel.latest_attempt()?;
+    let accepted = channel.latest_ingest();
+    Some(ChannelIngestion {
+        latest_success_at: accepted.map(|event| event.ingested_at),
+        latest_success_event_id: accepted.map(|event| event.event_id.clone()),
+        latest_attempt_at: Some(attempt.attempted_at),
+        latest_attempt_event_id: attempt.event_id.clone(),
+        latest_error_code: channel
+            .latest_refusal()
+            .and_then(|refused| refused.error_code.clone()),
+    })
 }
 
 /// Take the channel `arn` back out of this service's registry — the effect
