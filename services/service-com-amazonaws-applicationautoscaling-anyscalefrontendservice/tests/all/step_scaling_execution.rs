@@ -40,6 +40,14 @@
 //! at `Successful` once the owning service reports the capacity in effect, with no later
 //! movement to override it ([`a_sustained_breach_settles_one_successful_activity`]).
 //!
+//! The same two rules together bound what the policies of ONE scalable target can reach. A
+//! policy whose alarm merely stays in `ALARM` raises nothing further, and one triggered while
+//! another policy's wait is still running is decided against the capacity that policy's
+//! decision was taken FROM — so the capacity a client reads is one adjustment past that base
+//! and never the sum of the adjustments the triggered policies state
+//! ([`a_policy_triggered_inside_another_policys_wait_adds_one_adjustment_and_no_more`],
+//! [`a_policy_triggered_inside_another_policys_wait_is_bounded_by_the_window_in_force`]).
+//!
 //! Every case goes through the same front door a client uses — the policy, the alarm, the
 //! breach and the read-back of the ECS service are all requests — so nothing reaches into a
 //! state struct and a capacity that is not computed from persisted state cannot pass.
@@ -2072,5 +2080,551 @@ async fn a_sustained_breach_settles_one_successful_activity() {
             1,
             "case {case:?}: expected the breach to record one activity in all, got {listed:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TWO policies of one target, one of them inside a long wait
+// ---------------------------------------------------------------------------
+//
+// The rule these rows pin: the capacity a scalable target reaches is bounded by ONE adjustment
+// applied to the capacity of the scaling decision in force — never the sum of the adjustments
+// the triggered policies state. Two things together make that bound:
+//
+// * what executes a policy is the alarm CHANGING state — "The actions to execute when this
+//   alarm transitions to the ALARM state from any other state"
+//   (`PutMetricAlarmInput$AlarmActions`) — so a policy whose alarm merely STAYS in `ALARM`
+//   while its metric goes on breaching has already performed the action that breach raised;
+// * and for the span a policy asks to "wait for a previous scaling activity to take effect"
+//   (`StepScalingPolicyConfiguration$Cooldown`) the movement that started the wait is still in
+//   flight, so a further action of that policy applies only the remainder that movement has
+//   not delivered — nothing at all for a repeat of the same step — and a policy of the same
+//   target triggered inside the wait computes its own adjustment from the capacity that
+//   decision was taken FROM rather than from the capacity it left behind, "Application Auto
+//   Scaling [giving] precedence to the policy that provides the largest capacity".
+//
+// Each row drives the shape a client gets from a long wait: a `control` policy whose wait is
+// far longer than the row runs, whose alarm is fed throughout and so never leaves `ALARM`
+// after its one transition, beside a `subject` policy with no wait at all whose own metric is
+// only published later — until then its alarm is in `INSUFFICIENT_DATA` and executes nothing.
+// The rows differ in the two adjustments, in how each is interpreted, in the starting
+// capacity, in the registered window the result is clamped into, in whether the subject policy
+// asks for MORE capacity than the control's decision settled or for less, and in whether its
+// alarm reaches the fed series by being REPOINTED at it — "When you update an existing alarm,
+// its state is left unchanged", so a repaired alarm transitions once, out of the state the
+// update left it in, exactly as one created on that series does.
+
+/// The policy whose wait is still running when the other one is triggered.
+const CONTROL_POLICY: &str = "control";
+/// The alarm wired to it, on the suite's own metric, which every phase of a row keeps
+/// breaching.
+const CONTROL_ALARM: &str = "control-alarm";
+/// The policy with no wait of its own, triggered while the control policy's wait runs.
+const SUBJECT_POLICY: &str = "subject";
+/// The alarm wired to it, on [`SECOND_METRIC_NAME`], which only the last phase of a row feeds.
+const SUBJECT_ALARM: &str = "subject-alarm";
+
+/// A metric inside [`METRIC_NAMESPACE`] that NOTHING ever publishes: the series a row's subject
+/// alarm watches until that row repoints it at the fed one.
+const UNFED_METRIC_NAME: &str = "LoadNeverPublished";
+
+/// How long a row watches a target it expects to hold still, publishing the breach that keeps
+/// the control alarm in `ALARM` throughout.
+///
+/// Several evaluation cadences of that alarm ([`CONTINUING_PERIOD_SECS`]) and many passes of
+/// the scaling clock, which is what an execution no policy is owed would arrive on. Nothing in
+/// the emulator sleeps for a movement, so a row that is owed one gets it inside the first few
+/// of those passes.
+const TWIN_WATCH: Duration = Duration::from_secs(12);
+
+/// One pair of policies on one scalable target, one of them inside a long wait.
+struct TwinRow {
+    case: &'static str,
+    /// The `desiredCount` the ECS service is created with, which is the capacity the control
+    /// policy's decision is taken from.
+    starting: i64,
+    min: i64,
+    max: i64,
+    /// The wait the control policy asks for, in seconds: far longer than the row runs, so
+    /// every later action of that policy lands inside it.
+    control_cooldown: i64,
+    control_adjustment_type: &'static str,
+    control_step: &'static [Step],
+    /// The capacity the control alarm's one transition lands the target on.
+    after_control: i64,
+    subject_adjustment_type: &'static str,
+    subject_step: &'static [Step],
+    /// The capacity the target holds once the subject policy has been triggered too: its own
+    /// adjustment computed from the capacity the control's decision was taken FROM, clamped
+    /// into the registered window — and the capacity that decision settled, where the subject
+    /// policy asks for no more than it.
+    after_subject: i64,
+    /// What each movement of the log set the capacity to, oldest first: one per execution that
+    /// moved capacity, and no second one for the control policy.
+    movements: &'static [i64],
+    /// Capacities the resource must never be reported at — the ACCUMULATION of the two
+    /// adjustments above all.
+    never: &'static [i64],
+    /// Whether the subject alarm reaches the fed series by being REPOINTED at it: created on a
+    /// series nothing publishes ([`UNFED_METRIC_NAME`]) and written again, as a client repairs
+    /// an alarm that was watching the wrong dimension, rather than created on the fed one.
+    repoint_subject: bool,
+    /// How far past the threshold each published datapoint is.
+    breach: f64,
+}
+
+/// The rows whose subject policy asks for MORE capacity than the control's decision settled, so
+/// it moves the target — by its own adjustment from that decision's base capacity, and never by
+/// that plus the step the control policy has already delivered.
+const TWIN_NETTED_CATALOG: &[TwinRow] = &[
+    // The shape a client that sizes a long wait to bound how fast a service grows gets: one
+    // task from the control policy, then two from the subject policy — computed from the one
+    // task the control's decision started at, so three in all and never four or five.
+    TwinRow {
+        case: "a +2 policy triggered inside a +1 policy's hour-long wait",
+        starting: 1,
+        min: 1,
+        max: 6,
+        control_cooldown: 3_600,
+        control_adjustment_type: "ChangeInCapacity",
+        control_step: &[Step { lower: Some(0.0), upper: None, adjustment: 1 }],
+        after_control: 2,
+        subject_adjustment_type: "ChangeInCapacity",
+        subject_step: &[Step { lower: Some(0.0), upper: None, adjustment: 2 }],
+        after_subject: 3,
+        movements: &[2, 3],
+        never: &[4, 5, 6],
+        repoint_subject: true,
+        breach: 25.0,
+    },
+    // Larger steps and a wider window: +2 then +3, which is five tasks from the two the
+    // decision started at and never the seven the two adjustments add up to.
+    TwinRow {
+        case: "a +3 policy triggered inside a +2 policy's half-hour wait",
+        starting: 2,
+        min: 1,
+        max: 10,
+        control_cooldown: 1_800,
+        control_adjustment_type: "ChangeInCapacity",
+        control_step: &[Step { lower: Some(0.0), upper: None, adjustment: 2 }],
+        after_control: 4,
+        subject_adjustment_type: "ChangeInCapacity",
+        subject_step: &[Step { lower: Some(0.0), upper: None, adjustment: 3 }],
+        after_subject: 5,
+        movements: &[4, 5],
+        never: &[6, 7, 9],
+        repoint_subject: false,
+        breach: 25.0,
+    },
+];
+
+/// The rows where the registered window or the decision already in force is what bounds the
+/// subject policy: an `ExactCapacity` ask past the ceiling is performed AT the ceiling, and an
+/// ask that provides no more capacity than the control's decision settled is suppressed
+/// entirely.
+const TWIN_BOUNDED_CATALOG: &[TwinRow] = &[
+    TwinRow {
+        case: "an ExactCapacity policy asking past the ceiling inside the other's wait",
+        starting: 2,
+        min: 1,
+        max: 5,
+        control_cooldown: 3_600,
+        control_adjustment_type: "ChangeInCapacity",
+        control_step: &[Step { lower: Some(0.0), upper: None, adjustment: 1 }],
+        after_control: 3,
+        subject_adjustment_type: "ExactCapacity",
+        subject_step: &[Step { lower: Some(0.0), upper: None, adjustment: 9 }],
+        after_subject: 5,
+        movements: &[3, 5],
+        never: &[4, 6, 9],
+        repoint_subject: true,
+        breach: 25.0,
+    },
+    TwinRow {
+        case: "a +1 policy triggered inside a +4 policy's wait is suppressed entirely",
+        starting: 3,
+        min: 1,
+        max: 12,
+        control_cooldown: 3_600,
+        control_adjustment_type: "ChangeInCapacity",
+        control_step: &[Step { lower: Some(0.0), upper: None, adjustment: 4 }],
+        after_control: 7,
+        subject_adjustment_type: "ChangeInCapacity",
+        subject_step: &[Step { lower: Some(0.0), upper: None, adjustment: 1 }],
+        after_subject: 7,
+        movements: &[7],
+        never: &[4, 8, 11, 12],
+        repoint_subject: false,
+        breach: 25.0,
+    },
+];
+
+/// The series a row's subject alarm watches before it is triggered: the fed one, or the one
+/// nothing publishes for a row that REPOINTS the alarm later.
+fn subject_metric_before(row: &TwinRow) -> &'static str {
+    if row.repoint_subject {
+        UNFED_METRIC_NAME
+    } else {
+        SECOND_METRIC_NAME
+    }
+}
+
+/// Publish the breach each phase of a row feeds: always the control alarm's metric, and the
+/// subject alarm's too once the row has started feeding it.
+async fn feed_twin(emulator: &Emulator, row: &TwinRow, feed_subject: bool, case: &str) {
+    publish_breach_on(emulator, METRIC_NAME, row.breach, case).await;
+    if feed_subject {
+        publish_breach_on(emulator, SECOND_METRIC_NAME, row.breach, case).await;
+    }
+}
+
+/// Keep the breaches alive until the ECS service's `desiredCount` reaches `wanted`, answering
+/// every DISTINCT capacity it was reported at in the order they were read.
+///
+/// The poll is the TEST waiting for the clock that executes a breach, so a row whose capacity
+/// never moves fails on the readings it collected rather than on how fast the host ran.
+async fn drive_twin_until(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    row: &TwinRow,
+    feed_subject: bool,
+    wanted: i64,
+    case: &str,
+) -> Vec<i64> {
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    let mut readings: Vec<i64> = Vec::new();
+    loop {
+        feed_twin(emulator, row, feed_subject, case).await;
+        let count = emulator.ecs_desired_count(cluster, service).await;
+        if readings.last() != Some(&count) {
+            readings.push(count);
+        }
+        if count == wanted || std::time::Instant::now() >= deadline {
+            return readings;
+        }
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// Keep the breaches alive for the whole of [`TWIN_WATCH`], answering every distinct capacity
+/// the ECS service was reported at: this is what a row that expects NO further movement fails
+/// on.
+async fn watch_twin(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    row: &TwinRow,
+    feed_subject: bool,
+    case: &str,
+) -> Vec<i64> {
+    let deadline = std::time::Instant::now() + TWIN_WATCH;
+    let mut readings: Vec<i64> = Vec::new();
+    loop {
+        feed_twin(emulator, row, feed_subject, case).await;
+        let count = emulator.ecs_desired_count(cluster, service).await;
+        if readings.last() != Some(&count) {
+            readings.push(count);
+        }
+        if std::time::Instant::now() >= deadline {
+            return readings;
+        }
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// Keep both breaches alive until the subject alarm reports `ALARM`, which is the instant its
+/// policy's one action was raised at.
+///
+/// A row whose subject policy is SUPPRESSED expects no capacity movement from it at all, so the
+/// trigger itself is what has to be waited for: without this the row would read the capacity it
+/// already held and conclude before the alarm had graded anything.
+async fn await_subject_alarm(emulator: &Emulator, row: &TwinRow, case: &str) {
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    loop {
+        feed_twin(emulator, row, true, case).await;
+        let state = alarm_state(emulator, SUBJECT_ALARM, case).await;
+        if state == "ALARM" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the published datapoints to put the subject alarm in \
+             ALARM, it reports {state:?}"
+        );
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// Let the control alarm's breach UP and drive it back, with BOTH series still breaching while
+/// it returns, so that alarm transitions into `ALARM` afresh — the state change that raises its
+/// policy's actions again, this time inside the wait its own first movement started.
+///
+/// The subject alarm's series is published throughout: a gap in it would let that alarm lapse
+/// and come back too, which is an action of ITS own rather than the one this phase is about.
+async fn given_fresh_control_transition(emulator: &Emulator, row: &TwinRow, case: &str) {
+    emulator.set_alarm_state(CONTROL_ALARM, "OK").await;
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    loop {
+        feed_twin(emulator, row, true, case).await;
+        let state = alarm_state(emulator, CONTROL_ALARM, case).await;
+        if state == "ALARM" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the still-breaching datapoints to put the control alarm \
+             back in ALARM, it reports {state:?}"
+        );
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// One report per capacity of `forbidden` that `readings` holds.
+fn forbidden_readings(readings: &[i64], forbidden: &[i64]) -> Vec<i64> {
+    forbidden
+        .iter()
+        .copied()
+        .filter(|capacity| readings.contains(capacity))
+        .collect()
+}
+
+/// Drive one twin row end to end: the target, both policies, both alarms, the control breach
+/// alone, and then the subject breach beside it — holding the row's assertions at each stage.
+async fn drive_twin(row: &TwinRow) {
+    let case = row.case;
+    let emulator = Emulator::empty();
+    let cluster = "twinned";
+    let service = "web";
+    let resource_id = emulator
+        .given_ecs_service(cluster, service, row.starting)
+        .await;
+    register(&emulator, &resource_id, row.min, row.max, case).await;
+    let control_arn = put_step_policy(
+        &emulator,
+        &resource_id,
+        CONTROL_POLICY,
+        json!({
+            "AdjustmentType": row.control_adjustment_type,
+            "StepAdjustments": step_adjustments(row.control_step),
+            "Cooldown": row.control_cooldown,
+        }),
+        case,
+    )
+    .await;
+    let subject_arn = put_step_policy(
+        &emulator,
+        &resource_id,
+        SUBJECT_POLICY,
+        json!({
+            "AdjustmentType": row.subject_adjustment_type,
+            "StepAdjustments": step_adjustments(row.subject_step),
+            // No wait of its own, so nothing this policy asks for is held back by one: the
+            // bound on what it can reach is the decision the control policy settled.
+            "Cooldown": 0,
+        }),
+        case,
+    )
+    .await;
+    given_breaching_alarm_on(
+        &emulator,
+        CONTROL_ALARM,
+        METRIC_NAME,
+        &control_arn,
+        "GreaterThanThreshold",
+        case,
+    )
+    .await;
+    given_breaching_alarm_on(
+        &emulator,
+        SUBJECT_ALARM,
+        subject_metric_before(row),
+        &subject_arn,
+        "GreaterThanThreshold",
+        case,
+    )
+    .await;
+
+    // The control alarm's transition into `ALARM` is the only action raised so far, so the
+    // capacity moves by the control policy's own step and by nothing else.
+    let readings = drive_twin_until(
+        &emulator,
+        cluster,
+        service,
+        row,
+        false,
+        row.after_control,
+        case,
+    )
+    .await;
+    let reached = readings.last().copied().unwrap_or_default();
+    assert_eq!(
+        reached, row.after_control,
+        "case {case:?}: expected the control alarm's transition to drive the ECS desiredCount \
+         to {}, got {reached:?} after reading {readings:?}",
+        row.after_control
+    );
+
+    // And it HOLDS there. The metric goes on breaching and the alarm goes on being graded, but
+    // it does not change state again, so there is no further action of that policy to execute —
+    // and its own wait is running throughout anyway. The subject alarm, whose metric nothing
+    // has published, has no datapoint to be graded on at all.
+    let watched = watch_twin(&emulator, cluster, service, row, false, case).await;
+    let held = watched.last().copied().unwrap_or_default();
+    assert_eq!(
+        held, row.after_control,
+        "case {case:?}: expected the capacity to hold at {} while the control alarm merely \
+         stays in ALARM, got {held:?} after reading {watched:?}",
+        row.after_control
+    );
+    let state = alarm_state(&emulator, CONTROL_ALARM, case).await;
+    assert_eq!(
+        state, "ALARM",
+        "case {case:?}: expected the control alarm to have been breaching throughout the \
+         watch, got {state:?}"
+    );
+    let state = alarm_state(&emulator, SUBJECT_ALARM, case).await;
+    assert_eq!(
+        state, "INSUFFICIENT_DATA",
+        "case {case:?}: expected the never-fed subject alarm to report INSUFFICIENT_DATA, got \
+         {state:?}"
+    );
+
+    // Now the subject alarm's own metric breaches too, so its transition raises its policy's
+    // one action — decided against the scaling decision the control policy settled rather than
+    // against the capacity that decision left behind. A row that REPOINTS the alarm writes it
+    // again onto the fed series first: "When you update an existing alarm, its state is left
+    // unchanged", so the repaired alarm is still the one that has graded nothing.
+    if row.repoint_subject {
+        given_breaching_alarm_on(
+            &emulator,
+            SUBJECT_ALARM,
+            SECOND_METRIC_NAME,
+            &subject_arn,
+            "GreaterThanThreshold",
+            case,
+        )
+        .await;
+        let state = alarm_state(&emulator, SUBJECT_ALARM, case).await;
+        assert_eq!(
+            state, "INSUFFICIENT_DATA",
+            "case {case:?}: expected the repointed subject alarm to keep the state the update \
+             left unchanged, got {state:?}"
+        );
+    }
+    await_subject_alarm(&emulator, row, case).await;
+    let readings = drive_twin_until(
+        &emulator,
+        cluster,
+        service,
+        row,
+        true,
+        row.after_subject,
+        case,
+    )
+    .await;
+    let reached = readings.last().copied().unwrap_or_default();
+    assert_eq!(
+        reached, row.after_subject,
+        "case {case:?}: expected the subject policy's action to leave the ECS desiredCount at \
+         {}, got {reached:?} after reading {readings:?}",
+        row.after_subject
+    );
+    let forbidden = forbidden_readings(&readings, row.never);
+    assert!(
+        forbidden.is_empty(),
+        "case {case:?}: expected the desiredCount never to be reported at any of {:?}, got \
+         {forbidden:?} among {readings:?}",
+        row.never
+    );
+
+    // Both alarms stay in `ALARM` from here, and neither policy has an action left to perform:
+    // the capacity holds at the bound one adjustment from the decision's base capacity put it
+    // at, rather than creeping up once per evaluation.
+    let watched = watch_twin(&emulator, cluster, service, row, true, case).await;
+    let settled = watched.last().copied().unwrap_or_default();
+    assert_eq!(
+        settled, row.after_subject,
+        "case {case:?}: expected the capacity to hold at {} while both alarms merely stay in \
+         ALARM, got {settled:?} after reading {watched:?}",
+        row.after_subject
+    );
+    let forbidden = forbidden_readings(&watched, row.never);
+    assert!(
+        forbidden.is_empty(),
+        "case {case:?}: expected the settled desiredCount never to be reported at any of {:?}, \
+         got {forbidden:?} among {watched:?}",
+        row.never
+    );
+    let state = alarm_state(&emulator, CONTROL_ALARM, case).await;
+    assert_eq!(
+        state, "ALARM",
+        "case {case:?}: expected the control alarm never to have left ALARM, got {state:?}"
+    );
+    let state = alarm_state(&emulator, SUBJECT_ALARM, case).await;
+    assert_eq!(
+        state, "ALARM",
+        "case {case:?}: expected the fed subject alarm to have stayed in ALARM, got {state:?}"
+    );
+
+    // And a FRESH transition of the control alarm adds nothing either, because it lands inside
+    // the wait that policy asked for: the movement that wait is a wait FOR is what a repeat of
+    // the same step is netted against, and it has no remainder left to deliver.
+    given_fresh_control_transition(&emulator, row, case).await;
+    let watched = watch_twin(&emulator, cluster, service, row, true, case).await;
+    let settled = watched.last().copied().unwrap_or_default();
+    assert_eq!(
+        settled, row.after_subject,
+        "case {case:?}: expected a fresh transition inside the control policy's wait to leave \
+         the capacity at {}, got {settled:?} after reading {watched:?}",
+        row.after_subject
+    );
+    let forbidden = forbidden_readings(&watched, row.never);
+    assert!(
+        forbidden.is_empty(),
+        "case {case:?}: expected the capacity never to be reported at any of {:?} after the \
+         fresh transition, got {forbidden:?} among {watched:?}",
+        row.never
+    );
+
+    // And the log says the same thing the capacity does: one movement per execution that moved
+    // capacity, in the order they happened, with exactly one of them attributable to the
+    // control policy — whose alarm transitioned once.
+    let expected: Vec<String> = row
+        .movements
+        .iter()
+        .map(|capacity| format!("Setting desired count to {capacity}."))
+        .collect();
+    let moved = movement_descriptions(&emulator, &resource_id, case).await;
+    assert_eq!(
+        moved, expected,
+        "case {case:?}: expected one activity per execution that moved capacity, got {moved:?}"
+    );
+    let listed = activities(&emulator, &resource_id, case).await;
+    let by_control: Vec<String> = listed
+        .iter()
+        .filter_map(|activity| activity["Cause"].as_str())
+        .filter(|cause| cause.ends_with(&format!("triggered policy {CONTROL_POLICY}")))
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        by_control.len(),
+        1,
+        "case {case:?}: expected exactly one activity caused by the control policy's one \
+         transition, got {by_control:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_policy_triggered_inside_another_policys_wait_adds_one_adjustment_and_no_more() {
+    for row in TWIN_NETTED_CATALOG {
+        drive_twin(row).await;
+    }
+}
+
+#[tokio::test]
+async fn a_policy_triggered_inside_another_policys_wait_is_bounded_by_the_window_in_force() {
+    for row in TWIN_BOUNDED_CATALOG {
+        drive_twin(row).await;
     }
 }
