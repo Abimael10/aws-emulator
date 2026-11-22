@@ -50,8 +50,13 @@
 //! A sixth seam, `override_protocol`, is taken too: every timestamp member of this model
 //! declares `@timestampFormat("date-time")`, so each one is an RFC 3339 STRING on the wire
 //! rather than the epoch-seconds number `restJson1` defaults to. See the method below.
+//!
+//! `GetQueryResults` is served through one more wrapper around that envelope
+//! ([`query_repository_body`]), for the one member of its answer no schema-driven
+//! serializer can leave out: the `Data` member of a query repository that holds no rows.
 
 pub mod error_code;
+pub mod query_repository_body;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -72,6 +77,9 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// ONCE here because [`Service::override_protocol`] hands back a borrow of it and must
     /// never build a protocol per request.
     protocol: ::service_common::date_time_json::DateTimeRestJson,
+    /// The wrapper `GetQueryResults` alone is served through, held in a field for the same
+    /// reason the envelope is: `override_operation` hands back a reference to it.
+    repository: query_repository_body::QueryRepositoryOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -83,6 +91,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
             envelope: error_code::ErrorCodeOperation,
             protocol: ::service_common::date_time_json::DateTimeRestJson::new(),
+            repository: query_repository_body::QueryRepositoryOperation::new(),
         }
     }
 }
@@ -115,7 +124,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // [`error_code`]). The routing stays the model's: a request the table cannot
         // serve is declined here, so the framework answers it as the unroutable request
         // it is.
-        error_code::routes(&self.entry, req).then_some(&self.envelope as _)
+        if !error_code::routes(&self.entry, req) {
+            return None;
+        }
+        // `GetQueryResults` goes through one more wrapper around that envelope, which
+        // leaves out the `Data` member of a repository that holds no rows (see
+        // [`query_repository_body`]). Every other operation is served by the envelope
+        // itself.
+        if query_repository_body::serves(&self.entry, req) {
+            return Some(&self.repository as _);
+        }
+        Some(&self.envelope as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

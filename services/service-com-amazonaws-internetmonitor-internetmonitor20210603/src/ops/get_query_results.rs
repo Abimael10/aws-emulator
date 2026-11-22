@@ -21,6 +21,15 @@
 //! `FilterParameters` it was started with. Nothing is invented: a monitor whose stored
 //! measurements hold no row inside the window reports none.
 //!
+//! WHICH columns that repository is made of is decided by the `QueryType` the query was
+//! started with and by nothing else — "each `QueryType` includes a specific set of fields
+//! and datatypes to retrieve data for" (`QueryField`'s documentation) — so the stored
+//! query's type selects one catalog ([`REPOSITORIES`]) out of this interface's columns
+//! ([`FIELDS`]), and that one catalog drives `Fields`, every value of every row of `Data`
+//! and the `FilterParameters` lookup together. `Data` rows are positional ("Data is
+//! returned in arrays, aligned with the `Fields` for the query"), so the three cannot
+//! disagree about a column's name, its declared data type or its position.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -134,134 +143,334 @@ struct MeasurementRow<'a> {
     location: &'a ImpactedLocation,
 }
 
-/// One column of that repository: the `QueryField` it is reported as, and how a row's
-/// value for it is rendered.
-///
-/// One catalog drives `Fields`, every value in `Data` and the `FilterParameters` lookup,
-/// so the three cannot disagree about what a column is called or what it holds.
-struct Column {
+/// The `Type` tokens a `QueryField` declares a column's data type with: "The data type for
+/// a query field, which must correspond to the field you're defining for `QueryField`. For
+/// example, if the query field name is `availability_score`, the data type is `float`"
+/// (`smithy_query(query="shape",shape="QueryField")`). A score is `float`, a place or an
+/// identifier is `string`, and a whole number is `integer` — or `bigint` for a count and
+/// for a duration in milliseconds, which is what AWS's own answer declares for the
+/// measurement repository's traffic and round-trip columns.
+const TYPE_FLOAT: &str = "float";
+/// See [`TYPE_FLOAT`].
+const TYPE_INTEGER: &str = "integer";
+/// See [`TYPE_FLOAT`].
+const TYPE_BIGINT: &str = "bigint";
+/// See [`TYPE_FLOAT`].
+const TYPE_STRING: &str = "string";
+
+/// One column a repository can be made of: the `QueryField` it is reported as, and how a
+/// row's value for it is rendered.
+struct Field {
     /// The `QueryField` `Name`.
     name: &'static str,
     /// The `QueryField` `Type`: the model describes a field as a "name-data type pair,
     /// such as availability_score-float"
-    /// (`smithy_query(query="doc",shape="GetQueryResultsOutput",member="Fields")`).
+    /// (`smithy_query(query="doc",shape="GetQueryResultsOutput",member="Fields")`). One of
+    /// the tokens above, and the form every value of this column is rendered in.
     kind: &'static str,
     /// This column's value for one row, rendered as the string `QueryData` carries
-    /// (`QueryData` is a list of lists of strings); a member the stored record leaves
-    /// unset renders as the empty string.
+    /// (`QueryData` is a list of lists of strings); a quantity the stored record holds no
+    /// measurement of renders as the empty string.
     value: fn(&MeasurementRow<'_>) -> String,
 }
 
-/// The repository's columns: the members the model declares for a measured client
-/// location — `ImpactedLocation`, and the `InternetHealth` /
-/// `AvailabilityMeasurement` / `PerformanceMeasurement` / `RoundTripTime` shapes it
-/// carries (`smithy_query(query="shape",shape="ImpactedLocation,InternetHealth,AvailabilityMeasurement,PerformanceMeasurement,RoundTripTime")`)
-/// — each named in the model's own `name-data type` form.
-const COLUMNS: &[Column] = &[
-    Column {
+/// Every column the repositories of this query interface are made of, each declared
+/// exactly once.
+///
+/// A `QueryType`'s own catalog ([`REPOSITORIES`]) names the columns it reports out of this
+/// one registry, so `Fields`, every value in `Data` and the `FilterParameters` lookup
+/// cannot disagree about what a column is called, what data type it declares, or what it
+/// holds. The values come from the Internet Monitor data this service stores for the
+/// monitor — `ImpactedLocation` and the `InternetHealth` / `AvailabilityMeasurement` /
+/// `PerformanceMeasurement` / `RoundTripTime` shapes it carries
+/// (`smithy_query(query="shape",shape="ImpactedLocation,InternetHealth,AvailabilityMeasurement,PerformanceMeasurement,RoundTripTime")`)
+/// — so a quantity the model records nowhere ([`unmeasured`]) is reported as no value
+/// rather than as an invented one.
+const FIELDS: &[Field] = &[
+    // The instant a repository reported at an interval is keyed by. Its declared type is a
+    // whole number, so the value is the measurement's instant on the epoch-second scale
+    // this service's state keeps instants on (`crate::state::epoch_seconds`), not a
+    // date-time string, which the declared type would contradict.
+    Field {
         name: "timestamp",
-        kind: "timestamp",
-        value: |row| {
-            crate::state::wire_timestamp(row.at)
-                .fmt(::aws_smithy_types::date_time::Format::DateTime)
-                .unwrap_or_default()
-        },
+        kind: TYPE_INTEGER,
+        value: |row| whole(crate::state::epoch_seconds(row.at)),
     },
-    Column {
-        name: "as_name",
-        kind: "string",
-        value: |row| row.location.as_name.clone(),
-    },
-    Column {
-        name: "as_number",
-        kind: "integer",
-        value: |row| row.location.as_number.to_string(),
-    },
-    Column {
-        name: "country",
-        kind: "string",
-        value: |row| row.location.country.clone(),
-    },
-    Column {
-        name: "subdivision",
-        kind: "string",
-        value: |row| text(row.location.subdivision.as_deref()),
-    },
-    Column {
-        name: "metro",
-        kind: "string",
-        value: |row| text(row.location.metro.as_deref()),
-    },
-    Column {
-        name: "city",
-        kind: "string",
-        value: |row| text(row.location.city.as_deref()),
-    },
-    Column {
-        name: "latitude",
-        kind: "float",
-        value: |row| number(row.location.latitude),
-    },
-    Column {
-        name: "longitude",
-        kind: "float",
-        value: |row| number(row.location.longitude),
-    },
-    Column {
-        name: "status",
-        kind: "string",
-        value: |row| row.location.status.clone(),
-    },
-    Column {
-        name: "service_location",
-        kind: "string",
-        value: |row| text(row.location.service_location.as_deref()),
-    },
-    Column {
-        name: "availability_score",
-        kind: "float",
+    // The measurement repository's own scores and round-trip times, named as AWS reports
+    // them for it.
+    Field {
+        name: "availability",
+        kind: TYPE_FLOAT,
         value: |row| number(availability(row).and_then(|measured| measured.experience_score)),
     },
-    Column {
-        name: "performance_score",
-        kind: "float",
+    Field {
+        name: "performance",
+        kind: TYPE_FLOAT,
         value: |row| number(performance(row).and_then(|measured| measured.experience_score)),
     },
-    Column {
-        name: "percent_of_total_traffic_impacted",
-        kind: "float",
-        value: |row| {
-            number(
-                availability(row).and_then(|measured| measured.percent_of_total_traffic_impacted),
-            )
-        },
-    },
-    Column {
-        name: "percent_of_client_location_impacted",
-        kind: "float",
-        value: |row| {
-            number(
-                availability(row)
-                    .and_then(|measured| measured.percent_of_client_location_impacted),
-            )
-        },
-    },
-    Column {
+    Field {
         name: "rtt_p50",
-        kind: "float",
-        value: |row| number(round_trip_time(row).and_then(|rtt| rtt.p50)),
+        kind: TYPE_BIGINT,
+        value: |row| whole(round_trip_time(row).and_then(|rtt| rtt.p50)),
     },
-    Column {
+    Field {
         name: "rtt_p90",
-        kind: "float",
-        value: |row| number(round_trip_time(row).and_then(|rtt| rtt.p90)),
+        kind: TYPE_BIGINT,
+        value: |row| whole(round_trip_time(row).and_then(|rtt| rtt.p90)),
     },
-    Column {
+    Field {
         name: "rtt_p95",
-        kind: "float",
-        value: |row| number(round_trip_time(row).and_then(|rtt| rtt.p95)),
+        kind: TYPE_BIGINT,
+        value: |row| whole(round_trip_time(row).and_then(|rtt| rtt.p95)),
+    },
+    // The total traffic a repository reports. Internet Monitor measures traffic volume
+    // from the application's own traffic, which this service does not carry: the model
+    // declares no byte count on any shape it stores, so the columns are reported and their
+    // values are unmeasured.
+    Field {
+        name: "bytes_in",
+        kind: TYPE_BIGINT,
+        value: unmeasured,
+    },
+    Field {
+        name: "bytes_out",
+        kind: TYPE_BIGINT,
+        value: unmeasured,
+    },
+    // The client location and network a location report groups by: the members of the
+    // stored location that name a place or a network rather than measure it.
+    Field {
+        name: "as_name",
+        kind: TYPE_STRING,
+        value: |row| row.location.as_name.clone(),
+    },
+    Field {
+        name: "as_number",
+        kind: TYPE_INTEGER,
+        value: |row| row.location.as_number.to_string(),
+    },
+    Field {
+        name: "country",
+        kind: TYPE_STRING,
+        value: |row| row.location.country.clone(),
+    },
+    Field {
+        name: "subdivision",
+        kind: TYPE_STRING,
+        value: |row| text(row.location.subdivision.as_deref()),
+    },
+    Field {
+        name: "metro",
+        kind: TYPE_STRING,
+        value: |row| text(row.location.metro.as_deref()),
+    },
+    Field {
+        name: "city",
+        kind: TYPE_STRING,
+        value: |row| text(row.location.city.as_deref()),
+    },
+    Field {
+        name: "service_location",
+        kind: TYPE_STRING,
+        value: |row| text(row.location.service_location.as_deref()),
+    },
+    Field {
+        name: "ip_prefix",
+        kind: TYPE_STRING,
+        value: |row| {
+            text(
+                row.location
+                    .ipv4_prefixes
+                    .as_ref()
+                    .and_then(|prefixes| prefixes.first())
+                    .map(String::as_str),
+            )
+        },
+    },
+    // A location report's scores, under the names the model's own example gives for a
+    // field of this interface ("availability_score-float").
+    Field {
+        name: "availability_score",
+        kind: TYPE_FLOAT,
+        value: |row| number(availability(row).and_then(|measured| measured.experience_score)),
+    },
+    Field {
+        name: "performance_score",
+        kind: TYPE_FLOAT,
+        value: |row| number(performance(row).and_then(|measured| measured.experience_score)),
+    },
+    // Time to first byte, which the location and suggestion repositories report: measured,
+    // in the configuration the application runs in and in the ones a suggestion compares
+    // against. Internet Monitor computes these from the traffic it routes for the
+    // monitor's resources; this service routes none, so the columns are reported and their
+    // values are unmeasured.
+    Field {
+        name: "time_to_first_byte",
+        kind: TYPE_BIGINT,
+        value: unmeasured,
+    },
+    Field {
+        name: "cloudfront_time_to_first_byte",
+        kind: TYPE_BIGINT,
+        value: unmeasured,
+    },
+    Field {
+        name: "best_ec2_time_to_first_byte",
+        kind: TYPE_BIGINT,
+        value: unmeasured,
+    },
+    Field {
+        name: "best_ec2_region",
+        kind: TYPE_STRING,
+        value: unmeasured,
+    },
+    // The routing report's predicted round-trip time, which AWS predicts from the routes
+    // it observes for the monitor's traffic — another quantity this service holds no
+    // measurement of.
+    Field {
+        name: "predicted_rtt",
+        kind: TYPE_BIGINT,
+        value: unmeasured,
     },
 ];
+
+/// What one `QueryType`'s repository is made of: the columns it reports, in order.
+struct Repository {
+    /// The `QueryType` the query was started with (`crate::ops::types::QUERY_TYPE_VALUES`).
+    query_type: &'static str,
+    /// The [`FIELDS`] names this type reports, in the order `Fields` lists them and every
+    /// row of `Data` is aligned with.
+    columns: &'static [&'static str],
+}
+
+/// Each `QueryType`'s own catalog: "Each `QueryType` includes a specific set of fields and
+/// datatypes to retrieve data for" (`smithy_query(query="shape",shape="QueryField")`), so
+/// the columns a result reports are a function of the type the query was started with and
+/// of nothing else.
+///
+/// Source: the data the model states each type provides
+/// (`smithy_query(query="doc",shape="StartQueryInput",member="QueryType")`) — the
+/// measurement type "provides availability score, performance score, total traffic, and
+/// round-trip times, at 5 minute intervals", which is exactly the eight columns AWS's own
+/// answer reports for it, in this order; the location types add the location and network
+/// combination they rank, and time to first byte; and the suggestion types report the time
+/// to first byte each suggestion compares, for the Amazon Web Services location, the top
+/// location or the IP prefix it is made for.
+const REPOSITORIES: &[Repository] = &[
+    Repository {
+        query_type: MEASUREMENTS_QUERY_TYPE,
+        columns: &[
+            "timestamp",
+            "availability",
+            "performance",
+            "rtt_p50",
+            "rtt_p90",
+            "rtt_p95",
+            "bytes_in",
+            "bytes_out",
+        ],
+    },
+    Repository {
+        query_type: "TOP_LOCATIONS",
+        columns: &[
+            "as_name",
+            "as_number",
+            "country",
+            "subdivision",
+            "metro",
+            "city",
+            "availability_score",
+            "performance_score",
+            "bytes_in",
+            "bytes_out",
+            "time_to_first_byte",
+        ],
+    },
+    Repository {
+        query_type: "TOP_LOCATION_DETAILS",
+        columns: &[
+            "timestamp",
+            "as_name",
+            "as_number",
+            "country",
+            "subdivision",
+            "metro",
+            "city",
+            "service_location",
+            "time_to_first_byte",
+            "cloudfront_time_to_first_byte",
+            "best_ec2_time_to_first_byte",
+            "best_ec2_region",
+        ],
+    },
+    Repository {
+        query_type: "OVERALL_TRAFFIC_SUGGESTIONS",
+        columns: &["service_location", "time_to_first_byte"],
+    },
+    Repository {
+        query_type: "OVERALL_TRAFFIC_SUGGESTIONS_DETAILS",
+        columns: &[
+            "as_name",
+            "as_number",
+            "country",
+            "subdivision",
+            "metro",
+            "city",
+            "service_location",
+            "time_to_first_byte",
+        ],
+    },
+    Repository {
+        query_type: "ROUTING_SUGGESTIONS",
+        columns: &[
+            "timestamp",
+            "ip_prefix",
+            "service_location",
+            "predicted_rtt",
+        ],
+    },
+];
+
+/// The columns every row carries whatever its repository reports: the stored client
+/// location's own members, which identify the location and network a measurement was taken
+/// for.
+///
+/// "The filter parameters that you can specify depend on the query type that you used to
+/// create the repository" and "for each filter, you specify a field (such as `city`)"
+/// (`smithy_query(query="doc",shape="FilterParameter")`), so a query is filtered by the
+/// columns its own type reports plus these, which identify the measured location every
+/// type's repository is built from.
+const DIMENSIONS: &[&str] = &[
+    "as_name",
+    "as_number",
+    "country",
+    "subdivision",
+    "metro",
+    "city",
+    "service_location",
+    "ip_prefix",
+];
+
+/// The registry entry one column name names, or `None` for a name no column carries.
+fn field(name: &str) -> Option<&'static Field> {
+    FIELDS.iter().find(|field| field.name == name)
+}
+
+/// The columns one `QueryType`'s repository reports, in order.
+///
+/// A type the model does not declare — nothing this service mints a query for, since
+/// `StartQuery` admits only `QueryType`'s own members — defines no set of fields, so its
+/// repository reports none rather than another type's.
+fn columns_of(query_type: &str) -> Vec<&'static Field> {
+    REPOSITORIES
+        .iter()
+        .find(|repository| repository.query_type == query_type)
+        .map(|repository| repository.columns)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|name| field(name))
+        .collect()
+}
 
 /// A string member's value, or the empty string for one the stored record leaves unset.
 fn text(value: Option<&str>) -> String {
@@ -273,6 +482,29 @@ fn number(value: impl Into<Option<f64>>) -> String {
     value
         .into()
         .map_or_else(String::new, |measured| measured.to_string())
+}
+
+/// A numeric member's value as the WHOLE number a column declaring `integer` or `bigint`
+/// holds, or the empty string for one the stored record leaves unset: the column's
+/// declared data type is what a client parses its values with, so a column declared a
+/// whole number must not report a fraction.
+///
+/// A stored measurement is rounded to the nearest whole number, and one that is not finite
+/// reports no value rather than a word no whole-number column can hold.
+fn whole(value: impl Into<Option<f64>>) -> String {
+    value
+        .into()
+        .filter(|measured| measured.is_finite())
+        .map_or_else(String::new, |measured| format!("{measured:.0}"))
+}
+
+/// A column of a quantity this service holds no measurement of: it is reported as part of
+/// the schema the query asked for, with no value.
+///
+/// Reporting a number here would be a measurement nothing took, so the honest value is the
+/// same one a member the stored record leaves unset reports.
+fn unmeasured(_row: &MeasurementRow<'_>) -> String {
+    String::new()
 }
 
 /// The availability measurement of a row's location, if it carries one.
@@ -303,19 +535,19 @@ fn round_trip_time<'a>(row: &'a MeasurementRow<'_>) -> Option<&'a RoundTripTime>
 /// "For each filter, you specify a field (such as `city`), an operator (such as
 /// `not_equals`), and a value or array of values": a filter keeps a row whose value for
 /// the named field is one of the values it lists, and `NOT_EQUALS` keeps exactly the rows
-/// equality would not. A filter that names no field constrains nothing; one that names a
-/// field the repository has no column for matches no row's value, so equality keeps
-/// nothing and its negation keeps everything.
-fn keeps(row: &MeasurementRow<'_>, filters: &[FilterParameter]) -> bool {
+/// equality would not. The fields a query can be filtered by are the columns its own
+/// repository reports plus the [`DIMENSIONS`] every row is measured for; a filter that
+/// names no field constrains nothing, and one that names a field this query's repository
+/// cannot be filtered by matches no row's value, so equality keeps nothing and its
+/// negation keeps everything.
+fn keeps(row: &MeasurementRow<'_>, filters: &[FilterParameter], columns: &[&'static Field]) -> bool {
     filters.iter().all(|filter| {
-        let Some(field) = filter.field.as_deref() else {
+        let Some(name) = filter.field.as_deref() else {
             return true;
         };
         let empty: Vec<String> = Vec::new();
         let values = filter.values.as_ref().unwrap_or(&empty);
-        let matched = COLUMNS
-            .iter()
-            .find(|column| column.name == field)
+        let matched = filterable(columns, name)
             .map(|column| (column.value)(row))
             .is_some_and(|value| values.contains(&value));
         if filter.operator.as_deref() == Some(OPERATOR_NOT_EQUALS) {
@@ -324,6 +556,21 @@ fn keeps(row: &MeasurementRow<'_>, filters: &[FilterParameter]) -> bool {
             matched
         }
     })
+}
+
+/// The column one filter's field names, out of the columns this query's repository reports
+/// and the [`DIMENSIONS`] every row carries — or `None` for a field neither names.
+fn filterable(columns: &[&'static Field], name: &str) -> Option<&'static Field> {
+    columns
+        .iter()
+        .copied()
+        .find(|column| column.name == name)
+        .or_else(|| {
+            DIMENSIONS
+                .contains(&name)
+                .then(|| field(name))
+                .flatten()
+        })
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -378,6 +625,7 @@ impl From<GetQueryResultsErrorModeled> for GetQueryResultsError {
 fn selected_rows<'a>(
     store: &'a crate::state::ComAmazonawsInternetmonitorInternetmonitor20210603State,
     query: &'a crate::state::QueryRecord,
+    columns: &[&'static Field],
 ) -> Vec<MeasurementRow<'a>> {
     let measured: Vec<MeasurementRow<'a>> = store
         .health_events_for(&query.monitor_name)
@@ -394,7 +642,7 @@ fn selected_rows<'a>(
                     location,
                 })
         })
-        .filter(|row| keeps(row, &query.filter_parameters))
+        .filter(|row| keeps(row, &query.filter_parameters, columns))
         .collect();
 
     if query.query_type == MEASUREMENTS_QUERY_TYPE {
@@ -537,13 +785,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The repository's own columns are the ones the query's `QueryType` defines —
+        // "each QueryType includes a specific set of fields and datatypes to retrieve data
+        // for" — so they are read from the stored query's type, before any row is, and the
+        // same catalog then drives the filters, the page projection and `Fields`.
+        let columns = columns_of(&query.query_type);
+
         // A query that has not completed has produced no rows yet — its caller polls
         // `GetQueryStatus` for that — and one that was canceled or failed produced none at
         // all, so only a `SUCCEEDED` query reports rows. The repository's own columns are
         // reported either way: they are what the query asked for, not what it found.
         let rows: Vec<MeasurementRow<'_>> =
             if query.status == crate::state::QUERY_STATUS_SUCCEEDED {
-                selected_rows(&store, &query)
+                selected_rows(&store, &query, &columns)
             } else {
                 Vec::new()
             };
@@ -560,7 +814,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         Ok(GetQueryResultsOutput {
-            fields: COLUMNS
+            fields: columns
                 .iter()
                 .map(|column| QueryField {
                     name: Some(column.name.to_string()),
@@ -571,7 +825,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .take(page_size)
                 .map(|row| {
-                    COLUMNS
+                    columns
                         .iter()
                         .map(|column| (column.value)(row))
                         .collect::<Vec<String>>()

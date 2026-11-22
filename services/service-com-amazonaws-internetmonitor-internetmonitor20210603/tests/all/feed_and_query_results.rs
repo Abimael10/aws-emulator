@@ -90,6 +90,12 @@ fn wire_time(at: SystemTime) -> String {
         .expect("a formattable timestamp")
 }
 
+/// An instant as the WHOLE NUMBER a query column declaring `integer` holds: the query
+/// interface's `timestamp` column declares a whole number, not a date-time string.
+fn epoch_label(at: SystemTime) -> String {
+    format!("{:.0}", epoch_seconds(at))
+}
+
 // ---------------------------------------------------------------------------------------
 // The service's own internet-event feed
 // ---------------------------------------------------------------------------------------
@@ -912,9 +918,14 @@ fn field_index(result: &Value) -> BTreeMap<String, usize> {
 }
 
 /// The `Data` rows of a result.
+///
+/// A result whose repository holds no rows carries no `Data` member at all, which is what
+/// no rows looks like on this wire; a member that IS there is a list of lists of strings.
 fn rows(result: &Value) -> Vec<Vec<String>> {
-    result["Data"]
-        .as_array()
+    let Some(data) = member(result, "Data") else {
+        return Vec::new();
+    };
+    data.as_array()
         .unwrap_or_else(|| panic!("Data must be a list, got {result}"))
         .iter()
         .map(|row| {
@@ -1006,14 +1017,20 @@ async fn get_query_results_refuses_a_query_id_the_named_monitor_has_no_query_for
 async fn get_query_results_reports_the_measurements_the_store_holds() {
     let (router, engine, at) = emulator_with_measurements().await;
 
-    /// One query row: the type it was started with, the window it covers, and the cities
-    /// its rows must carry — in order.
+    /// One query row: the type it was started with, the window it covers, the filters it
+    /// was started with, and the rows it must report — named by one column of the
+    /// repository that `QueryType` reports, since which columns a result reports is itself
+    /// a function of the type (see `query_result_schema` below).
     struct ResultCase {
         case: &'static str,
         query_type: &'static str,
         window_secs: u64,
         filters: Vec<FilterParameter>,
-        expected_cities: Vec<&'static str>,
+        /// The column the values below are read from: the location reports name their rows
+        /// by `city`, while the measurement repository reports no location column at all,
+        /// so its rows are named by a measurement of the location they were taken for.
+        row_column: &'static str,
+        expected_rows: Vec<&'static str>,
     }
 
     let cases = vec![
@@ -1022,42 +1039,50 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
             query_type: "MEASUREMENTS",
             window_secs: 5_400,
             filters: Vec::new(),
-            expected_cities: vec!["Seattle", "Dublin", "Seattle", "Tokyo"],
+            row_column: "availability",
+            // Seattle, Dublin, Seattle again and Tokyo, whose availability the store does
+            // not hold.
+            expected_rows: vec!["98.5", "80", "98.5", ""],
         },
         ResultCase {
             case: "a narrower window drops the older measurements",
             query_type: "MEASUREMENTS",
             window_secs: 900,
             filters: Vec::new(),
-            expected_cities: vec!["Seattle", "Tokyo"],
+            row_column: "availability",
+            expected_rows: vec!["98.5", ""],
         },
         ResultCase {
             case: "a window wide enough for every measurement",
             query_type: "MEASUREMENTS",
             window_secs: 86_400,
             filters: Vec::new(),
-            expected_cities: vec!["Seattle", "Dublin", "Seattle", "Tokyo", "Mumbai"],
+            row_column: "availability",
+            expected_rows: vec!["98.5", "80", "98.5", "", "99"],
         },
         ResultCase {
             case: "a window that holds no measurement",
             query_type: "MEASUREMENTS",
             window_secs: 60,
             filters: Vec::new(),
-            expected_cities: Vec::new(),
+            row_column: "availability",
+            expected_rows: Vec::new(),
         },
         ResultCase {
             case: "one row per location, ordered by the location's identity",
             query_type: "TOP_LOCATIONS",
             window_secs: 5_400,
             filters: Vec::new(),
-            expected_cities: vec!["Tokyo", "Dublin", "Seattle"],
+            row_column: "city",
+            expected_rows: vec!["Tokyo", "Dublin", "Seattle"],
         },
         ResultCase {
             case: "the detailed location report collapses the same way",
             query_type: "TOP_LOCATION_DETAILS",
             window_secs: 86_400,
             filters: Vec::new(),
-            expected_cities: vec!["Tokyo", "Dublin", "Mumbai", "Seattle"],
+            row_column: "city",
+            expected_rows: vec!["Tokyo", "Dublin", "Mumbai", "Seattle"],
         },
         ResultCase {
             case: "an equality filter keeps the rows of the city it names",
@@ -1068,7 +1093,8 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
                 operator: Some(OPERATOR_VALUES[0].to_string()),
                 values: Some(vec!["Seattle".to_string()]),
             }],
-            expected_cities: vec!["Seattle", "Seattle"],
+            row_column: "availability",
+            expected_rows: vec!["98.5", "98.5"],
         },
         ResultCase {
             case: "a negated filter keeps exactly the rest",
@@ -1079,7 +1105,8 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
                 operator: Some(OPERATOR_VALUES[1].to_string()),
                 values: Some(vec!["Seattle".to_string()]),
             }],
-            expected_cities: vec!["Dublin", "Tokyo", "Mumbai"],
+            row_column: "availability",
+            expected_rows: vec!["80", "", "99"],
         },
         ResultCase {
             case: "a filter listing several values keeps them all",
@@ -1090,7 +1117,8 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
                 operator: Some(OPERATOR_VALUES[0].to_string()),
                 values: Some(vec!["Dublin".to_string(), "Mumbai".to_string()]),
             }],
-            expected_cities: vec!["Dublin", "Mumbai"],
+            row_column: "availability",
+            expected_rows: vec!["80", "99"],
         },
         ResultCase {
             case: "two filters are both applied",
@@ -1108,7 +1136,8 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
                     values: Some(vec!["2914".to_string()]),
                 },
             ],
-            expected_cities: vec!["Tokyo"],
+            row_column: "performance",
+            expected_rows: vec!["70.125"],
         },
         ResultCase {
             case: "a filter on a column the repository does not carry keeps nothing",
@@ -1119,21 +1148,24 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
                 operator: Some(OPERATOR_VALUES[0].to_string()),
                 values: Some(vec!["anything".to_string()]),
             }],
-            expected_cities: Vec::new(),
+            row_column: "availability",
+            expected_rows: Vec::new(),
         },
         ResultCase {
             case: "the suggestion reports have no rows here",
             query_type: "OVERALL_TRAFFIC_SUGGESTIONS",
             window_secs: 86_400,
             filters: Vec::new(),
-            expected_cities: Vec::new(),
+            row_column: "service_location",
+            expected_rows: Vec::new(),
         },
         ResultCase {
             case: "the routing suggestions have no rows here",
             query_type: "ROUTING_SUGGESTIONS",
             window_secs: 86_400,
             filters: Vec::new(),
-            expected_cities: Vec::new(),
+            row_column: "ip_prefix",
+            expected_rows: Vec::new(),
         },
     ];
 
@@ -1153,11 +1185,13 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
             status, 200,
             "case {label:?}: expected 200, got {status} with {result}"
         );
-        // Every result reports the repository's columns, whether or not it found rows.
+        // Every result reports the columns of the repository its own `QueryType` defines,
+        // whether or not it found rows.
         let fields = field_index(&result);
         assert!(
-            fields.contains_key("city") && fields.contains_key("availability_score"),
-            "case {label:?}: the repository's columns must be reported, got {result}"
+            fields.contains_key(case.row_column),
+            "case {label:?}: the repository must report a {:?} column, got {result}",
+            case.row_column
         );
         for row in rows(&result) {
             assert_eq!(
@@ -1167,12 +1201,12 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
                 fields.len()
             );
         }
-        let cities = column(&result, "city");
+        let reported = column(&result, case.row_column);
         assert_eq!(
-            cities,
-            case.expected_cities
+            reported,
+            case.expected_rows
                 .iter()
-                .map(|city| (*city).to_string())
+                .map(|value| (*value).to_string())
                 .collect::<Vec<String>>(),
             "case {label:?}: unexpected rows in {result}"
         );
@@ -1202,12 +1236,12 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
         "the Seattle rows: expected 200, got {status} with {result}"
     );
     assert_eq!(
-        column(&result, "availability_score"),
+        column(&result, "availability"),
         vec!["98.5".to_string(), "98.5".to_string()],
         "the availability score must be the stored measurement's, got {result}"
     );
     assert_eq!(
-        column(&result, "performance_score"),
+        column(&result, "performance"),
         vec!["95.25".to_string(), "95.25".to_string()],
         "the performance score must be the stored measurement's, got {result}"
     );
@@ -1217,20 +1251,37 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
         "the round-trip time must be the stored measurement's, got {result}"
     );
     assert_eq!(
-        column(&result, "as_name"),
-        vec![
-            MEASURED[0].as_name.to_string(),
-            MEASURED[0].as_name.to_string()
-        ],
-        "the network name must be the stored location's, got {result}"
-    );
-    assert_eq!(
         column(&result, "timestamp"),
         vec![
-            wire_time(at - Duration::from_secs(EVENT_SEEDS[0].measured_secs_ago)),
-            wire_time(at - Duration::from_secs(EVENT_SEEDS[1].measured_secs_ago)),
+            epoch_label(at - Duration::from_secs(EVENT_SEEDS[0].measured_secs_ago)),
+            epoch_label(at - Duration::from_secs(EVENT_SEEDS[1].measured_secs_ago)),
         ],
         "each row must carry the instant its measurement was taken, got {result}"
+    );
+
+    // The same filter over a location report, whose repository DOES report the stored
+    // location's network name: one row per location, carrying the stored value.
+    let query_id = seed_query(
+        &engine,
+        "33333333-3333-4333-8333-444444444444",
+        "TOP_LOCATIONS",
+        (at - Duration::from_secs(5_400), at),
+        vec![FilterParameter {
+            field: Some("as_number".to_string()),
+            operator: Some(OPERATOR_VALUES[0].to_string()),
+            values: Some(vec![MEASURED[0].as_number.to_string()]),
+        }],
+        false,
+    );
+    let (status, result) = query_results(&router, MONITOR, &query_id, "").await;
+    assert_eq!(
+        status, 200,
+        "the Seattle location: expected 200, got {status} with {result}"
+    );
+    assert_eq!(
+        column(&result, "as_name"),
+        vec![MEASURED[0].as_name.to_string()],
+        "the network name must be the stored location's, got {result}"
     );
 
     // A measurement the store leaves unset is reported as no value, never as an invented
@@ -1253,12 +1304,12 @@ async fn get_query_results_reports_the_measurements_the_store_holds() {
         "the Dublin row: expected 200, got {status} with {result}"
     );
     assert_eq!(
-        column(&result, "availability_score"),
+        column(&result, "availability"),
         vec!["80".to_string()],
         "the stored availability score must be reported, got {result}"
     );
     assert_eq!(
-        column(&result, "performance_score"),
+        column(&result, "performance"),
         vec![String::new()],
         "a measurement the store does not hold must be reported as no value, got {result}"
     );
@@ -1459,4 +1510,277 @@ async fn the_rows_of_a_query_are_reachable_one_page_at_a_time() {
             "case {case:?} (MaxResults={value}): expected {expected}, got {status} with {body}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// The repository schema a result reports
+// ---------------------------------------------------------------------------------------
+
+/// Each `QueryType`'s own field catalog: the columns the repository that type creates is
+/// made of, in order, each with the data type it declares.
+///
+/// Written out here rather than read back from the service, so this is an expectation and
+/// not a second copy of the implementation. Source: the data the model states each type
+/// provides (`smithy_query(query="doc",shape="StartQueryInput",member="QueryType")`) — the
+/// measurement type "provides availability score, performance score, total traffic, and
+/// round-trip times, at 5 minute intervals", which is exactly the eight columns AWS's own
+/// answer reports for it, in this order; the location types add the location and network
+/// combination they rank and time to first byte; and the suggestion types report the time
+/// to first byte each suggestion compares, for the Amazon Web Services location, the top
+/// location or the IP prefix it is made for. The data types are the tokens `QueryField`
+/// documents ("if the query field name is availability_score, the data type is float").
+/// AWS's own answer is the authority: the measurement row is what it reports, and a later
+/// recording of another type is what would correct that type's row.
+const SCHEMAS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "MEASUREMENTS",
+        &[
+            ("timestamp", "integer"),
+            ("availability", "float"),
+            ("performance", "float"),
+            ("rtt_p50", "bigint"),
+            ("rtt_p90", "bigint"),
+            ("rtt_p95", "bigint"),
+            ("bytes_in", "bigint"),
+            ("bytes_out", "bigint"),
+        ],
+    ),
+    (
+        "TOP_LOCATIONS",
+        &[
+            ("as_name", "string"),
+            ("as_number", "integer"),
+            ("country", "string"),
+            ("subdivision", "string"),
+            ("metro", "string"),
+            ("city", "string"),
+            ("availability_score", "float"),
+            ("performance_score", "float"),
+            ("bytes_in", "bigint"),
+            ("bytes_out", "bigint"),
+            ("time_to_first_byte", "bigint"),
+        ],
+    ),
+    (
+        "TOP_LOCATION_DETAILS",
+        &[
+            ("timestamp", "integer"),
+            ("as_name", "string"),
+            ("as_number", "integer"),
+            ("country", "string"),
+            ("subdivision", "string"),
+            ("metro", "string"),
+            ("city", "string"),
+            ("service_location", "string"),
+            ("time_to_first_byte", "bigint"),
+            ("cloudfront_time_to_first_byte", "bigint"),
+            ("best_ec2_time_to_first_byte", "bigint"),
+            ("best_ec2_region", "string"),
+        ],
+    ),
+    (
+        "OVERALL_TRAFFIC_SUGGESTIONS",
+        &[("service_location", "string"), ("time_to_first_byte", "bigint")],
+    ),
+    (
+        "OVERALL_TRAFFIC_SUGGESTIONS_DETAILS",
+        &[
+            ("as_name", "string"),
+            ("as_number", "integer"),
+            ("country", "string"),
+            ("subdivision", "string"),
+            ("metro", "string"),
+            ("city", "string"),
+            ("service_location", "string"),
+            ("time_to_first_byte", "bigint"),
+        ],
+    ),
+    (
+        "ROUTING_SUGGESTIONS",
+        &[
+            ("timestamp", "integer"),
+            ("ip_prefix", "string"),
+            ("service_location", "string"),
+            ("predicted_rtt", "bigint"),
+        ],
+    ),
+];
+
+/// The `Fields` of a result as the name/type pairs they are, in order.
+fn reported_schema(result: &Value) -> Vec<(String, String)> {
+    result["Fields"]
+        .as_array()
+        .unwrap_or_else(|| panic!("Fields must be a list, got {result}"))
+        .iter()
+        .map(|field| {
+            let name = field["Name"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every field carries a Name, got {field}"));
+            let kind = field["Type"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every field carries a Type, got {field}"));
+            (name.to_string(), kind.to_string())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_reported_schema_is_the_query_types_own_field_catalog() {
+    let (router, engine, at) = emulator_with_measurements().await;
+
+    // Every modelled QueryType is a row, so no type is answered with another type's
+    // schema: the catalog table above covers exactly the enum the model declares.
+    assert_eq!(
+        SCHEMAS.len(),
+        QUERY_TYPE_VALUES.len(),
+        "every modelled QueryType needs a catalog of its own, got {} for {} types",
+        SCHEMAS.len(),
+        QUERY_TYPE_VALUES.len()
+    );
+    for query_type in QUERY_TYPE_VALUES {
+        assert!(
+            SCHEMAS.iter().any(|(named, _)| named == query_type),
+            "case {query_type:?}: the modelled type must have a catalog of its own"
+        );
+    }
+
+    let mut seen: BTreeSet<Vec<(String, String)>> = BTreeSet::new();
+    for (index, (query_type, schema)) in SCHEMAS.iter().enumerate() {
+        let query_id = format!("99999999-9999-4999-8999-{index:012}");
+        seed_query(
+            &engine,
+            &query_id,
+            query_type,
+            (at - Duration::from_secs(86_400), at),
+            Vec::new(),
+            false,
+        );
+        let (status, result) = query_results(&router, MONITOR, &query_id, "").await;
+        assert_eq!(
+            status, 200,
+            "case {query_type:?}: expected 200, got {status} with {result}"
+        );
+
+        let expected: Vec<(String, String)> = schema
+            .iter()
+            .map(|(name, kind)| ((*name).to_string(), (*kind).to_string()))
+            .collect();
+        let reported = reported_schema(&result);
+        assert_eq!(
+            reported, expected,
+            "case {query_type:?}: expected the type's own catalog, got {reported:?} in {result}"
+        );
+        assert!(
+            seen.insert(reported.clone()),
+            "case {query_type:?}: a type must not report another type's catalog, got \
+             {reported:?}"
+        );
+
+        // `Data` is positional — "Data is returned in arrays, aligned with the Fields for
+        // the query" — so every row carries one value per reported column, and a value it
+        // does carry is of the data type that column declares.
+        for row in rows(&result) {
+            assert_eq!(
+                row.len(),
+                expected.len(),
+                "case {query_type:?}: every row must align with Fields, got {row:?} for {} \
+                 columns",
+                expected.len()
+            );
+            for ((name, kind), value) in schema.iter().zip(row.iter()) {
+                if value.is_empty() {
+                    continue;
+                }
+                let parses = match *kind {
+                    "integer" | "bigint" => value.parse::<i64>().is_ok(),
+                    "float" => value.parse::<f64>().is_ok(),
+                    _ => true,
+                };
+                assert!(
+                    parses,
+                    "case {query_type:?}: the {name:?} column declares {kind:?}, so {value:?} \
+                     must be one"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_repository_that_holds_no_rows_reports_its_schema_and_no_data_member() {
+    let (router, engine, at) = emulator_with_measurements().await;
+
+    // Rows differ in WHY the repository holds no rows: a window no measurement falls in, a
+    // filter that keeps nothing, a type this service holds no data for, and a query that
+    // has not produced its rows yet.
+    let cases: Vec<(&str, &str, u64, Vec<FilterParameter>, bool)> = vec![
+        ("a window that holds no measurement", "MEASUREMENTS", 60, Vec::new(), false),
+        (
+            "a filter that keeps nothing",
+            "MEASUREMENTS",
+            86_400,
+            vec![FilterParameter {
+                field: Some("city".to_string()),
+                operator: Some(OPERATOR_VALUES[0].to_string()),
+                values: Some(vec!["Nowhere".to_string()]),
+            }],
+            false,
+        ),
+        (
+            "a type this service holds no data for",
+            "OVERALL_TRAFFIC_SUGGESTIONS_DETAILS",
+            86_400,
+            Vec::new(),
+            false,
+        ),
+        ("a query that has not completed", "MEASUREMENTS", 86_400, Vec::new(), true),
+    ];
+
+    for (index, (case, query_type, window_secs, filters, pending)) in cases.into_iter().enumerate()
+    {
+        let query_id = format!("aaaaaaaa-aaaa-4aaa-8aaa-{index:012}");
+        seed_query(
+            &engine,
+            &query_id,
+            query_type,
+            (at - Duration::from_secs(window_secs), at),
+            filters,
+            pending,
+        );
+        let (status, result) = query_results(&router, MONITOR, &query_id, "").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200, got {status} with {result}"
+        );
+        assert!(
+            !reported_schema(&result).is_empty(),
+            "case {case:?}: the columns the query asked for are reported either way, got \
+             {result}"
+        );
+        assert!(
+            member(&result, "Data").is_none(),
+            "case {case:?}: a repository that holds no rows reports no Data member, got \
+             {result}"
+        );
+    }
+
+    // And a repository that DOES hold rows reports them in that member, so the absence
+    // above is about the rows and not about the member.
+    let query_id = seed_query(
+        &engine,
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "MEASUREMENTS",
+        (at - Duration::from_secs(86_400), at),
+        Vec::new(),
+        false,
+    );
+    let (status, result) = query_results(&router, MONITOR, &query_id, "").await;
+    assert_eq!(
+        status, 200,
+        "the populated repository: expected 200, got {status} with {result}"
+    );
+    assert!(
+        member(&result, "Data").is_some() && !rows(&result).is_empty(),
+        "a repository that holds rows reports them in Data, got {result}"
+    );
 }
