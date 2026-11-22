@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::error_with_message;
-use crate::repository_lifecycle::{base64, emulator, error, ok, string_at};
+use crate::repository_lifecycle::{base64, emulator, error, git_blob_id, ok, string_at};
 
 /// The HTTP status every error this suite asserts models (`errorKind: client`,
 /// `httpError: 400` on each of these error shapes).
@@ -779,6 +779,104 @@ async fn hunks_are_paged_by_max_results_and_the_token_resumes_the_comparison() {
             pages,
             all.len().div_ceil(page.min(all.len()).max(1)),
             "page {page}: the hunks must come in the fewest pages that hold them"
+        );
+    }
+}
+
+/// One error code, two sentences — each worded by the operation that raises it. A
+/// well-formed object name no object of the repository carries is refused by the
+/// COMPARISON with the condition stated alone (no value of the request reaches the
+/// text), and by the single-object READ with the object the caller asked for named in
+/// it. The two templates coexist, so neither operation may borrow the other's.
+///
+/// The rows span the forms such an object name takes (a content id of content never
+/// written, each end of the object-name range, a fixed id, the same id in upper case,
+/// since an object name is hexadecimal) and which member of the comparison carries it
+/// — the after side alone, the before side beside a held after side, and both sides at
+/// once.
+#[tokio::test]
+async fn the_comparison_and_the_single_object_read_word_an_absent_blob_differently() {
+    let router = emulator();
+    let repository = "blobdiff-absent-wording";
+    let held_before = b"alpha\nbeta\n".to_vec();
+    let held_after = b"alpha\nBETA\n".to_vec();
+    let (_, after_id) = blob_pair(&router, repository, &held_before, &held_after).await;
+
+    // `BlobIdDoesNotExistException`'s text on the comparison path: entirely fixed,
+    // spelled out here so the WORDING is what these rows are held to.
+    const BLOB_NOT_IN_REPOSITORY: &str = "The specified blob does not exist in the repository.";
+
+    let absent: Vec<(&str, String)> = vec![
+        (
+            "a content id of content never written",
+            git_blob_id(b"never written to this repository\n"),
+        ),
+        ("the lowest object name", "0".repeat(40)),
+        ("the highest object name", "f".repeat(40)),
+        (
+            "a fixed object id",
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+        ),
+        (
+            "the same fixed object id in upper case",
+            "0123456789ABCDEF0123456789ABCDEF01234567".to_string(),
+        ),
+    ];
+    for (label, missing) in absent {
+        let comparisons: Vec<(&str, Value)> = vec![
+            (
+                "the after side alone",
+                json!({ "repositoryName": repository, "afterBlobId": missing }),
+            ),
+            (
+                "the before side beside a held after side",
+                request(repository, &missing, &after_id),
+            ),
+            ("both sides at once", request(repository, &missing, &missing)),
+        ];
+        for (side, body) in comparisons {
+            let (code, message) =
+                error_with_message(&router, "GetBlobDifferences", &body, CLIENT_ERROR_STATUS).await;
+            assert_eq!(
+                code, "BlobIdDoesNotExistException",
+                "case (GetBlobDifferences, {label}, {side}): expected code \
+                 BlobIdDoesNotExistException, got {code:?}"
+            );
+            assert_eq!(
+                message, BLOB_NOT_IN_REPOSITORY,
+                "case (GetBlobDifferences, {label}, {side}): expected message \
+                 {BLOB_NOT_IN_REPOSITORY:?}, got {message:?}"
+            );
+            assert!(
+                !message.contains(missing.as_str()) && !message.contains(repository),
+                "case (GetBlobDifferences, {label}, {side}): the comparison's sentence \
+                 interpolates no value of the request, got {message:?}"
+            );
+        }
+
+        // The same code on the single-object read keeps its own template, which names
+        // the object asked about — the two wordings coexist.
+        let (code, read_message) = error_with_message(
+            &router,
+            "GetBlob",
+            &json!({ "repositoryName": repository, "blobId": missing }),
+            CLIENT_ERROR_STATUS,
+        )
+        .await;
+        let expected =
+            format!("AWS CodeCommit could not find the blob {missing} in the repository.");
+        assert_eq!(
+            code, "BlobIdDoesNotExistException",
+            "case (GetBlob, {label}): expected code BlobIdDoesNotExistException, got {code:?}"
+        );
+        assert_eq!(
+            read_message, expected,
+            "case (GetBlob, {label}): expected message {expected:?}, got {read_message:?}"
+        );
+        assert_ne!(
+            read_message, BLOB_NOT_IN_REPOSITORY,
+            "case (GetBlob, {label}): the single-object read must not borrow the comparison's \
+             sentence, got {read_message:?}"
         );
     }
 }
