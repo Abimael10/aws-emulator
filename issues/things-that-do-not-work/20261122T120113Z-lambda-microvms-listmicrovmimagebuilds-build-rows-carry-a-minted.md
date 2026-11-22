@@ -1,0 +1,60 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: lambdamicrovms-customer-image-lifecycle
+Issue-Step: task#8
+Issue-Severity: LOW
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: lambdamicrovms-customer-image-lifecycle
+Issue-Shape-Id: com.amazonaws.lambdamicrovms#LambdaMicrovms
+Issue-Key: lambda-microvms|ListMicrovmImageBuilds|2xx->2xx|$.items[*]
+Issue-Commit: c715480170741a84c2fa772a3d743f7ed03fb9c6
+
+# lambda-microvms ListMicrovmImageBuilds build rows carry a minted buildId that is not the recorded build-identifier form
+
+> _Note: this issue was identified against the code base at commit `c715480170741a84c2fa772a3d743f7ed03fb9c6`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ListMicrovmImageBuilds
+
+## Description
+One root cause, observed on replay of wire corpus simparity-wire-aws-v1 against the emulator built from this checkout (emulator_up true, /__admin/health 200; 104 steps, 89 passed, 15 mismatched, 0 errored, 0 blocked, score 85.6%, 13 divergence clusters). A fixer must close Cause 1 of 1 before submitting.
+
+=== Cause 1 of 1: the build identifier the build LISTING publishes on every row is not in the form the recording publishes a build id in, so each recorded row fails to match ===
+Fixture lambdamicrovms-customer-image-lifecycle, step task#8 (ListMicrovmImageBuilds, HTTP 200 on both sides, both rows of the page reported as not matching).
+
+AWS: Smithy ListMicrovmImageBuilds is GET /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds -> 200, output items @required MicrovmImageBuildSummaries. MicrovmImageBuildSummary$buildId is @required NonBlankString (@length 1..2048, pattern ^[^\s]+$) documented 'The build request ID.'; the row's other members are imageArn, imageVersion, buildState (BuildState enum), architecture (Architecture enum), chipset (Chipset enum), chipsetGeneration (@required NonBlankString), stateReason (String) and createdAt (@required Timestamp). For the buildId's concrete FORM the model states nothing, so this is recorded behavior only: the corpus records the member as a shaped, non-asserted value, i.e. the requirement is that a build row publish an identifier of the SHAPE AWS mints build request ids in, and that the same identifier appear on the single-build read and in the builds path label. The recorded page for a version whose two builds both settled FAILED carries, on each row, imageVersion '1.0', buildState 'FAILED', architecture 'ARM_64', chipset 'GRAVITON', stateReason 'The S3 bucket does not exist.' and terminationReasonCode null — all of which the emulator now matches.
+
+Emulator: every row's buildId is minted from one global, zero-padded counter — crate::state::ComAmazonawsLambdamicrovmsLambdamicrovmsState::next_build_id formats it as 'build-{seq:016x}' (so the page under test answers 'build-0000000000000000' and 'build-0000000000000001'), and the row projection echoes the stored field verbatim (ops/list_microvm_image_builds.rs summary_of -> payload_of, build_id: build.build_id.clone()). The replay therefore reports $.items[0] and $.items[1] as not matching the recorded rows while every value-asserted member of both rows except the per-run instant agrees. This is the same minted form the single-build read of this very fixture (task#9) answers with and which the replay also rejects there.
+
+NOT claimed by this cause, and a fixer must not try to make either of them equal: (a) createdAt — the recorded rows carry the instant of the recording run (epoch-seconds, millisecond precision) and the emulator now serves an instant of the replay run at the same precision; the INSTANT is a per-run clock value and is not a requirement; (b) chipsetGeneration — the corpus records it shaped/non-asserted and the particular generation numbers the build fan-out chooses (crate::state::BUILD_TARGETS / mint_builds) were already settled as recorded values rather than contract by '20261027T003752Z-lambda-microvms-re-delete-of-a-gone-image.md'. The identifier FORM is the emulator-attributable content of this cluster.
+
+Why: buildId is the only handle a client has on one build of one image version — it is the path label for GetMicrovmImageBuild, the correlation key between a listing row and a build read back, and the value a pipeline persists to re-poll a build later. A client that enumerates builds, stores each row's buildId and then joins it to a build read back, or asserts it against the identifier it asked for, gets a value in a form AWS never mints: an id-shape assertion, a regex check or a round-trip comparison fails against the emulator even though the right build was served, so the build-tracking branch of the client is unreachable in emulation while it works against AWS.
+
+Fix: the build identifier minted into the build record in the service state (crate::state::next_build_id, the one place that formats it, as consumed by mint_builds) must produce the identifier form AWS records, and it must stay the single source for the listing row projection, the single-build read and the builds path label so those three cannot disagree. The listing handler and its row projection are faithful and need no change; do not special-case the listing to rewrite ids, which would hide the minting form from the other paths.
+
+Related issues, NONE of which covers this replay key: open '20261117T102011Z-lambda-microvms-getmicrovmimagebuild-answers-with-a-buildid-that.md' reports the same minting form, but it is keyed on lambdamicrovms-customer-image-lifecycle#task#9 (GetMicrovmImageBuild $.buildId) only — the replay reports THIS cluster (task#8) with an EMPTY owned_by and an EMPTY stub_path, so closing that issue does not re-replay this step. '20261108T125129Z-lambda-microvms-image-version-and-build-read-paths.md' (its Cause 2, the row's terminationReasonCode) and '20261118T161010Z-lambda-microvms-image-version-and-build-listing-rows.md' (its Cause 2, the createdAt precision) did carry this ListMicrovmImageBuilds key, but both are RESOLVED (status fixed) and so cover nothing; both of those causes are confirmed served by this replay (the row now carries terminationReasonCode null and a millisecond-precision createdAt), which is why the identifier form is what is left.
+
+Traces: lambdamicrovms-customer-image-lifecycle#task#8 (ListMicrovmImageBuilds, 200 vs 200).
+
+## Evidence
+Wire replay of trace set simparity-wire-aws-v1 (trace_set_id simparity-wire-aws-v1, emulator_up true, '/__admin/health answered 200 and the :38947 data listener accepts'; fixtures_replayed 13, steps_total 104, steps_passed 89, steps_mismatched 15, steps_errored 0, steps_blocked 0, divergence_count 13, score_pct 85.6, bootstrap_signal false). Expected = recorded AWS response, Actual = emulator response.
+
+Cause 1 — lambdamicrovms-customer-image-lifecycle#task#8, ListMicrovmImageBuilds, status 200 vs 200, verdict mismatch, stub_path EMPTY, owned_by EMPTY, affected ['lambdamicrovms-customer-image-lifecycle#task#8'] (affected_count 1):
+  detail: "$.items[0]: missing (expected {'architecture': 'ARM_64', 'buildId': '<shaped-not-asserted>', 'buildState': 'FAILED', 'chipset': 'GRAVITON', 'chipsetGeneration': '<shaped-not-asserted>', 'createdAt': 1793052797.597, 'imageArn': 'arn:aws:lambda:us-west-2:000000000000:microvm-image:sim2real-probe-mvmimg-8661b5c1', 'imageVersion': '1.0', 'stateReason': 'The S3 bucket does not exist.', 'terminationReasonCode': None}, got {'imageArn': ..., 'imageVersion': '1.0', 'buildId': 'build-0000000000000000', 'buildState': 'FAILED', 'architecture': 'ARM_64', 'chipset': 'GRAVITON', 'chipsetGeneration': '2', 'stateReason': 'The S3 bucket does not exist.', 'createdAt': 1795348660.152, 'terminationReasonCode': None})"
+  detail: "$.items[1]: missing (same expected row; got {... 'buildId': 'build-0000000000000001', ... 'chipsetGeneration': '3', 'createdAt': 1795348660.152, 'terminationReasonCode': None})"
+  divergence_key: service=lambda-microvms|ListMicrovmImageBuilds|status=200->200|keys=$.items[0],$.items[1]
+  Reading of the diff: the comparison is whole-row. terminationReasonCode is now PRESENT and null on both sides and createdAt is now millisecond-precision on both sides (the two previously filed, now resolved causes), so the remaining content of the diff is the shaped buildId — minted 'build-0000000000000000'/'build-0000000000000001' — plus the per-run createdAt instant and the shaped chipsetGeneration, neither of which this issue claims. The same minted identifier is rejected on the single-build read of this fixture at task#9 (expected and actual render identically there, which is the signature of a form divergence below the rendering), so a fixer must compare the raw bytes (length, digit count, encoding) of the recorded identifier against the one the emulator mints rather than compare by eye.
+
+Model grounding (services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/smithy-model/com-amazonaws-lambdamicrovms-lambdamicrovms.json): ListMicrovmImageBuilds — GET /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds, 200, @paginated; output items @required MicrovmImageBuildSummaries, nextToken String; MicrovmImageBuildSummary members imageArn/imageVersion/buildId/chipsetGeneration @required NonBlankString (@length 1..2048, pattern ^[^\s]+$), buildState @required BuildState, architecture @required Architecture, chipset @required Chipset, stateReason String, createdAt @required Timestamp; buildId doc 'The build request ID.'; MicrovmImageBuildSummary declares NO terminationReasonCode (recorded behavior only, already served). Errors: AccessDeniedException 403, InternalServerException 500, ResourceNotFoundException 404, ThrottlingException 429, ValidationException 400.
+
+Code sightings (orientation only, this checkout): services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/src/state.rs:2553-2560 (next_build_id, format!("build-{seq:016x}") off the single global next_build_seq) and src/state.rs:2562-2589 (mint_builds, the per-target fan-out that inserts each build under that id and assigns its chipset generation); src/ops/list_microvm_image_builds.rs:290-318 (summary_of / payload_of, build_id: build.build_id.clone()); src/ops/get_microvm_image_build.rs (the same stored field on the single-build read).
+
+## Steps to Reproduce
+1. Boot the emulator from this checkout; mvm = client('lambda-microvms').
+2. base = ListManagedMicrovmImages()['items'][0]['imageArn'] (the managed al2023-1 base image).
+3. CreateMicrovmImage(name=<unique>, baseImageArn=base, buildRoleArn=<an IAM role arn>, codeArtifact={'uri': 's3://<unique>-absent/code.zip'}) and let the asynchronous build settle (it settles FAILED because the artifact bucket does not exist).
+4. rows = ListMicrovmImageBuilds(imageIdentifier=<the new imageArn>, imageVersion='1.0')['items'].
+   AWS: each row's buildId is a build request id in the form AWS mints (the corpus records the value as shaped/non-asserted, so assert the FORM — length and character class — not a literal), and the same identifier is what GetMicrovmImageBuild echoes and what the builds path label accepts.
+   Emulator: rows[0]['buildId'] == 'build-0000000000000000', rows[1]['buildId'] == 'build-0000000000000001' — a zero-padded hex counter, which is not the recorded identifier form. Inspect the raw bytes/length rather than by eye.
+5. GetMicrovmImageBuild(imageIdentifier=<imageArn>, imageVersion='1.0', buildId=rows[0]['buildId']) and check that the echoed identifier is byte-identical to the row's and in the same form.
+6. Re-replay fixture lambdamicrovms-customer-image-lifecycle step task#8 to confirm the fix: both rows of the page must match the recorded rows on every member the corpus asserts, and the shaped buildId must satisfy the recorded identifier shape. Do NOT attempt to reproduce the recorded createdAt instant or the recorded chipset generations — the corpus does not assert them as contract.
