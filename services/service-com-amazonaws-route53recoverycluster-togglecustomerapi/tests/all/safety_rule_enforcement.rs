@@ -16,6 +16,11 @@
 //! value of the modelled `RuleType` enum, `Inverted` both ways, thresholds at and past
 //! the number of controls a rule evaluates, a control no rule guards, and the single and
 //! the batch update operation.
+//!
+//! The last two suites cover the configuration a client cannot talk its way out of: an
+//! `ATLEAST` rule whose `Threshold` is past the number of controls it asserts, which no
+//! state vector satisfies, and the fact that enforcement tracks the control plane's
+//! current rule set — a deleted rule guards nothing, a re-created one guards again.
 
 use serde_json::{json, Value};
 
@@ -744,4 +749,271 @@ async fn a_gating_rule_orders_the_gate_before_its_target() {
             "case gate and target in one batch: expected {expected} for {arn}, got {state}"
         );
     }
+}
+
+/// The three parts the refusal of an update a safety rule blocks must carry, for a rule
+/// whose condition is "at least `required_on` of the controls it evaluates must be On":
+/// the quoted condition, the routing control the request named and the rule that blocked
+/// it. The whole sentence is pinned, character for character, by
+/// `crate::safety_rule_refusal_message`; a row here states the three VARIABLE parts it
+/// renders from the stored `RuleConfig`, the request and the rule.
+fn refusal_parts(required_on: i32, routing_control_arn: &str, safety_rule_arn: &str) -> [String; 3] {
+    [
+        format!("\"At least {required_on} routing controls must be On.\""),
+        format!("Routing control: [{routing_control_arn}]"),
+        format!("Safety rule: {safety_rule_arn}"),
+    ]
+}
+
+/// Assert that `body` is the refusal `safety_rule_arn` answers an update of
+/// `routing_control_arn` with, for a rule that needs `required_on` controls On.
+fn assert_refused(
+    case: &str,
+    status: u16,
+    body: &Value,
+    required_on: i32,
+    routing_control_arn: &str,
+    safety_rule_arn: &str,
+) {
+    assert_eq!(
+        status, 400,
+        "case {case}: expected 400, got {status} with {body}"
+    );
+    assert_eq!(
+        error_code(body),
+        "ValidationException",
+        "case {case}: expected ValidationException, got {body}"
+    );
+    let actual = error_message(body);
+    for part in refusal_parts(required_on, routing_control_arn, safety_rule_arn) {
+        assert!(
+            actual.contains(&part),
+            "case {case}: the refusal must state {part:?}, got {actual:?}"
+        );
+    }
+}
+
+/// RULE: a safety rule's `RuleConfig` is evaluated exactly as stored, so an `ATLEAST`
+/// assertion rule whose `Threshold` is greater than the number of controls it asserts is
+/// satisfied by no state vector at all: every update of every control it asserts is
+/// refused with HTTP 400 `ValidationException` naming that rule, in either direction and
+/// through either update operation, and nothing is written. A control the rule does not
+/// assert is not affected by it, and listing the rule's ARN in `SafetyRulesToOverride` is
+/// the one way through.
+///
+/// The control plane accepts such a rule — `CreateSafetyRule` validates `Threshold`
+/// against nothing (`smithy_query(query="shape",shape="RuleConfig")` on the control
+/// plane's model constrains neither member) — so the wedge is a configuration a client
+/// can really get into, and the rows span it: 1, 2 and 3 asserted controls, each with a
+/// `Threshold` one and two past that count, every asserted control as the one updated,
+/// and both values of the modelled `RoutingControlState` enum as the state requested.
+#[tokio::test]
+async fn an_unsatisfiable_threshold_refuses_every_update_of_the_controls_it_asserts() {
+    for asserted_count in 1..=3usize {
+        for past_the_count in 1..=2i32 {
+            let threshold = asserted_count as i32 + past_the_count;
+            let row = format!("ATLEAST {threshold} over {asserted_count} asserted controls");
+
+            // One control more than the rule asserts, so every row also carries a control
+            // no rule names.
+            let (router, panel, controls) = panel_with_controls(asserted_count + 1).await;
+            let asserted: Vec<String> = controls[..asserted_count]
+                .iter()
+                .map(|control| control.arn.clone())
+                .collect();
+            let unguarded = controls[asserted_count].arn.clone();
+            let rule = create_assertion_rule(
+                &router,
+                &panel.arn,
+                "wedged",
+                &asserted,
+                RuleConfigSpec {
+                    rule_type: "ATLEAST",
+                    threshold,
+                    inverted: false,
+                },
+            )
+            .await;
+
+            for arn in &asserted {
+                for requested in ["On", "Off"] {
+                    let before = reported_state(&router, arn).await;
+
+                    let case = format!("{row}: {arn} to {requested}");
+                    let (status, body) = update(&router, arn, requested, &[]).await;
+                    assert_refused(&case, status, &body, threshold, arn, &rule);
+
+                    // The same update as a one-entry batch: the stage that refuses it is
+                    // the same one, so the answer is the same.
+                    let batch_case = format!("{row}: {arn} to {requested} as a batch");
+                    let (status, body) =
+                        update_batch(&router, &[(arn.clone(), requested)], &[]).await;
+                    assert_refused(&batch_case, status, &body, threshold, arn, &rule);
+
+                    let after = reported_state(&router, arn).await;
+                    assert_eq!(
+                        after, before,
+                        "case {case}: a refused update must not move {arn}, got {after}"
+                    );
+                }
+            }
+
+            // A control the wedged rule does not assert is not gated by it.
+            for requested in ["On", "Off"] {
+                let case = format!("{row}: the unasserted control to {requested}");
+                let (status, body) = update(&router, &unguarded, requested, &[]).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: expected 200, got {status} with {body}"
+                );
+                let after = reported_state(&router, &unguarded).await;
+                assert_eq!(
+                    after, requested,
+                    "case {case}: the update must move {unguarded} to {requested}, got {after}"
+                );
+            }
+
+            // Overriding the wedged rule is the break-glass way through it, and the state
+            // really moves.
+            let arn = &asserted[0];
+            let case = format!("{row}: {arn} to On with the rule overridden");
+            let (status, body) = update(&router, arn, "On", std::slice::from_ref(&rule)).await;
+            assert_eq!(
+                status, 200,
+                "case {case}: expected 200, got {status} with {body}"
+            );
+            let after = reported_state(&router, arn).await;
+            assert_eq!(
+                after, "On",
+                "case {case}: the overridden update must move {arn} to On, got {after}"
+            );
+        }
+    }
+}
+
+/// RULE: enforcement reads the control plane's CURRENT safety rules rather than a copy
+/// taken when a rule was created, so an update is refused exactly while a rule that
+/// refuses it exists: once `DeleteSafetyRule` has removed it — the point from which
+/// `ListSafetyRules` no longer reports it — the identical update is accepted, and a rule
+/// created again refuses that identical update again.
+///
+/// The ARN of a rule that no longer exists in `SafetyRulesToOverride` overrides nothing,
+/// which is the same answer an ARN that never named a rule gets.
+#[tokio::test]
+async fn enforcement_follows_the_control_plane_rule_set() {
+    use super::common::{control_plane, encode_arn};
+
+    /// Whether `ListSafetyRules` still reports `safety_rule_arn` for `control_panel_arn`.
+    async fn listed(
+        router: &MultiServiceRouter,
+        control_panel_arn: &str,
+        safety_rule_arn: &str,
+    ) -> bool {
+        let (status, body) = control_plane(
+            router,
+            "GET",
+            &format!("/controlpanel/{}/safetyrules", encode_arn(control_panel_arn)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case ListSafetyRules({control_panel_arn}): expected 200, got {status} with {body}"
+        );
+        body.get("SafetyRules")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case ListSafetyRules: a page carries SafetyRules, got {body}"))
+            .iter()
+            // The modelled `Rule` shape carries each rule under the member its own kind
+            // fills: `ASSERTION` or `GATING`.
+            .filter_map(|rule| rule.get("ASSERTION").or_else(|| rule.get("GATING")))
+            .any(|rule| rule.get("SafetyRuleArn").and_then(Value::as_str) == Some(safety_rule_arn))
+    }
+
+    let (router, panel, controls) = panel_with_controls(2).await;
+    let arn = controls[0].arn.clone();
+    let wedged = RuleConfigSpec {
+        rule_type: "ATLEAST",
+        threshold: 3,
+        inverted: false,
+    };
+    let asserted = vec![arn.clone(), controls[1].arn.clone()];
+
+    let first = create_assertion_rule(&router, &panel.arn, "wedged", &asserted, wedged).await;
+    assert!(
+        listed(&router, &panel.arn, &first).await,
+        "case the rule is created: ListSafetyRules must report {first}"
+    );
+    let (status, body) = update(&router, &arn, "On", &[]).await;
+    assert_refused("the rule exists", status, &body, 3, &arn, &first);
+
+    let (status, body) = control_plane(
+        &router,
+        "DELETE",
+        &format!("/safetyrule/{}", encode_arn(&first)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case DeleteSafetyRule({first}): expected 200, got {status} with {body}"
+    );
+    // The deletion is waited for by the CONDITION it establishes, not by a clock: the rule
+    // stops guarding from the point the control plane stops reporting it.
+    let mut gone = false;
+    for _ in 0..600 {
+        if !listed(&router, &panel.arn, &first).await {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        gone,
+        "case the rule is deleted: ListSafetyRules kept reporting {first}"
+    );
+
+    let (status, body) = update(&router, &arn, "On", &[]).await;
+    assert_eq!(
+        status, 200,
+        "case the rule is deleted: expected 200, got {status} with {body}"
+    );
+    let after = reported_state(&router, &arn).await;
+    assert_eq!(
+        after, "On",
+        "case the rule is deleted: the update must move {arn} to On, got {after}"
+    );
+
+    // A rule created again refuses the identical update again, and the deleted rule's ARN
+    // overrides nothing.
+    let second = create_assertion_rule(&router, &panel.arn, "wedged-again", &asserted, wedged).await;
+    assert_ne!(
+        second, first,
+        "case the rule is created again: a second create mints its own ARN, got {second}"
+    );
+    let (status, body) = update(&router, &arn, "Off", std::slice::from_ref(&first)).await;
+    assert_refused(
+        "the deleted rule's ARN as the override",
+        status,
+        &body,
+        3,
+        &arn,
+        &second,
+    );
+    let after = reported_state(&router, &arn).await;
+    assert_eq!(
+        after, "On",
+        "case the deleted rule's ARN as the override: {arn} must not have moved, got {after}"
+    );
+
+    let (status, body) = update(&router, &arn, "Off", std::slice::from_ref(&second)).await;
+    assert_eq!(
+        status, 200,
+        "case the new rule overridden: expected 200, got {status} with {body}"
+    );
+    let after = reported_state(&router, &arn).await;
+    assert_eq!(
+        after, "Off",
+        "case the new rule overridden: the update must move {arn} to Off, got {after}"
+    );
 }
