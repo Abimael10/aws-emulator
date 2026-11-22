@@ -174,8 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_all(now);
         // And what the service that OWNS this volume has already done: a volume removed
         // there is gone, so this service's record of it goes too and its id resolves to
-        // nothing here — there is ONE volume and one answer about whether it exists.
-        crate::state::drop_volumes_the_account_no_longer_holds(&*self.engine, &mut state, &region);
+        // nothing here — there is ONE volume and one answer about whether it exists — and an
+        // attachment taken down there is one no volume here holds any more.
+        crate::state::settle_volumes_against_the_owning_service(&*self.engine, &mut state, &region);
 
         // "Attaches a volume to a WorkSpace Instance": both resources are resolved
         // against the store, in the Region this call was signed for, and an id that
@@ -195,9 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .placement_availability_zone()
             .map(ToString::to_string);
         // The managed Amazon EC2 instance this WorkSpace Instance IS — the instance the
-        // attach is performed against, and the one EC2 names when it refuses the attach.
-        // `None` while its launch is still being made or after it failed: there is then no
-        // managed instance for EC2 to have refused anything about.
+        // attach is performed against, the one the attachment it produces names, and the one
+        // EC2 names when it refuses the attach. `None` for an instance whose launch EC2
+        // refused: there is then no managed instance for EC2 to have attached anything to or
+        // refused anything about.
         let ec2_instance_id = instance.ec2_instance_id.clone();
 
         // Which volume already holds the device path asked for, read before the volume
@@ -268,12 +270,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ValidationException` (HTTP 400), because no later call makes this `Device`
         // attachable: the request itself is what is wrong, not a state that clears.
         if let Some(occupant) = occupant {
-            return match ec2_instance_id {
+            return match &ec2_instance_id {
                 Some(ec2_instance_id) => {
                     Err(AssociateVolumeErrorModeled::ValidationException(
                         crate::state::device_already_in_use(
                             &input.volume_id,
-                            &ec2_instance_id,
+                            ec2_instance_id,
                             &input.device,
                         ),
                     )
@@ -296,9 +298,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Nothing has been written until every refusal above is past: the attachment is
         // the one thing this call persists, and the response models no members, so that
-        // stored relation is the whole of its effect — `DisassociateVolume` removes it,
+        // relation is the whole of its effect — `DisassociateVolume` removes it,
         // `AssociateVolume` refuses a second attachment of the volume, and `DeleteVolume`
         // refuses the volume while it holds one.
+        //
+        // It is persisted where the volume IS: the volume is an Amazon EBS volume of the
+        // account and the WorkSpace Instance is the managed EC2 instance, so the attachment
+        // this call makes is that volume's EBS attachment to that instance at this `Device`
+        // — recorded in the store that OWNS the volume, the same way `CreateVolume` records
+        // the volume itself there, so every EBS read of the volume resolves the one
+        // attachment. An attach the owning store cannot make attaches nothing, so no
+        // attachment is reported for it and this service's own record is not written
+        // either: the two views of one volume are written together or not at all.
+        //
+        // An instance whose launch produced no managed EC2 instance has no EBS attachment
+        // for this call to make — there is no instance half to make one against — so what is
+        // written for it is this service's own relation alone, exactly as before.
+        if let Some(ec2_instance_id) = &ec2_instance_id {
+            if !crate::state::attach_ebs_volume(
+                &*self.engine,
+                &input.volume_id,
+                ec2_instance_id,
+                &input.device,
+            ) {
+                return Err(AssociateVolumeErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the volume could not be attached to the managed instance"
+                            .to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into());
+            }
+        }
         volume.attachment = Some(crate::state::VolumeAttachment {
             workspace_instance_id: input.workspace_instance_id,
             device: input.device,

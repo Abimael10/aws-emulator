@@ -14,13 +14,15 @@
 //! owns EBS volumes holds it, its reads resolve it, and `DeleteVolume` makes it disappear
 //! from there.
 //!
-//! This module is that seam. Nothing here invents a volume: the record is written by the
-//! owning service's own writer
-//! ([`ec2_store::ComAmazonawsEc2Amazonec2State::insert_volume`]), which mints the `VolumeId`
+//! This module is that seam. Nothing here invents a volume or an attachment: the record is
+//! written by the owning service's own writers
+//! ([`ec2_store::ComAmazonawsEc2Amazonec2State::insert_volume`], which mints the `VolumeId`
 //! out of ITS id counter, builds the EBS `Volume` shape its own `CreateVolume` builds and
-//! charges the bytes against its own store budget — so the id this service reports is the id
-//! that store holds, and every EBS read of it (a describe, a tag, an attach) resolves the
-//! same record.
+//! charges the bytes against its own store budget, and
+//! [`ec2_store::ComAmazonawsEc2Amazonec2State::attach_volume_to_instance`], which brings an
+//! attachment up exactly as that service's own `AttachVolume` does) — so the id this service
+//! reports is the id that store holds, and every EBS read of it (a describe, a tag, an
+//! attach) resolves the same record.
 //!
 //! The store is reached through the SHARED ENGINE, the same seam
 //! `service-com-amazonaws-ec2-amazonec2` reaches the EBS direct APIs' snapshot store
@@ -34,7 +36,9 @@
 //! cannot invert.
 
 use std::collections::BTreeMap;
+use std::time::SystemTime;
 
+use ::service_com_amazonaws_ec2_amazonec2::ops::types::AttachVolumeOutput;
 use ::service_com_amazonaws_ec2_amazonec2::state::{self as ec2_store, VolumeSpec};
 
 use crate::ops::types::{CreateVolumeInput, ValidationException};
@@ -253,8 +257,76 @@ pub fn create_ebs_volume<Eng: Send + Sync + 'static>(
     })
 }
 
-/// Drop this service's record of every volume of Region `region` the service that OWNS EBS
-/// volumes no longer holds.
+/// Attach the Amazon EBS volume `volume_id` to the managed Amazon EC2 instance
+/// `ec2_instance_id` at `device`, as `AssociateVolume` does, and answer whether the owning
+/// store held the volume to attach.
+///
+/// The attachment this service accepts IS that volume's EBS attachment: the volume is an EBS
+/// volume of the account and the WorkSpace Instance is the managed EC2 instance, so the
+/// relation is recorded in the store that OWNS the volume and every EBS read of it — a
+/// describe, a snapshot, a detach made over the EC2 API — resolves the one attachment, the
+/// same way [`create_ebs_volume`] records the volume itself there. It is an INSTANCE's own
+/// attachment, naming the `InstanceId` the volume is exposed to and the `Device` it is
+/// exposed at, so it carries neither marker of an attachment to an Amazon Web
+/// Services-managed resource ("the ARN of the Amazon Web Services-managed resource to which
+/// the volume is attached" / "the service principal of the Amazon Web Services service that
+/// owns the underlying resource", each returned only for those) — which is also why its
+/// `DeleteOnTermination` is the one the owning service answers for a volume attached to a
+/// running instance ([`ec2_store::ATTACHMENT_DELETE_ON_TERMINATION`]) rather than a launch's.
+///
+/// The attachment is brought up the way that store brings one up: `attaching` now, with its
+/// clock owing `attached`, so a caller that reads straight after this call sees the
+/// transient state.
+pub fn attach_ebs_volume<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    volume_id: &str,
+    ec2_instance_id: &str,
+    device: &str,
+) -> bool {
+    let Some(state) = ec2_store::service_state(engine) else {
+        return false;
+    };
+    let attachment = AttachVolumeOutput {
+        volume_id: Some(volume_id.to_string()),
+        instance_id: Some(ec2_instance_id.to_string()),
+        device: Some(device.to_string()),
+        state: Some(ec2_store::VOLUME_ATTACHMENT_STATE_ATTACHING.to_string()),
+        // "The time stamp when the attachment initiated" (`VolumeAttachment$AttachTime`):
+        // this call's own clock reading.
+        attach_time: Some(ec2_store::system_time_to_date_time(SystemTime::now())),
+        delete_on_termination: Some(ec2_store::ATTACHMENT_DELETE_ON_TERMINATION),
+        associated_resource: None,
+        instance_owning_service: None,
+        ebs_card_index: Some(ec2_store::DEFAULT_EBS_CARD_INDEX),
+    };
+    let mut store = state.lock();
+    store.attach_volume_to_instance(volume_id, attachment)
+}
+
+/// Detach the Amazon EBS volume `volume_id` from the managed Amazon EC2 instance
+/// `ec2_instance_id` at `device`, as `DisassociateVolume` does, and answer whether the
+/// owning store held that attachment.
+///
+/// The mirror of [`attach_ebs_volume`], for the same reason: the attachment this service
+/// removes is the volume's EBS attachment, so it is taken down in the store that owns the
+/// volume — `detaching` now with its removal owed by that store's clock, exactly as a detach
+/// made over the EC2 API — and no EBS read reports the volume attached afterwards.
+pub fn detach_ebs_volume<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    volume_id: &str,
+    ec2_instance_id: &str,
+    device: &str,
+) -> bool {
+    ec2_store::service_state(engine).is_some_and(|state| {
+        state
+            .lock()
+            .detach_volume_from_instance(volume_id, ec2_instance_id, device)
+    })
+}
+
+/// Bring this service's volume records into line with what the service that OWNS EBS volumes
+/// holds, for Region `region`: a volume it no longer holds goes from here too, and so does an
+/// attachment it no longer holds.
 ///
 /// The volume a successful `CreateVolume` reports IS that EBS volume, so there is ONE volume
 /// and one answer to whether it exists: a volume removed through the owning service's own
@@ -264,13 +336,19 @@ pub fn create_ebs_volume<Eng: Send + Sync + 'static>(
 /// ([`ec2_store::ComAmazonawsEc2Amazonec2State::volume_is_withdrawn`]), so the two services
 /// cannot disagree about which ids resolve.
 ///
-/// The removal was owed at the instant the owning service removed the volume, whether or not
-/// anybody called here — so this materialises what has ALREADY happened, the way
+/// An ATTACHMENT answers to the same rule, in the same direction: the attachment
+/// `AssociateVolume` makes is the volume's EBS attachment ([`attach_ebs_volume`]), so one the
+/// owning store no longer holds — taken down over the EC2 API, or released when the instance
+/// it was on went away — is one this service holds no more either, and the volume it was on is
+/// free to be attached again and free to be deleted.
+///
+/// Both were owed at the instant the owning service made them, whether or not anybody called
+/// here — so this materialises what has ALREADY happened, the way
 /// [`crate::state::ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState::settle_all`]
-/// materialises what the clock already owed, and a WRITER calls it. It goes through this
-/// store's own `remove_volume`, so the creating `ClientToken` and the volume's modification
-/// claims are retired with the record exactly as a `DeleteVolume` retires them.
-pub fn drop_volumes_the_account_no_longer_holds<Eng: Send + Sync + 'static>(
+/// materialises what the clock already owed, and a WRITER calls it. The removal goes through
+/// this store's own `remove_volume`, so the creating `ClientToken` and the volume's
+/// modification claims are retired with the record exactly as a `DeleteVolume` retires them.
+pub fn settle_volumes_against_the_owning_service<Eng: Send + Sync + 'static>(
     engine: &Eng,
     state: &mut crate::state::ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState,
     region: &str,
@@ -279,19 +357,54 @@ pub fn drop_volumes_the_account_no_longer_holds<Eng: Send + Sync + 'static>(
         return;
     };
     let now = std::time::Instant::now();
-    let withdrawn: Vec<String> = {
+    let (withdrawn, detached) = {
         let owner = owner.lock();
-        state
+        let held: Vec<&crate::state::VolumeRecord> = state
             .volumes
             .values()
+            .filter(|record| record.region == region)
+            .collect();
+        let withdrawn: Vec<String> = held
+            .iter()
+            .filter(|record| owner.volume_is_withdrawn(&record.id, now))
+            .map(|record| record.id.clone())
+            .collect();
+        // Which of the volumes the account still holds no longer carry the attachment this
+        // service recorded for them. The instance half of the attachment is the managed EC2
+        // instance the WorkSpace Instance IS, read off this service's own record of it — the
+        // same id the attach was made against. A WorkSpace Instance that has none (one whose
+        // launch EC2 refused) has no EBS attachment for the owning store to have taken down,
+        // so there is nothing of it to follow here.
+        let detached: Vec<String> = held
+            .iter()
+            .filter(|record| !owner.volume_is_withdrawn(&record.id, now))
             .filter(|record| {
-                record.region == region && owner.volume_is_withdrawn(&record.id, now)
+                record.attachment.as_ref().is_some_and(|attachment| {
+                    state
+                        .instances
+                        .get(&attachment.workspace_instance_id)
+                        .and_then(|instance| instance.ec2_instance_id.as_deref())
+                        .is_some_and(|ec2_instance_id| {
+                            !owner.volume_is_attached_at(
+                                &record.id,
+                                ec2_instance_id,
+                                &attachment.device,
+                                now,
+                            )
+                        })
+                })
             })
             .map(|record| record.id.clone())
-            .collect()
+            .collect();
+        (withdrawn, detached)
     };
     for volume_id in withdrawn {
         state.remove_volume(region, &volume_id);
+    }
+    for volume_id in detached {
+        if let Some(record) = state.volume_mut(region, &volume_id) {
+            record.attachment = None;
+        }
     }
 }
 

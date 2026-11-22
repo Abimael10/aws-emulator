@@ -532,6 +532,47 @@ impl VolumeRecord {
             .retain(|key, due_at| now < *due_at && held.contains(key));
     }
 
+    /// Start taking the attachment `key` names down: it reads `detaching` from now, and the
+    /// clock owes its removal [`TRANSITION_DELAY`] later.
+    ///
+    /// The ONE writer of that move, so `ec2:DetachVolume` and a service of this account that
+    /// detaches a volume from a resource of its own take an attachment down the same way. The
+    /// instant `detached` falls due is owed by the call that STARTED the move, so an
+    /// attachment already on its way down keeps the instant it has: overwriting would let a
+    /// caller that polls with a detach postpone the move for as long as it keeps asking.
+    pub fn begin_detachment(&mut self, key: &(String, String), now: Instant) {
+        for stored in self.view.attachments.iter_mut().flatten() {
+            if &Self::attachment_key(stored) == key {
+                stored.state = Some(VOLUME_ATTACHMENT_STATE_DETACHING.to_string());
+            }
+        }
+        if !self.detaching_at.contains_key(key) {
+            self.detaching_at
+                .insert(key.clone(), now + TRANSITION_DELAY);
+        }
+    }
+
+    /// Drop the attachment at `key` that a detach has already taken down, if the volume still
+    /// holds one, and the removal that was owed with it.
+    ///
+    /// One `(InstanceId, Device)` pair identifies ONE attachment of a volume
+    /// ([`Self::attachment_key`]), so an attachment at that key whose detach has started is
+    /// not one a NEW attachment can sit beside: the detach decided it is going. Without this,
+    /// a volume attached again at the device it was just detached from would report two rows
+    /// under one key, and the removal the clock still owed the old one would take the new one
+    /// with it ([`Self::materialize_due_detachments`] and [`Self::attachments_at`] read the
+    /// key, not the row). Called by the writer that records an attachment, which is the only
+    /// place a second row under one key could arise.
+    pub fn drop_detaching_attachment(&mut self, key: &(String, String)) {
+        if let Some(attachments) = self.view.attachments.as_mut() {
+            attachments.retain(|attachment| {
+                &Self::attachment_key(attachment) != key
+                    || attachment.state.as_deref() != Some(VOLUME_ATTACHMENT_STATE_DETACHING)
+            });
+        }
+        self.detaching_at.remove(key);
+    }
+
     /// The volume's `VolumeState` at `now`.
     ///
     /// A volume being created is `creating`; one an instance still holds an attachment of
@@ -1131,18 +1172,120 @@ impl ComAmazonawsEc2Amazonec2State {
         volume_id: &str,
         attachment: AttachVolumeOutput,
     ) -> bool {
+        self.record_volume_attachment(volume_id, attachment, None)
+    }
+
+    /// Record `attachment` on the volume `volume_id`, for a volume a SERVICE of this account
+    /// attached to an INSTANCE of the account on its behalf, and answer whether the volume
+    /// was there to attach.
+    ///
+    /// The attachment such a service makes is an instance's own — it names the `InstanceId`
+    /// the volume is exposed to and the `Device` it is exposed at — so it is stored exactly
+    /// as `ec2:AttachVolume` stores one: in the non-terminal `attaching` state with the
+    /// clock owing it `attached` [`TRANSITION_DELAY`] later, so a caller that reads straight
+    /// after the attach still sees the transient state, and the volume reports `in-use` from
+    /// the moment it holds the attachment. An attachment handed over already `attached` owes
+    /// no move and is stored as it stands.
+    pub fn attach_volume_to_instance(
+        &mut self,
+        volume_id: &str,
+        attachment: AttachVolumeOutput,
+    ) -> bool {
+        let attached_at = (attachment.state.as_deref() == Some(VOLUME_ATTACHMENT_STATE_ATTACHING))
+            .then(|| Instant::now() + TRANSITION_DELAY);
+        self.record_volume_attachment(volume_id, attachment, attached_at)
+    }
+
+    /// Store `attachment` on the volume `volume_id`, owing its `attached` move at
+    /// `attached_at` where one is owed, and answer whether the volume was there to attach.
+    ///
+    /// The ONE push of a stored attachment that is not an `ec2:AttachVolume`'s own: the
+    /// moves the clock already finished for this volume are materialised first, so the
+    /// record holds only what a reader is already being shown and nothing is owed on an
+    /// attachment that is gone — the same order `ec2:AttachVolume` writes in.
+    fn record_volume_attachment(
+        &mut self,
+        volume_id: &str,
+        attachment: AttachVolumeOutput,
+        attached_at: Option<Instant>,
+    ) -> bool {
+        let now = Instant::now();
+        let key = VolumeRecord::attachment_key(&attachment);
+        let Some(record) = self.volumes.get_mut(volume_id) else {
+            return false;
+        };
+        record.materialize_due_detachments(now);
+        record.materialize_due_attachments(now);
+        // One `(InstanceId, Device)` pair is one attachment, so an attachment at this key
+        // that a detach has already taken down makes way for this one rather than staying
+        // beside it.
+        record.drop_detaching_attachment(&key);
+        record
+            .view
+            .attachments
+            .get_or_insert_with(Vec::new)
+            .push(attachment);
+        if let Some(attached_at) = attached_at {
+            record.attaching_at.insert(key, attached_at);
+        }
+        true
+    }
+
+    /// Take the attachment of the volume `volume_id` to the instance `instance_id` at
+    /// `device` down, for a volume a SERVICE of this account detached from an instance on
+    /// its behalf, and answer whether the volume held that attachment.
+    ///
+    /// The mirror of [`Self::attach_volume_to_instance`], through the one writer of that
+    /// move ([`VolumeRecord::begin_detachment`]): the attachment reads `detaching` from now
+    /// and the clock owes its removal, exactly as `ec2:DetachVolume` takes one down. `false`
+    /// for a volume the account does not hold and for one holding no such attachment, so a
+    /// caller cannot report a detach that removed nothing.
+    pub fn detach_volume_from_instance(
+        &mut self,
+        volume_id: &str,
+        instance_id: &str,
+        device: &str,
+    ) -> bool {
         let now = Instant::now();
         let Some(record) = self.volumes.get_mut(volume_id) else {
             return false;
         };
         record.materialize_due_detachments(now);
         record.materialize_due_attachments(now);
-        record
-            .view
-            .attachments
-            .get_or_insert_with(Vec::new)
-            .push(attachment);
+        let key = (instance_id.to_string(), device.to_string());
+        if !record
+            .attachments_at(now)
+            .iter()
+            .any(|held| VolumeRecord::attachment_key(held) == key)
+        {
+            return false;
+        }
+        record.begin_detachment(&key, now);
         true
+    }
+
+    /// Whether the volume `volume_id` holds an attachment to the instance `instance_id` at
+    /// `device` at `now`.
+    ///
+    /// Read through [`VolumeRecord::attachments_at`], the crate's one clock-aware reading of
+    /// an attachment, so an attachment whose detach the clock has already finished is not
+    /// one the volume holds and one still `attaching` is. Asked by a service of this account
+    /// that recorded such an attachment here, so its own view of the volume follows this
+    /// store's.
+    pub fn volume_is_attached_at(
+        &self,
+        volume_id: &str,
+        instance_id: &str,
+        device: &str,
+        now: Instant,
+    ) -> bool {
+        let key = (instance_id.to_string(), device.to_string());
+        self.volumes.get(volume_id).is_some_and(|record| {
+            record
+                .attachments_at(now)
+                .iter()
+                .any(|held| VolumeRecord::attachment_key(held) == key)
+        })
     }
 
     /// Whether the account holds an EBS snapshot under `snapshot_id`.

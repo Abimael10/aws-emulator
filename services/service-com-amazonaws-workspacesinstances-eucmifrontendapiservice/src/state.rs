@@ -2878,8 +2878,8 @@ pub const VOLUME_ALREADY_ATTACHED_MESSAGE: &str =
     "Workspace managed EBS volume is already attached to a workspace instance";
 
 /// The `Message` for an attach at a device path another volume already occupies on a
-/// WorkSpace Instance that reports NO managed EC2 instance — one whose launch is still
-/// being made or failed. `ResourceId` names that other volume.
+/// WorkSpace Instance that reports NO managed EC2 instance — one whose launch EC2 refused.
+/// `ResourceId` names that other volume.
 ///
 /// An attach is performed by the service that owns the instance, so where there IS a
 /// managed instance the refusal is that service's own

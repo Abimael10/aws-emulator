@@ -202,8 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            TRANSITION_DELAY, VOLUME_ATTACHMENT_STATE_DETACHING, VolumeRecord,
-            dry_run_operation, incorrect_state_of, instance_id_is_well_formed,
+            VolumeRecord, dry_run_operation, incorrect_state_of, instance_id_is_well_formed,
             invalid_attachment_not_found, invalid_volume_id_malformed,
             invalid_volume_id_not_found, require_readable_volume_id, require_service_state,
             unsupported_operation, volume_id_is_well_formed,
@@ -321,27 +320,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The detach is a write: the attachment moves to `detaching` now, and the clock owes
         // it `detached` — the same span, read off the same monotonic clock, as a volume's
-        // `creating` -> `available` move — at which point the volume holds it no more.
+        // `creating` -> `available` move — at which point the volume holds it no more. That
+        // move is made through its one writer (`VolumeRecord::begin_detachment`), which a
+        // service of this account detaching a volume from a resource of its own reaches too,
+        // so no two paths take an attachment down differently.
         //
         // One reading of which attachment is this one: `VolumeRecord::attachment_key`, the
-        // same key the owed instant below is stored under, so the write and the clock cannot
+        // same key the owed instant is stored under, so the write and the clock cannot
         // identify the attachment two ways.
         let key = VolumeRecord::attachment_key(&attachment);
-        for stored in record.view.attachments.iter_mut().flatten() {
-            if VolumeRecord::attachment_key(stored) == key {
-                stored.state = Some(VOLUME_ATTACHMENT_STATE_DETACHING.to_string());
-            }
-        }
-        // The instant `detached` falls due is owed by the call that STARTED the move, so a
-        // detach of an attachment already on its way down reports it as it stands without
-        // pushing its completion further out: the instant is written only when none is owed
-        // yet. Overwriting would let a caller that polls with a detach postpone the move for
-        // as long as it keeps asking.
-        if !record.detaching_at.contains_key(&key) {
-            record
-                .detaching_at
-                .insert(key.clone(), now + TRANSITION_DELAY);
-        }
+        record.begin_detachment(&key, now);
 
         // Read the answer back OUT of the store, so the caller is told what a later
         // `DescribeVolumes` will report rather than the request object.

@@ -300,7 +300,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already done: a volume removed there is gone, so this service's record of it goes
         // too — it is neither counted against the quota below nor left holding the
         // `ClientToken` of the create that made it.
-        crate::state::drop_volumes_the_account_no_longer_holds(&*self.engine, &mut state, &region);
+        crate::state::settle_volumes_against_the_owning_service(&*self.engine, &mut state, &region);
 
         // `@idempotent` + `@idempotencyToken`: "Unique token to prevent duplicate volume
         // creation" — a `ClientToken` this service has already created a volume for is

@@ -180,8 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_all(now);
         // And what the service that OWNS this volume has already done: a volume removed
         // there is gone, so this service's record of it goes too and its id resolves to
-        // nothing here — there is ONE volume and one answer about whether it exists.
-        crate::state::drop_volumes_the_account_no_longer_holds(&*self.engine, &mut state, &region);
+        // nothing here — there is ONE volume and one answer about whether it exists — and an
+        // attachment taken down there is one this call finds nothing left to detach of.
+        crate::state::settle_volumes_against_the_owning_service(&*self.engine, &mut state, &region);
 
         // "Detaches a volume from a WorkSpace Instance": both resources are resolved
         // against the store, in the Region this call was signed for, and an id that
@@ -190,15 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // volume is being detached FROM. Both go through the shared not-found helpers,
         // so this path answers the same (status, code) pair as every other not-found in
         // this service.
-        if state
-            .settled(&region, &input.workspace_instance_id, now)
-            .is_none()
-        {
+        let Some(instance) = state.settled(&region, &input.workspace_instance_id, now) else {
             return Err(crate::state::instance_not_found_error(
                 &input.workspace_instance_id,
                 DisassociateVolumeErrorModeled::ResourceNotFoundException,
             ));
-        }
+        };
+        // The managed Amazon EC2 instance this WorkSpace Instance IS: the instance half of
+        // the EBS attachment the detach below takes down, read while the instance is
+        // borrowed. `None` only for an instance whose launch failed, which can hold no
+        // attachment at all — `AssociateVolume` refuses an attach to one — so such a volume
+        // is answered by the "not attached" conflict below.
+        let ec2_instance_id = instance.ec2_instance_id.clone();
 
         let Some(volume) = state.volume_mut(&region, &input.volume_id) else {
             return Err(crate::state::volume_not_found_error(
@@ -259,13 +263,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // free for another volume, and a second detach of the same volume is the
         // "not attached" conflict above rather than a second success.
         //
+        // It goes where the attachment IS: the relation this service holds is the Amazon EBS
+        // attachment of that volume to the managed EC2 instance ([`AssociateVolume`]), so the
+        // detach is made in the store that OWNS the volume as well — the mirror of the attach
+        // — and no EBS read reports the volume attached afterwards. The owning store having
+        // no such attachment left (one taken down over the EC2 API, or released with the
+        // instance it was on) is the same outcome this call promises, so the record here goes
+        // either way: what the caller is told is that the volume is detached, and it is.
+        //
         // `DisassociateMode` (FORCE | NO_FORCE) chooses how the guest is asked to
         // release the device before the volume is detached — a forced detach skips
         // that and risks the data still buffered in the guest. Either way the volume
         // ends up detached, and this service records no state the choice could show up
         // in (no attachment status is modelled anywhere, and no guest file system
         // exists here), so neither mode is given an invented effect of its own.
+        let detached_device = attachment.device.clone();
         volume.attachment = None;
+        if let Some(ec2_instance_id) = ec2_instance_id.as_deref() {
+            let _ = crate::state::detach_ebs_volume(
+                &*self.engine,
+                &input.volume_id,
+                ec2_instance_id,
+                &detached_device,
+            );
+        }
 
         Ok(DisassociateVolumeOutput {})
     }
