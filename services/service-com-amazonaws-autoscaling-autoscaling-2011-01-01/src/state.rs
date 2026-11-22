@@ -252,6 +252,10 @@ pub use notification_configurations::{
 /// and terminations produce.
 pub mod sns_notifications;
 
+/// The TEST message a lifecycle hook's notification target is proved by as the hook is put,
+/// and the refusal of a hook whose role may not publish to that target.
+pub mod lifecycle_hook_test_notification;
+
 pub use lifecycle_events::{
     drive_lifecycle_clock, InstanceLifecycle, InstanceLifecycleChange, PendingLifecycleEvent,
     StepOutcome,

@@ -141,6 +141,30 @@ pub fn test_notification(
         );
         return None;
     }
+    Some(PendingNotification {
+        topic_arn: topic_arn.to_string(),
+        message: test_notification_document(group, request_id, at),
+    })
+}
+
+/// The document a TEST notification of `group` carries, whichever target it is published to.
+///
+/// THE ONE rendering of it: the confirmation a notification configuration owes its topic and
+/// the test message a lifecycle hook's notification target is proved by
+/// ([`super::lifecycle_hook_test_notification`]) are the same event of this service's own
+/// catalog — "test messages contain the following additional key-value pair: "Event":
+/// "autoscaling:TEST_NOTIFICATION"" — so two targets cannot be told about one group
+/// differently.
+///
+/// `request_id` is the id of the call that named the target: the notification reports which
+/// request produced it, exactly as the notification for a lifecycle step reports the activity
+/// that produced that one.
+#[must_use]
+pub fn test_notification_document(
+    group: &StoredGroup,
+    request_id: &str,
+    at: SystemTime,
+) -> String {
     let mut document = ::serde_json::Map::new();
     insert_text(&mut document, "AccountId", ::engine::emulator_account_id());
     insert_text(&mut document, "RequestId", request_id);
@@ -149,10 +173,7 @@ pub fn test_notification(
     insert_text(&mut document, "Service", NOTIFICATION_SERVICE);
     insert_text(&mut document, "Event", TEST_NOTIFICATION);
     insert_text(&mut document, "Time", &date_time_text(at));
-    Some(PendingNotification {
-        topic_arn: topic_arn.to_string(),
-        message: ::serde_json::Value::Object(document).to_string(),
-    })
+    ::serde_json::Value::Object(document).to_string()
 }
 
 /// Every notification one instance lifecycle step owes: one per topic the group's

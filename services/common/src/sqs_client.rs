@@ -73,6 +73,46 @@ pub fn queue_arn_of_url(region: &str, queue_url: &str) -> Option<String> {
     Some(format!("arn:aws:sqs:{region}:{account}:{name}"))
 }
 
+/// The `QueueUrl` Amazon SQS addresses the queue `queue_arn` names by, or `None` when the
+/// value names no queue a service of this emulator could deliver to.
+///
+/// The REVERSE of [`queue_arn_of_url`], and here for the same reason: a queue's ARN names the
+/// queue DIRECTLY (`arn:<partition>:sqs:<region>:<account>:<QueueName>`) while every Amazon
+/// SQS operation takes the url `<endpoint>/<account>/<QueueName>`, so a service handed an ARN
+/// — a notification target, an event or schedule target, a dead-letter queue — has to read
+/// the one into the other before it can deliver anything. One reading for all of them, so two
+/// services handed one ARN address one queue.
+///
+/// `None` for every value that does not name such a queue, because each of its fields reaches
+/// an URL where it is not just data and a caller supplies the whole ARN:
+///
+/// * a value that is not an ARN of the `sqs` vendor names no queue at all;
+/// * a Region field outside the Region-label grammar ([`super::arn::region_label`]) would
+///   re-point or truncate the endpoint's AUTHORITY;
+/// * an account field that is not an account id names no queue owner, and the name is the
+///   url's last path segment, so a name carrying `/` or `:` would reshape the path.
+///
+/// The copies that predate this function — `queue_url` in the EventBridge v2, EventBridge
+/// Scheduler, EventBridge Pipes and Amazon S3 crates — are to be MIGRATED onto it, each in the
+/// change that owns its service. Nothing new should inline the reading.
+#[must_use]
+pub fn queue_url_of_arn(queue_arn: &str) -> Option<String> {
+    /// How many digits an account id carries.
+    const ACCOUNT_ID_DIGITS: usize = 12;
+
+    let arn = super::arn::parse_of(queue_arn, "sqs")?;
+    let region = super::arn::region_label(arn.region)?;
+    let names_an_account = arn.account.len() == ACCOUNT_ID_DIGITS
+        && arn.account.bytes().all(|byte| byte.is_ascii_digit());
+    if !names_an_account || arn.resource.is_empty() || arn.resource.contains(['/', ':']) {
+        return None;
+    }
+    Some(format!(
+        "https://sqs.{region}.amazonaws.com/{}/{}",
+        arn.account, arn.resource
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +166,71 @@ mod tests {
             assert_eq!(
                 &actual, expected,
                 "case {case:?}: expected {url:?} to name {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the url a queue is addressed by is read off the fields of its own ARN — its
+    /// Region into the endpoint, its owner and its name into the path — and a value whose
+    /// fields name no queue addresses none.
+    ///
+    /// The rows differ along which field is in question: a queue of this account, one of
+    /// another, a FIFO queue (whose name carries the suffix), another vendor's ARN, a
+    /// partition-global ARN with no Region, a Region outside the label grammar, an account
+    /// field that is not an account id, and a resource field carrying a path or a further
+    /// colon.
+    #[test]
+    fn a_queues_url_is_read_off_the_fields_of_its_own_arn() {
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "a queue of this account",
+                "arn:aws:sqs:us-east-1:000000000000:orders",
+                Some("https://sqs.us-east-1.amazonaws.com/000000000000/orders"),
+            ),
+            (
+                "a queue of another account, in another partition",
+                "arn:aws-cn:sqs:cn-north-1:111111111111:orders",
+                Some("https://sqs.cn-north-1.amazonaws.com/111111111111/orders"),
+            ),
+            (
+                "a FIFO queue, whose name carries the suffix",
+                "arn:aws:sqs:us-east-1:000000000000:orders.fifo",
+                Some("https://sqs.us-east-1.amazonaws.com/000000000000/orders.fifo"),
+            ),
+            (
+                "another vendor's ARN",
+                "arn:aws:sns:us-east-1:000000000000:orders",
+                None,
+            ),
+            (
+                "a partition-global ARN, which carries no Region",
+                "arn:aws:sqs::000000000000:orders",
+                None,
+            ),
+            (
+                "a Region field outside the label grammar",
+                "arn:aws:sqs:us-east-1/../x:000000000000:orders",
+                None,
+            ),
+            (
+                "an account field that is no account id",
+                "arn:aws:sqs:us-east-1:aws:orders",
+                None,
+            ),
+            (
+                "a resource field carrying a path",
+                "arn:aws:sqs:us-east-1:000000000000:queue/orders",
+                None,
+            ),
+            ("no queue name at all", "arn:aws:sqs:us-east-1:000000000000:", None),
+            ("no ARN at all", "orders", None),
+        ];
+        for (case, arn, expected) in rows {
+            let actual = queue_url_of_arn(arn);
+            assert_eq!(
+                actual.as_deref(),
+                *expected,
+                "case {case:?}: expected {arn:?} to be addressed by {expected:?}, got {actual:?}"
             );
         }
     }

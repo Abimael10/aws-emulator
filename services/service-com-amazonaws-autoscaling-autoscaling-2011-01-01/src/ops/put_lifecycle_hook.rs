@@ -21,6 +21,12 @@
 //! heartbeat timeout against its documented range — are checked before the group the
 //! request names is resolved.
 //!
+//! A request that names either half of a hook's notification pair is proved against it
+//! before anything is written: the call publishes an `autoscaling:TEST_NOTIFICATION` message
+//! to the target the hook would stand with, under the role it would stand with, so a role IAM
+//! answers may not publish there refuses the call with `ValidationError` and stores no hook
+//! ([`crate::state::lifecycle_hook_test_notification`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -229,61 +235,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.materialize_due(&*self.engine, now);
 
+        // The TARGET and the ROLE the hook WOULD STAND with, which are what the publish below
+        // is made to and under: a member the request omits keeps the value the stored hook
+        // carries, and an empty notification target leaves the hook with none. Read in a
+        // critical section that ENDS here, because the decision that follows asks IAM over the
+        // in-process hop — so this service's lock is not held across an await.
+        //
         // A hook belongs to a group, so a name no group answers to is refused in the
         // detail form this operation serves: the detail states that no such group
         // exists, naming the one the request asked for.
-        let Some(group) = state.groups.get_mut(&group_name) else {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message_as_no_such_group(&group_name),
-            ));
+        let (stored_target, stored_role) = {
+            let mut state = state.lock();
+            state.materialize_due(&*self.engine, now);
+            let Some(group) = state.groups.get(&group_name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::absent_group_message_as_no_such_group(&group_name),
+                ));
+            };
+            match group.lifecycle_hook(&hook_name) {
+                Some(hook) => (
+                    hook.notification_target_arn.clone(),
+                    hook.role_arn.clone(),
+                ),
+                None => (None, None),
+            }
         };
+        let standing_target = match put.notification_target_arn.as_deref() {
+            Some(named) => (!named.is_empty()).then(|| named.to_string()),
+            None => stored_target,
+        };
+        let standing_role = put.role_arn.clone().or(stored_role);
 
-        group
-            .put_lifecycle_hook(&hook_name, &put)
-            .map_err(|refusal| {
-                let message = refusal.message(&hook_name);
-                match refusal {
-                    // The group's own ceiling on hooks is the operation's modelled
-                    // `LimitExceededFault`; every other refusal is about the values the
-                    // request carries, which this service answers `ValidationError` for.
-                    crate::state::LifecycleHookRefusal::LimitExceeded => {
-                        PutLifecycleHookErrorModeled::LimitExceededFault(LimitExceededFault {
-                            message: Some(message),
-                        })
-                        .into()
+        // The pair this call PROVES, if any: a call that names either member of it publishes
+        // the test message to the standing target under the standing role — specifying a
+        // target sends the message to it, and pointing an existing target at another role
+        // sends it under that role. A call that names neither changes nothing about the pair,
+        // and one that CLEARS the target leaves none to prove.
+        let proved = (put.notification_target_arn.is_some() || put.role_arn.is_some())
+            .then(|| standing_target.zip(standing_role))
+            .flatten();
+        // Proved before the hook is written, so a role IAM answers may not publish there
+        // refuses the call and leaves the group's hooks exactly as they were
+        // ([`crate::state::lifecycle_hook_test_notification`]). Asked with no lock of this
+        // service's store held.
+        if let Some((target, role)) = proved.as_ref() {
+            if let Some(refusal) =
+                crate::state::lifecycle_hook_test_notification::unpublishable_target_error(
+                    ctx,
+                    &crate::state::request_region(ctx.parts()),
+                    target,
+                    role,
+                )
+                .await
+            {
+                return Err(refusal);
+            }
+        }
+
+        // The whole of the write, in ONE critical section that ENDS before the delivery
+        // below: the store's lock is not held across an await, so nothing of this service's
+        // state is held while another service is called in process.
+        let (held, test_messages) = {
+            let mut state = state.lock();
+            state.materialize_due(&*self.engine, now);
+
+            // The group as it stands now: a group deleted while the publish above was
+            // decided answers to the name no more than one that never existed.
+            let Some(group) = state.groups.get_mut(&group_name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::absent_group_message_as_no_such_group(&group_name),
+                ));
+            };
+
+            group
+                .put_lifecycle_hook(&hook_name, &put)
+                .map_err(|refusal| {
+                    let message = refusal.message(&hook_name);
+                    match refusal {
+                        // The group's own ceiling on hooks is the operation's modelled
+                        // `LimitExceededFault`; every other refusal is about the values the
+                        // request carries, which this service answers `ValidationError` for.
+                        crate::state::LifecycleHookRefusal::LimitExceeded => {
+                            PutLifecycleHookErrorModeled::LimitExceededFault(LimitExceededFault {
+                                message: Some(message),
+                            })
+                            .into()
+                        }
+                        _ => crate::scaffolded::Scaffolded::validation_error(message),
                     }
-                    _ => crate::scaffolded::Scaffolded::validation_error(message),
-                }
-            })?;
+                })?;
 
-        crate::state::audit(
-            ctx.parts(),
-            "PutLifecycleHook",
-            &format!("{group_name}/{hook_name}"),
-            "lifecycle hook stored",
-        );
+            crate::state::audit(
+                ctx.parts(),
+                "PutLifecycleHook",
+                &format!("{group_name}/{hook_name}"),
+                "lifecycle hook stored",
+            );
 
-        // A LAUNCH hook acts on the launches of its group that have not COMPLETED: an
-        // instance the group still reports `Pending` has not passed the launching
-        // transition, so a hook stored while that launch is in flight takes it into the
-        // wait state exactly as a hook stored before the launch does
-        // ([`crate::state::AutoScalingState::hold_launches_in_flight`], which states why the
-        // other transition has no such point to catch). The transition is read off the
-        // STORED hook, because an update need not carry one.
-        let holds_launches = state
-            .groups
-            .get(&group_name)
-            .and_then(|group| group.lifecycle_hook(&hook_name))
-            .is_some_and(|hook| hook.lifecycle_transition == crate::state::TRANSITION_LAUNCHING);
-        let held =
-            holds_launches && state.hold_launches_in_flight(&*self.engine, &group_name, now);
+            // A LAUNCH hook acts on the launches of its group that have not COMPLETED: an
+            // instance the group still reports `Pending` has not passed the launching
+            // transition, so a hook stored while that launch is in flight takes it into the
+            // wait state exactly as a hook stored before the launch does
+            // ([`crate::state::AutoScalingState::hold_launches_in_flight`], which states why
+            // the other transition has no such point to catch). The transition is read off
+            // the STORED hook, because an update need not carry one.
+            let holds_launches = state
+                .groups
+                .get(&group_name)
+                .and_then(|group| group.lifecycle_hook(&hook_name))
+                .is_some_and(|hook| {
+                    hook.lifecycle_transition == crate::state::TRANSITION_LAUNCHING
+                });
+            let held =
+                holds_launches && state.hold_launches_in_flight(&*self.engine, &group_name, now);
+            // The test message the proved pair is PROVED by, rendered against the group as
+            // it now stands and delivered once the store's lock is released: the target has
+            // to receive it for the pair to be usable, and the role was already answered for
+            // above.
+            let test_messages: Vec<
+                crate::state::lifecycle_hook_test_notification::PendingTestMessage,
+            > = proved
+                .as_ref()
+                .and_then(|(target, _role)| {
+                    state.groups.get(&group_name).and_then(|group| {
+                        crate::state::lifecycle_hook_test_notification::owed_test_message(
+                            group,
+                            target,
+                            &::service_common::query_error_envelope::new_request_id(),
+                            now,
+                        )
+                    })
+                })
+                .into_iter()
+                .collect();
+            (held, test_messages)
+        };
+        crate::state::lifecycle_hook_test_notification::publish(ctx, &test_messages).await;
         // The hold this stored hook took is announced as every hold is, by the one pump
-        // that publishes what the clock owes. The store's lock is released first: the pump
+        // that publishes what the clock owes. The store's lock was released above: the pump
         // takes it itself.
-        drop(state);
         if held {
             crate::state::drive_lifecycle_clock(ctx, &self.engine);
         }
