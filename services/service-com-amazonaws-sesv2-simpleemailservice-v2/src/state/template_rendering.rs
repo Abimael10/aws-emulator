@@ -104,6 +104,20 @@ pub fn message_variables(raw: &str) -> Option<Value> {
     parsed.is_object().then_some(parsed)
 }
 
+/// How this service words the refusal of rendering DATA that is no set of key-value pairs
+/// — data [`message_variables`] supplies no message variables from.
+///
+/// The sentence this condition is answered with, which is wholly FIXED text: the data is
+/// refused for not being the object the model says it is, and no part of it is echoed
+/// back. Stated once here, so the surface that previews a render
+/// (`crate::ops::test_render_email_template`) and a send whose content names a template
+/// (`crate::ops::send_email`) word the one condition the same way. The DISTINCT sentence
+/// for data that IS an object but states no value for an attribute the template names is
+/// [`missing_rendering_attribute`].
+pub fn invalid_rendering_data() -> String {
+    "Template rendering data is invalid".to_string()
+}
+
 /// How this service words the failure of a render whose data states no value for an
 /// attribute the template names.
 ///

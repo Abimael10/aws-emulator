@@ -751,9 +751,14 @@ async fn a_name_outside_the_documented_rule_is_refused() {
             created.status,
             created.body
         );
-        assert!(
-            created.message().contains("64"),
-            "case {:?}: the refusal must state the documented rule, got {:?}",
+        assert_eq!(
+            created.message(),
+            format!(
+                "Invalid configuration set name <{}>: only alphanumeric ASCII characters, \
+                 '_', and '-' are allowed.",
+                case.name
+            ),
+            "case {:?}: the refusal must be AWS's own sentence naming the rejected name, got {:?}",
             case.case,
             created.message()
         );

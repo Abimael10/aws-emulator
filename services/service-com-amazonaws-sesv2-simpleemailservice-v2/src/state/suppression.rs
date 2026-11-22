@@ -152,6 +152,24 @@ pub fn suppressed_destination_not_found(tenant_name: Option<&str>, email_address
     format!("Email address {email_address} does not exist on your {list}.")
 }
 
+/// How `PutConfigurationSetSuppressionOptions` words the refusal of a suppression reason
+/// outside `SuppressionListReason`'s modelled value set.
+///
+/// It is that OPERATION's wording of the unmodelled-value class, not this service's: SES
+/// answers a sentence about what the member MEANS — the rejected value as the request
+/// spelled it, and the values the member takes — where every other operation carrying the
+/// same member answers the constraint walk's own report of the member and its value set
+/// ([`crate::state::boundary_refusal_message`]). Fixed text around the rejected value,
+/// which is the only variable part beside the value set; the set is the model's own
+/// (`crate::ops::types::SUPPRESSION_LIST_REASON_VALUES`), listed in the order this service
+/// publishes it in ([`crate::state::published_enum_value_list`]).
+pub fn invalid_suppression_reason(reason: &str) -> String {
+    format!(
+        "Reason {reason} is invalid, must be one of [{}].",
+        crate::state::published_enum_value_list(crate::ops::types::SUPPRESSION_LIST_REASON_VALUES)
+    )
+}
+
 /// How the suppression-list LISTING words the refusal of a window that runs backwards: the
 /// start it was given, the end it was given, and the requirement between them.
 ///

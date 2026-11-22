@@ -98,6 +98,10 @@ pub mod authorization;
 /// claimed on the same seam the SDK collection listings are.
 pub mod export_download;
 
+/// The ONE input refusal this service words per operation rather than per member, stated
+/// in front of the framework's own constraint walk.
+mod operation_worded_refusal;
+
 /// Unit cases for the media type this service announces (see the module header); the
 /// module is test-only, so nothing it holds is part of the served surface.
 #[cfg(test)]
@@ -432,6 +436,14 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizedRoute<Eng> {
                 authorization::refusal(&*self.engine, ctx, operation, &resource)
             {
                 return announced(req, authorization::refusal_response(&message));
+            }
+            // The ONE input refusal this service words per OPERATION rather than per member,
+            // stated ahead of the framework's own constraint walk — which is handed the
+            // member without the operation that carried it (see
+            // [`operation_worded_refusal`]). A request refused here reaches no handler, so
+            // it stores nothing and reports nothing, exactly as the walk's own refusal does.
+            if let Some(response) = operation_worded_refusal::refusal(svc, req, operation) {
+                return announced(req, response);
             }
             inner.run(svc, req, ctx).await
         })

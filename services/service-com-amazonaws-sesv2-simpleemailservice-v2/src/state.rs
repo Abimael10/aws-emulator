@@ -88,6 +88,8 @@ pub mod template_rendering;
 /// This surface's view of the ACCOUNT's email templates — one set for both SES APIs — and
 /// the token the template listing pages it with.
 pub mod templates;
+mod constraint_refusals;
+pub use constraint_refusals::*;
 
 pub use configuration_sets::*;
 pub use dedicated_ips::*;
@@ -1112,15 +1114,32 @@ pub fn tenant_name_is_well_formed(tenant_name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// How this service words `BadRequestException` for a `TenantName` that does not
-/// satisfy the documented form, stated once for every operation that takes one.
-pub fn invalid_tenant_name(tenant_name: &str) -> String {
+/// How this service words the refusal of a `name` SES does not accept for a resource of
+/// `kind`, stated once for every resource whose name carries the one character rule.
+///
+/// SES states the rejected name between angle brackets and then the characters it admits:
+/// `Invalid <kind> name <<name>>: only alphanumeric ASCII characters, '_', and '-' are
+/// allowed.` The name as the REQUEST spelled it is the only variable part beside the kind,
+/// so a caller can read the value it sent back out from between the brackets. The member's
+/// documented LENGTH bound is part of the same check and is refused in the same sentence,
+/// since a name outside it is a name SES does not accept either.
+pub fn invalid_resource_name(kind: &str, name: &str) -> String {
     format!(
-        "Invalid tenant name: {tenant_name}. The name can contain up to \
-         {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, \
-         numbers, hyphens (-) and underscores (_) only."
+        "Invalid {kind} name <{name}>: only alphanumeric ASCII characters, '_', and '-' \
+         are allowed."
     )
 }
+
+/// How this service words `BadRequestException` for a `TenantName` that does not
+/// satisfy the documented form, stated once for every operation that takes one — the
+/// write path (`CreateTenant`) and the read path (`GetTenant`), which validates the
+/// name before it looks a tenant up, alike.
+pub fn invalid_tenant_name(tenant_name: &str) -> String {
+    invalid_resource_name(TENANT_RESOURCE_KIND, tenant_name)
+}
+
+/// The resource kind a tenant's name is refused as, as SES names it in that sentence.
+const TENANT_RESOURCE_KIND: &str = "tenant";
 
 /// How this service words `NotFoundException` for a tenant the account does not hold.
 ///
@@ -3616,137 +3635,6 @@ pub fn multi_region_endpoint_not_found_to_delete() -> crate::ops::types::NotFoun
 /// on, because it is the one a delete put the resource into.
 pub fn unable_to_delete_while_deprovisioning() -> String {
     format!("Unable to delete resource in {DEPROVISIONING_STATUS} status.")
-}
-
-/// `value` when it is one of `allowed`, and the refusal naming `member` otherwise.
-///
-/// The wording an operation lifts into its own input error, so every member of this
-/// service refuses an unmodelled value the same way — and a member SES words the
-/// refusal of itself ([`SERVICE_WORDED_ENUM_MEMBERS`]) gets that sentence here too,
-/// so a handler's own read of the member and the request boundary's read of it cannot
-/// answer differently.
-pub fn modelled_enum_value(
-    member: &str,
-    value: String,
-    allowed: &[&str],
-) -> Result<String, String> {
-    if allowed.contains(&value.as_str()) {
-        return Ok(value);
-    }
-    if let Some(sentence) = service_worded_enum_refusal(member) {
-        return Err(sentence.to_string());
-    }
-    // The values are listed in the order this service publishes for the enum, the same
-    // order the request boundary's own report of the value set states
-    // ([`published_enum_value_list`]).
-    Err(format!(
-        "{member} {value} is not one of {}.",
-        published_enum_value_list(allowed)
-    ))
-}
-
-/// The members whose refusal for a value outside their own modelled value set SES
-/// states as its OWN sentence, rather than as a report of the constraint that failed.
-///
-/// A constraint report names the member and the requirement it broke, which is what
-/// SES answers for most members. For the members below it answers a semantic sentence
-/// about what the member MEANS instead: fixed text with no variable part, naming
-/// neither the offending value nor a member path. Stated once here, keyed by the
-/// member's own name, so the sentence does not depend on which operation carried the
-/// member, where in a collection the offending entry sat, or whether the value was
-/// refused on the request boundary or by a handler reading the member itself.
-const SERVICE_WORDED_ENUM_MEMBERS: [(&str, &str); 1] =
-    [("DimensionValueSource", "invalid CloudWatch dimension source")];
-
-/// SES's own sentence for a value outside `member`'s modelled value set, for a member
-/// it words the refusal of itself; `None` for every other member, which is refused
-/// with the constraint report.
-///
-/// `member` may be a dotted PATH to the member, as the constraint walk spells one, or
-/// the member's own name, as a handler names the one it read: the last segment is what
-/// is matched, and the match ignores case because a path spells a member in lowerCamel
-/// while the model names it in UpperCamel.
-fn service_worded_enum_refusal(member: &str) -> Option<&'static str> {
-    let name = member.rsplit('.').next().unwrap_or(member);
-    SERVICE_WORDED_ENUM_MEMBERS
-        .iter()
-        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
-        .map(|(_, sentence)| *sentence)
-}
-
-/// SES's own sentence for `violation`, when it is a value outside the value set of a
-/// member SES words the refusal of itself ([`service_worded_enum_refusal`]).
-fn service_worded_violation(violation: &Violation) -> Option<&'static str> {
-    if !matches!(violation.kind, ViolationKind::EnumValue(_)) {
-        return None;
-    }
-    service_worded_enum_refusal(&violation.path)
-}
-
-/// The text separating the subject of a validation clause from the requirement it
-/// states, as the framework renders one.
-const CONSTRAINT_SEPARATOR: &str = " failed to satisfy constraint: ";
-
-/// The message this service answers a refusal the constraint walk made at the request
-/// boundary with: one clause per violation, in the envelope AWS counts them in.
-///
-/// Every clause is the framework's own, with ONE difference: a value refused for its
-/// FORM — outside a modelled enum's value set, or outside a modelled `@pattern` — or for
-/// being LONGER than a modelled `@length` maximum is stated WITHOUT the value. SES names
-/// the member and the value set, the pattern or the maximum that member had to satisfy
-/// and withholds what was sent. A too-SHORT value, a range violation and an absent member
-/// quote the value the way the framework renders it, which is how AWS's own validation
-/// renders those.
-///
-/// `None` when there is nothing to state, which keeps the framework's own wording.
-pub fn boundary_refusal_message(violations: &[Violation]) -> Option<String> {
-    // A member whose refusal for a value outside its own value set SES words ITSELF
-    // answers that sentence alone: it is a semantic refusal about what the member
-    // means, not a report of the walk, so it carries neither the envelope the walk
-    // counts clauses in nor any other clause.
-    if let Some(sentence) = violations.iter().find_map(service_worded_violation) {
-        return Some(sentence.to_string());
-    }
-    let clauses: Vec<String> = violations.iter().map(boundary_clause).collect();
-    match clauses.len() {
-        0 => None,
-        1 => Some(format!("1 validation error detected: {}", clauses[0])),
-        n => Some(format!(
-            "{n} validation errors detected: {}",
-            clauses.join("; ")
-        )),
-    }
-}
-
-/// One clause of [`boundary_refusal_message`].
-///
-/// The requirement half is the framework's own words — the clause is cut at the
-/// separator rather than rebuilt — so a constraint class the framework learns to check
-/// cannot drift from this wording, and only the SUBJECT of a clause about a value's
-/// form or its excess length changes: from the value-quoting form to the member on its
-/// own.
-///
-/// The one thing decided here rather than by the walk is the ORDER a value set is listed
-/// in, which belongs to the enum rather than to the walk that read the model's members
-/// ([`in_published_enum_value_order`]) — applied to the violation before it is
-/// rendered, so the sentence around the list stays the framework's whatever shape it
-/// takes.
-fn boundary_clause(violation: &Violation) -> String {
-    let violation = &in_published_enum_value_order(violation);
-    let rendered = violation.message();
-    if !matches!(
-        violation.kind,
-        ViolationKind::EnumValue(_) | ViolationKind::Pattern(_) | ViolationKind::MaxLength(_)
-    ) {
-        return rendered;
-    }
-    match rendered.split_once(CONSTRAINT_SEPARATOR) {
-        Some((_, requirement)) => format!(
-            "Value at '{}'{CONSTRAINT_SEPARATOR}{requirement}",
-            violation.path
-        ),
-        None => rendered,
-    }
 }
 
 /// How this service words the refusal of a `NextToken` that is not a position in the

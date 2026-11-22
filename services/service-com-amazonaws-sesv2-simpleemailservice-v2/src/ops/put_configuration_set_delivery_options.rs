@@ -193,7 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(crate::state::configuration_set_not_found(&name)));
         };
         if let Some(pool_name) = missing_pool {
-            return Err(not_found(crate::state::dedicated_ip_pool_not_found(
+            // The pool a set is to send from is a PARAMETER of this request rather than the
+            // resource it addresses, so a name no pool is held under is the input error
+            // ([`crate::state::sending_pool_does_not_exist`]) and not the modelled 404.
+            return Err(bad_request(crate::state::sending_pool_does_not_exist(
                 &pool_name,
             )));
         }

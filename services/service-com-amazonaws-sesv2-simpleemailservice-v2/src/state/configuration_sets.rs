@@ -277,13 +277,17 @@ pub fn configuration_set_name_is_valid(name: &str) -> bool {
 /// How this service words the refusal of a `ConfigurationSetName` outside the
 /// documented character and length rule, stated once for every operation that takes
 /// one.
+///
+/// SES refuses such a name in the form it refuses every resource NAME it does not accept
+/// in ([`super::invalid_resource_name`]): the rejected name between angle brackets, then
+/// the characters a name may carry.
 pub fn configuration_set_name_invalid(configuration_set_name: &str) -> String {
-    format!(
-        "Configuration set name {configuration_set_name} is invalid. The name can contain up to \
-         {MAX_CONFIGURATION_SET_NAME_LEN} alphanumeric characters, including letters, numbers, \
-         hyphens (-) and underscores (_) only."
-    )
+    super::invalid_resource_name(CONFIGURATION_SET_RESOURCE_KIND, configuration_set_name)
 }
+
+/// The resource kind a configuration set's name is refused as, as SES names it in that
+/// sentence.
+const CONFIGURATION_SET_RESOURCE_KIND: &str = "configuration set";
 
 /// How this service words `NotFoundException` for a configuration set it does not
 /// hold.

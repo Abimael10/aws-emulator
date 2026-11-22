@@ -338,21 +338,21 @@ async fn the_sending_pool_a_write_names_must_be_one_the_account_holds() {
     create_set(&ses, set).await;
     let pool = "warm-pool";
 
-    // The pool does not exist yet, so the association names a resource that is not there
-    // and the set is left as it was.
+    // The pool does not exist yet, so the association names a pool the account does not
+    // hold — a parameter the request may not carry — and the set is left as it was.
     let refused = ses
         .put_delivery_options(set, json!({"SendingPoolName": pool}))
         .await;
     assert_eq!(
         (refused.status, refused.error_code().as_str()),
-        (404, "NotFoundException"),
-        "a pool the account does not hold: expected 404 NotFoundException, got {} ({})",
+        (400, "BadRequestException"),
+        "a pool the account does not hold: expected 400 BadRequestException, got {} ({})",
         refused.status,
         refused.message()
     );
     assert_eq!(
         refused.message(),
-        format!("The requested pool <{pool}> does not exist."),
+        format!("SendingPool <{pool}> doesn't exist"),
         "a pool the account does not hold: unexpected refusal sentence {:?}",
         refused.message()
     );
@@ -398,9 +398,15 @@ async fn the_sending_pool_a_write_names_must_be_one_the_account_holds() {
         .await;
     assert_eq!(
         (created.status, created.error_code().as_str()),
-        (404, "NotFoundException"),
-        "a create naming an absent pool: expected 404 NotFoundException, got {} ({})",
+        (400, "BadRequestException"),
+        "a create naming an absent pool: expected 400 BadRequestException, got {} ({})",
         created.status,
+        created.message()
+    );
+    assert_eq!(
+        created.message(),
+        "SendingPool <no-such-pool> doesn't exist",
+        "a create naming an absent pool: unexpected refusal sentence {:?}",
         created.message()
     );
     let read = ses.get_set("pool-at-create").await;

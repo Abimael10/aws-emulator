@@ -623,9 +623,8 @@ async fn a_tenant_the_account_does_not_hold_selects_no_list_to_remove_from() {
     let too_long = "t".repeat(MAX_TENANT_NAME_CHARS + 1);
     let invalid = |tenant: &str| {
         format!(
-            "Invalid tenant name: {tenant}. The name can contain up to \
-             {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, \
-             numbers, hyphens (-) and underscores (_) only."
+            "Invalid tenant name <{tenant}>: only alphanumeric ASCII characters, '_', and \
+             '-' are allowed."
         )
     };
     let absent = |tenant: &str| format!("The requested tenant <{tenant}> does not exist.");

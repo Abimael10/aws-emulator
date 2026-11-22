@@ -94,6 +94,22 @@ pub fn dedicated_ip_pool_not_found(pool_name: &str) -> String {
     format!("The requested pool <{pool_name}> does not exist.")
 }
 
+/// How this service words `BadRequestException` for a `SendingPoolName` that names no
+/// dedicated IP pool the account holds — the pool a configuration set's delivery options
+/// ask SES to send that set's mail from.
+///
+/// SES reads that member as a PARAMETER of the request rather than as the resource the
+/// call addresses: the call addresses the configuration set, so a pool name no pool is
+/// held under is a value the request may not carry — the input error — and not the
+/// modelled 404 a call that addresses the POOL itself is answered with
+/// ([`dedicated_ip_pool_not_found`]). One wording for every operation that associates a
+/// pool with a set, so a create and a later write of the same member cannot disagree.
+/// Fixed text around the one variable part, the name as the request spelled it, and the
+/// sentence ends without a full stop.
+pub fn sending_pool_does_not_exist(pool_name: &str) -> String {
+    format!("SendingPool <{pool_name}> doesn't exist")
+}
+
 /// Whether `scaling_mode` is a mode `PutDedicatedIpPoolScalingAttributes` can apply to a
 /// dedicated IP pool.
 ///

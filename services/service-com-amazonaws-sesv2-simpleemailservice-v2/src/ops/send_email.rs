@@ -638,10 +638,6 @@ enum ContentForm {
     Templated,
 }
 
-/// How this operation refuses templated content whose `TemplateData` is no set of key-value
-/// pairs, which is the one text a render reads with a parser.
-const INVALID_TEMPLATE_DATA: &str = "The template data is not a valid JSON object";
-
 /// How this operation refuses templated content that identifies no template at all — content
 /// whose `Template` names neither a stored template nor content of its own: there is no
 /// template to render the message from.
@@ -826,7 +822,15 @@ fn request_content(
                 None => ::serde_json::Value::Object(::serde_json::Map::new()),
                 Some(raw) => match crate::state::template_rendering::message_variables(raw) {
                     Some(variables) => variables,
-                    None => return Err(bad_request(INVALID_TEMPLATE_DATA)),
+                    None => {
+                        // The one sentence this service states for rendering data that is
+                        // no set of key-value pairs, which the operation that PREVIEWS a
+                        // render states too
+                        // ([`crate::state::template_rendering::invalid_rendering_data`]).
+                        return Err(bad_request(
+                            crate::state::template_rendering::invalid_rendering_data(),
+                        ));
+                    }
                 },
             };
             Ok(RequestContent::Templated(TemplatedRequest {

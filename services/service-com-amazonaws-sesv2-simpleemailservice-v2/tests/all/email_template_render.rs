@@ -762,8 +762,8 @@ async fn rendering_data_that_is_no_set_of_key_value_pairs_is_refused() {
         );
         assert_eq!(
             reply.message(),
-            "The template data is not a valid JSON object",
-            "case {case:?}: expected the refusal to name the data, got {:?}",
+            "Template rendering data is invalid",
+            "case {case:?}: expected AWS's sentence for malformed rendering data, got {:?}",
             reply.message()
         );
     }

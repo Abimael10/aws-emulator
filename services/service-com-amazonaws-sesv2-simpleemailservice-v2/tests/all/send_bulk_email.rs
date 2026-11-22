@@ -1876,14 +1876,14 @@ async fn a_templated_send_that_names_no_renderable_template_is_refused() {
             json!({"Template": {"TemplateName": TEMPLATE, "TemplateData": "[]"}}),
             400,
             "BadRequestException",
-            "The template data is not a valid JSON object".to_string(),
+            "Template rendering data is invalid".to_string(),
         ),
         (
             "template data that is no JSON at all",
             json!({"Template": {"TemplateName": TEMPLATE, "TemplateData": "name=Ada"}}),
             400,
             "BadRequestException",
-            "The template data is not a valid JSON object".to_string(),
+            "Template rendering data is invalid".to_string(),
         ),
         (
             "a template naming neither a stored template nor content of its own",

@@ -491,11 +491,10 @@ async fn a_name_outside_the_documented_rule_is_refused() {
             assert_eq!(
                 put.message(),
                 format!(
-                    "Configuration set name {set} is invalid. The name can contain up to \
-                     {MAX_CONFIGURATION_SET_NAME_LEN} alphanumeric characters, including letters, \
-                     numbers, hyphens (-) and underscores (_) only."
+                    "Invalid configuration set name <{set}>: only alphanumeric ASCII \
+                     characters, '_', and '-' are allowed."
                 ),
-                "case {case}: expected the documented refusal, got {:?}",
+                "case {case}: expected the refusal AWS words for a name it does not accept, got {:?}",
                 put.message()
             );
             let seen = reported_set(&ses, identity, &case).await;

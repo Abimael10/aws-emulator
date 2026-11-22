@@ -260,7 +260,7 @@ const DATA: &str = "{\"name\":\"Ada\"}";
 
 /// The sentence this service answers for template data that is no set of key-value pairs,
 /// which `TestRenderEmailTemplate` answers the same data with.
-const INVALID_DATA: &str = "The template data is not a valid JSON object";
+const INVALID_DATA: &str = "Template rendering data is invalid";
 
 /// The sentence this service answers for content whose `Template` identifies no template at
 /// all — naming neither a stored one nor carrying content of its own.

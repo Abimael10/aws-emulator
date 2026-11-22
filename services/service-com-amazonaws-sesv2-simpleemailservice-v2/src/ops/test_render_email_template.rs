@@ -191,7 +191,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(variables) =
             crate::state::template_rendering::message_variables(&input.template_data)
         else {
-            return Err(bad_request(INVALID_TEMPLATE_DATA));
+            return Err(bad_request(
+                crate::state::template_rendering::invalid_rendering_data(),
+            ));
         };
 
         let rendered = match crate::state::template_language::evaluate(&content, &variables).await {
@@ -295,13 +297,6 @@ fn bad_request(message: impl Into<String>) -> TestRenderEmailTemplateError {
     })
     .into()
 }
-
-/// How this operation refuses rendering data that is no set of key-value pairs.
-///
-/// Worded as the sibling send operation words the same absence in the same kind of
-/// member (`SendBulkEmail`'s default template data), so one client sees one sentence for
-/// data that is not the object the model says it has to be.
-const INVALID_TEMPLATE_DATA: &str = "The template data is not a valid JSON object";
 
 /// How this operation refuses a render it has no place to run.
 ///

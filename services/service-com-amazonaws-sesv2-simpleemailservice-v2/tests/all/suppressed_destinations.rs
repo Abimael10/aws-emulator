@@ -709,9 +709,8 @@ async fn a_tenant_the_account_does_not_hold_is_refused_before_the_list_is_read()
             status: 400,
             code: "BadRequestException",
             message: format!(
-                "Invalid tenant name: {too_long}. The name can contain up to \
-                 {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, numbers, \
-                 hyphens (-) and underscores (_) only."
+                "Invalid tenant name <{too_long}>: only alphanumeric ASCII characters, \
+                 '_', and '-' are allowed."
             ),
         },
         TenantCase {
@@ -719,11 +718,9 @@ async fn a_tenant_the_account_does_not_hold_is_refused_before_the_list_is_read()
             tenant: "tenant.one".to_string(),
             status: 400,
             code: "BadRequestException",
-            message: format!(
-                "Invalid tenant name: tenant.one. The name can contain up to \
-                 {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, numbers, \
-                 hyphens (-) and underscores (_) only."
-            ),
+            message: "Invalid tenant name <tenant.one>: only alphanumeric ASCII characters, \
+                      '_', and '-' are allowed."
+                .to_string(),
         },
     ];
 
@@ -1633,9 +1630,8 @@ async fn a_tenant_the_account_does_not_hold_is_refused_before_the_list_is_listed
             status: 400,
             code: "BadRequestException",
             message: format!(
-                "Invalid tenant name: {too_long}. The name can contain up to \
-                 {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, numbers, \
-                 hyphens (-) and underscores (_) only."
+                "Invalid tenant name <{too_long}>: only alphanumeric ASCII characters, \
+                 '_', and '-' are allowed."
             ),
         },
         TenantCase {
@@ -1643,11 +1639,9 @@ async fn a_tenant_the_account_does_not_hold_is_refused_before_the_list_is_listed
             tenant: "tenant.one".to_string(),
             status: 400,
             code: "BadRequestException",
-            message: format!(
-                "Invalid tenant name: tenant.one. The name can contain up to \
-                 {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, numbers, \
-                 hyphens (-) and underscores (_) only."
-            ),
+            message: "Invalid tenant name <tenant.one>: only alphanumeric ASCII characters, \
+                      '_', and '-' are allowed."
+                .to_string(),
         },
     ];
 
@@ -2095,9 +2089,8 @@ async fn a_suppression_write_the_account_cannot_make_stores_nothing() {
             status: 400,
             code: "BadRequestException",
             message: format!(
-                "Invalid tenant name: {too_long}. The name can contain up to \
-                 {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, numbers, \
-                 hyphens (-) and underscores (_) only."
+                "Invalid tenant name <{too_long}>: only alphanumeric ASCII characters, \
+                 '_', and '-' are allowed."
             ),
         },
         TenantCase {
@@ -2105,11 +2098,9 @@ async fn a_suppression_write_the_account_cannot_make_stores_nothing() {
             tenant: "tenant.one".to_string(),
             status: 400,
             code: "BadRequestException",
-            message: format!(
-                "Invalid tenant name: tenant.one. The name can contain up to \
-                 {MAX_TENANT_NAME_CHARS} alphanumeric characters, including letters, numbers, \
-                 hyphens (-) and underscores (_) only."
-            ),
+            message: "Invalid tenant name <tenant.one>: only alphanumeric ASCII characters, \
+                      '_', and '-' are allowed."
+                .to_string(),
         },
     ];
 

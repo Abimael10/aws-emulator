@@ -265,23 +265,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // `DeliveryOptions$SendingPoolName` names "the dedicated IP pool to associate
         // with the configuration set", so a set can only be associated with a pool the
-        // account holds: a name no pool is held under is the resource that does not
-        // exist, and nothing is stored under this set's name. It is asked after the name
-        // this create would take is resolved — a second create under a name the account
-        // already holds collides whatever it names beside it — and before the slice's own
-        // ceiling, which is about the store rather than about this request.
+        // account holds. The pool is a PARAMETER of this request rather than the resource
+        // it addresses — the request addresses the set it is creating — so a name no pool
+        // is held under is the input error, worded as every write of that member words it
+        // ([`crate::state::sending_pool_does_not_exist`]), and nothing is stored under
+        // this set's name. It is asked after the name this create would take is resolved —
+        // a second create under a name the account already holds collides whatever it
+        // names beside it — and before the slice's own ceiling, which is about the store
+        // rather than about this request.
         if let Some(pool_name) = record
             .delivery_options
             .as_ref()
             .and_then(|options| options.sending_pool_name.as_ref())
         {
             if !store.dedicated_ip_pools.contains_key(pool_name) {
-                return Err(CreateConfigurationSetErrorModeled::NotFoundException(
-                    NotFoundException {
-                        message: Some(crate::state::dedicated_ip_pool_not_found(pool_name)),
-                    },
-                )
-                .into());
+                return Err(bad_request(crate::state::sending_pool_does_not_exist(
+                    pool_name,
+                )));
             }
         }
         if store.configuration_sets.len() >= crate::state::MAX_CONFIGURATION_SETS {
