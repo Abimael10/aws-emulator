@@ -1,0 +1,56 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: bedrock.delete-model-invocation-logging-withholds-further-records
+Issue-Key: bedrock.delete-model-invocation-logging-withholds-further-records|run#29|Timeout|time.sleep(_POLL_S)
+Issue-Commit: 95ac6b97296b25f638775ef6173e027be717227c
+
+# bedrock model invocation logging delivers no record at all: the stop-after-delete scenario again burns its whole 60 s budget in leg A's positive-control delivery wait
+
+> _Note: this issue was identified against the code base at commit `95ac6b97296b25f638775ef6173e027be717227c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+PutModelInvocationLoggingConfiguration
+
+## Description
+This issue carries 1 root cause grounded in 1 failing check under the suite's `bedrock` service heading. It is the only surviving failure in this replay: every other bedrock / bedrock-runtime / bedrock-runtime__* failure was marked OWNED by an open issue and skipped.
+
+Context on what is already on file. The open issue 20261109T011501Z-bedrock-model-invocation-logging-delivers-no-record-to.md names this same check in its Issue-Trace-Ids, but the replay key it carries for it is `bedrock.delete-model-invocation-logging-withholds-further-records|_await_record#19|AssertionError|raise AssertionError(` — an assertion raised inside `_await_record` under a 180 s budget. On this replay the check never reaches that assertion: it is killed by the harness budget (`Check timed out after 60.0s`), so the failure is not carried by that key and the report did not mark it OWNED. The RESOLVED issue 20261121T024543Z-bedrock-model-invocation-logging-still-delivers-no-record.md did carry exactly this timeout key (`...|run#29|Timeout|time.sleep(_POLL_S)`) and was closed as fixed, yet the check fails identically again here: delivery is still entirely absent, so that fix did not land the delivery path. A resolved issue does not cover a live failure, so this issue re-files the defect and names both so a fixer can close them together. This is not a refusal: every control-plane and data-plane call in the check answers 200, so the service is up and answering wrongly.
+
+---
+Cause 1 of 1: an accepted model-invocation-logging configuration is stored and echoed back, but no invocation ever produces a log record at the configured S3 destination, so the Delete-stops-delivery guarantee can never be observed — the check's leg-A positive control polls an empty prefix until the budget is exhausted.
+
+AWS: Smithy (services/service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice/smithy-model/com-amazonaws-bedrock-amazonbedrockcontrolplaneservice.json): PutModelInvocationLoggingConfiguration PUT /logging/modelinvocations -> 200, input member `loggingConfig` (LoggingConfig, required), errors AccessDeniedException 403 / ValidationException 400 / ThrottlingException 429 / InternalServerException 500; GetModelInvocationLoggingConfiguration GET /logging/modelinvocations -> 200 with output member `loggingConfig`; DeleteModelInvocationLoggingConfiguration DELETE /logging/modelinvocations -> 200. Record DELIVERY itself is not modeled, so for delivery this is recorded behavior only: with `loggingConfig.s3Config = {bucketName, keyPrefix}` and `textDataDeliveryEnabled: true`, every subsequent inference writes a JSON-lines object under that prefix in that bucket within the delivery window, and each line carries that invocation's own `requestId`, its `operation` (here `Converse`), its `modelId` and — with text delivery enabled — the prompt and completion bodies. After DeleteModelInvocationLoggingConfiguration, Get reports no configuration and further invocations produce NO new record; re-Putting the configuration resumes delivery for LATER invocations without retroactively flushing the ones made while it was deleted. Bucket name, key prefix, requestId, model id and the prompt nonce are per-request/per-run values, never literals.
+
+Emulator: Put is accepted, Get echoes the stored configuration byte-for-byte (the check's `bucketName` assertion passes), and Converse answers 200 with a RequestId — but zero objects ever appear under the configured prefix. Leg A's positive control `_await_record(..., 'leg-A-positive-control', timeout_s=110.0)` lists ListObjectsV2/GetObject under `s3://<bucket>/<prefix>` every 2 s and never finds a record, so the check consumes the entire harness budget and is reported as `Error: Check timed out after 60.0s`. The previous replay of this same check under a 180 s budget failed at exactly that poll with `AssertionError: leg-A-positive-control: no invocation log record carrying requestId '<per-run id>' appeared under s3://<bucket>/sim2real within 110.0s; 0 record(s) present, requestIds []`, which identifies the absent delivery as what consumes the budget. Because the positive control never lands, legs B (no new record while logging is deleted) and C (delivery resumes after re-Put while the withheld invocation stays absent) are never reached.
+
+Why: a client cannot distinguish 'logging is configured' from 'logging works'. An audit or prompt/completion-review pipeline enables invocation logging, sees the configuration echoed back, and concludes records are being written — then finds an empty bucket. The compliance-relevant guarantee that Delete STOPS delivery, and that a re-enable does not retroactively flush invocations made while logging was off, is unobservable.
+
+Fix: the invocation-logging delivery path — a post-inference hook in the bedrock-runtime inference handlers (Converse/InvokeModel and their streaming forms) that emits a record, plus the bedrock control plane's model-invocation-logging component that resolves the stored `s3Config` (bucketName/keyPrefix), writes the JSON-lines object carrying the invocation's requestId/operation/modelId (and bodies when text delivery is on), honours textDataDeliveryEnabled / imageDataDeliveryEnabled / embeddingDataDeliveryEnabled, and emits nothing once the configuration has been deleted.
+
+Traces: bedrock.delete-model-invocation-logging-withholds-further-records.
+
+## Evidence
+Behavioral suite simparity-behavioral-aws-v1: 100/156 passed (64.1%); mismatched 45, errored 11, skipped 0. Service heading `bedrock` 46/57 (81%), 11 failed; 10 of those 11 were marked OWNED by open issues and skipped, as were all 40 bedrock-runtime failures and the 5 failures under bedrock-runtime__cloudwatch / bedrock-runtime__iam__sts / bedrock-runtime__s3 / bedrock__bedrock-runtime.
+
+bedrock.delete-model-invocation-logging-withholds-further-records [mismatch]
+  Setup that SUCCEEDED (emulator answered 200): s3.create_bucket + put_bucket_tagging + put_bucket_policy (Principal Service bedrock.amazonaws.com, s3:PutObject on arn:aws:s3:::<bucket>/*); bedrock.put_model_invocation_logging_configuration(loggingConfig={'s3Config': {'bucketName': <per-run bucket>, 'keyPrefix': 'sim2real'}, 'textDataDeliveryEnabled': True, 'imageDataDeliveryEnabled': False, 'embeddingDataDeliveryEnabled': False}); bedrock.get_model_invocation_logging_configuration() echoed the same bucketName (assertion passed); bedrock-runtime.converse(modelId='amazon.nova-lite-v1:0', ...) returned 200 with a RequestId.
+  Expected (AWS): within the delivery window a JSON-lines object appears under s3://<bucket>/<keyPrefix> whose record has requestId == the Converse response's RequestId, operation == 'Converse', and contains that leg's prompt nonce.
+  Actual: nothing is ever delivered. The leg-A poll (ListObjectsV2 + GetObject every 2 s, 110 s budget) never finds a record, so the check never reaches an assertion and the harness reports:
+    Error: Check timed out after 60.0s
+  Note on the timeout: the 60 s is the harness budget, not an AWS requirement, and no HTTP status or error code diverges here — the divergence is the absence of any delivered object. The only wait reached before the budget expires is leg A's delivery poll (legs B and C are gated behind leg A succeeding), and the 180 s-budget replay of this same check recorded the explicit AssertionError quoted in the description at exactly that poll.
+
+Regression context: the resolved issue 20261121T024543Z-bedrock-model-invocation-logging-still-delivers-no-record.md carried this exact replay key (`bedrock.delete-model-invocation-logging-withholds-further-records|run#29|Timeout|time.sleep(_POLL_S)`) and was closed as fixed; the behaviour is unchanged on this replay, so no delivery path shipped.
+
+Model evidence (smithy_query): PutModelInvocationLoggingConfiguration PUT /logging/modelinvocations -> 200, loggingConfig required, errors 403/400/429/500; GetModelInvocationLoggingConfiguration GET -> 200 with loggingConfig; DeleteModelInvocationLoggingConfiguration DELETE -> 200; on services/service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice/smithy-model/com-amazonaws-bedrock-amazonbedrockcontrolplaneservice.json. Delivery of the records themselves is not modeled (recorded behavior only).
+
+Bootstrap gate: get_bootstrap_status() returns an empty `pending` list and `bootstrapped` contains service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice and service-com-amazonaws-bedrockruntime-amazonbedrockfrontendservice, so bedrock is stood up and this is a fidelity finding.
+
+## Steps to Reproduce
+1. git_clone, then run_behavioral_suite so the emulator is built and booted.
+2. Re-replay exactly the check in trace_ids: bedrock.delete-model-invocation-logging-withholds-further-records.
+3. Manually: create an S3 bucket in the suite's own region and attach the Bedrock log-write bucket policy (Principal Service bedrock.amazonaws.com, s3:PutObject on arn:aws:s3:::<bucket>/*).
+4. bedrock.put_model_invocation_logging_configuration(loggingConfig={'s3Config': {'bucketName': <bucket>, 'keyPrefix': '<prefix>'}, 'textDataDeliveryEnabled': True, 'imageDataDeliveryEnabled': False, 'embeddingDataDeliveryEnabled': False}) and confirm get_model_invocation_logging_configuration() echoes it (this part already works).
+5. bedrock-runtime.converse(modelId='amazon.nova-lite-v1:0', messages=[{'role':'user','content':[{'text':'Repeat exactly this token and nothing else: <nonce>'}]}], inferenceConfig={'maxTokens':40,'temperature':0.0}) and note ResponseMetadata.RequestId.
+6. Poll s3.list_objects_v2(Bucket=<bucket>, Prefix='<prefix>') and get_object on each key. Expected (AWS): a JSON-lines record carrying that RequestId, operation 'Converse', the modelId and the nonce. Observed: zero objects, indefinitely — this is the wait that exhausts the check's budget.
+7. Once delivery exists, verify the rest of the scenario the timeout hides: bedrock.delete_model_invocation_logging_configuration(); confirm get_model_invocation_logging_configuration() reports no configuration; issue a second Converse and confirm NO new requestId appears under the prefix for at least 3x the latency measured in step 6; then re-Put the same configuration, issue a third Converse and confirm its record DOES arrive while the invocation made during the deleted window is still absent (withheld, not buffered).
