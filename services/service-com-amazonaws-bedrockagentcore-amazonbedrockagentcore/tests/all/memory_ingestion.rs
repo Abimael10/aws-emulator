@@ -22,7 +22,7 @@ use std::sync::Arc;
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
 use agentcore::ops::types::{Content, IngestPayloadType, MetadataValue};
 
-use super::harness::{create_memory, label};
+use super::harness::{create_memory, delete_memory, label};
 
 /// A memory id matching `MemoryId`'s pattern
 /// `^(arn:...:memory/)?[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`.
@@ -30,6 +30,22 @@ const MEMORY: &str = "ingest-memory-0123456789";
 /// The same memory addressed by its ARN spelling, which that same pattern admits.
 const MEMORY_ARN: &str =
     "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/ingest-memory-0123456789";
+
+/// An id of that same modelled shape that the CONTROL plane never creates here, so no
+/// container of this account is addressed by it, and the ARN spellings of that same absent
+/// id — one per partition `MemoryId`'s pattern admits, `aws|aws-cn|aws-us-gov` (source:
+/// smithy_query query="operation" operation="IngestData", member `memoryId`).
+const ABSENT_MEMORY: &str = "absent-memory-9876543210";
+const ABSENT_MEMORY_ARN: &str =
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:memory/absent-memory-9876543210";
+const ABSENT_MEMORY_ARN_CN: &str =
+    "arn:aws-cn:bedrock-agentcore:cn-north-1:123456789012:memory/absent-memory-9876543210";
+const ABSENT_MEMORY_ARN_GOV: &str =
+    "arn:aws-us-gov:bedrock-agentcore:us-gov-west-1:123456789012:memory/absent-memory-9876543210";
+
+/// A container the CONTROL plane creates and then deletes, so the account stops holding it
+/// while the id stays as well-formed as it ever was.
+const DELETED_MEMORY: &str = "gone-memory-1234567890";
 
 /// The emulator, with request authentication off so a test signs nothing, plus the
 /// shared engine so a case can read back what a request persisted.
@@ -123,6 +139,22 @@ async fn create_event(router: &MultiServiceRouter, memory: &str, body: Value) ->
         router,
         "POST",
         &format!("/memories/{}/events", label(memory)),
+        Some(body),
+    )
+    .await
+}
+
+/// `ListMemoryExtractionJobs`: the units of long-term extraction work a container holds,
+/// which is what a submit queues and a refused submit must not.
+async fn list_extraction_jobs(
+    router: &MultiServiceRouter,
+    memory: &str,
+    body: Value,
+) -> (u16, Value) {
+    send(
+        router,
+        "POST",
+        &format!("/memories/{}/extractionJobs", label(memory)),
         Some(body),
     )
     .await
@@ -869,4 +901,213 @@ async fn the_ingestion_store_evicts_its_oldest_records() {
         "expected the oldest retained record to be the fourth submitted, got {:?}",
         held.first()
     );
+}
+
+/// The `memoryId`s this plane's own store holds a container under, sorted — how a case
+/// shows that a refused submit conjured no container.
+fn stored_memory_ids(engine: &engine::InMemoryEngine) -> Vec<String> {
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    let store = state.lock();
+    let mut held: Vec<String> = store.memories.keys().cloned().collect();
+    held.sort();
+    held
+}
+
+/// The `message` member of a refusal.
+fn message(body: &Value) -> &str {
+    body.get("message").and_then(Value::as_str).unwrap_or("")
+}
+
+/// A submit whose path names a container the account does not hold is refused with 404
+/// `ResourceNotFoundException` naming that container, BEFORE it mints a session, stores the
+/// content, records the `clientToken` or queues any extraction work.
+///
+/// The rows differ along what the rule generalises over: how the absent container is
+/// addressed (the bare id and the ARN spelling in each partition `MemoryId`'s pattern
+/// admits), why it is absent (never created, or created and then deleted), and which
+/// optional members the body carries (`sessionId`, `clientToken`, `metadata`,
+/// `extractionConfig`) — none of which can make a container exist.
+#[tokio::test]
+async fn a_submit_into_a_container_the_account_does_not_hold_is_refused_and_persists_nothing() {
+    let (router, engine) = emulator();
+    // One container the control plane created and then deleted: the account stops holding
+    // it, so it is absent for exactly the same reason an id nothing created is.
+    create_memory(&engine, DELETED_MEMORY);
+    delete_memory(&engine, DELETED_MEMORY);
+
+    /// The token the refused submits carry, replayed afterwards into the container the
+    /// account does hold.
+    const REFUSED_TOKEN: &str = "token-of-a-refused-submit";
+
+    let payload = json!([conversational("USER", "remember this")]);
+    let cases: Vec<(&str, &str, Value)> = vec![
+        (
+            // The recorded shape: the required members only, naming no session.
+            "never-created-bare-id-naming-no-session",
+            ABSENT_MEMORY,
+            json!({
+                "actorId": "actor-1",
+                "contentTimestamp": 1_700_000_100,
+                "source": {"inline": {"payload": payload.clone()}},
+            }),
+        ),
+        (
+            "never-created-bare-id-naming-a-session",
+            ABSENT_MEMORY,
+            json!({
+                "actorId": "actor-1",
+                "sessionId": "ingest-session-absent",
+                "contentTimestamp": 1_700_000_100,
+                "source": {"inline": {"payload": payload.clone()}},
+            }),
+        ),
+        (
+            "never-created-arn-spelling",
+            ABSENT_MEMORY_ARN,
+            json!({
+                "actorId": "actor-1",
+                "contentTimestamp": 1_700_000_100,
+                "source": {"inline": {"payload": payload.clone()}},
+            }),
+        ),
+        (
+            "never-created-arn-spelling-in-the-china-partition",
+            ABSENT_MEMORY_ARN_CN,
+            json!({
+                "actorId": "actor-1",
+                "contentTimestamp": 1_700_000_100,
+                "source": {"inline": {"payload": payload.clone()}},
+            }),
+        ),
+        (
+            "never-created-arn-spelling-in-the-govcloud-partition",
+            ABSENT_MEMORY_ARN_GOV,
+            json!({
+                "actorId": "actor-1",
+                "contentTimestamp": 1_700_000_100,
+                "source": {"inline": {"payload": payload.clone()}},
+            }),
+        ),
+        (
+            "never-created-with-a-client-token",
+            ABSENT_MEMORY,
+            json!({
+                "actorId": "actor-1",
+                "sessionId": "ingest-session-absent",
+                "clientToken": REFUSED_TOKEN,
+                "contentTimestamp": 1_700_000_100,
+                "source": {"inline": {"payload": payload.clone()}},
+            }),
+        ),
+        (
+            "never-created-with-metadata-and-an-extraction-config",
+            ABSENT_MEMORY,
+            json!({
+                "actorId": "actor-1",
+                "contentTimestamp": 1_700_000_100,
+                "metadata": {"channel": {"stringValue": "chat"}},
+                "extractionConfig": {"namespaceVariables": {"tenant": "acme"}},
+                "source": {"inline": {"payload": payload.clone()}},
+            }),
+        ),
+        (
+            "created-and-then-deleted",
+            DELETED_MEMORY,
+            json!({
+                "actorId": "actor-1",
+                "contentTimestamp": 1_700_000_100,
+                "source": {"inline": {"payload": payload.clone()}},
+            }),
+        ),
+    ];
+
+    for (case, memory, body) in cases {
+        let (status, refused) = ingest_data(&router, memory, body).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected HTTP 404, got {status} with {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {case:?}: expected a ResourceNotFoundException, got {refused:?}"
+        );
+        // The sentence names the resource that did not resolve and the identifier the
+        // request spelled, in the spelling it arrived in.
+        let expected = format!("Memory not found: {memory}");
+        assert_eq!(
+            message(&refused),
+            expected,
+            "case {case:?}: expected message {expected:?}, got {:?}",
+            message(&refused)
+        );
+        assert!(
+            refused.get("sessionId").is_none(),
+            "case {case:?}: expected no session to be reported by a refusal, got {refused:?}"
+        );
+    }
+
+    // Not one refusal conjured a container: the only id this plane's store holds anything
+    // under is the one the control plane created and the successful submits below use —
+    // and so far there have been none.
+    assert_eq!(
+        stored_memory_ids(&engine),
+        Vec::<String>::new(),
+        "expected a refused submit to persist nothing, got {:?}",
+        stored_memory_ids(&engine)
+    );
+
+    // A refusal recorded no `clientToken` either: the same token into the container the
+    // account DOES hold is a first submit, not a replay answered with someone else's
+    // session.
+    let (status, answered) = ingest_data(
+        &router,
+        MEMORY,
+        json!({
+            "actorId": "actor-1",
+            "sessionId": "after-the-refusal",
+            "clientToken": REFUSED_TOKEN,
+            "contentTimestamp": 1_700_000_100,
+            "source": {"inline": {"payload": payload.clone()}},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "case the token of a refused submit, replayed into a container that exists: expected \
+         HTTP 202, got {status} with {answered:?}"
+    );
+    assert_eq!(
+        answered["sessionId"].as_str(),
+        Some("after-the-refusal"),
+        "case the token of a refused submit: expected the session the body named, got {answered:?}"
+    );
+    assert_eq!(
+        stored_ingestions(&engine, MEMORY, "actor-1", "after-the-refusal").len(),
+        1,
+        "case the token of a refused submit: expected the content stored once, got {:?}",
+        stored_ingestions(&engine, MEMORY, "actor-1", "after-the-refusal")
+    );
+
+    // And no refusal queued extraction work: once a container of the refused id does
+    // exist, it holds none of the units those submits would have queued, while the
+    // container that took the one accepted submit holds exactly one.
+    create_memory(&engine, ABSENT_MEMORY);
+    for (case, memory, expected) in [
+        ("the container the refusals named", ABSENT_MEMORY, 0),
+        ("the container the accepted submit used", MEMORY, 1),
+    ] {
+        let (status, jobs) = list_extraction_jobs(&router, memory, json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from ListMemoryExtractionJobs, got {status} with \
+             {jobs:?}"
+        );
+        assert_eq!(
+            jobs["jobs"].as_array().map(Vec::len),
+            Some(expected),
+            "case {case:?}: expected {expected} extraction job(s), got {:?}",
+            jobs["jobs"]
+        );
+    }
 }
