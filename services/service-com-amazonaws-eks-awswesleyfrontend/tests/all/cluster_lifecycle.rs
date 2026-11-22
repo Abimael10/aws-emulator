@@ -1054,17 +1054,20 @@ async fn delete_removes_the_cluster_and_deletion_protection_refuses() {
             vec![name.clone()],
             "case {case:?}: a cluster being deleted is still listed"
         );
-        // A delete that arrives in that window is the conflict it is: the cluster is
-        // being deleted, not absent.
+        // A delete that arrives in that window asks for the deletion that is already
+        // running, so it is answered with it: the cluster is being deleted, not
+        // absent.
         let again = delete(&router, &name).await;
         assert_eq!(
-            again.status, 409,
-            "case {case:?}: a second delete inside the window is a conflict, got {again:?}"
+            again.status, 200,
+            "case {case:?}: a delete sent again inside the window is answered with the running \
+             deletion, got {again:?}"
         );
         assert_eq!(
-            again.error_type.as_deref(),
-            Some("ResourceInUseException"),
-            "case {case:?}: expected ResourceInUseException, got {again:?}"
+            (&again.cluster()["status"], &again.cluster()["arn"]),
+            (&removed.cluster()["status"], &removed.cluster()["arn"]),
+            "case {case:?}: the delete sent again answers what the accepted one did, got \
+             {again:?}"
         );
 
         // ONLY ONCE THE DELETION HAS FINISHED is the cluster absent: the read 404s,

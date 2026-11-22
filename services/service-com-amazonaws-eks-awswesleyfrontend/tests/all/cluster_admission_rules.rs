@@ -24,19 +24,20 @@
 //!   would leave it in a configuration Amazon EKS cannot have — and that refusal
 //!   starts no update.
 //! * `DeleteCluster` is refused while managed node groups or Fargate profiles are
-//!   attached to the cluster, and a delete that arrives while an accepted deletion
-//!   is still in flight finds the cluster in use rather than absent.
+//!   attached to the cluster, and a delete sent again while an accepted deletion is
+//!   still running is answered with that deletion rather than with an absent
+//!   cluster.
 //!
 //! Every assertion names its case and prints the actual value. The expected
 //! sentences are written out here rather than read from the crate's own constants,
 //! so this suite pins the WORDING a client sees instead of re-asserting whatever
 //! the handler happens to carry.
 
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
     cluster_not_found_message, ComAmazonawsEksAwswesleyfrontendState, SupportStatus,
-    ACCESS_ENTRY_TYPES, ACCESS_ENTRY_TYPE_STANDARD, CLUSTER_ACTIVATION_DELAY,
+    ACCESS_ENTRY_TYPES, ACCESS_ENTRY_TYPE_STANDARD,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -56,8 +57,8 @@ const NODE_ROLE: &str = "arn:aws:iam::000000000000:role/eksNodeRole";
 /// rather than read from the crate's own constant so this suite pins the WORDING a
 /// client sees.
 const AUTO_MODE_ALL_OR_NOTHING: &str =
-    "All of computeConfig.enabled, kubernetesNetworkConfig.elasticLoadBalancing.enabled, and \
-     storageConfig.blockStorage.enabled must be set to either true or false.";
+    "For EKS Auto Mode, please ensure that all required configs, including computeConfig, \
+     kubernetesNetworkConfig, and blockStorage are all either fully enabled or fully disabled.";
 
 /// The two subnets every cluster here is placed in.
 fn subnets() -> serde_json::Value {
@@ -299,8 +300,8 @@ async fn a_cluster_configuration_eks_cannot_have_is_refused_and_writes_nothing()
                 "storageConfig": { "blockStorage": { "enabled": true } },
                 "kubernetesNetworkConfig": { "elasticLoadBalancing": { "enabled": true } },
             }),
-            "computeConfig.nodeRoleArn must be specified when computeConfig.nodePools is \
-             specified."
+            "When Compute Config nodeRoleArn is null or empty, nodePool list cannot be \
+             populated."
                 .to_string(),
         ),
         (
@@ -687,8 +688,19 @@ async fn an_update_that_would_leave_a_configuration_eks_cannot_have_is_refused()
         let created = create_cluster(&router, &request(&name, overrides.clone())).await;
         assert_eq!(created.status, 200, "case {case:?}: setup: {created:?}");
     }
-    // An update is only started on a cluster that is running.
-    tokio::time::sleep(CLUSTER_ACTIVATION_DELAY + Duration::from_millis(250)).await;
+    // An update is only started on a cluster that is running, which is waited for
+    // by LOOKING AGAIN rather than by waiting out the activation span
+    // ([`crate::wire::read_until`]).
+    for (index, (case, _, _, _)) in rows.iter().enumerate() {
+        let name = format!("updated-{index}");
+        read_until(
+            case,
+            "the cluster reported ACTIVE",
+            || describe_cluster(&router, &name),
+            |read| read.body["cluster"]["status"] == serde_json::json!("ACTIVE"),
+        )
+        .await;
+    }
 
     for (index, (case, _, change, expected)) in rows.iter().enumerate() {
         let name = format!("updated-{index}");
@@ -1132,16 +1144,19 @@ async fn a_cluster_is_deleted_only_once_nothing_is_attached_to_it() {
     }
 }
 
-/// The losing side of two `DeleteCluster` calls that OVERLAP is told the cluster is
-/// IN USE — it is being deleted — while a call that arrives after the deletion has
-/// FINISHED is told the cluster is not there at all.
+/// A `DeleteCluster` sent again while the deletion it asked for is RUNNING is
+/// answered with that deletion — the cluster, `DELETING`, under the ARN it always
+/// had — while a call that arrives after the deletion has FINISHED is told the
+/// cluster is not there at all.
 ///
-/// An accepted deletion runs for a window of its own, so the overlap is driven end
-/// to end: the second call is sent while the first deletion is
-/// still in flight, and the not-found case is read once the name has become absent —
-/// waited for by LOOKING AGAIN rather than for a span ([`crate::wire::read_until`]).
+/// An accepted deletion runs for a window of its own, so the re-send is driven end
+/// to end: the second call is sent while the first deletion is still in flight, and
+/// the not-found case is read once the name has become absent — waited for by
+/// LOOKING AGAIN rather than for a span ([`crate::wire::read_until`]). WHICH call
+/// makes the transition when two of them overlap is
+/// `cluster_delete_serialization`'s rule.
 #[tokio::test]
-async fn a_delete_that_overlaps_an_accepted_deletion_is_a_conflict() {
+async fn a_delete_resent_while_the_deletion_runs_is_answered_with_it() {
     let router = emulator();
     let cluster = "race-overlap";
     let created = create_cluster(&router, &minimal_request(cluster)).await;
@@ -1167,23 +1182,23 @@ async fn a_delete_that_overlaps_an_accepted_deletion_is_a_conflict() {
         "the accepted delete reports DELETING, got {first:?}"
     );
 
-    // That deletion is in flight — the window a second, overlapping call arrives in —
-    // so the cluster is reported in use rather than absent.
-    let loser = delete_cluster(&router, cluster).await;
+    // That deletion is running, so the call that asks for it again gets it: the
+    // same cluster, the same ARN, the status that deletion put it in.
+    let resent = delete_cluster(&router, cluster).await;
     assert_eq!(
-        loser.status, 409,
-        "a delete that overlaps an accepted deletion is a conflict, got {loser:?}"
+        resent.status, 200,
+        "a delete re-sent while the deletion runs is answered with it, got {resent:?}"
     );
     assert_eq!(
-        error_code(&loser),
-        "ResourceInUseException",
-        "expected ResourceInUseException, got {loser:?}"
-    );
-    assert_eq!(
-        message_of(&loser),
-        format!("Cluster is being deleted: {cluster}"),
-        "expected the in-flight-deletion sentence, got {:?}",
-        message_of(&loser)
+        (
+            &resent.body["cluster"]["status"],
+            &resent.body["cluster"]["arn"]
+        ),
+        (
+            &first.body["cluster"]["status"],
+            &first.body["cluster"]["arn"]
+        ),
+        "the re-sent delete answers the cluster the first one did, got {resent:?}"
     );
 
     // Once the deletion has finished, the name holds nothing: a delete of it is a

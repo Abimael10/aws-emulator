@@ -7,24 +7,24 @@
 //! Until the clock finishes that deletion the resource is still there in its
 //! `DELETING` status — an independent `DescribeCluster` answers 200 with that status
 //! and with the identifiers the resource always had, the listing still names it, the
-//! name is still taken, and a second delete of it is the conflict a resource in use
-//! earns — and only once the deletion has finished does the name answer 404. That is
-//! what every client waiting out a teardown polls for: a deletion whose transient
-//! status no reader can observe gives a waiter the wrong answer (absent) at an
-//! instant when the resource is still being torn down.
+//! name is still taken, and a delete sent again is answered with the deletion that
+//! is already running — and only once the deletion has finished does the name answer
+//! 404. That is what every client waiting out a teardown polls for: a deletion whose
+//! transient status no reader can observe gives a waiter the wrong answer (absent) at
+//! an instant when the resource is still being torn down.
 //!
 //! The rows differ along what the rule generalises over: whether the cluster had
 //! reached `ACTIVE` or was still `CREATING` when the delete was accepted, the Region
 //! the request is signed for, whether the cluster carries tags, and which reader
-//! observes the window (the describe, the listing, the second delete, a create under
-//! the same name).
+//! observes the window (the describe, the listing, the delete sent again, a create
+//! under the same name).
 //!
 //! The wire harness (`Answer`, `emulator`, `call`, `encode_label`) is the shared one
 //! in `tests/all/wire.rs` and the `CreateCluster` body is `cluster_lifecycle`'s: no
 //! suite grows its own client.
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    cluster_being_deleted, cluster_not_found_message, STATUS_DELETING,
+    cluster_not_found_message, STATUS_DELETING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -207,20 +207,21 @@ async fn an_accepted_delete_leaves_the_cluster_deleting_until_the_deletion_finis
             "case {case:?}: a cluster being deleted is still listed"
         );
 
-        // THE NAME IS STILL TAKEN, and the deletion is in flight: a second delete is
-        // the conflict a resource in use earns, and a create under that name is the
-        // conflict a taken name earns — neither is an absent cluster.
+        // THE NAME IS STILL TAKEN, and the deletion is running: a delete sent again
+        // is answered with that deletion — the same cluster, the same ARN, the status
+        // the deletion put it in — and a create under that name is the conflict a
+        // taken name earns; neither is an absent cluster.
         let again = delete_cluster(&router, region, name).await;
         assert_eq!(
-            (again.status, error_code(&again).as_str()),
-            (409, "ResourceInUseException"),
-            "case {case:?}: a second delete inside the window is a conflict, got {again:?}"
+            again.status, 200,
+            "case {case:?}: a delete sent again inside the window is answered with the running \
+             deletion, got {again:?}"
         );
         assert_eq!(
-            again.message(),
-            cluster_being_deleted(name),
-            "case {case:?}: expected the in-flight-deletion sentence, got {:?}",
-            again.message()
+            (&again.cluster()["status"], &again.cluster()["arn"]),
+            (&deleted.cluster()["status"], &deleted.cluster()["arn"]),
+            "case {case:?}: the delete sent again answers what the accepted one did, got \
+             {again:?}"
         );
         let retaken = create_cluster(&router, region, &body).await;
         assert_eq!(

@@ -132,12 +132,23 @@ pub struct ComAmazonawsEksAwswesleyfrontendState {
     /// A cluster whose delete has been accepted stays in [`Self::clusters`]
     /// reporting `DELETING` for that whole window — a reader that polls
     /// `DescribeCluster` through a teardown sees the status the delete reported,
-    /// and a `DeleteCluster` that arrives in the window is refused as a resource in
-    /// use rather than answered as a cluster that was never there. The clock is
+    /// and a `DeleteCluster` that arrives in the window asks for a deletion that is
+    /// already running rather than for a cluster that was never there. The clock is
     /// what ends it ([`Self::finish_due_cluster_deletions`]), so this map holds at
     /// most the deletions of the last [`CLUSTER_DELETION_DELAY`] and the record it
     /// names leaves the store at the same instant for every caller.
     pub cluster_deletions: BTreeMap<(String, String), SystemTime>,
+    /// The clusters whose deletion one call is STARTING right now, by that
+    /// cluster's `(region, name)` key.
+    ///
+    /// Starting a deletion is what the calls that ask for one are serialised on
+    /// ([`Self::claim_cluster_delete`]): the call that takes the claim is the one
+    /// that makes the transition, and a call that finds it taken is asking for a
+    /// transition another call is making at that instant. It is held only while
+    /// that one call runs — a deletion that has been STARTED is
+    /// [`Self::cluster_deletions`]'s business, for the whole window the clock gives
+    /// it — so this set is empty whenever no delete of this service is in progress.
+    pub cluster_delete_claims: ::std::collections::BTreeSet<(String, String)>,
     /// The Kubernetes API plane of each cluster, by that cluster's
     /// `(region, name)` key: the objects its API server holds, the address it is
     /// published at, and the listener that keeps that address open
@@ -170,6 +181,7 @@ impl Default for ComAmazonawsEksAwswesleyfrontendState {
             addon_catalog: seed_addon_catalog(),
             minted_updates: 0,
             cluster_deletions: BTreeMap::new(),
+            cluster_delete_claims: ::std::collections::BTreeSet::new(),
             kubernetes_api: BTreeMap::new(),
         }
     }
@@ -1743,11 +1755,37 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     }
 
     /// Whether the deletion of the cluster `key` names is still in flight at
-    /// `now` — the window in which the cluster reports `DELETING` and a second
-    /// `DeleteCluster` for it is a conflict rather than a not-found.
+    /// `now` — the window in which the cluster reports `DELETING` and a
+    /// `DeleteCluster` for it asks for a deletion that is already running rather
+    /// than for a cluster that is not there.
     pub fn cluster_deletion_in_flight(&self, key: &(String, String), now: SystemTime) -> bool {
         self.cluster_deletions
             .get(key)
             .is_some_and(|due| now < *due)
+    }
+
+    /// Claim the START of the deletion of the cluster `key` names for the caller,
+    /// answering whether the claim was free.
+    ///
+    /// `true` means this caller is the one making the transition and holds the
+    /// claim until it gives it back ([`Self::release_cluster_delete`]); `false`
+    /// means another call is making that same transition at this instant, so this
+    /// one made none. The claim is what makes a deletion resolve to ONE accepted
+    /// delete however many calls ask for it at once.
+    pub fn claim_cluster_delete(&mut self, key: (String, String)) -> bool {
+        self.cluster_delete_claims.insert(key)
+    }
+
+    /// Whether a call is starting the deletion of the cluster `key` names right
+    /// now — see [`Self::claim_cluster_delete`].
+    #[must_use]
+    pub fn cluster_delete_claimed(&self, key: &(String, String)) -> bool {
+        self.cluster_delete_claims.contains(key)
+    }
+
+    /// Give back the claim [`Self::claim_cluster_delete`] took, which the call that
+    /// took it does however it ends.
+    pub fn release_cluster_delete(&mut self, key: &(String, String)) {
+        self.cluster_delete_claims.remove(key);
     }
 }

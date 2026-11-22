@@ -169,22 +169,22 @@ pub fn cluster_deletion_protected(cluster_name: &str) -> String {
 ///
 /// EKS Auto Mode is ONE mode of the cluster made of three capabilities — compute,
 /// block storage and load balancing — so the three `enabled` members are set to
-/// the same value or the request is refused. Fixed text: it names the three
-/// members, and WHICH of them is out of step is already in the caller's own
-/// request.
+/// the same value or the request is refused. The whole sentence is fixed text: it
+/// names the three configurations the mode is made of, and WHICH of them is out of
+/// step is already in the caller's own request.
 pub const AUTO_MODE_ALL_OR_NOTHING: &str =
-    "All of computeConfig.enabled, kubernetesNetworkConfig.elasticLoadBalancing.enabled, and \
-     storageConfig.blockStorage.enabled must be set to either true or false.";
+    "For EKS Auto Mode, please ensure that all required configs, including computeConfig, \
+     kubernetesNetworkConfig, and blockStorage are all either fully enabled or fully disabled.";
 
 /// The refusal a compute capability that names node pools but no node role earns.
 ///
 /// The role is what the instances of those pools run as — "The ARN of the IAM Role
 /// EKS will assign to EC2 Managed Instances in your EKS Auto Mode cluster"
 /// (`ComputeConfigRequest$nodeRoleArn`) — so a `nodePools` list without it names
-/// pools nothing can run. Fixed text naming the two members, in the register of
-/// [`AUTO_MODE_ALL_OR_NOTHING`] above.
+/// pools nothing can run. The whole sentence is fixed text, naming the two members
+/// of that relation and nothing from the request.
 pub const AUTO_MODE_NODE_ROLE_REQUIRED: &str =
-    "computeConfig.nodeRoleArn must be specified when computeConfig.nodePools is specified.";
+    "When Compute Config nodeRoleArn is null or empty, nodePool list cannot be populated.";
 
 /// The refusal a `kubernetesNetworkConfig.serviceIpv4Cidr` earns, or `None` when
 /// the block is one Amazon EKS assigns Kubernetes services from.

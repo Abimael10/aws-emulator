@@ -7,8 +7,9 @@
 //! `ListClusters` in that window reads the cluster as `DELETING` with the ARN it
 //! always had — which is what every waiter that polls a teardown until the name
 //! 404s needs — and only once the deletion has finished does the name answer
-//! `ResourceNotFoundException`. A second `DeleteCluster` inside the window is a
-//! `ResourceInUseException`: the cluster is being deleted, not absent.
+//! `ResourceNotFoundException`. A `DeleteCluster` inside the window asks for the
+//! deletion that is already running, so it is answered with that same cluster,
+//! `DELETING`, under the same ARN.
 //!
 //! What the cluster OWNS is given up when the delete is accepted: its EKS Pod
 //! Identity associations, add-ons, capabilities, node groups and Fargate profiles,
@@ -30,11 +31,15 @@
 //! managed node groups or Fargate profiles attached to the cluster, you must delete
 //! them first" ([`crate::state::ComAmazonawsEksAwswesleyfrontendState::attached_compute_refusal`]).
 //!
-//! The deletion this call accepts is IN FLIGHT until the clock finishes it, so a
-//! `DeleteCluster` that arrives in that window — the losing side of two racing
-//! calls, or a caller re-sending its own delete — is refused with
-//! `ResourceInUseException`: the cluster is being deleted, not absent. Once the
-//! deletion has finished the name answers `ResourceNotFoundException` again.
+//! Two calls that ask to delete the same cluster resolve to ONE deletion: the call
+//! that starts it is accepted, and a call that arrives while another is STARTING
+//! that same deletion — the losing side of two overlapping calls — is refused with
+//! `ResourceInUseException`, because the cluster it names is in use by the
+//! transition the winner is making. A call that arrives once that deletion is
+//! running is answered with the cluster it asked to delete, in `DELETING`: a caller
+//! re-sending its own delete reaches the same end as one that sent it once, and
+//! nothing is started twice. Once the deletion has finished the name answers
+//! `ResourceNotFoundException` again.
 //!
 //! A capability exists only inside a cluster — its key and its ARN both name one — so the
 //! accepted deletion takes the cluster's capabilities with it. Without that, a later cluster
@@ -199,12 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // has finished is absent, and so is one that was never there.
                 return Err(not_found());
             };
-            // A cluster whose deletion has already been ACCEPTED is not absent and
-            // is not deletable again: it is being deleted, so a second call — the
-            // losing side of two racing ones, or a caller re-sending the delete —
-            // is told the resource is in use. Once the clock has finished that
-            // deletion the name answers not-found again.
-            if guard.cluster_deletion_in_flight(&key, now) {
+            // Another call is STARTING the deletion of this cluster at this
+            // instant, so this one does not make that transition: it is the losing
+            // side of two overlapping calls, and the cluster it names is in use by
+            // the deletion the winner is starting rather than absent.
+            if guard.cluster_delete_claimed(&key) {
                 return Err(DeleteClusterErrorModeled::ResourceInUseException(
                     ResourceInUseException {
                         cluster_name: Some(input.name.clone()),
@@ -213,6 +217,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
                 .into());
+            }
+            // The deletion of this cluster has already been STARTED and the clock
+            // has not finished it: this call asks for a deletion that is already
+            // running, which is the deletion it gets. It is answered with the
+            // cluster it asked to delete, under the identifiers that cluster always
+            // had and in the status the accepted deletion put it in — nothing is
+            // started a second time and the instant the clock owes the removal at
+            // does not move, so a caller re-sending its own delete reaches the same
+            // end as a caller that sent it once. Once the clock has finished that
+            // deletion the name answers not-found again.
+            if guard.cluster_deletion_in_flight(&key, now) {
+                return Ok(DeleteClusterOutput {
+                    cluster: Some(existing.to_deleted_cluster()),
+                });
             }
             if existing.deletion_protection {
                 return Err(DeleteClusterErrorModeled::InvalidRequestException(
@@ -293,7 +311,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .resources_vpc_config
                 .as_ref()
                 .and_then(|vpc_config| vpc_config.cluster_security_group_id.clone());
-            (record.to_deleted_cluster(), owned_group, released_capacity)
+            let answer = record.to_deleted_cluster();
+            // This call is the one that made the transition, so it takes the claim
+            // the calls asking for this deletion are serialised on, last and under
+            // the same lock the transition was written under: a call that arrives
+            // while it is held is the losing side above, and the guard built from it
+            // the moment this lock is given up is what gives it back
+            // ([`ClusterDeleteClaim`]).
+            guard.claim_cluster_delete(key.clone());
+            (answer, owned_group, released_capacity)
+        };
+
+        // From here the claim is given back however this call ends, including on a
+        // panic: the deletion it started is the store's business from now on
+        // ([`crate::state::ComAmazonawsEksAwswesleyfrontendState::cluster_deletions`]),
+        // and a call that asks for it again is answered with it rather than refused.
+        let claim = ClusterDeleteClaim {
+            store: store.clone(),
+            key: key.clone(),
         };
 
         // The cluster is already reporting `DELETING`, so the answer does not depend
@@ -318,8 +353,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::pod_identity_plane::forget_cluster(&plane, &key.1);
         }
 
+        // Every piece of work this delete carries has run, so the transition it was
+        // serialised on is no longer being made and the claim goes back.
+        drop(claim);
+
         Ok(DeleteClusterOutput {
             cluster: Some(cluster),
         })
+    }
+}
+
+/// The claim ONE `DeleteCluster` call holds on starting the deletion of one
+/// cluster, given back whenever that call ends.
+///
+/// Two calls that ask to delete the same cluster resolve to ONE deletion: the one
+/// that takes this claim
+/// ([`crate::state::ComAmazonawsEksAwswesleyfrontendState::claim_cluster_delete`])
+/// makes the transition, and one that finds it taken is asking for a transition
+/// another call is making at that instant. The claim is a guard rather than a pair
+/// of calls so the work the delete carries after it has written the store — the
+/// calls out to the services that own what the cluster ran on — cannot end without
+/// giving it back.
+struct ClusterDeleteClaim {
+    store: ::engine::ServiceState<crate::state::ComAmazonawsEksAwswesleyfrontendState>,
+    /// The `(region, name)` key of the cluster whose deletion is claimed.
+    key: (String, String),
+}
+
+impl Drop for ClusterDeleteClaim {
+    fn drop(&mut self) {
+        self.store.lock().release_cluster_delete(&self.key);
     }
 }
