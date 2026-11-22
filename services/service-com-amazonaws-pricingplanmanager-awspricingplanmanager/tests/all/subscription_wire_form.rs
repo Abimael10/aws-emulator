@@ -755,7 +755,7 @@ fn the_service_takes_the_shared_date_time_protocol() {
 
 /// The instants a published subscription or summary names — `createdAt` then `updatedAt`,
 /// in epoch milliseconds.
-type Instants = (i64, i64);
+pub(crate) type Instants = (i64, i64);
 
 /// Every `date-time` member the published structure carries, asserted in the form the
 /// first rule requires: the two required ones, plus a pending change's `effectiveDate`
@@ -784,7 +784,11 @@ fn published_instants(case: &str, published: &Value) -> Instants {
 
 /// Both rules on one `Subscription` payload and the `ETag` header it came with: every
 /// `date-time` member is a date-time string, and the tag is `revision` in decimal.
-fn check_published_subscription(case: &str, answer: &Answer, revision: u64) -> Instants {
+///
+/// Visible to the sibling suites of this test crate: this and [`check_published_summary`]
+/// are the ONE pair of form assertions the crate's integration tests make, so a suite
+/// about a new subject states no second copy of either rule.
+pub(crate) fn check_published_subscription(case: &str, answer: &Answer, revision: u64) -> Instants {
     let instants = published_instants(case, &answer.body);
     let token = answer.require_etag(case);
     assert_eq!(
@@ -797,7 +801,7 @@ fn check_published_subscription(case: &str, answer: &Answer, revision: u64) -> I
 
 /// The same two rules on a `SubscriptionSummary`, where the model puts the tag in the
 /// `eTag` BODY member instead of a response header.
-fn check_published_summary(case: &str, summary: &Value, revision: u64) -> Instants {
+pub(crate) fn check_published_summary(case: &str, summary: &Value, revision: u64) -> Instants {
     let instants = published_instants(case, summary);
     let token = summary["eTag"]
         .as_str()
