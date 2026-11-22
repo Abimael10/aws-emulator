@@ -95,27 +95,28 @@ impl Destination {
     }
 }
 
-/// Why `arn` names no dead-letter destination a pipe may configure.
+/// Why a configured dead-letter destination is one no pipe may name, as the pipe REPORTS it:
+/// the service the ARN names is not one a pipe delivers to.
 ///
-/// The fixed text is the rule AWS states for the member itself — "For Amazon Kinesis stream
-/// and Amazon DynamoDB stream sources, specify either an Amazon SNS topic or Amazon SQS queue
-/// ARN" (`DeadLetterConfig$Arn`, `smithy_query(query="doc", shape="DeadLetterConfig",
-/// member="Arn")`) — and the one variable part is the destination the configuration names,
-/// read from the pipe's own record. One sentence for every value the member cannot carry, so
-/// the lifecycle's bring-up decision ([`super::super::bring_up`]) and this data plane's own
-/// reading of a pipe's configuration report such a value identically.
-fn unsupported_destination(arn: &str) -> String {
-    format!(
-        "DeadLetterConfig.Arn {arn} is not valid. For Amazon Kinesis stream and Amazon \
-         DynamoDB stream sources, specify either an Amazon SNS topic or Amazon SQS queue ARN."
-    )
-}
+/// Recorded behaviour, as a FIXED sentence with NO variable part: a destination of an
+/// unsupported service is one failure CLASS, and the sentence states the class — it names
+/// neither the configured ARN, nor the member that carried it, nor the kind of source whose
+/// parameters carried it, so every value the member cannot carry is reported identically. It
+/// carries the same opening as every other reason a pipe cannot be brought up
+/// ([`super::super::execution_role::source_read_failure_reason`]).
+///
+/// One sentence for the whole class, so the lifecycle's bring-up decision
+/// ([`super::super::bring_up`]) and this data plane's own reading of a pipe's configuration
+/// report such a value identically.
+pub(super) const UNSUPPORTED_DESTINATION_REASON: &str =
+    "Input parameter is invalid from the request due to : The service specified by the \
+     TargetArn isn't supported as a destination.";
 
 /// The destination the `DeadLetterConfig.Arn` `arn` names, or why it names none a pipe may
 /// dead-letter to.
 pub(super) fn resolve(arn: &str) -> Result<Destination, String> {
     let Some(parsed) = ::service_common::arn::parse(arn) else {
-        return Err(unsupported_destination(arn));
+        return Err(UNSUPPORTED_DESTINATION_REASON.to_string());
     };
     // Neither a queue nor a topic carries a resource type or a path: a value whose resource
     // field is compound names something else of that service's — a subscription, a platform
@@ -132,7 +133,7 @@ pub(super) fn resolve(arn: &str) -> Result<Destination, String> {
             arn: arn.to_string(),
             region: parsed.region.to_string(),
         }),
-        _ => Err(unsupported_destination(arn)),
+        _ => Err(UNSUPPORTED_DESTINATION_REASON.to_string()),
     }
 }
 
@@ -477,12 +478,29 @@ mod tests {
                 "case {case:?}: the refusal and the resolution have to agree, got {:?}",
                 refusal(arn)
             );
-            if let Ok(destination) = resolved {
-                assert_eq!(
+            match &resolved {
+                Ok(destination) => assert_eq!(
                     destination.arn(),
                     arn,
                     "case {case:?}: a destination is named by the ARN the pipe configured"
-                );
+                ),
+                // The fixed text of the unsupported-destination class, written out here
+                // rather than read off the code under test, and the same for every value
+                // the member cannot carry: it interpolates nothing of the configuration.
+                Err(reason) => {
+                    assert_eq!(
+                        reason,
+                        "Input parameter is invalid from the request due to : The service \
+                         specified by the TargetArn isn't supported as a destination.",
+                        "case {case:?}: expected the unsupported-destination sentence, got \
+                         {reason:?}"
+                    );
+                    assert!(
+                        !reason.contains(arn),
+                        "case {case:?}: the sentence interpolates no part of the \
+                         configuration, it names {arn}: {reason:?}"
+                    );
+                }
             }
         }
     }

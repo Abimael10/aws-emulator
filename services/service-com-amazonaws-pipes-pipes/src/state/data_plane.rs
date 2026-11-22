@@ -4341,9 +4341,18 @@ mod tests {
                 "case {case:?}: expected refused={refused}, got {answered:?}"
             );
             if let (Some(reason), Some(arn)) = (&answered, arn) {
+                // One fixed sentence for the class, naming no part of the configuration.
+                assert_eq!(
+                    reason,
+                    "Input parameter is invalid from the request due to : The service \
+                     specified by the TargetArn isn't supported as a destination.",
+                    "case {case:?}: expected the unsupported-destination sentence, got \
+                     {reason:?}"
+                );
                 assert!(
-                    reason.contains(arn),
-                    "case {case:?}: expected the refusal to name {arn}, got {reason:?}"
+                    !reason.contains(arn),
+                    "case {case:?}: the refusal names no part of the configuration, it names \
+                     {arn}: {reason:?}"
                 );
             }
             // A QUEUE source's parameters carry no such member at all, so the same
