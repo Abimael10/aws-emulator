@@ -36,14 +36,19 @@
 //! [`super::association_executions`].
 //!
 //! A create is owed its move off `Creating` ([`ASSOCIATION_CREATION_DELAY`]) the same way.
+//!
+//! What a managed node REPORTS for an association ([`AssociationRecord::reported_status`]) is
+//! held with it rather than derived from the clock: `UpdateAssociationStatus` is the node's own
+//! report of how the association went there, so once a node has reported, that report is what
+//! the association's status, its progress and its per-node status report read.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AlarmConfiguration, Association, AssociationDescription, AssociationOverview,
-    InstanceAssociationOutputLocation, InstanceAssociationStatusInfo, Target, TargetLocation,
-    ASSOCIATION_FILTER_KEY_VALUES,
+    AssociationStatus, InstanceAssociationOutputLocation, InstanceAssociationStatusInfo, Target,
+    TargetLocation, ASSOCIATION_FILTER_KEY_VALUES,
 };
 
 use super::ComAmazonawsSsmAmazonssmState;
@@ -403,6 +408,14 @@ pub struct AssociationRecord {
     /// association ([`super::association_executions`]); the last is its most recent
     /// ([`AssociationRecord::last_run`]).
     pub executions: Vec<AssociationRunRecord>,
+    /// "The association status" a managed node last REPORTED for this association
+    /// (`UpdateAssociationStatus`), held exactly as that call supplied it, and `None` for an
+    /// association no node has reported on — which is why a create leaves it unset.
+    ///
+    /// The node it was reported for is [`AssociationRecord::instance_id`]: reporting a status
+    /// "is only used for associations created with the InstanceId legacy parameter"
+    /// (`UpdateAssociationStatus`), so an association carries at most the one node's report.
+    pub reported_status: Option<AssociationStatus>,
 }
 
 /// One run of an association: when State Manager dispatched it, and to which managed nodes.
@@ -498,7 +511,30 @@ impl AssociationRecord {
             versions: vec![version],
             tags,
             executions: Vec::new(),
+            // Nothing has reported on an association that has only just been created, and
+            // `AssociationDescription$Status` is a node's report rather than anything a
+            // create states.
+            reported_status: None,
         }
+    }
+
+    /// Record `status` as what the managed node this association was created for reports for
+    /// it, which is what `UpdateAssociationStatus` persists.
+    ///
+    /// The report REPLACES whatever that node reported before: it is the status of the
+    /// association on that node now, so the last report is the one every later read of this
+    /// association reports.
+    pub fn report_status(&mut self, status: AssociationStatus) {
+        self.reported_status = Some(status);
+    }
+
+    /// The status the managed node `instance_id` has reported for this association, or `None`
+    /// when it has reported none — including when `instance_id` is not the node the
+    /// association was created for, which is a node no report of this association is about.
+    pub fn reported_status_for(&self, instance_id: &str) -> Option<&AssociationStatus> {
+        self.reported_status
+            .as_ref()
+            .filter(|_| self.instance_id.as_deref() == Some(instance_id))
     }
 
     /// Record that State Manager has dispatched this association to `nodes` at `now`, which
@@ -613,6 +649,21 @@ impl AssociationRecord {
     /// create is still settling ([`ASSOCIATION_CREATION_DELAY`]) and `InProgress` while a
     /// dispatched run is still being worked through.
     pub fn overview(&self, now: SystemTime) -> AssociationOverview {
+        // A status a managed node has REPORTED for the association is the association's own
+        // result, whatever a run of it was owed: "UpdateAssociationStatus is primarily used
+        // by the Amazon Web Services Systems Manager Agent (SSM Agent) to report status
+        // updates about your associations", so the status it reported is the status, it is
+        // all the detail there is of it, and the count of targets by status counts the one
+        // node that reported it.
+        if let Some(reported) = self.reported_status.as_ref() {
+            return AssociationOverview {
+                status: Some(reported.name.clone()),
+                detailed_status: Some(reported.name.clone()),
+                association_status_aggregated_count: Some(
+                    [(reported.name.clone(), 1)].into_iter().collect(),
+                ),
+            };
+        }
         // A run that has finished is what the association reports: every node it was
         // dispatched to applied the document, which is the count of targets by status
         // `AssociationStatusAggregatedCount` carries.
@@ -674,8 +725,9 @@ impl AssociationRecord {
                 self.updated_at(),
             )),
             // "The association status" is the result a managed node reports for the
-            // association through `UpdateAssociationStatus`; no node has reported one.
-            status: None,
+            // association through `UpdateAssociationStatus`, held as that call supplied it
+            // and unset until one has reported.
+            status: self.reported_status.clone(),
             overview: Some(self.overview(now)),
             document_version: version.document_version.clone(),
             automation_target_parameter_name: version.automation_target_parameter_name.clone(),
@@ -862,6 +914,9 @@ impl AssociationRecord {
     ) -> InstanceAssociationStatusInfo {
         let version = self.latest();
         let run = self.run_on_node(instance_id);
+        // What the node itself has reported for this association, which is the status of the
+        // association ON that node ([`AssociationRecord::reported_status_for`]).
+        let reported = self.reported_status_for(instance_id);
         InstanceAssociationStatusInfo {
             association_id: Some(self.association_id.clone()),
             name: Some(self.name.clone()),
@@ -869,14 +924,20 @@ impl AssociationRecord {
             association_version: Some(self.latest_version().to_string()),
             instance_id: Some(instance_id.to_string()),
             execution_date: run.map(|run| ::aws_smithy_types::DateTime::from(run.started_at)),
-            // A node no run has reached reports the status of an association nothing has
-            // run, and a run that reached it reports how far that run has got
+            // A node that has REPORTED on this association reports what it reported, a node
+            // no run has reached reports the status of an association nothing has run, and a
+            // run that reached it reports how far that run has got
             // ([`AssociationRunRecord::status`]).
-            status: Some(
-                run.map_or(ASSOCIATION_STATUS_PENDING, |run| run.status(now))
-                    .to_string(),
-            ),
-            detailed_status: run.map(|run| run.detailed_status(now).to_string()),
+            status: Some(reported.map_or_else(
+                || {
+                    run.map_or(ASSOCIATION_STATUS_PENDING, |run| run.status(now))
+                        .to_string()
+                },
+                |reported| reported.name.clone(),
+            )),
+            detailed_status: reported.map(|reported| reported.name.clone()).or_else(|| {
+                run.map(|run| run.detailed_status(now).to_string())
+            }),
             execution_summary: None,
             error_code: None,
             output_url: None,
@@ -933,6 +994,22 @@ impl ComAmazonawsSsmAmazonssmState {
     ) -> Option<&AssociationRecord> {
         self.associations
             .iter()
+            .filter(|((held, _), _)| held == region)
+            .map(|(_, record)| record)
+            .find(|record| {
+                record.name == name && record.instance_id.as_deref() == Some(instance_id)
+            })
+    }
+
+    /// The same association, to record the status a node reported for it.
+    pub fn association_of_node_mut(
+        &mut self,
+        region: &str,
+        name: &str,
+        instance_id: &str,
+    ) -> Option<&mut AssociationRecord> {
+        self.associations
+            .iter_mut()
             .filter(|((held, _), _)| held == region)
             .map(|(_, record)| record)
             .find(|record| {

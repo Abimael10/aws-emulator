@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAssociationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAssociationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAssociationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the status a managed node reports for the State Manager association it is
+//! applying, on this service's own association store
+//! ([`crate::state::associations::AssociationRecord::reported_status`]), so what this call
+//! persisted is what `DescribeAssociation` and every other read of that association report
+//! back.
+//!
+//! The association is addressed the way the SSM Agent addresses it: by the document and the
+//! node a create paired through the deprecated `InstanceId` member — "UpdateAssociationStatus
+//! is primarily used by the Amazon Web Services Systems Manager Agent (SSM Agent) to report
+//! status updates about your associations and is only used for associations created with the
+//! InstanceId legacy parameter" — through the endpoint that create was made at, since the
+//! Region comes from the request's own credential scope. A pair no association of that Region
+//! holds is what `AssociationDoesNotExist` reports.
+//!
+//! A report of the status the node has already reported changes nothing, which is what
+//! `StatusUnchanged` ("The updated status is the same as the current status") refuses; an
+//! association no node has reported on yet has no current status for a report to be the same
+//! as.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +168,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAssociationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAssociationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAssociationStatus"))
+        // `Name`'s and `InstanceId`'s presence and patterns, `AssociationStatus`'s presence
+        // and the presence, the `AssociationStatusName` enum and the lengths of its own
+        // members are MODELLED constraints the centralized walk has already refused anything
+        // outside of. What is read here is which association the document and the node
+        // resolve to, and whether the status they report is a change at all.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAssociationStatusErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the association store is unavailable".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The transitions the clock already owed were due at the same instant whether or not
+        // anybody called — among them the application an association owes a node that has
+        // registered since its current run was dispatched — so they are materialised before
+        // the association is read back.
+        store.materialize_due(now);
+
+        // The report addresses the association by the document and the node a create paired,
+        // which carries no association id: there is nothing for the refusal to name, and
+        // Systems Manager answers this one with the error code alone, so it carries no
+        // message either.
+        let Some(held) = store.association_of_node_mut(&region, &input.name, &input.instance_id)
+        else {
+            return Err(UpdateAssociationStatusErrorModeled::AssociationDoesNotExist(
+                AssociationDoesNotExist { message: None },
+            )
+            .into());
+        };
+        // "The updated status is the same as the current status" (`StatusUnchanged`): the
+        // status is `AssociationStatus$Name` ("The status."), so a node reporting the status
+        // it has already reported is reporting no change — whatever reason or user-defined
+        // string it carries this time. An association no node has reported on has no current
+        // status for a report to be the same as, so its first report always lands.
+        if held
+            .reported_status
+            .as_ref()
+            .is_some_and(|current| current.name == input.association_status.name)
+        {
+            return Err(
+                UpdateAssociationStatusErrorModeled::StatusUnchanged(StatusUnchanged {}).into(),
+            );
+        }
+        // The report is held exactly as the node sent it: its name, the instant it says the
+        // status changed, its reason and its user-defined string are the node's to state.
+        held.report_status(input.association_status.clone());
+        // "Information about the association" as it stands after the report, read back from
+        // the store the report was just written to, so the description this answers with is
+        // the one a later `DescribeAssociation` reports.
+        let description = held.latest_description(now).ok_or_else(|| {
+            UpdateAssociationStatusErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the association holds no version to report".to_string()),
+            })
+        })?;
+
+        Ok(UpdateAssociationStatusOutput {
+            association_description: Some(description),
+        })
     }
 }
