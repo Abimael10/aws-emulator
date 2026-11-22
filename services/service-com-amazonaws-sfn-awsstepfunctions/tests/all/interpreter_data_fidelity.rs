@@ -228,23 +228,25 @@ async fn a_choice_rules_own_assign_is_the_selected_rules() {
 }
 
 /// A `Choice` rule's own `Output` is the state's where that rule declares one, and the
-/// state's own `Output` decides it otherwise — over the variables the SELECTED rule's
-/// `Assign` has just written, which is what the states after the `Choice` read.
+/// state's own `Output` decides it otherwise — each evaluated against the variables the
+/// state was REACHED with, because the `Assign` that applies is evaluated after it and
+/// what it writes is read by the states the transition goes to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_selected_choice_rules_output_decides_the_states_output() {
-    // (case, the rules, the state-level Assign, the state-level Output, the input,
-    //  the expected output)
-    let rows: Vec<(&str, Value, Value, Value, &str, Value)> = vec![
+    // (case, the rules, the state-level Assign, the state-level Output, the Output of the
+    //  state the transition reaches, the input, the expected output)
+    let rows: Vec<(&str, Value, Value, Value, Value, &str, Value)> = vec![
         (
             "the selected rule declares an Output of its own",
             json!([{
                 "Condition": "{% $states.input.n > 0 %}",
                 "Assign": { "seen": "{% $states.input.n %}" },
-                "Output": { "from": "rule", "seen": "{% $seen %}" },
+                "Output": { "from": "rule", "seen": "{% $states.input.n %}" },
                 "Next": "Done",
             }]),
             Value::Null,
             json!({ "from": "state" }),
+            Value::Null,
             r#"{"n":3}"#,
             json!({ "from": "rule", "seen": 3 }),
         ),
@@ -256,13 +258,15 @@ async fn the_selected_choice_rules_output_decides_the_states_output() {
                 "Next": "Done",
             }]),
             Value::Null,
-            json!({ "from": "state", "seen": "{% $seen %}" }),
+            json!({ "from": "state", "seen": "{% $states.input.n * 2 %}" }),
+            Value::Null,
             r#"{"n":3}"#,
             json!({ "from": "state", "seen": 6 }),
         ),
         (
             "neither declares one, so the state's own input goes through",
             json!([{ "Condition": "{% $states.input.n > 0 %}", "Next": "Done" }]),
+            Value::Null,
             Value::Null,
             Value::Null,
             r#"{"n":3}"#,
@@ -287,6 +291,7 @@ async fn the_selected_choice_rules_output_decides_the_states_output() {
                 },
             ]),
             json!({ "tag": "from-state-level" }),
+            Value::Null,
             json!({ "tag": "{% $tag %}" }),
             r#"{"n":50}"#,
             json!({ "tag": "from-first-rule" }),
@@ -294,7 +299,7 @@ async fn the_selected_choice_rules_output_decides_the_states_output() {
     ];
 
     let emulator = Emulator::new();
-    for (index, (case, choices, state_assign, state_output, input, expected)) in
+    for (index, (case, choices, state_assign, state_output, done_output, input, expected)) in
         rows.into_iter().enumerate()
     {
         let mut pick = json!({ "Type": "Choice", "Choices": choices, "Default": "Done" });
@@ -304,12 +309,16 @@ async fn the_selected_choice_rules_output_decides_the_states_output() {
         if !state_output.is_null() {
             pick["Output"] = state_output;
         }
+        let mut done = json!({ "Type": "Pass", "End": true });
+        if !done_output.is_null() {
+            done["Output"] = done_output;
+        }
         let definition = json!({
             "QueryLanguage": "JSONata",
             "StartAt": "Pick",
             "States": {
                 "Pick": pick,
-                "Done": { "Type": "Pass", "End": true }
+                "Done": done
             }
         });
         let described =

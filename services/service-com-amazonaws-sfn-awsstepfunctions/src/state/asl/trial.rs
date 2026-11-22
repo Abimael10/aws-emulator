@@ -385,9 +385,9 @@ impl Interpreter<'_> {
         );
         let placed = match produced {
             Ok(result) => match language {
-                // A JSONata state's output is its `Output`, over the variables its
-                // own `Assign` has just written; there are no result-side filters to
-                // record stages for. A `Choice` state's own `Assign` and the SELECTED
+                // A JSONata state's output is its `Output`, evaluated before the
+                // `Assign` that follows it; there are no result-side filters to
+                // record stages for. A `Choice` state's own members and the SELECTED
                 // rule's decide it together, exactly as they do in the walk.
                 JSONATA => {
                     if let Some(result) = result.as_ref() {

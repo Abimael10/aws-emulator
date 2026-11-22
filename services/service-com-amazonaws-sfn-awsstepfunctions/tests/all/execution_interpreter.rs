@@ -1318,16 +1318,16 @@ async fn numbers_at_the_edge_of_what_a_definition_may_carry_are_answered() {
 // ---------------------------------------------------------------------------
 
 /// A retried state reads the attempt it is on through `$$.State.RetryCount`, so the
-/// value a retried `ItemSelector` sees is the attempt the interpreter really ran — and
-/// the member is there only once the state HAS been retried.
+/// value a retried `ItemSelector` sees is the attempt the interpreter really ran — zero
+/// on the attempt no `Retry` re-ran.
 #[tokio::test]
 async fn a_retried_state_reads_the_attempt_it_is_on() {
     let emulator = Emulator::new();
-    // The first attempt has been retried no times, so `$$.State` carries no
-    // `RetryCount` at all and the iteration fails; the retry's `ItemSelector` then
-    // reads the attempt the state is on, so the second succeeds and the output says
-    // which attempt produced it.
-    let definition = r#"{"StartAt":"M","States":{"M":{"Type":"Map","Retry":[{"ErrorEquals":["NeedAnotherTry"],"MaxAttempts":2,"IntervalSeconds":0}],"ItemSelector":{"state.$":"$$.State","value.$":"$$.Map.Item.Value"},"ItemProcessor":{"StartAt":"C","States":{"C":{"Type":"Choice","Choices":[{"Variable":"$.state.RetryCount","IsPresent":false,"Next":"F"}],"Default":"P"},"P":{"Type":"Pass","Parameters":{"attempt.$":"$.state.RetryCount","value.$":"$.value"},"End":true},"F":{"Type":"Fail","Error":"NeedAnotherTry"}}},"End":true}}}"#;
+    // The first attempt has been retried no times, so `$$.State` carries `RetryCount`
+    // zero and the iteration fails; the retry's `ItemSelector` then reads the attempt
+    // the state is on, so the second succeeds and the output says which attempt produced
+    // it.
+    let definition = r#"{"StartAt":"M","States":{"M":{"Type":"Map","Retry":[{"ErrorEquals":["NeedAnotherTry"],"MaxAttempts":2,"IntervalSeconds":0}],"ItemSelector":{"state.$":"$$.State","value.$":"$$.Map.Item.Value"},"ItemProcessor":{"StartAt":"C","States":{"C":{"Type":"Choice","Choices":[{"Variable":"$.state.RetryCount","NumericEquals":0,"Next":"F"}],"Default":"P"},"P":{"Type":"Pass","Parameters":{"attempt.$":"$.state.RetryCount","value.$":"$.value"},"End":true},"F":{"Type":"Fail","Error":"NeedAnotherTry"}}},"End":true}}}"#;
     let machine = create_machine(&emulator, "retry-count", definition).await;
     let execution = start_execution(&emulator, &machine, "only", r#"["a"]"#).await;
 

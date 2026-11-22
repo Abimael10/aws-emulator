@@ -2322,9 +2322,10 @@ fn diagnose_state<'a>(
     } else {
         diagnose_jsonpath_state(name, state, state_type, &here, into);
     }
-    // A variable the state ASSIGNS is in scope for the state's own expressions,
-    // because the language evaluates a state's assignments before the output they
-    // feed; everything else it may read is what reaching this state already assigned.
+    // A variable the state ASSIGNS is one the definition declares AT this state, so a
+    // read of it here names nothing the definition leaves undeclared: a field that reads
+    // it before the assignment that writes it has been made fails when the state RUNS
+    // rather than when it is created, which is what the warning below reports.
     let own = assigned_variables(state);
     // The ASSIGNMENTS themselves: a block of them is an object, and each name it
     // assigns is a name the language admits for a variable.

@@ -29,7 +29,10 @@
 //!   ([`::service_common::json_parse_fault::REDACTED_SOURCE`]) and no clause for the
 //!   position the parse ended at follows the sentence, so a caller's input — a
 //!   `@sensitive` member — is never printed back into a message that is logged and
-//!   surfaced;
+//!   surfaced; a refusal about a document the EXECUTION's own data carries
+//!   ([`redacted_diagnostic`]) withholds it the same way and does state that position,
+//!   because a definition's own expression over that data is told where the text it
+//!   could not read stopped parsing;
 //! * a refusal about a state machine DEFINITION ([`definition_diagnostic`]) quotes
 //!   the document it was reading in each clause, and states the position the parse
 //!   ended at after the sentence as well as in the diagnostic's own `location`
@@ -66,6 +69,29 @@ use ::service_common::json_parse_fault as fault;
 /// and nowhere else.
 pub fn diagnostic(document: &str, error: &serde_json::Error) -> String {
     framed(document, error, fault::REDACTED_SOURCE)
+}
+
+/// [`diagnostic`] followed by the position the parse ENDED at, with that document
+/// withheld there too.
+///
+/// It is what a refusal about a document the EXECUTION's own data carries states: the
+/// text is a caller's payload, so the sentence and both of its location clauses report
+/// their source as redacted ([`::service_common::json_parse_fault::REDACTED_SOURCE`]),
+/// and what is told is WHERE the parse stopped and nothing of what it was reading.
+///
+/// RECORDED: the service answers the redaction marker in place of the document and
+/// states the line and the column beside it, which is what lets a caller locate the
+/// fault in a payload it holds without the service printing that payload into a message
+/// that is logged and surfaced.
+///
+/// `error` is the parse that refused `document`: call this where that parse failed, and
+/// nowhere else.
+pub fn redacted_diagnostic(document: &str, error: &serde_json::Error) -> String {
+    format!(
+        "{}\n at {}",
+        framed(document, error, fault::REDACTED_SOURCE),
+        stopped_at_clause(document, error, fault::REDACTED_SOURCE)
+    )
 }
 
 /// [`definition_diagnostic`] for any other document this service QUOTES the text of

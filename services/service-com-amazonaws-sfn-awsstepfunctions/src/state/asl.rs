@@ -546,6 +546,26 @@ fn member_path_diagnosis(member: &str, path: &str, why: String) -> String {
 const PARAMETER_OPENING: &str = "The ";
 const NO_INPUT_VALUE_CLAUSE: &str = " parameter does not reference an input value: ";
 
+/// The clause that follows the member's own name in the diagnosis of a `*Path` member
+/// whose value cannot be read as a WHOLE NUMBER, and the separator between the path and
+/// the value it selected ([`parameter_not_a_long`]).
+///
+/// RECORDED text: the member carries a count of seconds, so a value that is not a whole
+/// number is reported as one that cannot be read as the integer the member holds, and
+/// the clause names the reference path as the definition wrote it beside the value that
+/// path selected.
+const NOT_A_LONG_CLAUSE: &str = " parameter cannot be parsed as a long value: ";
+const RESOLVED_TO: &str = " == ";
+
+/// The clause that follows the member's own name in the diagnosis of a member whose
+/// STRING value is not an instant ([`field_not_an_instant`]).
+///
+/// RECORDED text: a value of the right JSON type that the field could not READ is
+/// reported as a parse failure of that field, which is a different outcome from a value
+/// of another type and is worded differently — the offending text follows the clause.
+const NOT_AN_INSTANT_CLAUSE: &str =
+    " field cannot be parsed as an ISO-8601 extended offset date-time format string: ";
+
 /// The diagnosis for the `*Path` member `member` whose path selected no value: the
 /// member named as the parameter it is, and the path the definition wrote in it.
 ///
@@ -555,6 +575,31 @@ const NO_INPUT_VALUE_CLAUSE: &str = " parameter does not reference an input valu
 /// it ([`executing_state`], through [`names_its_state`]).
 fn parameter_without_input_value(member: &str, path: &str) -> String {
     format!("{PARAMETER_OPENING}{member}{NO_INPUT_VALUE_CLAUSE}{path}")
+}
+
+/// The diagnosis for the `*Path` member `member`, written as the reference path `path`,
+/// whose value cannot be read as the whole number of seconds the member holds: the
+/// member, the path as the definition wrote it, and the value that path selected,
+/// rendered as JSON.
+///
+/// The member names the field to correct and the PATH is what finds that field in a
+/// definition of many states, so both are named; the value is what a reader compares
+/// against the data the execution ran on. The state names itself around the whole of it
+/// ([`executing_state`], through [`names_its_state`]).
+pub(super) fn parameter_not_a_long(member: &str, path: &str, value: &Value) -> String {
+    format!("{PARAMETER_OPENING}{member}{NOT_A_LONG_CLAUSE}{path}{RESOLVED_TO}{value}")
+}
+
+/// The diagnosis for the member `member` whose value is a string the service cannot
+/// read as an instant: the member, and the text as it was written.
+///
+/// A value of the right JSON TYPE that the field cannot read is a different failure from
+/// a value of another type ([`referenced_value_must_be`]), so it is worded as the parse
+/// failure it is: what a client classifying the two acts on is which of them happened.
+/// The state names itself around the whole of it ([`executing_state`], through
+/// [`names_its_state`]).
+pub(super) fn field_not_an_instant(member: &str, text: &str) -> String {
+    format!("{PARAMETER_OPENING}{member}{NOT_AN_INSTANT_CLAUSE}{text}")
 }
 
 /// The diagnosis for a `Fail` state's `*Path` member that resolved to a value of
@@ -698,19 +743,31 @@ fn names_its_state(cause: &str) -> bool {
         || names_a_parameter(cause)
 }
 
-/// Whether `cause` is the diagnosis of a `*Path` member whose path selected nothing
-/// ([`parameter_without_input_value`]).
+/// Whether `cause` is the diagnosis of a MEMBER of the state being executed that this
+/// module worded under the member's own name ([`parameter_without_input_value`],
+/// [`parameter_not_a_long`], [`field_not_an_instant`]).
 ///
 /// The member's name is the only caller-chosen part, and it is written between the
 /// opening and the clause, so the reading is anchored at the START of the cause rather
 /// than searching it: a value this module echoes elsewhere in a cause cannot make
 /// another diagnosis look like this one.
 fn names_a_parameter(cause: &str) -> bool {
-    cause
-        .strip_prefix(PARAMETER_OPENING)
-        .and_then(|rest| rest.split_once(NO_INPUT_VALUE_CLAUSE))
-        .is_some_and(|(member, _)| !member.is_empty() && !member.contains(' '))
+    let Some(rest) = cause.strip_prefix(PARAMETER_OPENING) else {
+        return false;
+    };
+    MEMBER_CLAUSES.iter().any(|clause| {
+        rest.split_once(clause)
+            .is_some_and(|(member, _)| !member.is_empty() && !member.contains(' '))
+    })
 }
+
+/// The clauses that follow the member's own name in a diagnosis this module words about
+/// ONE member of the state being executed ([`names_a_parameter`]).
+const MEMBER_CLAUSES: &[&str] = &[
+    NO_INPUT_VALUE_CLAUSE,
+    NOT_A_LONG_CLAUSE,
+    NOT_AN_INSTANT_CLAUSE,
+];
 
 /// How the diagnosis of a PAYLOAD-TEMPLATE member whose path could not be found opens
 /// ([`template_expression`]), which is what tells it from every other cause
@@ -1579,14 +1636,22 @@ pub struct Context {
 impl Context {
     /// The context object a definition reads through `$$`, without the per-state
     /// members [`Interpreter::context_for`] adds.
+    ///
+    /// The members are written in the order the service SERIALIZES them in, because
+    /// the whole object is quoted inside a diagnosis about a path that could not be
+    /// resolved against it ([`CONTEXT_PATH_OPENING`], [`intrinsic_path_not_found`]):
+    /// that diagnosis is one string, so the order the members are built in is part of
+    /// what a client comparing the message reads. RECORDED order: under `Execution`,
+    /// the id, the input, the instant the run started, the name, the role and the
+    /// redrive count.
     fn value(&self, input: &Value, start: SystemTime) -> Value {
         json!({
             "Execution": {
                 "Id": self.execution_arn,
                 "Input": input,
+                "StartTime": iso(start),
                 "Name": self.execution_name,
                 "RoleArn": self.role_arn,
-                "StartTime": iso(start),
                 "RedriveCount": self.redrive_count,
             },
             "StateMachine": {
@@ -4144,10 +4209,9 @@ fn errors_match(entry: &Map<String, Value>, error: &str) -> bool {
 /// `context` with `$$.State.RetryCount` set to the attempt the state is on, for an
 /// attempt a `Retry` re-ran.
 ///
-/// RECORDED: the member is supplied only once the state HAS been retried, so the
-/// attempt a state is on is written into the context object only for an attempt after
-/// the first and the member stays absent otherwise — the shape
-/// [`Interpreter::context_for`] builds.
+/// The member is PRESENT on every attempt ([`Interpreter::context_for`] writes it, zero
+/// on the first), so this only has to move it on for an attempt after the first: the
+/// attempt a state is on is what a field reading it resolves.
 fn with_retry_count(context: &Value, attempt: u64) -> Value {
     let mut context = context.clone();
     if attempt == 0 {

@@ -17,11 +17,11 @@
 //! state's own `Assign` and a `Catch` catcher's own) — and, for the one language whose
 //! output is an expression, the scope that holds nothing for the name at all.
 //!
-//! A `Choice` is the one node this does NOT hold for, and it is covered here too: a
-//! `Choice` assigns as part of the TRANSITION its selected rule decides, so what that rule
-//! assigned is in scope for the output of that transition — the reading
-//! `interpreter_data_fidelity` pins for the rule's own `Output`, asserted here for both
-//! query languages so the two cannot drift.
+//! A `Choice` is covered here too, because the node that decides its transition is a RULE
+//! rather than the state: the rule's own `Assign` is evaluated after the `Output` that
+//! decides what the state puts out, so that output reads the scope the state was reached
+//! with and the state the transition goes to is the first to read what the rule assigned —
+//! asserted for both query languages so the two cannot drift.
 //!
 //! The harness (`Emulator`, `create_machine`, `start_execution`, `describe_execution`) is
 //! the one `state_machine_lifecycle` builds; `tests/all/main.rs` picks this file up, so
@@ -200,14 +200,15 @@ async fn what_a_node_assigns_is_read_by_the_nodes_after_it() {
     check("commit", rows).await;
 }
 
-/// The one node the rule above does not hold for: a `Choice` assigns as part of the
-/// TRANSITION its selected rule decides, so what that rule assigned is in scope for the
-/// output of that transition — and the state after it reads the same value.
+/// The same rule where the node that assigns is a `Choice` RULE: what the selected rule
+/// assigns commits for the transition it decides, so the output of that transition reads
+/// the value the run was already holding and the state the transition reaches is the first
+/// to read the assigned one.
 ///
 /// The rows are the two query languages, which build that output through different
 /// members: the rule's own `Output` expression, and the state's `OutputPath`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_choice_assigns_for_the_transition_its_rule_decides() {
+async fn a_choice_rules_assign_commits_for_the_transition_it_decides() {
     let rows: Vec<Row> = vec![
         Row {
             case: "a JSONata Choice rule's own Assign and Output",
@@ -224,7 +225,7 @@ async fn a_choice_assigns_for_the_transition_its_rule_decides() {
                 },
             })),
             input: r#"{"go":true}"#,
-            expected: Expected::Output(json!({ "seen": 2, "nextSeen": 2 })),
+            expected: Expected::Output(json!({ "seen": 1, "nextSeen": 2 })),
         },
         Row {
             case: "a JSONPath Choice rule's own Assign and the state's OutputPath",
@@ -251,7 +252,7 @@ async fn a_choice_assigns_for_the_transition_its_rule_decides() {
                 },
             }),
             input: r#"{"go":true}"#,
-            expected: Expected::Output(json!({ "seen": 2, "nextSeen": 2 })),
+            expected: Expected::Output(json!({ "seen": 1, "nextSeen": 2 })),
         },
     ];
 

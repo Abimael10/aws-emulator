@@ -7,9 +7,9 @@
 //!
 //! The rules under test:
 //!
-//! 1. the context object's `$$.State` carries `RetryCount` only for an attempt a
-//!    `Retry` re-ran: a state on its first attempt has been retried no times, so the
-//!    member is absent from the document a query over `$$` reads;
+//! 1. the context object's `$$.State` carries the attempt the state is on: `RetryCount`
+//!    is present on every attempt — zero on the first, which a `Retry` has re-run no
+//!    times — and moves on with each attempt a retrier re-ran;
 //! 2. a `Fail` state's `Error`/`Cause` written as JSON null declares no value for it —
 //!    null is the absence of a value, so the execution surfaces the same absent error
 //!    an omitted member does, and a `Catch` naming an error does not match it;
@@ -92,18 +92,18 @@ fn output(described: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// 1. `$$.State.RetryCount` is there only once a Retry has re-run the state
+// 1. `$$.State.RetryCount` is the attempt the state is on
 // ---------------------------------------------------------------------------
 
-/// `$$.State` omits `RetryCount` on an attempt no `Retry` re-ran and carries the
-/// attempt once one has, and it carries the state's name and entry instant either way.
+/// `$$.State` carries `RetryCount` on every attempt — zero on the one no `Retry` re-ran
+/// — beside the state's name and entry instant.
 ///
 /// The rows vary the dimension the rule generalises over: how many attempts the state
 /// has taken by the time the context object is read — none (the first attempt of a
 /// state with no `Retry` at all, and the first attempt of one that declares one) and
 /// one (the attempt a retrier re-ran).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_context_object_carries_a_retry_count_only_once_a_retry_re_ran_the_state() {
+async fn the_context_object_carries_the_attempt_the_state_is_on() {
     // (case, the state that reads `$$.State`, the attempt the member must report)
     let rows: Vec<(&str, Value, Option<u64>)> = vec![
         (
@@ -113,7 +113,7 @@ async fn the_context_object_carries_a_retry_count_only_once_a_retry_re_ran_the_s
                 "Parameters": { "state.$": "$$.State" },
                 "End": true,
             }),
-            None,
+            Some(0),
         ),
         (
             "the first attempt of a state that declares a Retry",
@@ -128,7 +128,7 @@ async fn the_context_object_carries_a_retry_count_only_once_a_retry_re_ran_the_s
                 "OutputPath": "$[0]",
                 "End": true,
             }),
-            None,
+            Some(0),
         ),
     ];
 
@@ -174,7 +174,7 @@ async fn the_context_object_carries_a_retry_count_only_once_a_retry_re_ran_the_s
     }
 
     // And the attempt a retrier re-ran reads the attempt it is on: the first attempt
-    // fails because the member is absent, the retry supplies it, and the output says
+    // fails on the zero the member carries, the retry moves it on, and the output says
     // which attempt produced it.
     let definition = json!({
         "StartAt": "Try",
@@ -190,7 +190,7 @@ async fn the_context_object_carries_a_retry_count_only_once_a_retry_re_ran_the_s
                         "Decide": {
                             "Type": "Choice",
                             "Choices": [{ "Variable": "$.state.RetryCount",
-                                          "IsPresent": false, "Next": "Again" }],
+                                          "NumericEquals": 0, "Next": "Again" }],
                             "Default": "Report",
                         },
                         "Report": {

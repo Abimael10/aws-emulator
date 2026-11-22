@@ -376,7 +376,7 @@ pub(super) fn apply_intrinsic(
             serde_json::from_str(&text).map_err(|error| {
                 Invalid::Function(format!(
                     "Cannot convert String to Json in {name}, caused by: {}",
-                    crate::state::json_parse_quoted_diagnostic(&text, &error)
+                    crate::state::json_parse_redacted_diagnostic(&text, &error)
                 ))
             })
         }

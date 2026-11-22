@@ -629,6 +629,29 @@ pub fn invalid_value(node: &Value, field: &str, must_be: &str, value: &Value) ->
     ))
 }
 
+/// The diagnosis of a field whose expression produced a value of the right JSON type
+/// that the field could not READ, in the SERVICE's own words about that field rather
+/// than in the language's sentence about a result type: `diagnosis` is the whole of it.
+///
+/// A `Wait`'s `Timestamp` that is a string but denotes no instant is such a field — the
+/// expression produced a string, which is what the field holds, and the text could not
+/// be read — and the service words that as the parse failure it is. The field is
+/// remembered beside the diagnosis exactly as it is for every other diagnosis this
+/// module words ([`failed_in`]), because the event reporting the failure carries it.
+///
+/// `None` for a field that carries a literal rather than an expression: nothing was
+/// evaluated for it, so the failure is not one of evaluating an expression.
+pub fn unreadable_value(node: &Value, field: &str, diagnosis: String) -> Option<Refusal> {
+    let Value::String(text) = node else {
+        return None;
+    };
+    if !is_expression(text) {
+        return None;
+    }
+    failed_in(field);
+    Some(Refusal::NotEvaluated(diagnosis))
+}
+
 /// The field a diagnosis this module worded names — "the location of the field in the
 /// state in which the evaluation error occurred", which the event reporting the
 /// failure carries, TAKEN from the thread it was remembered on.

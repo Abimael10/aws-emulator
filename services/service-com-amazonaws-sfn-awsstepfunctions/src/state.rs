@@ -3311,11 +3311,17 @@ pub use json_diagnostic::definition_diagnostic as json_parse_definition_diagnost
 /// What a refusal about any OTHER document this service quotes the text of states:
 /// the same reading, with that document quoted in each clause and the position the
 /// parse ended at stated after the sentence.
+pub use json_diagnostic::quoted_diagnostic as json_parse_quoted_diagnostic;
+
+/// What a failure about a document the EXECUTION's own data carries states: the same
+/// reading with the document WITHHELD in every clause, and the position the parse ended
+/// at stated after the sentence.
 ///
 /// It is what a definition's own expression converting a string to JSON reports
-/// (`States.StringToJson`): the string is the execution's data and the service is
-/// recorded quoting it, exactly as it quotes a definition it could not read.
-pub use json_diagnostic::quoted_diagnostic as json_parse_quoted_diagnostic;
+/// (`States.StringToJson`): the string is the execution's data, which this service does
+/// not print back into a cause a client reads and logs, so the source is the redaction
+/// marker and what is told is where the text stopped parsing.
+pub use json_diagnostic::redacted_diagnostic as json_parse_redacted_diagnostic;
 
 /// WHERE a refused definition stopped parsing, as the `location` of the diagnostic
 /// that reports it — the clause [`json_parse_definition_diagnostic`] also states

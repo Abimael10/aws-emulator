@@ -751,14 +751,13 @@ impl Interpreter<'_> {
                             .rule
                             .as_ref()
                             .map_or(state, |(_, rule)| rule);
+                        // What the node that decided the transition assigns COMMITS for
+                        // the states after it, exactly as every other node's `Assign`
+                        // does ([`Interpreter::jsonpath_assign`]): this state's own
+                        // `OutputPath` is evaluated against the scope the state was
+                        // reached with, which the block put back.
                         self.jsonpath_assign(owner, &effective, &context)
                             .map_err(|failure| failure.at(at))?;
-                        // A `Choice` assigns as part of the TRANSITION its selected rule
-                        // decides, so what it assigned is in scope for the output of that
-                        // transition — the rule the other query language's `Choice`
-                        // follows too ([`Interpreter::choice_output`]), and the one node
-                        // whose own assignment its own output reads.
-                        VariableScope::reinstall(&self.variables);
                         self.output_value(state, effective.clone(), &context)
                             .map_err(|failure| failure.at(at))?
                     }
@@ -1027,15 +1026,18 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    /// A JSONata state's `Assign`, and the `Output` it is evaluated beside.
+    /// A JSONata state's `Output`, and the `Assign` that is evaluated after it.
+    ///
+    /// The fields of a node are evaluated in a FIXED order with `Assign` LAST: the
+    /// node's `Output` is built first, against the variables the run held when the node
+    /// was reached, and only then are the assignments made — so the first of the two to
+    /// fail is the one the failure names, and a node that both reads and writes one
+    /// variable puts out the value it was reached with.
     ///
     /// "Assign ... store values in variables", and what a node assigns is in scope for
     /// the nodes AFTER it: the assignments COMMIT when the node is done with its own
-    /// fields, so this node's `Output` is evaluated against the variables the run held
-    /// when the node was reached and the next state is the first to read what this
-    /// `Assign` wrote. A node that both reads and writes one variable therefore puts out
-    /// the value it was reached with, which is the value a later state no longer sees —
-    /// the rule the other query language's `Assign` follows too
+    /// fields, so the next state is the first to read what this `Assign` wrote — the
+    /// rule the other query language's `Assign` follows too
     /// ([`Interpreter::jsonpath_assign`]).
     ///
     /// A node that declares no `Output` puts out what the state's own data flow owes
@@ -1044,10 +1046,10 @@ impl Interpreter<'_> {
     /// the error output it was handed; a state whose work produced a result puts out
     /// that result; and a state whose work produced none carries its own input through.
     ///
-    /// A state that FAILS assigns nothing: where the `Output` those assignments feed
-    /// cannot be built, the scope is put back as the state found it, so the states
-    /// after a caught failure read what reaching the failed state had assigned and no
-    /// more — and the event the state is left by reports no assignment of its own.
+    /// A state that FAILS assigns nothing: where either field cannot be evaluated, the
+    /// scope is put back as the state found it, so the states after a caught failure
+    /// read what reaching the failed state had assigned and no more — and the event the
+    /// state is left by reports no assignment of its own.
     pub(super) fn jsonata_output(
         &mut self,
         state: &Map<String, Value>,
@@ -1056,36 +1058,41 @@ impl Interpreter<'_> {
         error_output: Option<&Value>,
         context: &Value,
     ) -> Result<Value, Failure> {
-        // ONE allowance for the `Assign` and the `Output` it feeds: they are the
+        // ONE allowance for the `Output` and the `Assign` after it: they are the
         // expressions of one template, so they spend from the same budget.
         let mut budget = self.jsonata_budget();
         let scope = self.variables.clone();
         let assigned = self.assigned.clone();
-        let produced = self
-            .jsonata_assign(state, ASSIGN_MEMBER, input, result, error_output, context, &mut budget)
-            .and_then(|()| match state.get("Output") {
-                None => Ok(error_output
-                    .or(result)
-                    .cloned()
-                    .unwrap_or_else(|| input.clone())),
-                Some(template) => {
-                    // Evaluated against the scope the node was REACHED with: what its
-                    // own `Assign` wrote commits for the nodes after it, so the
-                    // committed scope is put back once this field is built.
-                    let committed = ::std::mem::replace(&mut self.variables, scope.clone());
-                    let rendered = {
-                        let bindings = self.bindings(input, context, result, error_output);
-                        super::super::jsonata::render(
-                            template,
-                            OUTPUT_MEMBER,
-                            &bindings,
-                            &mut budget,
-                        )
-                    };
-                    self.variables = committed;
-                    rendered.map_err(jsonata_failure)
-                }
-            });
+        let built = match state.get(OUTPUT_MEMBER) {
+            None => Ok(error_output
+                .or(result)
+                .cloned()
+                .unwrap_or_else(|| input.clone())),
+            Some(template) => {
+                let rendered = {
+                    let bindings = self.bindings(input, context, result, error_output);
+                    super::super::jsonata::render(
+                        template,
+                        OUTPUT_MEMBER,
+                        &bindings,
+                        &mut budget,
+                    )
+                };
+                rendered.map_err(jsonata_failure)
+            }
+        };
+        let produced = built.and_then(|value| {
+            self.jsonata_assign(
+                state,
+                ASSIGN_MEMBER,
+                input,
+                result,
+                error_output,
+                context,
+                &mut budget,
+            )
+            .map(|()| value)
+        });
         if produced.is_err() {
             self.variables = scope;
             self.assigned = assigned;
@@ -1418,6 +1425,12 @@ impl Interpreter<'_> {
     /// under the member the DEFINITION wrote — `HeartbeatSecondsPath` where the
     /// definition carries that — because the two forms are alternatives and naming the
     /// one it does not carry points a reader at the wrong field.
+    ///
+    /// A value a `*Path` member selected that is not a whole number at all cannot be
+    /// read as the integer the member holds, which is a different failure from a whole
+    /// number the member does not allow: it is reported as the parse failure it is,
+    /// naming the reference path the definition wrote and the value that path selected
+    /// ([`parameter_not_a_long`]).
     pub(super) fn task_seconds(
         &self,
         state: &Map<String, Value>,
@@ -1427,13 +1440,16 @@ impl Interpreter<'_> {
         context: &Value,
     ) -> Result<Option<u64>, Failure> {
         let path_member = format!("{member}Path");
-        let (wrote, declared) = match (state.get(member), state.get(path_member.as_str())) {
+        let (wrote, reference, declared) = match (state.get(member), state.get(path_member.as_str()))
+        {
             (Some(declared), _) => (
                 member.to_string(),
+                None,
                 self.literal(language, declared, member, input, context)?,
             ),
             (None, Some(Value::String(path))) => (
                 path_member.clone(),
+                Some(path.clone()),
                 Some(member_path_value(&path_member, path, input, context).map_err(runtime)?),
             ),
             (None, Some(other)) => {
@@ -1445,13 +1461,23 @@ impl Interpreter<'_> {
         };
         match declared.as_ref().and_then(Value::as_u64) {
             Some(seconds) if seconds > 0 => Ok(Some(seconds)),
-            _ => Err(self.invalid_field_value(
-                language,
-                state.get(wrote.as_str()),
-                &wrote,
-                POSITIVE_SECONDS,
-                declared.as_ref().unwrap_or(&Value::Null),
-            )),
+            _ => {
+                let value = declared.unwrap_or(Value::Null);
+                // A whole number the member cannot take — zero, a negative one — WAS
+                // read as the integer the member holds, so what is reported is the
+                // value the member does not allow; every other value could not be read
+                // as that integer at all.
+                match reference.filter(|_| !is_whole_number(&value)) {
+                    Some(path) => Err(runtime(parameter_not_a_long(&wrote, &path, &value))),
+                    None => Err(self.invalid_field_value(
+                        language,
+                        state.get(wrote.as_str()),
+                        &wrote,
+                        POSITIVE_SECONDS,
+                        &value,
+                    )),
+                }
+            }
         }
     }
 
@@ -1483,14 +1509,42 @@ impl Interpreter<'_> {
         runtime(referenced_value_must_be(field, must_be, value))
     }
 
+    /// What a FIELD of a state whose value is of the kind the language accepts there
+    /// but which the field could not READ reports: `diagnosis`, the service's own
+    /// sentence about that field.
+    ///
+    /// It is the same two classes [`Interpreter::invalid_field_value`] answers in — a
+    /// JSONata field's failure is the language's own query-evaluation failure, located
+    /// at the field the expression is written in, and every other field's is the
+    /// service's run-time failure — and the DIAGNOSIS is the one sentence either way,
+    /// because what could not be read is the same thing whichever language the state is
+    /// written in.
+    pub(super) fn unreadable_field_value(
+        &self,
+        language: &'static str,
+        node: Option<&Value>,
+        field: &str,
+        diagnosis: String,
+    ) -> Failure {
+        if language == JSONATA {
+            if let Some(refusal) = node.and_then(|node| {
+                super::super::jsonata::unreadable_value(node, field, diagnosis.clone())
+            }) {
+                return jsonata_failure(refusal);
+            }
+        }
+        runtime(diagnosis)
+    }
+
     /// The context object (`$$`) a state reads: the run's own members, plus the state
     /// it is being read in and the `Map` item being iterated, when there is one.
     ///
     /// `$$.State` carries the members the service supplies for the attempt being run:
-    /// the state's name and the instant it was entered always, and `RetryCount` only
-    /// once a `Retry` has re-run it ([`with_retry_count`]). A state on its first
-    /// attempt has been retried no times, so the member is ABSENT from the document a
-    /// query over `$$` reads rather than present as a zero.
+    /// the state's name, the instant it was entered, and the attempt it is on. RECORDED
+    /// shape: `RetryCount` is PRESENT on every attempt — zero on the first, which has
+    /// been retried no times — so a field reading it resolves whatever attempt the state
+    /// is on, and the member is in the object a diagnosis about an unresolved context
+    /// path quotes ([`with_retry_count`] writes the attempt a `Retry` re-ran).
     pub(super) fn context_for(&self, scope: &Scope, name: &str, at: Duration) -> Value {
         let mut context = self.base_context.clone();
         if let Some(object) = context.as_object_mut() {
@@ -1500,9 +1554,7 @@ impl Interpreter<'_> {
                 "EnteredTime".to_string(),
                 serde_json::json!(iso(self.start + at)),
             );
-            if self.retry_count > 0 {
-                state.insert("RetryCount".to_string(), serde_json::json!(self.retry_count));
-            }
+            state.insert("RetryCount".to_string(), serde_json::json!(self.retry_count));
             object.insert("State".to_string(), Value::Object(state));
             if let Some(item) = &scope.map_item {
                 object.insert("Map".to_string(), serde_json::json!({ "Item": item }));
@@ -2065,13 +2117,26 @@ impl Interpreter<'_> {
                 iso_millis(text).ok().map(|millis| (text.to_string(), millis))
             });
             let Some((text, due_millis)) = instant else {
-                return Err(self.invalid_field_value(
-                    language,
-                    state.get(member),
-                    member,
-                    ISO_INSTANT,
-                    &timestamp,
-                ));
+                // A value that IS a string and merely denotes no instant could not be
+                // READ, which is a different failure from a value of another type and
+                // is reported as the parse failure it is
+                // ([`field_not_an_instant`]); every other type never named an instant
+                // at all.
+                return Err(match timestamp.as_str() {
+                    Some(written) => self.unreadable_field_value(
+                        language,
+                        state.get(member),
+                        member,
+                        field_not_an_instant(member, written),
+                    ),
+                    None => self.invalid_field_value(
+                        language,
+                        state.get(member),
+                        member,
+                        ISO_INSTANT,
+                        &timestamp,
+                    ),
+                });
             };
             let reached = super::super::epoch_millis(self.start)
                 .saturating_add(i64::try_from(at.as_millis()).unwrap_or(i64::MAX));
@@ -2192,9 +2257,14 @@ impl Interpreter<'_> {
     /// was taken — a matched rule that declares none assigns nothing, rather than
     /// falling back on the state's.
     ///
-    /// The `Output` those assignments feed is the selected rule's where it declares
-    /// one and the state's otherwise, and a state and rule that declare neither put
-    /// the state's own input through.
+    /// The `Output` that decides what the state puts out is the selected rule's where it
+    /// declares one and the state's otherwise, and a state and rule that declare neither
+    /// put the state's own input through.
+    ///
+    /// The fields are evaluated in the order the language fixes, with `Assign` LAST —
+    /// the condition that selected the rule, then the `Output` that applies, then the
+    /// `Assign` that applies — so the first of them to fail is the one the failure
+    /// names, exactly as for every other state ([`Interpreter::jsonata_output`]).
     ///
     /// As everywhere else, a state whose output cannot be BUILT assigns nothing: the
     /// scope is put back as the state found it.
@@ -2207,7 +2277,7 @@ impl Interpreter<'_> {
     ) -> Result<Value, Failure> {
         let scope = self.variables.clone();
         let assigned = self.assigned.clone();
-        let produced = self.choice_assign_and_output(state, rule, input, context);
+        let produced = self.choice_output_and_assign(state, rule, input, context);
         if produced.is_err() {
             self.variables = scope;
             self.assigned = assigned;
@@ -2216,24 +2286,19 @@ impl Interpreter<'_> {
     }
 
     /// [`Interpreter::choice_output`] without the roll-back, which that one adds.
-    fn choice_assign_and_output(
+    fn choice_output_and_assign(
         &mut self,
         state: &Map<String, Value>,
         rule: Option<&(usize, Map<String, Value>)>,
         input: &Value,
         context: &Value,
     ) -> Result<Value, Failure> {
-        // ONE allowance for the `Assign` that applies and the `Output` it feeds: they
+        // ONE allowance for the `Output` that applies and the `Assign` after it: they
         // are the expressions of one visit to this state.
         let mut budget = self.jsonata_budget();
-        // The `Assign` of whichever decided the transition: the rule that matched, or
-        // the state itself where none did. A member of a RULE is written inside that
-        // rule, which is where a diagnosis about it locates it.
-        let (owner, at) = match rule {
-            Some((index, rule)) => (rule, choice_rule_field(*index, ASSIGN_MEMBER)),
-            None => (state, ASSIGN_MEMBER.to_string()),
-        };
-        self.jsonata_assign(owner, &at, input, None, None, context, &mut budget)?;
+        // The `Output` of whichever decided the transition: the rule that matched where
+        // it declares one, and the state itself otherwise. A member of a RULE is written
+        // inside that rule, which is where a diagnosis about it locates it.
         let (template, at) = match rule.and_then(|(index, rule)| {
             rule.get(OUTPUT_MEMBER)
                 .map(|template| (template.clone(), choice_rule_field(*index, OUTPUT_MEMBER)))
@@ -2244,21 +2309,27 @@ impl Interpreter<'_> {
                 OUTPUT_MEMBER.to_string(),
             ),
         };
-        match template {
-            None => Ok(input.clone()),
+        // Built BEFORE the `Assign` that applies, because `Assign` is the last field a
+        // node evaluates: what it writes is in scope for the states after the
+        // transition rather than for the field that builds its output.
+        let produced = match template {
+            None => input.clone(),
             Some(template) => {
-                // Over the variables the `Assign` that applied has just written, which is
-                // what this state's own `Output` reads: a `Choice` assigns as part of the
-                // TRANSITION its selected rule decides, so the assignment is in scope for
-                // the output of that transition — unlike the `Assign` of a state whose own
-                // data flow builds its output ([`Interpreter::jsonata_output`]).
                 let rendered = {
                     let bindings = self.bindings(input, context, None, None);
                     super::super::jsonata::render(&template, &at, &bindings, &mut budget)
                 };
-                rendered.map_err(jsonata_failure)
+                rendered.map_err(jsonata_failure)?
             }
-        }
+        };
+        // The `Assign` of whichever decided the transition: the rule that matched, or
+        // the state itself where none did.
+        let (owner, at) = match rule {
+            Some((index, rule)) => (rule, choice_rule_field(*index, ASSIGN_MEMBER)),
+            None => (state, ASSIGN_MEMBER.to_string()),
+        };
+        self.jsonata_assign(owner, &at, input, None, None, context, &mut budget)?;
+        Ok(produced)
     }
 
     // -----------------------------------------------------------------------
@@ -4033,6 +4104,16 @@ fn member_path_value(
     expression(path, input, context).map_err(|failure| {
         member_path_diagnosis(member, path, failure.cause.unwrap_or_default())
     })
+}
+
+/// Whether `value` is a JSON number a member holding a whole number of seconds can be
+/// READ as one from — an integer, of either sign.
+///
+/// A value that is not is one such a member cannot be parsed from at all, which is the
+/// failure [`parameter_not_a_long`] words; a whole number outside the range the member
+/// allows was read and is reported as the value it is.
+fn is_whole_number(value: &Value) -> bool {
+    value.is_i64() || value.is_u64()
 }
 
 /// The error names a reply reports BESIDE the one its failure carries, for an outcome
