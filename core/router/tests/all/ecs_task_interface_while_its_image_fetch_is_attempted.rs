@@ -122,18 +122,20 @@ const FETCH_ATTEMPT: Duration =
 /// after it.
 const STOP_DEADLINE: Duration = FETCH_ATTEMPT.saturating_add(START_DEADLINE);
 
-/// How long a row looks again at a task whose fetch is still being attempted, asserting each
-/// time that it is still coming up with its interface attached.
+/// How long AFTER THE LAUNCH a row looks again at a task whose fetch is still being
+/// attempted, asserting each time that it is still coming up with its interface attached.
 ///
-/// A QUARTER of the attempt, so the window is nowhere near the instant the attempt ends — and
-/// never shorter than several task transitions, whatever that attempt is: what the window has
-/// to be past is the start such a task would have taken had its fetch been answered, which is
-/// ONE transition away ([`TRANSITION_SPAN`]), and a window under that would leave this loop
-/// asserting nothing.
+/// Counted from the launch rather than from whenever this suite got round to looking, because
+/// the attempt is a handful of lifecycle spans ([`FETCH_ATTEMPT`]) and a window counted from
+/// the first look could therefore reach past the instant the attempt ends. Two THIRDS of the
+/// attempt, so the window stops short of that instant — and never shorter than several task
+/// transitions, whatever that attempt is: what the window has to be past is the start such a
+/// task would have taken had its fetch been answered, which is ONE transition away
+/// ([`TRANSITION_SPAN`]), and a window under that would leave this loop asserting nothing.
 const STILL_ATTACHING: Duration = {
-    let quarter = FETCH_ATTEMPT.as_millis() as u64 / 4;
-    let floor = TRANSITION_SPAN.as_millis() as u64 * 4;
-    Duration::from_millis(if quarter > floor { quarter } else { floor })
+    let most_of_it = FETCH_ATTEMPT.as_millis() as u64 * 2 / 3;
+    let floor = TRANSITION_SPAN.as_millis() as u64 * 3;
+    Duration::from_millis(if most_of_it > floor { most_of_it } else { floor })
 };
 
 /// How long one lifecycle boundary of a task takes — the span the start this loop watches a
@@ -556,25 +558,31 @@ async fn an_awsvpc_tasks_interface_stays_attached_while_its_image_fetch_is_attem
     ];
 
     // Every task is launched first and read afterwards: each comes up on its own clock, so the
-    // whole table costs one start rather than one per row.
-    let mut placed: Vec<(&Row, String)> = Vec::new();
+    // whole table costs one start rather than one per row. Each row keeps the instant its OWN
+    // launch was made at, taken before the call: the window below is measured from it, so it
+    // ends inside that row's own attempt whatever the rows before it cost.
+    let mut placed: Vec<(&Row, String, Instant)> = Vec::new();
     for row in &rows {
-        placed.push((row, run(&router, row).await));
+        let launched_at = Instant::now();
+        placed.push((row, run(&router, row).await, launched_at));
     }
 
     // Every row's interface is ATTACHED while Amazon ECS brings its task up, and the id it
     // names is an interface Amazon EC2 holds in the launch's own subnet — whether or not the
     // image behind the task can be fetched from there.
-    let mut launched: Vec<(&Row, String, String)> = Vec::new();
-    for (row, task_arn) in placed {
+    let mut launched: Vec<(&Row, String, String, Instant)> = Vec::new();
+    for (row, task_arn, launched_at) in placed {
         let task = attached(&router, &task_arn, row.case).await;
         let interface_id = assert_interface_in_place(&task, &row.subnet_id, row.case);
         assert_ec2_holds(&router, &interface_id, &row.subnet_id, row.case).await;
-        launched.push((row, task_arn, interface_id));
+        launched.push((row, task_arn, interface_id, launched_at));
     }
 
     // The task whose image CAN be fetched runs, and its interface is attached with it.
-    for (row, task_arn, _) in launched.iter().filter(|(row, _, _)| row.reaches_the_registry) {
+    for (row, task_arn, _, _) in launched
+        .iter()
+        .filter(|(row, _, _, _)| row.reaches_the_registry)
+    {
         let deadline = Instant::now() + START_DEADLINE;
         let task = loop {
             let task = describe(&router, task_arn, row.case).await;
@@ -600,12 +608,15 @@ async fn an_awsvpc_tasks_interface_stays_attached_while_its_image_fetch_is_attem
     // attached, while the agent spends the attempt: looked at again and again over a window
     // far past the one transition the start of a task takes, each look asserting what the
     // client this is for reads.
-    for (row, task_arn, _) in launched
+    for (row, task_arn, _, launched_at) in launched
         .iter()
-        .filter(|(row, _, _)| !row.reaches_the_registry)
+        .filter(|(row, _, _, _)| !row.reaches_the_registry)
     {
-        let until = Instant::now() + STILL_ATTACHING;
-        while Instant::now() < until {
+        let until = *launched_at + STILL_ATTACHING;
+        // At least one look, however long the rows before this one took: what this asserts is
+        // read nowhere else, so a window the earlier phases had already consumed would leave it
+        // asserting nothing at all.
+        loop {
             let task = describe(&router, task_arn, row.case).await;
             assert!(
                 task["stopCode"].is_null(),
@@ -621,6 +632,9 @@ async fn an_awsvpc_tasks_interface_stays_attached_while_its_image_fetch_is_attem
                 row.case
             );
             assert_interface_in_place(&task, &row.subnet_id, row.case);
+            if Instant::now() >= until {
+                break;
+            }
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
@@ -628,9 +642,9 @@ async fn an_awsvpc_tasks_interface_stays_attached_while_its_image_fetch_is_attem
     // And only the stop that failed fetch earns takes the interface down: the attachment
     // reaches DELETED, the stop names the class the runtime reports a failed fetch under and
     // the image it could not fetch, and Amazon EC2 holds the interface no more.
-    for (row, task_arn, interface_id) in launched
+    for (row, task_arn, interface_id, _) in launched
         .iter()
-        .filter(|(row, _, _)| !row.reaches_the_registry)
+        .filter(|(row, _, _, _)| !row.reaches_the_registry)
     {
         let deadline = Instant::now() + STOP_DEADLINE;
         let task = loop {

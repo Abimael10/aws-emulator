@@ -133,10 +133,16 @@ pub const STOP_CODE_TASK_FAILED_TO_START: &str = "TaskFailedToStart";
 /// has spent it. A task is therefore still coming up for this long after its interface was
 /// attached, which is what a client that reads the attachment of a task whose image cannot
 /// be fetched — and joins it to Amazon EC2's record of that interface, which exists only
-/// while the task does — observes. A minute is the scale a connect timeout and the retries
-/// around it really take, and short enough that a client waiting for such a task to stop
-/// gets its answer inside a generous poll budget.
-pub const FAILED_IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+/// while the task does — observes.
+///
+/// Like every other span this emulator chooses for a transition the clock owes
+/// ([`TRANSITION_SPAN`]), it is a few lifecycle steps rather than the minutes a real connect
+/// timeout and the retries around it take: the OUTCOME is what a client reads, and one that
+/// falls due only after a realistic connect timeout is one no client's poll ever sees, so the
+/// isolation would have no observable effect at all. Non-zero and several transitions long, so
+/// a caller reading straight after the launch still finds such a task coming up with its
+/// interface attached.
+pub const FAILED_IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The destination of the route that carries traffic OFF a VPC: "a route table contains a
 /// set of rules, called routes" and the one for everything not inside the VPC is the
