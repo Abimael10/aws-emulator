@@ -824,15 +824,17 @@ async fn a_connection_write_whose_auth_parameters_name_no_single_type_states_one
     .await;
     // Exactly one authorization type is named, but nothing says which type it is
     // for: `AuthorizationType` is the member that selects the block in force, so
-    // the update is refused on ITS own sentence rather than on the one above.
+    // the update carries no authorization to write and is refused on the
+    // sentence listing what an update has to carry rather than on the one above.
     refused(
         &router,
         "an update naming one type's credentials and no AuthorizationType",
         "UpdateConnection",
         &json!({ "Name": "updatable", "AuthParameters": api_key }),
         "ValidationException",
-        "Failed to update the connection(s). Parameter AuthParameters is not valid. Reason: \
-         AuthorizationType must be provided when AuthParameters is provided.",
+        "Failed to update the connection(s). At least one of the following is required: \
+         Description, KmsKeyIdentifier, AuthorizationType with BasicAuthParameters, \
+         ApiKeyAuthParameters, or OAuthParameters.",
     )
     .await;
     accepted(

@@ -12,10 +12,10 @@
 //! connection will have after the update, and a type CHANGE has to bring the
 //! credentials of the new type with it — otherwise the stored connection could
 //! authorize nothing. `AuthorizationType` is what SELECTS which member of
-//! `AuthParameters` carries those credentials, so an update supplying
-//! `AuthParameters` has to name it ([`AUTHORIZATION_TYPE_REQUIRED`]) rather than
-//! leaving the service to guess which block it meant. No credential the request
-//! carried is kept on the record:
+//! `AuthParameters` carries those credentials, so the authorization counts as an
+//! update only as that PAIR, and a request carrying nothing this call would
+//! write asks for no change at all ([`AN_UPDATE_IS_REQUIRED`]). No credential
+//! the request carried is kept on the record:
 //! only the non-secret half of each parameter block is, exactly as
 //! `CreateConnection` stores it.
 //!
@@ -239,6 +239,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
+            // "You must include only authorization parameters for the
+            // AuthorizationType you specify"
+            // (`CreateConnection$AuthParameters`): which member of the submitted
+            // parameters carries the credentials in force is settled by the
+            // request alone, so a set naming none of them or several is refused
+            // whatever the connection holds.
+            if input
+                .auth_parameters
+                .as_ref()
+                .is_some_and(|parameters| named_authorization_types(parameters) != 1)
+            {
+                return Err(crate::scaffolded::Scaffolded::validation(refused(
+                    crate::state::ONE_AUTHORIZATION_TYPE,
+                )));
+            }
+
+            // An update writes what the request carries, so a request that
+            // carries nothing to write is refused rather than answered as an
+            // update ([`AN_UPDATE_IS_REQUIRED`]).
+            if updates_nothing(&input) {
+                return Err(crate::scaffolded::Scaffolded::validation(refused(
+                    AN_UPDATE_IS_REQUIRED,
+                )));
+            }
+
             // The type the connection will have after this update: the one the
             // request names, or the one it already has.
             let authorization_type = input
@@ -248,7 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let changes_type = authorization_type != stored.authorization_type;
             if let Some(reason) = auth_parameters_violation(
                 &authorization_type,
-                input.authorization_type.as_deref(),
                 input.auth_parameters.as_ref(),
                 changes_type,
             ) {
@@ -385,49 +409,50 @@ fn refused(reason: &str) -> String {
     crate::state::connection_refusal(VERB, reason)
 }
 
-/// What this call states about `AuthParameters` supplied without the
-/// `AuthorizationType` that selects them.
+/// What this call states about a request that asks it to write nothing.
 ///
-/// Each authorization type has exactly one member of
-/// `UpdateConnectionAuthRequestParameters` that carries its credentials, and
-/// `AuthorizationType` is "the type of authorization to use for the connection"
-/// (`UpdateConnection$AuthorizationType`) — the member that says WHICH of those
-/// blocks is the one in force. An update that supplies credentials without it is
-/// therefore incomplete whatever block it carried, including the block of the
-/// type the connection already has: the service is not told which type the new
-/// credentials are for, so it stores none of them and the connection keeps the
-/// authorization it had. The sentence states that rule, in the form this
-/// service's parameter refusals take; the failing call's own clause
-/// ([`refused`]) is stated before it.
-const AUTHORIZATION_TYPE_REQUIRED: &str =
-    "Parameter AuthParameters is not valid. Reason: AuthorizationType must be provided when \
-     AuthParameters is provided.";
+/// `Name` is the only member this operation requires, and every OTHER member is
+/// something the update would write: the description, the key the connection is
+/// encrypted with, and the authorization. The authorization counts only as a
+/// PAIR — `AuthorizationType` is "the type of authorization to use for the
+/// connection" (`UpdateConnection$AuthorizationType`), the member that says
+/// which block of `AuthParameters` carries the credentials in force, so
+/// credentials arriving without it select no authorization and a type arriving
+/// without them brings no credentials. A request carrying none of those
+/// alternatives asks for no change, which the service refuses rather than
+/// answering as an update.
+///
+/// The sentence is FIXED text for this error class: it lists the alternatives,
+/// one of which the request has to carry, and names no member, no value and no
+/// connection of the request. The failing call's own clause ([`refused`]) is
+/// stated before it.
+const AN_UPDATE_IS_REQUIRED: &str =
+    "At least one of the following is required: Description, KmsKeyIdentifier, \
+     AuthorizationType with BasicAuthParameters, ApiKeyAuthParameters, or OAuthParameters.";
 
-/// Why the submitted authorization parameters do not match the authorization type
-/// the connection will have, or `None` when they do.
+/// Whether the request carries nothing for this update to write
+/// ([`AN_UPDATE_IS_REQUIRED`]).
 ///
-/// "You must include only authorization parameters for the AuthorizationType you
-/// specify" (`CreateConnection$AuthParameters`), and each type has exactly one
-/// member of `UpdateConnectionAuthRequestParameters` that carries its
-/// credentials. So a request that carries `AuthParameters` at all has to name ONE
-/// authorization type in them, which the service states as its own rule
-/// ([`crate::state::ONE_AUTHORIZATION_TYPE`]) — the same rule `CreateConnection`
-/// charges. `changes_type` is what makes those credentials REQUIRED when the
-/// request carries none: an update that only renames the type would leave the
-/// connection holding the credentials of the old one, which authorize nothing.
-///
-/// `named_type` is the `AuthorizationType` the REQUEST carried, as opposed to
-/// the type the connection ends up with: credentials supplied without it are
-/// refused ([`AUTHORIZATION_TYPE_REQUIRED`]), because that member is what says
-/// which of the blocks is in force.
-fn auth_parameters_violation(
-    authorization_type: &str,
-    named_type: Option<&str>,
+/// The authorization counts as the pair of an `AuthorizationType` and the
+/// `AuthParameters` that carry a type's credentials, so neither half on its own
+/// is an update. `InvocationConnectivityParameters` is written by this call as
+/// well, so a request carrying it does ask for a
+/// change — the sentence above is fixed text and lists the three alternatives
+/// AWS words it with, not the set of members this call writes.
+fn updates_nothing(input: &UpdateConnectionInput) -> bool {
+    input.description.is_none()
+        && input.kms_key_identifier.is_none()
+        && input.invocation_connectivity_parameters.is_none()
+        && !(input.authorization_type.is_some() && input.auth_parameters.is_some())
+}
+
+/// Each authorization type, the member of
+/// `UpdateConnectionAuthRequestParameters` that carries its credentials, and
+/// whether the request supplied that member.
+fn credential_members(
     parameters: Option<&UpdateConnectionAuthRequestParameters>,
-    changes_type: bool,
-) -> Option<String> {
-    // (the type, the member that carries its credentials, whether it is present)
-    let supplied = [
+) -> [(&'static str, &'static str, bool); 3] {
+    [
         (
             API_KEY_AUTHORIZATION,
             "ApiKeyAuthParameters",
@@ -443,16 +468,39 @@ fn auth_parameters_violation(
             "OAuthParameters",
             parameters.is_some_and(|given| given.o_auth_parameters.is_some()),
         ),
-    ];
-    let named = supplied.iter().filter(|(_, _, present)| *present).count();
-    if parameters.is_some() && named != 1 {
-        return Some(crate::state::ONE_AUTHORIZATION_TYPE.to_string());
-    }
-    // Exactly one block IS named, and the request still has to say which type
-    // that block is for.
-    if parameters.is_some() && named_type.is_none() {
-        return Some(AUTHORIZATION_TYPE_REQUIRED.to_string());
-    }
+    ]
+}
+
+/// How many authorization types the submitted parameters name: one is what the
+/// rule admits ([`crate::state::ONE_AUTHORIZATION_TYPE`]).
+fn named_authorization_types(parameters: &UpdateConnectionAuthRequestParameters) -> usize {
+    credential_members(Some(parameters))
+        .iter()
+        .filter(|(_, _, present)| *present)
+        .count()
+}
+
+/// Why the submitted authorization parameters do not match the authorization type
+/// the connection will have, or `None` when they do.
+///
+/// "You must include only authorization parameters for the AuthorizationType you
+/// specify" (`CreateConnection$AuthParameters`), and each type has exactly one
+/// member of `UpdateConnectionAuthRequestParameters` that carries its
+/// credentials. `changes_type` is what makes those credentials REQUIRED when the
+/// request carries none of that type's: an update that only renames the type
+/// would leave the connection holding the credentials of the old one, which
+/// authorize nothing.
+///
+/// Whether the submitted parameters name exactly one type at all, and whether
+/// the request asks for any change, are settled before this
+/// ([`crate::state::ONE_AUTHORIZATION_TYPE`], [`AN_UPDATE_IS_REQUIRED`]).
+fn auth_parameters_violation(
+    authorization_type: &str,
+    parameters: Option<&UpdateConnectionAuthRequestParameters>,
+    changes_type: bool,
+) -> Option<String> {
+    // (the type, the member that carries its credentials, whether it is present)
+    let supplied = credential_members(parameters);
     for (kind, member, present) in supplied {
         if kind == authorization_type && changes_type && !present {
             return Some(format!(

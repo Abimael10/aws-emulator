@@ -17,8 +17,9 @@
 //!   on its own still narrows the listing;
 //! * `AuthorizationType` is what SELECTS which member of `AuthParameters`
 //!   carries a connection's credentials, so an `UpdateConnection` that supplies
-//!   `AuthParameters` without it names no type for them and is refused with a
-//!   400 client error — whichever block it carried, the block of the type the
+//!   `AuthParameters` without it carries no authorization to write and is
+//!   refused with a 400 client error listing the alternatives one of which an
+//!   update has to carry — whichever block it carried, the block of the type the
 //!   connection already has included — and the connection is left exactly as it
 //!   was, the authorization state it had included. The same request that names
 //!   the type is accepted and its credentials land.
@@ -370,8 +371,8 @@ async fn an_update_supplying_credentials_must_name_the_type_that_selects_them() 
 
     let expected_message = expected_refusal(
         "update",
-        "Parameter AuthParameters is not valid. Reason: AuthorizationType must be provided when \
-         AuthParameters is provided.",
+        "At least one of the following is required: Description, KmsKeyIdentifier, \
+         AuthorizationType with BasicAuthParameters, ApiKeyAuthParameters, or OAuthParameters.",
     );
     for (case, held_type, deauthorized, submitted_type) in rows {
         let router = emulator();
