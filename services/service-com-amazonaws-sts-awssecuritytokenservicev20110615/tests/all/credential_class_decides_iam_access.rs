@@ -3,15 +3,25 @@
 //! What the CLASS of the credential a request presents decides about a call to IAM.
 //!
 //! The rule under test: **which calls a temporary credential may make is decided by the CLASS
-//! of credential it is, not by the documents in force on the identity behind it — and two of
-//! the classes STS vends may not call IAM at all.** "You cannot call any IAM operations using
-//! the Amazon Web Services CLI or the Amazon Web Services API" (`GetFederationToken`, this
-//! service's model) bans a federated-user credential outright, and with a `GetSessionToken`
-//! credential "you cannot call any IAM API operations unless MFA authentication information is
-//! included in the request" (`GetSessionToken`) bans one whose mint presented no challenge.
-//! The ban is a fact about the credential rather than a document, so no `Allow` anywhere lifts
-//! it: a federated-user session whose own session policy and whose minting user both allow
-//! `iam:*` is refused exactly as one that allows nothing is.
+//! of credential it is, not by the documents in force on the identity behind it — and a
+//! credential of a class AWS bans from IAM is refused at AUTHENTICATION, before any policy is
+//! read.** "You cannot call any IAM operations using the Amazon Web Services CLI or the Amazon
+//! Web Services API" (`GetFederationToken`, this service's model) bans a federated-user
+//! credential outright, and with a `GetSessionToken` credential "you cannot call any IAM API
+//! operations unless MFA authentication information is included in the request"
+//! (`GetSessionToken`) bans one whose mint presented no challenge. The ban is a fact about the
+//! credential rather than a document, so no `Allow` anywhere lifts it: a federated-user
+//! session whose own session policy and whose minting user both allow `iam:*` is refused
+//! exactly as one that allows nothing is.
+//!
+//! WHERE the refusal lands follows from that: the credential type is one IAM does not accept,
+//! so the request never names a principal to judge — it is answered with the
+//! unknown-credential class of an authentication failure (`InvalidClientTokenId`, HTTP 403)
+//! and the fixed sentence that carries, and never with the authorization denial a KNOWN
+//! principal gets for an action its policies do not permit. The two drive opposite client
+//! behaviour: the authentication class is terminal and tells a credential provider this
+//! credential cannot be used with this service at all, while a denial reads as a missing grant
+//! on a valid credential and sends a caller to widen a policy AWS can never widen.
 //!
 //! The same class decides what the global `aws:PrincipalType` condition key answers —
 //! `AssumedRole` for a role session, `FederatedUser` for a federated-user session and `User`
@@ -50,9 +60,21 @@ const IAM_SIGNING_NAME: &str = "iam";
 /// itself — the position an administrator is in.
 const ACCOUNT_KEY: &str = "AKIDEMULATORCLASSES";
 
-/// The IAM operation every row calls, and the action it is authorized under.
+/// The IAM operation every row calls.
 const LIST_USERS: &str = "ListUsers";
-const LIST_USERS_ACTION: &str = "iam:ListUsers";
+
+/// What IAM answers a request presenting a credential it does not accept — an authentication
+/// failure, so the class an SDK's credential-refresh path keys on — and the fixed sentence it
+/// carries for the stage that resolves a KEY ID, which is what these calls present (they
+/// carry the SigV4 credential scope and no security token). Both are read from the module
+/// that owns the rule and the wording.
+const UNKNOWN_CREDENTIAL_CODE: &str = "InvalidClientTokenId";
+const UNRESOLVED_CREDENTIAL_MESSAGE: &str =
+    ::service_common::authentication_refusal::UNRESOLVED_CREDENTIAL_MESSAGE;
+
+/// The authorization denial, which a banned credential CLASS must never be answered with: it
+/// is what a resolved principal gets for an action its policies do not permit.
+const AUTHORIZATION_DENIAL: &str = "AccessDenied";
 
 /// One IAM awsQuery call, presented as signed with `access_key_id`.
 async fn iam_call(
@@ -258,13 +280,14 @@ async fn session_token(
 enum Expect {
     /// IAM serves it.
     Served,
-    /// IAM refuses it, naming the principal the credential speaks for.
+    /// IAM refuses it at AUTHENTICATION: the class of credential presented is one it does not
+    /// accept, so no principal was resolved and none is named.
     Refused,
 }
 
-/// RULE: a credential of a class AWS bans from IAM is refused every IAM call whatever any
-/// document allows, while a credential of a class under no such ban is decided on the
-/// documents in force on it.
+/// RULE: a credential of a class AWS bans from IAM is refused every IAM call at
+/// authentication, whatever any document allows, while a credential of a class under no such
+/// ban is decided on the documents in force on it.
 #[tokio::test]
 async fn the_class_of_a_credential_decides_whether_it_may_call_iam() {
     let (router, _engine) = emulator_with_iam();
@@ -291,7 +314,8 @@ async fn the_class_of_a_credential_decides_whether_it_may_call_iam() {
 
     // Every row's credential carries a grant of `iam:*` — through the user's own document, the
     // role's, or the session policy the mint passed — so the only thing that differs is the
-    // class of credential presented.
+    // class of credential presented. The principal each one speaks for is carried along to
+    // assert that a refusal names NO identity: nothing was resolved to name.
     let rows: Vec<(&str, String, String, Expect)> = vec![
         (
             "an IAM user's own long-term access key",
@@ -355,22 +379,24 @@ async fn the_class_of_a_credential_decides_whether_it_may_call_iam() {
                 );
                 let code = element(&body, "Code").unwrap_or_default();
                 assert_eq!(
-                    code, "AccessDenied",
-                    "case {row:?}: expected AccessDenied, got {code:?}: {body}"
+                    code, UNKNOWN_CREDENTIAL_CODE,
+                    "case {row:?}: the class of the credential is an authentication outcome, \
+                     so expected {UNKNOWN_CREDENTIAL_CODE}, got {code:?}: {body}"
+                );
+                assert_ne!(
+                    code, AUTHORIZATION_DENIAL,
+                    "case {row:?}: a credential type IAM does not accept is not a policy \
+                     verdict, got {body}"
                 );
                 let message = element(&body, "Message").unwrap_or_default();
-                let opening = format!(
-                    "User: {principal} is not authorized to perform: {LIST_USERS_ACTION}"
+                assert_eq!(
+                    message, UNRESOLVED_CREDENTIAL_MESSAGE,
+                    "case {row:?}: expected the fixed sentence of that class, got {message:?}"
                 );
                 assert!(
-                    message.starts_with(&opening),
-                    "case {row:?}: expected the refusal to open {opening:?}, got {message:?}"
-                );
-                assert!(
-                    message.contains(&format!(
-                        "because no identity-based policy allows the {LIST_USERS_ACTION} action"
-                    )),
-                    "case {row:?}: expected the no-grant diagnosis, got {message:?}"
+                    !body.contains(&principal),
+                    "case {row:?}: a refusal that resolved no principal must name none, got \
+                     {body}"
                 );
             }
         }

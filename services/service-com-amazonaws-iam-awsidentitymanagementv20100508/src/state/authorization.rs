@@ -673,12 +673,6 @@ fn authorize_request(
     policy_arn: Option<&str>,
 ) -> Result<(), AccessDenied> {
     let access_key_id = ::engine::extract_akid(&ctx.parts().headers);
-    // Whether a credential of the class presented may call IAM AT ALL, which is decided
-    // before any document is read: the ban is a property of the credential and no `Allow`
-    // in any policy lifts it ([`class_refusal`]).
-    if let Some(refused) = class_refusal(store, &access_key_id, action, resource, named_as) {
-        return Err(refused);
-    }
     // A credential this account holds no IAM user for carries no identity-based
     // policies, so there is nothing to judge it on (see the module docs).
     let Some(signer) = signing_principal(store, &access_key_id) else {
@@ -1087,62 +1081,11 @@ fn signing_principal<'a>(
     })
 }
 
-/// Why the CLASS of the credential a request presented may not call IAM at all, as the
-/// refusal the operation answers — or `None` for a credential whose class is under no such
-/// ban, which is every one this gate then judges on documents.
-///
-/// AWS states the ban per class of temporary credential, and the two classes it names differ
-/// in it ([`TemporaryCredentialClass::may_call_iam`]): a federated-user credential "cannot
-/// call any IAM operations", and a `GetSessionToken` credential cannot "unless MFA
-/// authentication information is included in the request". It is a fact about the CREDENTIAL
-/// and not a document, so it is decided before any policy is read and no `Allow` anywhere
-/// lifts it — which is also why the refusal names the no-grant diagnosis: no identity-based
-/// policy can grant such a credential an IAM action.
-///
-/// Which class a credential is, is read from the record the mint left
-/// ([`super::TemporaryCredentialRecord`]); a key the account holds no such record for is a
-/// long-term credential, which is under no ban.
-///
-/// A READ: the store is only consulted.
-fn class_refusal(
-    store: &IamState,
-    access_key_id: &str,
-    action: &str,
-    resource: &str,
-    named_as: &str,
-) -> Option<AccessDenied> {
-    let credential = store.temporary_credential(access_key_id, super::now())?;
-    if credential.may_call_iam() {
-        return None;
-    }
-    let principal = credential.principal_arn.clone();
-    ::tracing::info!(
-        audit = true,
-        outcome = "refused_access_denied",
-        principal = %principal,
-        action = %action,
-        resource = %resource,
-        explicit_deny = false,
-        "a credential of this class cannot call IAM"
-    );
-    // The detail of this refusal is filed like every other: the ban is a fact about the
-    // credential, so the record carries the decision it produced — nothing allowed the call —
-    // and the policies in force on the principal the credential speaks for.
-    Some(not_authorized_detailed(
-        store,
-        &details::DeniedRequest {
-            principal: &principal,
-            identity: &principal,
-            action,
-            resource,
-            // No document was read for this decision, so it was made in no condition
-            // context: the class of the credential is all it rests on.
-            context: &[],
-            explicit_deny: false,
-            boundary: None,
-            session_policies: 0,
-        },
-        named_as,
-        &format!("because no identity-based policy allows the {action} action"),
-    ))
-}
+// The CLASS of a temporary credential is NOT read here: whether a credential of the
+// presented class may call IAM at all is an AUTHENTICATION outcome rather than an
+// authorization one — "you cannot call any IAM operations using the Amazon Web Services CLI
+// or the Amazon Web Services API" (`GetFederationToken`, the STS model) bans the credential
+// and not the identity behind it, and no `Allow` anywhere lifts it. It is therefore decided
+// before any document is read, by this service's pre-dispatch admission (`crate::service`,
+// which reads `TemporaryCredentialClass::may_call_iam`), and what the class contributes to
+// this gate is only the value `aws:PrincipalType` answers (`request_context`).

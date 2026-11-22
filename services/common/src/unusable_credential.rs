@@ -1,28 +1,39 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ONE refusal of a request presenting a long-term access key the account holds and
-//! will NOT accept, for every service a credential like that can be presented to.
+//! The ONE refusal of a request presenting a credential the account holds and will NOT
+//! accept, for every service a credential like that can be presented to.
 //!
-//! An access key the account holds authenticates a request only while its stored `Status`
-//! is `Active`: `UpdateAccessKey$Status` documents that "Active means that the key can be
-//! used for programmatic calls to Amazon Web Services, while Inactive means that the key
-//! cannot be used", so moving a key's status off `Active` cuts the credential off while
-//! leaving the key listed — the reversible, non-destructive way to withdraw one.
+//! Two kinds of credential are refused here, and each is refused for what the credential IS
+//! rather than for what any document says about the identity behind it:
+//!
+//! * an access key the account holds authenticates a request only while its stored `Status`
+//!   is `Active`: `UpdateAccessKey$Status` documents that "Active means that the key can be
+//!   used for programmatic calls to Amazon Web Services, while Inactive means that the key
+//!   cannot be used", so moving a key's status off `Active` cuts the credential off while
+//!   leaving the key listed — the reversible, non-destructive way to withdraw one; and
+//! * a TEMPORARY credential a service does not accept at all — one of a class that may not
+//!   call the service ([`crate::temporary_credential_classes`]), and one the account has
+//!   withdrawn because the principal it speaks for is gone. Neither is a document, so no
+//!   `Allow` anywhere lifts the refusal and it is taken before any policy is read.
 //!
 //! What that makes the request is an AUTHENTICATION failure, and the distinction is
-//! load-bearing: the presented key is not a credential at all, so NO principal is resolved
-//! from it, no document is collected for it and no action is authorized — the request is
-//! refused before any operation runs. It is therefore answered with the code an unresolved
-//! credential carries (which [`crate::authentication_refusal`] states for each service's own
-//! vocabulary) and with that module's fixed sentence, never with an authorization denial and
+//! load-bearing: the presented credential is not one this service accepts at all, so NO
+//! principal is resolved from it, no document is collected for it and no action is
+//! authorized — the request is refused before any operation runs. It is therefore answered
+//! with the code an unresolved credential carries (which [`crate::authentication_refusal`]
+//! states for each service's own vocabulary) and with the fixed sentence that module states
+//! for the stage the refusal came from — the one that resolves a key id, and the one that
+//! resolves the security token presented with it — never with an authorization denial and
 //! never with one of a service's modelled resource errors.
 //!
 //! The rule is one rule, so it lives here once: the account's own records answer whether a
-//! key is usable, and every service asks them the same question and answers alike. What a
-//! service supplies is its own two halves — the unknown-credential CODE its protocol family
-//! names ([`UnusableCredential::stated_as`]), and the account's answer for the presented key
-//! id, read from the records the identity service's own `CreateAccessKey` / `UpdateAccessKey`
-//! wrote. Nothing here reaches a store, so this module names no service.
+//! credential is usable, and every service asks them the same question and answers alike.
+//! What a service supplies is its own two halves — the unknown-credential CODE its protocol
+//! family names ([`UnusableCredential::stated_as`]), and the account's answer for the
+//! presented key id, read from the records that own it (the identity service's own
+//! `CreateAccessKey` / `UpdateAccessKey`, and the record the operation that MINTED a
+//! temporary credential left). Nothing here reaches a store, so this module names no
+//! service.
 //!
 //! The seam a service reaches it from is [`smithy_server_runtime::Service::override_operation`],
 //! the one hook that sees a whole request before the modelled walk deserializes, validates
@@ -39,7 +50,7 @@ use ::smithy_server_runtime::{
     BoxFuture, ErasedOperation, OperationContext, ServerHttpProtocol, Service,
 };
 
-/// Answers a request that presented an access key the account will not accept, and decides
+/// Answers a request that presented a credential the account will not accept, and decides
 /// which request that is.
 ///
 /// Held by a service and handed back from its pre-dispatch seam as a borrowed

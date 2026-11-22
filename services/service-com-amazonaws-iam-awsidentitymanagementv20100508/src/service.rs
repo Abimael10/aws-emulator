@@ -53,24 +53,46 @@
 //! modelled error (and a refusal raised while an operation was being served) and its
 //! definition wrapper for the failures rendered outside the dispatch path.
 //!
-//! ## Credentials the account has deactivated
+//! ## Credentials this service will not accept
 //!
-//! An access key this account holds authenticates a request only while its stored
-//! `Status` is `Active`: `UpdateAccessKey$Status` documents that "Active means that the
-//! key can be used for programmatic calls to Amazon Web Services, while Inactive means
-//! that the key cannot be used", so deactivating a key must cut the credential off
-//! while leaving it listed. That is an AUTHENTICATION outcome — no principal is
-//! resolved at all — so it is refused BEFORE any operation runs, and with the code an
-//! authentication failure carries ([`UNUSABLE_CREDENTIAL_CODE`]) rather than with an
-//! authorization denial or one of the modelled resource errors.
+//! Three credentials are refused BEFORE any operation runs, because each is an
+//! AUTHENTICATION outcome — no principal is resolved at all — and so carries the code an
+//! authentication failure carries ([`UNUSABLE_CREDENTIAL_CODE`]) rather than an
+//! authorization denial or one of the modelled resource errors:
 //!
-//! The decision reads the records `iam:CreateAccessKey` and `iam:UpdateAccessKey` wrote
-//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::access_key_is_usable`]);
-//! this file only reaches it ahead of dispatch, through [`Service::override_operation`]
+//! * an access key this account holds authenticates a request only while its stored
+//!   `Status` is `Active`: `UpdateAccessKey$Status` documents that "Active means that the
+//!   key can be used for programmatic calls to Amazon Web Services, while Inactive means
+//!   that the key cannot be used", so deactivating a key must cut the credential off while
+//!   leaving it listed;
+//! * a temporary credential this account has WITHDRAWN — the session of a role it has since
+//!   deleted, which speaks for a principal the account no longer holds, so there is no
+//!   identity to collect documents for; and
+//! * a temporary credential of a CLASS that may not call IAM at all: "you cannot call any
+//!   IAM operations using the Amazon Web Services CLI or the Amazon Web Services API"
+//!   (`GetFederationToken`, the STS model) bans a federated-user credential outright, and a
+//!   `GetSessionToken` credential cannot "unless MFA authentication information is included
+//!   in the request" (`GetSessionToken`). The ban is a fact about the credential and not a
+//!   document, so it is decided here rather than against any policy and no `Allow`
+//!   anywhere lifts it.
+//!
+//! Which fixed sentence each refusal carries follows from what the request PRESENTED, which
+//! is the shared statement of these failures ([`::service_common::authentication_refusal`]):
+//! a request offering a security token carries the sentence of the stage that resolves one,
+//! and a request offering a key id alone the sentence of the stage that resolves that.
+//!
+//! The decision reads the records this account's own writes left — `iam:CreateAccessKey`
+//! and `iam:UpdateAccessKey` for a key's status
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::access_key_is_usable`]),
+//! the withdrawal `iam:DeleteRole` recorded
+//! ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::credential_is_withdrawn`]),
+//! and the class the operation that minted a temporary credential recorded
+//! ([`crate::state::TemporaryCredentialRecord::may_call_iam`]);
+//! this file only reaches them ahead of dispatch, through [`Service::override_operation`]
 //! — the one seam that sees a whole request before the modelled walk deserializes,
-//! validates and dispatches it. The rule itself, the sentence and the pre-dispatch refusal
+//! validates and dispatches it. The rule itself, the sentences and the pre-dispatch refusal
 //! are the tree's one copy ([`::service_common::unusable_credential`]), because every
-//! service a withdrawn credential can be presented to refuses it alike; what is this
+//! service a credential like that can be presented to refuses it alike; what is this
 //! service's own is the records it answers from and the code it states the refusal with.
 //!
 //! ## Wording a request authentication refused
@@ -331,7 +353,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// keys this service's own operations wrote. Never a store of its own: it is the
     /// `Arc` the router handed to `new`.
     engine: Arc<Eng>,
-    /// Answers a request presenting a credential this account will not accept.
+    /// Answers a request presenting a credential this service will not accept.
     unusable_credential: UnusableCredential,
     /// The envelope wrapper every modelled operation of this service is served through, so
     /// a modelled error and a refusal the centralized walk raised while an operation was
@@ -370,21 +392,44 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     }
 
     /// This service's pre-dispatch refusal for `req`, or `None` when the credential it
-    /// presents is one this account accepts — one whose stored `Status` is `Active` (see
-    /// the module docs).
+    /// presents is one this account accepts for a call to IAM (see the module docs).
+    ///
+    /// Three credentials are not, and each is an AUTHENTICATION outcome — nothing about the
+    /// documents in force on any identity, so none of them is reached by reading a policy:
+    ///
+    /// * a long-term access key whose stored `Status` the account has moved off `Active`;
+    /// * a temporary credential this account has WITHDRAWN, whose principal it no longer
+    ///   holds — the session of a deleted role
+    ///   ([`crate::state::ComAmazonawsIamAwsidentitymanagementv20100508State::credential_is_withdrawn`]);
+    ///   and
+    /// * a temporary credential of a CLASS that may not call IAM at all
+    ///   ([`crate::state::TemporaryCredentialRecord::may_call_iam`]).
+    ///
+    /// Which fixed sentence the refusal carries follows from what the request PRESENTED, as
+    /// the shared statement of these failures has it
+    /// ([`::service_common::authentication_refusal`]): a request offering a security token
+    /// carries the sentence of the stage that resolves one, and a request offering a key id
+    /// alone the sentence of the stage that resolves that.
     ///
     /// The decision is the shared one; what this service supplies is the account's own
-    /// answer for the presented key. A store this process cannot reach holds no key status
-    /// either, so such a request is admitted and the handler reports the unreachable store
-    /// as the modelled server error.
+    /// answer for the presented key. A store this process cannot reach holds no record of
+    /// the key either, so such a request is admitted and the handler reports the unreachable
+    /// store as the modelled server error.
     ///
     /// A READ: it takes the store's lock to look one key up and writes nothing, so a
     /// refused request changes nothing a later caller sees.
     fn unusable_credential_refusal(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
         self.unusable_credential
             .refusal_for(req, self.definition().protocol(), |access_key_id| {
-                crate::state::service_state(&*self.engine)
-                    .is_none_or(|state| state.lock().access_key_is_usable(access_key_id))
+                crate::state::service_state(&*self.engine).is_none_or(|state| {
+                    let now = crate::state::now();
+                    let held = state.lock();
+                    held.access_key_is_usable(access_key_id)
+                        && !held.credential_is_withdrawn(access_key_id, now)
+                        && held
+                            .temporary_credential(access_key_id, now)
+                            .is_none_or(crate::state::TemporaryCredentialRecord::may_call_iam)
+                })
             })
     }
 }

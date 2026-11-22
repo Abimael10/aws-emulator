@@ -307,24 +307,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Deleting a role … will immediately invalidate any existing temporary credentials
         // issued for that role" (IAM User Guide, *Deleting roles or instance profiles*): the
         // role is the principal those credentials speak for, so once it is gone they speak
-        // for nobody. The account's records of them go with the role
-        // (`withdraw_role_credentials`), and each credential itself is withdrawn from the
-        // emulator's credential store — which is what stops it being accepted whichever
-        // service it is presented to, rather than only by the services that read this store.
-        // Recreating a role under the same name therefore does not restore them.
+        // for nobody. The account's records of them go with the role, and the ids are
+        // recorded as withdrawn (`withdraw_role_credentials`), which is what makes a call
+        // that has to resolve a principal for one refuse it at credential resolution.
+        //
+        // The credential MATERIAL is deliberately left in the emulator's credential store:
+        // what the delete takes away is the principal, not the authenticity of the key pair
+        // the mint vended, so a request one of them signs stays a genuinely signed request
+        // and is never answered as a signature failure — and `sts:GetCallerIdentity`, which
+        // reports what the credential itself carries and for which "no permissions are
+        // required", still answers for it. Each credential stops being accepted anywhere at
+        // its own expiry, which is when the mint promised it would.
+        // Recreating a role under the same name does not restore the sessions either way.
         let withdrawn = store.withdraw_role_credentials(&resource);
         drop(store);
-        let credentials = ctx.credential_store();
-        for access_key_id in &withdrawn {
-            if let Err(error) = credentials.delete(access_key_id) {
-                ::tracing::warn!(
-                    operation = "DeleteRole",
-                    reason = ?error,
-                    "a credential issued for the deleted role was not held by the credential \
-                     store"
-                );
-            }
-        }
         // A credential-revoking call leaves a record of itself: how many of the role's
         // credentials were withdrawn and under which call, never any secret material.
         if !withdrawn.is_empty() {

@@ -172,7 +172,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(refusal);
         }
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is unreachable only when this service is mounted on an engine
             // that is not the shared `InMemoryEngine`; no tag set can then be removed, and
@@ -183,13 +182,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(DeleteBucketTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        // "To use this operation, you must have permission to perform the
+        // `s3:PutBucketTagging` action" (this operation's own documentation — removing the
+        // tag set is a WRITE of it), so a signed request is authorized against the documents
+        // in force on the principal it signed for — the identity's, the session policies the
+        // mint of its credential passed, and the bucket's own policy, in IAM's order
+        // ([`crate::service::request_authorization`]) — before anything is removed, so a
+        // refused request leaves the bucket's tags exactly as they were.
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
+            bucket.policy.as_deref(),
+            &crate::service::request_authorization::AddressedTags::of(bucket),
+            crate::service::request_authorization::PUT_BUCKET_TAGGING_ACTION,
+            &bucket.arn(&input.bucket),
+            &[],
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
+        // Idempotent: the operation "removes the entire tag set from the specified
+        // bucket", so a bucket that carried none is already in the asked-for state and the
+        // call still succeeds. The removal takes the mutable borrow once the decision above
+        // is behind it, over the bucket just resolved: the store's guard has been held
+        // throughout, so this lookup finds that same record and the absent arm is
+        // unreachable — it is the borrow checker, not the store, that asks for the second
+        // lookup.
         let Some(bucket) = store.bucket_mut(&input.bucket) else {
             return Err(DeleteBucketTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
-        // Idempotent: the operation "removes the entire tag set from the specified
-        // bucket", so a bucket that carried none is already in the asked-for state and the
-        // call still succeeds.
         bucket.clear_tags();
 
         // `Unit` output: success is the modelled 204 and an empty body.

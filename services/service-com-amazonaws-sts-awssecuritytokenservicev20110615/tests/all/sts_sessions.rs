@@ -548,8 +548,9 @@ async fn assume_role_refuses_a_role_arn_that_is_not_one() {
 // ---------------------------------------------------------------------------
 
 /// `PackedPolicySize` is the percentage of the packed token budget the request's session
-/// policies and tags take up: reported by every mint whose response models it — zero for a
-/// request that packs none, rounded up for one that packs any — and over 100 percent,
+/// policies and tags take up: reported by every mint whose response models it — at least one
+/// percent for a request that packs none, because the packed token always carries its own
+/// header, and rounded up for one that packs any — and over 100 percent,
 /// which is over the budget's 4,096 bytes, the request is refused with
 /// `PackedPolicyTooLarge` (the message that refusal carries is pinned by
 /// `packed_policy_budget`). An inline policy over the 2,048-character plaintext limit the
@@ -574,6 +575,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
     let percent_of_budget = |packed: usize| {
         i32::try_from(packed.saturating_mul(100).div_ceil(4096)).expect("a percentage fits")
     };
+    let packed_nothing = percent_of_budget(packed_token_bytes(None, &[], &[]));
     let packed_small_policy =
         percent_of_budget(packed_token_bytes(Some(&small_policy), &[], &[]));
     let packed_one_tag = percent_of_budget(packed_token_bytes(
@@ -602,7 +604,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             ],
             200,
             None,
-            Some(0),
+            Some(packed_nothing),
         ),
         (
             "assume-role, a small inline policy",
@@ -686,7 +688,7 @@ async fn session_policies_are_packed_measured_and_refused_by_the_same_rule() {
             vec![("Name", "bob".to_string())],
             200,
             None,
-            Some(0),
+            Some(packed_nothing),
         ),
         (
             "federation-token, a small inline policy",

@@ -210,6 +210,19 @@ pub const DIRECTORY_PUT_ENCRYPTION_CONFIGURATION_ACTION: &str =
 /// permission is required in a policy" (`PutBucketPolicy`'s own documentation).
 pub const PUT_BUCKET_POLICY_ACTION: &str = "s3:PutBucketPolicy";
 
+/// The IAM action a read of a bucket's TAG SET is authorized under: "to use this operation,
+/// you must have permission to perform the `s3:GetBucketTagging` action" (`GetBucketTagging`'s
+/// own documentation).
+pub const GET_BUCKET_TAGGING_ACTION: &str = "s3:GetBucketTagging";
+
+/// The IAM action a WRITE of a bucket's tag set is authorized under — ONE action for setting
+/// the tags and for removing them: "you must have permissions to perform the
+/// `s3:PutBucketTagging` action" (`PutBucketTagging`'s own documentation), and "to use this
+/// operation, you must have permission to perform the `s3:PutBucketTagging` action"
+/// (`DeleteBucketTagging`'s), because removing the tag set is a write of it. A caller holding
+/// [`GET_BUCKET_TAGGING_ACTION`] does not hold it.
+pub const PUT_BUCKET_TAGGING_ACTION: &str = "s3:PutBucketTagging";
+
 /// The IAM action a listing of the ACCOUNT's buckets is authorized under: "to grant IAM
 /// permission to use this operation, you must add the `s3:ListAllMyBuckets` policy action"
 /// (`ListBuckets`'s own documentation). It is not covered by the permission to list ONE

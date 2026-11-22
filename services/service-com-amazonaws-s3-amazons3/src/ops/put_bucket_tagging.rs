@@ -250,10 +250,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does not hold answers that — the way the service orders the two refusals —
         // rather than reporting whatever is wrong with a tag set the bucket could never
         // have carried.
+        //
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let mut store = state.lock();
-        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+        let Some(bucket) = store.bucket(&input.bucket) else {
             return Err(PutBucketTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
         };
+        // "To use this operation, you must have permissions to perform the
+        // `s3:PutBucketTagging` action" (this operation's own documentation), so a signed
+        // request is authorized against the documents in force on the principal it signed
+        // for — the identity's, the session policies the mint of its credential passed, and
+        // the bucket's own policy, in IAM's order
+        // ([`crate::service::request_authorization`]) — before anything is written, so a
+        // refused request leaves the bucket's tags exactly as they were.
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
+            bucket.policy.as_deref(),
+            &crate::service::request_authorization::AddressedTags::of(bucket),
+            crate::service::request_authorization::PUT_BUCKET_TAGGING_ACTION,
+            &bucket.arn(&input.bucket),
+            &[],
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
         // The tag set this one REPLACES: a tag in the namespace AWS keeps for itself that
         // the bucket already carries with this very value is neither added nor updated by
         // this request.
@@ -284,7 +310,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A replacement, not a merge: "it will overwrite any current tags the bucket
         // already has. You cannot use this operation to add tags to an existing list of
         // tags" (this operation's own documentation). An empty `TagSet` therefore leaves
-        // the bucket with no tags associated.
+        // the bucket with no tags associated. The write takes the mutable borrow once every
+        // decision above is behind it, over the bucket just resolved: the store's guard has
+        // been held throughout, so this lookup finds that same record and the absent arm is
+        // unreachable — it is the borrow checker, not the store, that asks for the second
+        // lookup.
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(PutBucketTaggingErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
         bucket.replace_tags(tags);
 
         // `Unit` output: success is the 204 and an empty body.

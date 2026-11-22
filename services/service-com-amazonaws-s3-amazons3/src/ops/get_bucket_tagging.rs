@@ -176,6 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Read-only: the guard is taken, the tag set is copied out, and nothing is
         // written — a later caller sees exactly what this one saw.
+        // WHO is asking is resolved BEFORE the store is locked, so the STS and IAM stores
+        // this service reads the calling principal and its policies from are never reached
+        // while this service's own guard is held.
+        let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
         let Some(bucket) = store.bucket(&input.bucket) else {
             // The refusal names the bucket it is about, the way every resource-scoped
@@ -185,6 +189,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .naming_bucket(&input.bucket));
         };
+
+        // "To use this operation, you must have permission to perform the
+        // `s3:GetBucketTagging` action" (this operation's own documentation), so a signed
+        // request is authorized against the documents in force on the principal it signed
+        // for — the identity's, the session policies the mint of its credential passed, and
+        // the bucket's own policy, in IAM's order
+        // ([`crate::service::request_authorization`]) — before anything about the bucket's
+        // tags is reported.
+        if let Some(message) = crate::service::request_authorization::denial(
+            &caller,
+            bucket.policy.as_deref(),
+            &crate::service::request_authorization::AddressedTags::of(bucket),
+            crate::service::request_authorization::GET_BUCKET_TAGGING_ACTION,
+            &bucket.arn(&input.bucket),
+            &[],
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::ACCESS_DENIED_CODE,
+                crate::state::ACCESS_DENIED_STATUS,
+                message,
+            ));
+        }
 
         let tags = bucket.tags();
         if tags.is_empty() {

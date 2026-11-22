@@ -76,8 +76,8 @@ pub(crate) const PACKED_FIELD_HEADER_BYTES: usize = 3;
 /// the session tags — is packed as one binary record per element behind the token's own
 /// header, a session tag's key and value each framed as a field of that tag's record, and
 /// the stream is then coded the way a token is carried, four characters per three bytes
-/// (RFC 4648 §4, the final group padded). A request that carries none of the three packs NO
-/// token, so its size is zero.
+/// (RFC 4648 §4, the final group padded). A mint that carries none of the three still packs
+/// the HEADER, so its size is the header's coded length rather than zero.
 pub(crate) fn packed_token_bytes(
     policy: Option<&str>,
     policy_arns: &[String],
@@ -95,9 +95,6 @@ pub(crate) fn packed_token_bytes(
             + 2 * PACKED_FIELD_HEADER_BYTES
             + key.len()
             + value.len();
-    }
-    if records == 0 {
-        return 0;
     }
     4 * (PACKED_TOKEN_HEADER_BYTES + records).div_ceil(3)
 }

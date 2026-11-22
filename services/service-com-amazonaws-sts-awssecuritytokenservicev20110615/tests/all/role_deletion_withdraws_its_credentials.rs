@@ -3,23 +3,24 @@
 //! What deleting a ROLE does to the temporary credentials already issued for it, on an
 //! emulator that VERIFIES request signatures.
 //!
-//! The rule under test: **deleting a role invalidates the temporary credentials issued for
-//! it immediately, and re-creating a role of the same name does not restore them.** "Deleting
-//! a role or instance profile that is associated with a running instance will break any
-//! applications running on the instance" (`DeleteRole`, IAM's model) is the operation's own
-//! warning about exactly that: the role is the principal those credentials speak for, so once
-//! it is gone they speak for nobody and no service is to serve a call made with one. A role
-//! is identified by its id — "the stable and unique string identifying the role"
+//! The rule under test: **deleting a role withdraws the PRINCIPAL its temporary credentials
+//! speak for immediately, so a call that has to be judged on that principal's policies is
+//! refused at credential resolution — and re-creating a role of the same name does not
+//! restore the withdrawn sessions.** "Deleting a role or instance profile that is associated
+//! with a running instance will break any applications running on the instance"
+//! (`DeleteRole`, IAM's model) is the operation's own warning about exactly that: the role is
+//! the principal those credentials speak for, so once it is gone they speak for nobody. A
+//! role is identified by its id — "the stable and unique string identifying the role"
 //! (`Role$RoleId`) — so a role created again under the same name is another principal behind
-//! the same ARN, and the credentials of the first one stay withdrawn.
+//! the same ARN, and the first one's sessions stay withdrawn.
 //!
-//! Withdrawn where it counts: the credential itself is given up, so the EMULATOR's own
-//! authentication layer stops accepting it whichever service it is presented to, rather than
-//! each service having to notice that the role behind it is gone. That is why this suite
-//! drives a router with request authentication ON and signs every call: the refusal a
-//! withdrawn credential earns is the service's unknown-credential answer (IAM's
-//! `InvalidClientTokenId`, HTTP 403), not an authorization denial — and a client tells the
-//! two apart to decide whether to refresh its credentials or to fix a policy.
+//! What the delete does NOT take away is the credential MATERIAL: the key, the secret and the
+//! session token the mint vended are still the ones this emulator issued, so a request one of
+//! them signs stays a genuinely signed request and is never answered as a signature failure.
+//! The refusal a withdrawn credential earns is therefore the service's unknown-credential
+//! answer (IAM's `InvalidClientTokenId`, HTTP 403) — and a client tells that apart from an
+//! authorization denial to decide whether to refresh its credentials or to fix a policy.
+//! What such a credential still ANSWERS is the subject of `withdrawn_session_credentials`.
 //!
 //! The stages differ along what has happened to the role since the session was minted: the
 //! role still there (the positive control), the role deleted, and a role of the same name
@@ -49,25 +50,31 @@ const SESSION_NAME: &str = "withdrawal";
 /// The IAM operation the session calls, and the action it is authorized under.
 const LIST_USERS: &str = "ListUsers";
 
-/// What IAM answers a request whose access key id resolves to no credential this emulator
-/// holds, and the fixed sentence that code carries
-/// (`::service_common::authentication_refusal::UNRESOLVED_CREDENTIAL_MESSAGE`).
+/// What IAM answers a request whose credential resolves to no principal this account holds,
+/// and the fixed sentence that code carries for the stage the refusal came from: these calls
+/// present a SECURITY TOKEN, so it is the sentence of the stage that resolves one
+/// (`::service_common::authentication_refusal::INVALID_SECURITY_TOKEN_MESSAGE`).
 const UNKNOWN_CREDENTIAL_CODE: &str = "InvalidClientTokenId";
-const UNKNOWN_CREDENTIAL_MESSAGE: &str = "The security token included in the request is invalid.";
+const UNKNOWN_CREDENTIAL_MESSAGE: &str =
+    ::service_common::authentication_refusal::INVALID_SECURITY_TOKEN_MESSAGE;
 
 /// The credential one call is signed with: the key pair this process publishes, or a session
 /// a mint handed back — which is that pair plus the session token travelling with it.
+///
+/// Shared with the suite whose rule is what such a credential still authenticates once the
+/// role behind it is gone (`withdrawn_session_credentials`), so both drive the emulator
+/// through one signer.
 #[derive(Clone)]
-struct Signer {
-    access_key_id: String,
-    secret_access_key: String,
-    session_token: Option<String>,
+pub(crate) struct Signer {
+    pub(crate) access_key_id: String,
+    pub(crate) secret_access_key: String,
+    pub(crate) session_token: Option<String>,
 }
 
 impl Signer {
     /// The key pair the router publishes once request authentication is on, which the setup
     /// calls are made with: it is the account's own credential.
-    fn published() -> Self {
+    pub(crate) fn published() -> Self {
         let minted = SigV4Authenticator::minted_credentials()
             .expect("turning request authentication on publishes this process's keys");
         Self {
@@ -81,7 +88,7 @@ impl Signer {
 /// One awsQuery call to `signing_name`, SIGNED with `signer` the way a client signs it: the
 /// shared in-process signer writes the `Authorization` header and the `x-amz-date` the
 /// emulator's verifier re-signs over, and a session credential carries its token beside them.
-async fn signed_query(
+pub(crate) async fn signed_query(
     router: &MultiServiceRouter,
     signer: &Signer,
     signing_name: &str,
@@ -125,7 +132,7 @@ async fn signed_query(
 }
 
 /// One signed IAM call.
-async fn iam_call(
+pub(crate) async fn iam_call(
     router: &MultiServiceRouter,
     signer: &Signer,
     action: &str,
@@ -135,7 +142,7 @@ async fn iam_call(
 }
 
 /// One signed STS call.
-async fn sts_call(
+pub(crate) async fn sts_call(
     router: &MultiServiceRouter,
     signer: &Signer,
     action: &str,
@@ -212,9 +219,10 @@ async fn assumed_session(router: &MultiServiceRouter, signer: &Signer, case: &st
     }
 }
 
-/// RULE: deleting a role gives up every temporary credential issued for it, so a call made
-/// with one is refused by the emulator's authentication layer — and creating a role of the
-/// same name does not revive it, while a session of the NEW role is served normally.
+/// RULE: deleting a role withdraws the principal every temporary credential issued for it
+/// speaks for, so a call that must be judged on that principal's policies is refused at
+/// credential resolution — and creating a role of the same name does not revive those
+/// sessions, while a session of the NEW role is served normally.
 #[tokio::test]
 async fn deleting_a_role_withdraws_the_credentials_it_issued() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());

@@ -10,7 +10,8 @@
 //!   state does not fit" stay two distinct refusals a client can branch on.
 //! * `PackedPolicySize` is a MEASUREMENT of the mint, so every mint whose response models
 //!   it reports one: the percentage of the token budget the request's session policies and
-//!   session tags occupy, which is zero for a request that packs none of them.
+//!   session tags occupy, which is at least one percent even for a request that packs none
+//!   of them, because the packed token always carries its own header.
 //! * A constraint refusal is worded from the REQUEST: the value between the quotes is the
 //!   one the caller submitted — up to the ceiling one clause may carry, past which a prefix
 //!   of it plus the marker naming its whole byte count, so no message is sized by the
@@ -263,8 +264,9 @@ async fn a_policy_too_long_to_quote_is_refused_with_a_bounded_message() {
 
 /// RULE: `PackedPolicySize` is the percentage of the token budget the request's session
 /// policies and session tags occupy, and every mint whose response models the member
-/// reports it — zero for a request that packs none of them, so two mints AWS answers alike
-/// do not differ in the shape of their response.
+/// reports it — at least one percent even for a request that packs none of them, because
+/// the packed token always carries its own header, so two mints AWS answers alike do not
+/// differ in the shape of their response.
 #[tokio::test]
 async fn every_mint_reports_the_packed_size_it_measured() {
     let (router, engine) = emulator();
@@ -285,7 +287,12 @@ async fn every_mint_reports_the_packed_size_it_measured() {
     let one_tag = [(tag_key.to_string(), tag_value.to_string())];
     let one_arn = [managed_arn.to_string()];
     let rows: Vec<PackedRow> = vec![
-        ("assume-role, nothing packed at all", "AssumeRole", vec![], 0),
+        (
+            "assume-role, nothing packed at all",
+            "AssumeRole",
+            vec![],
+            packed_token_bytes(None, &[], &[]),
+        ),
         (
             "assume-role, an inline policy only",
             "AssumeRole",
@@ -323,7 +330,7 @@ async fn every_mint_reports_the_packed_size_it_measured() {
             "federation-token, nothing packed at all",
             "GetFederationToken",
             vec![],
-            0,
+            packed_token_bytes(None, &[], &[]),
         ),
         (
             "federation-token, an inline policy only",

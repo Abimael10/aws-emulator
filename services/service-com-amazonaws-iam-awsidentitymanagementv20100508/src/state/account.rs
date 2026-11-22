@@ -542,6 +542,19 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// the two classes that are no role's session at all. Written by the same mint that
     /// writes a role session ([`Self::record_temporary_credential`]), and keyed alike.
     pub temporary_credentials: BTreeMap<String, TemporaryCredentialRecord>,
+    /// Access key id -> the instant the credential was promised to expire, for every
+    /// temporary credential this account has WITHDRAWN before that instant: a session whose
+    /// role was deleted, which speaks for a principal the account no longer holds.
+    ///
+    /// The credential itself is still the one the emulator minted — its secret is intact, so
+    /// a request it signs is a genuinely signed request and never a signature failure — but
+    /// it resolves to no principal of this account, so this service refuses it at credential
+    /// resolution ([`Self::credential_is_withdrawn`]). Bounded exactly as
+    /// [`Self::role_sessions`] is: an entry past its own expiry is pruned by the next
+    /// withdrawal, because the credential is unusable from that instant whether or not
+    /// anybody called, and at [`MAX_ROLE_SESSIONS`] live entries the one closest to expiring
+    /// gives way — so no caller can grow this map without a ceiling.
+    pub withdrawn_credentials: BTreeMap<String, ::aws_smithy_types::DateTime>,
     /// `CertificateId` -> the signing certificate's record, including [`name_key`] of
     /// the user that holds it. `UploadSigningCertificate` is what fills this map,
     /// `ListSigningCertificates` pages over it, `UpdateSigningCertificate` moves one
@@ -969,6 +982,7 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             access_keys: BTreeMap::new(),
             role_sessions: BTreeMap::new(),
             temporary_credentials: BTreeMap::new(),
+            withdrawn_credentials: BTreeMap::new(),
             signing_certificates: BTreeMap::new(),
             ssh_public_keys: BTreeMap::new(),
             login_profiles: BTreeMap::new(),

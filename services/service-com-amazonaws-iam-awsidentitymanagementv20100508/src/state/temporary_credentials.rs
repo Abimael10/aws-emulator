@@ -136,25 +136,82 @@ impl IamState {
     /// "Deleting a role … will immediately invalidate any existing temporary credentials
     /// issued for that role" (IAM User Guide, *Deleting roles or instance profiles*): the
     /// role is the principal those credentials speak for, so once it is gone they speak for
-    /// nobody and a call made with one is not to be served by any service. The records this
-    /// store holds for them are dropped here, and the caller — the operation that deleted the
-    /// role — withdraws the credentials themselves from the emulator's credential store under
-    /// the ids answered, which is what stops them being accepted whichever service they are
-    /// presented to.
+    /// nobody and no call that has to be judged on this account's policies can be made with
+    /// one. What the deletion takes away is the PRINCIPAL and not the credential material:
+    /// the key, the secret and the session token the mint vended are still the ones this
+    /// emulator issued, so a request signed with one is a genuinely signed request. That is
+    /// why the ids are recorded as WITHDRAWN here ([`IamState::withdrawn_credentials`])
+    /// instead of the credential being torn out of the emulator's credential store — a
+    /// service that must resolve a principal for the request refuses it at that stage
+    /// ([`IamState::credential_is_withdrawn`]), while an operation that reports only what the
+    /// credential itself carries, `sts:GetCallerIdentity`, for which "no permissions are
+    /// required", still answers for it.
     ///
-    /// Recreating a role under the same name does not revive them: the ids are gone from both
-    /// this store and the credential store, so there is nothing left to resolve.
+    /// Recreating a role under the same name does not revive them: the session records are
+    /// gone from this store, so there is nothing left to resolve a new role's policies
+    /// through.
+    ///
+    /// Each withdrawal first drops the withdrawn ids the clock has taken past their own
+    /// expiry, and the map is bounded exactly as [`IamState::role_sessions`] is — at
+    /// [`MAX_ROLE_SESSIONS`] live ids the one CLOSEST TO EXPIRING gives way — so a caller
+    /// looping mint-and-delete inside one expiry window cannot grow it without a ceiling.
+    /// The id being recorded is always recorded: a credential this store holds no withdrawal
+    /// for is one no decision can refuse.
     pub fn withdraw_role_credentials(&mut self, role_arn: &str) -> Vec<String> {
-        let withdrawn: Vec<String> = self
+        let withdrawn: Vec<(String, ::aws_smithy_types::DateTime)> = self
             .role_sessions
             .iter()
             .filter(|(_, session)| session.role_arn == role_arn)
-            .map(|(access_key_id, _)| access_key_id.clone())
+            .map(|(access_key_id, session)| (access_key_id.clone(), session.expires))
             .collect();
-        for access_key_id in &withdrawn {
+        let now = super::now();
+        self.withdrawn_credentials
+            .retain(|_, expires| expires.secs() > now.secs());
+        for (access_key_id, expires) in &withdrawn {
             self.role_sessions.remove(access_key_id);
             self.temporary_credentials.remove(access_key_id);
+            while !self.withdrawn_credentials.contains_key(access_key_id)
+                && self.withdrawn_credentials.len() >= MAX_ROLE_SESSIONS
+            {
+                let earliest = self
+                    .withdrawn_credentials
+                    .iter()
+                    .min_by_key(|(key, expires)| (expires.secs(), (*key).clone()))
+                    .map(|(key, _)| key.clone());
+                match earliest {
+                    Some(key) => {
+                        self.withdrawn_credentials.remove(&key);
+                    }
+                    None => break,
+                }
+            }
+            self.withdrawn_credentials
+                .insert(access_key_id.clone(), *expires);
         }
         withdrawn
+            .into_iter()
+            .map(|(access_key_id, _)| access_key_id)
+            .collect()
+    }
+
+    /// Whether the credential `access_key_id` names is one this account WITHDREW before its
+    /// own expiry ([`IamState::withdrawn_credentials`]), so it speaks for a principal this
+    /// account no longer holds.
+    ///
+    /// A record past the expiry its mint promised answers `false`: such a credential is
+    /// unusable for having EXPIRED, which every service decides from the session's own
+    /// expiry, and the withdrawal adds nothing to it.
+    ///
+    /// A READ — the record is left where it is, and the next
+    /// [`Self::withdraw_role_credentials`] prunes it.
+    #[must_use]
+    pub fn credential_is_withdrawn(
+        &self,
+        access_key_id: &str,
+        now: ::aws_smithy_types::DateTime,
+    ) -> bool {
+        self.withdrawn_credentials
+            .get(access_key_id)
+            .is_some_and(|expires| expires.secs() > now.secs())
     }
 }

@@ -636,7 +636,8 @@ async fn a_managed_session_policy_whose_document_is_not_held_scopes_nothing() {
 /// your request are to the upper size limit", and the managed policy ARNs are among the
 /// things packed into that form — so a mint carrying managed session policy ARNs reports a
 /// strictly larger percentage than the same mint carrying none, and each further ARN
-/// strictly larger again.
+/// strictly larger again. A mint carrying none still reports a percentage inside the 1..100
+/// band, because the packed session state always carries the token's own header.
 #[tokio::test]
 async fn packed_policy_size_grows_with_every_managed_session_policy_packed_in() {
     let router = build_router();
@@ -668,7 +669,7 @@ async fn packed_policy_size_grows_with_every_managed_session_policy_packed_in() 
         let minted = assume_role(&router, &case, role_name, None, &arns[..count]).await;
         let packed = minted.packed_policy_size;
         assert!(
-            (0..=100).contains(&packed),
+            (1..=100).contains(&packed),
             "case {case:?}: PackedPolicySize must be a percentage of the budget, got {packed}"
         );
         if let Some(before) = previous {
@@ -676,11 +677,6 @@ async fn packed_policy_size_grows_with_every_managed_session_policy_packed_in() 
                 packed > before,
                 "case {case:?}: expected a packed size strictly greater than {before}, got \
                  {packed}"
-            );
-        } else {
-            assert_eq!(
-                packed, 0,
-                "case {case:?}: a mint packing no session state at all reports zero, got {packed}"
             );
         }
         previous = Some(packed);

@@ -447,16 +447,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => (long_term_identity(None, &access_key_id), None, None),
         };
 
-        let mut registry = state.lock();
-        // A caller presenting an expired session credential is refused, never served
-        // as another identity.
-        let caller = match resolve_request_caller(
-            &mut registry,
+        let resolved = resolve_request_caller(
+            &mut state.lock(),
             &access_key_id,
             now,
             store,
             long_term,
-        ) {
+        );
+        // A caller presenting an expired session credential is refused, never served
+        // as another identity. The session registry is taken for that RESOLUTION alone and
+        // given up again, so the caller's own identity-based documents can be read from the
+        // IAM store below without this handler ever holding the two locks at once; it is
+        // taken again for the mint.
+        let caller = match resolved {
             Ok(caller) => caller,
             Err(expired) => {
                 return Err(AssumeRoleErrorModeled::ExpiredTokenException(
@@ -467,6 +470,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         };
+        // The identity-based documents in force on the CALLER, which are what an explicit
+        // `Deny` of this assume would be stated in: for a session of a role, the role's own
+        // documents, so a chained assume is decided against the calling role's policies as
+        // well as the target role's trust policy (`caller_identity_denies`).
+        let caller_documents = crate::state::caller_identity_documents(iam.as_ref(), &caller);
 
         // Which STS operations a temporary credential may call is documented per kind;
         // see `caller_may_call`.
@@ -605,6 +613,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(role) = role else {
             return Err(refused(ASSUME_ROLE_ACTION));
         };
+        // An explicit `Deny` in the documents in force on the CALLER refuses this mint
+        // whatever the target role's trust policy says: a deny "overrides any allow" (AWS,
+        // *Policy evaluation logic*), and for a session of a role those documents are the
+        // role's own — so an administrator who denies `sts:AssumeRole` on a role in the
+        // policies of role A cuts off every chain from A's sessions into it, and the clause
+        // is decided against the calling session's own tags because the mint publishes them
+        // (`crate::state::caller_identity_denies`). Each action this mint has to be allowed
+        // to perform is asked about separately, so the refusal names the one that was denied.
+        for action in [
+            ASSUME_ROLE_ACTION,
+            TAG_SESSION_ACTION,
+            SET_SOURCE_IDENTITY_ACTION,
+        ] {
+            let asked_for = match action {
+                TAG_SESSION_ACTION => !tags.is_empty() || !transitive_tag_keys.is_empty(),
+                SET_SOURCE_IDENTITY_ACTION => source_identity.is_some(),
+                _ => true,
+            };
+            if asked_for
+                && crate::state::caller_identity_denies(
+                    &caller_documents,
+                    &caller,
+                    action,
+                    &role.arn,
+                    &condition_context,
+                    &published,
+                )
+            {
+                return Err(refused(action));
+            }
+        }
         // Whether the trust policy makes its grant to this caller turn on the SOURCE IDENTITY
         // the mint would set — a clause over `sts:SourceIdentity` on a statement that is
         // otherwise about this assume, wherever in the document it admits the assume itself or
@@ -743,6 +782,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: assumed_role_arn.clone(),
         };
 
+        // Everything this mint is allowed to do is decided, so the session registry is taken
+        // again — for the mint alone, and with no other guard held.
+        let mut registry = state.lock();
         let minted = crate::state::mint_session(
             &*self.engine,
             store,

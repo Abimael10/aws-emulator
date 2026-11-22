@@ -1370,6 +1370,79 @@ pub fn session_minted_from_role(
     Some((role_arn, session.role_id.clone()))
 }
 
+/// The identity-based policy documents in force on `caller` for a request it signs, as the
+/// IAM store holds them: the documents of the identity whose policies such a credential
+/// carries ([`Caller::identity_policies_arn`]).
+///
+/// Collected through the identity service's OWN collection of them
+/// (`IamState::principal_policies`), so a document `iam:PutRolePolicy` or
+/// `iam:AttachRolePolicy` wrote is read exactly as that service's own gate reads it. Empty
+/// where there is nothing to read — a router with no IAM store, and a credential whose
+/// identity this account holds no record of, which is the position the emulator's own
+/// published credential is in.
+///
+/// A READ, and the documents are COPIED OUT: the caller gives the IAM guard up again before
+/// it takes this service's session registry, so no handler holds the two at once.
+#[must_use]
+pub fn caller_identity_documents(
+    iam: Option<&::engine::ServiceState<IamState>>,
+    caller: &Caller,
+) -> Vec<String> {
+    let Some(iam) = iam else {
+        return Vec::new();
+    };
+    iam.lock()
+        .principal_policies(caller.identity_policies_arn())
+        .map(|policies| policies.documents)
+        .unwrap_or_default()
+}
+
+/// Whether the identity-based documents in force on the caller EXPLICITLY DENY `action` on
+/// `resource` — the one verdict of those documents that refuses a mint whatever the target
+/// role's trust policy says.
+///
+/// A role session is judged on the documents of the role it is a session of ("the temporary
+/// security credentials … have the permissions of the role", `AssumeRole`), so a statement an
+/// administrator embedded in that role is in force on every call the session makes, this one
+/// included: an `AssumeRole` made FROM a session (role chaining) is an action of the calling
+/// role, and a `Deny` naming it refuses the chain. An explicit deny "overrides any allow"
+/// (AWS, *Policy evaluation logic*), which is why this verdict alone is decided here while an
+/// ABSENT grant is not: a role trust policy is a resource-based policy, and within one
+/// account such a policy can admit a principal that no identity-based document names.
+///
+/// `context` and `published` are the condition keys the mint ANSWERS for
+/// ([`assume_role_condition_context`], [`assume_role_published_condition_keys`]) — among them
+/// the `aws:PrincipalTag/<key>` of every tag the calling session carries — so a `Deny`
+/// conditioned on the calling session's own tags decides rather than staying undecided.
+///
+/// The DECISION is [`::service_common::iam_authorization`], the tree's one evaluation of
+/// policy documents against a request, read as the IDENTITY-based documents they are.
+#[must_use]
+pub fn caller_identity_denies(
+    documents: &[String],
+    caller: &Caller,
+    action: &str,
+    resource: &str,
+    context: &[(String, String)],
+    published: &[&str],
+) -> bool {
+    if documents.is_empty() {
+        return false;
+    }
+    // Which principal the request is decided FOR, which is what a policy variable naming the
+    // caller is substituted from: the principal the credential speaks for, and — for a role
+    // session — the role whose documents these are.
+    let mut principals = vec![caller.identity.arn.clone()];
+    if let Some(role_arn) = &caller.role_arn {
+        principals.push(role_arn.clone());
+    }
+    let request = ::service_common::iam_authorization::Request::new(action, resource, &principals)
+        .with_context(context)
+        .with_published_keys(published);
+    ::service_common::iam_authorization::identity_decision(documents, &request)
+        == ::service_common::iam_authorization::Decision::Denied
+}
+
 /// Whether the account no longer holds the role a session was minted from, so that session's
 /// credential speaks for nobody.
 ///
@@ -2282,9 +2355,10 @@ pub const INVALID_ACCESS_KEY_ID_MESSAGE: &str = "Access key ID is not valid.";
 /// the measured size. The emulator compresses nothing, so no caller's session state is ever
 /// admitted because it happened to compress well.
 ///
-/// A request that carries no policy, no policy ARN and no session tag packs NO token at all
-/// — there is no session state to serialize — so its size is zero rather than the length of
-/// a bare header.
+/// A mint ALWAYS packs a token: the header frames the session state the mint writes, so a
+/// request that carries no policy, no policy ARN and no session tag still packs that header
+/// — with every count at zero — and its size is the header's rather than nothing. That is
+/// what makes the percentage [`packed_policy_size`] reports a measurement of every mint.
 #[must_use]
 pub fn packed_session_token(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> String {
     let mut records: Vec<u8> = Vec::new();
@@ -2299,9 +2373,6 @@ pub fn packed_session_token(policy: Option<&str>, policy_arns: &[String], tags: 
         push_packed_field(&mut body, PACKED_TAG_KEY_FIELD, tag.key.as_bytes());
         push_packed_field(&mut body, PACKED_TAG_VALUE_FIELD, tag.value.as_bytes());
         push_packed_record(&mut records, PACKED_TAG_KIND, &body);
-    }
-    if records.is_empty() {
-        return String::new();
     }
     let mut token: Vec<u8> = Vec::with_capacity(PACKED_TOKEN_HEADER_BYTES + records.len());
     token.push(PACKED_TOKEN_FORMAT_VERSION);
@@ -2394,15 +2465,16 @@ pub fn packed_policy_bytes(policy: Option<&str>, policy_arns: &[String], tags: &
 /// session policies and session tags combined passed in the request" (`PackedPolicySize`,
 /// this service's model).
 ///
-/// It is a measurement of the mint, so EVERY mint has one: a request that carries no
-/// session policy and no session tag packs nothing, which is zero percent of the budget
-/// and inside the member's modelled `0..` range — not an absent measurement. Every
-/// operation whose response models the member therefore reports it, so two mints AWS
-/// answers alike cannot differ in the shape of their response.
+/// It is a measurement of the mint, so EVERY mint has one and it is never zero: the packed
+/// session token a mint writes always carries its own header ([`packed_session_token`]), so
+/// there is always something packed, and the percentage is rounded UP — which is why a mint
+/// that passed no session policy and no session tag at all still reports at least one
+/// percent. Every operation whose response models the member therefore reports a percentage
+/// inside the 1..100 band, so two mints AWS answers alike cannot differ in the shape of their
+/// response.
 ///
-/// The percentage is rounded up, so anything packed at all reports at least one percent,
-/// and it passes 100 exactly when the packed size passes the byte limit — the one
-/// condition `PackedPolicyTooLargeException` is answered for.
+/// It passes 100 exactly when the packed size passes the byte limit — the one condition
+/// `PackedPolicyTooLargeException` is answered for.
 pub fn packed_policy_size(policy: Option<&str>, policy_arns: &[String], tags: &[Tag]) -> i32 {
     let packed = packed_policy_bytes(policy, policy_arns, tags);
     let percent = packed.saturating_mul(100).div_ceil(SESSION_TOKEN_SIZE_LIMIT);

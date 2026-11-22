@@ -27,8 +27,11 @@
 //! The rows differ along what the rule generalises over: WHICH of the three packed inputs
 //! carries the bytes, how many elements the bytes are spread across, how long each element
 //! is, whether the bytes are ASCII or multi-byte, and where the state falls relative to the
-//! budget (well under it, exactly on it, one coding group past it, far past it). The
-//! budget's two halves — the refusal and the percentage — are driven from the same figure.
+//! budget (well under it, exactly on it, one coding group past it, far past it), down to a
+//! mint that passed NO session state at all — which still packs the token's own header, so
+//! the figure it reports is that header's length and the percentage it reports is one.
+//! The budget's two halves — the refusal and the percentage — are driven from the same
+//! figure.
 
 use super::sts_sessions::{call, element, emulator, member, seed_demo_role, LONG_TERM_KEY};
 
@@ -232,13 +235,13 @@ fn rows() -> Vec<Row> {
             tags: tags_of(2, 10, 20),
             measured: 952,
         },
-        // Nothing to pack packs no token at all.
+        // Nothing to pack still packs the token's own HEADER: 17 bytes, coded 24.
         Row {
             case: "no session state at all",
             policy: None,
             policy_arns: Vec::new(),
             tags: Vec::new(),
-            measured: 0,
+            measured: 24,
         },
     ]
 }
