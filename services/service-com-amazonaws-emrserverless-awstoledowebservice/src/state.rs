@@ -1317,13 +1317,13 @@ pub struct ComAmazonawsEmrserverlessAwstoledowebserviceState {
     /// ([`session_endpoint_url`]), so two sessions carrying the same id would be reached
     /// at the same address.
     pub next_session_seq: u64,
-    /// The job-run executions this process has STARTED and that have not answered yet,
+    /// The job-run executions this process has STARTED and has not finished waiting for,
     /// keyed by the run each belongs to ([`spark_job_run::in_flight_key`]).
     ///
     /// Held in the store rather than in a process-wide table, so an execution belongs to the
-    /// store whose submit started it; each is collected by the next call that settles this
-    /// store, which is what makes one submitted application run ONCE however often its run
-    /// is read ([`spark_job_run`]).
+    /// store whose submit started it; each is performed by ONE task of this process, which is
+    /// what makes one submitted application run ONCE however often its run is read
+    /// ([`spark_job_run`]).
     pub in_flight_workloads: HashMap<String, spark_job_run::PendingWorkloadRun>,
 }
 

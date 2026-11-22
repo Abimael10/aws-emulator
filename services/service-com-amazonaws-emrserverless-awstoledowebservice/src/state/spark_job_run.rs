@@ -40,13 +40,17 @@
 //! itself and, for anything it did not reach, by the next call that settles this store
 //! ([`perform_owed`]). A submit waits for none of it and a read waits only
 //! [`WORKLOAD_FIRST_WAIT`], so no client's call is held for as long as the application takes
-//! and the run is observable while its workload is in flight.
+//! and the run is observable while its workload is in flight. What an execution nobody is
+//! waiting for any more came to is recorded by the TASK performing it
+//! ([`perform_handed_off_workload`]), so a run comes to rest whether or not anybody polls it.
 //!
 //! WHAT the run then reports is the CLOCK's: the state the execution came to is due once every
 //! stage the run still owes has fallen due ([`super::JOB_RUN_STAGES`]) and never before the
 //! execution itself answered ([`JobRunRecord::record_execution`]) — so a run passes through
 //! `RUNNING` for as long as its workload takes and a client polling it observes every state it
-//! goes through. A run whose workload has not answered never reaches a terminal state at all.
+//! goes through. The instant the execution answered is the instant that state is dated from,
+//! whether a call was waiting for it or the task performing it recorded it, so what a run comes
+//! to rest in — and when — does not depend on when anybody read it.
 //!
 //! # Bounds and containment
 //!
@@ -64,12 +68,13 @@
 //! registered, the host surface that is compiled out and the stop no guest call can clear — is
 //! that engine's, which is why nothing of it is stood up again here.
 //!
-//! An execution this service began stays reachable rather than being forgotten: where its
-//! answer arrives is held on this store
-//! ([`ComAmazonawsEmrserverlessAwstoledowebserviceState::in_flight_workloads`]) until it is
-//! collected, and this emulator gives up on one that has not answered within
+//! An execution this service began stays reachable rather than being forgotten: the TASK that
+//! waits for its answer and records what it came to is held on this store
+//! ([`ComAmazonawsEmrserverlessAwstoledowebserviceState::in_flight_workloads`]) until it has
+//! ended, and this emulator gives up on an execution that has not answered within
 //! [`WORKLOAD_HOST_WAIT`] — the host ceiling the engine stops it on, plus the grace that stop
-//! needs to land.
+//! needs to land — settling the run in the modelled failure state rather than leaving it
+//! `RUNNING`.
 
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::aws_api::CallerIdentity;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::execution_role_session::execution_role_identity;
@@ -555,8 +560,8 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
         None
     }
 
-    /// Keep an execution this process STARTED and that has not answered yet, so the next call
-    /// that settles this store collects it.
+    /// Keep an execution this process HANDED OFF, so one this service began stays reachable
+    /// rather than detached, and is forgotten once the task performing it has ended.
     fn hold_in_flight_workload(
         &mut self,
         application_id: &str,
@@ -567,56 +572,28 @@ impl ComAmazonawsEmrserverlessAwstoledowebserviceState {
             .insert(in_flight_key(application_id, job_run_id), pending);
     }
 
-    /// Record what every in-flight execution has ANSWERED by `now`, and give up on the ones
-    /// this emulator has waited the whole host wait for.
+    /// Forget the executions whose task has ENDED, which is every execution that has already
+    /// recorded what it came to ([`perform_handed_off_workload`]).
     ///
-    /// Each answer is taken ONCE: the entry is removed as it is read, so one execution decides
-    /// its run's terminal state however many calls arrive afterwards. An execution still going
-    /// is left in flight, which is why the run it belongs to stays `RUNNING` rather than being
-    /// reported as finished for work nothing has answered for.
-    fn collect_answered_workloads(&mut self, now: SystemTime) {
-        let keys: Vec<String> = self.in_flight_workloads.keys().cloned().collect();
-        for key in keys {
-            let Some(pending) = self.in_flight_workloads.get_mut(&key) else {
-                continue;
-            };
-            let outcome = match pending.answer.try_recv() {
-                Ok(finished) => read_outcome(&finished.completion),
-                Err(::tokio::sync::oneshot::error::TryRecvError::Empty)
-                    if now < pending.give_up_at =>
-                {
-                    continue;
-                }
-                // The thread ended without reporting, or this emulator has waited the whole
-                // host wait for it: nothing is known about what the application came to.
-                Err(_) => WorkloadOutcome::Failed(job_run_workload_unanswered()),
-            };
-            self.in_flight_workloads.remove(&key);
-            let Some((application_id, job_run_id)) = split_in_flight_key(&key) else {
-                continue;
-            };
-            if let Some(record) = self
-                .applications
-                .get_mut(application_id)
-                .and_then(|application| application.job_runs.get_mut(job_run_id))
-            {
-                record.record_execution(&outcome, now);
-            }
-        }
+    /// Nothing is decided here: the outcome of an execution is recorded by the task performing
+    /// it, at the instant that execution ANSWERED, so what a run comes to rest in does not
+    /// depend on when anybody next read it. This only drops the handles of the tasks that are
+    /// done, so the table holds the executions still in flight and nothing else.
+    fn forget_ended_workloads(&mut self) {
+        self.in_flight_workloads
+            .retain(|_, pending| !pending.task.is_finished());
     }
 }
 
-/// An execution this process STARTED and that has not answered yet.
+/// An execution this process started and has not finished waiting for.
 ///
-/// The run itself is a thread of this process ([`run_application`]); what is held here is where
-/// its answer arrives and when this emulator gives up waiting for one.
+/// The run itself is a thread of this process ([`run_application`]) and the wait for it is a
+/// TASK of this process ([`perform_handed_off_workload`]); what is held here is that task's
+/// handle, so an execution this service began stays reachable rather than detached.
 #[derive(Debug)]
 pub struct PendingWorkloadRun {
-    /// Where the execution's own answer arrives, once its thread has one.
-    answer: ::tokio::sync::oneshot::Receiver<python::Finished>,
-    /// When this emulator gives up on it: the whole host wait after it was started
-    /// ([`WORKLOAD_HOST_WAIT`]).
-    give_up_at: SystemTime,
+    /// The task waiting for the execution's own answer and recording what it came to.
+    task: ::tokio::task::JoinHandle<()>,
 }
 
 /// What separates the two halves of the key an in-flight execution is held under: a unit
@@ -630,11 +607,6 @@ pub fn in_flight_key(application_id: &str, job_run_id: &str) -> String {
     format!("{application_id}{IN_FLIGHT_KEY_SEPARATOR}{job_run_id}")
 }
 
-/// The application and job run one such key names.
-fn split_in_flight_key(key: &str) -> Option<(&str, &str)> {
-    key.split_once(IN_FLIGHT_KEY_SEPARATOR)
-}
-
 /// Perform the workload every job run of this store already owes.
 ///
 /// Called by the one clock pump every operation of this service runs before it reads the store
@@ -645,10 +617,10 @@ fn split_in_flight_key(key: &str) -> Option<(&str, &str)> {
 ///
 /// The CALL waits [`WORKLOAD_FIRST_WAIT`] for each application it starts and no longer: one
 /// that answers inside that slice decides its run here, and one that does not is LEFT RUNNING,
-/// with the run still `RUNNING`, until a later call collects its answer
-/// ([`ComAmazonawsEmrserverlessAwstoledowebserviceState::collect_answered_workloads`]) — which
-/// is also what makes one submitted application run ONCE however often its run is read. What
-/// one call spends is bounded either way ([`MAX_WORKLOAD_RUNS_PER_CALL`] over at most
+/// with the run still `RUNNING`, while a TASK of this process carries the rest of the wait and
+/// records what the execution then answers ([`perform_handed_off_workload`]) — which is also
+/// what makes one submitted application run ONCE however often its run is read. What one call
+/// spends is bounded either way ([`MAX_WORKLOAD_RUNS_PER_CALL`] over at most
 /// [`WORKLOAD_CALL_CEILING`]).
 pub async fn perform_owed<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     engine: &Eng,
@@ -662,9 +634,9 @@ pub async fn perform_owed<Eng: ::std::marker::Send + ::std::marker::Sync + 'stat
 ///
 /// The work is owed from the instant the submit was accepted, so it is started there — but a
 /// submit answers the id it minted rather than waiting on the work, so this waits for nothing:
-/// every execution it starts is left in flight and collected by a later call. What the submit
-/// is still held by is the one in-process read of the application's own object, which is what
-/// decides whether there is anything to run at all.
+/// every execution it starts is handed to a task of this process, which records what that
+/// execution answers. What the submit is still held by is the one in-process read of the
+/// application's own object, which is what decides whether there is anything to run at all.
 pub async fn start_owed<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
@@ -683,12 +655,13 @@ async fn perform_owed_waiting<Eng: ::std::marker::Send + ::std::marker::Sync + '
         return;
     };
     {
-        // What the executions already in flight have ANSWERED, taken first: a run whose work
-        // has finished can then reach the state it answered, and a run that owes a further
-        // attempt is not started while its own is still going.
+        // The executions this process has already finished waiting for are forgotten first,
+        // and every state the clock owes this store is materialised: an execution records
+        // what it came to as it answers, so a run whose work has finished has its terminal
+        // state owed to it from that instant and reaches it here.
         let mut store = state.lock();
         let now = SystemTime::now();
-        store.collect_answered_workloads(now);
+        store.forget_ended_workloads();
         store.settle_all(now);
     }
     let region = request_region(ctx.parts());
@@ -1058,21 +1031,88 @@ async fn run_application(
                 &WorkloadOutcome::Failed(job_run_workload_unanswered()),
             );
         }
-        // Still running: the run stays `RUNNING` and the execution is LEFT in flight, to be
-        // collected by a later call. It is not given back to the owed queue — its application
-        // is really running, and running it a second time would make its effects twice.
+        // Still running: the run stays `RUNNING` and the rest of the wait is carried by a TASK
+        // of this process, which records what the execution answers AT THE INSTANT it answers
+        // ([`perform_handed_off_workload`]). The execution is not given back to the owed queue —
+        // its application is really running, and running it a second time would make its
+        // effects twice.
         Err(_) => {
-            let mut store = state.lock();
-            store.hold_in_flight_workload(
-                &application_id,
-                &job_run_id,
-                PendingWorkloadRun {
-                    answer: receiver,
-                    give_up_at: due_at(SystemTime::now(), WORKLOAD_HOST_WAIT),
-                },
-            );
+            hand_off_execution(state, &application_id, &job_run_id, receiver, first_wait);
         }
     }
+}
+
+/// Hand the rest of the wait for one started execution to a TASK of this process, and keep that
+/// task's handle on the store.
+///
+/// What the execution came to is recorded by that task, under the store's guard, at the instant
+/// the execution ANSWERED — so the state the clock then owes the run is dated from when its work
+/// finished rather than from when somebody next read it, and a run comes to rest whether or not
+/// anybody is polling. The task stops waiting after the whole host wait
+/// ([`WORKLOAD_HOST_WAIT`], less what the call that started the execution already spent), so a
+/// run whose execution never answers reaches the modelled failure state saying so rather than
+/// staying `RUNNING`.
+fn hand_off_execution(
+    state: &::engine::ServiceState<ComAmazonawsEmrserverlessAwstoledowebserviceState>,
+    application_id: &str,
+    job_run_id: &str,
+    answer: ::tokio::sync::oneshot::Receiver<python::Finished>,
+    already_waited: Duration,
+) {
+    let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
+        // No task can carry the wait, so nothing of this process will ever hear the answer:
+        // the run says this emulator has no outcome for it rather than staying `RUNNING`.
+        record_outcome(
+            state,
+            application_id,
+            job_run_id,
+            &WorkloadOutcome::Failed(job_run_workload_unanswered()),
+        );
+        return;
+    };
+    let performed = ::engine::ServiceState::clone(state);
+    let held_application = application_id.to_string();
+    let held_job_run = job_run_id.to_string();
+    let task = runtime.spawn(async move {
+        perform_handed_off_workload(
+            &performed,
+            &held_application,
+            &held_job_run,
+            answer,
+            already_waited,
+        )
+        .await;
+    });
+    state
+        .lock()
+        .hold_in_flight_workload(application_id, job_run_id, PendingWorkloadRun { task });
+}
+
+/// Wait for one handed-off execution and record what it came to on the run it belongs to.
+///
+/// The wait is the whole host wait less what the call that started the execution already spent,
+/// so this emulator gives up on an execution that has not answered at the same instant whichever
+/// call started it; the engine stops the run itself at the host time one run may take
+/// ([`WORKLOAD_HOST_CEILING`]), which is what this wait allows for.
+async fn perform_handed_off_workload(
+    state: &::engine::ServiceState<ComAmazonawsEmrserverlessAwstoledowebserviceState>,
+    application_id: &str,
+    job_run_id: &str,
+    answer: ::tokio::sync::oneshot::Receiver<python::Finished>,
+    already_waited: Duration,
+) {
+    let outcome = match ::tokio::time::timeout(
+        WORKLOAD_HOST_WAIT.saturating_sub(already_waited),
+        answer,
+    )
+    .await
+    {
+        Ok(Ok(finished)) => read_outcome(&finished.completion),
+        // The thread ended without reporting, or the whole host wait passed: nothing is known
+        // about what the application came to.
+        Ok(Err(_)) | Err(_) => WorkloadOutcome::Failed(job_run_workload_unanswered()),
+    };
+    record_outcome(state, application_id, job_run_id, &outcome);
 }
 
 /// What the run reports for an application the interpreter answered for.
