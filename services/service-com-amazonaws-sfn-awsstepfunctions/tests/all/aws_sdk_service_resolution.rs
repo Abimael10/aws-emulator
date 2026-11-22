@@ -797,7 +797,7 @@ async fn a_call_the_execution_role_may_not_make_fails_with_the_services_own_refu
             machine: "denied-destinations",
             resource: EVENTBRIDGE_LIST_DESTINATIONS,
             action: LIST_DESTINATIONS_ACTION,
-            error: "EventBridge.AmazonCloudWatchEventsException",
+            error: "EventBridge.AmazonEventBridgeException",
             service: "EventBridge",
             status: 400,
         },

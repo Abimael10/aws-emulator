@@ -18,11 +18,14 @@
 //!    moment of each call, so an execution started before an update is judged by the
 //!    role it carries;
 //! 2. **what the call asks for** — the `(action, resource)` pair the call is subject
-//!    to, formed from the call itself ([`super::integration::access_request`]): the
+//!    to, formed from the call itself ([`super::integration::access_requests`]): the
 //!    IAM action is the invoked service's action namespace and the operation's own
 //!    name, and the resource is the ARN of what that integration's request names —
 //!    the ARN itself where the operation takes one, and otherwise the ARN of the
-//!    resource of that NAME in the Region the call is made in;
+//!    resource of that NAME in the Region the call is made in. A request carrying one
+//!    unit of work per resource — a publication naming a bus per entry — asks for one
+//!    pair per resource, and the first one the documents withhold is a call that is not
+//!    made;
 //! 3. **what the role may do** — the identity-based documents the IAM store holds for
 //!    it (its inline policies and the default version of each managed policy attached
 //!    to it), read through IAM's own
@@ -106,7 +109,7 @@ use ::std::sync::Arc;
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 use super::integration::{
-    access_request, Activities, Api, Call, Denied, ExpressMachines, Failed, Family, Handovers,
+    access_requests, Activities, Api, Call, Denied, ExpressMachines, Failed, Family, Handovers,
     MapRuns, RoleGate, TASK_FAILED_ERROR,
 };
 
@@ -438,43 +441,51 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
         // is left to the invoked operation's own answer.
         let targets = call.targets?;
         let iam = iam_state(&*engine)?;
-        let (action, resource) = access_request(call, request, &region)?;
-        // The sentence reports the action as the INVOKED service's own refusal spells it;
-        // IAM compares action names without regard to case, so the decision is the same
-        // either way ([`super::integration::Api::refused_action`]).
-        let action = call.api.refused_action(&action);
+        // Every resource the call acts on, each decided in the order the request names
+        // them: a call whose request carries one unit of work per resource — a
+        // publication naming a bus per entry — is the execution's call on each of them,
+        // and the first one the documents in force withhold is a call that is not made,
+        // exactly as the invoked service refuses the whole request over the first unit it
+        // may not perform.
+        let asked = access_requests(call, request, &region);
         let (code, status) = denied_answer(call.api, targets.denied);
-        // What the TARGET's own policy says about the call, read before IAM's store is
-        // locked: a grant in it allows the call even where the role carries no
-        // identity-based grant ([`super::target_resource_policy`]).
-        let target_policy = super::target_resource_policy::in_force(&*engine, &resource);
-        if let Some(refused) = refusal(
-            &iam.lock(),
-            Acts {
-                role_arn: &role_arn,
-                session_name: &session_name,
-            },
-            &action,
-            &resource,
-            target_policy.as_deref(),
-            Answered {
-                api: call.api,
-                family: call.family,
-                code,
-                status,
-            },
-        ) {
-            // The refusal reaches the state as the error the invoked OPERATION models for
-            // an unauthorized call, where it models one; an operation that models none
-            // leaves the invoked service's BASE SDK exception, which is what its client
-            // deserializes an unmodelled code into.
-            return Some(Failed {
-                error: targets.denied.map_or_else(
-                    || call.base_error(),
-                    |denied| call.task_error(denied.exception),
-                ),
-                cause: refused,
-            });
+        for (action, resource) in &asked {
+            // The sentence reports the action as the INVOKED service's own refusal spells
+            // it; IAM compares action names without regard to case, so the decision is
+            // the same either way ([`super::integration::Api::refused_action`]).
+            let action = call.api.refused_action(action);
+            // What the TARGET's own policy says about the call, read before IAM's store is
+            // locked: a grant in it allows the call even where the role carries no
+            // identity-based grant ([`super::target_resource_policy`]).
+            let target_policy = super::target_resource_policy::in_force(&*engine, resource);
+            if let Some(refused) = refusal(
+                &iam.lock(),
+                Acts {
+                    role_arn: &role_arn,
+                    session_name: &session_name,
+                },
+                &action,
+                resource,
+                target_policy.as_deref(),
+                Answered {
+                    api: call.api,
+                    family: call.family,
+                    code,
+                    status,
+                },
+            ) {
+                // The refusal reaches the state as the error the invoked OPERATION models
+                // for an unauthorized call, where it models one; an operation that models
+                // none leaves the invoked service's BASE SDK exception, which is what its
+                // client deserializes an unmodelled code into.
+                return Some(Failed {
+                    error: targets.denied.map_or_else(
+                        || call.base_error(),
+                        |denied| call.task_error(denied.exception),
+                    ),
+                    cause: refused,
+                });
+            }
         }
         // A target of THIS service that is on a customer managed KMS key seals the data
         // this call hands it under that key, and the call is made as this execution's
@@ -485,8 +496,9 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
         // did not happen, so the failure is the task's own — ASL's [`TASK_FAILED_ERROR`]
         // — carrying the refusal the key answered with, exactly as every other refusal
         // of a call this state would have made is carried.
-        let key_refusal =
-            super::encryption::target_key_denied(&*engine, &region, &resource, &role_arn)?;
+        let key_refusal = asked.iter().find_map(|(_, resource)| {
+            super::encryption::target_key_denied(&*engine, &region, resource, &role_arn)
+        })?;
         let cause = match key_refusal {
             super::encryption::KeyRefusal::InvalidState { message, .. }
             | super::encryption::KeyRefusal::AccessDenied(message) => message,

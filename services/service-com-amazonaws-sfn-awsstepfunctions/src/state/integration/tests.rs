@@ -1076,7 +1076,8 @@ fn the_envelope_names_a_header_the_way_the_operation_binds_it() {
 /// carrying an ARN instead), several actions of one service, an operation whose
 /// published permission is not its own name, each form in which an integration
 /// addresses its target by something other than an ARN ([`TargetNaming`]), an
-/// integration the table carries no entry for, the AWS SDK family, and a request
+/// integration the table carries no entry for, a member reached INSIDE the request
+/// (and the default the operation documents for it), the AWS SDK family, and a request
 /// naming no resource at all.
 #[test]
 fn an_access_request_is_the_action_and_the_resource_the_request_names() {
@@ -1087,7 +1088,9 @@ fn an_access_request_is_the_action_and_the_resource_the_request_names() {
     let queue_arn = ::engine::emulator_arn(SQS_NAMESPACE, region, "orders");
     let function_arn = ::engine::emulator_arn(LAMBDA_NAMESPACE, region, "function:handler");
     // (case, the Resource, the request the state built, the expected pair)
-    let rows: [AccessRow; 20] = [
+    let orders_bus = ::engine::emulator_arn("events", region, "event-bus/orders");
+    let default_bus = ::engine::emulator_arn("events", region, "event-bus/default");
+    let rows: [AccessRow; 25] = [
         (
             "a nested execution, the member in the integration's own spelling",
             "arn:aws:states:::states:startExecution",
@@ -1132,6 +1135,39 @@ fn an_access_request_is_the_action_and_the_resource_the_request_names() {
         ),
         (
             "an integration no entry is carried for",
+            "arn:aws:states:::ecs:runTask",
+            ::serde_json::json!({"Cluster": "orders", "TaskDefinition": "pack:1"}),
+            None,
+        ),
+        // A publication's bus is named by a member of each ENTRY, so the resource is
+        // read inside the request's own list — by name, by ARN, or by the default the
+        // operation documents for an entry that omits it.
+        (
+            "a publication, the bus named inside the entry it publishes",
+            "arn:aws:states:::events:putEvents",
+            ::serde_json::json!({"Entries": [{"EventBusName": "orders", "Detail": {}}]}),
+            Some(("events:PutEvents", orders_bus.clone())),
+        ),
+        (
+            "the same bus named by its ARN, which is the resource itself",
+            "arn:aws:states:::events:putEvents",
+            ::serde_json::json!({"Entries": [{"EventBusName": orders_bus.clone()}]}),
+            Some(("events:PutEvents", orders_bus.clone())),
+        ),
+        (
+            "a publication whose entry omits the bus, which is the default one",
+            "arn:aws:states:::events:putEvents",
+            ::serde_json::json!({"Entries": [{"Source": "orders.service"}]}),
+            Some(("events:PutEvents", default_bus.clone())),
+        ),
+        (
+            "the AWS SDK family of that publication, which acts on the same bus",
+            "arn:aws:states:::aws-sdk:eventbridge:putEvents",
+            ::serde_json::json!({"Entries": [{"eventBusName": "orders"}]}),
+            Some(("events:PutEvents", orders_bus.clone())),
+        ),
+        (
+            "a publication carrying no entry at all, which names no bus",
             "arn:aws:states:::events:putEvents",
             ::serde_json::json!({"Entries": []}),
             None,
@@ -1237,6 +1273,76 @@ fn an_access_request_is_the_action_and_the_resource_the_request_names() {
         let call = read(resource).expect("every row names a call");
         let asked = access_request(&call, &request, region);
         let expected = expected.map(|(action, named)| (action.to_string(), named));
+        assert_eq!(
+            asked, expected,
+            "case {case:?}: expected {expected:?}, got {asked:?}"
+        );
+    }
+}
+
+/// A call whose request carries one unit of work per resource is subject to ONE access
+/// request per resource it names, in the order the request writes them — and the same
+/// resource named twice asks for nothing further.
+///
+/// The rows span what the rule generalises over: one entry, several entries naming
+/// several buses, an entry that omits the bus beside one that names it, the same bus
+/// named twice, a bus named by its ARN beside one named by name, and a request carrying
+/// no entry at all.
+#[test]
+fn a_request_naming_several_resources_asks_one_access_request_of_each() {
+    let region = "us-west-2";
+    let orders = ::engine::emulator_arn("events", region, "event-bus/orders");
+    let audit = ::engine::emulator_arn("events", region, "event-bus/audit");
+    let default_bus = ::engine::emulator_arn("events", region, "event-bus/default");
+    // (case, the request the state built, the resources each pair is over)
+    let rows: [(&str, Value, Vec<String>); 6] = [
+        (
+            "one entry, which names one bus",
+            ::serde_json::json!({"Entries": [{"EventBusName": "orders"}]}),
+            vec![orders.clone()],
+        ),
+        (
+            "two entries naming two buses, in the order the request writes them",
+            ::serde_json::json!({
+                "Entries": [{"EventBusName": "orders"}, {"EventBusName": "audit"}],
+            }),
+            vec![orders.clone(), audit.clone()],
+        ),
+        (
+            "an entry that omits the bus beside one that names it",
+            ::serde_json::json!({
+                "Entries": [{"Source": "orders.service"}, {"EventBusName": "audit"}],
+            }),
+            vec![default_bus.clone(), audit.clone()],
+        ),
+        (
+            "the same bus named by two entries, which asks for it once",
+            ::serde_json::json!({
+                "Entries": [{"EventBusName": "orders"}, {"EventBusName": "orders"}],
+            }),
+            vec![orders.clone()],
+        ),
+        (
+            "a bus named by its ARN beside the same bus named by name",
+            ::serde_json::json!({
+                "Entries": [{"EventBusName": orders.clone()}, {"EventBusName": "audit"}],
+            }),
+            vec![orders.clone(), audit.clone()],
+        ),
+        (
+            "a request carrying no entry at all, which names no bus",
+            ::serde_json::json!({"Entries": []}),
+            Vec::new(),
+        ),
+    ];
+
+    for (case, request, resources) in rows {
+        let call = read("arn:aws:states:::events:putEvents").expect("the publication");
+        let asked = access_requests(&call, &request, region);
+        let expected: Vec<(String, String)> = resources
+            .into_iter()
+            .map(|resource| ("events:PutEvents".to_string(), resource))
+            .collect();
         assert_eq!(
             asked, expected,
             "case {case:?}: expected {expected:?}, got {asked:?}"

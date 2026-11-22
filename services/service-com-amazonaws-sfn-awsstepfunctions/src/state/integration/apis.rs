@@ -208,11 +208,14 @@ pub const APIS: &[Api] = &[
         // The AWS SDK names the service `EventBridge`, which its own `EventBridge`
         // client carries.
         sdk_error_prefix: "EventBridge",
-        // The client the events API is reached through is
-        // `AmazonCloudWatchEventsClient`, whose base exception is
-        // `AmazonCloudWatchEventsException`.
-        sdk_client: "AmazonCloudWatchEvents",
-        sdk_exception: "AmazonCloudWatchEventsException",
+        // The client the events API is reached through is `AmazonEventBridgeClient`,
+        // whose base exception is `AmazonEventBridgeException` — the class its
+        // deserializer resolves an answer no error shape of this service's model names
+        // into, and the one a refused publication reaches a `Task` state as
+        // (`EventBridge.AmazonEventBridgeException`, over a cause whose metadata names
+        // the service `AmazonEventBridge`).
+        sdk_client: "AmazonEventBridge",
+        sdk_exception: "AmazonEventBridgeException",
         access_denied_status: TARGET_CLIENT_ERROR_STATUS,
         access_denied_code: COMMON_ACCESS_DENIED_CODE,
         lowercases_refused_action: false,
