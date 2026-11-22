@@ -86,7 +86,7 @@ const UNVERIFIABLE_TOKEN_MESSAGE: &str =
 /// The emulator these rows drive: one engine carrying Amazon Cognito's user pools, IAM's
 /// providers and roles, and STS — the three services the rule spans, mounted as the router
 /// mounts them, so every record a decision reads is the one its owning service wrote.
-fn emulator_with_providers() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_with_providers() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -96,12 +96,22 @@ fn emulator_with_providers() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>
     (router, engine)
 }
 
-/// One Amazon Cognito operation, required to succeed, with its response body.
-async fn cognito(router: &MultiServiceRouter, operation: &str, body: &Value) -> Value {
+/// One Amazon Cognito operation addressed at `host`, required to succeed, with its response
+/// body.
+///
+/// `host` is the endpoint the request REACHES, which is the address a pool created by it
+/// publishes its token issuer on — so a suite that needs a pool whose issuer names another
+/// authority creates it through that authority.
+pub(crate) async fn cognito_at(
+    router: &MultiServiceRouter,
+    host: &str,
+    operation: &str,
+    body: &Value,
+) -> Value {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", COGNITO_HOST)
+        .header("host", host)
         .header("content-type", "application/x-amz-json-1.1")
         .header(
             "x-amz-target",
@@ -144,26 +154,37 @@ async fn iam_call(
 
 /// What a sign-in against one pool left behind: the pool, the app client the token was
 /// issued to, the identity it names, and the ID token itself.
-struct SignedIn {
-    client_id: String,
-    sub: String,
+pub(crate) struct SignedIn {
+    pub(crate) client_id: String,
+    pub(crate) sub: String,
     /// The user the token was issued for, which the pool publishes as a claim of its own.
-    username: String,
+    pub(crate) username: String,
     /// The `iss` the issued token carries, which is where a verifier is led for the keys.
-    issuer: String,
-    id_token: String,
+    pub(crate) issuer: String,
+    pub(crate) id_token: String,
 }
 
 /// Create a user pool, an app client and a user through Amazon Cognito's own operations and
 /// sign that user in, answering the ID token the pool SIGNED.
-async fn sign_in(router: &MultiServiceRouter, pool_name: &str) -> SignedIn {
-    let pool = cognito(router, "CreateUserPool", &json!({ "PoolName": pool_name })).await;
+pub(crate) async fn sign_in(router: &MultiServiceRouter, pool_name: &str) -> SignedIn {
+    sign_in_at(router, pool_name, COGNITO_HOST).await
+}
+
+/// [`sign_in`] through the endpoint `host`, which is the authority the pool it creates
+/// publishes its token issuer on.
+pub(crate) async fn sign_in_at(
+    router: &MultiServiceRouter,
+    pool_name: &str,
+    host: &str,
+) -> SignedIn {
+    let pool = cognito_at(router, host, "CreateUserPool", &json!({ "PoolName": pool_name })).await;
     let user_pool_id = pool["UserPool"]["Id"]
         .as_str()
         .expect("a minted pool id")
         .to_string();
-    let client = cognito(
+    let client = cognito_at(
         router,
+        host,
         "CreateUserPoolClient",
         &json!({
             "UserPoolId": user_pool_id,
@@ -177,14 +198,16 @@ async fn sign_in(router: &MultiServiceRouter, pool_name: &str) -> SignedIn {
         .expect("a minted client id")
         .to_string();
     let username = format!("{pool_name}-user");
-    cognito(
+    cognito_at(
         router,
+        host,
         "AdminCreateUser",
         &json!({ "UserPoolId": user_pool_id, "Username": username }),
     )
     .await;
-    cognito(
+    cognito_at(
         router,
+        host,
         "AdminSetUserPassword",
         &json!({
             "UserPoolId": user_pool_id,
@@ -194,8 +217,9 @@ async fn sign_in(router: &MultiServiceRouter, pool_name: &str) -> SignedIn {
         }),
     )
     .await;
-    let signed_in = cognito(
+    let signed_in = cognito_at(
         router,
+        host,
         "AdminInitiateAuth",
         &json!({
             "UserPoolId": user_pool_id,
@@ -255,7 +279,11 @@ fn claims_of(token: &str) -> Value {
 
 /// Register `issuer` as an OpenID Connect provider of this account through IAM's own
 /// operation, and answer the provider ARN a trust policy names it by.
-async fn register_provider(router: &MultiServiceRouter, issuer: &str, audience: &str) -> String {
+pub(crate) async fn register_provider(
+    router: &MultiServiceRouter,
+    issuer: &str,
+    audience: &str,
+) -> String {
     let (status, body) = iam_call(
         router,
         "CreateOpenIDConnectProvider",
@@ -313,7 +341,7 @@ async fn create_federated_role_with(
 
 /// [`create_federated_role_with`] under the one clause the suite's main table uses: the
 /// audience claim that provider publishes equals the app client the token was issued to.
-async fn create_federated_role(
+pub(crate) async fn create_federated_role(
     router: &MultiServiceRouter,
     role_name: &str,
     provider_arn: &str,
@@ -336,7 +364,7 @@ async fn create_federated_role(
 
 /// One `AssumeRoleWithWebIdentity`, made the way a web identity client makes it: UNSIGNED,
 /// holding no Amazon Web Services credential at all.
-async fn exchange(
+pub(crate) async fn exchange(
     router: &MultiServiceRouter,
     role_arn: &str,
     token: &str,
@@ -521,7 +549,9 @@ async fn a_web_identity_is_federated_only_when_its_issuers_published_key_signed_
                     "case {case:?}: expected the assumed-role ARN {assumed_role_arn}, got {body}"
                 );
                 for (name, expected_value) in [
-                    ("Provider", signed_in.issuer.as_str()),
+                    // The provider identifier, which is the issuer with its scheme
+                    // dropped — the form the registered provider is keyed by.
+                    ("Provider", provider.as_str()),
                     ("Audience", signed_in.client_id.as_str()),
                     ("SubjectFromWebIdentityToken", signed_in.sub.as_str()),
                 ] {

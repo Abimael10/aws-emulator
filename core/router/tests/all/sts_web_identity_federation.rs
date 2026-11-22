@@ -8,8 +8,10 @@
 //! Amazon Cognito Identity call that minted the token is the evidence the redeemer has, in
 //! place of the issuer's published verification key, which this emulator fetches from
 //! nowhere. The session is one of the role's own, so `sts:GetCallerIdentity` under the
-//! credential reports the assumed-role identity, and the response reports the three claims
-//! the token carries (`Provider`, `Audience`, `SubjectFromWebIdentityToken`).
+//! credential reports the assumed-role identity, and the response reports what the token
+//! names: the provider it came from (as the scheme-less identifier that provider is known
+//! by), the `Audience` it was issued for and the `SubjectFromWebIdentityToken` it speaks
+//! for.
 //!
 //! The trust policy decides, as it does for every assume: the role must admit the token's
 //! ISSUER for `sts:AssumeRoleWithWebIdentity`, and a `Condition` on the audience the issuer
@@ -369,8 +371,9 @@ fn a_web_identity_token_this_emulator_issued_is_exchanged_for_a_role_session() {
             );
             assert_eq!(
                 member(case, &body, "Provider"),
-                "https://cognito-identity.amazonaws.com",
-                "case {case:?}: the issuer the token names must be reported, got {body}"
+                "cognito-identity.amazonaws.com",
+                "case {case:?}: the provider identifier the issuer is known by — the \
+                 issuer with its scheme dropped — must be reported, got {body}"
             );
             let assumed_role_arn = member(case, &body, "Arn");
             assert!(

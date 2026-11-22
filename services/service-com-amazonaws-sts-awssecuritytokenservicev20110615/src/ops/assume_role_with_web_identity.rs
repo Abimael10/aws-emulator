@@ -59,6 +59,18 @@
 //! token, which is not a token this emulator issues, so a request naming one is answered
 //! for the token it presents exactly as a request without it is.
 //!
+//! ## What the exchange reports the provider as
+//!
+//! The issuing authority is reported as the identifier the identity provider is KNOWN BY:
+//! the issuer with its URL scheme dropped, `<host>[:<port>]/<path>`. That is the form an
+//! OpenID Connect provider is registered and keyed under in IAM, the form the trailing
+//! segment of its ARN carries, the form a trust policy names it by as a `Federated`
+//! principal and the form its condition keys are prefixed with — so a client that
+//! correlates this response with the provider it registered compares the two directly.
+//! The derivation is [`crate::state::web_identity_provider_name`], this tree's one
+//! dropping of an issuer's scheme, which is also what the principals and the condition
+//! keys the exchange is decided under are spelled with.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -588,10 +600,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: assumed_role_arn,
             }),
             packed_policy_size: Some(packed_policy),
-            // The three facts the token itself carries, as the issuance recorded them:
-            // "the value of the `iss` field", the client id the token was issued for, and
-            // "the value returned by the identity provider as the token's `sub` claim".
-            provider: Some(web_identity.identity.issuer),
+            // The three facts the token itself carries, as the issuance recorded them: the
+            // issuing authority, the client id the token was issued for, and "the value
+            // returned by the identity provider as the token's `sub` claim".
+            //
+            // The issuing authority is reported as the IDENTIFIER that provider is known by
+            // rather than as the raw `iss` URL: the scheme-less `<host>[:<port>]/<path>`
+            // form that an IAM OpenID Connect provider is registered and keyed under, that
+            // the trailing segment of its ARN carries, that a trust policy spells in its
+            // `Federated` principal and that its condition keys are prefixed with
+            // (`crate::state::web_identity_provider_name`, the tree's one dropping of an
+            // issuer's scheme). A client correlating this response with the provider it
+            // registered compares the two directly.
+            provider: Some(
+                crate::state::web_identity_provider_name(&web_identity.identity.issuer)
+                    .to_string(),
+            ),
             audience: Some(web_identity.identity.audience),
             subject_from_web_identity_token: Some(web_identity.identity.subject),
             // "The value of the source identity that is returned in the JSON web token
