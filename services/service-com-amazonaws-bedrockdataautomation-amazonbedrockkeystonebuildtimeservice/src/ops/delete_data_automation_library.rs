@@ -9,6 +9,11 @@
 //! is the modelled `ResourceNotFoundException`, a listing no longer enumerates it, and its
 //! `libraryName` is free for another create.
 //!
+//! A library a DataAutomationProject still names in its stored configuration is IN USE: the
+//! delete is refused with the modelled `ValidationException` and nothing is written, so the
+//! library stays `ACTIVE` until the referring projects let go of it
+//! (`crate::state::library_deletion`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -118,6 +123,16 @@ impl From<DeleteDataAutomationLibraryErrorModeled> for DeleteDataAutomationLibra
     }
 }
 
+/// What this operation answers for a `libraryArn` that names no library of this store:
+/// the modelled `ResourceNotFoundException` with the service's fixed sentence, which is
+/// also what a read, an update and a repeated delete of a released library answer.
+fn library_not_found() -> DeleteDataAutomationLibraryError {
+    DeleteDataAutomationLibraryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::LIBRARY_ARN_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
 /// The `DeleteDataAutomationLibrary` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -181,20 +196,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reads.
         let now = ::std::time::SystemTime::now();
         // A library whose earlier delete has already settled resolves to nothing, which is
-        // the refusal below — the same sentence a read of it gives.
-        store.settle_library_deletions(now);
+        // the refusal below — the same sentence a read of it gives. `live_library`
+        // materialises every removal the clock has already made due before it answers.
+        if store.live_library(&input.library_arn, now).is_none() {
+            return Err(library_not_found());
+        }
+
+        // A library a project still names in its stored configuration is IN USE: the delete
+        // is refused and NOTHING is written, so the library stays ACTIVE for the projects
+        // configured with it. Read under the same store guard as the acceptance below, so no
+        // project can be created against a library this call is releasing. The rule and the
+        // sentence live with the deletion state (`crate::state::library_deletion`).
+        if let Some(refusal) = store.library_reference_refusal(&input.library_arn) {
+            return Err(
+                DeleteDataAutomationLibraryErrorModeled::ValidationException(refusal).into(),
+            );
+        }
 
         // The delete is `@idempotent`: accepting it again leaves the library with the due
         // instant the FIRST delete set, so repeating the call cannot postpone a removal.
         let accepted = store
             .accept_library_deletion(&input.library_arn, now)
-            .ok_or_else(|| {
-                DeleteDataAutomationLibraryErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::LIBRARY_ARN_NOT_FOUND_MESSAGE.to_string()),
-                    },
-                )
-            })?;
+            .ok_or_else(library_not_found)?;
 
         // Answered from the record that is now PERSISTED, so the status this call reports is
         // the one a read of the library reports until the removal settles.

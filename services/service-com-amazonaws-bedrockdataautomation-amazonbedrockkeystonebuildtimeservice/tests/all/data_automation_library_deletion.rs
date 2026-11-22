@@ -9,13 +9,15 @@
 //! `ResourceNotFoundException` (HTTP 404) with the service's fixed sentence, a listing no
 //! longer enumerates it, the ingestion jobs submitted against it are gone with it, and the
 //! `libraryName` it held is free for another create. A delete of a library that is not there
-//! is that same 404.
+//! is that same 404. A library a DataAutomationProject still references is not released at
+//! all: that delete is the modelled `ValidationException` (HTTP 400) and writes nothing.
 //!
 //! The suites are TABLE-driven along what the rule generalises over: the operation a
 //! released library is addressed through, the number of libraries in the store, whether the
-//! library carried ingestion jobs, and how many times the `@idempotent` delete is called.
-//! Nothing here asserts on elapsed time: a case that waits for the settling polls the
-//! CONDITION — the 404 — under a deadline far larger than the span.
+//! library carried ingestion jobs, how many times the `@idempotent` delete is called, and
+//! which library each project of the store references. Nothing here asserts on elapsed time:
+//! a case that waits for the settling polls the CONDITION — the 404 — under a deadline far
+//! larger than the span.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -110,6 +112,154 @@ async fn create_library(router: &MultiServiceRouter, name: &str) -> String {
 /// `GetDataAutomationLibrary`.
 async fn get_library(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     call(router, "POST", &library_uri(arn), &json!({})).await
+}
+
+/// One project's path, as `GetDataAutomationProject` (POST), `UpdateDataAutomationProject`
+/// (PUT) and `DeleteDataAutomationProject` (DELETE) all bind it.
+fn project_uri(arn: &str) -> String {
+    format!("/data-automation-projects/{}/", encode_label(arn))
+}
+
+/// A project request body: the members `CreateDataAutomationProject` and
+/// `UpdateDataAutomationProject` both require, plus the library references handed in. A body
+/// for no reference at all carries no `dataAutomationLibraryConfiguration` member, which is
+/// what a project that references nothing is created — and updated — with.
+fn project_body(name: Option<&str>, libraries: &[String]) -> Value {
+    let mut body = json!({ "standardOutputConfiguration": {} });
+    if let Some(name) = name {
+        body["projectName"] = json!(name);
+    }
+    if !libraries.is_empty() {
+        body["dataAutomationLibraryConfiguration"] = json!({
+            "libraries": libraries
+                .iter()
+                .map(|arn| json!({ "libraryArn": arn }))
+                .collect::<Vec<Value>>(),
+        });
+    }
+    body
+}
+
+/// `CreateDataAutomationProject` referencing `libraries`; returns the `projectArn` it minted.
+async fn create_project(
+    router: &MultiServiceRouter,
+    name: &str,
+    libraries: &[String],
+) -> String {
+    let (status, payload) = call(
+        router,
+        "PUT",
+        "/data-automation-projects/",
+        &project_body(Some(name), libraries),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {name:?}: expected CreateDataAutomationProject 201, got {status} with {payload:?}"
+    );
+    string_at(&payload, "projectArn", name)
+}
+
+/// `UpdateDataAutomationProject`, re-specifying the project's library references as
+/// `libraries` — an update that names none leaves the project referencing nothing.
+async fn update_project(
+    router: &MultiServiceRouter,
+    arn: &str,
+    libraries: &[String],
+    case: &str,
+) {
+    let (status, payload) = call(
+        router,
+        "PUT",
+        &project_uri(arn),
+        &project_body(None, libraries),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected UpdateDataAutomationProject 200, got {status} with {payload:?}"
+    );
+}
+
+/// `DeleteDataAutomationProject`.
+async fn delete_project(router: &MultiServiceRouter, arn: &str, case: &str) {
+    let (status, payload) = call(router, "DELETE", &project_uri(arn), &json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected DeleteDataAutomationProject 200, got {status} with {payload:?}"
+    );
+}
+
+/// Assert that a delete of `arn` was refused as the in-use ValidationException, and that the
+/// refusal performed NOTHING: the library still reads ACTIVE and no removal is owed for it.
+async fn assert_referenced_refusal(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    arn: &str,
+    case: &str,
+) {
+    let (status, payload) = delete_library(router, arn).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {payload:?}"
+    );
+    assert_eq!(
+        error_code(&payload),
+        "ValidationException",
+        "case {case:?}: expected a ValidationException, got {payload:?}"
+    );
+    assert_eq!(
+        payload.get("message").and_then(Value::as_str),
+        Some(state::library_deletion::LIBRARY_REFERENCED_MESSAGE),
+        "case {case:?}: expected {:?}, got {payload:?}",
+        state::library_deletion::LIBRARY_REFERENCED_MESSAGE
+    );
+
+    let (status, read) = get_library(router, arn).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the refused library must still read back, got {status} with {read:?}"
+    );
+    assert_eq!(
+        read.get("library")
+            .and_then(|library| library.get("status"))
+            .and_then(Value::as_str),
+        Some(state::LIBRARY_ACTIVE),
+        "case {case:?}: expected the library left at {:?}, got {read:?}",
+        state::LIBRARY_ACTIVE
+    );
+
+    let store = engine.state::<ServiceState>();
+    let held = store.lock();
+    let owed = held
+        .libraries
+        .get(arn)
+        .unwrap_or_else(|| panic!("case {case:?}: the refused library must still be stored"))
+        .deletion_due;
+    assert!(
+        owed.is_none(),
+        "case {case:?}: a refused delete must owe no removal, got {owed:?}"
+    );
+}
+
+/// Assert that a delete of `arn` was accepted and answers the modelled DELETING status.
+async fn assert_delete_accepted(router: &MultiServiceRouter, arn: &str, case: &str) {
+    let (status, payload) = delete_library(router, arn).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with {payload:?}"
+    );
+    assert_eq!(
+        payload.get("libraryArn").and_then(Value::as_str),
+        Some(arn),
+        "case {case:?}: expected the ARN it was handed, got {payload:?}"
+    );
+    assert_eq!(
+        payload.get("status").and_then(Value::as_str),
+        Some(state::library_deletion::LIBRARY_DELETING),
+        "case {case:?}: expected {:?}, got {payload:?}",
+        state::library_deletion::LIBRARY_DELETING
+    );
 }
 
 /// `DeleteDataAutomationLibrary`.
@@ -484,4 +634,109 @@ async fn repeating_the_delete_answers_the_same_acceptance() {
         "case \"the store\": expected no record left, store holds {:?}",
         held.libraries.keys().collect::<Vec<_>>()
     );
+}
+
+/// RULE: a library a DataAutomationProject still names in its stored configuration is IN USE
+/// — the delete is refused with the modelled `ValidationException` (HTTP 400) and the
+/// service's fixed sentence, and performs nothing: the library still reads `ACTIVE` and owes
+/// no removal. Once nothing refers to it any more the identical delete is accepted.
+///
+/// The rows differ along WHICH library each project of the store references and HOW MANY
+/// projects reference the target: the target from one project, from two, beside a project
+/// that references another library, another library only, no library at all, and no project
+/// at all — so the refusal follows from "some project references it" rather than from one
+/// configuration's shape. A project references at most ONE library
+/// (`smithy_query(query="shape",shape="DataAutomationLibraryConfiguration")`: `libraries` is
+/// `@length(min: 0, max: 1)`), which is why the rows vary the projects rather than the list.
+#[tokio::test]
+async fn deleting_a_library_a_project_references_is_refused() {
+    // (case, how many libraries the store holds, the library indices each project references,
+    //  whether anything still references the target — library #0)
+    let rows: [(&str, usize, &[&[usize]], bool); 6] = [
+        ("one project naming it", 1, &[&[0]], true),
+        ("two projects both naming it", 1, &[&[0], &[0]], true),
+        (
+            "one project naming it beside one naming another library",
+            2,
+            &[&[0], &[1]],
+            true,
+        ),
+        ("one project naming another library only", 2, &[&[1]], false),
+        ("one project naming no library at all", 1, &[&[]], false),
+        ("no project at all", 1, &[], false),
+    ];
+    for (case, libraries, references, referenced) in rows {
+        let (router, engine) = emulator();
+        let mut arns: Vec<String> = Vec::new();
+        for index in 0..libraries {
+            arns.push(create_library(&router, &format!("in_use_library_{index}")).await);
+        }
+        let mut projects: Vec<String> = Vec::new();
+        for (index, named) in references.iter().enumerate() {
+            let named_arns: Vec<String> = named.iter().map(|at| arns[*at].clone()).collect();
+            projects
+                .push(create_project(&router, &format!("in-use-project-{index}"), &named_arns).await);
+        }
+
+        let target = arns[0].clone();
+        if referenced {
+            assert_referenced_refusal(&router, &engine, &target, case).await;
+            // The reference is let go of on the PROJECT side, and from that instant the
+            // identical delete is accepted.
+            for (index, project) in projects.iter().enumerate() {
+                delete_project(&router, project, &format!("{case}: referrer #{index}")).await;
+            }
+        }
+        assert_delete_accepted(&router, &target, case).await;
+        // Every other library of the store is untouched by the delete of this one.
+        for (index, other) in arns.iter().enumerate().skip(1) {
+            let (status, read) = get_library(&router, other).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: library #{index} must be untouched, got {status} with {read:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the references that decide the refusal are the ones the project's stored
+/// configuration carries RIGHT NOW, so an `UpdateDataAutomationProject` that acquires a
+/// reference starts refusing the delete and one that lets go of it stops.
+#[tokio::test]
+async fn an_update_of_the_project_decides_whether_the_library_can_be_deleted() {
+    // (case, the library the project references before the update, the one it references
+    //  after it — by index, the target being library #0 — and whether the target is still
+    //  referenced once the update has been applied)
+    let rows: [(&str, &[usize], &[usize], bool); 4] = [
+        ("the update acquires the reference", &[1], &[0], true),
+        ("the update keeps the reference", &[0], &[0], true),
+        (
+            "the update hands the reference to another library",
+            &[0],
+            &[1],
+            false,
+        ),
+        ("the update names no library at all", &[0], &[], false),
+    ];
+    for (case, before, after, referenced) in rows {
+        let (router, engine) = emulator();
+        let target = create_library(&router, "update_referenced_target").await;
+        let other = create_library(&router, "update_referenced_other").await;
+        let arns = [target.clone(), other.clone()];
+        let referenced_before: Vec<String> = before.iter().map(|at| arns[*at].clone()).collect();
+        let project = create_project(&router, "update-referrer", &referenced_before).await;
+        if before.contains(&0) {
+            assert_referenced_refusal(&router, &engine, &target, &format!("{case}: before it"))
+                .await;
+        }
+
+        let referenced_after: Vec<String> = after.iter().map(|at| arns[*at].clone()).collect();
+        update_project(&router, &project, &referenced_after, case).await;
+
+        if referenced {
+            assert_referenced_refusal(&router, &engine, &target, case).await;
+        } else {
+            assert_delete_accepted(&router, &target, case).await;
+        }
+    }
 }

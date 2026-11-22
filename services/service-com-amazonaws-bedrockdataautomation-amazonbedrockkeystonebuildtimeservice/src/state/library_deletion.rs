@@ -18,6 +18,15 @@
 //! due instant the FIRST delete set: a caller cannot postpone a settling deletion by asking
 //! for it again.
 //!
+//! RULE. A library that is still IN USE is not released at all: while any DataAutomationProject
+//! of this account names it in its stored configuration
+//! ([`super::DataAutomationProjectRecord::library_references`]), the delete is refused with the
+//! modelled `ValidationException` (HTTP 400) and [`LIBRARY_REFERENCED_MESSAGE`], and the
+//! library is left exactly as it was — still `ACTIVE`, with no removal owed — so the referring
+//! projects keep resolving the library they were configured with. The reference is dropped by
+//! the project side (a project deleted, or updated to a configuration that no longer names the
+//! library), and from that instant the identical delete is accepted.
+//!
 //! Single-homed here because every operation that resolves a `libraryArn` has to agree about
 //! which libraries still exist: two readings of that are two answers about one library
 //! waiting to drift.
@@ -26,6 +35,7 @@ use std::time::{Duration, SystemTime};
 
 use super::ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState as ServiceState;
 use super::DataAutomationLibraryRecord;
+use crate::ops::types::ValidationException;
 
 /// The status a library reports between the delete that was accepted for it and the removal
 /// that delete owes.
@@ -43,6 +53,16 @@ pub const LIBRARY_DELETING: &str = "DELETING";
 /// after the delete still observes `DELETING`, so the transient status the model declares is
 /// never skipped.
 pub const LIBRARY_DELETION_SPAN: Duration = Duration::from_secs(3);
+
+/// What a delete of a library a project still references answers.
+///
+/// RECORDED behaviour, and entirely FIXED text: the sentence names neither the library nor any
+/// referring project, interpolates no count and reads nothing from state — so it is spelled
+/// here once and never formatted. The model states no cross-resource rule of its own, which is
+/// why the words and the 400 come from the recording.
+pub const LIBRARY_REFERENCED_MESSAGE: &str = "Unable to delete the library as it is being \
+     referenced by some project. You must remove it from all referring projects before you can \
+     delete the library.";
 
 impl ServiceState {
     /// Accept a delete of the library `library_arn` names, as of `now`: the library moves to
@@ -63,6 +83,43 @@ impl ServiceState {
             record.deletion_due = Some(now + LIBRARY_DELETION_SPAN);
         }
         Some(record)
+    }
+
+    /// Every project of this store whose STORED configuration still references the library
+    /// `library_arn` names, by `projectArn`.
+    ///
+    /// Read off the configuration the create or the latest update persisted — the same
+    /// references a listing's library filter narrows on — so a project stops referring exactly
+    /// when it is deleted or updated to a configuration that no longer names the library.
+    /// Served lazily, so the refusal below settles the question on the first referrer it finds.
+    pub fn projects_referencing_library<'store>(
+        &'store self,
+        library_arn: &'store str,
+    ) -> impl Iterator<Item = &'store str> + 'store {
+        self.projects
+            .values()
+            .filter(move |project| {
+                project
+                    .library_references()
+                    .any(|item| item.library_arn == library_arn)
+            })
+            .map(|project| project.project_arn.as_str())
+    }
+
+    /// The refusal a delete of `library_arn` answers while a project of this store still
+    /// references it, or `None` when nothing does.
+    ///
+    /// Handed back as the modelled shape rather than as a response, so the operation lifts it
+    /// into its OWN error channel. It carries no `fieldList`: the sentence names no input
+    /// member, so an entry invented here would report one the service does not.
+    #[must_use]
+    pub fn library_reference_refusal(&self, library_arn: &str) -> Option<ValidationException> {
+        self.projects_referencing_library(library_arn)
+            .next()
+            .map(|_| ValidationException {
+                message: Some(LIBRARY_REFERENCED_MESSAGE.to_string()),
+                field_list: None,
+            })
     }
 
     /// Materialise every library removal the clock has already made due at `now`.
@@ -157,6 +214,37 @@ mod tests {
         store
     }
 
+    /// One stored project whose configuration references the library `library_arn` names, as
+    /// a create carrying a `dataAutomationLibraryConfiguration` leaves it.
+    fn referring_project(
+        project_arn: &str,
+        library_arn: &str,
+    ) -> crate::state::DataAutomationProjectRecord {
+        crate::state::DataAutomationProjectRecord {
+            project_arn: project_arn.to_string(),
+            project_name: "a_project".to_string(),
+            project_stage: crate::state::DEFAULT_PROJECT_STAGE.to_string(),
+            project_type: "ASYNC".to_string(),
+            project_description: None,
+            standard_output_configuration: None,
+            custom_output_configuration: None,
+            override_configuration: None,
+            data_automation_library_configuration: Some(
+                crate::ops::types::DataAutomationLibraryConfiguration {
+                    libraries: Some(vec![crate::ops::types::DataAutomationLibraryItem {
+                        library_arn: library_arn.to_string(),
+                    }]),
+                },
+            ),
+            creation_time: ::aws_smithy_types::DateTime::from_secs(0),
+            last_modified_time: ::aws_smithy_types::DateTime::from_secs(0),
+            kms_key_id: None,
+            kms_encryption_context: None,
+            completes_at: SystemTime::UNIX_EPOCH,
+            tags: Vec::new(),
+        }
+    }
+
     /// RULE: the delete is accepted, the library reports DELETING for the span, and from the
     /// instant the removal falls due it resolves to nothing and its name is free again.
     #[test]
@@ -216,6 +304,46 @@ mod tests {
              got {:?}",
             store.library_names.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// RULE: a library a project's stored configuration still references earns the in-use
+    /// refusal, and one nothing references does not.
+    #[test]
+    fn a_library_a_project_references_earns_the_in_use_refusal() {
+        let referenced =
+            "arn:aws:bedrock:us-east-1:000000000000:data-automation-library/abcdefabcdef";
+        let free = "arn:aws:bedrock:us-east-1:000000000000:data-automation-library/0123456789ab";
+        let mut store = store_with(referenced, "a_library");
+        store.libraries.insert(free.to_string(), library(free, "a_free_library"));
+        let project_arn =
+            "arn:aws:bedrock:us-east-1:000000000000:data-automation-project/abcdefabcdef";
+        store.projects.insert(
+            project_arn.to_string(),
+            referring_project(project_arn, referenced),
+        );
+
+        // (case, the library asked about, the projects expected to refer to it)
+        let rows: [(&str, &str, Vec<&str>); 2] = [
+            ("the referenced library", referenced, vec![project_arn]),
+            ("a library nothing references", free, Vec::new()),
+        ];
+        for (case, library_arn, expected) in rows {
+            let mut referrers: Vec<&str> = store.projects_referencing_library(library_arn).collect();
+            referrers.sort_unstable();
+            assert_eq!(
+                referrers, expected,
+                "case {case:?}: expected the referrers {expected:?}, got {referrers:?}"
+            );
+            let refusal = store
+                .library_reference_refusal(library_arn)
+                .and_then(|refusal| refusal.message);
+            let expected_message =
+                (!expected.is_empty()).then(|| LIBRARY_REFERENCED_MESSAGE.to_string());
+            assert_eq!(
+                refusal, expected_message,
+                "case {case:?}: expected {expected_message:?}, got {refusal:?}"
+            );
+        }
     }
 
     /// RULE: repeating the `@idempotent` delete keeps the due instant the first one set.
