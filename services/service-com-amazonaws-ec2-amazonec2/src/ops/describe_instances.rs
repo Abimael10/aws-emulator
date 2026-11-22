@@ -183,7 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             decode_page_token, filter_name_supported, instance_region,
             max_results_below_published_minimum, page_from_cursor, request_region,
-            require_decoded_instance_record, require_service_state, CompiledFilter, MatchBudget,
+            require_decoded_instance_ids, require_decoded_instance_record, require_service_state,
+            CompiledFilter, MatchBudget,
             PageTokenRule, ReservationView, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
             MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
         };
@@ -293,6 +294,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.materialize_due_transitions();
 
+        // Every id the request names is checked against the FORM this service issues before
+        // any of them is resolved, so an id it cannot read is refused as malformed wherever it
+        // sits among ids that merely name no instance.
+        require_decoded_instance_ids(&store, &requested_ids)?;
         for instance_id in &requested_ids {
             // A long-form id this service never issued is one it cannot decode, which is
             // the malformed half; a short-form id it holds no instance for is the

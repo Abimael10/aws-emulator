@@ -149,6 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
             MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS, decode_page_token, encode_page_token,
             invalid_pagination_token_for, matches_every_filter, require_known_instance,
+            require_well_formed_instance_ids,
             require_service_state,
         };
 
@@ -249,7 +250,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The IDs of the instances for which to describe application status": an id that
         // names no instance of the account is an error, not an absent row — a malformed
-        // one before an unknown one.
+        // one before an unknown one, and the FORM of every id the request names is read
+        // before any of them is resolved, so a value this service cannot read as an instance
+        // id is refused as malformed wherever it sits among ids that name no instance.
+        require_well_formed_instance_ids(&requested_ids)?;
         for instance_id in &requested_ids {
             require_known_instance(&store, instance_id)?;
         }

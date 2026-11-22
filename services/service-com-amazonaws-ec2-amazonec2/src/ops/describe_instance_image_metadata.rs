@@ -183,7 +183,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, PageTokenRule,
             decode_page_token, instance_region, invalid_pagination_token,
             matches_every_filter, page_from_cursor, request_region,
-            require_decoded_instance_record_fully_worded, require_service_state,
+            require_decoded_instance_ids, require_decoded_instance_record_fully_worded,
+            require_service_state,
         };
 
         // EC2 is a REGIONAL service: the instances this report covers are the ones of the
@@ -274,6 +275,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // sentence with a full stop where the describes beside it do not). An instance of
         // ANOTHER Region names no instance here, EC2 being reached through a regional
         // endpoint.
+        // Every id the request names is checked against the FORM this service issues before
+        // any of them is resolved, so an id it cannot read is refused as malformed wherever it
+        // sits among ids that merely name no instance.
+        require_decoded_instance_ids(&store, requested_ids)?;
         for instance_id in requested_ids {
             let instance = require_decoded_instance_record_fully_worded(
                 &store,

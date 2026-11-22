@@ -341,9 +341,86 @@ pub fn instance_id_filter_value_is_readable(
     store: &ComAmazonawsEc2Amazonec2State,
     value: &str,
 ) -> bool {
-    instance_id_is_well_formed(value)
-        && !long_form_identifier(value)
+    instance_id_decodes_as_one(store, value)
+}
+
+/// Whether the service's id DECODER can READ `instance_id` at all: the value is inside one of
+/// the two published forms ([`instance_id_is_well_formed`]) and — for the LONG form, which EC2
+/// hands out as an OBFUSCATED identifier — it carries an identifier this service has issued
+/// rather than one merely spelled in that form.
+///
+/// The ONE statement of the MALFORMED half the decoding readers answer, so the per-id resolver
+/// ([`require_decoded_instance_record_fully_worded`]), the whole-list check a describe makes
+/// before it resolves anything ([`require_decoded_instance_ids_worded`]) and the filter-value
+/// parser ([`instance_id_filter_value_is_readable`]) cannot disagree about which values this
+/// service can read as an instance id.
+pub fn instance_id_decodes_as_one(
+    store: &ComAmazonawsEc2Amazonec2State,
+    instance_id: &str,
+) -> bool {
+    instance_id_is_well_formed(instance_id)
+        && !long_form_identifier(instance_id)
             .is_some_and(|identifier| identifier > u128::from(store.next_instance))
+}
+
+/// Refuse the first id of `instance_ids` this service cannot READ, BEFORE any id of the
+/// request is RESOLVED.
+///
+/// A request's resource ids are checked against the form the service issues as a WHOLE, and
+/// only then resolved: syntax is a fact of the request, where existence is a fact of the
+/// account, so an id the service cannot decode is answered as malformed wherever it sits
+/// among ids that merely name nothing. Resolving id by id instead would report the first id
+/// that is absent and hand a caller a `NotFound` — which reads as eventual consistency, and so
+/// as worth retrying — for a request that can never succeed.
+///
+/// The MALFORMED sentence is the caller's to choose, for the reason
+/// [`require_decoded_instance_record_worded`] states: EC2's per-operation validators do not
+/// agree about how they word an id they cannot read, so the RULE lives here once.
+///
+/// WHICH values an operation can read as an instance id is the reading it was recorded taking
+/// ([`instance_id_reads_as_one`]), so the reading is passed in as `readable` and the ORDER
+/// stays here once: the readers that DECODE a long-form id pass
+/// [`instance_id_decodes_as_one`], the ones that LOOK an id UP pass the id FORM alone.
+pub fn require_readable_instance_ids_worded<E>(
+    instance_ids: &[String],
+    readable: impl Fn(&str) -> bool,
+    malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    match instance_ids
+        .iter()
+        .find(|instance_id| !readable(instance_id))
+    {
+        Some(unreadable) => Err(malformed(unreadable)),
+        None => Ok(()),
+    }
+}
+
+/// [`require_readable_instance_ids_worded`] for the describes that DECODE a long-form id
+/// before any lookup ([`require_decoded_instance_record`]), worded the way they word a value
+/// they cannot read ([`crate::scaffolded::Scaffolded::invalid_instance_id_malformed`]).
+pub fn require_decoded_instance_ids<E>(
+    store: &ComAmazonawsEc2Amazonec2State,
+    instance_ids: &[String],
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    require_readable_instance_ids_worded(
+        instance_ids,
+        |instance_id| instance_id_decodes_as_one(store, instance_id),
+        crate::scaffolded::Scaffolded::invalid_instance_id_malformed,
+    )
+}
+
+/// [`require_readable_instance_ids_worded`] for the describes that LOOK an id UP rather than
+/// decoding it ([`require_known_instance`]): only a value outside the FORM EC2 issues is
+/// unreadable there, and the sentence is the one those operations answer
+/// ([`crate::scaffolded::Scaffolded::instance_id_is_malformed`]).
+pub fn require_well_formed_instance_ids<E>(
+    instance_ids: &[String],
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    require_readable_instance_ids_worded(
+        instance_ids,
+        instance_id_is_well_formed,
+        crate::scaffolded::Scaffolded::instance_id_is_malformed,
+    )
 }
 
 /// Refuse an instance id the request named that this service cannot resolve: a
@@ -465,9 +542,7 @@ pub fn require_decoded_instance_record_fully_worded<'store, E>(
     malformed: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
     not_found: impl Fn(&str) -> crate::scaffolded::Scaffolded<E>,
 ) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
-    if long_form_identifier(instance_id)
-        .is_some_and(|identifier| identifier > u128::from(store.next_instance))
-    {
+    if !instance_id_decodes_as_one(store, instance_id) {
         return Err(malformed(instance_id));
     }
     require_instance_record_fully_worded(store, instance_id, malformed, not_found)

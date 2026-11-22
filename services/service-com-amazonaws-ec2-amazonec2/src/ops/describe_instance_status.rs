@@ -181,7 +181,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             decode_page_token, instance_region, instance_status_filter_supported,
             instance_status_filter_values, max_results_below_published_minimum, page_from_cursor,
-            request_region, require_decoded_instance_record, require_service_state, CompiledFilter,
+            request_region, require_decoded_instance_ids, require_decoded_instance_record,
+            require_service_state, CompiledFilter,
             InstanceStateName, MatchBudget, PageTokenRule, MAX_FILTERS, MAX_FILTER_MATCH_STEPS,
             MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
         };
@@ -202,11 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "You cannot specify this parameter and the instance IDs parameter in the same
         // request" (`$MaxResults`), refused through the one template this service words that
-        // pair with, naming the two parameters the way this operation's wire form spells
-        // them.
+        // pair with, naming the two parameters the way this operation's OWN recorded refusal
+        // spells them: the wire set name of its id list and the wire spelling of its page
+        // size, which are not the spellings the describe beside it uses for the same pair.
         if !requested_ids.is_empty() && input.max_results.is_some() {
             return Err(crate::state::parameters_cannot_be_combined(
-                "instancesSet",
+                "instanceIdsSet",
                 "maxResults",
             ));
         }
@@ -281,6 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.materialize_due_transitions();
         let now = ::std::time::SystemTime::now();
 
+        // Every id the request names is checked against the FORM this service issues before
+        // any of them is resolved, so an id it cannot read is refused as malformed wherever it
+        // sits among ids that merely name no instance.
+        require_decoded_instance_ids(&store, &requested_ids)?;
         for instance_id in &requested_ids {
             // A long-form id this service never issued is one it cannot decode, which is the
             // malformed half; a short-form id it holds no instance for is the not-found half.
