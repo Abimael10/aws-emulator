@@ -9,13 +9,14 @@
 //! was applied to reports the map with nothing in it that it projected to, and only a key
 //! holding no item reports no member at all.
 //!
-//! A TRANSACTIONAL read answers the same two facts in its own envelope: what it reports is
-//! the `ItemResponse` object, which carries an `Item` for every item its get FOUND — "if a
-//! requested item could not be retrieved, the corresponding ItemResponse object is Null, or
-//! if the requested item has no projected attributes, the corresponding ItemResponse object
-//! is an empty Map" (`TransactGetItems$Responses`) — so a get whose projection matched
-//! nothing answers the `Item` it projected to, which is the empty map, and only a get that
-//! retrieved no item answers the `ItemResponse` with no member in it.
+//! A TRANSACTIONAL read answers those two facts in ONE object instead: what it reports is
+//! the `ItemResponse`, which carries "a Map of the name-value pairs that are the projected
+//! attributes of the requested item" — "if a requested item could not be retrieved, the
+//! corresponding ItemResponse object is Null, or if the requested item has no projected
+//! attributes, the corresponding ItemResponse object is an empty Map"
+//! (`TransactGetItems$Responses`) — so a get that retrieved no item and a get whose
+//! projection matched nothing both answer the empty `ItemResponse`, with no `Item` member in
+//! it, while the single-item reader answers the one with the member and the other without.
 //!
 //! The rows span what the rule generalises over: the FORM of the projection that matched
 //! nothing (an attribute the item does not hold, that attribute reached through an alias, a
@@ -276,7 +277,7 @@ async fn the_legacy_projection_member_reports_that_item_the_same_way() {
 }
 
 #[tokio::test]
-async fn an_element_of_a_transactional_read_reports_it_the_same_way() {
+async fn an_element_of_a_transactional_read_states_both_facts_in_one_object() {
     let router = seeded().await;
 
     for row in rows() {
@@ -288,11 +289,14 @@ async fn an_element_of_a_transactional_read_reports_it_the_same_way() {
             row.case
         );
         let reported = read["Responses"][0].get("Item").cloned();
-        // The `ItemResponse` carries the item its get FOUND, so the member is there for
-        // every such get: the map the single-item reader reports with nothing in it is the
-        // `Item` of the empty map here, and only a get that retrieved no item answers an
-        // `ItemResponse` with no member in it.
-        let expected = row.reported.clone();
+        // The `ItemResponse` carries the projected pairs its get came to, and states having
+        // none as the object with nothing in it: the map the single-item reader reports as
+        // its empty `Item` is the empty `ItemResponse` here, and so is a get that retrieved
+        // no item at all.
+        let expected = row
+            .reported
+            .clone()
+            .filter(|item| item.as_object().is_some_and(|pairs| !pairs.is_empty()));
         assert_eq!(
             reported, expected,
             "case {:?} (TransactGetItems): expected {expected:?}, got {read}",
@@ -301,8 +305,8 @@ async fn an_element_of_a_transactional_read_reports_it_the_same_way() {
         assert_eq!(
             read["Responses"][0].as_object().map(serde_json::Map::len),
             Some(usize::from(expected.is_some())),
-            "case {:?} (TransactGetItems): only a get that retrieved no item answers the \
-             empty ItemResponse, got {read}",
+            "case {:?} (TransactGetItems): a get with no projected pair answers the empty \
+             ItemResponse, got {read}",
             row.case
         );
     }

@@ -3,13 +3,14 @@
 //! What ONE element of a transactional read reports, driven end to end.
 //!
 //! RULE under test: an `ItemResponse` carries the PROJECTED ATTRIBUTES of the item its `Get`
-//! FOUND, so whether it carries an `Item` at all is decided by whether that get retrieved an
-//! item — "if a requested item could not be retrieved, the corresponding ItemResponse object
-//! is Null, or if the requested item has no projected attributes, the corresponding
-//! ItemResponse object is an empty Map" (`TransactGetItems$Responses`). A key that holds no
-//! item answers the empty `ItemResponse`, with no `Item` member in it, while a projection
-//! that named no location of the item it FOUND answers the `Item` it projected to, which is
-//! the empty map.
+//! FOUND, and states the absence of any such attribute as the object with nothing in it —
+//! "if a requested item could not be retrieved, the corresponding ItemResponse object is
+//! Null, or if the requested item has no projected attributes, the corresponding
+//! ItemResponse object is an empty Map" (`TransactGetItems$Responses`). So a key that holds
+//! no item and a projection that named no location of the item it FOUND are answered the
+//! same way: the empty `ItemResponse`, with no `Item` member in it. The member is there only
+//! where the get came to at least one projected pair, so a client testing for it reads
+//! "there are attributes here" rather than "the item exists".
 //!
 //! The rows differ along what the rule generalises over:
 //!
@@ -83,7 +84,8 @@ fn get(partition: &str, expression: &str, names: Value) -> Value {
 }
 
 /// One row: the case, the element, and the `Item` the element must report — `None` where the
-/// `ItemResponse` must be the empty object, which is only where the get retrieved no item.
+/// `ItemResponse` must be the empty object, which is where the get came to no projected pair
+/// at all: a key holding no item, and a projection that named nothing of the item it found.
 struct Row {
     case: &'static str,
     element: Value,
@@ -96,32 +98,32 @@ fn rows() -> Vec<Row> {
         Row {
             case: "an attribute the item does not hold",
             element: get("seed", "absent", Value::Null),
-            reported: Some(json!({})),
+            reported: None,
         },
         Row {
             case: "that attribute behind an alias",
             element: get("seed", "#a", json!({"#a": "absent"})),
-            reported: Some(json!({})),
+            reported: None,
         },
         Row {
             case: "a path into a map that holds nothing there",
             element: get("seed", "doc.gap", Value::Null),
-            reported: Some(json!({})),
+            reported: None,
         },
         Row {
             case: "a path past the end of a stored list",
             element: get("seed", "parts[9]", Value::Null),
-            reported: Some(json!({})),
+            reported: None,
         },
         Row {
             case: "a path through a scalar, which holds no member",
             element: get("seed", "note.gap", Value::Null),
-            reported: Some(json!({})),
+            reported: None,
         },
         Row {
             case: "several paths that all name nothing",
             element: get("seed", "absent, doc.gap, parts[9]", Value::Null),
-            reported: Some(json!({})),
+            reported: None,
         },
         Row {
             case: "a key that holds no item",
@@ -162,7 +164,7 @@ fn response_at(answered: &Value, at: usize) -> Value {
 }
 
 #[tokio::test]
-async fn an_item_response_carries_an_item_for_every_get_that_retrieved_one() {
+async fn an_item_response_carries_an_item_only_where_a_pair_was_projected() {
     let router = seeded().await;
 
     for row in rows() {
@@ -186,8 +188,9 @@ async fn an_item_response_carries_an_item_for_every_get_that_retrieved_one() {
             row.case,
             row.reported
         );
-        // Only a get that retrieved NO item answers the empty ItemResponse; a get whose
-        // projection matched nothing answers the `Item` it projected to.
+        // The empty ItemResponse is the answer to both facts that leave a get with no
+        // projected pair: a key holding no item, and a projection that named nothing of the
+        // item it found.
         let expected_members = usize::from(row.reported.is_some());
         assert_eq!(
             response.as_object().map(serde_json::Map::len),

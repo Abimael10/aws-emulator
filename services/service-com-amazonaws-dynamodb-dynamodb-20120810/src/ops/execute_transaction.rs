@@ -640,7 +640,14 @@ fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         ));
         *per_table.entry(name.clone()).or_default() += units;
         responses.push(ItemResponse {
-            item: found.map(|item| crate::state::project_item(&item, select.projection.as_ref())),
+            // What a statement reports is the `ItemResponse` object, which carries the
+            // projected pairs the read came to and states both of the facts that leave it
+            // with none — no item at the key, and a projection that named nothing of the
+            // item it found — as the object with nothing in it
+            // ([`crate::state::item_response_item`]).
+            item: crate::state::item_response_item(
+                found.map(|item| crate::state::project_item(&item, select.projection.as_ref())),
+            ),
         });
     }
     // The read capacity each table is provisioned for bounds a PartiQL read transaction

@@ -1096,6 +1096,13 @@ fn rendered_key_schema(elements: &[KeySchemaElement]) -> String {
 /// scalar type — "The attributes in KeySchema must also be defined in the
 /// AttributeDefinitions array" (`CreateTable$KeySchema`).
 ///
+/// The SCHEMA the table would be created on is settled first — every element paired with
+/// the definition it keys on, the type that definition states, the two key roles distinct
+/// and the elements in the order their roles require — and only then the declared list's
+/// own defects: a name it defines twice and a definition no schema of the table uses. So a
+/// request that gets both wrong is told about the key schema, which is what the table could
+/// not be built from, rather than about the declaration it draws its types from.
+///
 /// [`DeclaredTable::clamped`] has already bounded every list this walks.
 pub fn validated_key_schema(
     declared: &DeclaredTable<'_>,
@@ -1107,10 +1114,6 @@ pub fn validated_key_schema(
         ));
     }
     let definitions = declared.attribute_definitions.to_vec();
-    // Two entries defining the same attribute state two types for one attribute of the
-    // item, which is a defect of the DECLARED list itself rather than of any schema that
-    // draws on it ([`check_distinct_definitions`]).
-    check_distinct_definitions(&definitions)?;
     if key_schema.len() > crate::state::MAX_TABLE_KEY_ELEMENTS {
         // The LIST itself is what broke a bound here — a primary key may carry one
         // partition key and at most one sort key, so a longer list is outside the length
@@ -1206,6 +1209,14 @@ pub fn validated_key_schema(
     // with nothing declared for it has no attribute to key on at all, which is the earlier
     // defect of the two.
     validated_key_type_order(None, &key_schema, crate::state::MAX_TABLE_PARTITION_KEYS)?;
+    // The key schema the table is created ON is settled above; what is left are the defects
+    // of the DECLARED list itself, which is a different member and is read only once the
+    // schema drawing on it holds together. Two entries defining the same attribute state two
+    // types for one attribute of the item ([`check_distinct_definitions`]), and an entry no
+    // schema of the table uses is declared for nothing (below) — so a request that gets both
+    // its key schema and its declaration wrong is told about the SCHEMA, which is what the
+    // table could not be built from.
+    check_distinct_definitions(&definitions)?;
     for definition in &definitions {
         // "Some AttributeDefinitions are not used in any KeySchema": every defined
         // attribute must be consumed by a schema of the table — its own key, the key of
