@@ -542,6 +542,14 @@ pub fn encode_page_token(kind: &str, offset: usize) -> String {
 /// The offset a `nextToken` carries, or `None` when the token does not even
 /// have the FORM [`encode_page_token`] gives a token of this `kind`.
 ///
+/// Having that form means being the very bytes [`encode_page_token`] renders
+/// for the offset the token carries, which is what the re-encoding below
+/// decides: a decoding that merely *reads back* as an offset is not enough,
+/// because both the hex layer and `usize`'s `FromStr` accept spellings the
+/// issuer can never emit (upper-case hex digits, leading zeros, a leading
+/// `+`). Those spellings name a cursor no page ever handed out, so they are
+/// refused exactly like a token of the other listing or of no listing at all.
+///
 /// The form is only half of "was this token issued": the offset it carries has
 /// to be one the issuer could have produced too, which is what
 /// [`page_offset`] decides. Handlers go through that one, never through this.
@@ -549,7 +557,8 @@ fn decode_page_token(kind: &str, token: &str) -> Option<usize> {
     let decoded = ::hex::decode(token).ok()?;
     let text = String::from_utf8(decoded).ok()?;
     let offset = text.strip_prefix(&format!("{PAGE_TOKEN_VERSION}:{kind}:"))?;
-    offset.parse::<usize>().ok()
+    let offset = offset.parse::<usize>().ok()?;
+    (encode_page_token(kind, offset) == token).then_some(offset)
 }
 
 /// The stored-collection offset a request resumes its listing at: `0` when it

@@ -13,8 +13,14 @@
 //! every unissued token in, rather than answered as "the listing is
 //! exhausted".
 //!
-//! Both paginated operations decode through that one helper, so the table below
-//! runs against both.
+//! The FORM half is the same rule read on the token's bytes: the only tokens a
+//! listing hands out are the bytes its encoder renders, so a token that merely
+//! READS BACK as an in-range offset — through a hex layer that also accepts
+//! upper-case digits, or a numeral spelled with leading zeros or a leading `+`
+//! — names a cursor no page ever issued and is refused the same way.
+//!
+//! Both paginated operations decode through that one helper, so the tables below
+//! run against both.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::ACTIVITY_STATUS_VALUES;
@@ -87,6 +93,107 @@ async fn the_probe_tokens_are_in_the_encoding_the_service_issues() {
             "case {operation}: the token a one-row page issues must be the probe encoding for \
              offset 1, got {issued}"
         );
+    }
+}
+
+/// The spellings of one cursor that the issuer's encoding can never render,
+/// each named by what makes it non-canonical.
+///
+/// `offset` is an offset the listing really can hand out, so the only thing that
+/// makes each row unissued is its SPELLING: the decimal tail's (a leading zero,
+/// any number of them, a leading sign, surrounding space) and the hex layer's
+/// (digit case, which `hex::encode` always renders lower-case).
+fn non_canonical_spellings(kind: &str, offset: usize) -> Vec<(String, String)> {
+    let canonical = token(kind, &offset.to_string());
+    // Only the FIRST letter raised, so the row differs from both the canonical
+    // token and the wholly upper-case one whatever the hex digits happen to be.
+    let first_letter = canonical
+        .find(|digit: char| digit.is_ascii_alphabetic())
+        .unwrap_or_else(|| {
+            panic!("case {kind}: a hex token carries at least one letter, got {canonical}")
+        });
+    let mut mixed_case = canonical.clone();
+    mixed_case.replace_range(
+        first_letter..first_letter + 1,
+        &canonical[first_letter..first_letter + 1].to_uppercase(),
+    );
+
+    let spellings = vec![
+        ("one leading zero".to_string(), token(kind, &format!("0{offset}"))),
+        (
+            "six leading zeros".to_string(),
+            token(kind, &format!("000000{offset}")),
+        ),
+        ("a leading plus".to_string(), token(kind, &format!("+{offset}"))),
+        ("a leading space".to_string(), token(kind, &format!(" {offset}"))),
+        ("a trailing space".to_string(), token(kind, &format!("{offset} "))),
+        ("upper-case hex digits".to_string(), canonical.to_uppercase()),
+        ("mixed-case hex digits".to_string(), mixed_case),
+    ];
+
+    for (case, probe) in &spellings {
+        assert_ne!(
+            probe, &canonical,
+            "case {kind} offset {offset} with {case}: the probe must differ from the canonical \
+             token, got {probe}"
+        );
+    }
+    spellings
+}
+
+/// A token that is not the bytes the issuer renders is refused even when it
+/// reads back as an offset the listing could have handed out — and the
+/// canonical spelling of that very offset is still served, so what is refused
+/// is the spelling and not the cursor.
+#[tokio::test]
+async fn a_non_canonical_spelling_of_an_issuable_cursor_is_refused() {
+    let router = harness().0;
+
+    for (operation, items_member, kind) in PAGINATED {
+        let total = whole_collection(&router, operation, items_member)
+            .await
+            .len();
+        assert!(
+            total >= 2,
+            "case {operation}: the account must hold at least two rows for an issuable offset to \
+             exist, got {total}"
+        );
+
+        // The one wording this service refuses an unissued token in, taken from
+        // a token that is not even hex.
+        let (status, payload) = call(&router, operation, &json!({"nextToken": "not-a-token"})).await;
+        assert_eq!(
+            status, 400,
+            "case {operation}: a token that is not even hex must be refused, got {status} with \
+             {payload}"
+        );
+        let wording = text(&payload, "message");
+
+        for offset in 1..total {
+            let canonical = json!({
+                "maxResults": MAX_RESULTS_CEILING,
+                "nextToken": token(kind, &offset.to_string()),
+            });
+            let (status, payload) = call(&router, operation, &canonical).await;
+            assert_eq!(
+                status, 200,
+                "case {operation} offset {offset}: the canonical spelling of an issuable offset \
+                 must still be served, got {status} with {payload}"
+            );
+
+            for (case, probe) in non_canonical_spellings(kind, offset) {
+                let body = json!({"maxResults": MAX_RESULTS_CEILING, "nextToken": probe});
+                refused(&router, operation, &body, 400, "ValidationException").await;
+
+                let (_, payload) = call(&router, operation, &body).await;
+                assert_eq!(
+                    text(&payload, "message"),
+                    wording,
+                    "case {operation} offset {offset} with {case}: a token the issuer's encoding \
+                     cannot render must be refused in the one wording, got {payload}"
+                );
+            }
+        }
     }
 }
 
