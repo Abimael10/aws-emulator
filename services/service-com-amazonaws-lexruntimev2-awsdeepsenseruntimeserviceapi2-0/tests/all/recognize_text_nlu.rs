@@ -884,17 +884,15 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
         "the locale under test must be one that was never built, got {described:?}"
     );
 
-    // (case, the labels the turn addresses, the message the refusal carries, the
-    // message the READ of that session carries) — one row per way the addressed
-    // combination can have no built model. The two address refusals are worded
-    // differently: a `botId`/`botAliasId` pair that resolves to no alias names
-    // both ids, while a locale with no built model carries the fixed
-    // BotId/BotLocale sentence. The READ of the session resolves the SESSION
-    // alone — it interprets nothing, so it needs neither the built model nor a
-    // control-plane record behind the labels — so on every row it reports the
-    // session the refused turn never started.
-    let session_absent = "The session for user unbuilt doesn\u{2019}t exist or has expired.";
-    let rows: Vec<(&str, String, String, String)> = vec![
+    // (case, the labels the turn addresses, the message the refusal carries) —
+    // one row per way the addressed combination can have no built model. The two
+    // address refusals are worded differently: a `botId`/`botAliasId` pair that
+    // resolves to no alias names both ids, while a locale with no built model
+    // carries the fixed BotId/BotLocale sentence. The READ of that session
+    // resolves the SAME address, so on every row it carries the SAME sentence as
+    // the turn: the session behind an address Amazon Lex V2 cannot serve is never
+    // reported, as absent or otherwise.
+    let rows: Vec<(&str, String, String)> = vec![
         (
             "the bot's own locale, never built",
             format!(
@@ -902,7 +900,6 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 bot.bot_id, bot.bot_alias_id, bot.locale_id
             ),
             NOT_VALID.to_string(),
-            session_absent.to_string(),
         ),
         (
             "a bot id nothing was ever created for",
@@ -914,7 +911,6 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 "ZZZZZZZZZZ/{} is not a valid BotId/BotAliasId combination.",
                 bot.bot_alias_id
             ),
-            session_absent.to_string(),
         ),
         (
             "an alias id the bot does not have",
@@ -926,7 +922,6 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 "{}/NOSUCHALIAS is not a valid BotId/BotAliasId combination.",
                 bot.bot_id
             ),
-            session_absent.to_string(),
         ),
         (
             "a locale id the bot has no locale for",
@@ -935,11 +930,10 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 bot.bot_id, bot.bot_alias_id
             ),
             NOT_VALID.to_string(),
-            session_absent.to_string(),
         ),
     ];
 
-    for (case, path, expected_message, expected_read_message) in &rows {
+    for (case, path, expected_message) in &rows {
         let refused = emulator
             .send(
                 "POST",
@@ -965,9 +959,9 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
             refused.json()
         );
 
-        // The read of that session reports the session that is not there: it
-        // resolves the SESSION alone, so an address naming no bot, no alias of it
-        // or no locale of the version the alias points at holds no session.
+        // The read of that session resolves the same address, so it carries the
+        // same sentence: the absence of the bot address is never reported as the
+        // absence of a session.
         let read = emulator.send("GET", path, None).await;
         assert_eq!(
             read.status, 404,
@@ -977,8 +971,8 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
         );
         assert_eq!(
             at(&read.json(), "/message").as_deref(),
-            Some(expected_read_message.as_str()),
-            "case {case:?}: expected the read refused with {expected_read_message:?}, got {:?}",
+            Some(expected_message.as_str()),
+            "case {case:?}: expected the read refused with {expected_message:?}, got {:?}",
             read.json()
         );
     }

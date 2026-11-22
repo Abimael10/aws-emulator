@@ -16,6 +16,12 @@
 //! Nothing here is authored in this crate: a value this module reports was
 //! stored by the control plane, so a turn can only recognise what the client
 //! actually built.
+//!
+//! Resolving the ADDRESS — the bot/alias pair and the locale behind it — is the
+//! other half of the same reading, and every operation the four session labels
+//! address resolves it here, including the two that only report or remove the
+//! session held under those labels
+//! ([`servable_address`]).
 
 use crate::ops::types::{Button, ImageResponseCard, Message, Value};
 use crate::state::FALLBACK_INTENT;
@@ -282,13 +288,10 @@ pub enum LocaleUnavailable {
 /// model is refused: which modelled error answers it, and the sentence that
 /// error carries.
 ///
-/// Every operation that NEEDS the built model behind those labels — the two
-/// encodings of a turn and `PutSession` — resolves the SAME address, so the two
-/// refusals are worded in one place rather than in each operation's own error
-/// channel; a handler only lifts the answer into the error type its model
-/// declares. The two calls that merely read or remove a stored session resolve
-/// the session against this runtime's own store instead, so they reach none of
-/// this.
+/// EVERY operation addressed by those labels resolves the SAME address, so the
+/// two refusals are worded in one place rather than in each operation's own
+/// error channel; a handler only lifts the answer into the error type its model
+/// declares.
 #[derive(Debug, Clone)]
 pub enum AddressRefused {
     /// The modelled `ResourceNotFoundException`, with the sentence for the
@@ -317,15 +320,8 @@ impl LocaleUnavailable {
 }
 
 /// The built locale the four labels of a runtime request address, read off the
-/// control plane's store.
-///
-/// The alias is what the runtime is addressed by, and an alias points at one
-/// version of the bot, so the version whose locale is served is the alias's own
-/// — which is why the `botId`/`botAliasId` PAIR is what resolves, and an alias
-/// that is not that bot's addresses nothing. A locale is then servable only in
-/// `Built`, the status AWS documents as the one where "the bot is ready for use
-/// and can be tested using any utterance": every other status — including the
-/// `NotBuilt` a freshly created locale sits in — has no runtime model behind it.
+/// control plane's store: the address resolved by [`servable_version`], plus
+/// everything a turn interprets an utterance against.
 pub fn built_locale<Eng: Send + Sync + 'static>(
     engine: &Eng,
     bot_id: &str,
@@ -336,22 +332,11 @@ pub fn built_locale<Eng: Send + Sync + 'static>(
         lexmodels::state::service_state(engine).ok_or(LocaleUnavailable::StoreUnavailable)?;
     let mut control_plane = control_plane.lock();
 
-    let bot_version = control_plane
-        .bot_aliases
-        .get(&lexmodels::state::bot_alias_key(bot_id, bot_alias_id))
-        .map(|alias| alias.bot_version.clone())
-        .ok_or(LocaleUnavailable::UnknownBotAlias)?;
-
-    // `settled_bot_locale` applies the status transition the clock has already
-    // made due, so a build that fell due is observed here exactly as
-    // `DescribeBotLocale` observes it.
-    let locale = control_plane
+    let bot_version = servable_version(&mut control_plane, bot_id, bot_alias_id, locale_id)?;
+    let nlu_intent_confidence_threshold = control_plane
         .settled_bot_locale(bot_id, &bot_version, locale_id)
-        .ok_or(LocaleUnavailable::NotBuilt)?;
-    if locale.bot_locale_status != lexmodels::state::BOT_LOCALE_STATUS_BUILT {
-        return Err(LocaleUnavailable::NotBuilt);
-    }
-    let nlu_intent_confidence_threshold = locale.nlu_intent_confidence_threshold;
+        .ok_or(LocaleUnavailable::NotBuilt)?
+        .nlu_intent_confidence_threshold;
 
     // The locale's intents, in the order it acquired them, so what a turn
     // reports does not depend on how the store happens to hold its records.
@@ -407,6 +392,59 @@ pub fn built_locale<Eng: Send + Sync + 'static>(
         nlu_intent_confidence_threshold,
         intents,
     })
+}
+
+/// Resolve the address alone: the bot, the alias and the locale the four labels
+/// of a session call name, without copying out the model a turn is interpreted
+/// against.
+///
+/// What this answers is whether Amazon Lex V2 can serve the bot address at all —
+/// "if the bot, alias, or session identifier doesn't exist … if the locale
+/// doesn't exist or is not enabled for the alias" — which every operation
+/// addressed by those labels resolves, including the two that only report or
+/// remove the session held under them.
+pub fn servable_address<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    bot_id: &str,
+    bot_alias_id: &str,
+    locale_id: &str,
+) -> Result<(), LocaleUnavailable> {
+    let control_plane =
+        lexmodels::state::service_state(engine).ok_or(LocaleUnavailable::StoreUnavailable)?;
+    let mut control_plane = control_plane.lock();
+    servable_version(&mut control_plane, bot_id, bot_alias_id, locale_id).map(|_| ())
+}
+
+/// The bot version the addressed pair resolves to, once that version's locale is
+/// one the runtime can serve — the one place the address is resolved.
+///
+/// The alias is what the runtime is addressed by, and an alias points at one
+/// version of the bot, so the version served is the alias's own and an alias
+/// that is not that bot's addresses nothing. The locale is then servable only in
+/// `Built`, the status AWS documents as the one where "the bot is ready for use
+/// and can be tested using any utterance".
+fn servable_version(
+    control_plane: &mut lexmodels::state::ComAmazonawsLexmodelsv2Lexmodelbuildingservicev2State,
+    bot_id: &str,
+    bot_alias_id: &str,
+    locale_id: &str,
+) -> Result<String, LocaleUnavailable> {
+    let bot_version = control_plane
+        .bot_aliases
+        .get(&lexmodels::state::bot_alias_key(bot_id, bot_alias_id))
+        .map(|alias| alias.bot_version.clone())
+        .ok_or(LocaleUnavailable::UnknownBotAlias)?;
+
+    // `settled_bot_locale` applies the status transition the clock has already
+    // made due, so a build that fell due is observed here exactly as
+    // `DescribeBotLocale` observes it.
+    let locale = control_plane
+        .settled_bot_locale(bot_id, &bot_version, locale_id)
+        .ok_or(LocaleUnavailable::NotBuilt)?;
+    if locale.bot_locale_status != lexmodels::state::BOT_LOCALE_STATUS_BUILT {
+        return Err(LocaleUnavailable::NotBuilt);
+    }
+    Ok(bot_version)
 }
 
 /// The slots of `intent`, in the order Amazon Lex V2 elicits them: the order its
