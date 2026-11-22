@@ -73,7 +73,7 @@ const FQDN_EXPRESSION: &str = concat!(
 /// Policy-Min-TLS-1-2-RFC9151-FIPS-2024-08, Policy-Min-TLS-1-2-FIPS-PQ-2026-10]`
 /// (`smithy_query(query="shape",shape="TLSSecurityPolicy")`) and codegen hands the walk
 /// them sorted, so this is neither of those two orders.
-const PUBLISHED_TLS_POLICIES: [&str; 5] = [
+pub(crate) const PUBLISHED_TLS_POLICIES: [&str; 5] = [
     "Policy-Min-TLS-1-2-FIPS-PQ-2026-10",
     "Policy-Min-TLS-1-0-2019-07",
     "Policy-Min-TLS-1-2-2019-07",

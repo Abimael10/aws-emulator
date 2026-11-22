@@ -30,6 +30,16 @@
 //!    applying nothing to, and the Auto-Tune settings the service fills in.
 //! 6. `ChangeProgressStatus$TotalNumberOfStages` counts the stages that change reports.
 
+/// What every descriptor of a domain reports for the options of its ENDPOINT: not which
+/// address it publishes, but the container the service provisions the domain's endpoint
+/// with and reports whether or not the request supplied one.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself
+/// reached through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a
+/// SIBLING suite.
+#[path = "domain_descriptor_projection/endpoint_options_are_always_reported.rs"]
+mod endpoint_options_are_always_reported;
+
 use serde_json::{json, Value};
 
 use super::change_progress::LEAF_PROPERTY_BLOCKS;
