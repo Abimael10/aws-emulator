@@ -241,6 +241,11 @@ mod appsync_event_and_merged_apis;
 /// schema, its data sources, its resolvers, its pipeline functions and its API keys: created
 /// in AWS AppSync itself ([`appsync_resources`]).
 mod appsync_resources;
+/// The documents an `AWS::AppSync::*` declaration holds in Amazon S3 rather than in the
+/// template — a resolver's or a function's code, a schema's definition, a mapping template, a
+/// channel namespace's handlers — read from the object the declaration addresses and submitted
+/// as the property whose text they are ([`appsync_s3_documents`]).
+mod appsync_s3_documents;
 /// Reading a declared property document as the TYPES the owning API models its members as —
 /// the one walk every provisioning arm whose owning model types a member as a number or a
 /// boolean reaches ([`modelled_declaration`]).

@@ -1779,6 +1779,15 @@ impl Owner {
             Self::ElasticLoadBalancing(_) if code.contains(PRIORITY_IN_USE) => {
                 super::HANDLER_ERROR_ALREADY_EXISTS
             }
+            // AWS AppSync's providers read the document a declaration holds in Amazon S3
+            // themselves ([`appsync_s3_documents`]), and a read they could not make is an
+            // exception the plugin has no mapping for: the provider classified it itself, and
+            // the class it carries as its code is what it is reported under.
+            Self::AppSyncResource(_) | Self::AppSyncEventOrMergedApi(_)
+                if code == appsync_s3_documents::READ_FAILED =>
+            {
+                super::HANDLER_ERROR_SERVICE_FAILED
+            }
             // API Gateway's providers map that service's own MODELLED errors — a bad request,
             // a resource it does not hold — and nothing else: a call its CONSTRAINT layer
             // refused carries that layer's own class ([`API_GATEWAY_VALIDATION`]), which is no

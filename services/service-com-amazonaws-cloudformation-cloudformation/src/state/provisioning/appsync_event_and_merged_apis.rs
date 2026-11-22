@@ -60,8 +60,9 @@
 //! A declared property no call here carries is REFUSED rather than dropped
 //! ([`refuse_unapplied_properties`]): a resource reported created with less than its
 //! declaration asked for is the shallow success these arms exist to avoid. `CodeS3Location`
-//! is refused for the same reason — nothing here reads an Amazon S3 object, so a namespace
-//! could not be created with the handlers it names.
+//! holds the text of `CodeHandlers` in an Amazon S3 object, which is READ into that property
+//! before the create is made ([`super::appsync_s3_documents`]), so a namespace is created with
+//! the handlers it named either way.
 
 use std::collections::BTreeMap;
 
@@ -158,8 +159,8 @@ const CHANNEL_NAMESPACE_PROPERTIES: &[&str] = &[
     TAGS,
 ];
 
-/// The property naming an Amazon S3 object the handler code is held in, which nothing here
-/// fetches.
+/// The property naming an Amazon S3 object the handler code is held in, which is read into
+/// `CodeHandlers` before the create is made ([`super::appsync_s3_documents`]).
 const CODE_S3_LOCATION: &str = "CodeS3Location";
 
 /// The properties of a channel namespace that travel as the create's own members.
@@ -239,7 +240,18 @@ pub(super) async fn create(
     propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     refuse_unapplied_properties(&resource.properties, resource, properties_of(kind))?;
-    refuse_unfetched_documents(&resource.properties, resource)?;
+    let fetched = super::appsync_s3_documents::fetched(
+        ctx,
+        region,
+        &resource.properties,
+        super::appsync_s3_documents::CHANNEL_NAMESPACE_DOCUMENTS,
+    )
+    .await?
+    .map(|properties| StoredResource {
+        properties,
+        ..resource.clone()
+    });
+    let resource = fetched.as_ref().unwrap_or(resource);
     match kind {
         Kind::EventApi => create_api(ctx, region, resource, propagated).await,
         Kind::ChannelNamespace => create_channel_namespace(ctx, region, resource, propagated).await,
@@ -501,7 +513,16 @@ pub(super) async fn update(
     declared: &Value,
 ) -> Result<Option<Created>, Refusal> {
     refuse_unapplied_properties(declared, resource, properties_of(kind))?;
-    refuse_unfetched_documents(declared, resource)?;
+    // A changed declaration states its handlers the same two ways a create's does, so a
+    // reference it holds is read and applied as the property whose text it is.
+    let fetched = super::appsync_s3_documents::fetched(
+        ctx,
+        region,
+        declared,
+        super::appsync_s3_documents::CHANNEL_NAMESPACE_DOCUMENTS,
+    )
+    .await?;
+    let declared = fetched.as_ref().unwrap_or(declared);
     let held = &resource.properties;
     match kind {
         Kind::EventApi => {
@@ -880,26 +901,6 @@ fn minted(record: &Value, member: &str, operation: &str) -> Result<String, Refus
     text_member(record, member).ok_or_else(|| Refusal {
         code: UNIDENTIFIED_FAILURE.to_string(),
         message: format!("AppSync answered {operation} without a {member}"),
-    })
-}
-
-/// The refusal for a declaration that states a document this emulator does not FETCH: handler
-/// code held in Amazon S3. Nothing here reads an S3 object, so such a declaration is refused
-/// rather than created without the code it asked for.
-fn refuse_unfetched_documents(
-    properties: &Value,
-    resource: &StoredResource,
-) -> Result<(), Refusal> {
-    if stated(properties, CODE_S3_LOCATION).is_none() {
-        return Ok(());
-    }
-    Err(Refusal {
-        code: NOT_IMPLEMENTED.to_string(),
-        message: format!(
-            "this emulator does not read the document a {} holds in Amazon S3, so the resource \
-             was not created from its {CODE_S3_LOCATION} property",
-            resource.resource_type
-        ),
     })
 }
 

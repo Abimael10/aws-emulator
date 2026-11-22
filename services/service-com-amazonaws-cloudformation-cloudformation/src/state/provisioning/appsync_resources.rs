@@ -74,7 +74,10 @@
 //!   `CreateGraphqlApi` takes, so it is rendered as that map;
 //! * a `Definition`, a `Code` and a mapping template are TEXT the API runs, carried verbatim —
 //!   a schema document reaching `StartSchemaCreation` as the base64 its `definition` blob is
-//!   serialized as.
+//!   serialized as. Each of them is also publishable as an Amazon S3 REFERENCE
+//!   (`CodeS3Location` beside `Code`, and so on), which is READ into the property whose text it
+//!   is before any call is made ([`super::appsync_s3_documents`]), so a declaration that ships
+//!   its code in an object creates exactly what one stating that text inline creates.
 //!
 //! A declared property no call here carries is REFUSED rather than dropped
 //! ([`refuse_unapplied_properties`]): a resource reported created with less than its
@@ -388,20 +391,14 @@ const API_KEY_ID: &str = "ApiKeyId";
 /// the epoch).
 const API_KEY_EXPIRES: &str = "Expires";
 
-/// The properties a declaration states that are the TEXT of a document this emulator does not
-/// fetch: each names an Amazon S3 object, which nothing here reads, so a declaration stating
-/// one is refused rather than created without the code or the template it asked for.
-const S3_LOCATIONS: &[&str] = &[
-    "CodeS3Location",
-    "DefinitionS3Location",
-    "RequestMappingTemplateS3Location",
-    "ResponseMappingTemplateS3Location",
-];
-
 /// Create the resource one of these types declares, in AWS AppSync itself — so a client that
 /// deployed the stack reads every one of them back through that service's own reads, and the
 /// endpoint the stack published really serves the schema and the resolvers the template
 /// declared.
+///
+/// A document the declaration holds in Amazon S3 rather than in the template is READ first and
+/// created from as the property whose text it is ([`super::appsync_s3_documents`]), so the
+/// create is made with exactly what a declaration stating that text inline would make it with.
 pub(super) async fn create(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -410,7 +407,18 @@ pub(super) async fn create(
     propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     refuse_unapplied_properties(&resource.properties, resource, properties_of(kind))?;
-    refuse_unfetched_documents(&resource.properties, resource)?;
+    let fetched = super::appsync_s3_documents::fetched(
+        ctx,
+        region,
+        &resource.properties,
+        super::appsync_s3_documents::GRAPHQL_ESTATE_DOCUMENTS,
+    )
+    .await?
+    .map(|properties| StoredResource {
+        properties,
+        ..resource.clone()
+    });
+    let resource = fetched.as_ref().unwrap_or(resource);
     match kind {
         Kind::GraphqlApi => create_graphql_api(ctx, region, resource, propagated).await,
         Kind::GraphqlSchema => start_schema_creation(ctx, region, resource).await,
@@ -816,7 +824,16 @@ pub(super) async fn update(
     declared: &Value,
 ) -> Result<Option<Created>, Refusal> {
     refuse_unapplied_properties(declared, resource, properties_of(kind))?;
-    refuse_unfetched_documents(declared, resource)?;
+    // A changed declaration states its documents the same two ways a create's does, so a
+    // reference it holds is read and applied as the property whose text it is.
+    let fetched = super::appsync_s3_documents::fetched(
+        ctx,
+        region,
+        declared,
+        super::appsync_s3_documents::GRAPHQL_ESTATE_DOCUMENTS,
+    )
+    .await?;
+    let declared = fetched.as_ref().unwrap_or(declared);
     if identity_moved(kind, resource, declared) {
         return Ok(None);
     }
@@ -1497,25 +1514,6 @@ fn lower_initial(property: &str) -> String {
         Some(initial) => initial.to_lowercase().chain(characters).collect(),
         None => String::new(),
     }
-}
-
-/// The refusal for a declaration that states a document this emulator does not FETCH: a code
-/// body, a schema definition or a mapping template held in Amazon S3. Nothing here reads an S3
-/// object, so such a declaration is refused rather than created without what it asked for.
-fn refuse_unfetched_documents(properties: &Value, resource: &StoredResource) -> Result<(), Refusal> {
-    for property in S3_LOCATIONS {
-        if stated(properties, property).is_some() {
-            return Err(Refusal {
-                code: NOT_IMPLEMENTED.to_string(),
-                message: format!(
-                    "this emulator does not read the document a {} holds in Amazon S3, so the \
-                     resource was not created from its {property} property",
-                    resource.resource_type
-                ),
-            });
-        }
-    }
-    Ok(())
 }
 
 /// The refusal for a declared property no call this module makes carries, naming which property
