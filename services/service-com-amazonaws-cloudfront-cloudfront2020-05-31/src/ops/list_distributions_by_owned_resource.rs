@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDistributionsByOwnedResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDistributionsByOwnedResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDistributionsByOwnedResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the persisted distributions that are associated with ONE resource this account
+//! owns and has SHARED with other accounts, addressed by that resource's ARN, one page at a
+//! time — each entry "pairs a CloudFront distribution ID with its owning Amazon Web Services
+//! account ID".
+//!
+//! The listing answers from the SAME stored association the resource's own by-resource listing
+//! serves ([`crate::state::references_vpc_origin`]): a distribution is listed exactly when the
+//! origins of its STORED configuration name that resource, so this listing and
+//! `ListDistributionsByVpcOriginId` can never disagree about which distributions use it. The
+//! page contract is the one every CloudFront distribution listing shares — `MaxItems` is the
+//! page size and is echoed, `Marker` is the distribution id the previous page ended at, and
+//! `NextMarker` and `IsTruncated` arrive exactly when selected distributions remain.
+//!
+//! `ResourceArn` is "the ARN of the CloudFront resource that you've shared with other Amazon
+//! Web Services accounts", so it is read the way the whole cross-account sharing surface reads
+//! that one member ([`crate::state::resource_policy_arn_refusal`], which the resource-policy
+//! operations go through): a value that is no ARN at all is refused on its FORM, an ARN naming
+//! any other resource type is refused on the TYPE it names — a distribution reaches a resource
+//! of ANOTHER account through `VpcOriginConfig$OwnerAccountId` alone, which is why the VPC
+//! origin is the one shareable resource type of this service — and only an ARN of that type is
+//! resolved against the store, where one naming nothing is reported ABSENT rather than
+//! answered with a page of nothing.
+//!
+//! This emulator serves ONE account ([`::engine::emulator_account_id`]), so every resource it
+//! holds was created by the caller through this control plane and every distribution it lists
+//! is that account's: the modelled `AccessDenied` states a cross-account condition this store
+//! cannot hold, which is why nothing here constructs it.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +96,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,18 +170,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDistributionsByOwnedResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDistributionsByOwnedResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDistributionsByOwnedResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "MaxItems: the maximum number of distributions to return" — the member BOUNDS the
+        // page rather than demanding one, so only a negative size names no page at all, and
+        // the size served is bounded above by this emulator's own page ceiling. The same
+        // parameter, the same constraint and the same refusal as `ListDistributions`. Judged
+        // from the REQUEST alone, so it is answered before anything is resolved against the
+        // store.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListDistributionsByOwnedResourceErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+        // "The response includes distributions in the list that occur after the marker" — the
+        // marker is the distribution id the previous page ended at, so a value that is not a
+        // distribution id was never a resume point this service handed out.
+        if let Some(marker) = crate::state::resume_marker(input.marker.as_deref()) {
+            if !crate::state::is_distribution_id(marker) {
+                return Err(ListDistributionsByOwnedResourceErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(crate::state::invalid_marker_message(
+                            crate::state::DISTRIBUTION_MARKER_KIND,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+        // Materialise the propagation the clock already owes, so this listing reads the store
+        // as it stands at this instant.
+        store.settle(SystemTime::now());
+
+        // The ONE reading of a shared resource's ARN this service has: a value that cannot be
+        // read as an ARN is refused on its form, an ARN naming another resource type is refused
+        // on that type, and an ARN of the shareable type naming no resource this store holds is
+        // reported absent — an empty page would claim the resource exists and is used by no
+        // distribution. The sentences are the ones this service's other READ of a shared
+        // resource puts on the wire.
+        if let Some(refusal) =
+            crate::state::resource_policy_arn_refusal(&store, &input.resource_arn)
+        {
+            return Err(match refusal {
+                crate::state::ResourceArnRefusal::Malformed => {
+                    ListDistributionsByOwnedResourceErrorModeled::InvalidArgument(
+                        crate::state::malformed_arn(),
+                    )
+                }
+                crate::state::ResourceArnRefusal::WrongType => {
+                    ListDistributionsByOwnedResourceErrorModeled::InvalidArgument(
+                        crate::state::invalid_resource_policy_arn(),
+                    )
+                }
+                crate::state::ResourceArnRefusal::AbsentResource => {
+                    ListDistributionsByOwnedResourceErrorModeled::EntityNotFound(
+                        crate::state::resource_policy_resource_absent(),
+                    )
+                }
+            }
+            .into());
+        }
+
+        // The resource the accepted ARN names, as its resource part spells it — which is the
+        // id the store holds that resource under, so the association is matched against the
+        // STORED identifier. The reading above already refused every ARN that names no
+        // resource of the shareable type, so this states the same condition rather than
+        // falling back to a selector that would match nothing.
+        let Some(resource_id) = crate::state::resource_policy_resource(&input.resource_arn)
+        else {
+            return Err(ListDistributionsByOwnedResourceErrorModeled::InvalidArgument(
+                crate::state::invalid_resource_policy_arn(),
+            )
+            .into());
+        };
+
+        // Every stored distribution one of whose origins fronts that resource, paged by the one
+        // page walk every CloudFront distribution listing shares, each paired with the account
+        // that owns the distribution.
+        Ok(ListDistributionsByOwnedResourceOutput {
+            distribution_list: Some(crate::state::distribution_id_owner_page(
+                &store.distributions,
+                crate::state::resume_marker(input.marker.as_deref()),
+                max_items,
+                page_size,
+                |stored| crate::state::references_vpc_origin(&stored.config, resource_id),
+            )),
+        })
     }
 }

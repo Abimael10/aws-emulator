@@ -232,6 +232,56 @@ where
     }
 }
 
+/// ONE page of the stored distributions `matches` selects, each paired with the account that
+/// OWNS it, as the `DistributionIdOwnerList` the listing of the distributions associated with
+/// an owned resource answers with.
+///
+/// The SAME page contract as [`distribution_page`] and [`distribution_id_page`] — the marker
+/// is the distribution id the previous page ended at, `NextMarker` and `IsTruncated` arrive
+/// exactly when selected distributions remain, and `Quantity` "specifies the actual number of
+/// `DistributionIdOwner` objects included in the list for the current page" — over the same
+/// walk, so this listing and the resource's own by-id listing can never disagree about which
+/// distributions a filter selects or about the order they are served in. Only the projection
+/// differs: an entry "pairs a CloudFront distribution ID with its owning Amazon Web Services
+/// account ID".
+///
+/// `OwnerAccountId` is "the ID of the Amazon Web Services account that owns the distribution",
+/// which is this emulator's own account ([`::engine::emulator_account_id`]) for every
+/// distribution it holds: each was created through this control plane, and it is the account
+/// segment of the ARN that create minted. The `Items` element is kept on an empty page, as
+/// [`distribution_id_page`] keeps it, so a caller reads the entries of every page the same
+/// way.
+pub fn distribution_id_owner_page<F>(
+    distributions: &BTreeMap<String, StoredDistribution>,
+    marker: Option<&str>,
+    max_items: i32,
+    page_size: usize,
+    mut matches: F,
+) -> crate::ops::types::DistributionIdOwnerList
+where
+    F: FnMut(&StoredDistribution) -> bool,
+{
+    let (items, is_truncated, last_id) = distribution_page_walk(
+        distributions,
+        marker,
+        page_size,
+        &mut matches,
+        |stored| crate::ops::types::DistributionIdOwner {
+            distribution_id: stored.id.clone(),
+            owner_account_id: ::engine::emulator_account_id().to_string(),
+        },
+    );
+
+    crate::ops::types::DistributionIdOwnerList {
+        marker: marker.unwrap_or_default().to_string(),
+        next_marker: if is_truncated { last_id } else { None },
+        max_items,
+        is_truncated,
+        quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+        items: Some(items),
+    }
+}
+
 /// The one page walk behind every CloudFront distribution listing: what `project` reads
 /// from each selected record, whether selected distributions remain after the page, and the
 /// distribution id this page ended at.
