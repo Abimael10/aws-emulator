@@ -18,7 +18,7 @@
 //! record set `ClaimPhoneNumber` writes, `DescribePhoneNumber` projects and
 //! `ReleasePhoneNumber` removes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -161,6 +161,16 @@ pub const LIST_INSTANCE_STORAGE_CONFIGS_DEFAULT_PAGE_SIZE: usize = 10;
 /// is released by `DeleteInstance`, and it sits far above any workflow an emulator
 /// serves. The same bound caps [`ComAmazonawsConnectAmazonconnectserviceState::client_tokens`].
 pub const INSTANCE_QUOTA: usize = 1_000;
+
+/// How many retired instance identifiers the store remembers, oldest dropped first.
+///
+/// The EMULATOR's own bound on its store, for the reason [`INSTANCE_QUOTA`] gives: nothing
+/// a caller can do releases a retirement, so without a cap a caller repeating
+/// create-and-delete would grow the record until the host ran out of memory. It is the same
+/// number as that quota, so the store remembers as many retired identifiers as an account
+/// may hold instances at once, and a retirement older than that is reported as an
+/// identifier this account never held.
+pub const RETIRED_INSTANCE_RECORD: usize = INSTANCE_QUOTA;
 
 /// How many queues one instance holds before `CreateQueue` refuses with the modelled
 /// `LimitExceededException`. The emulator's own bound on the store, for the reason
@@ -305,6 +315,16 @@ pub struct ComAmazonawsConnectAmazonconnectserviceState {
     /// Every live instance, keyed by instance id. Queues hang off their instance, so
     /// deleting the instance drops its queues with it. Bounded by [`INSTANCE_QUOTA`].
     pub instances: BTreeMap<String, InstanceRecord>,
+    /// The instance identifiers a `DeleteInstance` has retired, oldest first, which is what
+    /// tells an identifier this account never held from one it held until a delete dropped
+    /// it.
+    ///
+    /// The two are refused in DIFFERENT words by the operations whose addressed resource
+    /// IS the instance (see [`Self::missing_instance_refusal`]), so a delete has to leave
+    /// the identifier behind for the later refusal to recognise it. Bounded by
+    /// [`RETIRED_INSTANCE_RECORD`]: [`Self::retire_instance`] drops the oldest identifier
+    /// once the record is full, so a caller repeating create-and-delete cannot grow it.
+    pub retired_instances: VecDeque<String>,
     /// `CreateInstance` idempotency: client token -> the instance it minted. One entry
     /// accompanies one created instance and `DeleteInstance` drops it with that
     /// instance, so this map is bounded by [`INSTANCE_QUOTA`] too — which
@@ -346,6 +366,30 @@ impl ComAmazonawsConnectAmazonconnectserviceState {
             &hex[16..20],
             &hex[20..32]
         )
+    }
+
+    /// Record that `instance_id` named an instance of this account until a delete retired
+    /// it, dropping the oldest retirement once the record is full
+    /// ([`RETIRED_INSTANCE_RECORD`]).
+    ///
+    /// Idempotent in the identifier: one already recorded keeps its place, so a repeated
+    /// delete of the same identifier cannot push older retirements out.
+    pub fn retire_instance(&mut self, instance_id: &str) {
+        if self.is_retired_instance(instance_id) {
+            return;
+        }
+        self.retired_instances.push_back(instance_id.to_string());
+        while self.retired_instances.len() > RETIRED_INSTANCE_RECORD {
+            self.retired_instances.pop_front();
+        }
+    }
+
+    /// Whether `instance_id` named an instance of this account that a delete retired, as
+    /// far back as the store remembers ([`RETIRED_INSTANCE_RECORD`]).
+    pub fn is_retired_instance(&self, instance_id: &str) -> bool {
+        self.retired_instances
+            .iter()
+            .any(|retired| retired == instance_id)
     }
 
     /// The instance a phone-number operation's target names, resolved from the
@@ -1808,7 +1852,14 @@ pub fn deregister_instance<Eng: Send + Sync + 'static>(
         return false;
     };
     let mut store = state.lock();
-    store.instances.remove(connect_instance_id).is_some()
+    let removed = store.instances.remove(connect_instance_id).is_some();
+    if removed {
+        // The same effect `DeleteInstance` has: the identifier named an instance of this
+        // account, so it stays behind as a retired one and a later call carrying it reports
+        // the instance that is gone rather than one this account never held.
+        store.retire_instance(connect_instance_id);
+    }
+    removed
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -1820,4 +1871,55 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsConnectAmazonconnectserviceState>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The retirement record remembers the identifiers a delete retired, newest kept: it
+    /// never holds more than the bound, and once it is full the oldest identifier is the
+    /// one that leaves.
+    ///
+    /// The rows walk the record's size either side of its bound, so a repeated
+    /// create-and-delete cannot grow the store without end.
+    #[test]
+    fn the_retirement_record_holds_at_most_its_bound() {
+        let identifier = |index: usize| format!("instance-{index}");
+        for retired in [
+            0,
+            1,
+            RETIRED_INSTANCE_RECORD - 1,
+            RETIRED_INSTANCE_RECORD,
+            RETIRED_INSTANCE_RECORD + 1,
+            RETIRED_INSTANCE_RECORD * 2,
+        ] {
+            let mut store = ComAmazonawsConnectAmazonconnectserviceState::default();
+            for index in 0..retired {
+                store.retire_instance(&identifier(index));
+                // Retiring the same identifier again is not a second entry.
+                store.retire_instance(&identifier(index));
+            }
+            let held = store.retired_instances.len();
+            assert_eq!(
+                held,
+                retired.min(RETIRED_INSTANCE_RECORD),
+                "case {retired} retired: the record holds at most {RETIRED_INSTANCE_RECORD}, got {held}"
+            );
+            // The identifiers still recorded are the newest ones; everything older has left.
+            for index in 0..retired {
+                let expected = index + RETIRED_INSTANCE_RECORD >= retired;
+                let actual = store.is_retired_instance(&identifier(index));
+                assert_eq!(
+                    actual, expected,
+                    "case {retired} retired: identifier {index} recorded={actual}, expected \
+                     {expected}"
+                );
+            }
+            assert!(
+                !store.is_retired_instance(&identifier(retired)),
+                "case {retired} retired: an identifier no delete retired is not in the record"
+            );
+        }
+    }
 }

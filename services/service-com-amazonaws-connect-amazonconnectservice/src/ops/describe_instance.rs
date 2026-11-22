@@ -171,15 +171,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
-        // The addressed resource of this operation IS the instance, so an `InstanceId` that
-        // resolves to no instance is refused in the words Connect names a missing instance
-        // with (`crate::state::instance_not_found`): the sentence's one variable part is the
-        // identifier the request carried.
-        let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
-            DescribeInstanceErrorModeled::ResourceNotFoundException(
-                crate::state::instance_not_found(&input.instance_id),
-            )
-        })?;
+        // The addressed resource of this operation IS the instance, so the refusal is worded
+        // by what this account knows of the identifier (`missing_instance_refusal`): an
+        // identifier a delete retired names the instance that is gone, and one this account
+        // was never given is the service's fixed not-found sentence, which quotes nothing the
+        // request carried.
+        let instance = match store.instances.get(&input.instance_id) {
+            Some(instance) => instance,
+            None => {
+                return Err(DescribeInstanceErrorModeled::ResourceNotFoundException(
+                    store.missing_instance_refusal(&input.instance_id),
+                )
+                .into())
+            }
+        };
 
         Ok(DescribeInstanceOutput {
             instance: Some(instance.to_instance(now)),

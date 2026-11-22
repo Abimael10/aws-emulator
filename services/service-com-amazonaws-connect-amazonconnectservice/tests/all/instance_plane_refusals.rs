@@ -22,9 +22,10 @@
 //! longer than the maximum is not an identifier the service can read — the same error,
 //! `Instance id is not valid`. Both those sentences are fixed and quote no label. Every
 //! other label is RESOLVED, however unlike a minted identifier it looks, and one that
-//! holds nothing is `ResourceNotFoundException` (404) naming the instance the request
-//! addressed, `Instance <instanceId> not found` — the one sentence of this plane that has a
-//! variable part, and that part is the label the request carried.
+//! holds nothing is `ResourceNotFoundException` (404): the fixed `Resource not found` for an
+//! identifier this account was never given, and `Instance <instanceId> not found` — the one
+//! sentence of this plane that has a variable part, and that part is the label the request
+//! carried — for one this account held until its delete retired it.
 
 use serde_json::{json, Value};
 
@@ -37,9 +38,14 @@ const INVALID_REQUEST: &str = "Invalid request";
 /// The sentence it answers an identifier longer than the modelled maximum with.
 const INSTANCE_ID_NOT_VALID: &str = "Instance id is not valid";
 
-/// The sentence it answers an identifier that resolves to no instance with: the instance
-/// plane's not-found sentence, written out here rather than read off the implementation so
-/// the suite pins the text itself. Its one variable part is the label the request carried.
+/// The sentence it answers an identifier this account was never given with, written out here
+/// rather than read off the implementation so the suite pins the text itself. It has no
+/// variable part, so nothing the request carried appears in it.
+const RESOURCE_NOT_FOUND: &str = "Resource not found";
+
+/// The sentence it answers an identifier this account held until its delete retired it with:
+/// the instance plane's one sentence with a variable part, which is the label the request
+/// carried.
 fn instance_not_found(instance_id: &str) -> String {
     format!("Instance {instance_id} not found")
 }
@@ -264,8 +270,8 @@ struct Expected {
 /// RULE: the instance plane places its `InstanceId` label in one of three classes before
 /// resolving any state — carrying no identifier, longer than the identifier's modelled
 /// `@length` maximum, or a label to resolve — and the first two are 400s with fixed
-/// sentences, not 404s; the third, when it resolves nothing, is the 404 carrying the
-/// not-found sentence.
+/// sentences, not 404s; the third, when it resolves nothing this account was ever given, is
+/// the 404 carrying the fixed not-found sentence.
 ///
 /// The rows differ along the FORM and LENGTH of the label: three ways to carry no
 /// identifier, both ends of the modelled bound (1..100) and two past the maximum, and
@@ -278,8 +284,8 @@ async fn the_instance_plane_classifies_its_label_before_resolving() {
     // because the store is empty.
     let (live_id, _) = connect.create_instance(connect_managed("neighbour")).await;
 
-    // Which class the row's label falls in. The 404 names the instance the request
-    // addressed, so its sentence is built from the row's own label.
+    // Which class the row's label falls in. No row's label was ever allocated to this
+    // account, so the 404 class states the fixed sentence.
     #[derive(Clone, Copy)]
     enum Class {
         Blank,
@@ -368,7 +374,7 @@ async fn the_instance_plane_classifies_its_label_before_resolving() {
             Class::Absent => Expected {
                 status: 404,
                 code: "ResourceNotFoundException",
-                message: instance_not_found(&label),
+                message: RESOURCE_NOT_FOUND.to_string(),
             },
         };
         for (operation, method) in INSTANCE_PLANE {
@@ -395,10 +401,11 @@ async fn the_instance_plane_classifies_its_label_before_resolving() {
                 "case {case:?}/{operation}: expected message {:?}, got {actual:?}",
                 expected.message
             );
-            // The two 400 sentences are fixed, so the label cannot appear in those
-            // replies. Only a label long enough not to occur in a sentence by accident is
-            // checked: a one-character label is a letter of the sentence itself.
-            if matches!(class, Class::Blank | Class::TooLong) && label.trim().len() >= 4 {
+            // All three sentences are fixed for the labels this suite sends, so the label
+            // cannot appear in any reply. Only a label long enough not to occur in a
+            // sentence by accident is checked: a one-character label is a letter of the
+            // sentence itself.
+            if label.trim().len() >= 4 {
                 assert!(
                     !answer.body.to_string().contains(label.trim()),
                     "case {case:?}/{operation}: the refusal must not quote the label, got {}",

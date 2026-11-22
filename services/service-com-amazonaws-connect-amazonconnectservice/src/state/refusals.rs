@@ -13,9 +13,12 @@
 //! Five refusal classes live here:
 //!
 //! * a resource that does not exist: the one fixed sentence [`resource_not_found`] for a
-//!   resource INSIDE an instance or in the phone-number inventory, and
-//!   [`instance_not_found`] — which names the instance the request addressed — for an
-//!   operation whose addressed resource IS the instance;
+//!   resource INSIDE an instance, for one in the phone-number inventory, and for an
+//!   instance identifier this account never held, and [`instance_not_found`] — which
+//!   names the instance the request addressed — for an operation whose addressed resource
+//!   IS an instance whose identifier a delete RETIRED
+//!   ([`super::ComAmazonawsConnectAmazonconnectserviceState::missing_instance_refusal`]
+//!   is the one place that choice is made);
 //! * a parameter whose value is not one the service accepts ([`invalid_parameter`]),
 //!   which names the offending member;
 //! * a value longer (or shorter) than the maximum (minimum) the model declares for it
@@ -38,44 +41,71 @@ use crate::ops::types::{
     InvalidParameterException, InvalidRequestException, ResourceNotFoundException,
 };
 
-/// The `Message` a Connect `ResourceNotFoundException` carries for a resource INSIDE an
-/// instance, or in the phone-number inventory.
+use super::ComAmazonawsConnectAmazonconnectserviceState;
+
+/// The `Message` a Connect `ResourceNotFoundException` carries for a resource this account
+/// never held: one INSIDE an instance, one in the phone-number inventory, or an instance
+/// identifier that was never allocated.
 ///
 /// Entirely fixed text — it says neither which kind of resource was missing nor which
 /// identifier was asked for — so it is the whole requirement for those classes: an unknown
-/// queue, flow, hours of operation or storage association, and a phone number this account
-/// never claimed, all state it, and none of them quotes the identifier the request carried.
-/// The operations whose addressed resource is the INSTANCE ITSELF name that instance instead
+/// queue, flow, hours of operation or storage association, a phone number this account never
+/// claimed, and an instance identifier this account was never given, all state it, and none
+/// of them quotes the identifier the request carried. Only an identifier an instance of this
+/// account really held, until a delete retired it, is answered by naming that instance
 /// ([`instance_not_found`]).
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
 
-/// Connect's refusal for a request that names a resource this account does not hold —
-/// including an identifier that named one until a delete retired it.
+/// Connect's refusal for a request that names a resource this account does not hold.
 ///
-/// Every operation of this service that could not resolve a resource INSIDE an instance, or a
-/// phone number, words its modelled 404 here, whichever resource it was: the two are the same
-/// refusal in the same words, so the service has exactly one spelling of it. See
-/// [`RESOURCE_NOT_FOUND_MESSAGE`] for why this sentence takes nothing from the request, and
-/// [`instance_not_found`] for the refusal of an operation that addresses an instance.
+/// Every operation of this service that could not resolve a resource INSIDE an instance, a
+/// phone number, or an instance identifier this account never held, words its modelled 404
+/// here, whichever resource it was: they are the same refusal in the same words, so the
+/// service has exactly one spelling of it. See [`RESOURCE_NOT_FOUND_MESSAGE`] for why this
+/// sentence takes nothing from the request, and
+/// [`ComAmazonawsConnectAmazonconnectserviceState::missing_instance_refusal`] for the one
+/// case that words it differently.
 pub fn resource_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
     }
 }
 
-/// Connect's refusal for an operation whose ADDRESSED RESOURCE IS AN INSTANCE that this
-/// account does not hold — including an identifier that named one until a delete retired it:
-/// `Instance <instanceId> not found`.
+/// Connect's refusal for an operation whose ADDRESSED RESOURCE IS AN INSTANCE whose
+/// identifier this account held until a delete RETIRED it: `Instance <instanceId> not found`.
 ///
-/// The resource the request addressed is the instance, so the refusal says WHICH instance was
-/// not found: the sentence names the kind and carries one variable part, the `InstanceId` the
-/// REQUEST carried, which is the identifier the caller has to correct. An operation that
-/// resolved the instance and then failed to resolve a resource INSIDE it reports the generic
-/// [`resource_not_found`] instead: there the instance is the container rather than the
-/// addressed resource.
+/// The identifier did name an instance of this account, so the refusal says WHICH instance is
+/// gone: the sentence names the kind and carries one variable part, the `InstanceId` the
+/// REQUEST carried. An identifier the account was NEVER given is a different class and takes
+/// the fixed [`resource_not_found`] sentence, as does an operation that resolved the instance
+/// and then failed to resolve a resource INSIDE it — there the instance is the container
+/// rather than the addressed resource. Callers reach the choice between the two through
+/// [`ComAmazonawsConnectAmazonconnectserviceState::missing_instance_refusal`] rather than
+/// picking a sentence themselves.
 pub fn instance_not_found(instance_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Instance {instance_id} not found")),
+    }
+}
+
+impl ComAmazonawsConnectAmazonconnectserviceState {
+    /// The modelled 404 an operation whose ADDRESSED RESOURCE IS AN INSTANCE raises for an
+    /// `InstanceId` that resolved to no instance, worded by what this account knows about
+    /// that identifier.
+    ///
+    /// One function, so every such operation applies ONE rule: an identifier this account
+    /// held until a `DeleteInstance` retired it names the instance that is gone
+    /// ([`instance_not_found`]), and an identifier this account was never given — anything
+    /// the store never minted, and anything retired longer ago than the store remembers
+    /// ([`super::RETIRED_INSTANCE_RECORD`]) — is the resource it never had, in the
+    /// service's fixed not-found sentence ([`resource_not_found`]), which quotes nothing
+    /// the request carried.
+    pub fn missing_instance_refusal(&self, instance_id: &str) -> ResourceNotFoundException {
+        if self.is_retired_instance(instance_id) {
+            instance_not_found(instance_id)
+        } else {
+            resource_not_found()
+        }
     }
 }
 
@@ -172,8 +202,9 @@ pub fn instance_id_is_not_valid() -> InvalidRequestException {
 ///   could read, whatever the store holds ([`instance_id_is_not_valid`]).
 ///
 /// Anything between those ends is an identifier as far as the model is concerned, so it
-/// is RESOLVED — and answered [`instance_not_found`] when nothing holds it, however
-/// unlike a minted id it looks. (That is the narrower companion check
+/// is RESOLVED — and answered, when nothing holds it, in the words
+/// [`ComAmazonawsConnectAmazonconnectserviceState::missing_instance_refusal`] picks for it,
+/// however unlike a minted id it looks. (That is the narrower companion check
 /// [`super::is_resource_id`], which the queue plane applies to its own labels in its own
 /// wording; the instance plane's recorded refusals are the two above.)
 ///
@@ -219,8 +250,9 @@ pub const QUEUE_NAME_MAX_LENGTH: usize = 127;
 mod tests {
     use super::*;
 
-    /// The not-found sentence for a resource inside an instance is fixed: it is the same
-    /// string whatever was asked for. The sentence for an INSTANCE names the instance.
+    /// The not-found sentence for a resource this account never held is fixed: it is the
+    /// same string whatever was asked for. The sentence for a RETIRED instance names that
+    /// instance.
     #[test]
     fn the_not_found_messages_name_only_an_instance() {
         assert_eq!(
@@ -238,6 +270,49 @@ mod tests {
                 actual.as_deref(),
                 Some(expected.as_str()),
                 "case {instance_id:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// Which of the two sentences an instance-addressing operation states follows what the
+    /// store knows about the identifier: an identifier it retired names that instance, and
+    /// every identifier it never held takes the fixed sentence.
+    #[test]
+    fn the_instance_refusal_follows_what_the_store_knows_of_the_identifier() {
+        let retired = "a1b2c3d4-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+        let mut store = ComAmazonawsConnectAmazonconnectserviceState::default();
+        store.retire_instance(retired);
+
+        let cases: Vec<(&str, String, Option<String>)> = vec![
+            (
+                "the identifier a delete retired",
+                retired.to_string(),
+                Some(format!("Instance {retired} not found")),
+            ),
+            (
+                "another identifier of the minted form",
+                "7f3c9b21-0d4e-4a86-9c15-2b6f8e5d1a30".to_string(),
+                None,
+            ),
+            (
+                "the retired identifier in upper case",
+                retired.to_ascii_uppercase(),
+                None,
+            ),
+            ("a name, not an identifier", "support".to_string(), None),
+            (
+                "the longest identifier the model admits",
+                "i".repeat(INSTANCE_ID_MAX_LENGTH),
+                None,
+            ),
+        ];
+        for (case, instance_id, named) in cases {
+            let expected = named.unwrap_or_else(|| RESOURCE_NOT_FOUND_MESSAGE.to_string());
+            let actual = store.missing_instance_refusal(&instance_id).message;
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected.as_str()),
+                "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }
     }

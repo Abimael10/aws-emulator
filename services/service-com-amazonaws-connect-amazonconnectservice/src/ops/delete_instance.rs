@@ -3,7 +3,9 @@
 //! @op DeleteInstance
 //!
 //! Removes the instance and the queues inside it, so the matching `DescribeInstance` is
-//! a 404 and `ListInstances` no longer reports it. Deleting an instance that is not
+//! a 404 and `ListInstances` no longer reports it. The identifier stays behind as a
+//! retired one, which is what makes a later call carrying it report the instance that is
+//! gone rather than a resource this account never held. Deleting an instance that is not
 //! there is itself a 404.
 //!
 //! ## Shape of an operation
@@ -187,12 +189,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if store.instances.remove(&input.instance_id).is_none() {
             return Err(DeleteInstanceErrorModeled::ResourceNotFoundException(
-                // The addressed resource of this operation IS the instance, so the refusal
-                // names the instance it could not resolve, exactly as the instance read does.
-                crate::state::instance_not_found(&input.instance_id),
+                // The addressed resource of this operation IS the instance, so the refusal is
+                // worded by what this account knows of the identifier, exactly as the
+                // instance read words it: an identifier an earlier delete retired names the
+                // instance that is gone, and one this account was never given takes the
+                // service's fixed not-found sentence.
+                store.missing_instance_refusal(&input.instance_id),
             )
             .into());
         }
+        // The identifier stays behind as a retired one: it named an instance of this account,
+        // so a later call carrying it is refused in different words from one carrying an
+        // identifier the account never held. The record of retirements is bounded
+        // (`crate::state::RETIRED_INSTANCE_RECORD`), so repeating this call cannot grow the
+        // store without end.
+        store.retire_instance(&input.instance_id);
         // The create-time idempotency tokens of a deleted instance no longer name one, so
         // a later CreateInstance reusing that token mints a new instance.
         store

@@ -6,11 +6,11 @@
 //!
 //! RULE: Connect reports the resource the operation ADDRESSED as missing. The service
 //! answers HTTP 404 (the model's error binding) with `ResourceNotFoundException`, and the
-//! sentence follows that resource: an operation whose addressed resource IS the instance — an
-//! `InstanceId` that never named one, or one `DeleteInstance` retired — names it,
-//! `Instance <instanceId> not found`, while every operation that resolves the instance as the
-//! CONTAINER of the resource it addresses states the fixed `Resource not found`, which names
-//! no resource kind and quotes no identifier.
+//! sentence follows that resource: an operation whose addressed resource IS the instance names
+//! the instance, `Instance <instanceId> not found`, for an identifier this account held until
+//! `DeleteInstance` retired it, while an identifier the account was never given — like every
+//! operation that resolves the instance as the CONTAINER of the resource it addresses — states
+//! the fixed `Resource not found`, which names no resource kind and quotes no identifier.
 //!
 //! The suites below assert that rule over a TABLE: every operation of this service that
 //! has to resolve an `InstanceId` crossed with identifiers of several forms and lengths,
@@ -183,18 +183,19 @@ fn message_of(body: &Value) -> String {
     body["Message"].as_str().unwrap_or_default().to_string()
 }
 
-/// The sentence a `ResourceNotFoundException` about a resource INSIDE an instance carries,
-/// written out here rather than read off the implementation so the suite pins the text itself.
+/// The sentence a `ResourceNotFoundException` about a resource this account never held
+/// carries, written out here rather than read off the implementation so the suite pins the
+/// text itself.
 const RESOURCE_NOT_FOUND: &str = "Resource not found";
 
-/// The sentence a `ResourceNotFoundException` about the INSTANCE ITSELF carries, whose one
-/// variable part is the identifier the request carried.
+/// The sentence a `ResourceNotFoundException` about an instance this account held until a
+/// delete RETIRED it carries, whose one variable part is the identifier the request carried.
 fn instance_not_found(instance_id: &str) -> String {
     format!("Instance {instance_id} not found")
 }
 
-/// Whether `operation`'s own addressed resource IS the instance, so a missing instance is
-/// reported by naming it rather than with the fixed sentence for a resource inside one.
+/// Whether `operation`'s own addressed resource IS the instance, so a RETIRED instance is
+/// reported by naming it rather than with the fixed sentence.
 fn addresses_the_instance_itself(operation: &str) -> bool {
     matches!(operation, "DescribeInstance" | "DeleteInstance")
 }
@@ -215,16 +216,19 @@ fn checks_the_labels_form(operation: &str) -> bool {
 
 /// Drive every instance-resolving call against `instance_id` and assert the rule on each
 /// answer: 404, `ResourceNotFoundException`, and the sentence of the resource that operation
-/// ADDRESSED — the instance named, or the fixed sentence for a resource inside one.
+/// ADDRESSED — the retired instance named, or the fixed sentence for everything else.
 ///
 /// `of_the_identifier_form` says whether `instance_id` has the form this service mints;
 /// when it does not, the operations that check that form first are left out, since their
-/// answer is the parameter refusal rather than the not-found one.
+/// answer is the parameter refusal rather than the not-found one. `retired` says whether
+/// this account held `instance_id` until a `DeleteInstance` retired it, which is what decides
+/// the sentence of the operations whose addressed resource IS the instance.
 async fn assert_every_call_reports_the_instance_missing(
     connect: &Connect,
     case: &str,
     instance_id: &str,
     of_the_identifier_form: bool,
+    retired: bool,
 ) {
     for call in calls_resolving_an_instance(instance_id) {
         if !of_the_identifier_form && checks_the_labels_form(call.operation) {
@@ -244,7 +248,8 @@ async fn assert_every_call_reports_the_instance_missing(
             "case {case:?}/{}: expected error code ResourceNotFoundException, got {:?}",
             call.operation, answer.error_code
         );
-        let expected = if addresses_the_instance_itself(call.operation) {
+        let names_the_instance = retired && addresses_the_instance_itself(call.operation);
+        let expected = if names_the_instance {
             instance_not_found(instance_id)
         } else {
             RESOURCE_NOT_FOUND.to_string()
@@ -254,10 +259,9 @@ async fn assert_every_call_reports_the_instance_missing(
             "case {case:?}/{}: expected message {expected:?}, got {actual:?}",
             call.operation
         );
-        // The sentence for a resource inside an instance has no variable part, so the
-        // identifier asked for is not quoted back. Only a label long enough not to occur in
-        // the sentence by accident is checked.
-        if instance_id.len() >= 4 && !addresses_the_instance_itself(call.operation) {
+        // The fixed sentence has no variable part, so the identifier asked for is not quoted
+        // back. Only a label long enough not to occur in the sentence by accident is checked.
+        if instance_id.len() >= 4 && !names_the_instance {
             assert!(
                 !answer.body.to_string().contains(instance_id),
                 "case {case:?}/{}: the refusal must not quote the identifier the request \
@@ -269,10 +273,10 @@ async fn assert_every_call_reports_the_instance_missing(
     }
 }
 
-/// RULE: an `InstanceId` that names no instance is refused with
-/// `ResourceNotFoundException` (404) — naming the instance where the addressed resource is the
-/// instance itself, and the fixed `Resource not found` where it is a resource inside one — for
-/// every operation that resolves an `InstanceId`.
+/// RULE: an `InstanceId` this account was never given is refused with
+/// `ResourceNotFoundException` (404) carrying the fixed `Resource not found`, which quotes
+/// nothing the request sent — for every operation that resolves an `InstanceId`, the ones
+/// whose addressed resource IS the instance included.
 ///
 /// The table spans the identifier's form and length: the UUID shape Connect mints, both
 /// ends of the modelled `InstanceId` length bound (1..100), a mixed-case identifier, one
@@ -330,14 +334,16 @@ async fn an_unknown_instance_id_is_refused_in_awss_sentence() {
             case,
             &instance_id,
             of_the_identifier_form,
+            false,
         )
         .await;
     }
 }
 
-/// RULE (the same one, on an identifier that really named an instance): deleting an
-/// instance retires its identifier, so every later call carrying it is refused with the
-/// same sentence.
+/// RULE (the other half, on an identifier that really named an instance): deleting an
+/// instance retires its identifier, so every later call whose addressed resource IS that
+/// instance names it, while the operations that only resolve it as a container keep the
+/// fixed sentence.
 #[tokio::test]
 async fn a_deleted_instances_id_is_refused_in_awss_sentence() {
     let connect = Connect::new();
@@ -378,6 +384,7 @@ async fn a_deleted_instances_id_is_refused_in_awss_sentence() {
         "a deleted instance's identifier",
         &instance_id,
         true,
+        true,
     )
     .await;
 
@@ -386,6 +393,7 @@ async fn a_deleted_instances_id_is_refused_in_awss_sentence() {
         &connect,
         "a deleted instance's identifier, read twice",
         &instance_id,
+        true,
         true,
     )
     .await;

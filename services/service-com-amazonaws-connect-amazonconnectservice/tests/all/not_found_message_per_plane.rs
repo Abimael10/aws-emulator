@@ -4,17 +4,18 @@
 //! the same `MultiServiceRouter` the emulator serves with.
 //!
 //! RULE: a Connect `ResourceNotFoundException` states the sentence of the resource the
-//! operation ADDRESSED: an operation whose addressed resource is an instance names that
-//! instance — `Instance <instanceId> not found`, whose one variable part is the identifier the
-//! request carried — while an operation that could not resolve a resource INSIDE an instance,
-//! or a phone number, states the fixed `Resource not found`, with no variable part at all, so
-//! nothing the request carried is quoted back. The error shape and the status (404) are the
-//! same either way.
+//! operation ADDRESSED: an operation whose addressed resource is an instance this account
+//! held until a delete retired it names that instance — `Instance <instanceId> not found`,
+//! whose one variable part is the identifier the request carried — while an operation that
+//! could not resolve an instance identifier this account was never given, a resource INSIDE an
+//! instance, or a phone number, states the fixed `Resource not found`, with no variable part
+//! at all, so nothing the request carried is quoted back. The error shape and the status (404)
+//! are the same either way.
 //!
 //! Two suites: the first crosses the resource planes with the operations that reach them,
 //! which is what shows which sentence follows the addressed resource; the second walks the
-//! forms an `InstanceId` label can take and pins that the instance sentence carries the label
-//! and nothing else.
+//! forms an `InstanceId` label can take and pins that an identifier the account never held is
+//! the fixed sentence, whatever form the label has.
 
 use serde_json::{json, Value};
 
@@ -25,12 +26,13 @@ use super::harness::{connect_managed, Connect};
 /// resolves anything.
 const ABSENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 
-/// The sentence the resources INSIDE an instance and the phone-number inventory carry,
-/// written out here rather than read off the implementation so the suite pins the text itself.
+/// The sentence an instance identifier this account never held, the resources INSIDE an
+/// instance and the phone-number inventory all carry, written out here rather than read off
+/// the implementation so the suite pins the text itself.
 const RESOURCE_NOT_FOUND: &str = "Resource not found";
 
-/// The sentence an operation whose addressed resource IS an instance carries, for the
-/// instance `instance_id` it could not resolve.
+/// The sentence an operation whose addressed resource IS an instance carries for an instance
+/// `instance_id` this account held until a delete retired it.
 fn instance_not_found(instance_id: &str) -> String {
     format!("Instance {instance_id} not found")
 }
@@ -53,13 +55,14 @@ struct Row {
 }
 
 /// RULE: the sentence follows the resource the operation ADDRESSED — the instance plane names
-/// the instance, every resource inside an instance and the phone-number inventory state the
-/// fixed sentence.
+/// an instance it retired, and an identifier the account never held, every resource inside an
+/// instance and the phone-number inventory state the fixed sentence.
 ///
 /// The rows cross the planes with the operations that reach them: the instance itself
-/// through a read, a delete, a list and a configuration read of an absent instance; the
-/// resources inside a LIVE instance through their own reads; and the phone-number
-/// inventory through a read and a release of a number this account never claimed.
+/// through a read, a delete, a list and a configuration read of an absent instance, and
+/// through a read and a delete of an identifier a delete retired; the resources inside a LIVE
+/// instance through their own reads; and the phone-number inventory through a read and a
+/// release of a number this account never claimed.
 #[tokio::test]
 async fn the_not_found_sentence_follows_the_resource_the_operation_addressed() {
     let connect = Connect::new();
@@ -67,21 +70,46 @@ async fn the_not_found_sentence_follows_the_resource_the_operation_addressed() {
     // than being refused on the instance.
     let (live_id, _) = connect.create_instance(connect_managed("planes")).await;
     assert_ne!(live_id, ABSENT_ID, "the absent id must name no instance");
+    // An instance this account really held, retired by its delete: the one class the
+    // instance plane names rather than stating the fixed sentence.
+    let (retired_id, _) = connect.create_instance(connect_managed("retired")).await;
+    let deleted = connect
+        .send_answer("DELETE", &format!("/instance/{retired_id}"), None)
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "DeleteInstance of a live instance: got {} {}",
+        deleted.status, deleted.body
+    );
 
     let rows: Vec<Row> = vec![
         Row {
-            operation: "DescribeInstance",
+            operation: "DescribeInstance (an identifier never allocated)",
             method: "GET",
             uri: format!("/instance/{ABSENT_ID}"),
             body: None,
-            message: instance_not_found(ABSENT_ID),
+            message: RESOURCE_NOT_FOUND.to_string(),
         },
         Row {
-            operation: "DeleteInstance",
+            operation: "DeleteInstance (an identifier never allocated)",
             method: "DELETE",
             uri: format!("/instance/{ABSENT_ID}"),
             body: None,
-            message: instance_not_found(ABSENT_ID),
+            message: RESOURCE_NOT_FOUND.to_string(),
+        },
+        Row {
+            operation: "DescribeInstance (an identifier a delete retired)",
+            method: "GET",
+            uri: format!("/instance/{retired_id}"),
+            body: None,
+            message: instance_not_found(&retired_id),
+        },
+        Row {
+            operation: "DeleteInstance (an identifier a delete retired)",
+            method: "DELETE",
+            uri: format!("/instance/{retired_id}"),
+            body: None,
+            message: instance_not_found(&retired_id),
         },
         Row {
             operation: "ListQueues",
@@ -211,8 +239,9 @@ async fn the_not_found_sentence_follows_the_resource_the_operation_addressed() {
     );
 }
 
-/// RULE (the instance plane's variable part): the sentence names the `InstanceId` label the
-/// request carried, whatever form that label takes, and carries nothing else.
+/// RULE (the fixed half, over every form a label can take): an `InstanceId` this account was
+/// never given is the fixed sentence whatever form the label has, and the reply quotes neither
+/// that label nor any other identifier.
 ///
 /// The rows walk the forms a label can take inside the identifier's modelled `@length`
 /// bound (`InstanceId`, 1..100, from
@@ -220,7 +249,7 @@ async fn the_not_found_sentence_follows_the_resource_the_operation_addressed() {
 /// and the same shape in upper case, both ends of that bound, a name, digits only and a
 /// prefix of a live instance's own identifier.
 #[tokio::test]
-async fn the_instance_sentence_names_the_label_the_request_carried() {
+async fn an_instance_identifier_never_allocated_is_the_fixed_sentence() {
     let connect = Connect::new();
     let (live_id, _) = connect.create_instance(connect_managed("labels")).await;
 
@@ -247,16 +276,24 @@ async fn the_instance_sentence_names_the_label_the_request_carried() {
             .send_answer("GET", &format!("/instance/{label}"), None)
             .await;
         let actual = message_of(&answer.body);
-        let expected = instance_not_found(&label);
         assert_eq!(
             answer.status, 404,
             "case {case:?}: expected HTTP 404, got {} {}",
             answer.status, answer.body
         );
         assert_eq!(
-            actual, expected,
-            "case {case:?}: expected message {expected:?}, got {actual:?}"
+            actual, RESOURCE_NOT_FOUND,
+            "case {case:?}: expected message {RESOURCE_NOT_FOUND:?}, got {actual:?}"
         );
+        // The sentence has no variable part, so the label is not quoted back. Only a label
+        // long enough not to occur in the sentence by accident is checked.
+        if label.len() >= 4 {
+            assert!(
+                !answer.body.to_string().contains(&label),
+                "case {case:?}: this refusal quotes no identifier, got {}",
+                answer.body
+            );
+        }
     }
 
     // The instance that IS there is still read, not refused: the sentence above belongs
