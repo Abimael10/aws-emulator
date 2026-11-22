@@ -393,16 +393,21 @@ fn states_service_checked_clause_bare(operation: &str) -> bool {
 /// The table-name member is the one such member ([`SERVICE_REQUIRED_MEMBERS`]), and the
 /// same absence of the same member is observed to be stated BOTH ways: the operations
 /// below answer `1 validation error detected: Value null at 'tableName' failed to satisfy
-/// constraint: Member must not be null` — the walk's clause inside the counting envelope —
-/// while every other operation answers the reader's own sentence. Nothing about the model
-/// distinguishes the two groups, so this list is the only place the difference is recorded,
-/// and an operation later found to state the clause needs its own entry here.
-/// `tests/all/required_member_refusals.rs` pins both groups side by side so the difference
-/// is visible rather than silent.
+/// constraint: Member must not be null` — the walk's clause inside the counting envelope,
+/// naming the member by the lowerCamel path that walk reports — while every other
+/// operation answers the reader's own sentence. Nothing about the model distinguishes the
+/// two groups — every one of these operations declares the member `@required`
+/// (`smithy_query(query="operation", operation="DescribeTable")` gives `TableName`
+/// required, target `TableArn`, `@length` 1..1024, exactly as `DeleteTable` and `Scan`
+/// declare it) — so this list is the only place the difference is recorded, and an
+/// operation later found to state the clause needs its own entry here.
+/// `tests/all/required_member_refusals.rs` pins both groups side by side, and
+/// `tests/all/absent_table_name_refusal_wording.rs` drives the clause over the forms an
+/// absence takes, so the difference is visible rather than silent.
 ///
 /// Sorted, which [`states_absent_member_as_clause`] relies on for `binary_search` and
 /// `validator_null_clause_operations_are_sorted` pins.
-const VALIDATOR_NULL_CLAUSE_OPERATIONS: &[&str] = &["DeleteTable", "Scan"];
+const VALIDATOR_NULL_CLAUSE_OPERATIONS: &[&str] = &["DeleteTable", "DescribeTable", "Scan"];
 
 /// Whether `operation` states an absent such member as the walk's clause.
 fn states_absent_member_as_clause(operation: &str) -> bool {
@@ -1915,6 +1920,20 @@ mod tests {
             assert!(
                 states_absent_member_as_clause(operation),
                 "case {operation:?}: expected the walk's clause, got the service's sentence"
+            );
+        }
+        // The operations observed to state the reader's own parameter-required sentence
+        // for the same absence, which is what tells the two groups apart.
+        for operation in [
+            "CreateTable",
+            "DescribeKinesisStreamingDestination",
+            "GetItem",
+            "PutItem",
+            "Query",
+        ] {
+            assert!(
+                !states_absent_member_as_clause(operation),
+                "case {operation:?}: expected the service's sentence, got the walk's clause"
             );
         }
     }

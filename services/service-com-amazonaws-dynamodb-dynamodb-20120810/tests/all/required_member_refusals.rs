@@ -11,8 +11,8 @@
 //!    sentence: `The parameter '<Member>' is required but was not present in the
 //!    request`, naming the member as the model spells it on the wire and nothing of the
 //!    operation — except on the operations that are observed to state the validating
-//!    walk's clause for that member too (`DeleteTable` and `Scan`). Every OTHER required
-//!    member keeps
+//!    walk's clause for that member too (`DeleteTable`, `DescribeTable` and `Scan`).
+//!    Every OTHER required member keeps
 //!    that walk's clause inside the `<N> validation error(s) detected: ` envelope, naming
 //!    the member by the path that walk reports it under, which is lowerCamel.
 //! 2. When several members of one input fail, the clauses appear in the order the service
@@ -72,11 +72,12 @@ async fn refusal(
 async fn an_absent_table_name_is_the_parameter_required_sentence_on_every_operation() {
     let router = emulator();
 
-    // The rows span the planes and the shapes the member sits in: a create, a
-    // description, an item read, an item write, a batch of writes, a tagging-adjacent
-    // control-plane call and the Kinesis-destination surface. Every one of them declares
-    // `TableName` required, so every one of them states the same sentence — the member
-    // name is the only variable part, and it is the same member here.
+    // The rows span the planes and the shapes the member sits in: a create, an item read,
+    // an item write, a batch of writes, a tagging-adjacent control-plane call and the
+    // Kinesis-destination surface. Every one of them declares `TableName` required, so
+    // every one of them states the same sentence — the member name is the only variable
+    // part, and it is the same member here. The readers observed to state the walk's
+    // clause for the same absence are the test below's rows.
     let rows: Vec<(&str, &str, Value)> = vec![
         (
             "a create with no table name",
@@ -85,7 +86,6 @@ async fn an_absent_table_name_is_the_parameter_required_sentence_on_every_operat
                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
                    "BillingMode": "PAY_PER_REQUEST"}),
         ),
-        ("a description with no table name", "DescribeTable", json!({})),
         (
             "an item read with no table name",
             "GetItem",
@@ -265,6 +265,12 @@ async fn every_other_absent_required_member_keeps_the_walks_clause() {
         (
             "a table walk with no table name",
             "Scan",
+            json!({}),
+            "tableName",
+        ),
+        (
+            "a table description with no table name",
+            "DescribeTable",
             json!({}),
             "tableName",
         ),
