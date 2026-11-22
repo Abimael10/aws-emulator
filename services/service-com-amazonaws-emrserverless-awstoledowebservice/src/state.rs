@@ -204,12 +204,35 @@ pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 /// How long a submitted job run spends in EACH of the non-terminal `JobRunState` values
 /// it passes through ([`JOB_RUN_STAGES`]) before the clock owes it the next one.
 ///
-/// A real job run spends real time being admitted, queued and scheduled; the emulator
-/// CHOOSES this span, deliberately not zero, so a caller that submits work and then
-/// polls or filters for in-flight runs observes every stage it passes through. The due
-/// instants are stored on the record and materialised by whichever later call reads it —
-/// nothing sleeps.
-pub const JOB_RUN_STAGE_TRANSITION: Duration = Duration::from_millis(750);
+/// A real job run spends real time being admitted, queued and scheduled, and then runs for
+/// as long as its workload takes — minutes for a cold cluster. The emulator CHOOSES this
+/// span, but not freely: a client tells in-flight work from finished work by polling
+/// `GetJobRun` or by filtering `ListJobRuns` on the non-terminal states, and such a client
+/// looks on the order of seconds (the recorded clients driving this service look every
+/// ten), so the window a run is non-terminal for has to OUTLAST one look of a client that
+/// submits and then looks. The window is one of these spans per stage of
+/// [`JOB_RUN_STAGES`] plus the one the state its execution answered falls due after
+/// ([`non_terminal_job_run_window`]), so this span is sized to make that window longer
+/// than such a client's interval — which a span of milliseconds is not, however many
+/// stages it is multiplied by.
+///
+/// The due instants are stored on the record and materialised by whichever later call
+/// reads it — nothing sleeps, and no call is held for any of it.
+pub const JOB_RUN_STAGE_TRANSITION: Duration = Duration::from_secs(3);
+
+/// How long a submitted job run is NON-TERMINAL for at the least: one
+/// [`JOB_RUN_STAGE_TRANSITION`] per stage of [`JOB_RUN_STAGES`], plus the one the state
+/// the run's own execution answered falls due after the last of them
+/// ([`spark_job_run::JobRunRecord::record_execution`]).
+///
+/// A run whose workload is still in flight stays non-terminal past this; this is the
+/// window a client that submits work and then polls or lists observes even the smallest
+/// run of all in flight for.
+#[must_use]
+pub fn non_terminal_job_run_window() -> Duration {
+    JOB_RUN_STAGE_TRANSITION
+        .saturating_mul(u32::try_from(JOB_RUN_STAGES.len()).unwrap_or(1).saturating_add(1))
+}
 
 /// How long this emulator holds a resource idle for, per MINUTE of idle time the
 /// configuration governing it names: that minute itself.
@@ -1769,21 +1792,28 @@ pub fn mint_dashboard_grant(
     }
 }
 
-/// The URL a caller views one job run's dashboard at: the endpoint this request reached
-/// the emulator on, the run it names, and the grant minted for this call.
+/// The URL a caller views one job run's dashboard at: the endpoint this emulator SERVES, the
+/// run it names, and the grant minted for this call.
 ///
-/// The emulator serves no live Spark or Tez UI (it runs no workload), so the URL names
-/// the dashboard path of the endpoint the caller is already talking to rather than an
-/// Amazon EMR Studio host nothing here answers for.
+/// The emulator serves no live Spark or Tez UI (it runs no workload), so the URL names the
+/// dashboard path of this emulator's own endpoint rather than an Amazon EMR Studio host
+/// nothing here answers for.
+///
+/// `served_base` is [`::smithy_server_runtime::OperationContext::endpoint`], "the base URL a
+/// later request addresses", and it is the ONLY thing the authority is taken from — not the
+/// request's own `Host`, which an SDK client sets to the host AWS publishes its endpoints at.
+/// The value carries the `authToken` this call minted, so a client that dials it has to reach
+/// THIS process: an authority nothing here answers on takes that client out of the emulated
+/// environment carrying the token it was handed ([`session_endpoint_url`] states the same rule
+/// for the session endpoint).
 pub fn job_run_dashboard_url(
-    parts: &::http::request::Parts,
-    region: &str,
+    served_base: &str,
     application_id: &str,
     job_run_id: &str,
     attempt: i32,
     grant: &DashboardGrant,
 ) -> String {
-    let endpoint = request_endpoint(parts, region);
+    let endpoint = served_base.trim_end_matches('/');
     format!(
         "{endpoint}/dashboard/applications/{application_id}/jobruns/{job_run_id}\
          ?attempt={attempt}&authToken={}",
@@ -1859,22 +1889,6 @@ const APPLICATIONS_PATH_SEGMENT: &str = "applications";
 
 /// The path segment naming a session under it, from the same route.
 const SESSIONS_PATH_SEGMENT: &str = "sessions";
-
-/// The endpoint this request arrived on, falling back to the public EMR Serverless
-/// endpoint for `region` when the request names no authority at all.
-fn request_endpoint(parts: &::http::request::Parts, region: &str) -> String {
-    let authority = parts
-        .headers
-        .get(::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .filter(|host| !host.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| parts.uri.authority().map(ToString::to_string));
-    match authority {
-        Some(authority) => format!("https://{authority}"),
-        None => format!("https://{ARN_NAMESPACE}.{region}.amazonaws.com"),
-    }
-}
 
 /// The `autoStartConfiguration` to persist: the caller's, with
 /// `AutoStartConfig$enabled`'s documented default filled in.

@@ -14354,6 +14354,7 @@ dependencies = [
  "flate2",
  "hex",
  "http",
+ "parquet",
  "percent-encoding",
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",

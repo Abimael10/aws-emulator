@@ -158,7 +158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
         // The operation "Creates and returns a URL": it MINTS a grant rather than
         // reporting one, so the grant it mints is recorded on the job run. The only
@@ -199,8 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A fresh grant per call, which is what the documented one-hour validity means:
         // "To access the application UI after that hour elapses, you must invoke the API
         // again to generate a new URL." The emulator serves no live Spark or Tez UI —
-        // it runs no workload — so the URL names the dashboard path of the endpoint the
-        // caller reached this service on.
+        // it runs no workload — so the URL names the dashboard path of the endpoint THIS
+        // emulator serves, which is where the grant it carries can be dialled
+        // (`crate::state::job_run_dashboard_url`).
         job_run.dashboard_grants = job_run.dashboard_grants.wrapping_add(1);
         let grant = crate::state::mint_dashboard_grant(
             &job_run.job_run.arn,
@@ -209,8 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         );
         let url = crate::state::job_run_dashboard_url(
-            ctx.parts(),
-            &region,
+            ctx.endpoint().as_str(),
             &job_run.job_run.application_id,
             &job_run.job_run.job_run_id,
             attempt,

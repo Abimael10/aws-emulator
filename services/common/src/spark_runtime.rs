@@ -28,11 +28,12 @@
 //!
 //! What they are not is a distributed Spark. The partitions are lists in this process, there
 //! is no cluster to schedule them on, and the surface is the one this emulator can compute —
-//! the resilient distributed dataset, the session and context that hand one out, and the
-//! Hadoop filesystem a Spark program reads and writes through. A program that reaches for
-//! anything else (the SQL planner, a streaming source, the machine-learning library) raises
-//! the way a missing attribute raises, so the work it was submitted by FAILS carrying that
-//! error rather than reporting a success nothing computed.
+//! the resilient distributed dataset, the session and context that hand one out, the dataset of
+//! rows with its column expressions ([`sql`], [`column`], [`functions`]), the columnar format
+//! it reads and writes ([`parquet`]), and the Hadoop filesystem a Spark program reads and
+//! writes through. A program that reaches for anything else (a streaming source, the
+//! machine-learning library) raises the way a missing attribute raises, so the work it was
+//! submitted by FAILS carrying that error rather than reporting a success nothing computed.
 //!
 //! # Where its filesystem reads and writes land
 //!

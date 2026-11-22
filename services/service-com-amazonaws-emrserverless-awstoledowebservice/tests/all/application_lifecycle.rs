@@ -9,7 +9,7 @@
 //! a job run are whatever the create or submit stored, and every reporting operation
 //! computes its answer from that record rather than from the request that asked.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,8 +19,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_emrserverless_awstoledowebservice::state::spark_job_run::JOB_RUN_UNREADABLE_LEAD;
 use service_com_amazonaws_emrserverless_awstoledowebservice::state::{
-    DEFAULT_EXECUTION_TIMEOUT_MINUTES, JOB_RUN_STAGES, JOB_RUN_STAGE_TRANSITION,
-    LIFECYCLE_TRANSITION, PAGE_LIMIT, TERMINAL_JOB_RUN_STATES,
+    non_terminal_job_run_window, DEFAULT_EXECUTION_TIMEOUT_MINUTES, JOB_RUN_STAGES,
+    JOB_RUN_STAGE_TRANSITION, LIFECYCLE_TRANSITION, PAGE_LIMIT, TERMINAL_JOB_RUN_STATES,
 };
 use service_com_amazonaws_emrserverless_awstoledowebservice::EmulatedService;
 
@@ -2022,4 +2022,1112 @@ pub(crate) fn urlencode(value: &str) -> String {
             other => format!("%{other:02X}"),
         })
         .collect()
+}
+
+// --- what a SUBMITTED Spark program computes, and how long a run is observable in flight ---
+
+/// The bucket the Spark rows below stage their input in and write their output to.
+const SPARK_BUCKET: &str = "emr-serverless-spark-data";
+
+/// The interval a client that waits for work polls at.
+///
+/// A client submits a job run and then looks for it — `GetJobRun`, or `ListJobRuns` filtered
+/// on the non-terminal states — on the order of seconds; the recorded clients driving this
+/// service look every ten. The state such a client is told the run is in must not depend on
+/// how coarsely it looks, which is what the window a run is non-terminal for has to outlast.
+const CLIENT_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// The non-terminal `JobRunState` values a client filters a listing on to find work in
+/// flight. Source: `smithy_query(query="shape",shape="JobRunState")` — the enum's values
+/// less the three terminal ones. Written out here rather than imported, so a wrong set in
+/// `src/` cannot make this suite pass.
+const IN_FLIGHT_STATES: &[&str] = &["SUBMITTED", "PENDING", "QUEUED", "SCHEDULED", "RUNNING"];
+
+/// One path-style Amazon S3 call against the emulator this suite builds, answered as the
+/// whole HTTP response: the body of an object is BYTES, which is what a columnar object has
+/// to be read as.
+pub(crate) async fn s3(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Bytes,
+) -> (u16, Bytes) {
+    let mut builder = ::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("host", format!("s3.{REGION}.amazonaws.com"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/s3/aws4_request, \
+                 SignedHeaders=host, Signature=abc"
+            ),
+        );
+    if !body.is_empty() {
+        builder = builder.header("content-type", "application/octet-stream");
+    }
+    let request = builder.body(body).expect("the test request is well formed");
+    let response = router.dispatch(request).await;
+    (response.status().as_u16(), response.into_body())
+}
+
+/// Create [`SPARK_BUCKET`], so the paths the rows name resolve.
+pub(crate) async fn given_spark_bucket(router: &MultiServiceRouter) {
+    let configuration = format!(
+        "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"
+    );
+    let (status, body) = s3(
+        router,
+        "PUT",
+        &format!("/{SPARK_BUCKET}"),
+        Bytes::from(configuration),
+    )
+    .await;
+    assert!(
+        status == 200 || status == 409,
+        "creating s3://{SPARK_BUCKET} must succeed or report it is already there, got \
+         {status} with {:?}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// A key as it travels in a path-style Amazon S3 URI: each segment percent-encoded, with the
+/// separators between them left as they are.
+fn key_in_a_uri(key: &str) -> String {
+    key.split('/').map(urlencode).collect::<Vec<String>>().join("/")
+}
+
+/// Store one object in [`SPARK_BUCKET`].
+pub(crate) async fn put_object(router: &MultiServiceRouter, key: &str, body: Bytes) {
+    let (status, answered) = s3(
+        router,
+        "PUT",
+        &format!("/{SPARK_BUCKET}/{}", key_in_a_uri(key)),
+        body,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "storing s3://{SPARK_BUCKET}/{key} must succeed, got {status} with {:?}",
+        String::from_utf8_lossy(&answered)
+    );
+}
+
+/// The bytes of one object of [`SPARK_BUCKET`].
+pub(crate) async fn get_object(router: &MultiServiceRouter, key: &str) -> Bytes {
+    let (status, body) = s3(
+        router,
+        "GET",
+        &format!("/{SPARK_BUCKET}/{}", key_in_a_uri(key)),
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "reading s3://{SPARK_BUCKET}/{key} must succeed, got {status} with {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    body
+}
+
+/// The keys of every object under `prefix` in [`SPARK_BUCKET`], from `ListObjectsV2`.
+pub(crate) async fn keys_under(router: &MultiServiceRouter, prefix: &str) -> Vec<String> {
+    let (status, listing) = s3(
+        router,
+        "GET",
+        &format!("/{SPARK_BUCKET}?list-type=2&prefix={}", urlencode(prefix)),
+        Bytes::new(),
+    )
+    .await;
+    let listing = String::from_utf8_lossy(&listing).to_string();
+    assert_eq!(
+        status, 200,
+        "listing s3://{SPARK_BUCKET}/{prefix} must succeed, got {status} with {listing}"
+    );
+    listing
+        .split("<Key>")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("</Key>").map(|(key, _)| key.to_string()))
+        .collect()
+}
+
+/// The program every Spark row submits: it reads its source, GROUPS it (a shuffle), writes
+/// the result as Parquet — partitioned by the columns its fourth argument names — reads that
+/// output back, and FAILS unless what it read is what it wrote. The counts it then reports
+/// are written as its own output, so the suite reads them back out of the object store.
+const ROUNDTRIP_PROGRAM: &str = r#"
+import sys
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, sum as summed
+
+source, output, report, keys = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+names = [name for name in keys.split(",") if name]
+
+spark = SparkSession.builder.appName("partitioned-roundtrip").getOrCreate()
+frame = (
+    spark.read.option("header", "true")
+    .schema("region string, dt string, amount double, items bigint")
+    .csv(source)
+)
+grouped = frame.groupBy("region", "dt").agg(
+    summed("amount").alias("total"),
+    summed("items").alias("items"),
+    count("*").alias("rows"),
+)
+writer = grouped.write.mode("overwrite")
+if names:
+    writer = writer.partitionBy(*names)
+writer.parquet(output)
+
+read = spark.read.parquet(output)
+
+
+# What a dataset holds, by group. A partition column is resolved from the DIRECTORY that
+# names it, whose own type Spark infers, so a group is keyed by the TEXT of its key values
+# while its measures are compared as the values they are.
+def keyed(frame):
+    held = {}
+    for row in frame.collect():
+        held["%s|%s" % (row["region"], row["dt"])] = (
+            row["total"],
+            row["items"],
+            row["rows"],
+        )
+    return held
+
+
+held = keyed(read)
+wrote = keyed(grouped)
+if held != wrote:
+    raise ValueError("the parquet round trip read %r, having written %r" % (held, wrote))
+
+one = read.filter(col("region") == 'eu').orderBy("dt").collect()
+spark.createDataFrame(
+    [
+        {
+            "groups": len(held),
+            "eu": len(one),
+            "columns": ",".join(read.columns),
+            "types": ",".join("%s:%s" % pair for pair in read.dtypes),
+        }
+    ]
+).coalesce(1).write.mode("overwrite").json(report)
+"#;
+/// One row of the input the program reads: a group key, a measure that may be absent, and a
+/// count that may be absent.
+struct Fact {
+    region: &'static str,
+    dt: &'static str,
+    amount: Option<f64>,
+    items: Option<i64>,
+}
+
+/// The input as the header'd CSV the program reads.
+fn facts_csv(facts: &[Fact]) -> String {
+    let mut text = String::from("region,dt,amount,items\n");
+    for fact in facts {
+        text.push_str(&format!(
+            "{},{},{},{}\n",
+            fact.region,
+            fact.dt,
+            fact
+                .amount
+                .map(|value| format!("{value}"))
+                .unwrap_or_default(),
+            fact.items
+                .map(|value| format!("{value}"))
+                .unwrap_or_default(),
+        ));
+    }
+    text
+}
+
+/// The aggregate the program computes, as this suite computes it independently:
+/// `(region, dt) -> (total, items, rows)`, where a group holding no value for a measure
+/// reports none of it.
+type Groups = BTreeMap<(String, String), (Option<f64>, Option<i64>, i64)>;
+
+fn expected_groups(facts: &[Fact]) -> Groups {
+    let mut held: Groups = BTreeMap::new();
+    for fact in facts {
+        let entry = held
+            .entry((fact.region.to_string(), fact.dt.to_string()))
+            .or_insert((None, None, 0));
+        if let Some(amount) = fact.amount {
+            entry.0 = Some(entry.0.unwrap_or(0.0) + amount);
+        }
+        if let Some(items) = fact.items {
+            entry.1 = Some(entry.1.unwrap_or(0) + items);
+        }
+        entry.2 += 1;
+    }
+    held
+}
+
+/// Every row one Parquet object holds, as `(column name, value as text)` pairs — `None` for a
+/// row that holds no value — beside the NULL COUNT each of its column chunks reports in its
+/// own statistics. Both are read with the Apache implementation of the format, so what is
+/// asserted is that an INDEPENDENT reader parses the bytes this emulator's Spark wrote.
+#[allow(clippy::type_complexity)]
+fn parquet_rows(
+    case: &str,
+    key: &str,
+    body: &Bytes,
+) -> (
+    Vec<BTreeMap<String, Option<String>>>,
+    BTreeMap<String, u64>,
+) {
+    use ::parquet::file::reader::{FileReader, SerializedFileReader};
+    use ::parquet::record::Field;
+
+    let reader = SerializedFileReader::new(body.clone()).unwrap_or_else(|error| {
+        panic!("case {case:?}: {key} must be a Parquet file, got {error} for {body:?}")
+    });
+    let metadata = reader.metadata();
+    let mut nulls: BTreeMap<String, u64> = BTreeMap::new();
+    for group in 0..metadata.num_row_groups() {
+        let row_group = metadata.row_group(group);
+        for index in 0..row_group.num_columns() {
+            let column = row_group.column(index);
+            let name = column.column_path().string();
+            let statistics = column.statistics().unwrap_or_else(|| {
+                panic!("case {case:?}: {key} must report statistics for {name}")
+            });
+            let counted = statistics.null_count_opt().unwrap_or_else(|| {
+                panic!("case {case:?}: {key} must report a null count for {name}")
+            });
+            *nulls.entry(name).or_insert(0) += counted;
+        }
+    }
+    let mut rows = Vec::new();
+    for row in reader
+        .get_row_iter(None)
+        .unwrap_or_else(|error| panic!("case {case:?}: {key} must hold rows, got {error}"))
+    {
+        let row = row.unwrap_or_else(|error| {
+            panic!("case {case:?}: {key} must hold readable rows, got {error}")
+        });
+        let mut held = BTreeMap::new();
+        for (name, field) in row.get_column_iter() {
+            let value = match field {
+                Field::Null => None,
+                Field::Bool(held) => Some(held.to_string()),
+                Field::Long(held) => Some(held.to_string()),
+                Field::Int(held) => Some(held.to_string()),
+                Field::Double(held) => Some(format!("{held}")),
+                Field::Float(held) => Some(format!("{held}")),
+                Field::Str(held) => Some(held.clone()),
+                other => Some(format!("{other:?}")),
+            };
+            held.insert(name.clone(), value);
+        }
+        rows.push(held);
+    }
+    (rows, nulls)
+}
+
+/// RULE: a job run's terminal state is what RUNNING the work its driver submitted came to, so
+/// a `sparkSubmit` of a Python application that computes an aggregate, writes it as Parquet
+/// and reads it back ends in SUCCESS, and the objects it left are the ones it computed — real
+/// Parquet files, under the `name=value` directories the write partitioned them by, holding
+/// the values the program's own transformations produced.
+///
+/// The rows differ along what the rule generalises over: how the output is PARTITIONED (not at
+/// all, by one column, by two), the VALUES the groups carry (whole numbers, fractions, a
+/// measure no row of a group holds), and the FORM of a partition value (plain text, text a
+/// path cannot hold literally, text that reads as a number).
+#[tokio::test]
+async fn a_submitted_spark_program_round_trips_a_partitioned_parquet_dataset() {
+    // (case, the partition columns the write names, the facts the program reads)
+    let rows: Vec<(&str, &str, Vec<Fact>)> = vec![
+        (
+            "an unpartitioned output",
+            "",
+            vec![
+                Fact { region: "eu", dt: "2026-01-01", amount: Some(2.5), items: Some(3) },
+                Fact { region: "eu", dt: "2026-01-01", amount: Some(1.5), items: Some(4) },
+                Fact { region: "us", dt: "2026-01-02", amount: Some(7.0), items: Some(1) },
+            ],
+        ),
+        (
+            "one partition column",
+            "region",
+            vec![
+                Fact { region: "eu", dt: "2026-01-01", amount: Some(10.0), items: Some(2) },
+                Fact { region: "us", dt: "2026-01-01", amount: Some(20.0), items: Some(5) },
+                Fact { region: "us", dt: "2026-01-02", amount: Some(0.25), items: None },
+            ],
+        ),
+        (
+            "two partition columns, one of them read as a number",
+            "region,dt",
+            vec![
+                Fact { region: "42", dt: "2026-01-03", amount: Some(1.0), items: Some(1) },
+                Fact { region: "42", dt: "2026-01-04", amount: None, items: Some(2) },
+                Fact { region: "7", dt: "2026-01-03", amount: Some(3.5), items: Some(3) },
+            ],
+        ),
+        (
+            "a partition value a path cannot hold literally",
+            "region",
+            vec![
+                Fact { region: "eu:west", dt: "2026-02-01", amount: Some(4.0), items: Some(2) },
+                Fact { region: "eu", dt: "2026-02-01", amount: Some(6.0), items: Some(8) },
+            ],
+        ),
+    ];
+
+    // Every row's work is SUBMITTED first and read back afterwards: the runs are independent,
+    // so they are in flight together and the suite waits out one run's window rather than
+    // four.
+    let router = emulator();
+    given_spark_bucket(&router).await;
+    put_object(&router, "program/roundtrip.py", Bytes::from(ROUNDTRIP_PROGRAM)).await;
+    let application_id = started_application(&router, "tok-spark").await;
+    let mut submitted_runs: Vec<String> = Vec::new();
+    for (ordinal, (case, keys, facts)) in rows.iter().enumerate() {
+        let source = format!("input/{ordinal}/facts.csv");
+        put_object(&router, &source, Bytes::from(facts_csv(facts))).await;
+        let submitted = start_job_run(
+            &router,
+            &application_id,
+            json!({
+                "clientToken": format!("job-spark-{ordinal}"),
+                "executionRoleArn": EXECUTION_ROLE,
+                "jobDriver": {
+                    "sparkSubmit": {
+                        "entryPoint": format!("s3://{SPARK_BUCKET}/program/roundtrip.py"),
+                        "entryPointArguments": [
+                            format!("s3://{SPARK_BUCKET}/{source}"),
+                            format!("s3://{SPARK_BUCKET}/output/{ordinal}"),
+                            format!("s3://{SPARK_BUCKET}/report/{ordinal}"),
+                            keys,
+                        ],
+                    }
+                },
+            }),
+        )
+        .await;
+        assert_eq!(
+            submitted.status, 200,
+            "case {case:?}: StartJobRun expected 200, got {} with {:?}",
+            submitted.status, submitted.body
+        );
+        submitted_runs.push(
+            submitted
+                .at("/jobRunId")
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+
+    for (ordinal, (case, keys, facts)) in rows.iter().enumerate() {
+        let output = format!("output/{ordinal}");
+        let report = format!("report/{ordinal}");
+        let job_run_id = &submitted_runs[ordinal];
+
+        let settled = settled_job_run(&router, &application_id, job_run_id).await;
+        assert_eq!(
+            settled.at("/jobRun/state"),
+            json!("SUCCESS"),
+            "case {case:?}: a program that ran to its end must leave the run in SUCCESS, got \
+             {:?} with {:?}",
+            settled.at("/jobRun/state"),
+            settled.at("/jobRun/stateDetails")
+        );
+
+        // What the program WROTE: the objects under the output prefix, which are the output's
+        // own part files and the marker a completed write leaves beside them.
+        let keys_written = keys_under(&router, &format!("{output}/")).await;
+        let parts: Vec<String> = keys_written
+            .iter()
+            .filter(|key| key.ends_with(".snappy.parquet"))
+            .cloned()
+            .collect();
+        assert!(
+            !parts.is_empty(),
+            "case {case:?}: the write must leave Parquet part files, got {keys_written:?}"
+        );
+        assert!(
+            keys_written
+                .iter()
+                .any(|key| key.ends_with("/_SUCCESS")),
+            "case {case:?}: a completed write leaves its marker, got {keys_written:?}"
+        );
+
+        let partition_columns: Vec<&str> = keys.split(',').filter(|name| !name.is_empty()).collect();
+        let expected = expected_groups(facts);
+        let mut read_back: BTreeMap<(String, String), (String, String, String)> = BTreeMap::new();
+        for key in &parts {
+            // The directories between the output prefix and the part file are the partition
+            // columns of the output: one level per column the write named, in that order.
+            let within = key
+                .strip_prefix(&format!("{output}/"))
+                .unwrap_or(key)
+                .to_string();
+            let segments: Vec<&str> = within.split('/').collect();
+            assert_eq!(
+                segments.len(),
+                partition_columns.len() + 1,
+                "case {case:?}: expected {} partition director(ies) above {key}, got \
+                 {segments:?}",
+                partition_columns.len()
+            );
+            let mut from_the_key: BTreeMap<String, String> = BTreeMap::new();
+            for (segment, name) in segments.iter().zip(partition_columns.iter()) {
+                let (held, value) = segment.split_once('=').unwrap_or_else(|| {
+                    panic!("case {case:?}: {segment:?} must name a partition column")
+                });
+                assert_eq!(
+                    held, *name,
+                    "case {case:?}: expected the directory of {name}, got {segment:?}"
+                );
+                assert!(
+                    !value.contains(':') && !value.contains('/'),
+                    "case {case:?}: a partition value carrying a character the Hive layout \
+                     escapes must be written escaped, got {segment:?}"
+                );
+                from_the_key.insert(held.to_string(), unescape_partition(value));
+            }
+            let body = get_object(&router, key).await;
+            let (rows_held, nulls) = parquet_rows(case, key, &body);
+            // The statistics a column chunk reports are computed from the chunk's own values,
+            // so the null count of each column is how many of the rows in THIS file hold no
+            // value for it.
+            for (name, counted) in &nulls {
+                let expected_nulls = rows_held
+                    .iter()
+                    .filter(|row| row.get(name).map(Option::is_none).unwrap_or(false))
+                    .count() as u64;
+                assert_eq!(
+                    *counted, expected_nulls,
+                    "case {case:?}: {key} must report {expected_nulls} null(s) for {name}, got \
+                     {counted}"
+                );
+            }
+            for row in rows_held {
+                let mut values: BTreeMap<String, String> = row
+                    .iter()
+                    .map(|(name, value)| {
+                        (name.clone(), value.clone().unwrap_or_default())
+                    })
+                    .collect();
+                for (name, value) in &from_the_key {
+                    values.insert(name.clone(), value.clone());
+                }
+                for name in &partition_columns {
+                    assert!(
+                        !row.contains_key(*name),
+                        "case {case:?}: a partition column lives in the directory, not in the \
+                         file, got {row:?}"
+                    );
+                }
+                read_back.insert(
+                    (
+                        values.get("region").cloned().unwrap_or_default(),
+                        values.get("dt").cloned().unwrap_or_default(),
+                    ),
+                    (
+                        values.get("total").cloned().unwrap_or_default(),
+                        values.get("items").cloned().unwrap_or_default(),
+                        values.get("rows").cloned().unwrap_or_default(),
+                    ),
+                );
+            }
+        }
+        assert_eq!(
+            read_back.len(),
+            expected.len(),
+            "case {case:?}: expected {} group(s) in the output, got {read_back:?}",
+            expected.len()
+        );
+        for (group, (total, items, count)) in &expected {
+            let found = read_back.get(group).unwrap_or_else(|| {
+                panic!("case {case:?}: the output must hold the group {group:?}, got {read_back:?}")
+            });
+            let expected_total = total
+                .map(|value| format!("{value}"))
+                .unwrap_or_default();
+            let expected_items = items.map(|value| value.to_string()).unwrap_or_default();
+            assert_eq!(
+                found.0, expected_total,
+                "case {case:?}: group {group:?} must total {expected_total:?}, got {found:?}"
+            );
+            assert_eq!(
+                found.1, expected_items,
+                "case {case:?}: group {group:?} must count {expected_items:?} item(s), got \
+                 {found:?}"
+            );
+            assert_eq!(
+                found.2,
+                count.to_string(),
+                "case {case:?}: group {group:?} must hold {count} row(s), got {found:?}"
+            );
+        }
+
+        // ... and what the program REPORTED of its own read back, which is a second output it
+        // wrote through the same session.
+        let report_keys = keys_under(&router, &format!("{report}/")).await;
+        let mut reported = String::new();
+        for key in report_keys.iter().filter(|key| !key.ends_with("/_SUCCESS")) {
+            reported.push_str(&String::from_utf8_lossy(&get_object(&router, key).await));
+        }
+        let reported: Value = serde_json::from_str(reported.trim()).unwrap_or_else(|error| {
+            panic!("case {case:?}: the program's report must be JSON ({error}), got {reported:?}")
+        });
+        assert_eq!(
+            reported["groups"],
+            json!(expected.len()),
+            "case {case:?}: the program read back {} group(s), got {reported:?}",
+            expected.len()
+        );
+        let eu_groups = expected
+            .keys()
+            .filter(|(region, _dt)| region == "eu")
+            .count();
+        assert_eq!(
+            reported["eu"],
+            json!(eu_groups),
+            "case {case:?}: the program's filter must answer {eu_groups} group(s), got \
+             {reported:?}"
+        );
+        let columns = reported["columns"].as_str().unwrap_or_default();
+        for name in ["region", "dt", "total", "items", "rows"] {
+            assert!(
+                columns.split(',').any(|held| held == name),
+                "case {case:?}: the read-back dataset must carry {name}, got {columns:?}"
+            );
+        }
+        // A partition column is read back out of the DIRECTORY that names it, and the type it
+        // carries is the one inferred from the value spelled there — a whole number where it
+        // spells one, and text otherwise, which is what Spark's partition-column type
+        // inference answers.
+        let types = reported["types"].as_str().unwrap_or_default();
+        for name in &partition_columns {
+            let all_numeric = facts
+                .iter()
+                .map(|fact| if *name == "region" { fact.region } else { fact.dt })
+                .all(|value| value.parse::<i64>().is_ok());
+            let expected_type = if all_numeric { "bigint" } else { "string" };
+            assert!(
+                types
+                    .split(',')
+                    .any(|held| held == format!("{name}:{expected_type}")),
+                "case {case:?}: the partition column {name} must be read back as \
+                 {expected_type}, got {types:?}"
+            );
+        }
+    }
+}
+
+/// The text a percent-encoded partition value spells, which is how the suite reads one back
+/// out of a directory name — decoded by the maintained codec this crate already percent-codes
+/// with rather than by hand.
+fn unescape_partition(value: &str) -> String {
+    ::percent_encoding::percent_decode_str(value)
+        .decode_utf8_lossy()
+        .to_string()
+}
+
+/// RULE: a submitted program reading a source whose bytes are not a readable Parquet file
+/// FAILS with what the read raised, inside the bounds the codec holds a file's own claims to —
+/// so a malformed, truncated or oversized file ends that one run and leaves the emulator
+/// answering, rather than being read as rows nothing wrote.
+///
+/// The rows differ along how the bytes are unreadable: not the format at all, the format's
+/// magic with nothing behind it, a real file cut short, a real file whose footer claims a
+/// length the file does not hold, and one whose own page claims more values than it carries.
+#[tokio::test]
+async fn a_submitted_program_reading_unreadable_parquet_fails_within_the_codecs_bounds() {
+    let router = emulator();
+    given_spark_bucket(&router).await;
+
+    // A real Parquet file, written by this emulator's own Spark, is what the truncated and
+    // the tampered rows below are made from.
+    let source = "malformed/facts.csv";
+    let written = "malformed/written";
+    put_object(
+        &router,
+        source,
+        Bytes::from(facts_csv(&[Fact {
+            region: "eu",
+            dt: "2026-03-01",
+            amount: Some(1.5),
+            items: Some(2),
+        }])),
+    )
+    .await;
+    put_object(&router, "malformed/write.py", Bytes::from(ROUNDTRIP_PROGRAM)).await;
+    let application_id = started_application(&router, "tok-malformed").await;
+    let writing = start_job_run(
+        &router,
+        &application_id,
+        json!({
+            "clientToken": "job-malformed-write",
+            "executionRoleArn": EXECUTION_ROLE,
+            "jobDriver": {
+                "sparkSubmit": {
+                    "entryPoint": format!("s3://{SPARK_BUCKET}/malformed/write.py"),
+                    "entryPointArguments": [
+                        format!("s3://{SPARK_BUCKET}/{source}"),
+                        format!("s3://{SPARK_BUCKET}/{written}"),
+                        format!("s3://{SPARK_BUCKET}/malformed/report"),
+                        "",
+                    ],
+                }
+            },
+        }),
+    )
+    .await;
+    let writing_id = writing.at("/jobRunId").as_str().unwrap_or_default().to_string();
+    let wrote = settled_job_run(&router, &application_id, &writing_id).await;
+    assert_eq!(
+        wrote.at("/jobRun/state"),
+        json!("SUCCESS"),
+        "the control write must succeed before the unreadable rows are made from it, got {:?}",
+        wrote.at("/jobRun/stateDetails")
+    );
+    let part = keys_under(&router, &format!("{written}/"))
+        .await
+        .into_iter()
+        .find(|key| key.ends_with(".snappy.parquet"))
+        .expect("the control write leaves a Parquet part file");
+    let real = get_object(&router, &part).await.to_vec();
+
+    // (case, the bytes the program reads)
+    let mut tampered_footer = real.clone();
+    let footer_at = tampered_footer.len() - 8;
+    tampered_footer[footer_at..footer_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    let mut tampered_values = real.clone();
+    // The page header of the first column chunk opens right after the magic; raising the
+    // value count it states makes the chunk claim more values than its page carries.
+    for index in 4..tampered_values.len().min(64) {
+        if tampered_values[index] == 0x02 {
+            tampered_values[index] = 0x7E;
+            break;
+        }
+    }
+    let rows: Vec<(&str, Vec<u8>)> = vec![
+        ("bytes that are not the format at all", b"not a parquet file".to_vec()),
+        ("the magic with nothing behind it", b"PAR1PAR1".to_vec()),
+        ("a real file cut short", real[..real.len() / 2].to_vec()),
+        ("a footer claiming a length the file does not hold", tampered_footer),
+        ("a page claiming more values than it carries", tampered_values),
+    ];
+
+    put_object(
+        &router,
+        "malformed/read.py",
+        Bytes::from(
+            "import sys\n\nfrom pyspark.sql import SparkSession\n\nspark = \
+             SparkSession.builder.appName('read').getOrCreate()\n\
+             rows = spark.read.parquet(sys.argv[1]).collect()\n\
+             raise ValueError('the read answered %d row(s)' % (len(rows),))\n",
+        ),
+    )
+    .await;
+
+    // Every row's read is SUBMITTED first and read back afterwards, so the runs are in flight
+    // together and the suite waits out one run's window rather than five.
+    let mut submitted_reads: Vec<String> = Vec::new();
+    for (ordinal, (_case, body)) in rows.iter().enumerate() {
+        let key = format!("malformed/{ordinal}/part-00000.snappy.parquet");
+        put_object(&router, &key, Bytes::from(body.clone())).await;
+        let submitted = start_job_run(
+            &router,
+            &application_id,
+            json!({
+                "clientToken": format!("job-malformed-{ordinal}"),
+                "executionRoleArn": EXECUTION_ROLE,
+                "jobDriver": {
+                    "sparkSubmit": {
+                        "entryPoint": format!("s3://{SPARK_BUCKET}/malformed/read.py"),
+                        "entryPointArguments": [
+                            format!("s3://{SPARK_BUCKET}/malformed/{ordinal}/")
+                        ],
+                    }
+                },
+            }),
+        )
+        .await;
+        submitted_reads.push(
+            submitted
+                .at("/jobRunId")
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+
+    for (ordinal, (case, _body)) in rows.iter().enumerate() {
+        let settled = settled_job_run(&router, &application_id, &submitted_reads[ordinal]).await;
+        assert_eq!(
+            settled.at("/jobRun/state"),
+            json!("FAILED"),
+            "case {case:?}: a read of unreadable bytes must end the run in the modelled \
+             failure state, got {:?} with {:?}",
+            settled.at("/jobRun/state"),
+            settled.at("/jobRun/stateDetails")
+        );
+        let details = settled.at("/jobRun/stateDetails");
+        let details = details.as_str().unwrap_or_default();
+        assert!(
+            !details.contains("row(s)"),
+            "case {case:?}: no row may be answered for bytes nothing could be read from, got \
+             {details:?}"
+        );
+        // ... and the emulator answers the next call, so nothing of the refusal took the
+        // service with it.
+        assert_eq!(
+            get_application(&router, &application_id).await.status,
+            200,
+            "case {case:?}: the service must still answer after a refused read"
+        );
+    }
+}
+
+/// The program the join test submits: it matches two datasets it builds itself on the column
+/// they share, under each kind of join, and reports what each one answered — so what the suite
+/// asserts is what the engine COMPUTED over the program's own rows.
+const JOIN_PROGRAM: &str = r#"
+import sys
+
+from pyspark.sql import SparkSession
+
+report = sys.argv[1]
+spark = SparkSession.builder.appName("joins").getOrCreate()
+left = spark.createDataFrame(
+    [
+        {"region": "eu", "amount": 1},
+        {"region": "us", "amount": 2},
+        {"region": "us", "amount": 3},
+        {"region": "ap", "amount": 4},
+    ]
+).cache()
+right = spark.createDataFrame(
+    [
+        {"region": "eu", "tax": 10},
+        {"region": "us", "tax": 20},
+        {"region": "za", "tax": 30},
+    ]
+)
+
+answered = {}
+for how in (
+    "inner",
+    "cross",
+    "left",
+    "left_outer",
+    "right",
+    "right_outer",
+    "full",
+    "full_outer",
+    "outer",
+    "leftsemi",
+    "left_semi",
+    "semi",
+    "leftanti",
+    "left_anti",
+    "anti",
+):
+    joined = left.join(right, "region", how)
+    answered[how] = joined.count()
+    answered["%s_columns" % (how,)] = ",".join(joined.columns)
+
+# A `how` naming no kind of join is REFUSED rather than answered as some other join.
+try:
+    left.join(right, "region", "innr")
+    answered["refused"] = ""
+except Exception as error:
+    answered["refused"] = "%s: %s" % (type(error).__name__, error)
+
+matched = left.join(right, ["region"], "inner").select("*").orderBy("region", "amount")
+answered["matched"] = ";".join(
+    "%s:%s:%s" % (row["region"], row["amount"], row["tax"]) for row in matched.collect()
+)
+answered["regions"] = left.select("region").dropDuplicates().count()
+answered["unmatched_is_empty"] = int(left.join(right, "region", "leftanti").isEmpty())
+answered["first"] = matched.head()["region"]
+
+spark.createDataFrame([answered]).coalesce(1).write.mode("overwrite").json(report)
+"#;
+
+/// RULE: what a submitted program's own transformations answer is what this engine COMPUTES
+/// over its rows — so a program that matches two datasets on the column they share gets, for
+/// each kind of join, the rows that kind keeps and the columns it carries, and the dataset it
+/// then holds, de-duplicates and orders is the one its own values make.
+///
+/// The cases differ along what the rule generalises over: the KIND of join (inner, the three
+/// outer ones, and the two semi-joins), whether a row of either side matches, and whether a
+/// key matches more than one row on the other side.
+#[tokio::test]
+async fn a_submitted_spark_program_matches_two_datasets_on_the_column_they_share() {
+    let router = emulator();
+    given_spark_bucket(&router).await;
+    put_object(&router, "join/program.py", Bytes::from(JOIN_PROGRAM)).await;
+    let application_id = started_application(&router, "tok-join").await;
+    let submitted = start_job_run(
+        &router,
+        &application_id,
+        json!({
+            "clientToken": "job-join",
+            "executionRoleArn": EXECUTION_ROLE,
+            "jobDriver": {
+                "sparkSubmit": {
+                    "entryPoint": format!("s3://{SPARK_BUCKET}/join/program.py"),
+                    "entryPointArguments": [format!("s3://{SPARK_BUCKET}/join/report")],
+                }
+            },
+        }),
+    )
+    .await;
+    let job_run_id = submitted
+        .at("/jobRunId")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let settled = settled_job_run(&router, &application_id, &job_run_id).await;
+    assert_eq!(
+        settled.at("/jobRun/state"),
+        json!("SUCCESS"),
+        "a program that ran to its end must leave the run in SUCCESS, got {:?} with {:?}",
+        settled.at("/jobRun/state"),
+        settled.at("/jobRun/stateDetails")
+    );
+
+    let mut reported = String::new();
+    for key in keys_under(&router, "join/report/")
+        .await
+        .iter()
+        .filter(|key| !key.ends_with("/_SUCCESS"))
+    {
+        reported.push_str(&String::from_utf8_lossy(&get_object(&router, key).await));
+    }
+    let answered: Value = serde_json::from_str(reported.trim()).unwrap_or_else(|error| {
+        panic!("the program's report must be JSON ({error}), got {reported:?}")
+    });
+
+    // (case, how many rows that kind of join keeps, the columns it carries)
+    //
+    // The left dataset holds eu/1, us/2, us/3 and ap/4; the right holds eu/10, us/20 and
+    // za/30. So an inner join keeps the three matching pairs (the `us` key matching twice),
+    // each outer join adds the unmatched rows of the side it keeps, and the two semi-joins
+    // answer the rows of the left side that did and did not match. Every spelling
+    // `DataFrame.join`'s `how` documents for one kind answers that kind.
+    for (case, rows, columns) in [
+        ("inner", 3, "region,amount,tax"),
+        ("cross", 3, "region,amount,tax"),
+        ("left", 4, "region,amount,tax"),
+        ("left_outer", 4, "region,amount,tax"),
+        ("right", 4, "region,amount,tax"),
+        ("right_outer", 4, "region,amount,tax"),
+        ("full", 5, "region,amount,tax"),
+        ("full_outer", 5, "region,amount,tax"),
+        ("outer", 5, "region,amount,tax"),
+        ("leftsemi", 3, "region,amount"),
+        ("left_semi", 3, "region,amount"),
+        ("semi", 3, "region,amount"),
+        ("leftanti", 1, "region,amount"),
+        ("left_anti", 1, "region,amount"),
+        ("anti", 1, "region,amount"),
+    ] {
+        assert_eq!(
+            answered[case],
+            json!(rows),
+            "case {case:?}: expected {rows} row(s), got {answered:?}"
+        );
+        assert_eq!(
+            answered[format!("{case}_columns")],
+            json!(columns),
+            "case {case:?}: expected the columns {columns:?}, got {answered:?}"
+        );
+    }
+    assert_eq!(
+        answered["matched"],
+        json!("eu:1:10;us:2:20;us:3:20"),
+        "the matched rows must carry both sides' values, in the order asked for, got \
+         {answered:?}"
+    );
+    assert_eq!(
+        answered["regions"],
+        json!(3),
+        "the left dataset holds three distinct regions, got {answered:?}"
+    );
+    assert_eq!(
+        answered["unmatched_is_empty"],
+        json!(0),
+        "one row of the left dataset matched nothing, so the anti-join is not empty, got \
+         {answered:?}"
+    );
+    assert_eq!(
+        answered["first"],
+        json!("eu"),
+        "the first row of the ordered match is the least region, got {answered:?}"
+    );
+    // ... and a kind of join this engine does not match is refused, naming the kinds it does,
+    // rather than answering the rows of some other join.
+    let refused = answered["refused"].as_str().unwrap_or_default();
+    assert!(
+        refused.starts_with("AnalysisException: Unsupported join type 'innr'.")
+            && refused.contains("'LeftSemi'"),
+        "a join kind this engine does not match must be refused naming the kinds it does, \
+         got {refused:?}"
+    );
+}
+
+/// RULE: a submitted job run passes through the non-terminal `JobRunState` values — `RUNNING`
+/// among them — and stays in them for longer than the interval a client that submits work and
+/// then looks for it polls at, so such a client observes the run IN FLIGHT: `GetJobRun`
+/// reports a non-terminal state and a `ListJobRuns` filtered on the non-terminal states
+/// reports the run, whatever the run's own workload turns out to be.
+///
+/// The rows differ along what the rule generalises over: what the submitted work IS — an entry
+/// point the object store holds nothing at, a program that computes and ends at once, and one
+/// that asks to wait past the span one run may last — because the window a run is observable
+/// in flight for is the clock's and not the workload's.
+#[tokio::test]
+async fn a_submitted_job_run_is_observable_in_flight_past_a_client_poll_interval() {
+    assert!(
+        non_terminal_job_run_window() > CLIENT_POLL_INTERVAL,
+        "a run must stay non-terminal for longer than the {CLIENT_POLL_INTERVAL:?} a client \
+         looks at, got {:?}",
+        non_terminal_job_run_window()
+    );
+    assert!(
+        JOB_RUN_STAGES
+            .iter()
+            .any(|(state, _details)| *state == "RUNNING"),
+        "RUNNING must be among the states a run passes through, got {:?}",
+        JOB_RUN_STAGES
+            .iter()
+            .map(|(state, _)| *state)
+            .collect::<Vec<&str>>()
+    );
+
+    // (case, the program the submit names, and whether the object store holds it)
+    let rows: [(&str, &str, bool); 3] = [
+        ("an entry point the store holds nothing at", "", false),
+        (
+            "a program that computes and ends at once",
+            "value = sum(index for index in range(10))\n",
+            true,
+        ),
+        (
+            "a program that waits past the span one run may last",
+            "import time\ntime.sleep(240)\n",
+            true,
+        ),
+    ];
+
+    // Every row's work is SUBMITTED first and the runs are then polled TOGETHER, so the suite
+    // waits out one run's window rather than one per row, and each run is still observed
+    // through every state it passes.
+    let router = emulator();
+    given_spark_bucket(&router).await;
+    let application_id = started_application(&router, "tok-flight").await;
+    let mut runs: Vec<(usize, String, Vec<String>)> = Vec::new();
+    for (ordinal, (_case, program, staged)) in rows.iter().enumerate() {
+        let key = format!("in-flight/{ordinal}/app.py");
+        if *staged {
+            put_object(&router, &key, Bytes::from(program.to_string())).await;
+        }
+        let submitted = start_job_run(
+            &router,
+            &application_id,
+            json!({
+                "clientToken": format!("job-flight-{ordinal}"),
+                "executionRoleArn": EXECUTION_ROLE,
+                "jobDriver": {
+                    "sparkSubmit": { "entryPoint": format!("s3://{SPARK_BUCKET}/{key}") }
+                },
+            }),
+        )
+        .await;
+        runs.push((
+            ordinal,
+            submitted
+                .at("/jobRunId")
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            Vec::new(),
+        ));
+    }
+
+    // Every state each run is observed in, from the submit until it comes to rest: the look is
+    // a POLL for the next change rather than a wait of any length.
+    let deadline = Instant::now() + JOB_RUN_REST_DEADLINE;
+    loop {
+        let mut resting = 0;
+        for (ordinal, job_run_id, observed) in runs.iter_mut() {
+            let case = rows[*ordinal].0;
+            let answer = get_job_run(&router, &application_id, job_run_id).await;
+            let state = answer
+                .at("/jobRun/state")
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if observed.last() != Some(&state) {
+                // The listing a client filters on the non-terminal states must report the run
+                // for as long as it is in one of them, which is what makes it observable at
+                // all.
+                if !TERMINAL_JOB_RUN_STATES.contains(&state.as_str()) {
+                    let filter = IN_FLIGHT_STATES
+                        .iter()
+                        .map(|held| format!("states={held}"))
+                        .collect::<Vec<String>>()
+                        .join("&");
+                    let listed =
+                        list_job_runs(&router, &application_id, &format!("?{filter}")).await;
+                    let reported: Vec<String> = listed
+                        .body
+                        .get("jobRuns")
+                        .and_then(Value::as_array)
+                        .unwrap_or(&Vec::new())
+                        .iter()
+                        .map(|entry| entry["id"].as_str().unwrap_or_default().to_string())
+                        .collect();
+                    assert!(
+                        reported.contains(job_run_id),
+                        "case {case:?}: a run in {state} must be reported by a listing \
+                         filtered on the non-terminal states, got {reported:?}"
+                    );
+                }
+                observed.push(state.clone());
+            }
+            if TERMINAL_JOB_RUN_STATES.contains(&state.as_str()) {
+                resting += 1;
+            }
+        }
+        if resting == runs.len() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a submitted run never came to rest, having been {:?}",
+            runs.iter()
+                .map(|(_ordinal, _id, observed)| observed.clone())
+                .collect::<Vec<Vec<String>>>()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    for (ordinal, _job_run_id, observed) in &runs {
+        let case = rows[*ordinal].0;
+        for (state, _details) in JOB_RUN_STAGES {
+            assert!(
+                observed.iter().any(|held| held == state),
+                "case {case:?}: a client polling the run must observe it {state}, got \
+                 {observed:?}"
+            );
+        }
+        assert_eq!(
+            observed.first().map(String::as_str),
+            Some("SUBMITTED"),
+            "case {case:?}: a run is SUBMITTED when it is accepted, got {observed:?}"
+        );
+    }
 }

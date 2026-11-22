@@ -41,8 +41,10 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 # implementation this workspace already compresses with rather than by hand.
 flate2 = "1"
 # The `s3MonitoringConfiguration.logUri` a client configures log publishing with is a
-# caller-supplied URI, read by the maintained URL parser rather than split by hand.
-url = "2"
+# caller-supplied URI, read by the maintained URL parser rather than split by hand. Held at or
+# past 2.5.9, as every other crate that reads a URI holds it: every earlier release carries
+# RUSTSEC-2026-0592, the unbounded recursion `Url::origin()` takes over a `blob:` URL.
+url = "2.5.9"
 # ... and that URI's path spells an Amazon S3 key prefix, whose percent-escaping is
 # resolved by the maintained encoder the URL parser itself uses.
 percent-encoding = "2"
@@ -80,6 +82,10 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # ... and CloudWatch Logs beside it, for the other destination a monitoring configuration
 # names: the suite reads the delivered records back through `GetLogEvents`.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# The Apache implementation of the Parquet format, for the TESTS only: the objects a submitted
+# Spark program wrote are read back with it, so what the suite asserts of them is that an
+# independent reader of the format parses the bytes this emulator's Spark left.
+parquet = { version = "60", default-features = false, features = ["snap"] }
 
 [lints]
 workspace = true

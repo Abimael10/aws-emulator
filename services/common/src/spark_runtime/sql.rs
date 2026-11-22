@@ -63,6 +63,34 @@ class SparkException(Exception):
 # The column names a read gives the columns of a source that names none, as Spark names them.
 UNNAMED_COLUMN = "_c%d"
 
+# The KIND of join each spelling of `DataFrame.join`'s `how` names, mapped onto the one this
+# engine matches by. Source: `DataFrame.join`'s own `how` — "Must be one of: inner, cross,
+# outer, full, fullouter, full_outer, left, leftouter, left_outer, right, rightouter,
+# right_outer, semi, leftsemi, left_semi, anti, leftanti, left_anti" — read here with the
+# underscores taken out, so each documented spelling of a kind resolves to it. A `cross` named
+# with a join condition keeps the rows that satisfy it, which is the inner join of them.
+JOIN_KINDS = {
+    "inner": "inner",
+    "cross": "inner",
+    "outer": "outer",
+    "full": "outer",
+    "fullouter": "outer",
+    "left": "left",
+    "leftouter": "left",
+    "right": "right",
+    "rightouter": "right",
+    "semi": "semi",
+    "leftsemi": "semi",
+    "anti": "anti",
+    "leftanti": "anti",
+}
+
+# What a join whose `how` names no kind of join is refused with, as Spark words that refusal.
+UNSUPPORTED_JOIN = (
+    "Unsupported join type '%s'. Supported join types include: 'Inner', 'LeftOuter', "
+    "'RightOuter', 'FullOuter', 'LeftSemi', 'LeftAnti', 'Cross'."
+)
+
 # How a read treats a record it cannot read under the schema it was given, as the `mode`
 # option names it: the default nulls the field it could not read, `DROPMALFORMED` drops the
 # whole record, and `FAILFAST` fails the read. A mode outside these is one Spark reads as the
@@ -572,7 +600,15 @@ class DataFrameReader(object):
 
 
 class DataFrameWriter(object):
-    """Where a dataset of rows is WRITTEN: through the filesystem its path resolves in."""
+    """Where a dataset of rows is WRITTEN: through the filesystem its path resolves in.
+
+    The output is the layout Spark leaves: one part file per non-empty partition of the
+    dataset under the path, the `_SUCCESS` marker beside them, and — where the write names
+    columns to partition BY — one `name=value` directory level per such column, holding the
+    part files of the rows whose values those are. The partition columns are in the
+    directories rather than in the files, which is what a read of the output resolves them
+    from again.
+    """
 
     def __init__(self, frame):
         self._frame = frame
@@ -690,7 +726,7 @@ class DataFrameWriter(object):
         The part carries the suffix of the codec its pages are stored under, which is how
         Spark names a Parquet part file.
         """
-        declared = dict(self._frame.dtypes())
+        declared = dict(self._frame.dtypes)
         compression = self._options.get("compression", "snappy")
         _codec, suffix = parquet.codec_of(compression)
         for index, part in enumerate(slices(rows, self._frame.partitions())):
@@ -742,6 +778,26 @@ def _without(row, held):
     return Row(**dict((column, row[column]) for column in held))
 
 
+def _matched(columns, keys, left, right):
+    """One row of a join: the keys once, then what each side holds, null where it matched none.
+
+    A side that matched nothing is `None`, so every column of it is null in the row — which is
+    what an outer join leaves for an unmatched row.
+    """
+    values = {}
+    for name in columns:
+        value = None
+        if name in keys:
+            held = left if left is not None else right
+            value = held[name]
+        elif left is not None and name in left.fields():
+            value = left[name]
+        elif right is not None and name in right.fields():
+            value = right[name]
+        values[name] = value
+    return Row(**values)
+
+
 
 class DataFrame(object):
     """A dataset of rows: the rows themselves, and the computations over them.
@@ -785,7 +841,9 @@ class DataFrame(object):
             ]
         )
 
+    @property
     def dtypes(self):
+        """The (column, type) pairs of this dataset, as `DataFrame.dtypes` reports them."""
         return [(name, self._column_type(name)) for name in self._columns]
 
     def printSchema(self):
@@ -873,6 +931,100 @@ class DataFrame(object):
             return len(self._span)
         return len(self._rows)
 
+    def join(self, other, on=None, how="inner"):
+        """The two datasets matched on the columns `on` names.
+
+        "Joins with another DataFrame, using the given join expression" (`DataFrame.join`).
+        What is matched here is the EQUI-join on the column names both datasets carry, which
+        is what `on` names — one name, or a list of them; `how` is the kind of join
+        ([`JOIN_KINDS`]), and an unmatched side contributes its own row with the other side's
+        columns null wherever that kind keeps it. A join named by anything else — an `on`
+        that is not those names, or a `how` naming no kind of join — is REFUSED rather than
+        answered with the rows of some other join.
+
+        The result is a shuffle, so it is left over as many partitions as this dataset holds.
+        """
+        if isinstance(on, str):
+            names = [on]
+        elif isinstance(on, (list, tuple)) and on and all(
+            isinstance(value, str) for value in on
+        ):
+            names = [str(value) for value in on]
+        else:
+            raise AnalysisException(
+                "a join of this engine is made on the column names the two datasets share; "
+                "%r names none of them" % (on,)
+            )
+        for name in names:
+            if name not in self._columns:
+                raise AnalysisException("cannot resolve the column %s" % (name,))
+            if name not in other.columns:
+                raise AnalysisException("cannot resolve the column %s" % (name,))
+        spelled = str(how or "inner").lower().replace("_", "")
+        if spelled not in JOIN_KINDS:
+            raise AnalysisException(UNSUPPORTED_JOIN % (how,))
+        kind = JOIN_KINDS[spelled]
+        if kind in ("semi", "anti"):
+            columns = list(self._columns)
+        else:
+            # The join keys once, then each side's own columns, which is the order Spark
+            # leaves a join on names in.
+            columns = names + [name for name in self._columns if name not in names]
+            columns = columns + [name for name in other.columns if name not in columns]
+        matching = {}
+        for row in other.collect():
+            matching.setdefault(tuple(row[name] for name in names), []).append(row)
+        matched = set()
+        rows = []
+        for row in self._frame_rows():
+            keys = tuple(row[name] for name in names)
+            found = matching.get(keys) or []
+            if kind == "semi":
+                if found:
+                    rows.append(row)
+                continue
+            if kind == "anti":
+                if not found:
+                    rows.append(row)
+                continue
+            if found:
+                matched.add(keys)
+                for right in found:
+                    rows.append(_matched(columns, names, row, right))
+            elif kind in ("left", "outer"):
+                rows.append(_matched(columns, names, row, None))
+        if kind in ("right", "outer"):
+            for row in other.collect():
+                if tuple(row[name] for name in names) not in matched:
+                    rows.append(_matched(columns, names, None, row))
+        types = dict(other._types)
+        types.update(self._types)
+        return DataFrame(
+            rows,
+            columns,
+            self._partitions,
+            None,
+            dict((name, kind_of) for name, kind_of in types.items() if name in columns),
+        )
+
+    def crossJoin(self, other):
+        """Every row of this dataset beside every row of `other`.
+
+        A column name the two sides SHARE is one column of the product here, carrying this
+        dataset's value — the product of two datasets with a name in common is a dataset with
+        that name twice, which a row of this engine cannot hold.
+        """
+        columns = list(self._columns) + [
+            name for name in other.columns if name not in self._columns
+        ]
+        rows = []
+        for row in self._frame_rows():
+            for right in other.collect():
+                rows.append(_matched(columns, [], row, right))
+        types = dict(other._types)
+        types.update(self._types)
+        return DataFrame(rows, columns, self._partitions, None, types)
+
     def take(self, num):
         if self._span is not None:
             name = self._columns[0] if self._columns else "id"
@@ -890,15 +1042,66 @@ class DataFrame(object):
     def toLocalIterator(self):
         return iter(self._frame_rows())
 
+    def head(self, n=None):
+        """The first row, or the first `n` of them, as `head` answers either."""
+        if n is None:
+            return self.first()
+        return self.take(n)
+
+    def isEmpty(self):
+        return self.count() == 0
+
+    def dropDuplicates(self, subset=None):
+        """The rows of this dataset once each, told apart by the columns `subset` names."""
+        names = [str(name) for name in (subset or self._columns)]
+        for name in names:
+            if name not in self._columns:
+                raise AnalysisException("cannot resolve the column %s" % (name,))
+        seen = set()
+        rows = []
+        for row in self._frame_rows():
+            keys = tuple(row[name] for name in names)
+            if keys in seen:
+                continue
+            seen.add(keys)
+            rows.append(row)
+        return DataFrame(rows, self._columns, self._partitions, None, self._types)
+
+    def drop_duplicates(self, subset=None):
+        return self.dropDuplicates(subset)
+
+    def cache(self):
+        """The dataset itself: its rows are already held in this process.
+
+        "Persists the DataFrame with the default storage level" — a storage level is where a
+        distributed engine keeps the partitions it has computed, and this engine holds them
+        here, so there is nowhere else to put them and nothing for a program to observe but
+        the same dataset.
+        """
+        return self
+
+    def persist(self, storageLevel=None):
+        return self
+
+    def unpersist(self, blocking=False):
+        return self
+
     def select(self, *columns):
         """The dataset the expressions project, as `select` takes them.
 
         An argument is either the NAME of a column of this dataset or a column expression
         over it ([`pyspark.sql.column`]), and what the projection answers is what those
         expressions COMPUTE over this dataset's own rows: one row per row of it, or the one
-        row every aggregate answers when every expression is an aggregate.
+        row every aggregate answers when every expression is an aggregate. The name `*`
+        stands for every column of the dataset, as it does in a projection's own grammar.
         """
-        held = [self._resolved(column) for column in _flattened(columns)]
+        named = []
+        for column in _flattened(columns):
+            if isinstance(column, str) and column.strip() == "*":
+                named.extend(self._columns)
+            else:
+                named.append(column)
+        held = [self._resolved(column) for column in named]
         if not held:
             raise AnalysisException("a projection names no expression")
         folding = [column for column in held if column.folds()]
@@ -1017,10 +1220,11 @@ class DataFrame(object):
         ]
         names = [name for name in self._columns if name not in dropped]
         rows = [
-            Row(**dict((name, row[name]) for name in names))
-            for row in self._frame_rows()
+            Row(**dict((name, row[name]) for name in names)) for row in self._frame_rows()
         ]
-        types = dict((name, self._column_type(name)) for name in names)
+        types = dict(
+            (name, kind) for name, kind in self._types.items() if name in names
+        )
         return DataFrame(rows, names, self._partitions, None, types)
 
     def filter(self, condition):
@@ -1362,27 +1566,65 @@ class SparkSession(object):
         return self._context
 
     def createDataFrame(self, data, schema=None, **named):
+        """The dataset the values hold, under the schema one was stated as.
+
+        A stated schema names the columns and, where it states them, the types they carry —
+        as a `StructType`, as the data-definition text `<name> <type>` per column, or as the
+        names alone; a dataset named without one takes its columns from the values themselves
+        and its types from what they are.
+        """
         rows = list(data)
         columns = []
-        if isinstance(schema, (list, tuple)):
+        types = {}
+        if hasattr(schema, "fields"):
+            for field in schema.fields:
+                columns.append(field.name)
+                types[field.name] = field.dataType.simpleString()
+        elif hasattr(schema, "fieldNames"):
+            columns = list(schema.fieldNames())
+        elif isinstance(schema, (list, tuple)):
             columns = [str(column) for column in schema]
-        elif rows:
+        elif isinstance(schema, str):
+            # The data-definition spelling of a schema, which `DataFrameReader.schema` takes
+            # too: `<name> <type>` per column.
+            for field in schema.split(","):
+                stated = field.strip().split()
+                if not stated:
+                    continue
+                columns.append(stated[0])
+                if len(stated) > 1:
+                    held = type_by_name(" ".join(stated[1:]))
+                    if held is not None:
+                        types[stated[0]] = held.simpleString()
+        if not columns and rows:
             first = rows[0]
             if isinstance(first, Row):
-                columns = list(first._fields)
+                columns = list(first.fields())
             elif isinstance(first, dict):
                 columns = list(first.keys())
-            else:
+            elif isinstance(first, (list, tuple)):
                 columns = ["_%d" % (index + 1,) for index in range(len(first))]
+            else:
+                columns = ["_1"]
         built = []
         for row in rows:
             if isinstance(row, Row):
-                built.append(row)
+                values = row.asDict()
             elif isinstance(row, dict):
-                built.append(Row(**row))
+                values = dict(row)
+            elif isinstance(row, (list, tuple)):
+                values = dict(zip(columns, list(row)))
             else:
-                built.append(Row(**dict(zip(columns, list(row)))))
-        return DataFrame(built, columns)
+                values = dict(zip(columns, [row]))
+            built.append(Row(**dict((name, values.get(name)) for name in columns)))
+        return DataFrame(built, columns, 1, None, types)
+
+    @classmethod
+    def getActiveSession(cls):
+        """The session this application is running in, or None where it started none."""
+        if cls._active is not None and not cls._active._stopped:
+            return cls._active
+        return None
 
     def range(self, start, end=None, step=1, numPartitions=None):
         """The dataset of one bigint column over a span of numbers, as `range` names one.

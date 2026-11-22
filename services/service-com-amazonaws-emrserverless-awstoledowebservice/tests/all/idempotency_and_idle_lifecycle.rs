@@ -830,6 +830,75 @@ async fn get_dashboard_for_job_run_mints_an_https_url_per_call() {
     }
 }
 
+/// RULE: the URL `GetDashboardForJobRun` mints is DIALLED by the caller and carries the
+/// `authToken` this call minted, so its authority is the one THIS emulator serves —
+/// `OperationContext::endpoint`, "the base URL a later request addresses" — whatever host the
+/// request itself named. A host AWS publishes its own endpoints at would take the client out
+/// of the emulated environment carrying that token, and nothing of this process answers there.
+///
+/// The rows differ along what the REQUEST says about its host: the service's own public host
+/// (which is what an SDK client sends), another emulator's address, and no `Host` header at
+/// all — because the authority of the minted URL is not the request's to choose.
+#[tokio::test]
+async fn the_dashboard_url_leads_back_to_this_emulator() {
+    let router = emulator();
+    let application_id = started_application(&router, "tok-dashboard-host").await;
+    let job_run_id = submitted_job_run(&router, &application_id, "job-dashboard-host").await;
+
+    // (case, the Host header the request carries)
+    let rows: [(&str, Option<&str>); 4] = [
+        ("the service's own public host", Some("emr-serverless.eu-west-1.amazonaws.com")),
+        ("a public host of another region", Some("emr-serverless.us-east-1.amazonaws.com")),
+        ("another address entirely", Some("elsewhere.example.net:8443")),
+        ("no host at all", None),
+    ];
+
+    for (case, host) in rows {
+        let mut builder = ::http::Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/applications/{application_id}/jobruns/{job_run_id}/dashboard"
+            ))
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/eu-west-1/emr-serverless/aws4_request, \
+                 SignedHeaders=host, Signature=abc",
+            );
+        if let Some(host) = host {
+            builder = builder.header("host", host);
+        }
+        let request = builder
+            .body(::bytes::Bytes::new())
+            .expect("the test request is well formed");
+        let response = router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let body = response.into_body();
+        let body: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetDashboardForJobRun expected 200, got {status} with {body:?}"
+        );
+        let url = body["url"].as_str().unwrap_or_default().to_string();
+        assert!(
+            url.contains("authToken="),
+            "case {case:?}: the url must carry the grant this call minted, got {url:?}"
+        );
+        assert!(
+            !url.contains("amazonaws.com"),
+            "case {case:?}: the url a client dials must not name a host AWS publishes its own \
+             endpoints at, got {url:?}"
+        );
+        if let Some(host) = host {
+            assert!(
+                !url.contains(host),
+                "case {case:?}: the url's authority is the one this emulator serves, not the \
+                 one the request named, got {url:?}"
+            );
+        }
+    }
+}
+
 /// Rule 6: `AutoStopConfig` is enforced, not just stored. "Enables the application to
 /// automatically stop after a certain amount of time being idle. Defaults to true", and
 /// `idleTimeoutMinutes` is "the amount of idle time in minutes after which your
