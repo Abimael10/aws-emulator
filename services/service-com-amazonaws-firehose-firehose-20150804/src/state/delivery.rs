@@ -2212,10 +2212,16 @@ fn authority_of(url: &str) -> Option<String> {
 ///
 /// "The total amount of time that Firehose spends on retries. This duration starts after
 /// the initial attempt to send data to the custom destination via HTTPS endpoint fails"
-/// (`HttpEndpointRetryOptions$DurationInSeconds`) — and the initial attempt is the one made
-/// when the buffer came due, so the window closes that long after it. A configured ZERO is
-/// a destination that is not retried at all, which its own range (`min: 0`) admits. The
-/// rule is the destination's `RetryOptions` whichever kind carries it, so the window is
+/// (`HttpEndpointRetryOptions$DurationInSeconds`) — so no part of the window is spent until
+/// the initial attempt for the data this buffer carries has been MADE and has failed: a
+/// record no attempt has been left by yet ([`crate::state::StoredRecord::delivery_attempts`])
+/// is owed its own initial one, whatever the clock says, and only once that has failed does
+/// the duration run. The window is otherwise measured from the instant the buffer came due,
+/// which is the turn its destination's buffering hints lay. A configured ZERO is a
+/// destination that is not retried at all — "a value of 0 (zero) results in no retries"
+/// (`ElasticsearchRetryOptions$DurationInSeconds`), which every kind's own range (`min: 0`)
+/// admits — so the one attempt made when the buffer came due is all such a destination gets.
+/// The rule is the destination's `RetryOptions` whichever kind carries it, so the window is
 /// computed from the two values every kind states: its buffering hints and its retry
 /// duration.
 fn retries_spent(
@@ -2227,6 +2233,17 @@ fn retries_spent(
     let Some(opened_at) = delivery.records.first().map(|record| record.received_at) else {
         return true;
     };
+    // A destination that allows any retrying at all owes every record of the buffer an
+    // initial attempt before the duration it allows starts running, so a buffer carrying one
+    // that no attempt has failed for yet has spent none of its window.
+    if !retry_duration.is_zero()
+        && delivery
+            .records
+            .iter()
+            .any(|record| record.delivery_attempts == 0)
+    {
+        return false;
+    }
     let buffered: usize = delivery.records.iter().map(|record| record.data.len()).sum();
     let first_attempt = opened_at + delivery_window(hints, buffered);
     now >= first_attempt + retry_duration

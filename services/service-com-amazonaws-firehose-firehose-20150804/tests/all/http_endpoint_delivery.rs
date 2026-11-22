@@ -13,6 +13,10 @@
 //! as `RetryOptions` allows and then parks them in the destination's Amazon S3 backup
 //! ("only the documents that Firehose could not deliver to the specified HTTP endpoint
 //! destination (`FailedDataOnly`)" — `S3BackupMode`), so nothing a put accepted is lost.
+//! What that window allows starts after the initial attempt has FAILED — "this duration
+//! starts after the initial attempt to send data to the custom destination via HTTPS
+//! endpoint fails" (`HttpEndpointRetryOptions$DurationInSeconds`) — so only a destination
+//! configuring no window at all parks its records on that first failure.
 //!
 //! The stream is created and the records are put over the real `awsJson1_1` wire, and the
 //! endpoint is an in-process transport that records what it was sent: the request this
@@ -1087,6 +1091,223 @@ async fn records_an_http_endpoint_never_took_are_parked_in_the_destination_backu
             emulator.buffered(case).is_empty(),
             "case {case:?}: a parked buffer is no longer waiting for the endpoint, got {:?}",
             emulator.buffered(case)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The retry window
+// ---------------------------------------------------------------------------
+
+/// How long the outcome of a row of the retry-window table is waited for before it fails:
+/// far longer than the widest window any of those rows closes and the emulator's own span
+/// between attempts, so a loaded machine does not fail a row the clock would have served.
+const PARKING_DEADLINE: Duration = Duration::from_secs(60);
+
+/// What a row of the retry-window table expects of the records its endpoint never took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parked {
+    /// A destination that allows no retrying parks its records on the initial attempt, so
+    /// each document states exactly that one attempt.
+    OnTheInitialAttempt,
+    /// A destination that allows retrying has spent none of its window until the initial
+    /// attempt has failed, so the buffer is attempted again and each document states more
+    /// than one attempt.
+    AfterARetry,
+    /// The window the destination allows is still open, so nothing of the buffer is parked
+    /// and its records are still waiting for the endpoint.
+    NotAtAll,
+}
+
+/// One row of the retry-window table: the window the destination configures, the records put
+/// into its stream, and what becomes of them.
+#[derive(Debug, Clone, Copy)]
+struct RetryWindowRow {
+    case: &'static str,
+    /// `RetryOptions$DurationInSeconds` this row's destination configures.
+    retry_seconds: i64,
+    payloads: &'static [&'static [u8]],
+    expect: Parked,
+}
+
+impl RetryWindowRow {
+    /// The `ErrorOutputPrefix` this row's backup configures, which is what separates the
+    /// objects one row parks from a sibling's in the bucket the table shares.
+    fn error_prefix(&self) -> String {
+        format!("{}/failed/", self.case)
+    }
+}
+
+/// Every error-output document the backup holds under `prefix`, one per line of each object
+/// parked there.
+fn documents_under(emulator: &Emulator, case: &str, prefix: &str) -> Vec<Value> {
+    let parked = emulator.backup_objects();
+    let mut documents = Vec::new();
+    for (_, body) in parked.iter().filter(|(key, _)| key.starts_with(prefix)) {
+        for line in String::from_utf8_lossy(body).lines() {
+            documents.push(serde_json::from_str::<Value>(line).unwrap_or_else(|error| {
+                panic!("case {case:?}: every parked line is a JSON document, got {error}")
+            }));
+        }
+    }
+    documents
+}
+
+/// The error-output documents of `row`, read back out of the backup once the row's records
+/// have all been parked.
+///
+/// Nothing here drives a delivery: what makes the documents appear is the emulator's own
+/// delivery clock, which is what a producer that makes no further call observes. The objects
+/// are polled for until they hold a document per record of the row, since a row's records can
+/// be parked in more than one object.
+async fn parked_documents(emulator: &Emulator, row: &RetryWindowRow) -> Vec<Value> {
+    let case = row.case;
+    let prefix = row.error_prefix();
+    let deadline = Instant::now() + PARKING_DEADLINE;
+    loop {
+        let documents = documents_under(emulator, case, &prefix);
+        if documents.len() >= row.payloads.len() {
+            return documents;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected {} parked document(s) under {prefix:?} within \
+             {PARKING_DEADLINE:?}, got {}",
+            row.payloads.len(),
+            documents.len()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test]
+async fn a_refused_buffer_is_attempted_again_before_the_retry_window_it_configures_is_spent() {
+    // Each row configures a different retry window, which is what the rule generalises over:
+    // "the total amount of time that Firehose spends on retries. This duration starts after
+    // the initial attempt to send data to the custom destination via HTTPS endpoint fails"
+    // (`HttpEndpointRetryOptions$DurationInSeconds`). The rows span that member's own range
+    // (`min: 0`, `max: 7200`, from `smithy_query(query="shape",
+    // shape="HttpEndpointRetryOptions")`): both published bounds and two durations inside it,
+    // beside how many records one buffer holds. Nothing this emulator serves answers at any
+    // row's endpoint URL, so every attempt the emulator's own delivery clock makes fails and
+    // what separates the rows is the window alone.
+    let rows = [
+        RetryWindowRow {
+            case: "no-retry-window-at-all",
+            retry_seconds: 0,
+            payloads: &[b"alpha"],
+            expect: Parked::OnTheInitialAttempt,
+        },
+        RetryWindowRow {
+            case: "a-one-second-window",
+            retry_seconds: 1,
+            payloads: &[b"beta", b"gamma"],
+            expect: Parked::AfterARetry,
+        },
+        RetryWindowRow {
+            case: "a-two-second-window",
+            retry_seconds: 2,
+            payloads: &[b"delta", b"epsilon", b"zeta"],
+            expect: Parked::AfterARetry,
+        },
+        RetryWindowRow {
+            case: "the-widest-window-the-member-admits",
+            retry_seconds: 7_200,
+            payloads: &[b"eta", b"theta"],
+            expect: Parked::NotAtAll,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    emulator.create_bucket(BACKUP_BUCKET).await;
+
+    // Every row's stream is created first, so the `CREATING` -> `ACTIVE` span is waited out
+    // once for the whole table.
+    for row in rows {
+        let mut config = endpoint_configuration(&endpoint_url(row.case), row.retry_seconds);
+        config["S3Configuration"]["ErrorOutputPrefix"] = json!(row.error_prefix());
+        emulator.create_endpoint_stream(row.case, config).await;
+    }
+    emulator.await_active_streams().await;
+
+    // Every row's records are put before any outcome is read, so the rows' windows run beside
+    // each other rather than one after the other.
+    for row in rows {
+        emulator.put_batch(row.case, row.payloads).await;
+    }
+
+    for row in rows.iter().filter(|row| row.expect != Parked::NotAtAll) {
+        let case = row.case;
+        let documents = parked_documents(&emulator, row).await;
+        assert_eq!(
+            documents.len(),
+            row.payloads.len(),
+            "case {case:?}: one document per refused record, got {documents:?}"
+        );
+        let mut parked_payloads = Vec::new();
+        for document in &documents {
+            let code = document["errorCode"].as_str().unwrap_or_default();
+            assert!(
+                FAILED_ERROR_CODES.contains(&code),
+                "case {case:?}: the document names how the delivery failed, expected one of \
+                 {FAILED_ERROR_CODES:?}, got {code:?}"
+            );
+            let attempts = document["attemptsMade"].as_u64().unwrap_or_default();
+            match row.expect {
+                // The window starts after the initial attempt fails and this destination
+                // allows none of it, so that initial attempt is all its records cost.
+                Parked::OnTheInitialAttempt => assert_eq!(
+                    attempts,
+                    1,
+                    "case {case:?}: a destination configuring a {}s window is retried none, so \
+                     its document states the initial attempt alone, got {attempts}",
+                    row.retry_seconds
+                ),
+                // None of the window had been spent when the initial attempt was made, so the
+                // buffer was attempted again before any of it was parked.
+                Parked::AfterARetry => assert!(
+                    attempts >= 2,
+                    "case {case:?}: the buffer is attempted again inside its {}s retry window, \
+                     so its document states at least 2 attempts, got {attempts}",
+                    row.retry_seconds
+                ),
+                Parked::NotAtAll => unreachable!("a row that parks nothing has no document"),
+            }
+            let raw = document["rawData"].as_str().unwrap_or_default();
+            parked_payloads.push(aws_smithy_types::base64::decode(raw).unwrap_or_else(
+                |error| panic!("case {case:?}: rawData is base64, got {error} for {raw:?}"),
+            ));
+        }
+        // Every record the row put is parked, however many objects the documents were
+        // written as.
+        parked_payloads.sort();
+        let mut expected: Vec<Vec<u8>> = row.payloads.iter().map(|data| data.to_vec()).collect();
+        expected.sort();
+        assert_eq!(
+            parked_payloads, expected,
+            "case {case:?}: the documents carry the records' own bytes, got {parked_payloads:?}"
+        );
+    }
+
+    // Only once every other row has been parked — so this row's buffer has been refused over
+    // and over too — is the row whose window is still open read: its records are neither
+    // parked nor lost, but still waiting for the endpoint. The buffer is taken out of the
+    // store for the duration of an attempt, so this waits for the restored buffer rather than
+    // reading once.
+    for row in rows.iter().filter(|row| row.expect == Parked::NotAtAll) {
+        let case = row.case;
+        let expected: Vec<Vec<u8>> = row.payloads.iter().map(|data| data.to_vec()).collect();
+        emulator
+            .wait_until(case, "the records are back in the buffer", || {
+                emulator.buffered(case) == expected
+            })
+            .await;
+        let parked = documents_under(&emulator, case, &row.error_prefix());
+        assert!(
+            parked.is_empty(),
+            "case {case:?}: nothing is parked while the {}s retry window is still open, got \
+             {parked:?}",
+            row.retry_seconds
         );
     }
 }

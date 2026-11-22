@@ -336,9 +336,10 @@ async fn every_form_of_a_refused_delivery_parks_the_message_the_endpoint_reporte
                  expected {:?}, got {message:?}",
                 row.reported
             );
-            // The buffer was attempted when it came due and again inside the retry window
-            // this row configured, so the document states more than the one attempt a
-            // first-try failure costs.
+            // The retry window this row configured starts after the buffer's initial attempt
+            // FAILED, so that attempt is never the one the records are parked on: the buffer
+            // was attempted again inside the window, whatever the clock had done by then, and
+            // the document states more than the one attempt a first-try failure costs.
             let attempts = document["attemptsMade"].as_u64().unwrap_or_default();
             assert!(
                 attempts >= 2,

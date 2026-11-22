@@ -793,9 +793,10 @@ async fn the_error_output_of_a_refused_batch_carries_the_message_the_endpoint_re
                 "case {case:?}: the document carries the record's own bytes, got {:?}",
                 String::from_utf8_lossy(&decoded)
             );
-            // The buffer was attempted when it came due and again inside the retry window
-            // this row configured, so the document states more than the one attempt a
-            // first-try failure costs.
+            // The retry window this row configured starts after the buffer's initial attempt
+            // FAILED, so that attempt is never the one the records are parked on: the buffer
+            // was attempted again inside the window, whatever the clock had done by then, and
+            // the document states more than the one attempt a first-try failure costs.
             let attempts = document["attemptsMade"].as_u64().unwrap_or_default();
             assert!(
                 attempts >= 2,
