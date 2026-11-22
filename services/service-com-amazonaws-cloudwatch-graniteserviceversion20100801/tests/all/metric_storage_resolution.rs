@@ -17,10 +17,11 @@
 //!
 //! A read cannot report detail finer than the resolution the data is stored at, but it is not
 //! refused and not answered with nothing either: the datapoint is served at the start of the span
-//! it IS stored in — once the clock has LEFT that span, which is what makes the span's aggregate
-//! complete (`metric_open_span_reads` holds that half of the rule, over spans the clock is still
-//! inside). `StorageResolution` is optional and "if you omit this, the default of 60 is
-//! used", so an omitted member reads exactly like 60.
+//! it IS stored in. The one period that asks for detail a regular-resolution span holds none of is
+//! the one-second period, which is answered from such a span only once the clock has LEFT it and
+//! its aggregate is complete (`metric_open_span_reads` holds that half of the rule, over spans the
+//! clock is still inside). `StorageResolution` is optional and "if you omit this, the default of
+//! 60 is used", so an omitted member reads exactly like 60.
 //!
 //! The rows differ along what the rule generalises over: the resolution the series was published
 //! at (1, 60, and omitted), the period the read asks for (1, 5, 10, 20 and 30 seconds — every
