@@ -42,6 +42,8 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Declares every `tests/all/<name>.rs` suite of the single integration-test target.
+automod = { workspace = true }
 
 [lints]
 workspace = true

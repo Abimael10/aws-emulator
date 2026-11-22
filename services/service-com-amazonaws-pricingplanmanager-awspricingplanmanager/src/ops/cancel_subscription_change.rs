@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // change is within the processing window, this operation returns an error." A
         // change the billing system has not dated yet is in no window: its
         // `effectiveDate` "is populated after the change is confirmed".
-        if let Some(effective) = change.effective_date {
+        if let Some(effective) = change.effective_date() {
             if effective.secs().saturating_sub(now.secs()) < CHANGE_PROCESSING_WINDOW_SECONDS {
                 let effective_date = crate::state::format_date_time(effective)
                     .unwrap_or_else(|| effective.secs().to_string());

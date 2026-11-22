@@ -437,13 +437,8 @@ mod tests {
             status,
             status_reason: None,
             resource_arns: resources.iter().map(|arn| (*arn).to_string()).collect(),
-            scheduled_change: scheduled.then(|| super::super::ScheduledChangeRecord {
-                change_type: super::super::ChangeType::Cancellation,
-                effective_date: Some(super::super::end_of_billing_period(now)),
-                due_at: super::super::cancellation_due(now),
-                plan_tier: None,
-                usage_level: None,
-            }),
+            scheduled_change: scheduled
+                .then(|| super::super::ScheduledChangeRecord::pending_cancellation(now)),
             created_at: now,
             updated_at: now,
             client_token: None,

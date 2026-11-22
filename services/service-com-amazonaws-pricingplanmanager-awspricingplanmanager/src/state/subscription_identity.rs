@@ -89,7 +89,7 @@ pub fn client_token_parameters_differ(arn: &str) -> ConflictException {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ChangeType, ScheduledChangeRecord, Status, FIRST_REVISION};
+    use crate::state::{ScheduledChangeRecord, Status, FIRST_REVISION};
     use ::aws_smithy_types::DateTime;
 
     /// The ARN forms the owning services mint, which the rows below name.
@@ -213,13 +213,7 @@ mod tests {
         let mut record = stored();
         record.status = Status::SyncInProgress;
         record.status_reason = Some("applying".to_string());
-        record.scheduled_change = Some(ScheduledChangeRecord {
-            change_type: ChangeType::Cancellation,
-            effective_date: Some(crate::state::end_of_billing_period(now)),
-            due_at: crate::state::cancellation_due(now),
-            plan_tier: None,
-            usage_level: None,
-        });
+        record.scheduled_change = Some(ScheduledChangeRecord::pending_cancellation(now));
         record.touch(now);
         let pair = vec![DISTRIBUTION.to_string(), WEB_ACL.to_string()];
         assert!(

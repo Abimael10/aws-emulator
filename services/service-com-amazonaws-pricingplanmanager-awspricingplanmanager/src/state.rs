@@ -193,8 +193,19 @@ impl ApprovalMode {
 pub struct ScheduledChangeRecord {
     /// Which kind of change is pending.
     pub change_type: ChangeType,
-    /// When the change takes effect.
-    pub effective_date: Option<DateTime>,
+    /// When the change takes effect. Reported as `effectiveDate` only once the change has
+    /// been confirmed ([`Self::confirmed`]); until then the member is absent, so this is
+    /// the date the change WILL carry rather than one a caller has read.
+    pub takes_effect_at: DateTime,
+    /// The instant the confirmation of this change is due.
+    /// [`ComAmazonawsPricingplanmanagerAwspricingplanmanagerState::apply_due_changes`]
+    /// materialises it once the clock has reached this, with or without a caller. Never on
+    /// the wire ([`CONFIRMATION_SPAN_MILLIS`]).
+    pub confirm_at: DateTime,
+    /// Whether the change has been confirmed, which is what dates it on the wire:
+    /// `ScheduledChange$effectiveDate` "is populated after the change is confirmed by the
+    /// billing system", so a change this service has only just attached carries no date.
+    pub confirmed: bool,
     /// The instant this store APPLIES the change at:
     /// [`ComAmazonawsPricingplanmanagerAwspricingplanmanagerState::apply_due_changes`]
     /// materialises it once the clock has reached this, with or without a caller. Never on
@@ -208,27 +219,95 @@ pub struct ScheduledChangeRecord {
 }
 
 impl ScheduledChangeRecord {
+    /// The date this change reports: the instant it takes effect once the change has been
+    /// confirmed, and nothing at all before that — "This value is populated after the
+    /// change is confirmed by the billing system"
+    /// (`smithy_query(query="shape", shape="ScheduledChange")`, member `effectiveDate`).
+    pub fn effective_date(&self) -> Option<DateTime> {
+        self.confirmed.then_some(self.takes_effect_at)
+    }
+
     /// The modelled `ScheduledChange` shape for this record.
     pub fn to_shape(&self) -> ScheduledChange {
         ScheduledChange {
             change_type: self.change_type.wire().to_string(),
-            effective_date: self.effective_date,
+            effective_date: self.effective_date(),
             plan_tier: self.plan_tier.clone(),
             usage_level: self.usage_level.clone(),
         }
     }
+
+    /// The pending `CANCELLATION` a cancel call attaches at `now`.
+    ///
+    /// "For active subscriptions, the cancellation is scheduled to take effect at the end
+    /// of the current billing period", which is the date it will report; it carries none
+    /// yet, because the change has not been confirmed at the instant it is attached.
+    pub fn pending_cancellation(now: DateTime) -> Self {
+        Self {
+            change_type: ChangeType::Cancellation,
+            takes_effect_at: end_of_billing_period(now),
+            confirm_at: confirmation_due(now),
+            confirmed: false,
+            due_at: cancellation_due(now),
+            // "Not present for cancellations." — ScheduledChange$planTier.
+            plan_tier: None,
+            usage_level: None,
+        }
+    }
+
+    /// The pending `DOWNGRADE` an update call attaches at `now`, moving the subscription to
+    /// `plan_tier` and `usage_level`.
+    ///
+    /// "Downgrades are scheduled and the current tier remains unchanged until the end of
+    /// the billing cycle (calendar month)" — that documented instant is both the date the
+    /// change will report and the instant this store applies it at. It carries no date yet,
+    /// for the same reason a cancellation does not.
+    pub fn pending_downgrade(
+        now: DateTime,
+        plan_tier: String,
+        usage_level: Option<String>,
+    ) -> Self {
+        let takes_effect_at = end_of_billing_period(now);
+        Self {
+            change_type: ChangeType::Downgrade,
+            takes_effect_at,
+            confirm_at: confirmation_due(now),
+            confirmed: false,
+            due_at: takes_effect_at,
+            plan_tier: Some(plan_tier),
+            usage_level,
+        }
+    }
+}
+
+/// How long a scheduled change stays undated before it has been confirmed.
+///
+/// A change's `effectiveDate` "is populated after the change is confirmed by the billing
+/// system", so the date is not the scheduling call's to publish: it appears once that
+/// confirmation arrives. AWS publishes no duration for it, so this span is the emulator's
+/// own choice, like every other transition it owes. It is never zero, so a caller that
+/// reads straight after scheduling a change still sees the undated form the scheduling
+/// call answered with.
+pub const CONFIRMATION_SPAN_MILLIS: i64 = 3_000;
+
+/// The instant the confirmation of a change scheduled at `now` is due
+/// ([`CONFIRMATION_SPAN_MILLIS`]).
+pub fn confirmation_due(now: DateTime) -> DateTime {
+    instant_after_millis(now, CONFIRMATION_SPAN_MILLIS)
 }
 
 /// How long a scheduled CANCELLATION stays pending before this store has applied it.
 ///
 /// A cancellation is scheduled "to take effect at the end of the current billing period",
-/// which is the date it REPORTS ([`end_of_billing_period`]) — but what it does at that
-/// instant is end the subscription: the record goes away, its `clientToken` is released and
-/// the resources it covered are free for another subscription. That is a transition a
+/// which is the date it reports once confirmed ([`end_of_billing_period`]) — but what it
+/// does at that instant is end the subscription: the record goes away, its `clientToken` is
+/// released and the resources it covered are free for another subscription. That is a
+/// transition a
 /// caller waits for, and no caller can wait a calendar month for it, so the instant this
-/// store applies it at is this span after the call that scheduled it: the emulator's own
-/// choice, like every other transition it owes. It is never zero, so a caller that reads
-/// straight after cancelling still sees the subscription active with the change pending.
+/// store applies it at is this span after the change has been confirmed: the emulator's
+/// own choice, like every other transition it owes. It is never zero, so a caller that
+/// reads straight after cancelling still sees the subscription active with the change
+/// pending.
 ///
 /// A DOWNGRADE is not owed this way: what it does at its effective instant is report a
 /// lower tier, and that instant is one AWS publishes — "Downgrades are scheduled and the
@@ -237,10 +316,13 @@ impl ScheduledChangeRecord {
 /// value and is applied at the date it reports.
 pub const CANCELLATION_SPAN_MILLIS: i64 = 3_000;
 
-/// The instant a cancellation scheduled at `now` is applied at
-/// ([`CANCELLATION_SPAN_MILLIS`]).
+/// The instant a cancellation scheduled at `now` is applied at.
+///
+/// A change takes effect only once it has been confirmed, so the span this store owes the
+/// end of the subscription ([`CANCELLATION_SPAN_MILLIS`]) runs from the confirmation the
+/// change waits for ([`confirmation_due`]) rather than from the call that scheduled it.
 pub fn cancellation_due(now: DateTime) -> DateTime {
-    instant_after_millis(now, CANCELLATION_SPAN_MILLIS)
+    instant_after_millis(confirmation_due(now), CANCELLATION_SPAN_MILLIS)
 }
 
 /// A subscription, as stored. Every member of the modelled `Subscription` and
@@ -587,9 +669,19 @@ impl ComAmazonawsPricingplanmanagerAwspricingplanmanagerState {
                 record.sync_completes_at = None;
                 record.touch(now);
             }
-            let Some(change) = record.scheduled_change.as_ref() else {
+            let Some(change) = record.scheduled_change.as_mut() else {
                 continue;
             };
+            // A pending change is confirmed on its own too, and that confirmation is what
+            // DATES it: `effectiveDate` "is populated after the change is confirmed by the
+            // billing system", so once the clock has reached the instant the confirmation
+            // was owed at the change reports the date it takes effect, whether or not
+            // anybody called. Dating the change is not a revision of the subscription: no
+            // caller wrote the record, so neither its `updatedAt` nor the concurrency token
+            // it publishes moves.
+            if !change.confirmed && instant_key(change.confirm_at) <= instant_key(now) {
+                change.confirmed = true;
+            }
             // The instant the change is APPLIED at is the stored one: the date a downgrade
             // reports, and for a cancellation the span this store owes that transition at
             // ([`CANCELLATION_SPAN_MILLIS`]) rather than the end-of-billing-period date it
@@ -597,13 +689,16 @@ impl ComAmazonawsPricingplanmanagerAwspricingplanmanagerState {
             if instant_key(change.due_at) > instant_key(now) {
                 continue;
             }
+            // The change is due, so the record it sits on is about to be rewritten: read it
+            // out and let go of the borrow.
+            let change = change.clone();
             match change.change_type {
                 ChangeType::Cancellation => cancelled.push(arn.clone()),
                 ChangeType::Downgrade => {
-                    if let Some(tier) = change.plan_tier.clone() {
+                    if let Some(tier) = change.plan_tier {
                         record.plan_tier = tier;
                     }
-                    record.usage_level = change.usage_level.clone();
+                    record.usage_level = change.usage_level;
                     record.scheduled_change = None;
                     record.touch(now);
                 }

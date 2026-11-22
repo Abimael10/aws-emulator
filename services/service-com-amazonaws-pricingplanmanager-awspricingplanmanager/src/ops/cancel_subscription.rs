@@ -3,7 +3,7 @@
 //! @op CancelSubscription
 //!
 //! Cancels a subscription under `If-Match`. An active subscription keeps its status and
-//! gains a pending `CANCELLATION` change effective at the end of the billing period; a
+//! gains a pending `CANCELLATION` change, still undated until the change is confirmed; a
 //! subscription still awaiting approval is deleted outright.
 //!
 //! ## Shape of an operation
@@ -218,17 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "For active subscriptions, the cancellation is scheduled to take effect at the
         // end of the current billing period. The subscription remains active until that
-        // date." So the status is left alone and the pending change carries the date — while
-        // the instant this store ENDS the subscription at is the span it owes that
-        // transition ([`crate::state::CANCELLATION_SPAN_MILLIS`]).
-        record.scheduled_change = Some(crate::state::ScheduledChangeRecord {
-            change_type: crate::state::ChangeType::Cancellation,
-            effective_date: Some(crate::state::end_of_billing_period(now)),
-            due_at: crate::state::cancellation_due(now),
-            // "Not present for cancellations." — ScheduledChange$planTier.
-            plan_tier: None,
-            usage_level: None,
-        });
+        // date." So the status is left alone and a pending `CANCELLATION` is attached —
+        // UNDATED, because the date it will take effect at is "populated after the change
+        // is confirmed by the billing system" and this call is what asks for the change,
+        // not what confirms it.
+        record.scheduled_change = Some(crate::state::ScheduledChangeRecord::pending_cancellation(
+            now,
+        ));
         record.touch(now);
 
         Ok(CancelSubscriptionOutput {

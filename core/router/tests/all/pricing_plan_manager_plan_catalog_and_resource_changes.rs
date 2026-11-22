@@ -1175,9 +1175,10 @@ async fn a_pending_change_is_cancelled_outside_the_processing_window() {
 }
 
 /// Write `effective` onto the pending change of the subscription `arn` names, in the store
-/// the handlers read: both the date the change REPORTS and the instant the store applies it
-/// at. The one way this suite names an instant: a case that depends on how far off a change
-/// is sets that instant rather than waiting for the clock to reach it.
+/// the handlers read: the date the change takes effect, the confirmation that is what dates
+/// it on the wire, and the instant the store applies it at. The one way this suite names an
+/// instant: a case that depends on how far off a change is sets that instant rather than
+/// waiting for the clock to reach it.
 fn set_effective_date(
     engine: &Arc<engine::InMemoryEngine>,
     arn: &str,
@@ -1193,7 +1194,8 @@ fn set_effective_date(
         .scheduled_change
         .as_mut()
         .expect("the pending change is stored");
-    change.effective_date = Some(effective);
+    change.takes_effect_at = effective;
+    change.confirmed = true;
     change.due_at = effective;
 }
 

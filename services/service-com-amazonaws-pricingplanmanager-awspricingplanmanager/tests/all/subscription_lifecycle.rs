@@ -27,7 +27,9 @@ use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
 
 // The HTTP harness is `subscription_wire_form`'s — the ONE harness of this crate's
 // integration tests, so this suite adds no second copy of the request builder, the
-// response reader, the router or the create helper.
+// response reader, the router or the create helper. Making a pending change's
+// confirmation due belongs to the suite that owns that rule.
+use super::scheduled_change_confirmation::make_confirmation_due;
 use super::subscription_wire_form::{
     call, create, create_body as subscription_body, router, router_on, Answer,
 };
@@ -199,7 +201,7 @@ async fn a_created_subscription_reads_back_unchanged() {
 /// trait into the member schema, so a body timestamp goes out in restJson1's default
 /// encoding (epoch seconds). Accepting either keeps every assertion below about the
 /// VALUE the service stored, which is what this service owns.
-fn epoch_seconds(value: &Value, case: &str) -> f64 {
+pub(crate) fn epoch_seconds(value: &Value, case: &str) -> f64 {
     if let Some(number) = value.as_f64() {
         return number;
     }
@@ -217,7 +219,7 @@ fn epoch_seconds(value: &Value, case: &str) -> f64 {
 /// Checked by rendering the instant through the same date type the wire serializer uses
 /// (day 1, midnight, within one month of `after`) rather than by recomputing the
 /// production expression, so the assertion is independent of how the handler derived it.
-fn assert_end_of_billing_period(effective: f64, after: f64, case: &str) {
+pub(crate) fn assert_end_of_billing_period(effective: f64, after: f64, case: &str) {
     assert!(
         effective > after,
         "case {case}: a scheduled change takes effect in the future, got {effective} <= {after}"
@@ -410,7 +412,8 @@ async fn update_applies_an_upgrade_now_and_schedules_a_downgrade() {
         Case { from: "PREMIUM", to: "FREE", usage_level: Some("DEFAULT"), downgrade: true },
     ];
 
-    let router = router();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(Arc::clone(&engine));
     for case in &cases {
         let label = format!("{} -> {}", case.from, case.to);
         let mut body = create_body("CloudFront", case.from, 1, Some("IMMEDIATE"));
@@ -473,12 +476,32 @@ async fn update_applies_an_upgrade_now_and_schedules_a_downgrade() {
                 case.usage_level,
                 "case {label}: the pending change must carry the target usage level, got {change:?}"
             );
+            // The change is attached UNDATED: `effectiveDate` "is populated after the
+            // change is confirmed by the billing system", so what the date IS can only be
+            // read once that confirmation has arrived. Made due rather than waited for, so
+            // this row costs no wall-clock time; `scheduled_change_confirmation` is the
+            // suite that lets the clock do it.
+            assert!(
+                change.get("effectiveDate").is_none_or(Value::is_null),
+                "case {label}: a change the billing system has not confirmed carries no \
+                 effectiveDate, got {change:?}"
+            );
+            make_confirmation_due(&engine, &arn, &label);
+            let confirmed =
+                call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+            let change = confirmed
+                .body
+                .get("scheduledChange")
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!("case {label}: no scheduledChange in {:?}", confirmed.body)
+                });
             let effective = change
                 .get("effectiveDate")
                 .unwrap_or_else(|| panic!("case {label}: no effectiveDate in {change:?}"));
             assert_end_of_billing_period(
                 epoch_seconds(effective, &label),
-                epoch_seconds(&fetched.body["updatedAt"], &label),
+                epoch_seconds(&confirmed.body["updatedAt"], &label),
                 &label,
             );
         } else {
@@ -575,7 +598,8 @@ async fn cancel_schedules_for_an_active_subscription_and_deletes_a_pending_one()
         Case { approval: Some("MANUAL"), tier: "PREMIUM", deleted: true },
     ];
 
-    let router = router();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(Arc::clone(&engine));
     for case in &cases {
         let label = format!("{:?}/{}", case.approval, case.tier);
         let created = create(&router, create_body("CloudFront", case.tier, 1, case.approval)).await;
@@ -636,12 +660,32 @@ async fn cancel_schedules_for_an_active_subscription_and_deletes_a_pending_one()
                 change.get("planTier").is_none(),
                 "case {label}: planTier is not present for cancellations, got {change:?}"
             );
+            // The pending cancellation is attached UNDATED: `effectiveDate` "is populated
+            // after the change is confirmed by the billing system", so what the date IS can
+            // only be read once that confirmation has arrived. Made due rather than waited
+            // for, so this row costs no wall-clock time; `scheduled_change_confirmation` is
+            // the suite that lets the clock do it.
+            assert!(
+                change.get("effectiveDate").is_none_or(Value::is_null),
+                "case {label}: a change the billing system has not confirmed carries no \
+                 effectiveDate, got {change:?}"
+            );
+            make_confirmation_due(&engine, &arn, &label);
+            let confirmed =
+                call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+            let change = confirmed
+                .body
+                .get("scheduledChange")
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!("case {label}: no scheduledChange in {:?}", confirmed.body)
+                });
             let effective = change
                 .get("effectiveDate")
                 .unwrap_or_else(|| panic!("case {label}: no effectiveDate in {change:?}"));
             assert_end_of_billing_period(
                 epoch_seconds(effective, &label),
-                epoch_seconds(&fetched.body["updatedAt"], &label),
+                epoch_seconds(&confirmed.body["updatedAt"], &label),
                 &label,
             );
             assert_eq!(
@@ -3426,14 +3470,16 @@ async fn a_cancel_with_no_cancellable_change_is_a_validation_failure() {
 /// taken from the request or from state.
 const NO_CANCELLABLE_CHANGE: &str = "No scheduled updates found for this subscription.";
 
-/// Move both instants of the change pending on `arn` to `instant`, and report how the wire
-/// renders it.
+/// Move the instants of the change pending on `arn` to `instant`, as a change the billing
+/// system has already confirmed, and report how the wire renders it.
 ///
-/// A stored change carries two: the `effectiveDate` a caller reads, which is what decides
-/// whether the change is still the caller's to cancel, and the instant this store APPLIES
-/// it at. A row places a change relative to one of them and must not be surprised by the
-/// other, so both are written to the one instant — and WRITTEN rather than waited for, so
-/// no row costs wall-clock time or depends on how fast the host runs.
+/// A stored change carries several: the date it takes effect, which is what it reports once
+/// confirmed and what decides whether the change is still the caller's to cancel, and the
+/// instant this store APPLIES it at. A row places a change relative to one of them and must
+/// not be surprised by the other, so both are written to the one instant — and WRITTEN
+/// rather than waited for, so no row costs wall-clock time or depends on how fast the host
+/// runs. The confirmation is written too: an undated change is in no processing window, so
+/// a row about that window needs the dated form.
 fn move_change_instants(
     engine: &Arc<engine::InMemoryEngine>,
     arn: &str,
@@ -3450,7 +3496,8 @@ fn move_change_instants(
         .scheduled_change
         .as_mut()
         .unwrap_or_else(|| panic!("case {case}: the pending change is stored"));
-    change.effective_date = Some(instant);
+    change.takes_effect_at = instant;
+    change.confirmed = true;
     change.due_at = instant;
     format_date_time(instant)
         .unwrap_or_else(|| panic!("case {case}: the effective instant renders on the wire"))

@@ -41,6 +41,9 @@ use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
 };
 use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::EmulatedService;
 
+// Making a pending change's confirmation due belongs to the suite that owns that rule.
+use super::scheduled_change_confirmation::make_confirmation_due;
+
 /// A SigV4 `Authorization` header scoped to this service, as the router routes on.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/us-west-2/pricingplanmanager/aws4_request, \
@@ -263,7 +266,7 @@ pub(crate) async fn pages(router: &MultiServiceRouter) -> Vec<Vec<Value>> {
 
 /// The summary `ListSubscriptions` reports for `arn`, searched across every page so a
 /// store larger than one page is still covered.
-async fn summary_for(router: &MultiServiceRouter, arn: &str) -> Value {
+pub(crate) async fn summary_for(router: &MultiServiceRouter, arn: &str) -> Value {
     for page in pages(router).await {
         if let Some(found) = page
             .into_iter()
@@ -369,7 +372,8 @@ async fn date_time_members_travel_as_iso_8601_strings_on_every_read_path() {
         },
     ];
 
-    let router = router();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(Arc::clone(&engine));
     for case in &cases {
         let label = case.label;
         let created = create(
@@ -401,6 +405,15 @@ async fn date_time_members_travel_as_iso_8601_strings_on_every_read_path() {
                 updated.status, updated.body
             );
             current = updated;
+            // A downgrade leaves a pending change behind, and that change carries its
+            // `effectiveDate` only once it has been confirmed — "This value is populated
+            // after the change is confirmed by the billing system" — so the row brings the
+            // confirmation forward rather than waiting the span out. The rule itself is
+            // `scheduled_change_confirmation`'s; what is asserted here is the FORM the date
+            // travels in once it is there.
+            if case.expects_pending_change {
+                make_confirmation_due(&engine, &arn, label);
+            }
         }
 
         let fetched = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
@@ -827,12 +840,15 @@ async fn assert_reporting_paths_agree(
 /// update and the two reporting paths, and
 /// `the_entity_tag_is_the_decimal_revision_and_advances_once_per_mutation` reads the tag
 /// every mutation hands out. What no row of either asserts is the FORM of the date-time
-/// members on the remaining two publishers, nor `effectiveDate` on a MUTATING response —
-/// cancelling an active subscription is the write that populates it. Both rules are
-/// asserted here on each of those answers and on the two reporting paths after it, because
-/// every publisher renders the same stored record through the one representation/summary
-/// conversion and the one protocol seam: neither form can depend on which operation
-/// published it.
+/// members on the remaining two publishers. Both rules are asserted here on each of those
+/// answers and on the two reporting paths after it, because every publisher renders the
+/// same stored record through the one representation/summary conversion and the one
+/// protocol seam: neither form can depend on which operation published it.
+///
+/// A cancelled ACTIVE subscription is also where the model's third date-time member shows
+/// up: the pending `CANCELLATION` carries `effectiveDate` once the change has been
+/// confirmed, which is a rule of its own (`scheduled_change_confirmation`) and is brought
+/// forward here rather than waited out.
 ///
 /// `AssociateResourcesToSubscription`, `DisassociateResourcesFromSubscription` and
 /// `CancelSubscriptionChange` are still 501 stubs, so they publish nothing to assert on
@@ -849,7 +865,8 @@ async fn the_approve_and_cancel_publishers_use_the_same_wire_form() {
         ("CloudFront", "BUSINESS", 1, None),
     ];
 
-    let router = router();
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(Arc::clone(&engine));
     for (family, tier, resources, usage_level) in rows {
         let label = format!("{family}/{tier}");
         let created = create(
@@ -891,15 +908,18 @@ async fn the_approve_and_cancel_publishers_use_the_same_wire_form() {
         }
 
         // The `effectiveDate` assertions above are conditional on a change being reported,
-        // so pin that the cancellation did leave one behind.
+        // so pin that the cancellation did leave one behind, and that it is dated once the
+        // confirmation it waits for has arrived.
+        make_confirmation_due(&engine, &arn, &label);
         let read = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
         assert!(
             read.body
                 .get("scheduledChange")
                 .is_some_and(|change| !change["effectiveDate"].is_null()),
-            "case {label}: cancelling an active subscription leaves a dated pending change, \
-             which is what carries the third date-time member, got {:?}",
+            "case {label}: a confirmed cancellation is dated, which is what carries the third \
+             date-time member, got {:?}",
             read.body
         );
+        check_published_subscription(&format!("{label}/confirmed cancellation"), &read, revision);
     }
 }
