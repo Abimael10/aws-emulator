@@ -296,8 +296,9 @@ fn unseen_pattern_violations(
 /// * an expression the model wraps in a matched `^`…`$` pair already describes the whole
 ///   value, and is quoted as this service PUBLISHES it ([`super::published_patterns`]):
 ///   as the model declares it, anchors and all, for almost every shape of this model, and
-///   without the closing anchor for the few whose recorded refusal ends where the grammar
-///   ends. That is the rendering every other clause of this service carries
+///   without the closing anchor — or without either anchor — for the few whose recorded
+///   refusal publishes less than the model's own text. That is the rendering every other
+///   clause of this service carries
 ///   ([`super::stated_violation`]), so a clause built here reads like one the boundary
 ///   built.
 /// * an expression the model anchors at ONE end only leaves the other end OPEN — any run of
@@ -523,17 +524,22 @@ mod tests {
     }
 
     /// RULE: the expression a clause QUOTES is the one the whole value has to satisfy — the
-    /// model's text as declared where the model wraps it in a matched anchor pair, and with
-    /// an end the model leaves open spelled out where it does not.
+    /// expression this service publishes where the model wraps it in a matched anchor pair,
+    /// and with an end the model leaves open spelled out where it does not.
     #[test]
     fn a_clause_quotes_the_expression_the_whole_value_must_satisfy() {
         // One row per form the ends of an expression can take, each written the way a
         // `@pattern` of this model writes it.
-        let rows: [(&str, &str, &str); 4] = [
+        let rows: [(&str, &str, &str); 5] = [
             (
-                "a matched pair (an event topic name)",
+                "a matched pair published as declared (a directory id)",
+                r"^d-[0-9a-f]{10}$",
+                r"^d-[0-9a-f]{10}$",
+            ),
+            (
+                "a matched pair published without it (an event topic name)",
                 r"^[a-zA-Z0-9_-]+$",
-                r"^[a-zA-Z0-9_-]+$",
+                r"[a-zA-Z0-9_-]+",
             ),
             (
                 "a matched pair around look-ahead (a reset's account name)",

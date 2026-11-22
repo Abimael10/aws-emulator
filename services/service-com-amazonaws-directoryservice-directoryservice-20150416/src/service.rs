@@ -52,7 +52,7 @@
 //! framework when it refuses a request at its boundary: see the `override_refusal` body
 //! below, [`stated_enum_values`] (the order an enum's admissible values are listed in),
 //! [`published_patterns`] (the expression a clause quotes for a member whose published
-//! expression is not the model's own text) and [`stated_clause_order`] (the order the
+//! expression is not the model's own text, per shape) and [`stated_clause_order`] (the order the
 //! clauses of one refusal are stated in). A
 //! refusal of a constraint a LIST's ELEMENTS break is stated at the list member instead of at
 //! the element, which needs the request as well as the violations and so is answered in that
@@ -151,8 +151,9 @@ fn stated_refusal(refusal: &Refusal) -> Option<Refused> {
 /// ([`published_patterns`]): the model's text, anchors and all, for almost every shape of
 /// this model — the `^`/`$` a Smithy `@pattern` wraps a whole-value expression in are part
 /// of the expression a recorded Directory Service refusal quotes back, per-member clause and
-/// nested element set alike — and, for the few shapes whose recorded refusal ends where the
-/// grammar ends, that text without its closing anchor. The same holds for a clause built
+/// nested element set alike — and, for the few shapes whose recorded refusal publishes the
+/// grammar alone, that text without its closing anchor or without either of them. The same
+/// holds for a clause built
 /// where the framework's own walk could not apply the expression at all
 /// ([`model_pattern_refusals`]) and for the one a handler words itself
 /// (`crate::ops::create_alias`), so one rendering serves every member whatever found it.

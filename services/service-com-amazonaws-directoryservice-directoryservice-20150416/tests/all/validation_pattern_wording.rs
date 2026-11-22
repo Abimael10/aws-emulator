@@ -9,11 +9,13 @@
 //!
 //! The rule under test: a value a member's `@pattern` does not admit is refused HTTP 400
 //! `ValidationException` with the boundary's envelope — the rejected value, the member as
-//! the wire names it, and the requirement — and the requirement QUOTES the expression AS THE
-//! MODEL DECLARES IT, including the `^`/`$` pair the model wraps a whole-value pattern in. It
-//! is asserted over a TABLE of this service's `@pattern`-constrained members rather than the
-//! one recorded call: ids of four different id spaces, a topic name, a tag resource id and a
-//! domain name, which between them span a short character class, a class with an escaped
+//! the wire names it, and the requirement — and the requirement QUOTES the expression THIS
+//! SERVICE PUBLISHES for the member's shape, which for every shape below is the model's own
+//! text, including the `^`/`$` pair the model wraps a whole-value pattern in (the shapes
+//! this service publishes with an anchor dropped are `tests/all/published_pattern_text.rs`'s
+//! table). It is asserted over a TABLE of this service's `@pattern`-constrained members
+//! rather than the one recorded call: ids of four different id spaces, a tag resource id and
+//! a domain name, which between them span a short character class, a class with an escaped
 //! metacharacter, a bracketed single letter, a counted hex run and a grouped repetition.
 //!
 //! The requirement belongs to the MEMBER's shape and not to the operation that carried it,
@@ -43,8 +45,9 @@ struct PatternCase {
     operation: &'static str,
     member: &'static str,
     value: &'static str,
-    /// The expression as the refusal quotes it: the shape's `@pattern` itself, anchor pair
-    /// included. Each row's modelled pattern is named in the comment beside it, from
+    /// The expression as the refusal quotes it: the expression this service publishes for
+    /// the shape, which for every row of this table is the shape's `@pattern` itself, anchor
+    /// pair included. Each row's modelled pattern is named in the comment beside it, from
     /// `smithy_query(query="shape",shape="<Shape>")`.
     stated: &'static str,
     body: fn(&str) -> serde_json::Value,
@@ -54,15 +57,6 @@ struct PatternCase {
 /// this service declares.
 fn pattern_rows() -> Vec<PatternCase> {
     vec![
-        // `TopicName`: `^[a-zA-Z0-9_-]+$` — the recorded case, a plain character class.
-        PatternCase {
-            case: "a topic name carrying dots",
-            operation: "RegisterEventTopic",
-            member: "topicName",
-            value: "sim2real.behav.topic",
-            stated: r"^[a-zA-Z0-9_-]+$",
-            body: |value| json!({ "DirectoryId": ABSENT_DIRECTORY_ID, "TopicName": value }),
-        },
         // `DirectoryId`: `^d-[0-9a-f]{10}$` — a literal prefix and a counted hex run.
         PatternCase {
             case: "a directory id of the wrong form",
@@ -156,7 +150,7 @@ fn pattern_clause(value: &str, member: &str, stated: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_pattern_refusal_quotes_the_expression_the_model_declares() {
+async fn a_pattern_refusal_quotes_the_expression_the_service_publishes_for_the_shape() {
     let router = service();
 
     for row in pattern_rows() {

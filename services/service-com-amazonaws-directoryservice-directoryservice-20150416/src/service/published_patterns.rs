@@ -6,20 +6,22 @@
 //! ## The rule
 //!
 //! A clause about a value outside its member's `@pattern` quotes the expression the SERVICE
-//! publishes for that member's shape, which is the model's text for almost every shape of
-//! this model and, for a few of them, the same text without the `$` that CLOSES it: the
-//! constraint text behind those refusals is anchored at its start only, so the expression
-//! the refusal reports ends where the grammar ends. Which of the two forms a shape is
-//! published with cannot be read off the text — both are spelled `^…$` in the model — so it
-//! is reference data about the SHAPE, kept here, keyed by the expression itself
-//! ([`PUBLISHED_UNANCHORED_AT_THE_CLOSE`]) and therefore holding for every member that
-//! targets it: in any operation, in whatever binding carried the value, and inside the
-//! constraint set a clause nests at a collection of them.
+//! publishes for that member's shape. That is the model's text for almost every shape of
+//! this model and, for a few of them, the same text with an anchor the service does not
+//! publish dropped: without the `$` that CLOSES it, where the constraint text behind those
+//! refusals is anchored at its start only, and without EITHER anchor, where the published
+//! expression is the bare grammar the member's value has to be made of. Which of the three
+//! forms a shape is published with cannot be read off the text — all of them are spelled
+//! `^…$` in the model — so it is reference data about the SHAPE, kept here, keyed by the
+//! expression itself ([`PUBLISHED_UNANCHORED_AT_THE_CLOSE`], [`PUBLISHED_UNANCHORED`]) and
+//! therefore holding for every member that targets it: in any operation, in whatever binding
+//! carried the value, and inside the constraint set a clause nests at a collection of them.
 //!
-//! The DROP itself is the tree-wide reading of that anchor
-//! ([`::service_common::validation::unanchored_at_the_close`]), so nothing about how an
-//! anchor is recognised is decided here, and the CHECK is always the model's expression as
-//! written: this module changes what a refusal QUOTES and never which values are refused.
+//! The DROPS themselves are the tree-wide reading of those anchors
+//! ([`::service_common::validation::unanchored_at_the_close`],
+//! [`::service_common::validation::unanchored`]), so nothing about how an anchor is
+//! recognised is decided here, and the CHECK is always the model's expression as written:
+//! this module changes what a refusal QUOTES and never which values are refused.
 //!
 //! ## Where it is applied
 //!
@@ -40,20 +42,33 @@
 ///   a malformed `CreateAlias$Alias`;
 /// * `OCSPUrl` (`smithy_query(query="shape",shape="OCSPUrl")`) — the recorded refusal of a
 ///   malformed `RegisterCertificate$ClientCertAuthSettings.OCSPUrl`.
-///
-/// Every other expression of this model is published as the model declares it, anchors and
-/// all, which is what the recorded refusals of a directory id, a certificate id, an
-/// assessment id, a snapshot id, a topic name, a tag resource id, a domain name and the
-/// element sets of this service's lists quote.
 const PUBLISHED_UNANCHORED_AT_THE_CLOSE: &[&str] = &[
     r"^(?!D-|d-)([\da-zA-Z]+)([-]*[\da-zA-Z])*$",
     r"^(https?|ftp|file|ldaps?)://[-a-zA-Z0-9+&@#/%?=~_|!:,.;()]*[-a-zA-Z0-9+&@#/%=~_|()]$",
 ];
 
+/// The expressions this service publishes WITHOUT EITHER of the anchors the model wraps
+/// them in: the bare grammar a value of the shape has to be made of.
+///
+/// Each row is a shape whose recorded refusal quotes its expression that way:
+///
+/// * `TopicName` (`smithy_query(query="shape",shape="TopicName")`) — the recorded refusal of
+///   a `RegisterEventTopic$TopicName` carrying a character outside the class, which quotes
+///   `[a-zA-Z0-9_-]+`.
+///
+/// Every expression named in neither table is published as the model declares it, anchors
+/// and all, which is what the recorded refusals of a directory id, a certificate id, an
+/// assessment id, a tag value, an address block, a directory name and the element sets of
+/// this service's lists quote.
+const PUBLISHED_UNANCHORED: &[&str] = &[r"^[a-zA-Z0-9_-]+$"];
+
 /// The expression a clause QUOTES for the modelled `declared`: the model's own text, or that
-/// text less its closing anchor for a shape this service publishes that way.
+/// text less the anchor or anchors this service does not publish for the shape.
 #[must_use]
 pub fn published_pattern(declared: &str) -> String {
+    if PUBLISHED_UNANCHORED.contains(&declared) {
+        return ::service_common::validation::unanchored(declared);
+    }
     if PUBLISHED_UNANCHORED_AT_THE_CLOSE.contains(&declared) {
         return ::service_common::validation::unanchored_at_the_close(declared);
     }
@@ -64,7 +79,8 @@ pub fn published_pattern(declared: &str) -> String {
 /// what tells a refusal this service has a rendering of its own to state for it.
 #[must_use]
 pub fn restates(declared: &str) -> bool {
-    PUBLISHED_UNANCHORED_AT_THE_CLOSE.contains(&declared)
+    PUBLISHED_UNANCHORED.contains(&declared)
+        || PUBLISHED_UNANCHORED_AT_THE_CLOSE.contains(&declared)
 }
 
 #[cfg(test)]
@@ -72,13 +88,13 @@ mod tests {
     use super::*;
 
     /// RULE: a clause quotes the expression the service publishes for the shape — the
-    /// model's text, less the closing anchor for the shapes published that way — and the
-    /// drop touches neither the opening anchor nor any anchor the expression writes inside
-    /// itself.
+    /// model's text, less the closing anchor for the shapes published that way and less both
+    /// anchors for the shapes published with neither — and a drop touches no anchor the
+    /// expression writes inside itself.
     #[test]
     fn a_clause_quotes_the_published_expression() {
         // (case, the model's expression, what a clause quotes)
-        let rows: [(&str, &str, &str); 5] = [
+        let rows: [(&str, &str, &str); 6] = [
             (
                 "an alias name, published without its closing anchor",
                 r"^(?!D-|d-)([\da-zA-Z]+)([-]*[\da-zA-Z])*$",
@@ -88,6 +104,11 @@ mod tests {
                 "an OCSP URL, published without its closing anchor",
                 r"^(https?|ftp|file|ldaps?)://[-a-zA-Z0-9+&@#/%?=~_|!:,.;()]*[-a-zA-Z0-9+&@#/%=~_|()]$",
                 r"^(https?|ftp|file|ldaps?)://[-a-zA-Z0-9+&@#/%?=~_|!:,.;()]*[-a-zA-Z0-9+&@#/%=~_|()]",
+            ),
+            (
+                "a topic name, published without either anchor",
+                r"^[a-zA-Z0-9_-]+$",
+                r"[a-zA-Z0-9_-]+",
             ),
             (
                 "a directory id, published as the model declares it",
@@ -100,9 +121,9 @@ mod tests {
                 r"^c-[0-9a-f]{10}$",
             ),
             (
-                "a topic name, published as the model declares it",
-                r"^[a-zA-Z0-9_-]+$",
-                r"^[a-zA-Z0-9_-]+$",
+                "an assessment id, published as the model declares it",
+                r"^da-[0-9a-f]{18}$",
+                r"^da-[0-9a-f]{18}$",
             ),
         ];
         for (case, declared, expected) in rows {

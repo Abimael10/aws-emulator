@@ -158,17 +158,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // The delete answers while the Amazon Web Services side is still being torn down,
-        // so the relationship is recorded in the modelled transient `Deleting` state and
-        // the clock is what finishes the job: a caller reading straight afterwards still
-        // sees the teardown, then the settled `Deleted` state, and once that has been
-        // readable for a span the trust is gone from this service. A repeat of the delete
-        // is therefore not a refusal: it names a relationship that is already torn down,
-        // and reports the same id.
+        // What a teardown has to undo is the Amazon Web Services side the create
+        // established. Where there is one, the delete answers while it is still being taken
+        // out of service, so the relationship is recorded in the modelled transient
+        // `Deleting` state and the clock is what finishes the job: a caller reading straight
+        // afterwards still sees the teardown, then the settled `Deleted` state, and once
+        // that has been readable for a span the trust is gone from this service. A repeat of
+        // the delete is therefore not a refusal while the record is still there: it names a
+        // relationship that is already torn down, and reports the same id.
+        //
+        // Where the creation established nothing at all
+        // ([`crate::state::trust_teardown_is_owed`]) there is no such side and so nothing to
+        // wait for: the record leaves the store with this call, and the next read of the id
+        // — a describe, or another delete — reports the relationship this service no longer
+        // holds.
         let trust_id = trust.trust_id.clone();
         let directory_id = trust.directory_id.clone();
         let remote_domain_name = trust.remote_domain_name.clone();
-        if !crate::state::TORN_DOWN_TRUST_STATES.contains(&trust.trust_state.as_str()) {
+        if !crate::state::trust_teardown_is_owed(&trust.trust_state) {
+            store.trusts.remove(&input.trust_id);
+        } else if !crate::state::TORN_DOWN_TRUST_STATES.contains(&trust.trust_state.as_str()) {
             trust.trust_state = crate::state::TRUST_STATE_DELETING.to_string();
             // The teardown is the state the relationship is in now, and nothing but this
             // call put it there, so whatever explained the state before no longer

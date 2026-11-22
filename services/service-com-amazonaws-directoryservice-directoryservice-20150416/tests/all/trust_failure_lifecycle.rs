@@ -22,13 +22,18 @@
 //! `tests/all/trust_peer_resolution.rs` over the directories this service holds. This one
 //! asserts the chain a client actually drives across them: create, the bounded poll that
 //! has to CONVERGE on the failure, the refused verification, the delete a failed
-//! relationship still accepts, and the not-found that follows it.
+//! relationship still accepts, and the not-found that follows it — and, in the last case,
+//! that what a teardown waits for is the Amazon Web Services side the create established,
+//! so a relationship that established nothing leaves the service with the call that deleted
+//! it while an established one is taken out of service over the modelled transient states.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::directory_lifecycle::{PAST_ONE_SPAN, PAST_ONE_SPAN_ONLY};
-use crate::harness::{call, ok, service, string, PAST_THE_TEARDOWN};
+use crate::directory_lifecycle::PAST_ONE_SPAN_ONLY;
+use crate::harness::{
+    call, ok, poll_until_in_service, poll_until_reported, service, string, POLL_DEADLINE,
+};
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
 /// A `TrustPassword` the modelled pattern `^(\p{LD}|\p{Punct}| )+$` admits, within its
@@ -178,10 +183,56 @@ fn rows() -> [Row; 7] {
 }
 
 /// A Managed Microsoft AD directory in service, the only type a trust is supported for.
+///
+/// The build is owed to the clock, so the CONDITION is waited for the way a client's waiter
+/// waits for it rather than a span of time.
 async fn holder(router: &MultiServiceRouter, case: &str) -> String {
     let id = create_microsoft_ad(router, minimal_microsoft_ad(HOLDER_DOMAIN), case).await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    poll_until_in_service(router, &id, case).await;
     id
+}
+
+/// The `Trust` `DescribeTrusts` reports for `trust_id` once its `TrustState` is `state`,
+/// polled the way a client waiting for a clock-owed transition polls.
+async fn settles_on(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    trust_id: &str,
+    state: &str,
+    case: &str,
+) -> Value {
+    poll_until_reported(
+        case,
+        &format!("{trust_id} to settle on {state}"),
+        POLL_DEADLINE,
+        || describe_scoped(router, directory_id, trust_id, case),
+        |reported: &Value| reported["TrustState"] == json!(state),
+    )
+    .await
+}
+
+/// The response `DescribeTrusts` gives for `trust_id` once the service holds no such
+/// relationship: the refusal a client polling a teardown waits for.
+async fn refused_once_gone(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    trust_id: &str,
+    case: &str,
+) -> (u16, Value) {
+    poll_until_reported(
+        case,
+        &format!("{trust_id} to leave the service"),
+        POLL_DEADLINE,
+        || {
+            call(
+                router,
+                "DescribeTrusts",
+                json!({ "DirectoryId": directory_id, "TrustIds": [trust_id] }),
+            )
+        },
+        |(status, _): &(u16, Value)| *status == 400,
+    )
+    .await
 }
 
 /// The one `Trust` `DescribeTrusts` reports for `trust_id`, asked for the way a client
@@ -260,13 +311,12 @@ async fn a_trust_that_did_not_establish_reports_its_failure_refuses_a_verify_and
         created.push((row, trust_id));
     }
 
-    // The transition each create owed has fallen due — by the clock, not by the read.
-    tokio::time::sleep(PAST_ONE_SPAN_ONLY).await;
-
     for (row, trust_id) in &created {
         let case = row.case;
-        let settled = describe_scoped(&router, &directory_id, trust_id, case).await;
         let expected = row.settled_state();
+        // The transition each create owed falls due by the clock, not by the read, so the
+        // state it settles on is what is waited for.
+        let settled = settles_on(&router, &directory_id, trust_id, expected, case).await;
         assert_eq!(
             settled["TrustState"],
             json!(expected),
@@ -360,7 +410,11 @@ async fn a_trust_that_did_not_establish_reports_its_failure_refuses_a_verify_and
     }
 
     // A relationship that did not establish is still one the caller can take away: the
-    // delete is accepted and answers while the teardown is under way.
+    // delete is accepted, and what follows it is what there was to tear down. An
+    // established relationship is taken out of service by the clock, so the delete answers
+    // while the teardown is under way; a relationship that established NOTHING has no side
+    // to take out of service, so the delete takes the record with it and the very next read
+    // of the id reports a relationship this service no longer holds.
     for (row, trust_id) in &created {
         let case = row.case;
         let answer = ok(&router, "DeleteTrust", json!({ "TrustId": trust_id }), case).await;
@@ -369,25 +423,39 @@ async fn a_trust_that_did_not_establish_reports_its_failure_refuses_a_verify_and
             json!(trust_id),
             "case {case:?}: expected the delete to name the trust it tore down, got {answer}"
         );
-        let tearing_down = describe_scoped(&router, &directory_id, trust_id, case).await;
-        assert_eq!(
-            tearing_down["TrustState"],
-            json!(TRUST_STATE_DELETING),
-            "case {case:?}: expected the teardown to be under way, got {tearing_down}"
-        );
-    }
-
-    // Once the teardown has run out the relationship is gone, so resolving it by id is
-    // reported as the entity that does not exist rather than served as an empty page.
-    tokio::time::sleep(PAST_THE_TEARDOWN).await;
-    for (row, trust_id) in &created {
-        let case = row.case;
+        if row.has_a_peer {
+            let tearing_down = describe_scoped(&router, &directory_id, trust_id, case).await;
+            assert_eq!(
+                tearing_down["TrustState"],
+                json!(TRUST_STATE_DELETING),
+                "case {case:?}: expected the teardown to be under way, got {tearing_down}"
+            );
+            continue;
+        }
         let (status, parsed) = call(
             &router,
             "DescribeTrusts",
             json!({ "DirectoryId": &directory_id, "TrustIds": [trust_id] }),
         )
         .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the relationship that established nothing to be gone \
+             with the delete, got {status} with {parsed}"
+        );
+        assert_eq!(
+            refusal_text(&parsed, case),
+            format!("Trust: {trust_id} does not exist"),
+            "case {case:?}: expected the not-found sentence for the id the request named, got \
+             {parsed}"
+        );
+    }
+
+    // Once the teardown has run out the relationship is gone, so resolving it by id is
+    // reported as the entity that does not exist rather than served as an empty page.
+    for (row, trust_id) in &created {
+        let case = row.case;
+        let (status, parsed) = refused_once_gone(&router, &directory_id, trust_id, case).await;
         assert_eq!(
             status, 400,
             "case {case:?}: expected the trust to be gone, got {status} with {parsed}"
@@ -404,6 +472,153 @@ async fn a_trust_that_did_not_establish_reports_its_failure_refuses_a_verify_and
              {parsed}"
         );
     }
+}
+
+/// RULE: what a teardown has to finish is the Amazon Web Services side the create
+/// established — so a relationship that established NOTHING leaves the service with the call
+/// that deleted it, while one that WAS established is taken out of service over the modelled
+/// transient states — and a client's very next call about a relationship this service no
+/// longer holds is refused `EntityDoesNotExistException` naming the id it asked about.
+///
+/// Asserted over the whole table above, whose rows differ in what the remote domain is (a
+/// name no peer can answer for, in four reserved top-level domains and two spellings, against
+/// ordinary names), in the trust's direction and type and in whether selective
+/// authentication was asked for — so the outcome follows from what the create established and
+/// from nothing else.
+#[tokio::test]
+async fn a_teardown_is_owed_only_where_the_create_established_something() {
+    let router = service();
+    let table = rows();
+    let directory_id = holder(&router, "the teardown holder").await;
+
+    let mut created: Vec<(&Row, String)> = Vec::new();
+    for row in &table {
+        let answer = ok(
+            &router,
+            "CreateTrust",
+            row.create_body(&directory_id),
+            row.case,
+        )
+        .await;
+        created.push((row, string(&answer, "TrustId", row.case)));
+    }
+
+    // Each create's own outcome is waited for first, so what the delete below is called on
+    // is the state the relationship settled in rather than the one it was accepted in.
+    for (row, trust_id) in &created {
+        settles_on(
+            &router,
+            &directory_id,
+            trust_id,
+            row.settled_state(),
+            row.case,
+        )
+        .await;
+    }
+
+    for (row, trust_id) in &created {
+        let case = row.case;
+        let answer = ok(&router, "DeleteTrust", json!({ "TrustId": trust_id }), case).await;
+        assert_eq!(
+            answer["TrustId"],
+            json!(trust_id),
+            "case {case:?}: expected the delete to name the trust it tore down, got {answer}"
+        );
+
+        if row.has_a_peer {
+            // There was a side to take out of service, so the teardown is the clock's: the
+            // relationship is reported in the modelled transient state straight after the
+            // call, and a second delete during that window is not a refusal.
+            let tearing_down = describe_scoped(&router, &directory_id, trust_id, case).await;
+            assert_eq!(
+                tearing_down["TrustState"],
+                json!(TRUST_STATE_DELETING),
+                "case {case:?}: expected the teardown of an established relationship to be \
+                 under way, got {tearing_down}"
+            );
+        } else {
+            // Nothing was established, so there is nothing to wait for: the record went with
+            // the call, and the next read of the id reports the relationship as absent.
+            let (status, parsed) = call(
+                &router,
+                "DescribeTrusts",
+                json!({ "DirectoryId": &directory_id, "TrustIds": [trust_id] }),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the relationship that established nothing to be gone \
+                 with the delete, got {status} with {parsed}"
+            );
+            let wire_type = parsed["__type"].as_str().unwrap_or_default();
+            assert!(
+                wire_type.contains("EntityDoesNotExistException"),
+                "case {case:?}: expected EntityDoesNotExistException, got {parsed}"
+            );
+            assert_eq!(
+                refusal_text(&parsed, case),
+                format!("Trust: {trust_id} does not exist"),
+                "case {case:?}: expected the not-found sentence for the id the request named, \
+                 got {parsed}"
+            );
+
+            // And a second delete of it is refused the same way, by the same absence.
+            let (status, parsed) =
+                call(&router, "DeleteTrust", json!({ "TrustId": trust_id })).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected a second delete to be refused, got {status} with \
+                 {parsed}"
+            );
+            let wire_type = parsed["__type"].as_str().unwrap_or_default();
+            assert!(
+                wire_type.contains("EntityDoesNotExistException"),
+                "case {case:?}: expected EntityDoesNotExistException from a second delete, got \
+                 {parsed}"
+            );
+            assert_eq!(
+                refusal_text(&parsed, case),
+                format!("Trust: {trust_id} does not exist"),
+                "case {case:?}: expected the not-found sentence from a second delete, got \
+                 {parsed}"
+            );
+        }
+    }
+
+    // Whichever way the relationship went, the directory ends up holding none of them: the
+    // teardown the clock owed runs to its end, and what it ends in is the same absence.
+    for (row, trust_id) in &created {
+        let case = row.case;
+        let (status, parsed) = refused_once_gone(&router, &directory_id, trust_id, case).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the trust to have left the service, got {status} with \
+             {parsed}"
+        );
+        assert_eq!(
+            refusal_text(&parsed, case),
+            format!("Trust: {trust_id} does not exist"),
+            "case {case:?}: expected the not-found sentence for the id the request named, got \
+             {parsed}"
+        );
+    }
+    let left = ok(
+        &router,
+        "DescribeTrusts",
+        json!({ "DirectoryId": &directory_id }),
+        "the teardown holder",
+    )
+    .await;
+    let remaining = left["Trusts"]
+        .as_array()
+        .map(Vec::len)
+        .unwrap_or_default();
+    assert_eq!(
+        remaining, 0,
+        "case {:?}: expected the directory to hold no trust once every teardown ended, got \
+         {left}",
+        "the teardown holder"
+    );
 }
 
 /// RULE (the same one, read as the client reads it): `Failed` is TERMINAL, so a bounded poll

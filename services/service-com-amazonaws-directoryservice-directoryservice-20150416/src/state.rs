@@ -1021,6 +1021,27 @@ pub const TRUST_STATE_DELETED: &str = "Deleted";
 /// but it is no longer the relationship the directory has with that remote domain.
 pub const TORN_DOWN_TRUST_STATES: [&str; 2] = [TRUST_STATE_DELETING, TRUST_STATE_DELETED];
 
+/// Whether tearing a relationship in `trust_state` down is work the clock has to finish.
+///
+/// `DeleteTrust` "deletes an existing trust relationship between your Managed Microsoft AD
+/// directory and an external domain", and what a teardown has to undo is the Amazon Web
+/// Services side a create established — which is why the delete answers in the transient
+/// [`TRUST_STATE_DELETING`], settles on [`TRUST_STATE_DELETED`] and only then lets the
+/// record go. A relationship whose creation established NOTHING ([`TRUST_STATE_FAILED`],
+/// the state a create settles on when no peer answers for the remote domain) has no such
+/// side to take out of service, so its delete has nothing to wait for: the record leaves
+/// the store with the call that deleted it, and the next read of that trust id already
+/// reports a relationship this service does not hold. The other failures of the modelled
+/// enum (`VerifyFailed`, `UpdateFailed`) belong to a relationship that WAS established, so
+/// their teardown is owed like any other.
+///
+/// Decided from the stored record's own state, so it holds for every relationship this
+/// service ever settles that way rather than for the ones a caller happens to delete.
+#[must_use]
+pub fn trust_teardown_is_owed(trust_state: &str) -> bool {
+    trust_state != TRUST_STATE_FAILED
+}
+
 /// The `TrustState` values of a relationship the directory no longer HOLDS: the teardown
 /// states ([`TORN_DOWN_TRUST_STATES`]) and [`TRUST_STATE_FAILED`], where nothing was
 /// established at all.

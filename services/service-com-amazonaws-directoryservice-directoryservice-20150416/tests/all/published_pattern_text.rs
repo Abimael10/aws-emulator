@@ -11,16 +11,18 @@
 //! The rule under test: a clause about a value outside its member's `@pattern` quotes the
 //! expression this service PUBLISHES for that member's SHAPE. For almost every shape of this
 //! model that is the model's text, anchors and all; for the shapes whose published
-//! expression is anchored at its start only it is that text without the `$` that closes it.
-//! Which of the two a shape is published with belongs to the shape, so it holds for every
-//! member targeting it, in whatever operation and whatever binding carried the value, and
-//! the CHECK is unaffected: the values each expression admits are exactly the values it
-//! admitted before.
+//! expression is anchored at its start only it is that text without the `$` that closes it;
+//! and for the shapes published as the bare grammar a value is made of it is that text
+//! without either anchor. Which of the three a shape is published with belongs to the shape,
+//! so it holds for every member targeting it, in whatever operation and whatever binding
+//! carried the value, and the CHECK is unaffected: the values each expression admits are
+//! exactly the values it admitted before.
 //!
-//! It is asserted over a TABLE spanning both forms — the two shapes this service publishes
-//! without their closing anchor (a directory alias and an OCSP URL, reached through
-//! different operations, one of them inside a structure the request nests) and three it
-//! publishes as declared (two id spaces and a topic name) — with a value each expression
+//! It is asserted over a TABLE spanning all three forms — the two shapes this service
+//! publishes without their closing anchor (a directory alias and an OCSP URL, reached through
+//! different operations, one of them inside a structure the request nests), the one it
+//! publishes without either anchor (an event topic name, reached through BOTH operations that
+//! carry it) and two it publishes as declared (two id spaces) — with a value each expression
 //! ADMITS as the positive control, so no row can pass by matching one recorded message.
 
 use serde_json::{json, Value};
@@ -98,13 +100,26 @@ fn published_rows() -> Vec<PublishedCase> {
             published: r"^da-[0-9a-f]{18}$",
             body: |value| json!({ "AssessmentId": value }),
         },
-        // `TopicName`: a plain character class, published as declared.
+        // `TopicName`: the model declares `^[a-zA-Z0-9_-]+$` and the service publishes the
+        // bare grammar — neither anchor — for it.
         PublishedCase {
             case: "an event topic name",
             operation: "RegisterEventTopic",
             member: "topicName",
             value: "sim2real.behav.topic",
-            published: r"^[a-zA-Z0-9_-]+$",
+            published: r"[a-zA-Z0-9_-]+",
+            body: |value| {
+                json!({ "DirectoryId": ABSENT_DIRECTORY_ID, "TopicName": value })
+            },
+        },
+        // The same shape in the other operation that carries it: what is published belongs
+        // to the shape, not to the entry point.
+        PublishedCase {
+            case: "an event topic name a deregistration names",
+            operation: "DeregisterEventTopic",
+            member: "topicName",
+            value: "sim2real topic",
+            published: r"[a-zA-Z0-9_-]+",
             body: |value| {
                 json!({ "DirectoryId": ABSENT_DIRECTORY_ID, "TopicName": value })
             },
@@ -145,6 +160,67 @@ async fn a_pattern_clause_quotes_the_expression_the_service_publishes() {
             "case {:?}: expected the published expression, got {stated:?}",
             row.case
         );
+    }
+}
+
+/// The expression this service publishes for the `TopicName` shape, whose model text is
+/// `^[a-zA-Z0-9_-]+$` (`smithy_query(query="shape",shape="TopicName")`): the bare grammar a
+/// topic name is made of, which is what the recorded refusal of an event-topic registration
+/// quotes back.
+const PUBLISHED_TOPIC_NAME: &str = r"[a-zA-Z0-9_-]+";
+
+/// The ways a topic name can fall outside the class its expression admits, one row per form
+/// rather than one recorded value.
+///
+/// The last two rows are the ones the PUBLISHED expression would match somewhere inside: each
+/// CONTAINS a run of admitted characters, so they are refused only because the CHECK is still
+/// the model's anchored text — which is what ties the quoted expression to the one the walk
+/// applies.
+fn topic_names_outside_the_class() -> [(&'static str, &'static str); 7] {
+    [
+        ("dots between the labels", "sim2real.behav.topic"),
+        ("a space", "sim2real behav"),
+        ("a slash", "sim2real/behav"),
+        ("a colon", "topic:behav"),
+        ("a non-ASCII letter", "sim2réal"),
+        ("an admitted run with a trailing dot", "sim2real-behav."),
+        ("an admitted run with a leading bang", "!sim2real_behav"),
+    ]
+}
+
+/// RULE (the same rule read along the value and the operation): what is published belongs to
+/// the member's SHAPE, so every value that shape's expression refuses draws the same
+/// published text in either operation that carries the member, while the CHECK stays the
+/// model's own anchored expression.
+#[tokio::test]
+async fn every_refused_topic_name_publishes_the_same_expression() {
+    let router = service();
+
+    for operation in ["RegisterEventTopic", "DeregisterEventTopic"] {
+        for (form, value) in topic_names_outside_the_class() {
+            let case = format!("{operation}: {form}");
+            let (status, parsed) = call(
+                &router,
+                operation,
+                json!({ "DirectoryId": ABSENT_DIRECTORY_ID, "TopicName": value }),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the value to be refused, got {status} with {parsed}"
+            );
+            assert_eq!(
+                parsed["__type"],
+                json!("ValidationException"),
+                "case {case:?}: expected the boundary's validation envelope, got {parsed}"
+            );
+            let stated = parsed["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                stated,
+                published_clause(value, "topicName", PUBLISHED_TOPIC_NAME),
+                "case {case:?}: expected the published expression, got {stated:?}"
+            );
+        }
     }
 }
 
