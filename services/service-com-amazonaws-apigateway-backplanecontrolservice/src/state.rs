@@ -3432,17 +3432,6 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
             })
     }
 
-    /// Whether any stored access association names the domain name `domain_name_arn`.
-    ///
-    /// The dependency lookup, beside the pair lookup above: an association is created only
-    /// against a STORED private custom domain name, so one naming a domain name DEPENDS on
-    /// that record, and this is the one query that decides whether anything still does.
-    pub fn access_associations_depend_on(&self, domain_name_arn: &str) -> bool {
-        self.domain_name_access_associations
-            .values()
-            .any(|association| association.domain_name_arn == domain_name_arn)
-    }
-
     /// The custom domain names whose `BasePathMapping`s still route to the API
     /// `rest_api_id` — to the stage `stage_name` of it when one is named, or to the API at
     /// all when none is — each once and in creation order; empty when none does.
@@ -4104,9 +4093,9 @@ pub fn resolve_api_stage(
 /// The association is what makes the plan gate traffic on that stage, so the plan cannot
 /// go while it stands: the caller has to disassociate the stages first (an
 /// `UpdateUsagePlan` patch that removes them). Built FROM STORED STATE the way
-/// [`domain_name_has_access_associations`] is — the plan the request addressed, and one of
-/// the associations standing in its way, in the `<apiId>:<stageName>` spelling an
-/// `apiStages` entry is addressed by — so the caller can see which call to make first.
+/// [`no_such_rest_api`] is — the plan the request addressed, and one of the associations
+/// standing in its way, in the `<apiId>:<stageName>` spelling an `apiStages` entry is
+/// addressed by — so the caller can see which call to make first.
 pub fn usage_plan_has_api_stages(usage_plan_id: &str, api_id: &str, stage_name: &str) -> String {
     format!(
         "Cannot delete Usage Plan {usage_plan_id} because there are API Stages associated \
@@ -4252,23 +4241,6 @@ pub const INVALID_VPC_ENDPOINT_ID: &str = "Invalid VPC endpoint ID specified.";
 /// at all is refused with [`INVALID_VPC_ENDPOINT_ID`] instead.
 pub fn invalid_access_association_source(access_association_source: &str) -> String {
     format!("{access_association_source} is not a valid VPC endpoint id")
-}
-
-/// The `ConflictException` message for a custom domain name a stored
-/// `DomainNameAccessAssociation` still depends on, which is what `DeleteDomainName`
-/// refuses while the dependency stands (see
-/// [`ComAmazonawsApigatewayBackplanecontrolserviceState::access_associations_depend_on`]).
-///
-/// AWS publishes no fixed sentence for this condition, so the message is BUILT FROM
-/// STORED STATE the way [`no_such_rest_api`] is: it names the record the request
-/// addressed and the dependent resource kind, in the modelled spelling of both
-/// (`DomainName`, `DomainNameAccessAssociation`), so the caller can see which call to
-/// make first.
-pub fn domain_name_has_access_associations(domain_name: &str) -> String {
-    format!(
-        "The domain name {domain_name} has domain name access associations. Delete the \
-         domain name access associations before deleting the domain name."
-    )
 }
 
 /// How a refusal that names SEVERAL custom domain names lists them: the member it fills is

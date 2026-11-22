@@ -5,9 +5,10 @@
 //! (with `domainNameId` for a private one) addresses, so a later `GetDomainName` no longer
 //! finds it and the account's `GetDomainNames` listing stops reporting it; the
 //! `BasePathMapping` records that record HOLDS go with it, so a later `GetBasePathMapping`
-//! no longer finds them either; answers `NotFoundException` when no record answers to
-//! those identifiers, and `ConflictException` while a stored
-//! `DomainNameAccessAssociation` still names it.
+//! no longer finds them either; a stored `DomainNameAccessAssociation` that NAMES the
+//! record is left where it is, as an orphan, because it is a record of the account rather
+//! than of the domain name; answers `NotFoundException` when no record answers to those
+//! identifiers.
 //!
 //! ## Shape of an operation
 //!
@@ -190,50 +191,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::NO_SUCH_DOMAIN_NAME.to_string()),
             })
         })?;
-        let domain_name = entry.domain_name.clone();
         let domain_name_arn = entry.domain_name_arn.clone();
         // How many base path mappings go WITH the record, for the audit record below: a
         // mapping is a record OF this domain name, so it has no existence apart from it.
         let cascaded_mappings = entry.base_path_mappings.len();
 
-        // A `DomainNameAccessAssociation` is a record of the ACCOUNT that NAMES a stored
-        // private custom domain name — `CreateDomainNameAccessAssociation` refuses one
-        // whose `domainNameArn` resolves to no stored domain name — so an association
-        // still naming this record depends on it, and removing the record would leave an
-        // association this service says cannot exist. Such a delete is refused with the
-        // modelled conflict while the dependency stands; releasing the association is
-        // `DeleteDomainNameAccessAssociation`'s (or, for another account's,
-        // `RejectDomainNameAccessAssociation`'s) own call, not something this one does on
-        // the caller's behalf.
+        // A `DomainNameAccessAssociation` is a record of the ACCOUNT, not of the domain
+        // name: it is addressed by its own ARN, listed by the account's own collection and
+        // removed by `DeleteDomainNameAccessAssociation` (or, for another account's,
+        // `RejectDomainNameAccessAssociation`) without resolving any domain name. So one
+        // that NAMES this record neither holds the delete back nor goes with it: the
+        // removal is NOT consulted against the account's access associations at all, and
+        // each one still naming the record is left where it is, as an orphan the caller
+        // reaps with its own call afterwards. Gating the delete on them would deadlock a
+        // teardown that deletes the domain name first, since an association outlives the
+        // domain name it was created against.
         //
-        // Nothing the domain name itself carries conditions the removal: a record with a
-        // certificate, with mutual TLS, with a policy or carrying tags goes the same way,
-        // whatever `domainNameStatus` the clock currently owes it.
-        if store.access_associations_depend_on(&domain_name_arn) {
-            return Err(DeleteDomainNameErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(crate::state::domain_name_has_access_associations(
-                        &domain_name,
-                    )),
-                },
-            )
-            .into());
-        }
-
+        // Nothing the domain name itself carries conditions the removal either: a record
+        // with a certificate, with mutual TLS, with a policy or carrying tags goes the same
+        // way, whatever `domainNameStatus` the clock currently owes it, and so does one of
+        // any endpoint type.
+        //
         // A `BasePathMapping` is a SUBORDINATE record of this custom domain name — it is
         // created under it, addressed through it and reported by it — so it does not hold
         // the domain name back: the delete goes through while mappings stand and takes them
         // with the record, which is why a later `GetBasePathMapping` for one of them
         // resolves no domain name to reach it through and answers that record's own
-        // missing-resource refusal. A reference held by an INDEPENDENT record (the access
-        // association above, and the REST API or stage a mapping names, which
-        // `DeleteRestApi` and `DeleteStage` refuse over) is the opposite case: that record
-        // outlives the reference, so the delete is refused instead of cascading.
+        // missing-resource refusal.
         //
-        // The lookup, the dependency check and the removal share ONE hold of the store
-        // lock, so two concurrent deletes of one record cannot both remove it. Removing the
-        // record removes the mappings it holds with it, because a mapping is stored ON the
-        // record (`DomainNameEntry::base_path_mappings`).
+        // The lookup and the removal share ONE hold of the store lock, so two concurrent
+        // deletes of one record cannot both remove it. Removing the record removes the
+        // mappings it holds with it, because a mapping is stored ON the record
+        // (`DomainNameEntry::base_path_mappings`).
         store.domain_names.remove(&key);
         // The socket this record published its `regionalDomainName` as goes with it:
         // dropping the handle closes the port and severs every connection in flight on it,

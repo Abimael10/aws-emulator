@@ -15,9 +15,9 @@
 //!   nothing the record carries conditions the removal (its tags, the form of its source
 //!   identifier, or which private domain name it was created against — including two
 //!   private records that share one name, which are two domain names);
-//! * removing an association releases what depended on it: the pair
-//!   `(domain name, source)` is free for a new create, and a domain name whose last
-//!   association is gone can be deleted;
+//! * removing an association releases the pair it spells: the pair
+//!   `(domain name, source)` is free for a new create, and the ARN of a new association of
+//!   that pair is the one the delete released;
 //! * an ARN this service cannot read as one of ITS access association ARNs is the
 //!   modelled `BadRequestException` (400), while a well-formed one no stored record
 //!   answers to is the modelled `NotFoundException` (404) rather than a silent success —
@@ -53,7 +53,6 @@ use crate::tag_reads_by_arn::{apigateway_arn, encode_label, get_tags};
 
 const BAD_REQUEST: &str = "BadRequestException";
 const NOT_FOUND: &str = "NotFoundException";
-const CONFLICT: &str = "ConflictException";
 
 /// The status `DeleteDomainNameAccessAssociation`'s model declares for a success
 /// (`smithy_query(query="operation", operation="DeleteDomainNameAccessAssociation")`:
@@ -255,7 +254,7 @@ async fn deleting_an_association_removes_that_record_alone_and_a_second_delete_i
 }
 
 #[tokio::test]
-async fn removing_an_association_releases_the_pair_and_the_domain_name_it_named() {
+async fn removing_an_association_releases_the_pair_it_spells() {
     let gateway = Gateway::new();
     let domain = private_domain(&gateway, "released.example.com").await;
     // Rows differ along HOW MANY associations the domain name carries when the delete runs,
@@ -266,16 +265,6 @@ async fn removing_an_association_releases_the_pair_and_the_domain_name_it_named(
     for source in sources {
         arns.push(stored_association(&gateway, &domain, source).await);
     }
-
-    // The domain name cannot be deleted while an association names it.
-    let uri = delete_domain_uri(&domain);
-    let blocked = gateway.call("DELETE", &uri, None).await;
-    assert_failure(
-        &blocked,
-        409,
-        CONFLICT,
-        "DeleteDomainName while two associations stand",
-    );
 
     for (index, source) in sources.iter().enumerate() {
         let case = format!("the association of {source}");
@@ -296,9 +285,9 @@ async fn removing_an_association_releases_the_pair_and_the_domain_name_it_named(
         );
     }
 
-    // With the last association gone the domain name is deleted by the call that was
-    // refused above: it is the dependency that refuses the delete, not the record.
-    let freed = gateway.call("DELETE", &uri, None).await;
+    // The domain name the associations named keeps its own record and is deleted by its own
+    // call: this delete removed associations, not domain names.
+    let freed = gateway.call("DELETE", &delete_domain_uri(&domain), None).await;
     assert_deleted(&freed, "DeleteDomainName once no association stands");
 }
 

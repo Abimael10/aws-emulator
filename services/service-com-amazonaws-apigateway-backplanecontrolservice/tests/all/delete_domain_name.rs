@@ -17,31 +17,34 @@
 //! * identifiers no stored record answers to are the modelled `NotFoundException` (404)
 //!   rather than a silent success, which is what makes a second delete of one record
 //!   resolve to one success and one 404 rather than to a conflict;
-//! * a record another stored resource still DEPENDS on is the modelled
-//!   `ConflictException` (409) while that dependency stands, and a refused delete changes
-//!   nothing a later caller sees.
+//! * a stored `DomainNameAccessAssociation` naming the record is a record of the ACCOUNT,
+//!   not a precondition of this call: however many name the record, the delete is accepted,
+//!   the record stops reading, and every association is left behind as an orphan the
+//!   account's own collection still reports and its own delete still reaps.
 //!
 //! None of those answers is a 501: every request a caller can make against this operation
 //! is one of the statuses its model declares.
 //!
 //! [`Gateway`], [`Answer`], [`assert_failure`], [`string_member`] and [`page_items`] are
 //! this crate's one wire-test harness, reused rather than standing a second emulator up
-//! another way; `created_domain` is the domain-name suite's one create of a domain name
-//! and `association_body` / `create_association` the access-association suite's one
-//! create of an association.
+//! another way; `created_domain` is the domain-name suite's one create of a domain name,
+//! `association_body` / `create_association` / `list_associations` / `listed_arns` the
+//! access-association suite's own calls, and `encode_label` the tagging suite's one
+//! spelling of an ARN in a path label.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    domain_name_has_access_associations, DOMAIN_NAME_PENDING, NO_SUCH_DOMAIN_NAME,
-    PRIVATE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_TYPE,
+    DOMAIN_NAME_PENDING, NO_SUCH_DOMAIN_NAME, PRIVATE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_TYPE,
 };
 
-use crate::domain_name_access_associations::{association_body, create_association};
+use crate::domain_name_access_associations::{
+    association_body, create_association, list_associations, listed_arns,
+};
 use crate::domain_name_collection::created_domain;
 use crate::rest_api_lifecycle::{assert_failure, page_items, string_member, Answer, Gateway};
+use crate::tag_reads_by_arn::encode_label;
 
 const NOT_FOUND: &str = "NotFoundException";
-const CONFLICT: &str = "ConflictException";
 
 /// The status `DeleteDomainName`'s model declares for a success
 /// (`smithy_query(query="operation", operation="DeleteDomainName")`:
@@ -367,16 +370,29 @@ async fn identifiers_no_stored_domain_name_answers_to_are_the_modelled_not_found
     );
 }
 
+/// Every stored access association's ARN, in the account collection's own order.
+async fn stored_association_arns(gateway: &Gateway, case: &str) -> Vec<String> {
+    let answer = list_associations(gateway, "limit=500").await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case}: expected GetDomainNameAccessAssociations to answer 200, got {} \
+         with {:?}",
+        answer.status, answer.body
+    );
+    listed_arns(&answer.body, case)
+}
+
 #[tokio::test]
-async fn a_domain_name_a_stored_access_association_depends_on_is_the_modelled_conflict() {
+async fn deleting_a_domain_name_is_not_gated_on_its_access_associations() {
     let gateway = Gateway::new();
-    // Three private records: two carrying ONE name (so each is addressed by its own
-    // `domainNameId`) and one of its own, so the rows differ along HOW MANY associations
-    // depend on the record — none, one, several.
+    // Three private records — the only kind an access association can be created against —
+    // two carrying ONE name (so each is addressed by its own `domainNameId`) and one of its
+    // own, so the rows differ along HOW MANY associations name the record: none, one,
+    // several.
     let mut records: Vec<Stored> = Vec::new();
     for (case, domain_name) in [
-        ("one association", "depends.example.com"),
-        ("several associations", "depends.example.com"),
+        ("one association", "associated.example.com"),
+        ("several associations", "associated.example.com"),
         ("no association", "free.example.com"),
     ] {
         records.push(
@@ -415,53 +431,81 @@ async fn a_domain_name_a_stored_access_association_depends_on_is_the_modelled_co
             );
         }
     }
+    let associated = stored_association_arns(&gateway, "the created associations").await;
+    assert_eq!(
+        associated.len(),
+        3,
+        "case the created associations: expected the three stored associations, got {associated:?}"
+    );
 
-    // While an association depends on the record, every delete of it is the modelled
-    // conflict — however many associations there are, and however often it is tried.
-    for index in [0_usize, 1] {
-        let target = &records[index];
-        for attempt in 1..=2 {
-            let answer = delete_domain(&gateway, &target.domain_name, &target.query()).await;
-            let case = format!(
-                "DeleteDomainName({}) with {} (attempt {attempt})",
-                target.key(),
-                target.case
-            );
-            assert_failure(&answer, 409, CONFLICT, &case);
-            // The conflict says WHICH call to make first, in the one sentence this service
-            // words the condition with.
-            assert_eq!(
-                answer.body["message"].as_str(),
-                Some(domain_name_has_access_associations(&target.domain_name).as_str()),
-                "case {case}: expected the dependency sentence, got {:?}",
-                answer.body["message"]
-            );
-        }
-        // A refused delete changed nothing a later caller sees.
+    // However many associations name the record, the delete is accepted, the record stops
+    // reading, and a second delete of it is the modelled not-found: the account's access
+    // associations are not consulted at all.
+    for (index, target) in records.iter().enumerate() {
+        let case = format!("DeleteDomainName({}) with {}", target.key(), target.case);
+        assert_deleted(
+            &delete_domain(&gateway, &target.domain_name, &target.query()).await,
+            &case,
+        );
+
         let read = get_domain(&gateway, &target.domain_name, &target.query()).await;
+        assert_failure(&read, 404, NOT_FOUND, &format!("GetDomainName after {case}"));
         assert_eq!(
-            read.status,
-            200,
-            "case GetDomainName({}) after the conflict: expected the record to still read, \
-             got {} with {:?}",
-            target.key(),
-            read.status,
-            read.body
+            read.body["message"].as_str(),
+            Some(NO_SUCH_DOMAIN_NAME),
+            "case GetDomainName after {case}: expected {NO_SUCH_DOMAIN_NAME:?}, got {:?}",
+            read.body["message"]
+        );
+
+        let again = delete_domain(&gateway, &target.domain_name, &target.query()).await;
+        assert_failure(
+            &again,
+            404,
+            NOT_FOUND,
+            &format!("a second DeleteDomainName of {case}"),
+        );
+
+        // Every association is still where it was: the delete orphaned them rather than
+        // cascading, so the collection reports the same records in the same order.
+        let still_listed =
+            stored_association_arns(&gateway, &format!("the associations after {case}")).await;
+        assert_eq!(
+            still_listed, associated,
+            "case the associations after {case}: expected the orphans {associated:?}, got \
+             {still_listed:?}"
+        );
+
+        let left: Vec<String> = records[index + 1..].iter().map(Stored::key).collect();
+        let listed = listed_keys(&gateway, &format!("GetDomainNames after {case}")).await;
+        assert_eq!(
+            listed, left,
+            "case GetDomainNames after {case}: expected the records that are left {left:?}, \
+             got {listed:?}"
         );
     }
 
-    // The record NOTHING depends on is deleted by the same call: it is the dependency that
-    // refuses the delete, not the kind of record.
-    let free = &records[2];
-    assert_deleted(
-        &delete_domain(&gateway, &free.domain_name, &free.query()).await,
-        &format!("DeleteDomainName({}) with {}", free.key(), free.case),
-    );
-    let listed = listed_keys(&gateway, "GetDomainNames after the conflicts").await;
-    let expected = vec![records[0].key(), records[1].key()];
-    assert_eq!(
-        listed, expected,
-        "case GetDomainNames after the conflicts: expected the records an association \
-         depends on {expected:?}, got {listed:?}"
+    // The teardown ordering a client uses — delete the domain name, then reap the orphaned
+    // associations — goes through: each orphan is removed by its own call once its domain
+    // name is gone.
+    for arn in &associated {
+        let answer = gateway
+            .call(
+                "DELETE",
+                &format!("/domainnameaccessassociations/{}", encode_label(arn)),
+                None,
+            )
+            .await;
+        assert_eq!(
+            answer.status, DELETED,
+            "case DeleteDomainNameAccessAssociation({arn}) of an orphan: expected {DELETED}, \
+             got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
+    let left = stored_association_arns(&gateway, "the associations after the orphans were reaped")
+        .await;
+    assert!(
+        left.is_empty(),
+        "case the associations after the orphans were reaped: expected none left, got {left:?}"
     );
 }

@@ -225,8 +225,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // makes the account's `GetDomainNameAccessAssociations` listing — and a tag read by
         // this ARN — stop reporting it. Nothing the association carries conditions the
         // removal, and nothing else of this service depends on it; the domain name it was
-        // created against keeps its own record, which `DeleteDomainName` removes once no
-        // association names it any more.
+        // created against keeps its own record, and `DeleteDomainName` removes that record
+        // whether or not any association still names it — so this call also reaps an
+        // association whose domain name is already gone.
         //
         // "Only the AWS account that created the DomainNameAccessAssociation resource can
         // delete it": this emulator serves one account, so every stored record is one that

@@ -72,7 +72,7 @@ const VPCE: &str = "VPCE";
 /// `CreateDomainNameAccessAssociation` with `body`.
 ///
 /// Shared with the `delete_domain_name` suite, which needs a STORED association to show
-/// that a domain name one depends on cannot be deleted while it stands.
+/// that the delete of the domain name it names goes through all the same.
 pub(crate) async fn create_association(gateway: &Gateway, body: Value) -> Answer {
     gateway
         .call("POST", "/domainnameaccessassociations", Some(body))
