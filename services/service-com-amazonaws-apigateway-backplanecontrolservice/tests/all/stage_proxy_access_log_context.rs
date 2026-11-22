@@ -187,7 +187,17 @@ fn rows() -> Vec<Row> {
 }
 
 /// `CreateResource` of `path_part` under `parent`, answering the created resource's id.
-async fn child(router: &MultiServiceRouter, api: &str, parent: &str, path_part: &str) -> String {
+///
+/// `pub(crate)` because the sibling suite that takes ONE proxy-integrated stage through a
+/// sequence of logging configurations ([`crate::stage_access_log_reconfiguration`]) builds its
+/// resources the same way: one helper, so two suites cannot wire a resource tree differently
+/// while believing they agree.
+pub(crate) async fn child(
+    router: &MultiServiceRouter,
+    api: &str,
+    parent: &str,
+    path_part: &str,
+) -> String {
     let created = apigw(
         router,
         "CreateResource",
@@ -203,7 +213,10 @@ async fn child(router: &MultiServiceRouter, api: &str, parent: &str, path_part: 
 /// One open method on `resource`, served by `function_arn` through an `AWS_PROXY` integration —
 /// "for integrating the method request with the Lambda function-invoking action with the client
 /// request passed through as-is" (`IntegrationType`).
-async fn proxy_method(
+///
+/// `pub(crate)` for the reason [`child`] gives: the sibling suite serves its methods through the
+/// same integration, and one helper is what keeps the two from wiring it differently.
+pub(crate) async fn proxy_method(
     router: &MultiServiceRouter,
     api: &str,
     resource: &str,
