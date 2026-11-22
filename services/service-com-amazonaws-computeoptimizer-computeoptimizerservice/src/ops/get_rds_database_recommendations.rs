@@ -22,7 +22,9 @@
 //! The rows it reports are those of the ONE account the request is about: `accountIds` names
 //! the caller's own account or a member account of the organization this service records, so a
 //! well-formed id naming an account outside that set is refused rather than used to select
-//! rows with (see [`requested_account_id`]).
+//! rows with (see [`requested_account_id`]), and so is the account field of a `resourceArns`
+//! entry naming such an account (see [`foreign_account`]) — one request member cannot be
+//! refused while the other is answered under the same condition.
 //!
 //! ## Shape of an operation
 //!
@@ -214,10 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = requested_account_id(&state, input.account_ids.as_deref())?;
 
         // `resourceArns`: "The ARN that identifies the Amazon Aurora or RDS database" — so
-        // each value is an ARN. WHICH resource an ARN names is not checked here: a
-        // well-formed ARN this service holds no database recommendation for — including one
-        // naming a resource of an account it does not answer for — selects nothing, and is
-        // not refused.
+        // each value is an ARN, and one whose ACCOUNT field names an account other than the
+        // one this request is about asks about a database this service cannot report on,
+        // exactly as `accountIds` naming that account does, so it is refused with the crate's
+        // cross-account message rather than answered with an empty selection a client reads as
+        // "that account has no databases". WHICH resource an ARN of the requested account
+        // names is not checked here: a well-formed ARN this service holds no database
+        // recommendation for selects nothing, and is not refused.
         // The model bounds this list's length nowhere, so the service does: a request may
         // name at most the crate's ceiling
         // ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]), the same bound every reader of this
@@ -231,14 +236,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(reason));
         }
         let resource_arns = input.resource_arns.clone().unwrap_or_default();
-        if let Some(value) = resource_arns
-            .iter()
-            .find(|value| crate::state::parse_arn(value).is_none())
-        {
-            return Err(invalid_parameter(format!(
-                "The value supplied for parameter resourceArns is not valid: {value} is not an \
-                 Amazon Resource Name (ARN)."
-            )));
+        // Entry by entry in the order the list carries them, each judged for its form and then
+        // for the account it names before the next one is looked at — the order every other
+        // ARN-list reader of this service applies, so the FIRST entry a request cannot be
+        // answered about is the one the refusal is about.
+        for value in &resource_arns {
+            let Some(parsed) = crate::state::parse_arn(value) else {
+                return Err(invalid_parameter(format!(
+                    "The value supplied for parameter resourceArns is not valid: {value} is not \
+                     an Amazon Resource Name (ARN)."
+                )));
+            };
+            if parsed.account_id != account_id {
+                return Err(foreign_account());
+            }
         }
 
         // The filter vocabulary is the model's own; a name or value outside it is refused
@@ -364,9 +375,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_token,
             rds_db_recommendations: Some(page),
             // `errors` describes "errors of the request": the databases an analysis REJECTED,
-            // not the ones it has not reached. An ARN this service holds no database
-            // recommendation for — because nothing analysed it, or because the row belongs to
-            // another account — is simply absent from the answer, which stays a successful
+            // not the ones it has not reached. An ARN of the requested account this service
+            // holds no database recommendation for — because nothing analysed it — is simply
+            // absent from the answer, which stays a successful
             // empty result rather than a per-resource failure of the request. This emulator
             // analyses the databases in `crate::state` and classifies none of them as
             // unsupported, so it reports no error.
@@ -392,6 +403,15 @@ fn requested_account_id(
     account_ids: Option<&[String]>,
 ) -> Result<String, GetRDSDatabaseRecommendationsError> {
     crate::state::requested_account_id(state, account_ids).map_err(invalid_parameter)
+}
+
+/// What this reader answers a request that asks about an account it cannot answer for —
+/// either as an `accountIds` entry or as the account field of a `resourceArns` entry, judged
+/// by the crate's one rule for the condition ([`crate::state::is_foreign_account`]). The
+/// refusal is worded once for the whole crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no
+/// two readers differ.
+fn foreign_account() -> GetRDSDatabaseRecommendationsError {
+    invalid_parameter(crate::state::CROSS_ACCOUNT_MESSAGE.to_string())
 }
 
 /// The 400 `InvalidParameterValueException` this operation refuses a bad request with: "The

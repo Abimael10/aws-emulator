@@ -17,19 +17,19 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::{
     DBStorageConfiguration, RDSDBUtilizationMetric, Tag,
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY, DEFAULT_LOOK_BACK_PERIOD,
-    MAX_PAGE_SIZE, SOURCE_TYPE_RDS_DB_INSTANCE,
+    service_state, AnalysedResource, RdsDatabaseDetail, DEFAULT_LOOK_BACK_PERIOD, MAX_PAGE_SIZE,
+    SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 
 use crate::harness::{
-    call, call_in_region, emulator_with_engine, error_code, instance_arn, opt_in,
+    call, call_in_region, emulator_with_engine, error_code, instance_arn, make_analysis_due,
+    opt_in,
 };
 
 /// Another account entirely, which this service cannot be asked about: `accountIds` is how
@@ -323,9 +323,9 @@ fn reported_arns(body: &Value) -> Vec<String> {
 /// An emulator whose account is opted in, whose analysis is due and whose findings catalog
 /// holds [`primary_database`] and then [`corpus`].
 ///
-/// A recommendation is reported only once the analysis the enrollment started is due
-/// ([`ANALYSIS_DELAY`]), so the fixture waits that span out before reading, the way every
-/// other recommendation suite of this crate does; the extra margin covers scheduler jitter.
+/// A recommendation is reported only once the analysis the enrollment started is due, so the
+/// fixture makes that instant due ([`make_analysis_due`]) instead of waiting for the clock to
+/// reach it: the condition holds however fast or loaded the host is.
 async fn emulator_with_corpus() -> (
     smithy_server_runtime::MultiServiceRouter,
     Arc<engine::InMemoryEngine>,
@@ -336,7 +336,7 @@ async fn emulator_with_corpus() -> (
     let corpus = corpus();
     record(&engine, &[primary_database()]);
     record(&engine, &corpus);
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    make_analysis_due(&engine);
     (router, engine, corpus)
 }
 
@@ -392,7 +392,7 @@ async fn an_analysed_database_is_reported_from_its_catalog_row() {
     opt_in(&router).await;
     record(&engine, &[primary_database()]);
     // The catalog is read only once the analysis the enrollment started is due.
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    make_analysis_due(&engine);
     let seeded = db_arn(own_account(), "orders-primary");
     let before = catalog_size(&engine);
 
@@ -830,9 +830,9 @@ async fn the_read_selects_by_resource_account_and_filter() {
 /// cannot report, so it is refused with `InvalidParameterValueException` (400) rather than
 /// used as a key to select catalog rows with. An analysed database another account owns is
 /// therefore reported to nobody — not to a read that names no account, not to one that names
-/// the caller's own, not to one whose filter its finding would match, and not to one that
-/// names its very ARN, which is answered as a resource this service holds no recommendation
-/// for.
+/// the caller's own, and not to one whose filter its finding would match — and a read that
+/// names its very ARN is refused with that same refusal, because the account field of an ARN
+/// is judged by the same rule as an `accountIds` entry.
 #[tokio::test]
 async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nobody() {
     let (router, engine, corpus) = emulator_with_corpus().await;
@@ -863,9 +863,7 @@ async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nob
     let foreign_arn = foreign.arn_in(REGION);
 
     // Every read that could reach that row reports it to nobody, and each still reports the
-    // caller's own databases. The last row also pins what a read that names that database's
-    // very ARN answers: nothing reported, and no error — exactly as an ARN nothing analysed
-    // is answered.
+    // caller's own databases.
     let reads: Vec<(&str, Value, Vec<String>)> = vec![
         ("no selection", json!({}), own_databases.clone()),
         (
@@ -887,11 +885,6 @@ async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nob
                 own_databases[5].clone(),
             ],
         ),
-        (
-            "the foreign database's own ARN",
-            json!({"resourceArns": [foreign_arn.clone()]}),
-            Vec::new(),
-        ),
     ];
     for (case, request, wanted) in reads {
         let body = get_rds(&router, case, request).await;
@@ -906,6 +899,26 @@ async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nob
             "case {case:?}: expected no errors entry, got {body}"
         );
     }
+
+    // A read that names that database's very ARN is REFUSED, not answered with an empty
+    // selection a client would read as "that account has no databases": the account field of
+    // an ARN names the account the request asks about, exactly as `accountIds` does. The
+    // wording is pinned for every ARN-taking reader in `cross_account_resource_arns`.
+    let (status, body) = call(
+        &router,
+        "GetRDSDatabaseRecommendations",
+        json!({"resourceArns": [foreign_arn.clone()]}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "the foreign database's own ARN must be refused, got {status}: {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "InvalidParameterValueException",
+        "the foreign database's own ARN: expected InvalidParameterValueException, got {body}"
+    );
 
     // Well-formed ids that are not the caller's: the account the row above belongs to, the
     // documentation's own example account, an id one digit from the caller's own, and the
@@ -1378,7 +1391,7 @@ async fn the_reported_arn_names_the_region_the_endpoint_serves() {
     opt_in(&router).await;
     record(&engine, &corpus());
     // The catalog is read only once the analysis the enrollment started is due.
-    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    make_analysis_due(&engine);
 
     // The regions these rows are read at: the harness default, another commercial region and
     // one in another continent.
@@ -1479,7 +1492,7 @@ async fn the_read_waits_for_the_enrollment_and_the_analysis() {
                 "just opted in: the analysis is not due yet, so nothing is analysed: {fresh}"
             );
 
-            tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+            make_analysis_due(&engine);
             let body = get_rds(&router, "the analysis is due", json!({})).await;
             assert!(
                 !reported_arns(&body).is_empty(),

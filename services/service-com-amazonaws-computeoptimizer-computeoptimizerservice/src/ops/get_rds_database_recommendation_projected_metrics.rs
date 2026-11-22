@@ -214,13 +214,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `resourceArn`: "The ARN that identifies the Amazon Aurora or RDS database" — so the
         // value is an ARN. WHICH resource it names is not checked here: a well-formed ARN
         // this service holds no database analysis for is reported as a missing resource
-        // below, not refused.
-        if crate::state::parse_arn(&input.resource_arn).is_none() {
+        // below, not refused. An ARN whose ACCOUNT field names another account asks about a
+        // database this service cannot report on — this operation takes no `accountIds`, so
+        // the one account it answers for is the caller's own — and is refused with the crate's
+        // cross-account message rather than reported as a resource it holds no analysis for.
+        let Some(parsed) = crate::state::parse_arn(&input.resource_arn) else {
             return Err(invalid_parameter(format!(
                 "The value supplied for parameter resourceArn is not valid: {} is not an \
                  Amazon Resource Name (ARN).",
                 input.resource_arn
             )));
+        };
+        if crate::state::is_foreign_account(parsed.account_id) {
+            return Err(invalid_parameter(
+                crate::state::CROSS_ACCOUNT_MESSAGE.to_string(),
+            ));
         }
         // `period` is "The granularity, in seconds, of the projected metrics data points", so
         // it is a span of time: the member's modelled default `0` — which a request omitting
