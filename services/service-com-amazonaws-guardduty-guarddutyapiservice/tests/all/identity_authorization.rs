@@ -46,17 +46,17 @@ use crate::resource_tag_removal::{arn_of, uri_label};
 /// The region every call below is signed for. It is one of the Regions the investigation
 /// preview is served through, so the create row is judged rather than refused for the
 /// endpoint it arrived at.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The access-key id standing for the account's own published credential: neither STS nor
 /// IAM holds a record for it, so it resolves to the account's ambient identity, which holds
 /// no IAM policies and is allowed — the position AWS account root credentials are in.
-const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
+pub(crate) const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
 
 /// The wire name and status of the modelled refusal
 /// (`smithy_query(query="shape",shape="AccessDeniedException")`).
-const ACCESS_DENIED: &str = "AccessDeniedException";
-const ACCESS_DENIED_STATUS: u16 = 403;
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// A plan id of the minted form that no create ever minted. Its form — and its length —
 /// is the one the Malware Protection plan suite pins (`tests/all/malware_protection_plan.rs`),
@@ -69,15 +69,15 @@ const ABSENT_INVESTIGATION_ID: &str = "7f1d2c3b-4a59-4e6f-8a0b-1c2d3e4f5a6b";
 
 /// One response, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_code: String,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The `message` the error body carries.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body["message"]
             .as_str()
             .unwrap_or_default()
@@ -87,19 +87,19 @@ impl Reply {
 
 /// A principal a call is signed as: the access key id it presents, and the ARN a refusal
 /// must blame it by — what `sts:GetCallerIdentity` reports for that key.
-struct Principal {
-    access_key_id: String,
-    arn: String,
+pub(crate) struct Principal {
+    pub(crate) access_key_id: String,
+    pub(crate) arn: String,
 }
 
 /// The emulator these tests drive: one shared engine carrying this service beside the IAM
 /// and STS services the principals and their policies are made with.
-struct Emulator {
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing: the `Authorization` header carries only the credential
@@ -120,7 +120,7 @@ impl Emulator {
     }
 
     /// One call to this service, with `access_key_id` in the SigV4 credential scope.
-    async fn call(
+    pub(crate) async fn call(
         &self,
         access_key_id: &str,
         method: &str,
@@ -204,7 +204,7 @@ impl Emulator {
 
     /// Create an IAM user carrying `policy` as its inline policy (when one is given), mint
     /// a long-term access key for it, and answer that key id with the user's own ARN.
-    async fn user(&self, user_name: &str, policy: Option<&str>) -> Principal {
+    pub(crate) async fn user(&self, user_name: &str, policy: Option<&str>) -> Principal {
         let created = self
             .query(
                 "iam",
@@ -326,7 +326,7 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 }
 
 /// A policy document allowing `action` on `resource`.
-fn allow(action: &str, resource: &str) -> String {
+pub(crate) fn allow(action: &str, resource: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
          \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}]}}"
@@ -630,7 +630,7 @@ fn gated_requests(fixture: &Fixture, suffix: &str) -> Vec<Gated> {
 }
 
 /// The refusal IAM words for a request no identity-based document allows.
-fn default_deny_message(principal: &str, operation: &str, resource: &str) -> String {
+pub(crate) fn default_deny_message(principal: &str, operation: &str, resource: &str) -> String {
     let action = format!("{ACTION_PREFIX}:{operation}");
     format!(
         "User: {principal} is not authorized to perform: {action} on resource: {resource} \

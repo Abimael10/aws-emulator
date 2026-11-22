@@ -58,6 +58,13 @@
 //! * one association of a custom detection rule has an ARN whose resource path is NOT its
 //!   URI path, so it is built by the one function that builds it
 //!   ([`crate::state::custom_detection_rule_association_arn`]);
+//! * an operation whose URI binding carries no label for the association it acts on names
+//!   the rule the association belongs to in ANOTHER binding of the same request — the
+//!   `ruleId` query parameter of the listing and the `ruleId` body member of the create
+//!   ([`RULE_ID_BINDINGS`], which is read from the member's own binding traits) — so the
+//!   resource is that rule's association ARN with [`ANY_RESOURCE`] in the place of the
+//!   association id the request does not carry, which for a create the service has yet to
+//!   mint;
 //! * a request that addresses no single resource of this account in this Region — a
 //!   collection, and the whole published-rule catalogue, whose rules are AWS-MANAGED so
 //!   that their ARNs carry neither this account nor this Region
@@ -212,9 +219,13 @@ enum Addressed {
 /// on whether that resource exists — which is also what keeps a refused call from telling
 /// an unauthorized caller whether it does.
 #[must_use]
-pub fn judged_resource(ctx: &OperationContext<'_>, req: &RtRequest) -> String {
+pub fn judged_resource(ctx: &OperationContext<'_>, operation: &str, req: &RtRequest) -> String {
     let region = crate::state::request_region(ctx);
-    match addressed(::service_common::request_path(req.uri()), &region) {
+    match addressed(
+        ::service_common::request_path(req.uri()),
+        named_rule(operation, req).as_deref(),
+        &region,
+    ) {
         // Already whole: the tagging surface carries the ARN of its target, and an
         // association's ARN is built by the one function that builds it.
         Addressed::Arn(arn) => arn,
@@ -223,12 +234,73 @@ pub fn judged_resource(ctx: &OperationContext<'_>, req: &RtRequest) -> String {
     }
 }
 
-/// What `path` addresses, through `region`'s endpoint.
+/// Where an operation of this model carries its `RuleId` when its URI binding carries no
+/// label for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleIdBinding {
+    /// `@httpQuery("ruleId")`: the value travels in the request's query string.
+    Query,
+    /// A body member (`@jsonName("ruleId")`): the value travels in the restJson1 document.
+    Body,
+}
+
+/// The operations whose `RuleId` is NOT a URI label, with the binding each one's model
+/// gives that member.
+///
+/// Source: the member's own HTTP binding traits
+/// (`smithy_query(operation="CreateCustomDetectionRuleAssociation,ListCustomDetectionRuleAssociations")`),
+/// asserted against the model by this module's own test — so the id is read from the
+/// binding the request actually carries it in and one operation's query string can never
+/// decide a resource another operation takes from its body. Every other operation of this
+/// service takes its identifiers from its URI path ([`addressed`]).
+const RULE_ID_BINDINGS: &[(&str, RuleIdBinding)] = &[
+    (
+        "CreateCustomDetectionRuleAssociation",
+        RuleIdBinding::Body,
+    ),
+    (
+        "ListCustomDetectionRuleAssociations",
+        RuleIdBinding::Query,
+    ),
+];
+
+/// The `RuleId` `operation` names OUTSIDE its URI path, read from the binding its model
+/// gives that member ([`RULE_ID_BINDINGS`]), or `None` for an operation that binds the
+/// member nowhere but its path.
+///
+/// Only the member that identifies the resource is read: the decision rests on the action
+/// and the resource, and nothing else of the query or the body takes part. The value is
+/// decoded the way the codec that deserializes that binding decodes it, so the id read
+/// here is the one the handler reads.
+fn named_rule(operation: &str, req: &RtRequest) -> Option<String> {
+    let member = crate::state::RULE_ID_MEMBER;
+    let binding = RULE_ID_BINDINGS
+        .iter()
+        .find_map(|(name, binding)| (*name == operation).then_some(*binding))?;
+    let named = match binding {
+        RuleIdBinding::Query => req
+            .uri()
+            .split_once('?')
+            .and_then(|(_, query)| ::service_common::query_parameter(query, member))
+            .map(::smithy_server_runtime::percent_decode),
+        RuleIdBinding::Body => match ::serde_json::from_slice(req.body().bytes()?) {
+            Ok(::serde_json::Value::Object(members)) => members
+                .get(member)?
+                .as_str()
+                .map(::std::string::ToString::to_string),
+            _ => None,
+        },
+    };
+    named.filter(|rule_id| !rule_id.is_empty())
+}
+
+/// What `path` addresses, through `region`'s endpoint, where `named_rule` is the `RuleId`
+/// the rest of the request names ([`named_rule`]).
 ///
 /// Every label is decoded the way the codec that deserializes the request decodes it
 /// ([`::service_common::percent_decode_path_label`]), so an ARN label and a detector id
 /// are read exactly as the handler reads them.
-fn addressed(path: &str, region: &str) -> Addressed {
+fn addressed(path: &str, named_rule: Option<&str>, region: &str) -> Addressed {
     let segments: Vec<String> = path
         .trim_start_matches('/')
         .split('/')
@@ -269,6 +341,26 @@ fn addressed(path: &str, region: &str) -> Addressed {
                     ),
                 ),
                 _ => Addressed::Account,
+            }
+        }
+        // The association collection, whose operations carry the rule their associations
+        // belong to in the request's query string or its body rather than in its path
+        // ([`named_rule`]): the resource is that rule's own association ARN, with the
+        // ANY-association wildcard where the request names no association id — which a
+        // create has not minted yet. A request naming no rule addresses every association
+        // of the account in this Region.
+        Some(CUSTOM_DETECTION_RULE_PATH_SEGMENT)
+            if segment(1) == Some(ASSOCIATION_PATH_SEGMENT) && segment(2).is_none() =>
+        {
+            match named_rule {
+                Some(rule_id) => {
+                    Addressed::Arn(crate::state::custom_detection_rule_association_arn(
+                        region,
+                        rule_id,
+                        ANY_RESOURCE,
+                    ))
+                }
+                None => Addressed::Account,
             }
         }
         // Everything else names no single resource of this account in this Region: a
@@ -440,7 +532,7 @@ impl<Op: Operation, Eng: Send + Sync + 'static> ErasedOperation for Gated<Op, En
             // action is this operation's own name under this service's prefix, and the
             // resource is the one the REQUEST names. A refused request never reaches the
             // delegate, so it mints nothing, moves no status and reports nothing.
-            let resource = judged_resource(ctx, req);
+            let resource = judged_resource(ctx, Op::NAME, req);
             if let Err(denial) = authorize(&*self.engine, ctx, Op::NAME, &resource) {
                 // The protocol is read, used and dropped inside this one statement:
                 // `&dyn ErasedServiceDefinition` is not `Sync`, so holding it across the
@@ -616,6 +708,47 @@ mod tests {
         )
     }
 
+    /// RULE: every operation in [`RULE_ID_BINDINGS`] is read from the binding its own model
+    /// gives `RuleId`, so the id the decision uses is the one the request carries rather
+    /// than one another operation's binding would have carried.
+    ///
+    /// The bindings come from the MODEL rather than from a second hand list: an operation
+    /// that moves the member fails here instead of letting the gate judge a resource the
+    /// request never named.
+    #[test]
+    fn each_operation_is_read_from_the_binding_its_model_gives_the_rule_id() {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: ::serde_json::Value =
+            ::serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let shapes = &model["shapes"];
+        for (operation, binding) in RULE_ID_BINDINGS {
+            let input = shapes[format!("com.amazonaws.guardduty#{operation}")]["input"]["target"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {operation:?}: the model binds an input shape"))
+                .to_string();
+            let traits = &shapes[&input]["members"]["RuleId"]["traits"];
+            let query = traits["smithy.api#httpQuery"].as_str();
+            let json_name = traits["smithy.api#jsonName"].as_str();
+            let label = traits["smithy.api#httpLabel"].is_object();
+            let member = crate::state::RULE_ID_MEMBER;
+            match binding {
+                RuleIdBinding::Query => assert_eq!(
+                    (query, label),
+                    (Some(member), false),
+                    "case {operation:?}: expected RuleId bound to the query parameter \
+                     {member:?}, got {traits:?}"
+                ),
+                RuleIdBinding::Body => assert_eq!(
+                    (json_name, query, label),
+                    (Some(member), None, false),
+                    "case {operation:?}: expected RuleId bound to the body member {member:?}, \
+                     got {traits:?}"
+                ),
+            }
+        }
+    }
+
     /// RULE applied to the whole surface: [`GATED_OPERATIONS`] is EXACTLY the set of
     /// operations whose model declares `AccessDeniedException`.
     ///
@@ -684,8 +817,10 @@ mod tests {
     /// RULE: the resource a call is judged against is the one the REQUEST names — the
     /// detector-rooted and Malware Protection plan paths, which are the resource paths
     /// this service's ARNs carry; the ARN the tagging surface binds as its label; the ARN
-    /// the association builder spells; and the any-resource wildcard for a call that names
-    /// no single resource of this account in this Region.
+    /// the association builder spells, from the rule the request names in whichever
+    /// binding carries it and with the any-association wildcard where it names no
+    /// association id; and the any-resource wildcard for a call that names no single
+    /// resource of this account in this Region.
     #[test]
     fn the_request_decides_the_resource_the_action_is_judged_against() {
         /// The Region every row is read through, so an account-scoped ARN carries it.
@@ -693,61 +828,73 @@ mod tests {
         // A detector id of the minted form, and the ids of the sub-resources under it.
         let detector = "11111111111111111111111111111111";
         let plan_arn = crate::state::malware_protection_plan_arn(REGION, "plan-0001");
-        // (the case, the request path, what it names)
-        let rows: &[(&str, String, Addressed)] = &[
+        // (the case, the request path, the rule the rest of the request names, what it
+        // names)
+        let rows: &[(&str, String, Option<&str>, Addressed)] = &[
             (
                 "an investigation created under one detector",
                 format!("/detector/{detector}/investigation"),
+                None,
                 Addressed::Resource(format!("detector/{detector}/investigation")),
             ),
             (
                 "one investigation of one detector",
                 format!("/detector/{detector}/investigation/abc-123"),
+                None,
                 Addressed::Resource(format!("detector/{detector}/investigation/abc-123")),
             ),
             (
                 "one IPSet of one detector",
                 format!("/detector/{detector}/ipset/ip-0001"),
+                None,
                 Addressed::Resource(format!("detector/{detector}/ipset/ip-0001")),
             ),
             (
                 "one threat intel set of one detector",
                 format!("/detector/{detector}/threatintelset/ti-0001"),
+                None,
                 Addressed::Resource(format!("detector/{detector}/threatintelset/ti-0001")),
             ),
             (
                 "the detector collection, which names no detector",
                 "/detector".to_string(),
+                None,
                 Addressed::Account,
             ),
             (
                 "one Malware Protection plan",
                 "/malware-protection-plan/plan-0001".to_string(),
+                None,
                 Addressed::Resource("malware-protection-plan/plan-0001".to_string()),
             ),
             (
                 "the Malware Protection plan collection",
                 "/malware-protection-plan".to_string(),
+                None,
                 Addressed::Account,
             ),
             (
                 "one AWS-managed published rule, which is no resource of this account",
                 "/custom-detection-rule/rule/suspicious-login".to_string(),
+                None,
                 Addressed::Account,
             ),
             (
                 "the published rule catalogue",
                 "/custom-detection-rule/rule".to_string(),
+                None,
                 Addressed::Account,
             ),
             (
                 "an organization configuration of a published rule",
                 "/custom-detection-rule/org-configuration/suspicious-login".to_string(),
+                None,
                 Addressed::Account,
             ),
             (
                 "one association of a published rule, which the account owns",
                 "/custom-detection-rule/rule/suspicious-login/association/as-0001".to_string(),
+                None,
                 Addressed::Arn(crate::state::custom_detection_rule_association_arn(
                     REGION,
                     "suspicious-login",
@@ -755,23 +902,46 @@ mod tests {
                 )),
             ),
             (
-                "the association collection, which names no association",
+                "the association collection, for the rule the request names",
                 "/custom-detection-rule/association".to_string(),
+                Some("suspicious-login"),
+                Addressed::Arn(crate::state::custom_detection_rule_association_arn(
+                    REGION,
+                    "suspicious-login",
+                    ANY_RESOURCE,
+                )),
+            ),
+            (
+                "the association collection, for another rule",
+                "/custom-detection-rule/association".to_string(),
+                Some("credential-exfiltration"),
+                Addressed::Arn(crate::state::custom_detection_rule_association_arn(
+                    REGION,
+                    "credential-exfiltration",
+                    ANY_RESOURCE,
+                )),
+            ),
+            (
+                "the association collection, which names no rule at all",
+                "/custom-detection-rule/association".to_string(),
+                None,
                 Addressed::Account,
             ),
             (
                 "the tagging surface, whose label is the target's ARN",
                 format!("/tags/{}", encoded(&plan_arn)),
+                None,
                 Addressed::Arn(plan_arn.clone()),
             ),
             (
                 "the object malware scan path, which names no resource",
                 "/object-malware-scan/send".to_string(),
+                None,
                 Addressed::Account,
             ),
         ];
-        for (case, path, expected) in rows {
-            let reached = addressed(path, REGION);
+        for (case, path, rule, expected) in rows {
+            let reached = addressed(path, *rule, REGION);
             assert_eq!(
                 &reached, expected,
                 "case {case:?}: expected {path:?} to name {expected:?}, got {reached:?}"
@@ -779,7 +949,7 @@ mod tests {
         }
         // The plan's own ARN builder and the gate's reading of the plan's path agree, so a
         // statement written about the ARN a read reports covers the call that addresses it.
-        let plan_resource = match addressed("/malware-protection-plan/plan-0001", REGION) {
+        let plan_resource = match addressed("/malware-protection-plan/plan-0001", None, REGION) {
             Addressed::Resource(resource) => resource,
             other => panic!("a plan path names a resource of this account, got {other:?}"),
         };
