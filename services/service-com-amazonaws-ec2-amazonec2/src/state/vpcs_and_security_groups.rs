@@ -3170,10 +3170,23 @@ pub fn invalid_launch_template_id_malformed<E>(
     crate::scaffolded::Scaffolded::service_error(
         INVALID_LAUNCH_TEMPLATE_ID_MALFORMED,
         400,
-        format!(
-            "Malformed launch template Id: {}",
-            echoed_resource_id(launch_template_id)
-        ),
+        malformed_launch_template_id_message(launch_template_id),
+    )
+}
+
+/// That refusal's SENTENCE on its own, for the consumer of a launch template that reports
+/// EC2's wording inside an answer of its own rather than answering EC2's error.
+///
+/// Amazon EC2 Auto Scaling resolving the `LaunchTemplate` a group is configured with is that
+/// caller: the reference it resolves names THIS service's resource, so what it reports for an
+/// id this service cannot read is what a caller naming the same id here is told — worded HERE
+/// once, by the service that owns launch templates, exactly as
+/// [`specified_launch_template_id_not_found_message`] words the absent half.
+#[must_use]
+pub fn malformed_launch_template_id_message(launch_template_id: &str) -> String {
+    format!(
+        "Malformed launch template Id: {}",
+        echoed_resource_id(launch_template_id)
     )
 }
 

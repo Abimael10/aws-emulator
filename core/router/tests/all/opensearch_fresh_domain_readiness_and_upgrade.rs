@@ -720,9 +720,10 @@ struct SequenceRow {
 fn sequence_rows() -> Vec<SequenceRow> {
     vec![
         SequenceRow {
-            // The oldest release the index-management operations are offered on
-            // (`state::INDEX_MANAGEMENT_ENGINE_VERSION`), so the sequence runs on the floor
-            // of that gate as well as above it.
+            // An OpenSearch 3.x release, which is past the floor of the gate the
+            // index-management operations sit behind
+            // (`state::INDEX_MANAGEMENT_ENGINE_VERSION`), so the sequence runs above that
+            // gate and the index steps of it are served.
             case: "a sequence whose upgrade is polled through its status alone",
             domain: "sequence-three-one",
             source: "OpenSearch_3.1",

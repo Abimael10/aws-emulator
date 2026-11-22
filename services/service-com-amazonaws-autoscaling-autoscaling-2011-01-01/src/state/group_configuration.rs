@@ -326,6 +326,9 @@ fn first_unresolved<Eng: Send + Sync + 'static>(
 /// reference names does not exist.
 #[derive(Debug, Clone)]
 enum UnresolvedReference {
+    /// Amazon EC2 cannot READ the id half the specification stated — a value no mint of that
+    /// service ever produced — as that service words it.
+    Unreadable(String),
     /// The account holds no launch template under the half the specification stated.
     Template(TemplateIdentity),
     /// It holds the template and not the version, as Amazon EC2 words that half.
@@ -337,8 +340,8 @@ impl UnresolvedReference {
     /// carries it, and in the activity of a launch that read it off a stored configuration.
     fn message(self) -> String {
         match self {
+            Self::Unreadable(message) | Self::Version(message) => message,
             Self::Template(template) => template.absent_template_message(),
-            Self::Version(message) => message,
         }
     }
 }
@@ -385,6 +388,14 @@ impl TemplateReference {
         &self,
         store: &ec2::ComAmazonawsEc2Amazonec2State,
     ) -> Option<UnresolvedReference> {
+        // Amazon EC2 SCREENS a launch template id before it looks it up, so a reference this
+        // service resolves there is screened the same way ([`TemplateIdentity::unreadable`]):
+        // an id that service's mint never issued is not an id of a launch template at all,
+        // and is reported as the value it could not read rather than as a template that once
+        // existed and has gone.
+        if let Some(message) = self.template.unreadable(store) {
+            return Some(UnresolvedReference::Unreadable(message));
+        }
         let Some(record) = self.template.record(store) else {
             return Some(UnresolvedReference::Template(self.template.clone()));
         };
@@ -436,6 +447,28 @@ impl TemplateIdentity {
             .as_deref()
             .filter(|name| !name.is_empty())?;
         Some(Self::Name(name.to_string()))
+    }
+
+    /// Amazon EC2's own sentence for the id half of this identity where that service cannot
+    /// READ it, or `None` for an identity it can read — every name, and every id that
+    /// service's mint could have issued.
+    ///
+    /// A launch template id is a value Amazon EC2 ITSELF issued
+    /// ([`ec2::ComAmazonawsEc2Amazonec2State::id_was_issued`]), so one no issue of the kind
+    /// could have produced names no launch template at all and that service refuses it as
+    /// unreadable BEFORE any lookup — ahead of the template an ISSUED id names and may since
+    /// have been deleted. Amazon EC2 Auto Scaling resolves a group's reference through that
+    /// service, so a caller naming such an id is told what Amazon EC2 tells a caller naming
+    /// it there ([`ec2::malformed_launch_template_id_message`]) rather than that a template
+    /// of that id does not exist. A NAME has no shape to be wrong, so nothing is screened
+    /// for the name half.
+    fn unreadable(&self, store: &ec2::ComAmazonawsEc2Amazonec2State) -> Option<String> {
+        match self {
+            Self::Id(id) if !store.id_was_issued(ec2::LAUNCH_TEMPLATE_ID_PREFIX, id) => {
+                Some(ec2::malformed_launch_template_id_message(id))
+            }
+            Self::Id(_) | Self::Name(_) => None,
+        }
     }
 
     /// The launch template of the account's own Amazon EC2 store this identity names, looked

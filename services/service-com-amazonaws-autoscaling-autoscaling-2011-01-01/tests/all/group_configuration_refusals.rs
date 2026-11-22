@@ -465,10 +465,11 @@ async fn a_group_launches_only_from_a_launch_template_the_account_holds() {
         );
         let answered = message(&body);
         // The sentence is Amazon EC2's own for the half the request stated, surfaced by Auto
-        // Scaling: the launch template the reference names does not exist, named by the
-        // identifier the request carried.
+        // Scaling. That service SCREENS an id against its own mint before it looks one up, so
+        // an id it never issued — which is what every absent id below is — is reported as the
+        // value it could not read, while an absent NAME is a template that does not exist.
         let expected = if member.ends_with("LaunchTemplateId") {
-            format!("The specified launch template, with template ID {value}, does not exist.")
+            format!("Malformed launch template Id: {value}")
         } else {
             format!("The specified launch template, with template name {value}, does not exist.")
         };

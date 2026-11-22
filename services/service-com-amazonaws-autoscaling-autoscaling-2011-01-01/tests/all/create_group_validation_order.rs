@@ -52,7 +52,7 @@ const TEMPLATE_NAME: &str = "asg-validation-order-template";
 /// The instance type an override of a mixed instances policy overrides.
 const INSTANCE_TYPE: &str = "t3.micro";
 
-/// An id of the published form (`lt-` and 17 hex digits) no template of the account carries,
+/// An id of the published form (`lt-` and 17 hex digits) that Amazon EC2's mint never issued,
 /// a template name nothing creates, and a launch configuration name nothing creates: each
 /// names a launch source that resolves to nothing.
 const ABSENT_TEMPLATE_ID: &str = "lt-00000000000000999";
@@ -209,18 +209,15 @@ fn launch_source(source: Source, held: &HeldTemplate) -> Vec<(String, String)> {
 ///
 /// Each sentence is written out here rather than taken from the implementation — a test that
 /// re-used the implementation's own literal would assert nothing. The launch-template halves
-/// are Amazon EC2's own wording for the half that did not resolve (its "does not exist"
-/// sentence naming the id, the same sentence naming the name, and its version-resolution
-/// sentence for a version), and the last is Auto Scaling's own sentence for a group name
-/// already taken.
+/// are Amazon EC2's own wording for the half that did not resolve (its sentence for an id its
+/// mint never issued, which it cannot read at all, its "does not exist" sentence naming a
+/// name, and its version-resolution sentence for a version), and the last is Auto Scaling's
+/// own sentence for a group name already taken.
 fn expected_refusal(source: Source, held: &HeldTemplate) -> (&'static str, String) {
     match source {
         Source::AbsentTemplateId | Source::AbsentPolicyTemplateId => (
             VALIDATION_ERROR,
-            format!(
-                "The specified launch template, with template ID {ABSENT_TEMPLATE_ID}, does \
-                 not exist."
-            ),
+            format!("Malformed launch template Id: {ABSENT_TEMPLATE_ID}"),
         ),
         Source::AbsentTemplateName | Source::AbsentOverrideTemplateName => {
             (VALIDATION_ERROR, absent_template_name_message())

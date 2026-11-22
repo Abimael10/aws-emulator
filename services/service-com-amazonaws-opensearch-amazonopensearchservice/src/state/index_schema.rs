@@ -33,12 +33,14 @@ use crate::ops::types::{DependencyFailureException, InternalException, Validatio
 pub const INDEX_MANAGEMENT_ENGINE_TYPE: &str = ENGINE_TYPE_OPENSEARCH;
 
 /// The oldest OpenSearch release that serves them: these operations configure an index's
-/// AUTOMATIC SEMANTIC ENRICHMENT, which is built on the engine's own `semantic` field type
-/// ([`MAPPING_FIELD_TYPES`]) — a mapper the engine added in its THIRD major generation — so
-/// this is the first `OpenSearch_3` release the service offers
-/// ([`super::SUPPORTED_ENGINE_VERSIONS`]) and a domain on any earlier release is behind the
-/// software this feature needs, whichever of the two engines it runs.
-pub const INDEX_MANAGEMENT_ENGINE_VERSION: &str = "OpenSearch_3.1";
+/// AUTOMATIC SEMANTIC ENRICHMENT, and WHICH releases offer that feature is a fact of the
+/// service rather than of the model. The newest release recorded WITHOUT it is
+/// `OpenSearch_2.11` (where all four calls answer [`INDEX_MANAGEMENT_UNSUPPORTED`]) while
+/// later releases of that line serve them, so the feature arrives with the release that
+/// FOLLOWS 2.11 in the published catalog ([`super::SUPPORTED_ENGINE_VERSIONS`]): a domain on
+/// 2.11 or any earlier release is behind the software this feature needs, whichever of the
+/// two engines it runs.
+pub const INDEX_MANAGEMENT_ENGINE_VERSION: &str = "OpenSearch_2.13";
 
 /// Whether a domain running `engine_version` serves the index-management operations: its
 /// engine has to be [`INDEX_MANAGEMENT_ENGINE_TYPE`], at

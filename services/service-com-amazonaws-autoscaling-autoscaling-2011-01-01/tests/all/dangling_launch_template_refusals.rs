@@ -3,19 +3,26 @@
 //! The SENTENCE a request that configures a group against a launch template the account does
 //! not hold is refused with.
 //!
-//! RULE under test: a launch-template reference that resolves to no template of the account is
-//! reported with Amazon EC2's own sentence for the half of the reference the request stated —
-//! `The specified launch template, with template ID <id>, does not exist.` when it stated the
-//! id and `The specified launch template, with template name <name>, does not exist.` when it
-//! stated the name — under HTTP 400 and `ValidationError`, wherever the reference is carried
-//! and whichever request carries it, and nothing the refused request asked for is stored.
+//! RULE under test: Amazon EC2 Auto Scaling resolves a launch-template reference through the
+//! service that OWNS launch templates, so a reference that does not resolve is reported with
+//! that service's own sentence for what did not resolve, under HTTP 400 and `ValidationError`,
+//! wherever the reference is carried and whichever request carries it, and nothing the refused
+//! request asked for is stored:
+//!
+//! * a NAME nothing holds, and an id Amazon EC2's mint ISSUED whose template has since been
+//!   deleted, are a template that does not exist — `The specified launch template, with
+//!   template name <name>, does not exist.` and `… with template ID <id>, does not exist.`;
+//! * an id that mint never issued is no launch template id at all: Amazon EC2 screens an id
+//!   before it looks it up and refuses one it cannot read as malformed (`Malformed launch
+//!   template Id: <id>`), so that is what a group configured against such an id is told.
 //!
 //! The rows span what the rule generalises over: which half of the reference the request
 //! states, where the reference is carried (the group's own `LaunchTemplate`, the launch
 //! template of a `MixedInstancesPolicy`, the one an override of that policy names, the desired
 //! configuration of an instance refresh), which request carries it (the create, the update,
-//! the refresh), and whether the template was DELETED after the account held it or never
-//! existed at all — the reference resolves to nothing either way, so the answer is the same.
+//! the refresh), and what became of the template the reference names — held and then deleted,
+//! or never minted at all — which is what decides WHICH of the two sentences it earns. A
+//! second table spans the id FORMS the mint never produces.
 //!
 //! Auto Scaling and Amazon EC2 are mounted on ONE engine and driven over their own wire
 //! protocols — awsQuery and ec2Query — so every template this suite creates and deletes is
@@ -275,10 +282,18 @@ fn prefix(request: Request, carried: Carried) -> String {
 
 /// The sentence AWS answers the row with, written out here rather than taken from the
 /// implementation: fixed text around the ONE identifier the request stated.
-fn expected_message(named: Named, value: &str) -> String {
-    match named {
-        Named::Id => format!("The specified launch template, with template ID {value}, does not exist."),
-        Named::Name => {
+///
+/// Which sentence depends on what became of the template the reference names, because Amazon
+/// EC2 SCREENS an id against its own mint before it looks it up: an id it issued names a
+/// template that may since have gone, while an id it never issued is one it cannot read at
+/// all.
+fn expected_message(named: Named, history: History, value: &str) -> String {
+    match (named, history) {
+        (Named::Id, History::NeverCreated) => format!("Malformed launch template Id: {value}"),
+        (Named::Id, History::Deleted) => {
+            format!("The specified launch template, with template ID {value}, does not exist.")
+        }
+        (Named::Name, _) => {
             format!("The specified launch template, with template name {value}, does not exist.")
         }
     }
@@ -411,7 +426,7 @@ async fn a_reference_that_resolves_to_no_template_is_refused_by_the_half_it_stat
             "case {case:?}: expected {VALIDATION_ERROR}, got {body}"
         );
         let answered = xml_unescape(&tag_value(&body, "Message"));
-        let expected = expected_message(row.named, &value);
+        let expected = expected_message(row.named, row.history, &value);
         assert_eq!(
             answered, expected,
             "case {case:?}: expected {expected:?}, got {answered:?}"
@@ -440,6 +455,145 @@ async fn a_reference_that_resolves_to_no_template_is_refused_by_the_half_it_stat
                     started, 0,
                     "case {case:?}: the refused refresh must leave no instance refresh, got \
                      {started}"
+                );
+            }
+        }
+    }
+}
+
+/// The id FORMS Amazon EC2's mint never produces, from that service's own screen of a launch
+/// template id ([`ec2::ComAmazonawsEc2Amazonec2State::id_was_issued`], which holds an id to
+/// the long printed form, to a value at or below the mint's counter and off the all-zero
+/// placeholder): each names no launch template, whatever a client reads into it.
+const UNREADABLE_IDS: &[(&str, &str)] = &[
+    (
+        "a long-form id far above every value the mint can reach",
+        "lt-0123456789abcdef0",
+    ),
+    ("a short-form id, a form the mint never writes", "lt-0fedcba9"),
+    (
+        "the all-zero placeholder, which a mint counting from one cannot produce",
+        "lt-00000000000000000",
+    ),
+    ("an id that is not hexadecimal", "lt-zzzzzzzzzzzzzzzzz"),
+    (
+        "an id carrying another resource kind's prefix",
+        "sg-00000000000000001",
+    ),
+];
+
+/// RULE: a `LaunchTemplateId` Amazon EC2's mint never issued is reported as that service
+/// reports it — `Malformed launch template Id: <id>` — by every request that configures a
+/// group against it, while an id it DID issue is resolved: the template it names is launched
+/// from, or reported as not existing once it has been deleted.
+///
+/// The rows differ along the FORM of the id (its printed length, its digits, its prefix and
+/// the all-zero placeholder) and along what the mint did with it (never issued, issued and
+/// deleted, issued and held), and each is driven through both requests that configure a
+/// group — so what the rule pins is the screen, not one value.
+#[tokio::test]
+async fn an_id_the_mint_never_issued_is_reported_as_amazon_ec2_reports_it() {
+    let (router, _engine) = emulator();
+    let case = "the mint screen";
+    let held_id = create_template(&router, case, HELD_TEMPLATE_NAME).await;
+    let deleted_id = create_template(&router, case, DELETED_TEMPLATE_NAME).await;
+    delete_template(&router, case, &deleted_id).await;
+    create_group(&router, case).await;
+
+    // (case, the id, the sentence it earns, or `None` where the create must be served)
+    let mut rows: Vec<(String, String, Option<String>)> = UNREADABLE_IDS
+        .iter()
+        .map(|(case, id)| {
+            (
+                (*case).to_string(),
+                (*id).to_string(),
+                Some(format!("Malformed launch template Id: {id}")),
+            )
+        })
+        .collect();
+    rows.push((
+        "an id the mint really issued, whose template has since been deleted".to_string(),
+        deleted_id.clone(),
+        Some(format!(
+            "The specified launch template, with template ID {deleted_id}, does not exist."
+        )),
+    ));
+    rows.push((
+        "an id the mint really issued, whose template the account still holds".to_string(),
+        held_id.clone(),
+        None,
+    ));
+
+    let zone = zone();
+    for (at, (case, id, expected)) in rows.iter().enumerate() {
+        let created_name = format!("mint-screen-group-{at}");
+        let params = vec![
+            p("AutoScalingGroupName", created_name.as_str()),
+            p("MinSize", "0"),
+            p("MaxSize", "1"),
+            p("DesiredCapacity", "0"),
+            p("AvailabilityZones.member.1", zone.as_str()),
+            p("LaunchTemplate.LaunchTemplateId", id.as_str()),
+        ];
+        let (status, body) = query(&router, "CreateAutoScalingGroup", &borrowed(&params)).await;
+        // The same reference through the UPDATE, which resolves it the same way.
+        let (update_status, update_body) = query(
+            &router,
+            "UpdateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", GROUP),
+                ("LaunchTemplate.LaunchTemplateId", id.as_str()),
+            ],
+        )
+        .await;
+
+        match expected {
+            Some(expected) => {
+                for (operation, status, body) in [
+                    ("CreateAutoScalingGroup", status, &body),
+                    ("UpdateAutoScalingGroup", update_status, &update_body),
+                ] {
+                    assert_eq!(
+                        status, 400,
+                        "case {case:?}/{operation}: expected HTTP 400, got {status}: {body}"
+                    );
+                    assert_eq!(
+                        tag_value(body, "Code"),
+                        VALIDATION_ERROR,
+                        "case {case:?}/{operation}: expected {VALIDATION_ERROR}, got {body}"
+                    );
+                    let answered = xml_unescape(&tag_value(body, "Message"));
+                    assert_eq!(
+                        &answered, expected,
+                        "case {case:?}/{operation}: expected {expected:?}, got {answered:?}"
+                    );
+                }
+                assert!(
+                    !group_exists(&router, &created_name).await,
+                    "case {case:?}: the refused create must leave no group"
+                );
+                let reported = reported_template(&router).await;
+                assert_eq!(
+                    reported.0.as_str(),
+                    held_id.as_str(),
+                    "case {case:?}: the refused update must leave the group on the template it \
+                     resolved, got {reported:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}/CreateAutoScalingGroup: an issued id the account holds must \
+                     be resolved, got {status}: {body}"
+                );
+                assert_eq!(
+                    update_status, 200,
+                    "case {case:?}/UpdateAutoScalingGroup: an issued id the account holds must \
+                     be resolved, got {update_status}: {update_body}"
+                );
+                assert!(
+                    group_exists(&router, &created_name).await,
+                    "case {case:?}: the accepted create must leave a group"
                 );
             }
         }

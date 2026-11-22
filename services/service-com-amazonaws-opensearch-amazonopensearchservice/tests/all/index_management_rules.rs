@@ -25,6 +25,11 @@
 //!   engine release that does not is refused `ValidationException` with the service's
 //!   software-version sentence, and that refusal is answered BEFORE the index is looked up,
 //!   so a name no index of the domain carries earns it too;
+//! * and WHERE that bound sits: the feature is the OpenSearch engine's and arrives with the
+//!   release that follows the newest one published without it, so every Elasticsearch release
+//!   and every OpenSearch release at or before that one is gated while every later release
+//!   serves the whole family (create, read back, update, delete) — asserted over the whole
+//!   published catalog and over rows either side of the bound;
 //! * an analysis component is addressed by the NAME its settings define it under, and a name
 //!   carrying a character outside ASCII is one the domain's cluster cannot be handed: both
 //!   index writes refuse such a document with the modelled `DependencyFailureException` and
@@ -506,8 +511,8 @@ async fn the_version_gate_states_one_sentence_for_every_engine_it_gates() {
                 "Elasticsearch_1.5",
                 "Elasticsearch_7.10",
                 "OpenSearch_1.0",
+                "OpenSearch_1.3",
                 "OpenSearch_2.11",
-                "OpenSearch_2.19",
             ]
             .contains(version)
         })
@@ -863,4 +868,176 @@ async fn an_update_defining_a_component_under_a_non_ascii_name_is_refused_and_wr
         "case an ASCII component name: expected 200, got {} with {:?}",
         answer.status, answer.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// WHERE the software bound sits
+// ---------------------------------------------------------------------------
+
+/// The newest release the service publishes WITHOUT the feature these operations configure:
+/// the release the bound is read off, recorded answering the gate's own sentence for them.
+const NEWEST_RELEASE_WITHOUT_THE_FEATURE: &str = "OpenSearch_2.11";
+
+/// RULE: a published release offers these operations exactly when it is an OpenSearch release
+/// LATER than the newest release published without the feature — so no Elasticsearch release
+/// offers them at any major, every OpenSearch release at or before that one is gated, and
+/// every later one serves them.
+///
+/// Asserted over the service's WHOLE published catalog, so a release added to it is held to
+/// the same bound rather than quietly taking one side of it.
+#[test]
+fn the_software_bound_sits_after_the_newest_release_published_without_the_feature() {
+    let bound = state::upgrade_rank(NEWEST_RELEASE_WITHOUT_THE_FEATURE);
+    assert!(
+        bound.is_some(),
+        "case the bound: expected the catalog to rank {NEWEST_RELEASE_WITHOUT_THE_FEATURE:?}, \
+         got {bound:?}"
+    );
+    let (mut gated, mut serving) = (0usize, 0usize);
+    for version in state::published_engine_versions() {
+        let expected = state::engine_type_of(version) == Some(state::ENGINE_TYPE_OPENSEARCH)
+            && state::upgrade_rank(version) > bound;
+        let actual = state::serves_index_management(version);
+        assert_eq!(
+            actual, expected,
+            "case {version}: expected the feature to be offered = {expected}, got {actual}"
+        );
+        if actual {
+            serving += 1;
+        } else {
+            gated += 1;
+        }
+    }
+    assert!(
+        gated > 0 && serving > 0,
+        "case the catalog: expected published releases on both sides of the bound, got {gated} \
+         gated and {serving} serving"
+    );
+    // And the release the service states the bound by is the OLDEST that offers the feature:
+    // nothing published before it may offer it.
+    assert!(
+        state::serves_index_management(INDEX_MANAGEMENT_ENGINE_VERSION),
+        "case the stated bound: expected {INDEX_MANAGEMENT_ENGINE_VERSION} to offer the feature"
+    );
+    let earlier = state::published_engine_versions()
+        .into_iter()
+        .filter(|version| {
+            state::upgrade_rank(version) < state::upgrade_rank(INDEX_MANAGEMENT_ENGINE_VERSION)
+        })
+        .find(|version| state::serves_index_management(version));
+    assert!(
+        earlier.is_none(),
+        "case the stated bound: no release before {INDEX_MANAGEMENT_ENGINE_VERSION} may offer \
+         the feature, got {earlier:?}"
+    );
+}
+
+/// RULE, over the wire: a domain on a release past the bound serves the WHOLE family — a
+/// create, the read that proves what it persisted, an update that merges onto it and the
+/// delete that takes it away — while a domain at or before the bound is refused the create
+/// with the gate's one sentence.
+///
+/// The rows span both engines the service offers, several majors of each and the releases
+/// either side of the bound, the newest published release among them — releases no recorded
+/// call named.
+#[tokio::test]
+async fn a_release_past_the_bound_serves_the_whole_index_family() {
+    let emulator = Emulator::new();
+
+    let newest = state::published_engine_versions()
+        .into_iter()
+        .next()
+        .expect("the service publishes at least one release");
+    let rows: Vec<&str> = vec![
+        "Elasticsearch_1.5",
+        "Elasticsearch_7.10",
+        "OpenSearch_1.3",
+        NEWEST_RELEASE_WITHOUT_THE_FEATURE,
+        INDEX_MANAGEMENT_ENGINE_VERSION,
+        "OpenSearch_2.19",
+        newest,
+    ];
+    for version in &rows {
+        assert!(
+            state::offers_engine_version(version),
+            "case {version}: every row must name a release the service publishes"
+        );
+    }
+
+    // The domains are created first and settled together, so no case waits on a span of its
+    // own.
+    for (at, version) in rows.iter().enumerate() {
+        let domain = format!("bound-domain-{at}");
+        let answer = emulator
+            .create(json!({ "DomainName": domain, "EngineVersion": version }))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {version}: expected the domain to be created, got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
+    for (at, _) in rows.iter().enumerate() {
+        settled_domain(&emulator, &format!("bound-domain-{at}")).await;
+    }
+
+    let index = "bound-index";
+    let created_schema = json!({ "mappings": { "properties": { "title": { "type": "text" } } } });
+    let update = json!({ "mappings": { "properties": { "summary": { "type": "text" } } } });
+    for (at, version) in rows.iter().enumerate() {
+        let domain = format!("bound-domain-{at}");
+        let created = create_index(
+            &emulator,
+            &domain,
+            json!({ "IndexName": index, "IndexSchema": created_schema }),
+        )
+        .await;
+
+        if !state::serves_index_management(version) {
+            assert_eq!(
+                created.status, 400,
+                "case {version}/CreateIndex: expected HTTP 400, got {} with {:?}",
+                created.status, created.body
+            );
+            assert_eq!(
+                error_code(&created),
+                "ValidationException",
+                "case {version}/CreateIndex: expected ValidationException, got {:?}",
+                created.body
+            );
+            assert_eq!(
+                string_member(&created.body, "message", version),
+                state::INDEX_MANAGEMENT_UNSUPPORTED,
+                "case {version}/CreateIndex: expected the gate's own sentence, got {:?}",
+                created.body
+            );
+            continue;
+        }
+
+        assert_eq!(
+            created.status, 200,
+            "case {version}/CreateIndex: expected the create to be served, got {} with {:?}",
+            created.status, created.body
+        );
+        let read = read_schema(&emulator, &domain, index, version).await;
+        assert_eq!(
+            read, created_schema,
+            "case {version}/GetIndex: expected the schema the create persisted, got {read:?}"
+        );
+        updated_index(&emulator, &domain, index, &update, version).await;
+        let merged = read_schema(&emulator, &domain, index, version).await;
+        for field in ["title", "summary"] {
+            assert_eq!(
+                merged["mappings"]["properties"][field],
+                json!({ "type": "text" }),
+                "case {version}/GetIndex after the update: expected {field} mapped, got {merged:?}"
+            );
+        }
+        let removed = delete_index(&emulator, &domain, index).await;
+        assert_eq!(
+            removed.status, 200,
+            "case {version}/DeleteIndex: expected the delete to be served, got {} with {:?}",
+            removed.status, removed.body
+        );
+    }
 }

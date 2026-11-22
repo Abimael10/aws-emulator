@@ -41,8 +41,8 @@ const INSTANCE_TYPE: &str = "t3.micro";
 /// The name the account's launch template is created under.
 const TEMPLATE_NAME: &str = "asg-fleet-template";
 
-/// A launch template name no row creates, and an id of the published form no template of the
-/// account carries: a specification naming either resolves to nothing.
+/// A launch template name no row creates, and an id of the published form Amazon EC2's mint
+/// never issued: a specification naming either resolves to nothing.
 const ABSENT_TEMPLATE_NAME: &str = "asg-fleet-template-never-created";
 const ABSENT_TEMPLATE_ID: &str = "lt-00000000000000999";
 
@@ -239,13 +239,11 @@ async fn a_group_reports_both_halves_of_the_launch_template_it_resolves() {
                 "case {case:?}: expected ValidationError, got {body}"
             );
             // The sentence is Amazon EC2's own for the half the request stated, surfaced by
-            // Auto Scaling: the template the reference names does not exist, named by the
-            // identifier the request carried — the id when it stated the id, the name when it
-            // stated the name.
+            // Auto Scaling. That service SCREENS an id against its own mint before any
+            // lookup, so the id above — one it never issued — is reported as a value it
+            // cannot read, while a name nothing holds is a template that does not exist.
             let expected = match row.named {
-                Named::AbsentId => format!(
-                    "The specified launch template, with template ID {value}, does not exist."
-                ),
+                Named::AbsentId => format!("Malformed launch template Id: {value}"),
                 _ => format!(
                     "The specified launch template, with template name {value}, does not exist."
                 ),
