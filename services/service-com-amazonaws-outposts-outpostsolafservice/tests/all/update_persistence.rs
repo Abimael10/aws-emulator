@@ -27,9 +27,10 @@
 
 use serde_json::{json, Value};
 
+use crate::error_classification::{reported_tags, tag_map};
 use super::site_and_outpost_lifecycle::{
-    address, install_hardware, refusal, segment, text, Outposts, ABSENT_OUTPOST_ID, ABSENT_SITE_ID,
-    OUTPOST_ARN_PREFIX, SITE_ARN_PREFIX,
+    address, install_hardware, query_value, refusal, segment, text, Outposts, ABSENT_OUTPOST_ID,
+    ABSENT_SITE_ID, OUTPOST_ARN_PREFIX, SITE_ARN_PREFIX,
 };
 
 /// Every rack property `RackPhysicalProperties` declares, with every value its member's
@@ -313,6 +314,222 @@ async fn update_site_applies_present_members_and_reads_back() {
             outposts.get_site(&site_arn).await,
             expected,
             "case {case:?}: GetSite by ARN must answer the updated record"
+        );
+    }
+}
+
+/// Which keys a row of [`update_site_answers_the_tags_the_site_carries`] removes from
+/// the site before that row's update runs.
+enum Remove {
+    /// Nothing: the row only adds or replaces tags.
+    Nothing,
+    /// Exactly the keys named, whether the site carries them or not.
+    Keys(&'static [&'static str]),
+    /// Every key the site carries at that point — the row that leaves it untagged
+    /// again, so the rule is exercised on a tag map that BECAME empty as well as on
+    /// one that was never filled.
+    Every,
+}
+
+/// `POST /tags/{ResourceArn}`: how a row applies tags to the site between updates.
+async fn tag_site(outposts: &Outposts, arn: &str, tags: &Value) {
+    outposts
+        .no_content(
+            "POST",
+            &format!("/tags/{}", segment(arn)),
+            Some(&json!({ "Tags": tags })),
+        )
+        .await;
+}
+
+/// `DELETE /tags/{ResourceArn}?tagKeys=…`, with one `tagKeys` parameter per key —
+/// which is how a list-typed `@httpQuery` member travels. Each key is percent-encoded,
+/// because the modelled `TagKey` pattern admits characters a query string reads
+/// otherwise.
+async fn untag_site(outposts: &Outposts, arn: &str, keys: &[String]) {
+    let query: Vec<String> = keys
+        .iter()
+        .map(|key| format!("tagKeys={}", query_value(key)))
+        .collect();
+    outposts
+        .no_content(
+            "DELETE",
+            &format!("/tags/{}?{}", segment(arn), query.join("&")),
+            None,
+        )
+        .await;
+}
+
+/// The `Site` `ListSites` reports for `site_id`, if it reports one.
+async fn listed_site(outposts: &Outposts, site_id: &str) -> Option<Value> {
+    outposts.list_sites("").await["Sites"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|site| text(site, "SiteId") == site_id)
+}
+
+/// The rule for what an update REPORTS about a member it does not take: a site's tags
+/// are part of the site, so the `Site` `UpdateSite` answers reports the tags the site
+/// carries AT THAT MOMENT — the ones it was created with, the ones an earlier
+/// `TagResource` applied, and none an `UntagResource` has removed — which is the same
+/// map `GetSite` and `ListSites` report right after the call. The update writes only
+/// the three members it takes, so no row's tags change across it, and the map is
+/// reported even when the site carries no tags at all.
+///
+/// The rows differ along how the site's tags came to be what they are (created with
+/// them, added, replaced, one removed, a key it never carried removed, and every key
+/// removed), the SIZE of the map (none, one, several), the form of the keys and values
+/// (the character classes the modelled `TagKey` pattern `^(?!aws:)[a-zA-Z+-=._:/]+$`
+/// admits, and a value carrying the site's own ARN), and which of the three members
+/// the update itself carries (one, several, none). They are applied in sequence to the
+/// SAME site — once to a site created with tags and once to a site created without —
+/// so a row that dropped a previous row's tags shows up at once.
+#[tokio::test]
+async fn update_site_answers_the_tags_the_site_carries() {
+    let outposts = Outposts::new();
+    let starting: [(&str, Value); 2] = [
+        ("no tags at create", json!(null)),
+        ("tags at create", json!({ "Env": "prod", "cost.center": "4711" })),
+    ];
+
+    for (start, at_create) in &starting {
+        let mut request = json!({
+            "Name": format!("tag reporting site: {start}"),
+            "Description": "created description",
+            "Notes": "created notes",
+        });
+        if at_create.is_object() {
+            request["Tags"] = at_create.clone();
+        }
+        let created = outposts.create_site(&request).await;
+        let site_id = text(&created, "SiteId");
+        let site_arn = text(&created, "SiteArn");
+        let mut expected_tags = tag_map(at_create);
+
+        let rows: Vec<(&str, Value, Remove, Value)> = vec![
+            (
+                "the tags the site was created with",
+                json!(null),
+                Remove::Nothing,
+                json!({ "Name": "renamed" }),
+            ),
+            (
+                "one tag whose value is the site's own ARN",
+                json!({ "resourceArn": site_arn.clone() }),
+                Remove::Nothing,
+                json!({ "Description": "re-described" }),
+            ),
+            (
+                "several tags spanning the modelled key character classes",
+                json!({
+                    "a+b": "plus",
+                    "a-b": "dash",
+                    "a.b": "dot",
+                    "a_b": "underscore",
+                    "a:b": "colon",
+                    "a/b": "slash",
+                    "A1": "alnum",
+                }),
+                Remove::Nothing,
+                json!({ "Notes": "noted again" }),
+            ),
+            (
+                "a stored key at a new value",
+                json!({ "resourceArn": "replaced" }),
+                Remove::Nothing,
+                json!({}),
+            ),
+            (
+                "one key removed",
+                json!(null),
+                Remove::Keys(&["a+b"]),
+                json!({ "Name": "renamed again", "Notes": "noted once more" }),
+            ),
+            (
+                "a key the site does not carry removed",
+                json!(null),
+                Remove::Keys(&["never-applied"]),
+                json!({ "Description": "re-described again" }),
+            ),
+            (
+                "one key added and another removed before the same update",
+                json!({ "owner": "sre" }),
+                Remove::Keys(&["a.b"]),
+                json!({ "Name": "renamed once more", "Description": "d", "Notes": "n" }),
+            ),
+            (
+                "every key removed",
+                json!(null),
+                Remove::Every,
+                json!({ "Name": "renamed last" }),
+            ),
+        ];
+
+        for (row, applied, remove, patch) in &rows {
+            let case = format!("{start}: {row}");
+            if applied.is_object() {
+                tag_site(&outposts, &site_arn, applied).await;
+                expected_tags.extend(tag_map(applied));
+            }
+            let removed: Vec<String> = match remove {
+                Remove::Nothing => Vec::new(),
+                Remove::Keys(keys) => keys.iter().map(|key| (*key).to_string()).collect(),
+                Remove::Every => expected_tags.keys().cloned().collect(),
+            };
+            if !removed.is_empty() {
+                untag_site(&outposts, &site_arn, &removed).await;
+                for key in &removed {
+                    expected_tags.remove(key);
+                }
+            }
+
+            // The record as it stands with those tags on it: what the update must
+            // answer with only the members its own request carries changed.
+            let before = outposts.get_site(&site_id).await;
+            assert_eq!(
+                reported_tags(&before),
+                expected_tags,
+                "case {case:?}: the tag calls must leave the site carrying exactly \
+                 those tags, got {before:?}"
+            );
+
+            let answered = update_site(&outposts, &site_id, patch).await;
+            let expected = overlay(&before, patch);
+            assert_eq!(
+                answered, expected,
+                "case {case:?}: UpdateSite must answer the site as it now stands, \
+                 tags included, got {answered:?}"
+            );
+            assert_eq!(
+                reported_tags(&answered),
+                expected_tags,
+                "case {case:?}: UpdateSite must report the tags the site carries, \
+                 got {answered:?}"
+            );
+            assert!(
+                answered.get("Tags").is_some_and(Value::is_object),
+                "case {case:?}: the tag map is reported even when the site carries no \
+                 tags, got {answered:?}"
+            );
+            assert_eq!(
+                outposts.get_site(&site_arn).await,
+                expected,
+                "case {case:?}: GetSite must answer the same site the update answered"
+            );
+            let listed = listed_site(&outposts, &site_id).await;
+            assert_eq!(
+                listed.as_ref(),
+                Some(&expected),
+                "case {case:?}: ListSites must report the same site, got {listed:?}"
+            );
+        }
+
+        assert!(
+            expected_tags.is_empty(),
+            "case {start:?}: the rows end with every key removed, so the site must \
+             carry no tags, got {expected_tags:?}"
         );
     }
 }
