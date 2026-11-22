@@ -18,7 +18,10 @@
 //! The table's rows differ along what the rule generalises over: how many issuance requests
 //! reach one CA, the validity form each asks for, whether the request is completed or
 //! refused (and in which refusal class), and whether a completed request issues a new
-//! certificate or replays one. Every row runs against a CA of its own on ONE emulator, so
+//! certificate or replays one. The two tests under it carry the same rule over two further
+//! inputs: the KIND of certificate a request asks for (no template, an end-entity template,
+//! a CA certificate for a subordinate CA), and the reader that finds one CA's series by its
+//! dimension. Every row runs against a CA of its own on ONE emulator, so
 //! each row's own series is also the assertion that the dimension is honoured rather than
 //! aggregated away. The certificate each CA signs for its own activation is an issuance
 //! request too, and none of the expected counts holds it: a CA accounts for the issuances it
@@ -30,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::certificate_issuance_rules::root_ca_valid_for;
-use crate::private_ca_lifecycle::{blob, csr_pem, pem, string, Emulator};
+use crate::private_ca_lifecycle::{blob, csr_pem, pem, string, Emulator, ACCOUNT, REGION};
 
 // The namespace, dimension and metric names the series are published under, spelled out
 // here rather than read from the crate, so a re-authored name fails this suite. They are
@@ -583,6 +586,276 @@ async fn reading_the_series_reports_it_without_changing_it() {
         assert!(
             points.is_empty(),
             "a CA that served no issuance must report no {metric} datapoint, got {points:?}"
+        );
+    }
+}
+
+// The same rule over two inputs the table above does not span: the KIND of certificate a
+// request asks the CA for, and the reader a client finds one CA's series with.
+
+/// The certificate kinds one CA is asked for below, each named by the `TemplateArn` its
+/// request carries — `None` for the request that names none, which is answered under the
+/// default template ("If this parameter is not provided, Amazon Web Services Private CA
+/// defaults to the `EndEntityCertificate/V1` template",
+/// `smithy_query(query="doc",shape="IssueCertificateRequest",member="TemplateArn")`). They
+/// span the kinds a template ARN names: no template at all, an end-entity certificate, an
+/// end-entity certificate of another key purpose, and the CA certificate a CA signs for a
+/// subordinate CA, "where the path length is indicated by the PathLenN portion of the ARN"
+/// (the same member).
+const CERTIFICATE_KINDS: &[(&str, Option<&str>)] = &[
+    ("no template at all", None),
+    (
+        "the end-entity template a request may also name itself",
+        Some("arn:aws:acm-pca:::template/EndEntityCertificate/V1"),
+    ),
+    (
+        "an end-entity template of another key purpose",
+        Some("arn:aws:acm-pca:::template/CodeSigningCertificate/V1"),
+    ),
+    (
+        "the CA certificate a CA signs for a subordinate CA",
+        Some("arn:aws:acm-pca:::template/SubordinateCACertificate_PathLen0/V1"),
+    ),
+];
+
+/// A well-formed ARN of a certificate authority this emulator never minted: the issuance
+/// request naming it is refused before any CA takes it on.
+fn arn_of_no_ca(id: &str) -> String {
+    format!("arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/{id}")
+}
+
+/// An `IssueCertificate` body asking `ca_arn` for a thirty-day certificate of the kind
+/// `template_arn` names, over a certification request of its own — so two of them are never
+/// the same request.
+fn kind_request(ca_arn: &str, index: usize, template_arn: Option<&str>) -> Value {
+    let mut members = json!({"Validity": {"Type": "DAYS", "Value": 30}});
+    if let Some(template_arn) = template_arn {
+        members["TemplateArn"] = json!(template_arn);
+    }
+    request(ca_arn, &csr_pem(&format!("kind-{index}-leaf")), &members)
+}
+
+/// Every series `ListMetrics` reports for `metric` once the listing is narrowed to the
+/// dimension naming `ca_arn` — the read a client makes for the one CA it already holds
+/// (`ListMetrics`'s `Dimensions`: "The dimensions to filter against").
+async fn filtered_series(emulator: &Emulator, case: &str, metric: &str, ca_arn: &str) -> Vec<Value> {
+    let listed = cloudwatch(
+        emulator,
+        case,
+        "ListMetrics",
+        &json!({
+            "Namespace": NAMESPACE,
+            "MetricName": metric,
+            "Dimensions": [{"Name": CA_DIMENSION, "Value": ca_arn}],
+        }),
+    )
+    .await;
+    listed
+        .get("Metrics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// RULE: what the series account for is the issuance REQUEST a CA completed, whatever
+/// certificate that request asked for — so a leaf under the default template, a leaf under a
+/// template the request names and the CA certificate a CA signs for a subordinate each
+/// contribute one `Success` count and one `Time` observation to that CA's series, while a
+/// request no CA takes on contributes to none.
+#[tokio::test]
+async fn a_ca_counts_an_issuance_of_every_certificate_kind_it_signs() {
+    let emulator = Emulator::with_cloudwatch();
+    let opened = now_secs();
+    let case = "a CA asked for one certificate of every kind";
+    let arn = root_ca_valid_for(
+        &emulator,
+        case,
+        "every-kind-root",
+        json!({"Type": "YEARS", "Value": 10}),
+    )
+    .await;
+
+    for (index, (kind, template_arn)) in CERTIFICATE_KINDS.iter().enumerate() {
+        let kind_case = format!("{case}: {kind}");
+        let issued = emulator
+            .ok(
+                &kind_case,
+                "IssueCertificate",
+                &kind_request(&arn, index, *template_arn),
+            )
+            .await;
+        let certificate_arn = string(&issued, "CertificateArn", &kind_case);
+        assert!(
+            certificate_arn.starts_with(&format!("{arn}/certificate/")),
+            "case {kind_case:?}: expected a certificate of {arn:?}, got {certificate_arn:?}"
+        );
+    }
+
+    // A request no CA takes on: the ARN is well formed and names no authority, so the
+    // service refuses it and no CA accounts for it.
+    let unknown = arn_of_no_ca("7b9f4c1e-0d2a-4f6b-9c3e-5a8d1f2b4c60");
+    emulator
+        .refused(
+            "an issuance against a CA that does not exist",
+            "IssueCertificate",
+            &kind_request(&unknown, CERTIFICATE_KINDS.len(), None),
+            "ResourceNotFoundException",
+        )
+        .await;
+
+    let start = opened - WINDOW_SECS;
+    let end = now_secs() + WINDOW_SECS;
+    // One completed issuance request per kind.
+    let expected: f64 = CERTIFICATE_KINDS.iter().map(|_| 1.0).sum();
+
+    let successes = datapoints(
+        &emulator,
+        case,
+        SUCCESS,
+        &arn,
+        start,
+        end,
+        &["Sum", "SampleCount"],
+    )
+    .await;
+    let counted = total(&successes, "Sum");
+    assert!(
+        (counted - expected).abs() < 0.5,
+        "case {case:?}: {SUCCESS} for {arn} must sum to the {expected} issuance requests the \
+         CA completed, got {counted} from {successes:?}"
+    );
+    let observations = total(&successes, "SampleCount");
+    assert!(
+        (observations - expected).abs() < 0.5,
+        "case {case:?}: {SUCCESS} must carry one observation per completed issuance \
+         ({expected}), got {observations} from {successes:?}"
+    );
+
+    let times = datapoints(
+        &emulator,
+        case,
+        TIME,
+        &arn,
+        start,
+        end,
+        &["SampleCount", "Average"],
+    )
+    .await;
+    let timed = total(&times, "SampleCount");
+    assert!(
+        (timed - expected).abs() < 0.5,
+        "case {case:?}: {TIME} must carry one observation per completed issuance ({expected}), \
+         got {timed} from {times:?}"
+    );
+    let average = largest(&times, "Average");
+    assert!(
+        average > 0.0,
+        "case {case:?}: {TIME} must observe a positive latency, got {average} from {times:?}"
+    );
+
+    for (metric, points, unit) in [
+        (SUCCESS, &successes, "Count"),
+        (TIME, &times, "Milliseconds"),
+    ] {
+        for point in points {
+            assert_eq!(
+                point.get("Unit").and_then(Value::as_str),
+                Some(unit),
+                "case {case:?}: {metric} must be reported in {unit}, got {point:?}"
+            );
+        }
+    }
+
+    // The refused request is accounted for nowhere: neither under the ARN it named, which
+    // is no CA, nor as a failure of the CA that served the others.
+    for metric in [SUCCESS, FAILURE, TIME] {
+        let listed = filtered_series(&emulator, "a CA that does not exist", metric, &unknown).await;
+        assert!(
+            listed.is_empty(),
+            "a request refused for naming no CA must publish no {metric} series for \
+             {unknown}, got {listed:?}"
+        );
+    }
+    let failures = filtered_series(&emulator, case, FAILURE, &arn).await;
+    assert!(
+        failures.is_empty(),
+        "case {case:?}: a request refused before the CA takes it on must publish no \
+         {FAILURE} series for {arn}, got {failures:?}"
+    );
+}
+
+/// RULE (read from the other side): a series belongs to the CA its dimension names, so a
+/// listing narrowed to one CA's dimension reports that CA's series and only that one, and the
+/// volume read under it is that CA's own.
+#[tokio::test]
+async fn one_cas_series_are_found_by_its_own_dimension() {
+    let emulator = Emulator::with_cloudwatch();
+    let opened = now_secs();
+    // (case, the subject of the CA, how many issuance requests it is asked to complete)
+    let rows: Vec<(&str, &str, usize)> = vec![
+        ("a CA that completed one issuance", "one-served-root", 1),
+        ("a CA that completed three", "three-served-root", 3),
+    ];
+
+    // (the case, the CA it ran against, how many issuances that CA completed)
+    let mut served: Vec<(&str, String, f64)> = Vec::new();
+    for (case, common_name, requests) in rows {
+        let arn = root_ca_valid_for(
+            &emulator,
+            case,
+            common_name,
+            json!({"Type": "YEARS", "Value": 10}),
+        )
+        .await;
+        let mut completed = 0.0;
+        for index in 0..requests {
+            emulator
+                .ok(case, "IssueCertificate", &kind_request(&arn, index, None))
+                .await;
+            completed += 1.0;
+        }
+        served.push((case, arn, completed));
+    }
+
+    let start = opened - WINDOW_SECS;
+    let end = now_secs() + WINDOW_SECS;
+
+    for (case, arn, completed) in &served {
+        for metric in [SUCCESS, TIME] {
+            let listed = filtered_series(&emulator, case, metric, arn).await;
+            assert_eq!(
+                listed.len(),
+                1,
+                "case {case:?}: expected exactly one {metric} series under the dimension \
+                 naming {arn}, got {listed:?}"
+            );
+            let series = &listed[0];
+            assert_eq!(
+                series.get("Namespace").and_then(Value::as_str),
+                Some(NAMESPACE),
+                "case {case:?}: expected the {metric} series of {arn} in {NAMESPACE}, got \
+                 {series:?}"
+            );
+            assert_eq!(
+                series.get("MetricName").and_then(Value::as_str),
+                Some(metric),
+                "case {case:?}: expected the listed series to be {metric}, got {series:?}"
+            );
+            let dimensions = series["Dimensions"].as_array().cloned().unwrap_or_default();
+            assert_eq!(
+                dimensions,
+                vec![json!({"Name": CA_DIMENSION, "Value": arn})],
+                "case {case:?}: expected the {metric} series to carry the one dimension \
+                 naming {arn}, got {dimensions:?}"
+            );
+        }
+
+        let successes = datapoints(&emulator, case, SUCCESS, arn, start, end, &["Sum"]).await;
+        let counted = total(&successes, "Sum");
+        assert!(
+            (counted - completed).abs() < 0.5,
+            "case {case:?}: {SUCCESS} for {arn} must sum to the {completed} issuances that CA \
+             completed, got {counted} from {successes:?}"
         );
     }
 }
