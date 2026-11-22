@@ -22,9 +22,10 @@
 //!    assigning a variable again and by leaving the state machine that assigned it, so
 //!    an `Assign` past the bound fails with `States.DataLimitExceeded` while the same
 //!    bytes assigned over and over do not;
-//! 3. a `Map` state's `MaxConcurrency` is held to the range the member carries at RUN
-//!    time: the largest figure it carries runs, and a figure past it fails the execution
-//!    with `States.Runtime`;
+//! 3. a `Map` state's concurrency is held to the range the member carries where the
+//!    state RESOLVES it as it runs, so a path resolving past that range fails the
+//!    execution with `States.Runtime`, while a bound the definition STATES past it runs
+//!    under the largest figure the member carries;
 //! 4. a retrier's wait is the whole seconds of the figure its own members compute, so a
 //!    computed 7.5 seconds is waited as 7 — asserted through `TestState`, which reports
 //!    the interval a retriable state owes without anything waiting for it;
@@ -615,9 +616,10 @@ struct ConcurrencyRow {
     error: Option<&'static str>,
 }
 
-/// A `Map` state's `MaxConcurrency` is held to the range the member carries at RUN
-/// time: the published bounds run, and a figure past the largest one fails the
-/// execution with `States.Runtime`.
+/// A `Map` state's concurrency is held to the range the member carries where the state
+/// RESOLVES it as it runs: the published bounds run, a path resolving past the largest
+/// one fails the execution with `States.Runtime`, and a bound the definition STATES past
+/// it runs under that largest figure.
 #[tokio::test]
 async fn a_map_states_concurrency_is_held_to_the_range_the_member_carries() {
     let rows: Vec<ConcurrencyRow> = vec![
@@ -643,18 +645,18 @@ async fn a_map_states_concurrency_is_held_to_the_range_the_member_carries() {
             error: None,
         },
         ConcurrencyRow {
-            case: "one past the largest figure the member carries",
+            case: "a declared figure one past the largest the member carries",
             declared: json!({ "MaxConcurrency": MAX_MAP_CONCURRENCY + 1 }),
             input: r#"{"items":[1,2]}"#.to_string(),
-            status: "FAILED",
-            error: Some(RUNTIME_ERROR),
+            status: "SUCCEEDED",
+            error: None,
         },
         ConcurrencyRow {
-            case: "a figure far past it",
+            case: "a declared figure far past it",
             declared: json!({ "MaxConcurrency": 1_000_000_000_000_i64 }),
             input: r#"{"items":[1,2]}"#.to_string(),
-            status: "FAILED",
-            error: Some(RUNTIME_ERROR),
+            status: "SUCCEEDED",
+            error: None,
         },
         ConcurrencyRow {
             case: "a path resolving to the largest figure the member carries",

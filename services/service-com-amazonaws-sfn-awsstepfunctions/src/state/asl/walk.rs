@@ -3040,16 +3040,31 @@ impl Interpreter<'_> {
         // hands each iteration a BATCH of its items rather than one item, and the
         // `ItemSelector` is applied to each item on the way into its batch.
         let batcher = state.get("ItemBatcher");
-        let concurrency = self
+        let resolved = self
             .number_member(state, language, "MaxConcurrency", &effective, context, 0.0)
             .map_err(|failure| failure.at(at))?;
-        // The figure is held to the range the member carries BEFORE the state runs
-        // under it: a `MaxConcurrency` past that range names no bound an iteration
-        // count could ever be, so the state fails for it rather than running under a
-        // bound the definition did not write ([`MAX_MAP_CONCURRENCY`]). The member the
-        // definition wrote is the one the diagnosis names, as everywhere else the two
-        // forms are alternatives.
-        if concurrency > MAX_MAP_CONCURRENCY as f64 || concurrency.fract() != 0.0 {
+        // "MaxConcurrency ... an upper bound on how many invocations of the Iterator may
+        // run in parallel": a bound the DEFINITION states as a whole number is one the
+        // definition was accepted under, and a whole number past the largest concurrency
+        // a run can have ([`MAX_MAP_CONCURRENCY`], the range a Map Run reports its own
+        // through) bounds the iterations in flight no more tightly than that largest
+        // figure does — so the state RUNS, under that ceiling, which is the bound a
+        // definition naming a figure no item count reaches asked for.
+        //
+        // The range is a RUN-TIME test for a figure the state resolves as it runs
+        // instead: a `MaxConcurrencyPath` into the execution's data, or an expression
+        // computing one, carries whatever that run produced, which no definition could
+        // be held to, so a value outside the range names no bound this state can be run
+        // under and the state fails for it. The same holds for a figure that is not a
+        // whole number, which is no iteration count either way. The member the definition
+        // wrote is the one the diagnosis names, as everywhere else the two forms are
+        // alternatives.
+        let ceiling = MAX_MAP_CONCURRENCY as f64;
+        let stated_whole = state.get("MaxConcurrency").is_some_and(Value::is_number)
+            && resolved.fract() == 0.0;
+        let concurrency = if stated_whole {
+            resolved.min(ceiling)
+        } else if resolved > ceiling || resolved.fract() != 0.0 {
             let wrote = match state.contains_key("MaxConcurrency") {
                 true => "MaxConcurrency",
                 false => "MaxConcurrencyPath",
@@ -3057,10 +3072,15 @@ impl Interpreter<'_> {
             return Err(runtime(referenced_value_must_be(
                 wrote,
                 &bounded_concurrency(),
-                &json!(concurrency),
+                // The figure as the value it was READ as: a whole number resolved into a
+                // member that carries whole numbers is stated as the whole number it is,
+                // and not as a fraction of one.
+                &intrinsics::json_number(resolved),
             ))
             .at(at));
-        }
+        } else {
+            resolved
+        };
         let concurrency = concurrency as usize;
         let tolerated_count = self
             .number_member(

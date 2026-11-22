@@ -641,13 +641,15 @@ pub(super) const NON_NEGATIVE_NUMBER: &str = "a non-negative number";
 
 /// The largest `MaxConcurrency` a `Map` state can run under: the member is an `int32`
 /// on the wire — `MaxConcurrency` (range 0..), the field a Map Run reports its own
-/// concurrency through — so a figure past it names no bound the state could be run
-/// under.
+/// concurrency through — so a figure past it bounds the iterations in flight no more
+/// tightly than this one does. A bound the definition STATES past it is run under this
+/// ceiling; a figure resolved past it as the state runs names no bound the state can be
+/// run under at all.
 pub const MAX_MAP_CONCURRENCY: i64 = i32::MAX as i64;
 
-/// What a `Map` state's `MaxConcurrency` must carry: "an upper bound on how many
-/// invocations of the Iterator may run in parallel", inside the range the member
-/// carries ([`MAX_MAP_CONCURRENCY`]).
+/// What a `Map` state's `MaxConcurrency` must carry where the state RESOLVES it as it
+/// runs: "an upper bound on how many invocations of the Iterator may run in parallel",
+/// inside the range the member carries ([`MAX_MAP_CONCURRENCY`]).
 pub(super) fn bounded_concurrency() -> String {
     format!("a whole number from 0 to {MAX_MAP_CONCURRENCY}")
 }

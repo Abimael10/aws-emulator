@@ -559,8 +559,9 @@ pub(super) fn apply_intrinsic(
     }
 }
 
-/// A number an intrinsic computed, as the JSON value the wire carries: a whole
-/// result is a whole number, which is what the service's own intrinsics return.
+/// A number this walk computed or read, as the JSON value the wire carries: a whole
+/// result is a whole number, which is what the service's own intrinsics return and how
+/// a diagnosis stating the figure a member carried states it.
 pub(super) fn json_number(value: f64) -> Value {
     if value.fract() == 0.0 && value.abs() < 9_007_199_254_740_992.0 {
         return json!(value as i64);
