@@ -347,7 +347,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 ///
 /// The update is a PATCH (`PATCH /v2/apis/{ApiId}/authorizers/{AuthorizerId}`): a member the
 /// request carries replaces the stored one, and a member it omits leaves the stored value
-/// exactly as it was. A list member is a VALUE like any other, so an `IdentitySource` the
+/// exactly as it was. An OPTIONAL string member carried EMPTY describes no value to store:
+/// it asks for the stored one to be REMOVED, so no later reader reports it
+/// ([`crate::state::cleared_by_empty`]) — and the merged record is weighed below, so a clear
+/// that would leave an authorizer without a member its type needs is refused there. A list
+/// member is a VALUE like any other, so an `IdentitySource` the
 /// request carries replaces the stored list wholesale. Nothing here is defaulted: a default
 /// belongs to the create, and applying one again would silently undo a value a later
 /// `GetAuthorizer` reports.
@@ -367,13 +371,13 @@ fn patched(
         updated.authorizer_type = authorizer_type;
     }
     if let Some(authorizer_uri) = input.authorizer_uri.clone() {
-        updated.authorizer_uri = Some(authorizer_uri);
+        updated.authorizer_uri = crate::state::cleared_by_empty(authorizer_uri);
     }
     if let Some(credentials_arn) = input.authorizer_credentials_arn.clone() {
-        updated.authorizer_credentials_arn = Some(credentials_arn);
+        updated.authorizer_credentials_arn = crate::state::cleared_by_empty(credentials_arn);
     }
     if let Some(version) = input.authorizer_payload_format_version.clone() {
-        updated.authorizer_payload_format_version = Some(version);
+        updated.authorizer_payload_format_version = crate::state::cleared_by_empty(version);
     }
     if let Some(ttl) = input.authorizer_result_ttl_in_seconds {
         updated.authorizer_result_ttl_in_seconds = Some(ttl);
@@ -385,7 +389,7 @@ fn patched(
         updated.identity_source = identity_source;
     }
     if let Some(expression) = input.identity_validation_expression.clone() {
-        updated.identity_validation_expression = Some(expression);
+        updated.identity_validation_expression = crate::state::cleared_by_empty(expression);
     }
     if let Some(jwt_configuration) = input.jwt_configuration.clone() {
         updated.jwt_configuration = Some(jwt_configuration);

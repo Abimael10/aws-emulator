@@ -274,8 +274,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The update is a PATCH (`PATCH /v2/apis/{ApiId}/stages/{StageName}`): a member
         // the request carries replaces the stored one, and a member it omits leaves the
-        // stored value exactly as it was. A map member is a VALUE like any other, so one
-        // the request carries replaces the stored map wholesale. Nothing here is
+        // stored value exactly as it was. An OPTIONAL string member carried EMPTY
+        // describes no value to store: it asks for the stored one to be REMOVED, so no
+        // later reader reports it ([`crate::state::cleared_by_empty`]). A map member is a
+        // VALUE like any other, so one the request carries replaces the stored map
+        // wholesale. Nothing here is
         // defaulted: a default belongs to the create, and applying one again would
         // silently undo a value a later caller can still see through `GetStage`. The
         // members a stage never takes from a request — the name it is keyed by, its
@@ -283,13 +286,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over by the clone.
         let mut updated = existing.clone();
         if let Some(description) = input.description {
-            updated.description = Some(description);
+            updated.description = crate::state::cleared_by_empty(description);
         }
         if let Some(auto_deploy) = input.auto_deploy {
             updated.auto_deploy = Some(auto_deploy);
         }
         if let Some(client_certificate_id) = input.client_certificate_id {
-            updated.client_certificate_id = Some(client_certificate_id);
+            updated.client_certificate_id = crate::state::cleared_by_empty(client_certificate_id);
         }
         if let Some(settings) = input.access_log_settings {
             updated.access_log_settings = Some(settings);
@@ -318,7 +321,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
             // The stage serves ONE deployment of its own api: a `DeploymentId` naming no
-            // deployment of this api names a resource that is not there.
+            // deployment of this api names a resource that is not there — which an empty
+            // one does not either, so it is refused rather than read as a clear.
             if !api.deployments.contains_key(&deployment_id) {
                 return Err(UpdateStageErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::invalid_identifier_message(

@@ -765,3 +765,68 @@ async fn a_patch_that_leaves_a_stage_auto_deploying_releases_a_deployment_the_se
         "case {case:?}: exactly one deployment must have been released, got {deployments}"
     );
 }
+
+#[tokio::test]
+async fn an_optional_member_carried_empty_is_removed_from_the_stage() {
+    let emulator = emulator();
+
+    // The stage's own OPTIONAL string members: its description, and the client certificate
+    // it presents to its backends. Both are members a stage may simply not have. The api is
+    // a WebSocket one, because `ClientCertificateId` is supported only for those.
+    let rows = [
+        ("description", "re-described after the clear"),
+        ("clientCertificateId", "cert5678cd"),
+    ];
+
+    for (index, (member, restored)) in rows.into_iter().enumerate() {
+        let api_id = create_api(
+            &emulator,
+            member,
+            &websocket_api(&format!("stage-clear-{index}")),
+        )
+        .await;
+        create_route(&emulator, member, &api_id, "$connect").await;
+        let deployment_id = create_deployment(&emulator, member, &api_id).await;
+        let stage_name = create_stage(&emulator, member, &api_id, &base_stage(&deployment_id)).await;
+        let (_, created) = get_stage(&emulator, &api_id, &stage_name).await;
+        assert!(
+            created.get(member).is_some(),
+            "case {member:?}: the created stage must carry the member, got {created}"
+        );
+
+        let (status, cleared) =
+            update_stage(&emulator, &api_id, &stage_name, &json!({ member: "" })).await;
+        assert_eq!(
+            status, 200,
+            "case {member:?}: expected 200 from UpdateStage, got {status} {cleared}"
+        );
+        assert_eq!(
+            cleared.get(member),
+            None,
+            "case {member:?}: expected the cleared member to be absent, got {cleared}"
+        );
+        let (status, fetched) = get_stage(&emulator, &api_id, &stage_name).await;
+        assert_eq!(
+            status, 200,
+            "case {member:?}: expected 200 from GetStage, got {status} {fetched}"
+        );
+        assert_eq!(
+            fetched.get(member),
+            None,
+            "case {member:?}: expected GetStage to report no such member, got {fetched}"
+        );
+
+        let (status, patched) =
+            update_stage(&emulator, &api_id, &stage_name, &json!({ member: restored })).await;
+        assert_eq!(
+            status, 200,
+            "case {member:?}: expected 200 re-setting the member, got {status} {patched}"
+        );
+        let (_, read_back) = get_stage(&emulator, &api_id, &stage_name).await;
+        assert_eq!(
+            read_back.get(member).and_then(Value::as_str),
+            Some(restored),
+            "case {member:?}: expected GetStage to report the patched value, got {read_back}"
+        );
+    }
+}

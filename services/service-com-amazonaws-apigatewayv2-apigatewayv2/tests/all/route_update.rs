@@ -6,7 +6,10 @@
 //!
 //! * `PATCH /v2/apis/{ApiId}/routes/{RouteId}` is a patch of the STORED route: a member
 //!   the request carries replaces the stored value, a member it omits leaves the stored
-//!   value as it was, and what the call reports is what a later `GetRoute` reports.
+//!   value as it was, and what the call reports is what a later `GetRoute` reports. An
+//!   OPTIONAL string member carried EMPTY is the one exception to "replaces": it asks for
+//!   the stored member to be REMOVED, so neither the patch's answer nor any later read
+//!   reports it.
 //! * A route whose `AuthorizationType` hands the decision to an `Authorizer` resource
 //!   (`CUSTOM` or `JWT`) must be associated with one — `Route$AuthorizerId` is what
 //!   names it — so a request that leaves the merged record without one is refused with
@@ -889,5 +892,171 @@ async fn update_route_on_an_api_or_route_the_store_does_not_hold_is_not_found() 
     assert!(
         fetched.get("operationName").is_none(),
         "a refused UpdateRoute must store nothing, got {fetched}"
+    );
+}
+
+/// One row of the clear table: the member's wire name, the value the route is created
+/// with, and the value it is patched to after being cleared.
+struct ClearRow {
+    member: &'static str,
+    created: String,
+    restored: String,
+}
+
+/// The route's OPTIONAL string members — every one `UpdateRoute` takes that a route may
+/// simply not have — each with values of its own kind: a reference to a sibling resource,
+/// an identifier, a plain name, and a selection expression.
+fn clear_rows(integration_id: &str, other_integration_id: &str, authorizer_id: &str) -> Vec<ClearRow> {
+    vec![
+        ClearRow {
+            member: "operationName",
+            created: "sendMessage".to_string(),
+            restored: "renamedOperation".to_string(),
+        },
+        ClearRow {
+            member: "target",
+            created: format!("integrations/{integration_id}"),
+            restored: format!("integrations/{other_integration_id}"),
+        },
+        ClearRow {
+            member: "authorizerId",
+            created: authorizer_id.to_string(),
+            restored: authorizer_id.to_string(),
+        },
+        ClearRow {
+            member: "modelSelectionExpression",
+            created: "$request.body.action".to_string(),
+            restored: "$request.body.type".to_string(),
+        },
+        ClearRow {
+            member: "routeResponseSelectionExpression",
+            created: "$default".to_string(),
+            restored: "$disconnect".to_string(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_optional_member_carried_empty_is_removed_from_the_route() {
+    let emulator = emulator();
+
+    // A WebSocket api, because two of the members are "Supported only for WebSocket
+    // APIs"; the rest are accepted on a route of either protocol.
+    let api_id = create_api(&emulator, "route clears", &websocket_api("route-clear")).await;
+    let authorizer_id = create_authorizer(&emulator, "route clears", &api_id, "WEBSOCKET").await;
+    let integration_id = create_integration(&emulator, "route clears", &api_id).await;
+    let other_integration_id = create_integration(&emulator, "route clears", &api_id).await;
+
+    for (index, row) in clear_rows(&integration_id, &other_integration_id, &authorizer_id)
+        .into_iter()
+        .enumerate()
+    {
+        let member = row.member;
+        // (1) One route per row, carrying the member this row clears. Its authorization is
+        // open, so a cleared `AuthorizerId` leaves a record that holds together.
+        let route_id = create_route(
+            &emulator,
+            member,
+            &api_id,
+            &json!({
+                "routeKey": format!("clear-{index}"),
+                "authorizationType": "NONE",
+                member: row.created
+            }),
+        )
+        .await;
+        let (_, created) = get_route(&emulator, &api_id, &route_id).await;
+        assert_eq!(
+            created.get(member).and_then(Value::as_str),
+            Some(row.created.as_str()),
+            "case {member:?}: the created route must carry the member, got {created}"
+        );
+
+        // (2) The empty string clears it: the patch's own answer reports no such member.
+        let (status, cleared) =
+            update_route(&emulator, &api_id, &route_id, &json!({ member: "" })).await;
+        assert_eq!(
+            status, 201,
+            "case {member:?}: expected 201 from UpdateRoute clearing the member, got {status} {cleared}"
+        );
+        assert_eq!(
+            cleared.get(member),
+            None,
+            "case {member:?}: expected the cleared member to be absent, got {cleared}"
+        );
+
+        // (3) And the write is what a later reader sees — not an empty value, and not the
+        // value it had.
+        let (status, fetched) = get_route(&emulator, &api_id, &route_id).await;
+        assert_eq!(
+            status, 200,
+            "case {member:?}: expected 200 from GetRoute, got {status} {fetched}"
+        );
+        assert_eq!(
+            fetched.get(member),
+            None,
+            "case {member:?}: expected GetRoute to report no such member, got {fetched}"
+        );
+
+        // (4) Clearing again changes nothing, so the rule is idempotent.
+        let (status, again) =
+            update_route(&emulator, &api_id, &route_id, &json!({ member: "" })).await;
+        assert_eq!(
+            status, 201,
+            "case {member:?}: expected 201 clearing an already cleared member, got {status} {again}"
+        );
+        assert_eq!(
+            again, fetched,
+            "case {member:?}: expected a second clear to leave the route as it was; expected {fetched}, got {again}"
+        );
+
+        // (5) A value sent afterwards is stored as written.
+        let (status, restored) =
+            update_route(&emulator, &api_id, &route_id, &json!({ member: row.restored })).await;
+        assert_eq!(
+            status, 201,
+            "case {member:?}: expected 201 re-setting the member, got {status} {restored}"
+        );
+        let (_, read_back) = get_route(&emulator, &api_id, &route_id).await;
+        assert_eq!(
+            read_back.get(member).and_then(Value::as_str),
+            Some(row.restored.as_str()),
+            "case {member:?}: expected GetRoute to report the patched value, got {read_back}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_required_route_member_carried_empty_is_refused_rather_than_cleared() {
+    let emulator = emulator();
+
+    // `RouteKey` is a member every route reports (`Route$RouteKey`) — it is what the api
+    // selects the route by — so an empty one is no clear: it is refused with nothing
+    // written.
+    let api_id = create_api(&emulator, "required member", &http_api("route-required")).await;
+    let route_id = create_route(
+        &emulator,
+        "required member",
+        &api_id,
+        &json!({ "routeKey": "GET /kept" }),
+    )
+    .await;
+    let (_, before) = get_route(&emulator, &api_id, &route_id).await;
+
+    let (status, refused) =
+        update_route(&emulator, &api_id, &route_id, &json!({ "routeKey": "" })).await;
+    assert_eq!(
+        status, 400,
+        "expected 400 from UpdateRoute with an empty RouteKey, got {status} {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "BadRequestException",
+        "expected BadRequestException, got {refused}"
+    );
+    let (_, after) = get_route(&emulator, &api_id, &route_id).await;
+    assert_eq!(
+        after, before,
+        "a refused UpdateRoute must leave the route as it was; expected {before}, got {after}"
     );
 }

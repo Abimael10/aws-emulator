@@ -4,9 +4,9 @@
 //! IMPLEMENTED: patches the members the request names onto the [`crate::state::Api`]
 //! its `ApiId` names — refusing the `ProtocolType`-restricted ones on an api of another
 //! protocol, and a CORS document the api could never serve — and reports the stored
-//! record back. A string member whose shape admits no empty value is CLEARED when the
-//! request carries it empty ([`cleared_by_empty`]). This is the ONLY file to touch for
-//! this operation.
+//! record back. An OPTIONAL string member is CLEARED when the request carries it empty
+//! ([`crate::state::cleared_by_empty`]). This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -249,7 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A `Target` that patches the integration quick create minted names ONE of the two
         // backends it proxies to, on a patch as on a create
-        // ([`crate::state::target_selects_a_proxy`]).
+        // ([`crate::state::target_selects_a_proxy`]). An EMPTY one is no exception: "You
+        // can update a quick-created target, but you can't remove it from an API"
+        // (`UpdateApi$Target`), so it is refused rather than read as a clear.
         if protocol_type == crate::state::HTTP_PROTOCOL_TYPE
             && input
                 .target
@@ -264,12 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documented length on an api a later reader reports back. Checked BEFORE
         // anything is written, so a refused patch leaves the api exactly as it was.
         //
-        // A member whose shape admits NO empty value is the exception: carried empty, it
-        // describes no value to hold to a window at all — it asks for the stored one to be
-        // removed ([`cleared_by_empty`]). `Name` is one such member and is NOT cleared
-        // either, because the modelled `Api` requires one, so the empty string stays
-        // outside its window there; `Description` admits the empty string, so an empty one
-        // is a value and is stored as written.
+        // An OPTIONAL member is the exception: carried empty, it describes no value to
+        // hold to a window at all — it asks for the stored one to be removed
+        // ([`crate::state::cleared_by_empty`]). `Name` is NOT one of them, because the
+        // modelled `Api` always reports one, so the empty string stays outside its window
+        // there and the patch is refused.
         for (member, value, window, clearable) in [
             (
                 "Name",
@@ -281,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "Description",
                 input.description.as_deref(),
                 crate::state::API_DESCRIPTION_LEN,
-                false,
+                true,
             ),
             (
                 "Version",
@@ -306,10 +307,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.name = name;
         }
         if let Some(description) = input.description {
-            updated.description = Some(description);
+            updated.description = crate::state::cleared_by_empty(description);
         }
         if let Some(version) = input.version {
-            updated.version = cleared_by_empty(version);
+            updated.version = crate::state::cleared_by_empty(version);
         }
         if let Some(expression) = input.route_selection_expression {
             updated.route_selection_expression = expression;
@@ -408,7 +409,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
             if let Some(credentials_arn) = input.credentials_arn {
-                integration.credentials_arn = Some(credentials_arn);
+                // "To use resource-based permissions on supported AWS services, don't
+                // specify this parameter" (`UpdateApi$CredentialsArn`): an integration may
+                // carry no credentials at all, so an empty one clears the stored ARN.
+                integration.credentials_arn = crate::state::cleared_by_empty(credentials_arn);
             }
         }
 
@@ -497,19 +501,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             warnings: stored.warnings,
         })
     }
-}
-
-/// What a patch stores for a string member whose shape admits NO empty value.
-///
-/// Such a member sent EMPTY asks for the stored one to be REMOVED rather than rewritten:
-/// `UpdateApi$Version` targets `StringWithLengthBetween1And64`, which has no empty value at
-/// all, so a request carrying one describes an api that carries the member no longer and no
-/// reader reports a value the shape cannot hold. Any other value replaces the stored one as
-/// written. A member whose shape DOES admit the empty string (`UpdateApi$Description`,
-/// `StringWithLengthBetween0And1024`) is not read this way — there the empty string is a
-/// value, and it is stored.
-fn cleared_by_empty(value: String) -> Option<String> {
-    (!value.is_empty()).then_some(value)
 }
 
 /// This operation's refusal of a request it models no more specific error for: the

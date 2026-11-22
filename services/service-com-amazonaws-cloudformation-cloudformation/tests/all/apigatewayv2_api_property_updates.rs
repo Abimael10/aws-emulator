@@ -182,7 +182,9 @@ struct UpdateCase {
     /// The properties the revision declares.
     revised: Value,
     /// What API Gateway v2 must report for the api once the revision is deployed, as
-    /// `(dotted member path, value)` pairs.
+    /// `(dotted member path, value)` pairs. A `Value::Null` expectation is a member the api
+    /// must report NOT AT ALL: an update that states an optional string member EMPTY asks
+    /// that service to remove it, so the api carries no such member afterwards.
     expected: Vec<(&'static str, Value)>,
 }
 
@@ -217,7 +219,9 @@ fn update_cases() -> Vec<UpdateCase> {
             expected: vec![("description", json!("added by the revision"))],
         },
         UpdateCase {
-            case: "a description emptied, which that shape admits",
+            // API Gateway v2 reads an optional string member stated EMPTY as a request to
+            // remove it, so the api reports no description once the revision is deployed.
+            case: "a description emptied, which that service reads as a clear",
             stack: "apigwv2-inplace-emptied",
             created: json!({
                 "Name": "apigwv2-inplace-emptied-api",
@@ -229,7 +233,11 @@ fn update_cases() -> Vec<UpdateCase> {
                 "ProtocolType": HTTP,
                 "Description": "",
             }),
-            expected: vec![("description", json!(""))],
+            expected: vec![
+                ("description", Value::Null),
+                // The rest of the api is left as it was, so the clear is the only change.
+                ("name", json!("apigwv2-inplace-emptied-api")),
+            ],
         },
         UpdateCase {
             case: "two properties at once, one of them new",
@@ -392,13 +400,14 @@ async fn a_changed_api_property_is_applied_to_the_api_the_stack_already_has() {
              {after:?}"
         );
 
-        // ...and API Gateway v2 really holds the declared configuration.
+        // ...and API Gateway v2 really holds the declared configuration. A `Null`
+        // expectation is a member that service must report not at all.
         let held = held_api(&router, case, &api_id).await;
         for (path, value) in &expected {
             let found = held_member(&held, path);
+            let reported = found.clone().unwrap_or(Value::Null);
             assert_eq!(
-                found.as_ref(),
-                Some(value),
+                &reported, value,
                 "case {case:?}: expected API Gateway v2 to hold {path}={value}, got {found:?} \
                  (api {held})"
             );

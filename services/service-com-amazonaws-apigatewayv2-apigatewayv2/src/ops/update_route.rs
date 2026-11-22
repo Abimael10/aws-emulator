@@ -259,12 +259,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The update is a PATCH (`PATCH /v2/apis/{ApiId}/routes/{RouteId}`): a member
         // the request carries replaces the stored one, and a member it omits leaves the
-        // stored value exactly as it was. A map or list member is a VALUE like any
-        // other, so one the request carries replaces the stored map wholesale; removing
-        // a single request parameter without resending the rest is what
-        // `DeleteRouteRequestParameter` is for. Nothing here is defaulted: a default
-        // belongs to the create, and applying one again would silently undo a value a
-        // later caller can still see through `GetRoute`.
+        // stored value exactly as it was. An OPTIONAL string member carried EMPTY
+        // describes no value to store: it asks for the stored one to be REMOVED, so no
+        // later reader reports it ([`crate::state::cleared_by_empty`]). A map or list
+        // member is a VALUE like any other, so one the request carries replaces the
+        // stored map wholesale; removing a single request parameter without resending the
+        // rest is what `DeleteRouteRequestParameter` is for. Nothing here is defaulted: a
+        // default belongs to the create, and applying one again would silently undo a
+        // value a later caller can still see through `GetRoute`.
         let mut updated = existing.clone();
         if let Some(route_key) = input.route_key {
             // The `RouteKey` of a route API Gateway manages is patched like any other
@@ -285,28 +287,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.route_key = crate::state::normalized_route_key(&api.protocol_type, &route_key);
         }
         if let Some(target) = input.target {
-            updated.target = Some(target);
+            updated.target = crate::state::cleared_by_empty(target);
         }
         if let Some(authorization_type) = input.authorization_type {
             updated.authorization_type = authorization_type;
         }
         if let Some(authorizer_id) = input.authorizer_id {
-            updated.authorizer_id = Some(authorizer_id);
+            updated.authorizer_id = crate::state::cleared_by_empty(authorizer_id);
         }
         if let Some(api_key_required) = input.api_key_required {
             updated.api_key_required = api_key_required;
         }
         if let Some(operation_name) = input.operation_name {
-            updated.operation_name = Some(operation_name);
+            updated.operation_name = crate::state::cleared_by_empty(operation_name);
         }
         if let Some(authorization_scopes) = input.authorization_scopes {
             updated.authorization_scopes = authorization_scopes;
         }
         if let Some(expression) = input.model_selection_expression {
-            updated.model_selection_expression = Some(expression);
+            updated.model_selection_expression = crate::state::cleared_by_empty(expression);
         }
         if let Some(expression) = input.route_response_selection_expression {
-            updated.route_response_selection_expression = Some(expression);
+            updated.route_response_selection_expression =
+                crate::state::cleared_by_empty(expression);
         }
         if let Some(request_models) = input.request_models {
             updated.request_models = request_models.into_iter().collect();

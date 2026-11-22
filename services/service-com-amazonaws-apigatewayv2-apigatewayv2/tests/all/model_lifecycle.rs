@@ -700,7 +700,8 @@ struct PatchRow {
 
 /// The rows the patch rule is asserted over: they differ along WHICH member the patch
 /// carries (each of `Name`, `ContentType`, `Description`, `Schema`, several at once, and
-/// none at all), whether that member was already set, and the value's own shape.
+/// none at all), whether that member was already set, and the value's own shape — the empty
+/// string included, which asks for an optional member to be REMOVED rather than rewritten.
 fn patch_rows() -> Vec<PatchRow> {
     vec![
         PatchRow {
@@ -757,10 +758,10 @@ fn patch_rows() -> Vec<PatchRow> {
             ],
         },
         PatchRow {
-            case: "a description emptied to the shortest its bound allows",
+            case: "a description cleared with the empty string, which removes the member",
             patch: json!({ "description": "" }),
             expected: vec![
-                ("description", Some(json!(""))),
+                ("description", None),
                 ("contentType", Some(json!("application/xml"))),
             ],
         },
@@ -768,13 +769,33 @@ fn patch_rows() -> Vec<PatchRow> {
             case: "a patch that carries no member at all, which changes nothing",
             patch: json!({}),
             expected: vec![
-                ("description", Some(json!(""))),
+                ("description", None),
                 ("name", Some(json!("Renamed"))),
                 ("contentType", Some(json!("application/xml"))),
                 (
                     "schema",
                     Some(json!("<xs:schema><xs:element name=\"order\"/></xs:schema>")),
                 ),
+            ],
+        },
+        PatchRow {
+            // The content type and the schema are weighed as the PAIR the patch would
+            // leave behind, so the clear travels with a schema the model may carry
+            // without one.
+            case: "a content type cleared with the empty string",
+            patch: json!({ "contentType": "", "schema": "{}" }),
+            expected: vec![
+                ("contentType", None),
+                ("schema", Some(json!("{}"))),
+                ("name", Some(json!("Renamed"))),
+            ],
+        },
+        PatchRow {
+            case: "a description set again after the clear",
+            patch: json!({ "description": "described once more" }),
+            expected: vec![
+                ("description", Some(json!("described once more"))),
+                ("contentType", None),
             ],
         },
     ]

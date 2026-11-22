@@ -214,16 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The update is a PATCH
         // (`PATCH /v2/apis/{ApiId}/routes/{RouteId}/routeresponses/{RouteResponseId}`): a
         // member the request carries replaces the stored one, and a member it omits
-        // leaves the stored value exactly as it was. A map member is a VALUE like any
-        // other, so one the request carries replaces the stored map wholesale — including
-        // a map sent empty, which clears it. The `RouteResponseId` is the resource's
-        // identity and is never patched.
+        // leaves the stored value exactly as it was. An OPTIONAL string member carried
+        // EMPTY describes no value to store: it asks for the stored one to be REMOVED, so
+        // no later reader reports it ([`crate::state::cleared_by_empty`]). A map member is
+        // a VALUE like any other, so one the request carries replaces the stored map
+        // wholesale — including a map sent empty, which clears it. The `RouteResponseId`
+        // is the resource's identity and is never patched.
         let mut updated = existing.clone();
         if let Some(route_response_key) = input.route_response_key {
             updated.route_response_key = route_response_key;
         }
         if let Some(expression) = input.model_selection_expression {
-            updated.model_selection_expression = Some(expression);
+            updated.model_selection_expression = crate::state::cleared_by_empty(expression);
         }
         if let Some(response_models) = input.response_models {
             updated.response_models = response_models.into_iter().collect();

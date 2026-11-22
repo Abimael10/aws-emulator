@@ -426,7 +426,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The update is a PATCH (`PATCH /v2/apis/{ApiId}/integrations/{IntegrationId}`):
         // a member the request carries replaces the stored one, and a member it omits
-        // leaves the stored value exactly as it was. A map is a VALUE like any other, so
+        // leaves the stored value exactly as it was. An OPTIONAL string member carried
+        // EMPTY describes no value to store: it asks for the stored one to be REMOVED, so
+        // no later reader reports it ([`crate::state::cleared_by_empty`]) — and the MERGED
+        // record is then weighed below, so a clear that would leave an integration without
+        // a member its type requires is refused there. A map is a VALUE like any other, so
         // one the request carries replaces the stored map wholesale. Nothing here is
         // defaulted: a default belongs to the create, and applying one again would
         // silently undo a value a later `GetIntegration` can still report.
@@ -435,34 +439,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.integration_type = integration_type;
         }
         if let Some(integration_uri) = input.integration_uri {
-            updated.integration_uri = Some(integration_uri);
+            updated.integration_uri = crate::state::cleared_by_empty(integration_uri);
         }
         if let Some(integration_method) = input.integration_method {
-            updated.integration_method = Some(integration_method);
+            updated.integration_method = crate::state::cleared_by_empty(integration_method);
         }
         if let Some(integration_subtype) = input.integration_subtype {
-            updated.integration_subtype = Some(integration_subtype);
+            updated.integration_subtype = crate::state::cleared_by_empty(integration_subtype);
         }
         if let Some(connection_type) = input.connection_type {
             updated.connection_type = connection_type;
         }
         if let Some(connection_id) = input.connection_id {
-            updated.connection_id = Some(connection_id);
+            updated.connection_id = crate::state::cleared_by_empty(connection_id);
         }
         if let Some(strategy) = input.content_handling_strategy {
             updated.content_handling_strategy = Some(strategy);
         }
         if let Some(credentials_arn) = input.credentials_arn {
-            updated.credentials_arn = Some(credentials_arn);
+            updated.credentials_arn = crate::state::cleared_by_empty(credentials_arn);
         }
         if let Some(description) = input.description {
-            updated.description = Some(description);
+            updated.description = crate::state::cleared_by_empty(description);
         }
         if let Some(behavior) = input.passthrough_behavior {
             updated.passthrough_behavior = Some(behavior);
         }
         if let Some(version) = input.payload_format_version {
-            updated.payload_format_version = Some(version);
+            updated.payload_format_version = crate::state::cleared_by_empty(version);
         }
         if let Some(parameters) = input.request_parameters {
             updated.request_parameters = parameters.into_iter().collect();
@@ -477,7 +481,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect();
         }
         if let Some(expression) = input.template_selection_expression {
-            updated.template_selection_expression = Some(expression);
+            updated.template_selection_expression = crate::state::cleared_by_empty(expression);
         }
         if let Some(timeout_in_millis) = input.timeout_in_millis {
             updated.timeout_in_millis = timeout_in_millis;

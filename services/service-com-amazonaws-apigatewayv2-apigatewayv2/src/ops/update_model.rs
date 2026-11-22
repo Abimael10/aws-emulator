@@ -189,17 +189,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The update is a PATCH (`PATCH /v2/apis/{ApiId}/models/{ModelId}`): a member the
         // request carries replaces the stored one, and a member it omits leaves the stored
-        // value exactly as it was. The `ModelId` is the resource's identity and is never
-        // patched.
+        // value exactly as it was. An OPTIONAL string member carried EMPTY describes no
+        // value to store: it asks for the stored one to be REMOVED, so no later reader
+        // reports it ([`crate::state::cleared_by_empty`]). The `ModelId` is the resource's
+        // identity and is never patched.
         let mut updated = existing.clone();
         if let Some(name) = input.name {
             updated.name = name;
         }
         if let Some(content_type) = input.content_type {
-            updated.content_type = Some(content_type);
+            updated.content_type = crate::state::cleared_by_empty(content_type);
         }
         if let Some(description) = input.description {
-            updated.description = Some(description);
+            updated.description = crate::state::cleared_by_empty(description);
         }
         if let Some(schema) = input.schema {
             // The schema SOURCE, verbatim: every reader of the model reports the document

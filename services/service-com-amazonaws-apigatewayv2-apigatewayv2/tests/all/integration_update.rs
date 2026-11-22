@@ -11,6 +11,10 @@
 //! not hold is `NotFoundException` (404, `smithy_query(query="operation",
 //! operation="UpdateIntegration")`).
 //!
+//! An OPTIONAL string member carried EMPTY is the one exception to "replaces": it asks for
+//! the stored member to be REMOVED, so neither the patch's answer nor any later read
+//! reports it.
+//!
 //! The rows span what the rule generalises over: the member's type (string, integer,
 //! map, structure), how many members one patch names (none, one, several), the api's
 //! protocol, and which rule the merged record would break (a URI dropped from an
@@ -452,4 +456,117 @@ async fn update_integration_on_a_record_the_store_does_not_hold_is_not_found() {
         "still here",
         "the live integration must carry the patched description, got {updated}"
     );
+}
+
+/// One row of the clear table: the api to create the integration under, the integration
+/// body, the member cleared, and the value it is patched to afterwards.
+struct ClearRow {
+    case: &'static str,
+    /// `true` for an HTTP api, `false` for a WebSocket one — two of these members are
+    /// supported only on an api of one protocol.
+    http: bool,
+    integration: Value,
+    member: &'static str,
+    restored: &'static str,
+}
+
+/// The integration's OPTIONAL string members, over integrations of both protocols: a
+/// description, the ARN of the role the integration assumes, and the template selection
+/// expression a WebSocket integration selects a request template with.
+fn clear_rows() -> Vec<ClearRow> {
+    vec![
+        ClearRow {
+            case: "the description",
+            http: true,
+            integration: proxy_integration(),
+            member: "description",
+            restored: "re-described after the clear",
+        },
+        ClearRow {
+            case: "the credentials the integration assumes",
+            http: true,
+            integration: {
+                let mut integration = proxy_integration();
+                integration["credentialsArn"] = json!("arn:aws:iam::000000000000:role/apigw");
+                integration
+            },
+            member: "credentialsArn",
+            restored: "arn:aws:iam::000000000000:role/other",
+        },
+        ClearRow {
+            case: "a WebSocket integration's template selection expression",
+            http: false,
+            integration: json!({
+                "integrationType": "MOCK",
+                "templateSelectionExpression": "$request.body.action",
+                "requestTemplates": { "application/json": "{}" }
+            }),
+            member: "templateSelectionExpression",
+            restored: "$request.body.kind",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_optional_member_carried_empty_is_removed_from_the_integration() {
+    let emulator = emulator();
+
+    for (index, row) in clear_rows().into_iter().enumerate() {
+        let case = row.case;
+        let member = row.member;
+        let request = if row.http {
+            http_api(&format!("integration-clear-http-{index}"))
+        } else {
+            websocket_api(&format!("integration-clear-socket-{index}"))
+        };
+        let api_id = create_api(&emulator, case, &request).await;
+        let integration_id = create_integration(&emulator, case, &api_id, &row.integration).await;
+        let (_, created) = get_integration(&emulator, &api_id, &integration_id).await;
+        assert!(
+            created.get(member).is_some(),
+            "case {case:?}: the created integration must carry {member:?}, got {created}"
+        );
+
+        // The empty string clears it, in the patch's own answer and for every later reader.
+        let (status, cleared) =
+            update_integration(&emulator, &api_id, &integration_id, &json!({ member: "" })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from UpdateIntegration, got {status} {cleared}"
+        );
+        assert_eq!(
+            cleared.get(member),
+            None,
+            "case {case:?}: expected the cleared member to be absent, got {cleared}"
+        );
+        let (status, fetched) = get_integration(&emulator, &api_id, &integration_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetIntegration, got {status} {fetched}"
+        );
+        assert_eq!(
+            fetched.get(member),
+            None,
+            "case {case:?}: expected GetIntegration to report no such member, got {fetched}"
+        );
+
+        // And a value sent afterwards is stored as written.
+        let (status, restored) = update_integration(
+            &emulator,
+            &api_id,
+            &integration_id,
+            &json!({ member: row.restored }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 re-setting {member:?}, got {status} {restored}"
+        );
+        let (_, read_back) = get_integration(&emulator, &api_id, &integration_id).await;
+        assert_eq!(
+            read_back.get(member).and_then(Value::as_str),
+            Some(row.restored),
+            "case {case:?}: expected GetIntegration to report the patched value, got {read_back}"
+        );
+    }
 }

@@ -6,8 +6,10 @@
 //!
 //! * **`PATCH /v2/apis/{ApiId}` is a patch of the STORED api**: a member the request
 //!   carries replaces the stored one, a member it omits leaves the stored value as it
-//!   was, and what the call reports is what a later `GetApi` reports. An `ApiId` the
-//!   store does not hold — one never minted, or one a `DeleteApi` removed — is
+//!   was, and what the call reports is what a later `GetApi` reports. An OPTIONAL string
+//!   member carried EMPTY is the one exception to "replaces": it asks for the stored
+//!   member to be REMOVED, so neither the patch's answer nor any later read reports it. An
+//!   `ApiId` the store does not hold — one never minted, or one a `DeleteApi` removed — is
 //!   `NotFoundException` (404, `smithy_query(query="operation", operation="UpdateApi")`).
 //! * **A CORS configuration that allows credentialed requests cannot answer them with
 //!   the wildcard**, so such a document is refused with `BadRequestException` (400) and
@@ -71,10 +73,10 @@ async fn update_api(
 }
 
 /// The record `created` becomes once `patch` is applied: every member the patch names takes
-/// the patch's value, every other member keeps the stored one, and a member of
-/// [`CLEARED_BY_EMPTY`] sent as the EMPTY STRING is REMOVED — its shape admits no empty
-/// value, so an empty one asks for the stored member to be cleared rather than rewritten
-/// and no reader reports it afterwards. That is the patch rule itself, written once, so a
+/// the patch's value, every other member keeps the stored one, and an OPTIONAL member
+/// ([`CLEARED_BY_EMPTY`]) sent as the EMPTY STRING is REMOVED — an empty value describes no
+/// value to store, so it asks for the stored member to be cleared rather than rewritten and
+/// no reader reports it afterwards. That is the patch rule itself, written once, so a
 /// row only has to supply the patch.
 fn patched_record(created: &Value, patch: &Value) -> Value {
     let mut expected = created.clone();
@@ -91,11 +93,11 @@ fn patched_record(created: &Value, patch: &Value) -> Value {
     expected
 }
 
-/// The members of an api a patch CLEARS by carrying them empty: the ones whose shape admits
-/// no empty value (`Version` targets `StringWithLengthBetween1And64`). `Description`
-/// (`StringWithLengthBetween0And1024`) is not one of them — the empty string is a value
-/// there and is stored.
-const CLEARED_BY_EMPTY: &[&str] = &["version"];
+/// The members of an api a patch CLEARS by carrying them empty: its OPTIONAL string members,
+/// the ones an api may simply not have and whose readers report them only while they hold a
+/// value. `Name` is not one of them — every api reports one, so an empty `Name` falls outside
+/// the member's own window and the patch is refused.
+const CLEARED_BY_EMPTY: &[&str] = &["description", "version"];
 
 /// One patch row: the request body sent to `UpdateApi`.
 struct PatchRow {
@@ -132,6 +134,16 @@ fn patch_rows() -> Vec<PatchRow> {
             case: "the version cleared to the empty string",
             http: true,
             patch: json!({ "version": "" }),
+        },
+        PatchRow {
+            case: "both optional string members cleared at once, beside members that are set",
+            http: true,
+            patch: json!({
+                "description": "",
+                "version": "",
+                "name": "normalized-api",
+                "disableExecuteApiEndpoint": false
+            }),
         },
         PatchRow {
             case: "one boolean member, flipped",
@@ -199,6 +211,11 @@ fn patch_rows() -> Vec<PatchRow> {
             case: "a WebSocket api's name and description together",
             http: false,
             patch: json!({ "name": "socket-renamed", "description": "patched" }),
+        },
+        PatchRow {
+            case: "a WebSocket api's description cleared to the empty string",
+            http: false,
+            patch: json!({ "description": "" }),
         },
     ]
 }
@@ -655,4 +672,132 @@ async fn a_quick_create_member_is_refused_on_an_api_that_has_no_quick_create_res
             "case {case:?}: a refused UpdateApi must leave the api as it was"
         );
     }
+}
+
+/// One member of the clear table: the member's wire name, the value the api is created
+/// with, and a second value the member is patched to after being cleared.
+struct ClearRow {
+    member: &'static str,
+    created: &'static str,
+    restored: &'static str,
+}
+
+/// The api's own OPTIONAL string members — the ones `UpdateApi` takes that an api may
+/// simply not have (`UpdateApi$Description`, `UpdateApi$Version`) — each with a value of
+/// its own kind: prose with spaces, and a short version token.
+fn clear_rows() -> Vec<ClearRow> {
+    vec![
+        ClearRow {
+            member: "description",
+            created: "the api as created",
+            restored: "re-described after the clear",
+        },
+        ClearRow {
+            member: "version",
+            created: "2024-01-01",
+            restored: "v2",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn an_optional_member_carried_empty_is_removed_from_the_api() {
+    let emulator = emulator();
+
+    for (index, row) in clear_rows().into_iter().enumerate() {
+        let member = row.member;
+        // (1) The api carries the member, so there is a stored value to clear.
+        let mut request = http_api(&format!("clear-{index}"));
+        request[member] = json!(row.created);
+        let api_id = create_api(&emulator, member, &request).await;
+        let (_, created) = get_api(&emulator, &api_id).await;
+        assert_eq!(
+            created.get(member).and_then(Value::as_str),
+            Some(row.created),
+            "case {member:?}: the created api must carry the member, got {created}"
+        );
+
+        // (2) The empty string clears it: the patch's own answer reports no such member.
+        let (status, cleared) = update_api(&emulator, &api_id, &json!({ member: "" })).await;
+        assert_eq!(
+            status, 201,
+            "case {member:?}: expected 201 from UpdateApi clearing the member, got {status} {cleared}"
+        );
+        assert_eq!(
+            cleared.get(member),
+            None,
+            "case {member:?}: expected the cleared member to be absent, got {cleared}"
+        );
+
+        // (3) And the write is what a later reader sees — not an empty value, and not the
+        // value it had.
+        let (status, fetched) = get_api(&emulator, &api_id).await;
+        assert_eq!(
+            status, 200,
+            "case {member:?}: expected 200 from GetApi, got {status} {fetched}"
+        );
+        assert_eq!(
+            fetched.get(member),
+            None,
+            "case {member:?}: expected GetApi to report no such member, got {fetched}"
+        );
+
+        // (4) Clearing again changes nothing, so the rule is idempotent.
+        let (status, again) = update_api(&emulator, &api_id, &json!({ member: "" })).await;
+        assert_eq!(
+            status, 201,
+            "case {member:?}: expected 201 clearing an already cleared member, got {status} {again}"
+        );
+        assert_eq!(
+            again, fetched,
+            "case {member:?}: expected a second clear to leave the api as it was; expected {fetched}, got {again}"
+        );
+
+        // (5) A value sent afterwards is stored as written, so clearing removes the value
+        // and not the member's ability to carry one.
+        let (status, restored) =
+            update_api(&emulator, &api_id, &json!({ member: row.restored })).await;
+        assert_eq!(
+            status, 201,
+            "case {member:?}: expected 201 re-setting the member, got {status} {restored}"
+        );
+        assert_eq!(
+            restored.get(member).and_then(Value::as_str),
+            Some(row.restored),
+            "case {member:?}: expected the member to carry the patched value, got {restored}"
+        );
+        let (_, read_back) = get_api(&emulator, &api_id).await;
+        assert_eq!(
+            read_back.get(member).and_then(Value::as_str),
+            Some(row.restored),
+            "case {member:?}: expected GetApi to report the patched value, got {read_back}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_required_member_carried_empty_is_refused_rather_than_cleared() {
+    let emulator = emulator();
+
+    // `Name` is a member every api reports (`Api$Name`), so the empty string is no clear
+    // there: it falls outside the member's documented window
+    // (`StringWithLengthBetween1And128`) and the patch is refused with nothing written.
+    let api_id = create_api(&emulator, "the named api", &http_api("named-api")).await;
+    let (_, before) = get_api(&emulator, &api_id).await;
+
+    let (status, refused) = update_api(&emulator, &api_id, &json!({ "name": "" })).await;
+    assert_eq!(
+        status, 400,
+        "expected 400 from UpdateApi with an empty Name, got {status} {refused}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "BadRequestException",
+        "expected BadRequestException, got {refused}"
+    );
+    let (_, after) = get_api(&emulator, &api_id).await;
+    assert_eq!(
+        after, before,
+        "a refused UpdateApi must leave the api as it was; expected {before}, got {after}"
+    );
 }

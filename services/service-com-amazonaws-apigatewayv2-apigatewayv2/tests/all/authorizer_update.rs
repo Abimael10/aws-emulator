@@ -969,3 +969,78 @@ async fn the_connect_authorization_step_reads_the_patched_identity_sources() {
         answer.summary()
     );
 }
+
+#[tokio::test]
+async fn an_optional_member_carried_empty_is_removed_from_the_authorizer() {
+    let emulator = emulator();
+
+    // The authorizer's OPTIONAL string members, over an authorizer that carries each: the
+    // credentials it is invoked under and the expression an identity source is validated
+    // against. Rows differ along the KIND of value — an ARN and a regular expression.
+    let rows = [
+        (
+            "authorizerCredentialsArn",
+            "arn:aws:iam::123456789012:role/authorizer-invoker",
+            "arn:aws:iam::123456789012:role/another-invoker",
+        ),
+        ("identityValidationExpression", "^t0ken-.*$", "^[a-z]+$"),
+    ];
+
+    for (member, created_value, restored) in rows {
+        let api_id = create_api(&emulator, member, "HTTP").await;
+        let created = create_authorizer(
+            &emulator,
+            member,
+            &api_id,
+            &json!({
+                "name": format!("clear-{member}"),
+                "authorizerType": "REQUEST",
+                "identitySource": ["$request.header.Authorization"],
+                "authorizerUri": lambda_uri("authorizer"),
+                "authorizerPayloadFormatVersion": "2.0",
+                member: created_value
+            }),
+        )
+        .await;
+        let authorizer_id = as_str(&created, "authorizerId");
+        assert_eq!(
+            created.get(member).and_then(Value::as_str),
+            Some(created_value),
+            "case {member:?}: the created authorizer must carry the member, got {created}"
+        );
+
+        let (status, cleared) = patch(&emulator, &api_id, &authorizer_id, &json!({ member: "" })).await;
+        assert_eq!(
+            status, 200,
+            "case {member:?}: expected 200 from UpdateAuthorizer, got {status} {cleared}"
+        );
+        assert_eq!(
+            cleared.get(member),
+            None,
+            "case {member:?}: expected the cleared member to be absent, got {cleared}"
+        );
+        let (status, fetched) = get_authorizer(&emulator, &api_id, &authorizer_id).await;
+        assert_eq!(
+            status, 200,
+            "case {member:?}: expected 200 from GetAuthorizer, got {status} {fetched}"
+        );
+        assert_eq!(
+            fetched.get(member),
+            None,
+            "case {member:?}: expected GetAuthorizer to report no such member, got {fetched}"
+        );
+
+        let (status, patched) =
+            patch(&emulator, &api_id, &authorizer_id, &json!({ member: restored })).await;
+        assert_eq!(
+            status, 200,
+            "case {member:?}: expected 200 re-setting the member, got {status} {patched}"
+        );
+        let (_, read_back) = get_authorizer(&emulator, &api_id, &authorizer_id).await;
+        assert_eq!(
+            read_back.get(member).and_then(Value::as_str),
+            Some(restored),
+            "case {member:?}: expected GetAuthorizer to report the patched value, got {read_back}"
+        );
+    }
+}

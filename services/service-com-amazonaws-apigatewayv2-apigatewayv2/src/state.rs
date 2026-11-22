@@ -40,6 +40,7 @@ pub mod model_template;
 mod network;
 pub mod paging;
 pub mod parameter_mapping;
+pub mod patch;
 pub mod route_key;
 pub mod route_request_parameters;
 pub mod route_throttle;
@@ -53,6 +54,10 @@ pub use wire_status::{
     ACCEPTED_TEARDOWN_STATUS, FLUSHED_CACHE_OK_STATUS, REWRITTEN_RESOURCE_STATUS,
     WRITTEN_RESOURCE_OK_STATUS,
 };
+
+/// What every `Update…` handler stores for an optional string member a request carries —
+/// see [`patch`], the one statement of that reading.
+pub use patch::cleared_by_empty;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
