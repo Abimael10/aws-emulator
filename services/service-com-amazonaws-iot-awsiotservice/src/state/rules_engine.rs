@@ -6,13 +6,18 @@
 //! A rule's `sql` selects the messages it is about and its `actions` are what AWS IoT then
 //! does with each of them, so a message published to a topic a stored rule's `FROM` clause
 //! covers is evaluated against that rule and each of its actions is performed. Driven from
-//! the data plane's `Publish` ([`dispatch_published_message`]); none of it is reported to the
+//! the data plane's `Publish` ([`dispatch_published_message`]) and from the MESSAGE BROKER's
+//! own MQTT wire, whose publications reach it through the sink
+//! [`broker_publications`] installs ([`dispatch_broker_publication`]); none of it is reported
+//! to the
 //! publisher, so what a client observes is the effect on the action's TARGET — the record a
 //! `kinesis` action wrote onto its stream, the event a `lambda` action handed its function.
 //!
 //! Three gates, in order: the rule's topic filter covers the topic
 //! ([`super::topic_filter_matches`], the reading `ListTopicRules` also uses) and the rule is
-//! not disabled; the statement SELECTS the message ([`super::rule_sql`], which reads the
+//! not disabled — unless the publication NAMED its rule, which AWS IoT routes to that rule
+//! instead of matching the filters at all
+//! ([`::service_common::iot_mqtt_broker::basic_ingest`]); the statement SELECTS the message ([`super::rule_sql`], which reads the
 //! statement, and [`super::rule_expression`], which evaluates it over the message and the
 //! topic); and the action is one this service may make — for an action naming a role, that
 //! role must let this service make the action's API call ([`super::rule_action_role`]), and
@@ -83,6 +88,10 @@ use substitution_template::Parameters;
 /// and the hop it is written over.
 pub mod dynamodb_action;
 
+/// What a publication the MESSAGE BROKER took is evaluated by: this engine, reached from the
+/// broker's own MQTT wire.
+pub mod broker_publications;
+
 /// `Action$lambda`: the invocation a rule's `lambda` action makes, and the function
 /// resource-policy grant that admits it.
 pub mod lambda_action;
@@ -146,6 +155,15 @@ struct Published {
     /// How many `republish` actions this message has already passed through, bounded by
     /// [`MAX_REPUBLISH_HOPS`].
     hops: usize,
+    /// The rule this message was ADDRESSED to, and `None` for a message that is about
+    /// whichever rules cover its topic.
+    ///
+    /// Set for a message a client sent to a rule BY NAME — the Basic Ingest path
+    /// (`::service_common::iot_mqtt_broker::basic_ingest`) — which is what names the one rule
+    /// it runs instead of the statements' own topic filters deciding. A `republish` action
+    /// puts an ordinary message back in whatever carried it here, since the topic it
+    /// republishes to is what the rules after it are matched against.
+    addressed_rule: Option<String>,
 }
 
 /// One rule a message is about, as the pass under the store's guard read it.
@@ -184,6 +202,10 @@ struct Failure {
 /// `EnableTopicRule` / `DisableTopicRule` last left. An engine with no IoT store evaluates
 /// nothing.
 ///
+/// The Region an action's target is reached in is the one the publish was signed for; a
+/// publication that rode no signed request of its own ([`dispatch_broker_publication`]) names
+/// its Region itself.
+///
 /// A `republish` action puts its message back into this same walk, so a chain of rules is
 /// followed to its end rather than stopping at the first rule — which is what makes the
 /// standard staging pattern (one rule normalizes onto a topic a second rule is written
@@ -200,38 +222,90 @@ pub async fn dispatch_published_message<Eng: ::std::marker::Send + ::std::marker
     topic: &str,
     payload: &[u8],
 ) {
+    let region = super::request_region(ctx.parts()).to_string();
+    dispatch(
+        engine,
+        ctx,
+        &region,
+        Published {
+            topic: topic.to_string(),
+            payload: payload.to_vec(),
+            hops: 0,
+            addressed_rule: None,
+        },
+    )
+    .await;
+}
+
+/// Evaluate one publication the MESSAGE BROKER took, in the Region the endpoint it was
+/// published at belongs to.
+///
+/// The broker's own wire carries no signed request, so the Region is passed rather than read
+/// off one, and a publication the client addressed to a rule BY NAME
+/// (`Publication$addressed_rule`, the Basic Ingest path) is evaluated against that rule alone
+/// — AWS IoT routes such a message to the named rule instead of matching the rules' own topic
+/// filters, and the topic the statement reads is the one the broker handed over.
+///
+/// Everything else is [`dispatch_published_message`]: the same rules, the same statement
+/// reading, the same actions and the same bounds.
+pub async fn dispatch_broker_publication<
+    Eng: ::std::marker::Send + ::std::marker::Sync + 'static,
+>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    publication: ::service_common::iot_mqtt_broker::Publication,
+) {
+    dispatch(
+        engine,
+        ctx,
+        region,
+        Published {
+            topic: publication.topic,
+            payload: publication.payload,
+            hops: 0,
+            addressed_rule: publication.addressed_rule,
+        },
+    )
+    .await;
+}
+
+/// Evaluate `message` and whatever a `republish` action of a rule it selects puts back in —
+/// the one walk both entry points above run.
+async fn dispatch<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    message: Published,
+) {
     let Some(state) = super::service_state(engine) else {
         return;
     };
     // The IAM store of this same engine, which decides what an action's role may do. `None`
     // is a deployment with no IAM to ask, which bars nothing.
     let iam = super::rule_action_role::iam_state(engine);
-    // An action's target is reached in the Region the publish was signed for.
-    let region = super::request_region(ctx.parts());
     let mut performed = 0_usize;
     // The messages still to evaluate: the published one, plus whatever a `republish` action
     // puts back in. Each is taken in turn, so a chain is followed breadth-first and the
     // bounds above hold over the whole chain rather than per message.
-    let mut pending: VecDeque<Published> = VecDeque::from([Published {
-        topic: topic.to_string(),
-        payload: payload.to_vec(),
-        hops: 0,
-    }]);
+    let mut pending: VecDeque<Published> = VecDeque::from([message]);
 
     while let Some(published) = pending.pop_front() {
-        // PASS 1 — under the guard, the rules this message is about.
+        // PASS 1 — under the guard, the rules this message is about: the one it was ADDRESSED
+        // to where it names one, and otherwise every enabled rule whose statement's topic
+        // filter covers the topic. A rule is run only while it is enabled either way, since a
+        // disabled rule is a rule that does nothing.
         let selecting: Vec<Selecting> = {
             let store = state.lock();
             store
                 .topic_rules
                 .values()
                 .filter(|rule| !rule.rule_disabled)
-                .filter(|rule| {
-                    rule.topic_pattern
-                        .as_deref()
-                        .is_some_and(|pattern| {
-                            super::topic_filter_matches(pattern, &published.topic)
-                        })
+                .filter(|rule| match published.addressed_rule.as_deref() {
+                    Some(addressed) => rule.rule_name == addressed,
+                    None => rule.topic_pattern.as_deref().is_some_and(|pattern| {
+                        super::topic_filter_matches(pattern, &published.topic)
+                    }),
                 })
                 .map(|rule| Selecting {
                     rule_name: rule.rule_name.clone(),
@@ -288,7 +362,7 @@ pub async fn dispatch_published_message<Eng: ::std::marker::Send + ::std::marker
                     .perform(
                         ctx,
                         &state,
-                        &region,
+                        region,
                         iam.as_ref(),
                         &rule,
                         &published,
@@ -330,7 +404,7 @@ pub async fn dispatch_published_message<Eng: ::std::marker::Send + ::std::marker
                 .perform(
                     ctx,
                     &state,
-                    &region,
+                    region,
                     iam.as_ref(),
                     &rule,
                     &published,
@@ -678,6 +752,7 @@ fn republish(
         topic,
         payload: message.to_vec(),
         hops: published.hops + 1,
+        addressed_rule: None,
     });
     Ok(())
 }

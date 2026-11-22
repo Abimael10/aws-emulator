@@ -284,17 +284,32 @@ pub fn retired_endpoint_type_message(retired: EndpointType, retirement: Retireme
 /// address a data endpoint falls back to on an emulator that could open no socket of its
 /// own, which still serves that type's HTTPS half.
 ///
+/// Opening the broker's socket is also what installs the RULES ENGINE behind it
+/// ([`crate::state::rules_engine::broker_publications`]): a device publishes by sending a
+/// PUBLISH on that socket rather than by calling an API, so the account's topic rules are
+/// reached from the broker's own wire, in the `region` this endpoint belongs to.
+///
 /// Scheme and host only, no path: the value is an address a client appends the modelled
 /// path to, exactly as the `identifier.iot.region.amazonaws.com` form the member
 /// documents is.
 async fn published_endpoint_address<Eng: Send + Sync + 'static>(
     ctx: &smithy_server_runtime::OperationContext<'_>,
-    engine: &Eng,
+    engine: &::std::sync::Arc<Eng>,
+    region: &str,
     endpoint_type: EndpointType,
 ) -> String {
     if endpoint_type.serves_the_message_broker() {
+        // What a publication made on that socket is EVALUATED by: this service's rules
+        // engine, which holds the account's topic rules — installed by the call that
+        // publishes the address, so a device that connects to it has its publications
+        // evaluated from the moment the address exists
+        // ([`crate::state::rules_engine::broker_publications`]).
+        crate::state::rules_engine::broker_publications::install_rules_engine(
+            engine, ctx, region,
+        );
         if let Some(broker) =
-            ::service_common::iot_mqtt_broker::ensure_broker_endpoint(engine, ctx.callback()).await
+            ::service_common::iot_mqtt_broker::ensure_broker_endpoint(&**engine, ctx.callback())
+                .await
         {
             return broker;
         }
@@ -460,7 +475,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // WHERE that endpoint answers, which is what the caller is told: the socket this
         // emulator serves the asked-for type's protocols on.
-        let endpoint_address = published_endpoint_address(ctx, &*self.engine, endpoint_type).await;
+        let endpoint_address =
+            published_endpoint_address(ctx, &self.engine, &region, endpoint_type).await;
 
         audit(
             ctx,

@@ -13,7 +13,10 @@
 //! what the topics they cover have retained, a PUBLISH is handed to every session
 //! subscribed to that topic (and becomes that topic's retained message when it carried the
 //! RETAIN flag), a PINGREQ is answered, and the connection closing marks the session
-//! disconnected with the reason it closed for. The broker PUBLISHES about the session as
+//! disconnected with the reason it closed for. Every publication this wire serves is also
+//! EVALUATED by the account's topic rules ([`super::served_publication`]) — including one
+//! the client addressed to a rule by name, which is published to no subscriber at all
+//! ([`super::basic_ingest`]). The broker PUBLISHES about the session as
 //! well — its presence events, and the will the client left for a termination that was not
 //! its own DISCONNECT ([`super::lifecycle`]). Every fact the IoT data plane then reports
 //! about that client — connected, since when, which filters, what is queued — is read from
@@ -501,10 +504,13 @@ where
                 }
                 let at_least_once = message.qos >= MAX_GRANTED_QOS;
                 message.delivered_at_millis = now_millis();
-                // The whole publication: the RETAIN flag the client set makes this the
-                // topic's retained message (and an empty retained payload clears it),
-                // and the message goes to the topic's subscribers either way.
-                super::publish(state, &message);
+                // The whole publication: for an ordinary topic the RETAIN flag the client
+                // set makes this the topic's retained message (and an empty retained
+                // payload clears it) and the message goes to the topic's subscribers either
+                // way, while one the client addressed to a rule by name
+                // (`$aws/rules/<ruleName>/<topic>`) is published to nobody at all — and
+                // both are then evaluated by the account's topic rules.
+                super::served_publication(state, &message).await;
                 if at_least_once
                     && !write_packet(writer, |buffer| {
                         protocol::render_puback(version, buffer, packet_id)

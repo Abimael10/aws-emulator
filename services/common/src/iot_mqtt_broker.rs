@@ -23,6 +23,9 @@
 //!   SUBSCRIBE records topic filters on it (and is answered with what is retained on the
 //!   topics they cover), its PUBLISH is handed to the sessions subscribed to that topic, and
 //!   its close (or a `DeleteConnection`) marks the session disconnected.
+//! * [`basic_ingest`] — the reserved topic space a publication names ONE topic rule through,
+//!   bypassing the subscribers entirely, and [`PublicationSink`] — how a publication this
+//!   broker took reaches the service that holds those rules.
 //! * [`lifecycle`] — what the broker itself PUBLISHES about a session: the presence events a
 //!   connect and a disconnect make, and the client's own last will on a termination that was
 //!   not its own DISCONNECT.
@@ -34,18 +37,22 @@
 //! deliveries leave the lock as a handle ([`LiveConnection`]) that is used after the guard
 //! is dropped.
 
+pub mod basic_ingest;
 pub mod endpoint;
 pub mod https_plane;
 pub mod lifecycle;
 pub mod wire;
 
 use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use ::tokio::sync::mpsc::Sender;
 use ::tokio::sync::oneshot;
 use ::tokio::sync::Notify;
 
+pub use basic_ingest::{ingested, BasicIngest};
 pub use endpoint::{ensure_broker_endpoint, published_broker_endpoint};
 /// The MQTT codec this broker reads and writes the protocol with, re-exported: a client
 /// of this emulator written in this workspace speaks the same wire through it rather than
@@ -453,6 +460,42 @@ pub fn topic_filter_covers(filter: &str, topic: &str) -> bool {
     topic_levels.next().is_none()
 }
 
+/// One publication the broker took, as whatever EVALUATES it is handed it.
+///
+/// A publication reaches the rules engine on two paths and they differ in one way only, so
+/// one shape carries both: an ordinary publication is evaluated against the rules whose
+/// statements cover its topic, and one the client addressed to a rule by name
+/// ([`basic_ingest`]) is evaluated against that rule alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Publication {
+    /// The topic the message is on, which is what a rule's statement reads — the levels
+    /// after the rule name for a publication addressed to a rule by name.
+    pub topic: String,
+    /// The message as published, byte for byte.
+    pub payload: Vec<u8>,
+    /// The rule this publication was ADDRESSED to, and `None` for an ordinary publication,
+    /// which is about whichever rules cover its topic.
+    pub addressed_rule: Option<String>,
+}
+
+/// What a publication the broker took is handed to BESIDES the subscribers of its topic: the
+/// account's topic rules.
+///
+/// The rules engine belongs to the IoT control plane, which holds the rules a client created,
+/// and this crate is below it — so the engine is reached through this trait: the service that
+/// owns the rules installs its own sink on the broker's store
+/// ([`MqttBrokerState::install_publication_sink`]) and the wire hands every publication it
+/// serves to whatever is installed. A broker with none installed delivers to subscribers and
+/// evaluates nothing, which is what an emulator holding no IoT control plane is.
+pub trait PublicationSink: Send + Sync + 'static {
+    /// Evaluate `publication`. Nothing of it is reported to the publisher: AWS IoT answers an
+    /// accepted publication the same way whatever the rules did with it.
+    fn evaluate<'sink>(
+        &'sink self,
+        publication: Publication,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'sink>>;
+}
+
 /// The broker's state: the sessions it holds, the retained message of each topic, and the
 /// endpoint it answers at.
 #[derive(Default)]
@@ -466,6 +509,9 @@ pub struct MqttBrokerState {
     pub retained_messages: BTreeMap<String, DirectMessage>,
     /// The broker's endpoint, once a call has opened it — see [`endpoint`].
     pub(crate) endpoint: Option<endpoint::BrokerEndpoint>,
+    /// What the publications this broker takes are evaluated by, once the service that owns
+    /// the account's topic rules has installed it — see [`PublicationSink`].
+    rules: Option<Arc<dyn PublicationSink>>,
     /// How many connections this broker has accepted, which is what the next one is
     /// identified by ([`LiveConnection::id`]).
     connections_accepted: u64,
@@ -509,6 +555,26 @@ impl MqttBrokerState {
         self.endpoint
             .as_ref()
             .map(|endpoint| endpoint.authority().to_string())
+    }
+
+    /// Install what the publications this broker takes are EVALUATED by, keeping the first:
+    /// the rules engine is one per emulator, so the sink a later call would install evaluates
+    /// the same rules out of the same store as the one already here.
+    ///
+    /// Called by the service that owns the account's topic rules, on the call that publishes
+    /// the address a device then connects to — so a publication served on this broker's wire
+    /// is evaluated from the moment that address exists.
+    pub fn install_publication_sink(&mut self, rules: Arc<dyn PublicationSink>) {
+        if self.rules.is_none() {
+            self.rules = Some(rules);
+        }
+    }
+
+    /// What the publications this broker takes are evaluated by, or `None` while nothing has
+    /// installed a sink — see [`PublicationSink`].
+    #[must_use]
+    pub fn publication_sink(&self) -> Option<Arc<dyn PublicationSink>> {
+        self.rules.clone()
     }
 
     /// Identify the next connection: a number no other connection of this broker carries,
@@ -633,6 +699,46 @@ pub fn publish(state: &::engine::ServiceState<MqttBrokerState>, message: &Direct
         );
     }
     publish_to_subscribers(state, message)
+}
+
+/// Serve one publication a CLIENT of this broker made: what it does in the broker, and the
+/// evaluation it is then handed to.
+///
+/// The two are one step because the first decides the second. A publication addressed to a
+/// rule by name ([`basic_ingest`]) is handed to that rule ALONE and is published nowhere: no
+/// subscriber of any topic is delivered it and no topic retains it, since a retained message
+/// is a message kept for a later subscriber. Every other publication is the whole publication
+/// [`publish`] makes — the topic's subscribers, and the retained message its RETAIN flag
+/// leaves — and is evaluated against whichever rules cover its topic.
+///
+/// Nothing of the evaluation is reported to the publisher, so the caller answers its client
+/// the same way either way.
+pub async fn served_publication(
+    state: &::engine::ServiceState<MqttBrokerState>,
+    message: &DirectMessage,
+) {
+    let publication = match basic_ingest::ingested(&message.topic) {
+        Some(addressed) => Publication {
+            topic: addressed.topic,
+            payload: message.payload.clone(),
+            addressed_rule: Some(addressed.rule_name),
+        },
+        None => {
+            publish(state, message);
+            Publication {
+                topic: message.topic.clone(),
+                payload: message.payload.clone(),
+                addressed_rule: None,
+            }
+        }
+    };
+    // Read out from under the guard and evaluated with it released: the evaluation makes
+    // calls of its own, and no lock over this store is held across an await.
+    let rules = state.lock().publication_sink();
+    let Some(rules) = rules else {
+        return;
+    };
+    rules.evaluate(publication).await;
 }
 
 #[cfg(test)]
