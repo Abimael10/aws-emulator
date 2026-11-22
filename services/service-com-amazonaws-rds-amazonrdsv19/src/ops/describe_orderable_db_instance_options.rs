@@ -496,9 +496,9 @@ const X2IEDN_SIZES: &[&str] = &[
 /// `db.t3.medium` and `db.t4g.medium`, not on the smaller burstable sizes.
 const CLUSTER_BURSTABLE_SIZES: &[&str] = &["medium"];
 
-/// The sizes the graph engine's `r5` generations are published in: that line reaches
+/// The sizes a memory-optimised INTEL generation is published in: those lines reach
 /// `24xlarge`, one size past where [`STANDARD_SIZES`] stops.
-const GRAPH_MEMORY_SIZES: &[&str] = &[
+const MEMORY_OPTIMISED_SIZES: &[&str] = &[
     "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
 ];
 
@@ -558,6 +558,31 @@ const CLUSTER_FAMILIES: &[InstanceFamily] = &[
     family("r7g", STANDARD_SIZES, false, true),
 ];
 
+/// The DB instance families a member of a DOCUMENT engine cluster can be ordered in.
+///
+/// These rows are the SHARED catalog of that engine
+/// (`::service_common::docdb_engine_catalog::INSTANCE_FAMILIES`, which the suite in
+/// `tests/all/document_engine_published_record.rs` holds them to): the classes a cluster
+/// member of it can be ordered in are the ENGINE's and not this door's, so this view and the
+/// DocumentDB view of the same door publish one class list rather than two — the two
+/// burstable `medium` classes, the Intel memory-optimised `r5` line up to `24xlarge` and the
+/// Graviton `r6g` and `r7g` lines up to `16xlarge`. The Intel generations the Aurora list
+/// carries beside `r5` ([`CLUSTER_FAMILIES`]) are not in it, so a class that engine is not
+/// offered in is not reported as orderable for it, and `db.r5.24xlarge`, which it IS offered
+/// in, is.
+///
+/// Published per CONTROL PLANE for the same reason [`GRAPH_FAMILIES`] is: an option of an
+/// engine another control plane owns is that control plane's own catalog entry, and this
+/// report is what a caller sizing a cluster member reads before it creates one. The
+/// serverless capacity class is not one of them ([`publishes_serverless_capacity`]).
+const DOCUMENT_FAMILIES: &[InstanceFamily] = &[
+    family("t3", CLUSTER_BURSTABLE_SIZES, true, false),
+    family("t4g", CLUSTER_BURSTABLE_SIZES, true, true),
+    family("r5", MEMORY_OPTIMISED_SIZES, false, false),
+    family("r6g", STANDARD_SIZES, false, true),
+    family("r7g", STANDARD_SIZES, false, true),
+];
+
 /// The DB instance families a member of a GRAPH engine cluster can be ordered in.
 ///
 /// Source: the "DB instance classes" section of the Amazon Neptune User Guide, which
@@ -577,8 +602,8 @@ const CLUSTER_FAMILIES: &[InstanceFamily] = &[
 const GRAPH_FAMILIES: &[InstanceFamily] = &[
     family("t3", CLUSTER_BURSTABLE_SIZES, true, false),
     family("t4g", CLUSTER_BURSTABLE_SIZES, true, true),
-    family("r5", GRAPH_MEMORY_SIZES, false, false),
-    family("r5d", GRAPH_MEMORY_SIZES, false, false),
+    family("r5", MEMORY_OPTIMISED_SIZES, false, false),
+    family("r5d", MEMORY_OPTIMISED_SIZES, false, false),
     family("r6g", STANDARD_SIZES, false, true),
     family("r6i", GRAPH_LARGEST_MEMORY_SIZES, false, false),
     family("r7g", STANDARD_SIZES, false, true),
@@ -741,7 +766,7 @@ pub fn class_memory_bytes(db_instance_class: &str) -> Option<u64> {
 /// stored instance already runs, and reads them from here so the two reports cannot
 /// disagree about a class.
 pub fn instance_classes(engine: &str) -> Vec<InstanceClass> {
-    let cluster = is_cluster_engine(engine);
+    let cluster = is_cluster_engine(engine) && publishes_serverless_capacity(engine);
     let mut classes: Vec<InstanceClass> = instance_families(engine)
         .iter()
         .flat_map(|family| {
@@ -771,6 +796,18 @@ pub fn instance_classes(engine: &str) -> Vec<InstanceClass> {
     classes
 }
 
+/// Whether a cluster member of `engine` can be ordered with SERVERLESS capacity, which is
+/// what the `db.serverless` capacity class is ([`SERVERLESS_CLASS`]).
+///
+/// The Aurora engines of this control plane are ordered with it (Aurora Serverless v2), and
+/// so is a member of a graph cluster (Neptune Serverless). The DocumentDB control plane
+/// offers no serverless capacity for a cluster member at all — its elastic clusters are a
+/// resource of their own API, created with shards rather than with a DB instance class — so
+/// no option of that engine names the capacity class.
+fn publishes_serverless_capacity(engine: &str) -> bool {
+    engine != ::service_common::docdb_engine_catalog::ENGINE
+}
+
 /// The DB instance FAMILIES `engine` can be ordered in: the family rows this report is
 /// built from, which is the part of AWS's per-region, per-engine matrix this service
 /// publishes.
@@ -778,6 +815,10 @@ fn instance_families(engine: &str) -> &'static [InstanceFamily] {
     if engine.eq_ignore_ascii_case(crate::state::NEPTUNE_ENGINE) {
         // The graph engine's control plane publishes its own class list ([`GRAPH_FAMILIES`]).
         return GRAPH_FAMILIES;
+    }
+    if engine.eq_ignore_ascii_case(::service_common::docdb_engine_catalog::ENGINE) {
+        // So does the document engine's ([`DOCUMENT_FAMILIES`]).
+        return DOCUMENT_FAMILIES;
     }
     if is_cluster_engine(engine) {
         CLUSTER_FAMILIES
@@ -820,6 +861,7 @@ pub fn publishes_instance_family(db_instance_class: &str) -> bool {
     PROVISIONED_FAMILIES
         .iter()
         .chain(CLUSTER_FAMILIES)
+        .chain(DOCUMENT_FAMILIES)
         .chain(GRAPH_FAMILIES)
         .any(|row| row.family.eq_ignore_ascii_case(family))
 }
@@ -1397,10 +1439,16 @@ fn to_wire(
             .map(|throughput| throughput.max_per_iops),
         // Storage autoscaling raises `AllocatedStorage`, so it applies exactly where
         // storage is ordered per instance rather than managed by a cluster. It is reported
-        // for every option, including an engine whose cluster manages the storage, because
-        // `DescribeValidDBInstanceModifications` answers the same fact for a STORED instance
-        // of that engine and the two reports must agree about it.
-        supports_storage_autoscaling: Some(storage.size_range.is_some()),
+        // for every option of an engine whose DB instance keeps its own storage, including
+        // a cluster engine of THIS door, because `DescribeValidDBInstanceModifications`
+        // answers the same fact for a STORED instance of that engine and the two reports
+        // must agree about it. An engine of the DocumentDB control plane publishes no
+        // storage autoscaling at all — its cluster owns the storage and its create models no
+        // allocation to raise — so the member is left ABSENT on an option of that engine
+        // rather than answered false about a facility it does not have.
+        supports_storage_autoscaling: docdb
+            .is_none()
+            .then_some(storage.size_range.is_some()),
         min_storage_size: storage_size.map(|(min, _)| min),
         max_storage_size: storage_size.map(|(_, max)| max),
         supports_enhanced_monitoring: Some(supports_enhanced_monitoring(engine)),

@@ -745,10 +745,15 @@ async fn a_class_is_offered_once_per_storage_type_it_can_be_ordered_with() {
                 option.xml
             );
             // Storage autoscaling raises AllocatedStorage, so it is offered exactly where
-            // storage is ordered with the instance.
+            // storage is ordered with the instance. An engine of the DocumentDB control
+            // plane publishes no such facility at all — its cluster owns the storage and its
+            // create models no allocation to raise — so an option of it carries no answer
+            // rather than a false one.
+            let expected_autoscaling =
+                (*engine != "docdb").then(|| reported_min.is_some().to_string());
             assert_eq!(
-                text(&option.xml, "SupportsStorageAutoscaling"),
-                reported_min.is_some().to_string(),
+                optional_text(&option.xml, "SupportsStorageAutoscaling"),
+                expected_autoscaling,
                 "case {case:?}: {} SupportsStorageAutoscaling, got {}",
                 option.storage_type,
                 option.xml

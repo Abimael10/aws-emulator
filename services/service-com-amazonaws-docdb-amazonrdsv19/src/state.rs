@@ -2331,48 +2331,21 @@ pub fn unrecognized_filter_name_message(name: &str) -> String {
     format!("Unrecognized filter name: {name}")
 }
 
-/// The sizes the memory-optimised `r5` family is published in, smallest first.
-const R5_SIZES: &[&str] = &[
-    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
-];
-
-/// The sizes the Graviton memory-optimised families (`r6g`, `r7g`) are published in.
-const GRAVITON_SIZES: &[&str] = &[
-    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
-];
-
-/// The one size a burstable family is published in for this engine: a cluster member is
-/// offered on `db.t3.medium` and `db.t4g.medium` and on no smaller burstable size.
-const BURSTABLE_SIZES: &[&str] = &["medium"];
-
 /// The instance families a cluster member can be ordered in, and the sizes each is
 /// published in.
 ///
-/// Source: the "Amazon DocumentDB instance classes" section of the Amazon DocumentDB
-/// Developer Guide — the two burstable classes and the memory-optimised families, read as
-/// the family-by-size matrix a `DBInstanceClass` (`db.<family>.<size>`,
-/// `CreateDBInstanceMessage$DBInstanceClass`: "for example, `db.r5.large`") is named from,
-/// so the classes this service offers are each family crossed with its own sizes rather
-/// than a hand-listed set of names.
-pub const DOCDB_INSTANCE_FAMILIES: &[(&str, &[&str])] = &[
-    ("t3", BURSTABLE_SIZES),
-    ("t4g", BURSTABLE_SIZES),
-    ("r5", R5_SIZES),
-    ("r6g", GRAVITON_SIZES),
-    ("r7g", GRAVITON_SIZES),
-];
+/// It is the SHARED catalog of this engine's own
+/// ([`::service_common::docdb_engine_catalog::INSTANCE_FAMILIES`]), re-exported here rather
+/// than restated: the classes a cluster member of this engine can be ordered in are the
+/// ENGINE's, and both views of the one `rds` front door that report them — this one and the
+/// Amazon RDS view — read them there, so no client can read a different orderable class list
+/// depending on how it addressed the door.
+pub use ::service_common::docdb_engine_catalog::INSTANCE_FAMILIES as DOCDB_INSTANCE_FAMILIES;
 
 /// Every `DBInstanceClass` this service offers, in the order
 /// [`DOCDB_INSTANCE_FAMILIES`] publishes them.
 pub fn instance_classes() -> Vec<String> {
-    DOCDB_INSTANCE_FAMILIES
-        .iter()
-        .flat_map(|(family, sizes)| {
-            sizes
-                .iter()
-                .map(move |size| format!("db.{family}.{size}"))
-        })
-        .collect()
+    ::service_common::docdb_engine_catalog::instance_classes()
 }
 
 /// The storage types a cluster member of this engine can be ordered with, in the order the

@@ -377,8 +377,14 @@ fn valid_storage_options(
             }]
         }),
         // Storage autoscaling raises `AllocatedStorage`, so it applies exactly where
-        // storage is the instance's own.
-        supports_storage_autoscaling: Some(profile.size_range.is_some()),
+        // storage is the instance's own. An engine of the DocumentDB control plane publishes
+        // no storage autoscaling at all — its cluster owns the storage and its create models
+        // no allocation to raise — so the member is left ABSENT for it, exactly as it is on
+        // an orderable option of that engine
+        // (`crate::ops::describe_orderable_db_instance_options`): the two reports answer the
+        // same fact about one engine and cannot disagree about it.
+        supports_storage_autoscaling: (engine != ::service_common::docdb_engine_catalog::ENGINE)
+            .then_some(profile.size_range.is_some()),
     }
 }
 

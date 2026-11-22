@@ -746,10 +746,12 @@ async fn every_reported_bound_is_well_formed_for_the_instances_engine_and_class(
                  provisioned throughput: {option:?}"
             );
             // Autoscaling raises `AllocatedStorage`, so it is offered exactly where the
-            // instance has a storage size of its own to raise.
+            // instance has a storage size of its own to raise — and an engine of the
+            // DocumentDB control plane, whose cluster owns the storage and whose create
+            // models no allocation at all, publishes no answer about the facility.
             assert_eq!(
                 option.supports_storage_autoscaling.as_deref(),
-                Some(if option.storage_size.is_empty() {
+                (row.engine != "docdb").then_some(if option.storage_size.is_empty() {
                     "false"
                 } else {
                     "true"

@@ -12,6 +12,31 @@ Issue-Commit: c3a7d511a5670169ecde182d84092cb0c8e6535e
 
 # DocDB published reference catalogs diverge from AWS: engine-version list and orderable-instance-option list
 
+## Resolution
+
+Both reports are served by the Amazon RDS view of the shared `rds` front door, because an SDK
+DocumentDB client signs `rds` and the resolved routing key is therefore `rds`
+(`services/service-com-amazonaws-rds-amazonrdsv19/src/service.rs`).
+
+* Cause 1 (the `docdb` 3.6 engine-version family): published. `service_common::docdb_engine_catalog`
+  carries the 3.6.0 row as the first row of the engine's version list, with the 5.0.x/8.0.x
+  major-version upgrade edges its upgrade rule gives it, and both views project it; pinned by
+  `core/router/tests/all/rds_front_door_shared_catalogs.rs`.
+* Cause 2 (the orderable instance classes): the RDS view now publishes the DocumentDB control
+  plane's OWN instance-class table (`docdb_engine_catalog::INSTANCE_FAMILIES`, read by both views
+  rather than copied per view) instead of the door's Aurora class list, so `db.r5.24xlarge` is
+  orderable and `db.r6i.*` and `db.serverless` — classes that engine is not offered in — are not
+  reported for it; and an option of an engine whose cluster owns the storage reports the storage
+  type with no per-instance storage bound and no storage autoscaling (the same answer
+  `DescribeValidDBInstanceModifications` gives for a stored instance of it).
+
+Still divergent in the replay: the recorded option list continues past the `r5`/`r6g` block with a
+class this engine's published table does not name, and the recorded engine-version rows differ from
+the published ones in a per-row member the issue does not identify and the replay withholds. Both
+are the recorded account's own point-in-time offering matrix — "recorded behavior only", as the
+report says — rather than something a published rule produces, so the two replay keys are still red
+while the published catalogs are the documented ones.
+
 > _Note: this issue was identified against the code base at commit `c3a7d511a5670169ecde182d84092cb0c8e6535e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

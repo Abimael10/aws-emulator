@@ -441,6 +441,59 @@ pub const NETWORK_TYPES: &[&str] = &["IPV4", "DUAL"];
 /// the type a create defaults to.
 pub const STORAGE_TYPES: &[&str] = &["standard", "iopt1"];
 
+/// The sizes the memory-optimised `r5` family is published in for this engine, smallest
+/// first: that line reaches `24xlarge`.
+const R5_SIZES: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge", "24xlarge",
+];
+
+/// The sizes the Graviton memory-optimised families (`r6g`, `r7g`) are published in for this
+/// engine: those lines stop at `16xlarge`.
+const GRAVITON_SIZES: &[&str] = &[
+    "large", "xlarge", "2xlarge", "4xlarge", "8xlarge", "12xlarge", "16xlarge",
+];
+
+/// The one size a burstable family is published in for this engine: a cluster member is
+/// offered on `db.t3.medium` and `db.t4g.medium` and on no smaller burstable size.
+const BURSTABLE_SIZES: &[&str] = &["medium"];
+
+/// The instance families a cluster member of this engine can be ordered in, and the sizes
+/// each family is published in.
+///
+/// Source: the "Amazon DocumentDB instance classes" section of the Amazon DocumentDB
+/// Developer Guide — the two burstable classes and the memory-optimised families, read as the
+/// family-by-size matrix a `DBInstanceClass` (`db.<family>.<size>`,
+/// `CreateDBInstanceMessage$DBInstanceClass`: "for example, `db.r5.large`") is named from, so
+/// the classes this engine offers are each family crossed with its own sizes rather than a
+/// hand-listed set of names.
+///
+/// It lives HERE, with the rest of this engine's catalog, because the classes it can be
+/// ordered in are the engine's and not a front door's: both views of the one `rds` door that
+/// answer `DescribeOrderableDBInstanceOptions` for this engine publish this matrix, so a
+/// client reads the same orderable classes whichever view it addresses — where the Amazon RDS
+/// view's own cluster engines are offered that door's own class list, which is a different
+/// one.
+pub const INSTANCE_FAMILIES: &[(&str, &[&str])] = &[
+    ("t3", BURSTABLE_SIZES),
+    ("t4g", BURSTABLE_SIZES),
+    ("r5", R5_SIZES),
+    ("r6g", GRAVITON_SIZES),
+    ("r7g", GRAVITON_SIZES),
+];
+
+/// Every `DBInstanceClass` this engine offers, in the order [`INSTANCE_FAMILIES`] publishes
+/// them (each family crossed with its own sizes).
+pub fn instance_classes() -> Vec<String> {
+    INSTANCE_FAMILIES
+        .iter()
+        .flat_map(|(family, sizes)| {
+            sizes
+                .iter()
+                .map(move |size| format!("db.{family}.{size}"))
+        })
+        .collect()
+}
+
 /// `SupportedActivityStreamModes` of an option of this engine: the DocumentDB control plane
 /// binds no operation that starts a database activity stream, so an option of it publishes
 /// no mode — the member is reported EMPTY rather than left out, because it is a list and an
