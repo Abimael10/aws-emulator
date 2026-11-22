@@ -53,7 +53,8 @@ use ec2::state::{
     INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_IN_PROGRESS as STATE_DELETE_IN_PROGRESS,
     INSTANCE_CONNECT_ENDPOINT_STATE_UPDATE_COMPLETE as STATE_UPDATE_COMPLETE,
     INSTANCE_CONNECT_ENDPOINT_STATE_UPDATE_IN_PROGRESS as STATE_UPDATE_IN_PROGRESS,
-    IP_ADDRESS_TYPE_DUALSTACK, IP_ADDRESS_TYPE_IPV4, IP_ADDRESS_TYPE_IPV6, SecurityGroupSpec,
+    IP_ADDRESS_TYPE_DUALSTACK, IP_ADDRESS_TYPE_IPV4, IP_ADDRESS_TYPE_IPV6,
+    RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT, SecurityGroupSpec,
     SubnetSpec, TRANSITION_DELAY, availability_zones_in_region,
     instance_connect_endpoint_dns_name, instance_connect_endpoint_fips_dns_name,
     instance_connect_endpoint_id_is_well_formed,
@@ -1758,18 +1759,16 @@ async fn a_delete_that_cannot_resolve_its_endpoint_is_refused() {
             code,
             "case {case:?}: expected {code}, got {body}"
         );
-        // An id the account holds no endpoint for is reported as the id the REQUEST named,
-        // with what the caller has to do about it.
+        // An id the account holds no endpoint for is reported the way EC2 reports every
+        // unresolvable resource id: the resource's modelled type and the id the REQUEST named.
         if code.ends_with(".NotFound") {
             let named = params
                 .iter()
                 .find(|(key, _)| key == "InstanceConnectEndpointId")
                 .map(|(_, value)| value.clone())
                 .unwrap_or_default();
-            let expected = format!(
-                "The Instance Connect Endpoint {named} does not exist. Add an existing \
-                 Instance Connect Endpoint ID and retry your request."
-            );
+            let expected =
+                format!("The {RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT} ID '{named}' does not exist");
             let actual = error_message(&body);
             assert_eq!(
                 actual, expected,

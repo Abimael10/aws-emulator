@@ -402,7 +402,9 @@ pub trait ProgramFiles {
 /// their names.
 ///
 /// Each one's whole effect is inside the session and the tree it works over: `printf` writes
-/// one line of output, `mkdir`, `touch` and `rm` change the tree, `tee` writes what it reads
+/// one line of output, `mkdir`, `touch` and `rm` change the tree, `sync` flushes what was
+/// written to it (nothing is pending in a tree a write reaches at once, so it writes nothing
+/// and succeeds), `tee` writes what it reads
 /// into the files it names and passes it on, `ls` names what the tree
 /// holds, `test` (and its `[`
 /// spelling) answers a question about it, `sh` performs a program in this same session —
@@ -415,10 +417,19 @@ pub trait ProgramFiles {
 /// directory, a removal, a nested program and a file to read commands from are what an
 /// environment with storage of its own has, and such a session's tree is only the files its
 /// redirections left.
+///
+/// Every utility the shared file-utility reader performs over a session's tree
+/// ([`posix_shell_files::FILE_COMMANDS`]) is named here or among [`BUILT_IN_COMMANDS`]: a
+/// name it performs and no catalog holds would be resolved as a PROGRAM and reported as a
+/// command the shell could not find, however completely this module implements it.
 pub const VOLUME_COMMANDS: &[&str] = &[
-    "printf", "mkdir", "touch", "rm", TEE_COMMAND, LIST_COMMAND, "test", "[", "sh", "bash", ".",
-    "source", "sleep",
+    "printf", "mkdir", "touch", "rm", SYNC_COMMAND, TEE_COMMAND, LIST_COMMAND, "test", "[", "sh",
+    "bash", ".", "source", "sleep",
 ];
+
+/// The command of [`VOLUME_COMMANDS`] that FLUSHES what was written to the tree, performed by
+/// the shared file-utility reader like the other utilities that work over it.
+const SYNC_COMMAND: &str = "sync";
 
 /// The commands only a session working over a MACHINE's tree provides
 /// ([`ShellSession::in_volume`]), as their names: `cd` changes the DIRECTORY the paths a
@@ -2505,6 +2516,7 @@ impl ShellSession {
     /// `printf` writes its format with its arguments substituted. `mkdir` makes a
     /// directory (`-p` makes the ones above it too), `touch` makes an empty file where the
     /// tree holds none, and `rm` removes a file (`-f` passes over one that is not there).
+    /// `sync` flushes the tree, which has nothing pending in it.
     /// `ls` writes the names the tree holds at the paths it was given ([`Self::run_list`]).
     /// `tee` writes what it READS into each file it names and passes it on
     /// ([`Self::run_tee`]).

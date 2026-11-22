@@ -247,7 +247,7 @@ impl ComAmazonawsEc2Amazonec2State {
         // The guest's current boot: the session reads that boot's own identity, and an
         // instance whose guest has not come up yet has none.
         let boot = instance.boots.last()?;
-        let (boot_id, number) = (boot.boot_id.clone(), boot.number);
+        let (boot_id, number, booted_at) = (boot.boot_id.clone(), boot.number, boot.booted_at);
         let files = instance.guest_files.clone();
         // The machine the program runs on, running as the role the caller resolved for it:
         // which role the instance's profile carries is a fact IAM holds, so it is handed in
@@ -257,7 +257,7 @@ impl ComAmazonawsEc2Amazonec2State {
         // start or stop ([`super::guest_services`]).
         let services =
             super::guest_services::GuestServices::starting_from(&instance.guest_runtime);
-        let volume = guest_volume(&machine, &boot_id, &files);
+        let volume = guest_volume(&machine, &boot_id, booted_at, &files);
         let session = ShellSession::in_volume(
             guest_environment(&machine, number),
             SessionConfig {
@@ -422,10 +422,11 @@ impl ComAmazonawsEc2Amazonec2State {
         if instance.state != InstanceStateName::Running {
             return None;
         }
-        let boot_id = instance.boots.last()?.boot_id.clone();
+        let boot = instance.boots.last()?;
+        let (boot_id, booted_at) = (boot.boot_id.clone(), boot.booted_at);
         let held = instance.guest_files.clone();
         let machine = self.guest_machine(instance);
-        let mut volume = guest_volume(&machine, &boot_id, &held);
+        let mut volume = guest_volume(&machine, &boot_id, booted_at, &held);
         let answered = change(&mut volume);
         let stored: ::std::collections::BTreeMap<String, String> = volume
             .stored_files()

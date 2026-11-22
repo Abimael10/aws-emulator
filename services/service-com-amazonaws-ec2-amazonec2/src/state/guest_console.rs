@@ -67,6 +67,16 @@ pub const GUEST_HOSTNAME_PATH: &str = "/etc/hostname";
 /// The path the kernel publishes the command line it was booted with at.
 pub const GUEST_CMDLINE_PATH: &str = "/proc/cmdline";
 
+/// The path the kernel publishes how long THIS boot has been up at: `/proc/uptime` "contains two
+/// numbers (values in seconds): the uptime of the system (including time spent in suspend) and
+/// the amount of time spent in the idle process" (`proc(5)`), each written to two decimal places.
+///
+/// It is where a program inside a guest reads "how long have I been up" from, and it is published
+/// per READ rather than kept on the machine's storage: the value is a SPAN that grows with the
+/// clock ([`guest_uptime`]), so a program that reads it after an earlier one ran reads a larger
+/// number, and a reboot — which starts a new boot — starts it again from zero.
+pub const GUEST_UPTIME_PATH: &str = "/proc/uptime";
+
 /// The path cloud-init publishes the instance's own id to its guest at.
 pub const GUEST_INSTANCE_ID_PATH: &str = "/var/lib/cloud/data/instance-id";
 
@@ -727,6 +737,32 @@ fn guest_command_line(machine: &GuestMachine) -> String {
     )
 }
 
+/// What the kernel publishes at [`GUEST_UPTIME_PATH`] for a boot that started at `booted_at`,
+/// read at `now`: the seconds this boot has been up and the seconds its processors have spent
+/// idle, each to two decimal places, as the kernel writes that file.
+///
+/// The uptime is the SPAN from the instant the boot was recorded to the instant the file is
+/// read, so it is a fact of the clock rather than a value stored on the machine: a program that
+/// reads it later reads a larger number, and a reboot starts a new boot and so starts the span
+/// again. A clock that has gone backwards between the two instants leaves the span at zero,
+/// which is what a boot that has just happened reports.
+///
+/// The idle figure is that span over every processor the guest sees: the machine runs nothing of
+/// its own between the programs this emulator performs in it, so each of its processors has been
+/// idle for the whole of it — one vCPU for a machine whose processor count this emulator does
+/// not know.
+fn guest_uptime(machine: &GuestMachine, booted_at: SystemTime, now: SystemTime) -> String {
+    let up = now
+        .duration_since(booted_at)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let processors = machine
+        .processor
+        .map_or(1, |(vcpus, _)| vcpus.max(1))
+        .max(1);
+    format!("{up:.2} {idle:.2}\n", idle = up * f64::from(processors))
+}
+
 /// The MAC address of this machine's primary network interface, derived from its own private
 /// address — a locally administered address, which is what a virtualised interface carries.
 pub(super) fn guest_mac_address(machine: &GuestMachine) -> String {
@@ -795,7 +831,7 @@ fn run_guest_program(
             }
         }
     }
-    let volume = guest_volume(machine, boot_id, &held);
+    let volume = guest_volume(machine, boot_id, booted_at, &held);
     let mut session = ShellSession::in_volume(
         guest_environment(machine, number),
         SessionConfig {
@@ -817,9 +853,8 @@ fn run_guest_program(
     // instance's own facts with ([`super::guest_metadata`]) and installs and starts its
     // services with ([`super::guest_services`]).
     .with_environment_programs(super::guest_services::installed_programs(machine, services));
-    // The instant the boot happened is the console's, not the program's: a guest's own clock
-    // is not something a boot script reads here.
-    let _ = booted_at;
+    // The instant the boot happened is the console's, and it is also what the kernel counts
+    // this boot's uptime from ([`GUEST_UPTIME_PATH`]), which the tree above publishes.
     for command in program.commands_for_boot(number) {
         session.run(command);
         if session.exit_status().is_some() {
@@ -850,9 +885,10 @@ fn run_guest_program(
 pub(super) fn guest_volume(
     machine: &GuestMachine,
     boot_id: &str,
+    booted_at: SystemTime,
     files: &BTreeMap<String, String>,
 ) -> ShellVolume {
-    let published = guest_published_files(machine, boot_id);
+    let published = guest_published_files(machine, boot_id, booted_at);
     let published_bytes: usize = published
         .iter()
         .map(|(path, contents)| path.len().saturating_add(contents.len()))
@@ -914,7 +950,8 @@ fn directories_above(path: &str) -> Vec<String> {
 
 /// What the kernel and the init system publish TO this guest, as `(path, contents)`: this
 /// boot's own identity, the machine's identity, its host name, the command line it was booted
-/// with, the instance id cloud-init published to it — and, for a machine whose CPU layout this
+/// with, how long this boot has been up, the instance id cloud-init published to it — and, for a
+/// machine whose CPU layout this
 /// emulator knows, everything the kernel publishes about its processors
 /// ([`super::guest_cpu::published_cpu_files`]), beside what it publishes about each of the
 /// machine's block devices ([`super::guest_block_devices::published_block_device_files`]). A
@@ -923,7 +960,11 @@ fn directories_above(path: &str) -> Vec<String> {
 ///
 /// The ONE listing of that seed, so every program a guest runs reads the same published
 /// values and the budget above is computed from exactly what is seeded.
-fn guest_published_files(machine: &GuestMachine, boot_id: &str) -> Vec<(String, String)> {
+fn guest_published_files(
+    machine: &GuestMachine,
+    boot_id: &str,
+    booted_at: SystemTime,
+) -> Vec<(String, String)> {
     let mut published = vec![
         (GUEST_BOOT_ID_PATH.to_string(), format!("{boot_id}\n")),
         (
@@ -937,6 +978,10 @@ fn guest_published_files(machine: &GuestMachine, boot_id: &str) -> Vec<(String, 
         (
             GUEST_CMDLINE_PATH.to_string(),
             format!("{}\n", guest_command_line(machine)),
+        ),
+        (
+            GUEST_UPTIME_PATH.to_string(),
+            guest_uptime(machine, booted_at, SystemTime::now()),
         ),
         (
             GUEST_INSTANCE_ID_PATH.to_string(),

@@ -3408,6 +3408,13 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// the same monotonic clock and the same [`TRANSITION_DELAY`].
     /// [`Self::materialize_due_transitions`] applies it.
     pub ipam_prefix_list_resolver_target_create_complete_at: BTreeMap<String, Instant>,
+    /// When a `modify-in-progress` resolver target's move to `modify-complete` falls due, by
+    /// `IpamPrefixListResolverTargetId` — what `ModifyIpamPrefixListResolverTarget` records for
+    /// the target it modified
+    /// ([`Self::modify_ipam_prefix_list_resolver_target`]), on the same monotonic clock and the
+    /// same [`TRANSITION_DELAY`] as the creation above and applied by
+    /// [`Self::materialize_due_transitions`], which SYNCHRONIZES the target as it applies it.
+    pub ipam_prefix_list_resolver_target_modify_complete_at: BTreeMap<String, Instant>,
     /// A `CreateIpamPrefixListResolverTarget` `ClientToken` and the
     /// `IpamPrefixListResolverTargetId` that call minted, so a replay of the same request
     /// answers with that target instead of creating a second one: "a unique, case-sensitive
@@ -4212,6 +4219,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_prefix_list_resolver_client_tokens: HashMap::new(),
             ipam_prefix_list_resolver_targets: BTreeMap::new(),
             ipam_prefix_list_resolver_target_create_complete_at: BTreeMap::new(),
+            ipam_prefix_list_resolver_target_modify_complete_at: BTreeMap::new(),
             ipam_prefix_list_resolver_target_client_tokens: HashMap::new(),
             ipam_internet_registry_associations: BTreeMap::new(),
             ipam_internet_registry_association_client_tokens: HashMap::new(),

@@ -3039,6 +3039,12 @@ mod ipam_prefix_list_resolver_deletion;
 /// more lines here. Everything it declares is re-exported below, so a handler reaches these as
 /// `crate::state::<item>` like any primitive of this module.
 mod ipam_prefix_list_resolver_rules;
+/// What an IPAM prefix list resolver TARGET synchronizes — the prefix list version a created
+/// target records as synchronized, and what a `ModifyIpamPrefixListResolverTarget` does to a
+/// stored one — in a file of its own rather than as more lines here. Everything it declares is
+/// re-exported below, so a handler reaches these as `crate::state::<item>` like any primitive of
+/// this module.
+mod ipam_prefix_list_resolver_target_sync;
 mod ipam_pool_cidrs;
 /// The CIDRs ALLOCATED out of an IPAM pool — the store `AllocateIpamPoolCidr` writes and
 /// `GetIpamPoolAllocations` reports, the one reading of which space of a pool is already
@@ -3227,6 +3233,7 @@ pub use ipam_deletion::*;
 pub use ipam_policy_enablement::*;
 pub use ipam_prefix_list_resolver_deletion::*;
 pub use ipam_prefix_list_resolver_rules::*;
+pub use ipam_prefix_list_resolver_target_sync::*;
 pub use ipam_pool_cidrs::*;
 pub use ipam_pool_allocations::*;
 pub use capacity_billing_and_recycle_bins::*;

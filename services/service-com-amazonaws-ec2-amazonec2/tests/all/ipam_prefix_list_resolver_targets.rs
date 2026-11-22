@@ -39,7 +39,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use ec2::state::{
-    ADDRESS_FAMILY_IPV4, IDEMPOTENT_PARAMETER_MISMATCH,
+    ADDRESS_FAMILY_IPV4, FIRST_PREFIX_LIST_VERSION, IDEMPOTENT_PARAMETER_MISMATCH,
     INVALID_IPAM_PREFIX_LIST_RESOLVER_ID_NOT_FOUND,
     INVALID_IPAM_PREFIX_LIST_RESOLVER_TARGET_ID_NOT_FOUND, INVALID_MAX_RESULTS,
     INVALID_PREFIX_LIST_ID_MALFORMED, INVALID_PREFIX_LIST_ID_NOT_FOUND,
@@ -876,6 +876,41 @@ fn expected_ids(seeded: &[SeededTarget], keep: impl Fn(&SeededTarget) -> bool) -
     ids
 }
 
+/// Wait until every seeded target reports the state its creation settles into, looking again
+/// until it does or a generous deadline passes.
+///
+/// A CONDITION wait: what the rows below assert is about targets whose creation has settled, and
+/// waiting for that state rather than for a span keeps the outcome independent of how fast this
+/// host runs.
+async fn until_every_seeded_target_settles(router: &MultiServiceRouter, seeded: &[SeededTarget]) {
+    /// Far above the span the store owes a target its settled state on any host.
+    const GENEROUS_DEADLINE: Duration = Duration::from_secs(60);
+    /// How often the wait looks again.
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    let case = "waiting for the clock to settle every seeded target";
+    let deadline = std::time::Instant::now() + GENEROUS_DEADLINE;
+    loop {
+        let mut unsettled: Vec<String> = Vec::new();
+        for target in seeded {
+            let reported = describe_one(case, router, &target.id).await;
+            if reported.state.as_deref()
+                != Some(IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_COMPLETE)
+            {
+                unsettled.push(target.id.clone());
+            }
+        }
+        if unsettled.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: these targets never settled: {unsettled:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// The rule: the describe reports the stored targets, narrowed by the ids it names, by the
 /// resolver it names and by each documented filter — every filter matched against the value
 /// the target holds for it, and unnamed narrowing reporting everything the account holds.
@@ -884,9 +919,10 @@ async fn the_describe_narrows_by_id_resolver_and_filter() {
     let (router, _engine) = emulator();
     let (seeded, first_resolver, second_resolver) = seed_targets(&router, 8).await;
     let all = expected_ids(&seeded, |_| true);
-    // The clock has not necessarily settled every target, so a row filtering on `state` reads
-    // the state the store holds rather than assuming one.
-    tokio::time::sleep(past_the_transition()).await;
+    // The rows filtering on `state` and on the synchronized version read SETTLED targets, so
+    // this waits for every seeded target to BE settled — looking again until it is, never
+    // sleeping for the span the clock owes one.
+    until_every_seeded_target_settles(&router, &seeded).await;
 
     // Narrowing by id: none, one, several, all.
     let by_id: Vec<(&str, Vec<&str>)> = vec![
@@ -952,6 +988,10 @@ async fn the_describe_narrows_by_id_resolver_and_filter() {
         .find(|target| target.desired_version.is_some())
         .expect("one seeded target pins a version");
     let pinned_version = pinned.desired_version.expect("that target's version");
+    // Every seeded prefix list is at its FIRST version, so a target that follows its list has
+    // synchronized that version by the time the clock has settled it, and a target pinned to a
+    // version above it has synchronized none.
+    let synced_version = FIRST_PREFIX_LIST_VERSION.to_string();
     let arn = engine::emulator_arn(
         "ec2",
         "",
@@ -989,9 +1029,9 @@ async fn the_describe_narrows_by_id_resolver_and_filter() {
             vec![seeded[3].id.clone()],
         ),
         (
-            "last-synced-version, which no target carries yet",
-            filters(&[("last-synced-version", &["1"])]),
-            Vec::new(),
+            "last-synced-version, which a target that follows its prefix list carries",
+            filters(&[("last-synced-version", &[synced_version.as_str()])]),
+            expected_ids(&seeded, |target| target.tracking),
         ),
         (
             "owner-id",

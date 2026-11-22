@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyIpamPrefixListResolverTarget
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyIpamPrefixListResolverTarget`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyIpamPrefixListResolverTarget::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies an IPAM prefix list resolver target and STORES the modification: the members the
+//! request names are applied to the stored target through the one writer of a target
+//! modification
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::modify_ipam_prefix_list_resolver_target`]),
+//! which leaves it in the non-terminal `modify-in-progress` state and SYNCHRONIZES the target
+//! with the prefix list version the modification left it configured for at the instant the clock
+//! settles it — leaving it in `sync-complete`, the state that says that synchronization ran, with
+//! the version it published reported as
+//! `IpamPrefixListResolverTarget$LastSyncedVersion`.
+//! `DescribeIpamPrefixListResolverTargets` reports what this answers.
+//!
+//! A `DesiredVersion` ABOVE the version the target's prefix list stands at names a version no
+//! synchronization could publish, so it is refused rather than pinned.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +151,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyIpamPrefixListResolverTarget` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyIpamPrefixListResolverTargetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyIpamPrefixListResolverTarget"))
+        use crate::state;
+
+        // `ctx` carries request metadata only, and this operation reads none of it: a target
+        // names "the Amazon Web Services Region where the prefix list associated with this
+        // target is located" (`IpamPrefixListResolverTarget$PrefixListRegion`), which was
+        // settled when the target was created and no modification moves it. The store is
+        // reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "A check for whether you have the required permissions for the action WITHOUT
+        // ACTUALLY MAKING THE REQUEST and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`ModifyIpamPrefixListResolverTargetRequest$DryRun`): the flag asks about PERMISSION,
+        // not about the resources the request names, so it is answered before anything is
+        // resolved — the same place the create of this resource and the modify of its resolver
+        // answer it. Every caller of this emulator is permitted, and nothing is stored.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let modification = state::IpamPrefixListResolverTargetModification {
+            ipam_prefix_list_resolver_target_id: input.ipam_prefix_list_resolver_target_id.clone(),
+            desired_version: input.desired_version,
+            track_latest_version: input.track_latest_version,
+        };
+        // "A unique, case-sensitive identifier that you provide to ensure the idempotency of the
+        // request" (`$ClientToken`) names no second target and nothing a replay could duplicate:
+        // what this call does is SET the two members above on one target, so performing it twice
+        // leaves exactly the record performing it once leaves — which is what the token is there
+        // to guarantee. There is nothing for the store to remember it by, so it is not stored.
+        let _ = &input.client_token;
+        let target_id = modification.ipam_prefix_list_resolver_target_id.as_str();
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts:
+        // what this modification is applied to is the target as it ACTUALLY stands — its
+        // creation settled and its prefix list synchronized — rather than as the call before it
+        // left it.
+        store.materialize_due_transitions();
+
+        // "The ID of the IPAM prefix list resolver target to modify"
+        // (`$IpamPrefixListResolverTargetId`): an id this account holds no target for is
+        // `.NotFound`, in the wording this operation answers that code with
+        // ([`target_id_not_found`]). There is no form of the id to check before it: the model
+        // publishes no pattern for `IpamPrefixListResolverTargetId`.
+        let current = store
+            .ipam_prefix_list_resolver_targets
+            .get(target_id)
+            .cloned()
+            .ok_or_else(|| target_id_not_found(target_id))?;
+
+        // "The desired version of the prefix list to target. This allows you to pin the target
+        // to a specific version" (`$DesiredVersion`): the versions a prefix list HAS are the
+        // ones its own revisions minted, from its first up to "the version of the prefix list"
+        // (`ManagedPrefixList$Version`) it stands at now, so a version outside that range — and
+        // any version at all of a list this store no longer holds — is refused rather than
+        // pinned to a version nothing could ever synchronize.
+        if let Some(named) = input.desired_version {
+            let prefix_list_id = current.prefix_list_id.clone().unwrap_or_default();
+            let latest = store.managed_prefix_list_version(&prefix_list_id);
+            if named < state::FIRST_PREFIX_LIST_VERSION
+                || latest.is_none_or(|latest| named > latest)
+            {
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({named}) for parameter desiredVersion is invalid. The prefix list \
+                     '{prefix_list_id}' has no version {named}"
+                )));
+            }
+        }
+
+        // Written through the store's ONE writer of a target modification, so what this answers
+        // is the stored record a later `DescribeIpamPrefixListResolverTargets` of the same
+        // target reports rather than a value built here. Nothing caller-chosen is retained —
+        // both members the request may carry are numbers the model fixes the width of — so the
+        // store's byte budget has nothing to be asked about.
+        let modified = store
+            .modify_ipam_prefix_list_resolver_target(&modification)
+            .ok_or_else(|| {
+                // Unreachable: the target was resolved above and the store is locked throughout.
+                state::internal_error(format!(
+                    "the IPAM prefix list resolver target '{target_id}' could not be read back \
+                     after its modification"
+                ))
+            })?;
+
+        Ok(ModifyIpamPrefixListResolverTargetOutput {
+            ipam_prefix_list_resolver_target: Some(modified),
+        })
     }
+}
+
+/// Refuse an `IpamPrefixListResolverTargetId` this account holds no target for, as THIS
+/// operation words that refusal: HTTP 400
+/// [`crate::state::INVALID_IPAM_PREFIX_LIST_RESOLVER_TARGET_ID_NOT_FOUND`] — the resource's own
+/// code — carrying the quoted, id-interpolated sentence the rest of EC2 answers an unresolvable
+/// id with ([`crate::state::id_not_found`]): `The <resource type> ID '<id>' does not exist`, over
+/// this resource's modelled type
+/// ([`crate::state::RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER_TARGET`]) and the id the REQUEST
+/// named, never a stored one.
+///
+/// Worded here rather than through this family's shared refusal
+/// ([`crate::state::invalid_ipam_prefix_list_resolver_target_id_not_found`]) for the reason the
+/// resolver's own modify words its refusal in its handler: the DESCRIBES of this resource answer
+/// the same code with a sentence that interpolates NOTHING, and the sentence above is the one
+/// this operation is recorded answering, so neither can be reworded into the other.
+fn target_id_not_found(target_id: &str) -> ModifyIpamPrefixListResolverTargetError {
+    crate::state::id_not_found(
+        crate::state::INVALID_IPAM_PREFIX_LIST_RESOLVER_TARGET_ID_NOT_FOUND,
+        &format!(
+            "{resource} ID",
+            resource = crate::state::RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER_TARGET
+        ),
+        target_id,
+    )
 }

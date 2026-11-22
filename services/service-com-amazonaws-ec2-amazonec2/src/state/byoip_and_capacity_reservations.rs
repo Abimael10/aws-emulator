@@ -2051,17 +2051,18 @@ pub fn require_known_instance_connect_endpoint<E>(
 
 /// Refuse a request that named an EC2 Instance Connect Endpoint id no endpoint of the
 /// account has: HTTP 400 `InvalidInstanceConnectEndpointId.NotFound`, worded as EC2 words
-/// this error class — the resource, the id the request named, and what the caller has to do
-/// about it — with the id taken from the request.
+/// every `Invalid<Kind>.NotFound` of a resource id — `The <resource type> ID '<id>' does not
+/// exist` ([`id_not_found_message`]) over this resource's modelled type
+/// ([`RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT`]) — with the id taken from the REQUEST.
 pub fn invalid_instance_connect_endpoint_id_not_found<E>(
     endpoint_id: &str,
 ) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_INSTANCE_CONNECT_ENDPOINT_ID_NOT_FOUND,
         400,
-        format!(
-            "The Instance Connect Endpoint {endpoint_id} does not exist. Add an existing \
-             Instance Connect Endpoint ID and retry your request."
+        id_not_found_message(
+            &format!("{RESOURCE_TYPE_INSTANCE_CONNECT_ENDPOINT} ID"),
+            endpoint_id,
         ),
     )
 }

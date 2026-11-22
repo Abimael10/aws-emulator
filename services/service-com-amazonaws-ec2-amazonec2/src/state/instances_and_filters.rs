@@ -1018,24 +1018,27 @@ impl ComAmazonawsEc2Amazonec2State {
         // `create-in-progress` reaches `create-complete` once its due instant has passed,
         // whether or not anybody called — the same contract as the scope above, and the reason
         // the target's due instant is kept beside the target rather than on the modelled shape.
-        let resolver_targets = &mut self.ipam_prefix_list_resolver_targets;
-        self.ipam_prefix_list_resolver_target_create_complete_at
-            .retain(|target_id, due_at| {
-                if now < *due_at {
-                    return true;
-                }
-                if let Some(target) = resolver_targets.get_mut(target_id) {
-                    if target.state.as_deref()
-                        == Some(IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_IN_PROGRESS)
-                    {
-                        target.state = Some(
-                            IPAM_PREFIX_LIST_RESOLVER_TARGET_STATE_CREATE_COMPLETE.to_string(),
-                        );
-                    }
-                }
-                // The transition is applied once; nothing is owed on this target any more.
-                false
-            });
+        // Reaching it is also when the target SYNCHRONIZES the prefix list it was created
+        // against, which is what records the version it synchronized
+        // ([`Self::complete_ipam_prefix_list_resolver_target_creation`]) — so the due ids are
+        // collected first and each move applied through that one seam.
+        let due_targets: Vec<String> = self
+            .ipam_prefix_list_resolver_target_create_complete_at
+            .iter()
+            .filter(|(_, due_at)| now >= **due_at)
+            .map(|(target_id, _)| target_id.clone())
+            .collect();
+        for target_id in due_targets {
+            // The transition is applied once; nothing is owed on this target any more.
+            self.ipam_prefix_list_resolver_target_create_complete_at
+                .remove(&target_id);
+            self.complete_ipam_prefix_list_resolver_target_creation(&target_id);
+        }
+        // A target `ModifyIpamPrefixListResolverTarget` answered as `modify-in-progress` reaches
+        // `modify-complete` once its due instant has passed, whether or not anybody called —
+        // the same contract as its creation above, on the same clock, and it synchronizes the
+        // version the modification left it configured for.
+        self.materialize_due_ipam_prefix_list_resolver_target_modifications(now);
         // A resource discovery `CreateIpamResourceDiscovery` answered as `create-in-progress`
         // reaches `create-complete` once its due instant has passed, whether or not anybody
         // called — the same contract as the scope above. The DEFAULT discovery of an IPAM is
