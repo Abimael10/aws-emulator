@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReadSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReadSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReadSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +114,101 @@ impl From<ListReadSetsErrorModeled> for ListReadSetsError {
     }
 }
 
+/// A page token naming the read set the NEXT page starts at. The codec and the page
+/// bound are [`crate::state::encode_page_token`] / [`crate::state::decode_page_token`]
+/// and [`crate::state::MAX_LIST_PAGE_SIZE`], shared with this crate's other listings;
+/// this wrapper only renders an unreadable token as THIS operation's 400 refusal.
+fn decode_page_token(token: &str) -> Result<u64, ListReadSetsError> {
+    crate::state::decode_page_token(crate::state::READ_SET_PAGE_TOKEN_TAG, token).ok_or_else(|| {
+        ListReadSetsErrorModeled::ValidationException(ValidationException {
+            message: "nextToken is not a pagination token issued by ListReadSets".to_string(),
+        })
+        .into()
+    })
+}
+
+/// Whether `read_set` satisfies every member `filter` names.
+///
+/// Each member narrows the listing on its own and a member the filter leaves out narrows
+/// nothing, so a filter that names none selects every read set; the two instant bounds
+/// are inclusive. `referenceArn` also admits the empty string — its modelled pattern is
+/// `^$|^arn:.+$` — which names no reference genome and therefore narrows nothing either.
+fn matches(filter: Option<&ReadSetFilter>, read_set: &crate::state::ReadSet) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    filter
+        .name
+        .as_deref()
+        .is_none_or(|name| read_set.name == name)
+        && filter
+            .status
+            .as_deref()
+            .is_none_or(|status| read_set.status == status)
+        && filter
+            .sample_id
+            .as_deref()
+            .is_none_or(|sample_id| read_set.sample_id == sample_id)
+        && filter
+            .subject_id
+            .as_deref()
+            .is_none_or(|subject_id| read_set.subject_id == subject_id)
+        && filter
+            .generated_from
+            .as_deref()
+            .is_none_or(|generated_from| {
+                read_set.generated_from.as_deref() == Some(generated_from)
+            })
+        && filter
+            .creation_type
+            .as_deref()
+            .is_none_or(|creation_type| read_set.creation_type == creation_type)
+        && filter
+            .reference_arn
+            .as_deref()
+            .filter(|reference_arn| !reference_arn.is_empty())
+            .is_none_or(|reference_arn| read_set.reference_arn.as_deref() == Some(reference_arn))
+        && filter.created_after.as_ref().is_none_or(|after| {
+            after
+                .to_millis()
+                .is_ok_and(|ms| ms <= read_set.creation_time_ms)
+        })
+        && filter.created_before.as_ref().is_none_or(|before| {
+            before
+                .to_millis()
+                .is_ok_and(|ms| ms >= read_set.creation_time_ms)
+        })
+}
+
+/// One stored read set as this listing's item: every member `ReadSetListItem` models,
+/// read from that record alone, so a listed read set reports exactly what its own
+/// `GetReadSetMetadata` reports and nothing is invented for a member the upload that
+/// formed it never carried.
+///
+/// `etag` is left out for the reason `GetReadSetMetadata` leaves it out: the published
+/// ETag algorithm families are computed over the sequence records the real service
+/// ingests, and nothing here parses a FASTQ, BAM or CRAM record out of the uploaded
+/// bytes, so a digest of anything else would never match a client's.
+fn reported(read_set: &crate::state::ReadSet) -> ReadSetListItem {
+    ReadSetListItem {
+        id: read_set.id.clone(),
+        arn: read_set.arn.clone(),
+        sequence_store_id: read_set.sequence_store_id.clone(),
+        subject_id: Some(read_set.subject_id.clone()),
+        sample_id: Some(read_set.sample_id.clone()),
+        status: read_set.status.clone(),
+        name: Some(read_set.name.clone()),
+        description: read_set.description.clone(),
+        reference_arn: read_set.reference_arn.clone(),
+        file_type: read_set.file_type.clone(),
+        sequence_information: read_set.sequence_information_output(),
+        creation_time: crate::state::timestamp(read_set.creation_time_ms),
+        status_message: read_set.status_message.clone(),
+        creation_type: Some(read_set.creation_type.clone()),
+        etag: None,
+    }
+}
+
 /// The `ListReadSets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +245,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReadSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReadSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReadSets"))
+        // Reporting only: every member below is read from a stored read set, and the only
+        // write is the status transition the clock already owed each record, which was due
+        // at the same instant whether or not anybody called. Every branch records the call
+        // through `crate::state::audit`; a listing resolves no single resource, so its
+        // records carry `crate::state::AUDIT_NO_RESOURCE` once the store it reads has
+        // resolved.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            ListReadSetsErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics sequence store registry is unavailable".to_string(),
+            })
+        })?;
+
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_LIST_PAGE_SIZE, |requested| {
+                requested.clamp(1, crate::state::MAX_LIST_PAGE_SIZE as i32) as usize
+            });
+        let start = match input.next_token.as_deref().map(decode_page_token) {
+            Some(Err(refusal)) => {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    None,
+                );
+                return Err(refusal);
+            }
+            Some(Ok(start)) => start,
+            None => 0,
+        };
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // A read set is held BY a sequence store, so an id no store holds is "not found"
+        // rather than an empty listing. The store's CANONICAL id is what the walk below
+        // narrows on, so the listing is insensitive to the spelling of a `^[0-9]+$` id in
+        // exactly the way every other lookup is.
+        let Some(sequence_store_id) = registry
+            .sequence_store(&input.sequence_store_id)
+            .map(|store| store.id.clone())
+        else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.sequence_store_id),
+            );
+            return Err(ListReadSetsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut read_sets = Vec::new();
+        let mut next_token = None;
+        // The read sets the store still HOLDS, narrowed by the filter the request carried.
+        // A read set whose content the service has released no longer occupies the store —
+        // it is what `DeleteSequenceStore` stops counting as a dependent — so it is no
+        // longer among the store's read sets here either. The walk is the store's own key
+        // order — ascending `readSetId`, so creation order — which makes it stable across
+        // calls and lets a token name the read set the next page resumes at.
+        for (key, read_set) in registry.read_sets_for(&sequence_store_id) {
+            if *key < start || !read_set.is_held() || !matches(input.filter.as_ref(), read_set) {
+                continue;
+            }
+            // The first read set that does not fit becomes the next page's start, and only
+            // then is a `nextToken` emitted — the last page carries none.
+            if read_sets.len() == page_size {
+                next_token = Some(crate::state::encode_page_token(
+                    crate::state::READ_SET_PAGE_TOKEN_TAG,
+                    *key,
+                ));
+                break;
+            }
+            read_sets.push(reported(read_set));
+        }
+
+        crate::state::audit(Self::NAME, ctx, crate::state::AuditOutcome::Reported, None);
+
+        Ok(ListReadSetsOutput {
+            next_token,
+            read_sets,
+        })
     }
 }

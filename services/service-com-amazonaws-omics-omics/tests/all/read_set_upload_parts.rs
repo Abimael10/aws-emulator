@@ -26,15 +26,19 @@
 //! * `ListReadSetUploadParts` reports exactly the parts stored for the one upload and
 //!   source the request names, in ascending part-number order, each member read from the
 //!   stored part, paging over them and narrowing them by creation instant;
+//! * `ListReadSets` reports exactly the read sets the one sequence store the request names
+//!   still holds, each member read from that read set's own stored record, in ascending
+//!   `readSetId` order, paging over them and narrowing them by every member of its filter;
 //! * a request naming a sequence store or an upload this emulator does not hold — or
 //!   carrying no content at all — is refused rather than stored.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_omics_omics::state::{
     service_state, CREATION_TYPE_UPLOAD, FIRST_SEQUENCE_STORE_ID,
-    MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE, READ_SET_ID_OFFSET, READ_SET_NOT_FOUND_MESSAGE,
-    READ_SET_STATUS_ACTIVE, READ_SET_STATUS_PROCESSING_UPLOAD, RESOURCE_HAS_DEPENDENTS_MESSAGE,
-    SEQUENCE_STORE_NOT_FOUND_MESSAGE,
+    MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE, MULTIPART_READ_SET_UPLOAD_PAGE_TOKEN_TAG,
+    READ_SET_ID_OFFSET, READ_SET_NOT_FOUND_MESSAGE, READ_SET_PAGE_TOKEN_TAG,
+    READ_SET_STATUS_ACTIVE, READ_SET_STATUS_DELETED, READ_SET_STATUS_PROCESSING_UPLOAD,
+    RESOURCE_HAS_DEPENDENTS_MESSAGE, SEQUENCE_STORE_NOT_FOUND_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1776,4 +1780,728 @@ async fn a_sequence_store_holding_a_read_set_cannot_be_deleted() {
         registry.sequence_store(&empty).is_none(),
         "case \"an empty store\": the store must be gone"
     );
+}
+
+// ---------------------------------------------------------------------------
+// ListReadSets
+// ---------------------------------------------------------------------------
+//
+// The rules the cases below assert:
+//
+// * `ListReadSets` reports exactly the read sets the one sequence store the request names
+//   still holds, in ascending `readSetId` order — which is creation order — each member
+//   read from that read set's own stored record, so a listed read set reports what its own
+//   `GetReadSetMetadata` reports and nothing else;
+// * the listing pages over them by `maxResults`/`nextToken`, and a token it did not issue
+//   is refused;
+// * every member of the filter narrows the listing on its own, a member the filter leaves
+//   out narrows nothing, and both instant bounds are inclusive;
+// * a read set the store no longer holds leaves the listing;
+// * a sequence store id no store holds is the modelled 404.
+
+/// The published bounds of the modelled `maxResults` range (1..100).
+/// Source: the `maxResults` member of `ListReadSetsRequest`.
+const MAX_RESULTS_RANGE: (i64, i64) = (1, 100);
+
+/// Every member the modelled `ReadSetListItem` carries.
+/// Source: `smithy_query(query="shape",shape="ReadSetListItem")`.
+const READ_SET_LIST_ITEM_MEMBERS: &[&str] = &[
+    "id",
+    "arn",
+    "sequenceStoreId",
+    "subjectId",
+    "sampleId",
+    "status",
+    "name",
+    "description",
+    "referenceArn",
+    "fileType",
+    "sequenceInformation",
+    "creationTime",
+    "statusMessage",
+    "creationType",
+    "etag",
+];
+
+/// The members of `ReadSetListItem` the model makes required, which every listed read set
+/// therefore has to carry.
+/// Source: the same shape — `id`, `arn`, `sequenceStoreId`, `status`, `fileType` and
+/// `creationTime` are `@required`.
+const READ_SET_LIST_ITEM_REQUIRED: &[&str] = &[
+    "id",
+    "arn",
+    "sequenceStoreId",
+    "status",
+    "fileType",
+    "creationTime",
+];
+
+/// The members `GetReadSetMetadata` reports that the listing's item does NOT model, so a
+/// listed read set carries neither.
+/// Source: `ReadSetListItem` has no `files` and no `creationJobId` member.
+const NOT_IN_READ_SET_LIST_ITEM: &[&str] = &["files", "creationJobId"];
+
+/// The modelled `CreationType` an uploaded read set does NOT carry.
+/// Source: `smithy_query(query="shape",shape="CreationType")` -> IMPORT | UPLOAD.
+const CREATION_TYPE_IMPORT: &str = "IMPORT";
+
+/// A modelled `ReadSetStatus` no read set this emulator forms ever carries.
+/// Source: `smithy_query(query="shape",shape="ReadSetStatus")` -> ARCHIVED | ACTIVATING |
+/// ACTIVE | DELETING | DELETED | PROCESSING_UPLOAD | UPLOAD_FAILED.
+const READ_SET_STATUS_ARCHIVED: &str = "ARCHIVED";
+
+/// `POST /sequencestore/{store}/readsets{query}`, carrying `filter` when the case names
+/// one: `maxResults` and `nextToken` are `@httpQuery`, the filter is the request body.
+async fn list_read_sets(
+    router: &MultiServiceRouter,
+    sequence_store_id: &str,
+    query: &str,
+    filter: Option<&Value>,
+) -> (u16, Value) {
+    let body = match filter {
+        Some(filter) => json!({ "filter": filter }),
+        None => json!({}),
+    };
+    call(
+        router,
+        "POST",
+        &format!("/sequencestore/{sequence_store_id}/readsets{query}"),
+        Some(&body),
+    )
+    .await
+}
+
+/// The `readSets` of a 200 listing response, after asserting the status.
+fn listed_read_sets(case: &str, status: u16, body: &Value) -> Vec<Value> {
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {body:?}");
+    body.get("readSets")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: response carried no readSets, got {body:?}"))
+        .clone()
+}
+
+/// The `id` of each listed read set, in the order the listing reported them.
+fn listed_ids(case: &str, items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .map(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a listed read set carried no id, got {item:?}")
+                })
+                .to_string()
+        })
+        .collect()
+}
+
+/// A row of the read set table: how the row is reported in a failure, and the members the
+/// upload that forms it carries.
+struct ListedReadSet {
+    case: &'static str,
+    upload: Value,
+}
+
+/// The read sets every listing case below is asserted over, so each rule is checked over a
+/// class of read sets and not over one. The rows differ along the source format, the
+/// subject and the sample they came from, where the sequence was generated, whether they
+/// name a reference genome and whether they carry a description — so every filter member
+/// has rows on both sides of it, sharing values across rows where a filter must select
+/// several.
+fn listed_read_set_table() -> Vec<ListedReadSet> {
+    vec![
+        ListedReadSet {
+            case: "a single-source FASTQ",
+            upload: json!({
+                "name": "a single-source FASTQ",
+                "sourceFileType": "FASTQ",
+                "subjectId": "subject-alpha",
+                "sampleId": "sample-one",
+            }),
+        },
+        ListedReadSet {
+            case: "a described FASTQ",
+            upload: json!({
+                "name": "a described FASTQ",
+                "sourceFileType": "FASTQ",
+                "subjectId": "subject-alpha",
+                "sampleId": "sample-two",
+                "description": "the second cohort",
+            }),
+        },
+        ListedReadSet {
+            case: "a FASTQ with a named origin",
+            upload: json!({
+                "name": "a FASTQ with a named origin",
+                "sourceFileType": "FASTQ",
+                "subjectId": "subject-beta",
+                "sampleId": "sample-one",
+                "generatedFrom": "1000 Genomes",
+            }),
+        },
+        ListedReadSet {
+            case: "an aligned CRAM",
+            upload: json!({
+                "name": "an aligned CRAM",
+                "sourceFileType": "CRAM",
+                "subjectId": "subject-beta",
+                "sampleId": "sample-three",
+                "referenceArn": REFERENCE_ARN,
+                "description": "aligned reads",
+            }),
+        },
+        ListedReadSet {
+            case: "a UBAM",
+            upload: json!({
+                "name": "a UBAM",
+                "sourceFileType": "UBAM",
+                "subjectId": "subject-gamma",
+                "sampleId": "sample-one",
+            }),
+        },
+    ]
+}
+
+/// Form one read set per row of [`listed_read_set_table`] inside `store`, each out of one
+/// uploaded part, and answer their ids in the order they were formed.
+async fn form_listed_read_sets(router: &MultiServiceRouter, store: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for row in listed_read_set_table() {
+        let (status, body) = create_upload(router, store, &row.upload).await;
+        let upload = created_upload_id(row.case, status, &body);
+        let uploaded = upload_all(
+            router,
+            row.case,
+            store,
+            &upload,
+            &[("SOURCE1", 1, row.case.as_bytes().to_vec())],
+        )
+        .await;
+        let (status, body) = complete_upload(router, store, &upload, &parts_list(&uploaded)).await;
+        ids.push(completed_read_set_id(row.case, status, &body));
+    }
+    ids
+}
+
+/// Wait until every read set of `ids` carries the status the clock owes it, so a case that
+/// reads or filters on the status sees a settled store rather than a race.
+async fn await_all_active(router: &MultiServiceRouter, store: &str, ids: &[String]) {
+    for id in ids {
+        await_read_set_status(router, store, id, READ_SET_STATUS_ACTIVE).await;
+    }
+}
+
+/// The read set ids the rows named by `cases` were formed with, in table order.
+fn ids_of(cases: &[&str], ids: &[String]) -> Vec<String> {
+    listed_read_set_table()
+        .iter()
+        .zip(ids)
+        .filter(|(row, _)| cases.contains(&row.case))
+        .map(|(_, id)| id.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn list_read_sets_reports_the_read_sets_its_store_holds() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the listed store").await;
+    let elsewhere = create_store(&router, "another listed store").await;
+    let ids = form_listed_read_sets(&router, &store).await;
+    let elsewhere_ids = form_listed_read_sets(&router, &elsewhere).await;
+    await_all_active(&router, &store, &ids).await;
+
+    let case = "every read set the store holds";
+    let (status, body) = list_read_sets(&router, &store, "", None).await;
+    let items = listed_read_sets(case, status, &body);
+    assert_eq!(
+        listed_ids(case, &items),
+        ids,
+        "case {case:?}: expected the store's read sets in creation order, got {body:?}"
+    );
+    // The last page carries no token: everything the store holds fitted in it.
+    assert_absent(case, &["nextToken"], &body);
+    // Ascending `readSetId`, which is what lets a page token name a resume point.
+    let keys: Vec<u64> = ids
+        .iter()
+        .map(|id| id.parse().expect("a numeric readSetId"))
+        .collect();
+    assert!(
+        keys.windows(2).all(|pair| pair[0] < pair[1]),
+        "case {case:?}: expected ascending read set ids, got {keys:?}"
+    );
+
+    // Every member of a listed read set is the stored record's, which is exactly what that
+    // read set's own `GetReadSetMetadata` reports.
+    for (row, (id, item)) in listed_read_set_table()
+        .iter()
+        .zip(ids.iter().zip(items.iter()))
+    {
+        let case = row.case;
+        let (status, metadata) = read_set_metadata(&router, &store, id).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {metadata:?}");
+        for member in READ_SET_LIST_ITEM_MEMBERS {
+            assert_eq!(
+                item.get(member),
+                metadata.get(member),
+                "case {case:?}: the listed {member} must be the one GetReadSetMetadata \
+                 reports, got {item:?} against {metadata:?}"
+            );
+        }
+        for member in READ_SET_LIST_ITEM_REQUIRED {
+            assert!(
+                item.get(member).is_some(),
+                "case {case:?}: a listed read set must carry {member}, got {item:?}"
+            );
+        }
+        assert_absent(case, NOT_IN_READ_SET_LIST_ITEM, item);
+        assert_members(
+            case,
+            "ListReadSets",
+            &json!({
+                "id": id,
+                "sequenceStoreId": store,
+                "name": case,
+                "status": READ_SET_STATUS_ACTIVE,
+                "creationType": CREATION_TYPE_UPLOAD,
+            }),
+            item,
+        );
+        assert_timestamp(case, "creationTime", item);
+    }
+
+    // A read set belongs to the store that holds it: the other store's read sets are
+    // neither in this listing nor mixed into its own.
+    for id in &elsewhere_ids {
+        assert!(
+            !ids.contains(id),
+            "case {case:?}: read set {id} was minted for another store"
+        );
+    }
+    let case = "the other store's own listing";
+    let (status, body) = list_read_sets(&router, &elsewhere, "", None).await;
+    let items = listed_read_sets(case, status, &body);
+    assert_eq!(
+        listed_ids(case, &items),
+        elsewhere_ids,
+        "case {case:?}: expected only the other store's read sets, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_read_sets_narrows_on_every_filter_member() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the filtered store").await;
+    let ids = form_listed_read_sets(&router, &store).await;
+    await_all_active(&router, &store, &ids).await;
+
+    /// A row of the filter table: the filter a case sends and the rows it must select.
+    struct FilterCase {
+        case: &'static str,
+        filter: Value,
+        selects: &'static [&'static str],
+    }
+    let every_row: &[&str] = &[
+        "a single-source FASTQ",
+        "a described FASTQ",
+        "a FASTQ with a named origin",
+        "an aligned CRAM",
+        "a UBAM",
+    ];
+    let rows = vec![
+        FilterCase {
+            case: "a filter naming no member at all",
+            filter: json!({}),
+            selects: every_row,
+        },
+        FilterCase {
+            case: "a name one read set carries",
+            filter: json!({ "name": "a described FASTQ" }),
+            selects: &["a described FASTQ"],
+        },
+        FilterCase {
+            case: "a name nothing carries",
+            filter: json!({ "name": "no read set is called this" }),
+            selects: &[],
+        },
+        FilterCase {
+            case: "the status every settled read set carries",
+            filter: json!({ "status": READ_SET_STATUS_ACTIVE }),
+            selects: every_row,
+        },
+        FilterCase {
+            case: "a modelled status none carries",
+            filter: json!({ "status": READ_SET_STATUS_ARCHIVED }),
+            selects: &[],
+        },
+        FilterCase {
+            case: "a sample three read sets share",
+            filter: json!({ "sampleId": "sample-one" }),
+            selects: &[
+                "a single-source FASTQ",
+                "a FASTQ with a named origin",
+                "a UBAM",
+            ],
+        },
+        FilterCase {
+            case: "a subject two read sets share",
+            filter: json!({ "subjectId": "subject-beta" }),
+            selects: &["a FASTQ with a named origin", "an aligned CRAM"],
+        },
+        FilterCase {
+            case: "where the sequence was generated",
+            filter: json!({ "generatedFrom": "1000 Genomes" }),
+            selects: &["a FASTQ with a named origin"],
+        },
+        FilterCase {
+            case: "the creation type an uploaded read set carries",
+            filter: json!({ "creationType": CREATION_TYPE_UPLOAD }),
+            selects: every_row,
+        },
+        FilterCase {
+            case: "the other modelled creation type",
+            filter: json!({ "creationType": CREATION_TYPE_IMPORT }),
+            selects: &[],
+        },
+        FilterCase {
+            case: "a reference genome one read set is aligned against",
+            filter: json!({ "referenceArn": REFERENCE_ARN }),
+            selects: &["an aligned CRAM"],
+        },
+        FilterCase {
+            case: "a reference genome nothing is aligned against",
+            filter: json!({
+                "referenceArn":
+                    "arn:aws:omics:us-west-2:000000000000:referenceStore/1000000000/reference/9",
+            }),
+            selects: &[],
+        },
+        FilterCase {
+            // The modelled `ReferenceArnFilter` pattern is `^$|^arn:.+$` with length
+            // 0..127, so the empty string is a value the member admits; it names no
+            // reference genome, so it narrows nothing.
+            case: "the empty reference ARN the model admits",
+            filter: json!({ "referenceArn": "" }),
+            selects: every_row,
+        },
+        FilterCase {
+            case: "two members that agree on one read set",
+            filter: json!({ "name": "a UBAM", "sampleId": "sample-one" }),
+            selects: &["a UBAM"],
+        },
+        FilterCase {
+            case: "two members that agree on none",
+            filter: json!({ "name": "a UBAM", "sampleId": "sample-two" }),
+            selects: &[],
+        },
+        FilterCase {
+            case: "a subject and a sample that meet in one read set",
+            filter: json!({ "subjectId": "subject-alpha", "sampleId": "sample-one" }),
+            selects: &["a single-source FASTQ"],
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let (status, body) = list_read_sets(&router, &store, "", Some(&row.filter)).await;
+        let items = listed_read_sets(case, status, &body);
+        assert_eq!(
+            listed_ids(case, &items),
+            ids_of(row.selects, &ids),
+            "case {case:?}: expected the read sets {:?}, got {body:?}",
+            row.selects
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_read_sets_bounds_the_listing_by_creation_instant() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the time-filtered store").await;
+    let ids = form_listed_read_sets(&router, &store).await;
+    await_all_active(&router, &store, &ids).await;
+
+    // What each read set reports as its own creation instant: the wire value a filter
+    // bound carries, and the instant the expectation is computed from — so the rule is
+    // asserted against the store's own instants rather than against an assumed ordering.
+    let mut instants: Vec<(String, String, f64)> = Vec::new();
+    for id in &ids {
+        let (status, metadata) = read_set_metadata(&router, &store, id).await;
+        assert_eq!(status, 200, "read set {id}: expected 200, got {metadata:?}");
+        let text = metadata
+            .get("creationTime")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("read set {id}: no creationTime, got {metadata:?}"))
+            .to_string();
+        let seconds = assert_timestamp(id, "creationTime", &metadata);
+        instants.push((id.clone(), text, seconds));
+    }
+
+    for (id, text, seconds) in &instants {
+        // Both bounds are INCLUSIVE, so a read set's own instant selects it.
+        let case = format!("createdAfter the instant of read set {id}");
+        let (status, body) =
+            list_read_sets(&router, &store, "", Some(&json!({ "createdAfter": text }))).await;
+        let items = listed_read_sets(&case, status, &body);
+        let expected: Vec<String> = instants
+            .iter()
+            .filter(|(_, _, other)| other >= seconds)
+            .map(|(other, _, _)| other.clone())
+            .collect();
+        assert_eq!(
+            listed_ids(&case, &items),
+            expected,
+            "case {case:?}: expected every read set created at or after {text}, got {body:?}"
+        );
+
+        let case = format!("createdBefore the instant of read set {id}");
+        let (status, body) =
+            list_read_sets(&router, &store, "", Some(&json!({ "createdBefore": text }))).await;
+        let items = listed_read_sets(&case, status, &body);
+        let expected: Vec<String> = instants
+            .iter()
+            .filter(|(_, _, other)| other <= seconds)
+            .map(|(other, _, _)| other.clone())
+            .collect();
+        assert_eq!(
+            listed_ids(&case, &items),
+            expected,
+            "case {case:?}: expected every read set created at or before {text}, got {body:?}"
+        );
+
+        // The two bounds together are a window, and the narrowest one still holds the read
+        // set whose instant it was taken from.
+        let case = format!("the one-instant window of read set {id}");
+        let (status, body) = list_read_sets(
+            &router,
+            &store,
+            "",
+            Some(&json!({ "createdAfter": text, "createdBefore": text })),
+        )
+        .await;
+        let items = listed_read_sets(&case, status, &body);
+        assert!(
+            listed_ids(&case, &items).contains(id),
+            "case {case:?}: expected the window to hold read set {id}, got {body:?}"
+        );
+    }
+
+    // A window that closes before the store held anything selects nothing, and one that
+    // opens after it selects nothing either.
+    let (earliest, _, _) = instants.first().expect("at least one read set");
+    let (status, metadata) = read_set_metadata(&router, &store, earliest).await;
+    assert_eq!(status, 200, "expected 200, got {metadata:?}");
+    for (case, filter) in [
+        (
+            "a window closing before the store held anything",
+            json!({ "createdBefore": "2001-01-01T00:00:00Z" }),
+        ),
+        (
+            "a window opening long after it",
+            json!({ "createdAfter": "2999-01-01T00:00:00Z" }),
+        ),
+    ] {
+        let (status, body) = list_read_sets(&router, &store, "", Some(&filter)).await;
+        let items = listed_read_sets(case, status, &body);
+        assert!(
+            items.is_empty(),
+            "case {case:?}: expected no read set, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_read_sets_pages_over_its_store_in_creation_order() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the paged store").await;
+    let ids = form_listed_read_sets(&router, &store).await;
+    await_all_active(&router, &store, &ids).await;
+
+    let (smallest, largest) = MAX_RESULTS_RANGE;
+    for page_size in [smallest, 2, 3, ids.len() as i64, largest] {
+        let case = format!("maxResults={page_size}");
+        let mut seen: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let query = match &token {
+                Some(token) => format!("?maxResults={page_size}&nextToken={token}"),
+                None => format!("?maxResults={page_size}"),
+            };
+            let (status, body) = list_read_sets(&router, &store, &query, None).await;
+            let items = listed_read_sets(&case, status, &body);
+            assert!(
+                items.len() as i64 <= page_size,
+                "case {case:?}: expected at most {page_size} read sets in a page, got {body:?}"
+            );
+            seen.extend(listed_ids(&case, &items));
+            assert!(
+                seen.len() <= ids.len(),
+                "case {case:?}: the pages reported more read sets than the store holds, \
+                 got {seen:?}"
+            );
+            match body.get("nextToken").and_then(Value::as_str) {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen, ids,
+            "case {case:?}: paging must report every read set exactly once, in creation order"
+        );
+    }
+
+    // A page size outside the modelled range is refused by the constraint walk, so the
+    // page a request can ask for is bounded on both sides.
+    for page_size in [smallest - 1, largest + 1] {
+        let case = format!("maxResults={page_size}");
+        let (status, body) =
+            list_read_sets(&router, &store, &format!("?maxResults={page_size}"), None).await;
+        assert_eq!(status, 400, "case {case:?}: expected 400, got {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+    }
+
+    // A `nextToken` this listing did not issue resumes nothing, so it is refused rather
+    // than read as a position in the store.
+    for (case, token) in [
+        ("a token this service never issued", "notatoken".to_string()),
+        (
+            "another listing's token",
+            format!(
+                "{MULTIPART_READ_SET_UPLOAD_PAGE_TOKEN_TAG}{}",
+                hex::encode(&ids[0])
+            ),
+        ),
+        (
+            "a read set token naming no read set",
+            READ_SET_PAGE_TOKEN_TAG.to_string(),
+        ),
+    ] {
+        let (status, body) =
+            list_read_sets(&router, &store, &format!("?nextToken={token}"), None).await;
+        assert_eq!(status, 400, "case {case:?}: expected 400, got {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body:?}"
+        );
+    }
+
+    // And the token this listing DOES issue resumes it: the page after the first read set
+    // is the rest of the store.
+    let case = "the token the first page issued";
+    let (status, body) = list_read_sets(&router, &store, "?maxResults=1", None).await;
+    let items = listed_read_sets(case, status, &body);
+    assert_eq!(
+        listed_ids(case, &items),
+        ids[..1].to_vec(),
+        "case {case:?}: expected the first read set, got {body:?}"
+    );
+    let token = body
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a nextToken, got {body:?}"));
+    let (status, body) = list_read_sets(
+        &router,
+        &store,
+        &format!("?nextToken={token}&maxResults={largest}"),
+        None,
+    )
+    .await;
+    let items = listed_read_sets(case, status, &body);
+    assert_eq!(
+        listed_ids(case, &items),
+        ids[1..].to_vec(),
+        "case {case:?}: expected the rest of the store, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_read_set_its_store_no_longer_holds_leaves_the_listing() {
+    let (router, engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the emptied store").await;
+    let ids = form_listed_read_sets(&router, &store).await;
+    await_all_active(&router, &store, &ids).await;
+
+    // A read set reaches the terminal `DELETED` status through `BatchDeleteReadSet`, which
+    // is still a 501 in this crate, so the status is set on the stored record through the
+    // service's own state — the one record every read set operation reads — rather than
+    // through a call this emulator cannot answer yet.
+    let released = ids[1].clone();
+    {
+        let state = service_state(&*engine).expect("the omics service state");
+        let mut registry = state.lock();
+        registry
+            .read_set_mut(&store, &released)
+            .unwrap_or_else(|| panic!("no read set {released} is stored"))
+            .status = READ_SET_STATUS_DELETED.to_string();
+    }
+
+    let case = "a read set the store no longer holds";
+    let (status, body) = list_read_sets(&router, &store, "", None).await;
+    let items = listed_read_sets(case, status, &body);
+    let expected: Vec<String> = ids.iter().filter(|id| **id != released).cloned().collect();
+    assert_eq!(
+        listed_ids(case, &items),
+        expected,
+        "case {case:?}: expected the released read set to leave the listing, got {body:?}"
+    );
+
+    // Including when the filter asks for its status by name: it is no longer among the
+    // store's read sets at all.
+    let (status, body) = list_read_sets(
+        &router,
+        &store,
+        "",
+        Some(&json!({ "status": READ_SET_STATUS_DELETED })),
+    )
+    .await;
+    let items = listed_read_sets(case, status, &body);
+    assert!(
+        items.is_empty(),
+        "case {case:?}: expected no read set, got {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_read_sets_refuses_a_sequence_store_nothing_holds() {
+    let (router, _engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the only store").await;
+
+    // However the id is shaped inside the modelled `SequenceStoreId` (len 10..36, decimal):
+    // one no store holds is the modelled 404, and so is one wider than any id this
+    // emulator mints.
+    for (case, sequence_store_id) in [
+        ("an id no store holds", "9999999999".to_string()),
+        ("an id at the top of the modelled length", "9".repeat(36)),
+        (
+            "an id one digit past the ids this emulator mints",
+            format!("{}0", FIRST_SEQUENCE_STORE_ID),
+        ),
+    ] {
+        let (status, body) = list_read_sets(&router, &sequence_store_id, "", None).await;
+        assert_eq!(status, 404, "case {case:?}: expected 404, got {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(SEQUENCE_STORE_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the modelled message, got {body:?}"
+        );
+    }
+
+    // A store that holds no read set yet is an EMPTY listing, not a refusal.
+    let case = "a store holding no read set";
+    let (status, body) = list_read_sets(&router, &store, "", None).await;
+    let items = listed_read_sets(case, status, &body);
+    assert!(
+        items.is_empty(),
+        "case {case:?}: expected an empty listing, got {body:?}"
+    );
+    assert_absent(case, &["nextToken"], &body);
 }

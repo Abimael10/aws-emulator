@@ -13,7 +13,8 @@
 //! upload** a caller initiates against that store
 //! (`CreateMultipartReadSetUpload`) and the **parts** uploaded into it
 //! (`UploadReadSetPart` / `ListReadSetUploadParts`), and the **read set** that upload's
-//! completion forms (`CompleteMultipartReadSetUpload` / `GetReadSetMetadata`). Each resource is stored exactly once, keyed by the numeric id
+//! completion forms (`CompleteMultipartReadSetUpload` / `GetReadSetMetadata` /
+//! `ListReadSets`). Each resource is stored exactly once, keyed by the numeric id
 //! the model's `^[0-9]+$` patterns describe (a version by its name, inside its
 //! workflow's record), so every operation reads and writes the one record.
 //!
@@ -1884,6 +1885,10 @@ pub const WORKFLOW_VERSION_PAGE_TOKEN_TAG: &str = "wfv_";
 /// The same, for `ListMultipartReadSetUploads`. An upload is keyed by its numeric
 /// `uploadId`, so that listing's token names the upload the next page resumes at.
 pub const MULTIPART_READ_SET_UPLOAD_PAGE_TOKEN_TAG: &str = "mrsu_";
+
+/// The same, for `ListReadSets`. A read set is keyed by its numeric `readSetId`, so that
+/// listing's token names the read set the next page resumes at.
+pub const READ_SET_PAGE_TOKEN_TAG: &str = "rs_";
 
 /// A page token naming the record the NEXT page of a listing starts at, by that
 /// record's own key.
