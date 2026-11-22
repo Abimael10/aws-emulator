@@ -33,8 +33,10 @@
 //! no sooner than the threshold times that interval: a registration is never declared
 //! unhealthy faster than the schedule asked for could have decided it. WHY those checks failed
 //! is reported with the verdict ([`CheckFailure`]): a check the target answered with a status
-//! its group's `Matcher` does not accept is the model's own `Target.ResponseCodeMismatch`,
-//! while one nothing answered is worded as the family of load balancer performing it words it.
+//! its group's `Matcher` does not accept is the model's own `Target.ResponseCodeMismatch`, one
+//! that came back with an error or with an answer that is no response at all is its
+//! `Target.FailedHealthChecks`, and one nothing answered within the check's own timeout is
+//! worded as the family of load balancer performing it words it.
 //! What one check observes is decided in [`super::host_counts`], against the effective
 //! health-check port and the ports something behind the registration is listening on — the ones
 //! its scheduler declared ([`ServedPorts`]), and for an instance of this account the ones Amazon
@@ -204,7 +206,10 @@ const UNHEALTHY_TIMED_OUT: (&str, &str, &str) =
 /// Which failure a family of load balancer words a check nothing answered as is the
 /// family's own: an Application Load Balancer waits out the check's timeout and reports
 /// [`UNHEALTHY_TIMED_OUT`], while a Network or Gateway Load Balancer hands the connection on
-/// and reports the failed checks ([`unhealthy_for`]).
+/// and reports the failed checks ([`unhealthy_for`]). A check that came back with an ERROR or
+/// with an answer that is no response is this reason for EVERY family
+/// ([`CheckFailure::Malformed`]): it is the condition the model gives this reason for, and
+/// not one family's wording of a check that went unanswered.
 const UNHEALTHY_FAILED_CHECKS: (&str, &str, &str) = (
     UNHEALTHY_STATE,
     "Target.FailedHealthChecks",
@@ -258,6 +263,17 @@ pub enum CheckFailure {
     /// The target ANSWERED, with the status carried here, and that status is not one its
     /// group's `Matcher` counts as a success ([`RESPONSE_CODE_MISMATCH_REASON`]).
     ResponseCode(u16),
+    /// The check produced an ERROR instead of a response, or an answer that is no response at
+    /// all — the condition the model words as "the load balancer received an error while
+    /// establishing a connection to the target or the target response was malformed"
+    /// ([`UNHEALTHY_FAILED_CHECKS`]).
+    ///
+    /// A different fact from both of the failures beside it: the check was not left without an
+    /// answer within its own timeout, and nothing came back carrying a status to judge against
+    /// the group's criterion, so there is no HTTP code to mismatch. Worded the same way
+    /// whatever family of load balancer performed the check, because it is the model's own
+    /// reason for that condition rather than one family's wording of an unanswered check.
+    Malformed,
 }
 
 impl Observed {
@@ -298,9 +314,10 @@ fn unhealthy_for(family: super::LoadBalancerFamily) -> (&'static str, &'static s
 ///
 /// A check the target ANSWERED is reported as the mismatch it is — the model's own reason for
 /// an answer the group's success criterion rejects, described by the status that answer carried
-/// — and a check nothing answered as the family's own wording of that condition
-/// ([`unhealthy_for`]), which is also what a verdict whose failures are no longer known is
-/// reported as.
+/// — one that came back with an error or an answer that is no response as the failed checks
+/// that condition is the model's reason for ([`UNHEALTHY_FAILED_CHECKS`]), and a check nothing
+/// answered as the family's own wording of that condition ([`unhealthy_for`]), which is also
+/// what a verdict whose failures are no longer known is reported as.
 fn unhealthy_report(
     family: super::LoadBalancerFamily,
     failure: Option<CheckFailure>,
@@ -311,6 +328,7 @@ fn unhealthy_report(
             reason: Some(RESPONSE_CODE_MISMATCH_REASON.to_string()),
             description: Some(response_code_mismatch_description(status)),
         },
+        Some(CheckFailure::Malformed) => reported(UNHEALTHY_FAILED_CHECKS),
         Some(CheckFailure::Unanswered) | None => reported(unhealthy_for(family)),
     }
 }
@@ -954,6 +972,81 @@ mod tests {
                 due, expected,
                 "case {case:?}: expected the next check at {expected:?}, got {due:?}"
             );
+        }
+    }
+
+    /// RULE: an `unhealthy` verdict is WORDED by the condition its last failing check found —
+    /// an answer the group's criterion rejects as the model's response-code mismatch, described
+    /// by the status that answer carried; an error or an answer that is no response as the
+    /// model's failed checks, whatever family performed them; and a check nothing answered as
+    /// the family's own wording of that condition.
+    ///
+    /// The rows span every condition a check can fail on, each read for every family of load
+    /// balancer, and the answered ones over several statuses — so the description is the code
+    /// the target really answered rather than a constant.
+    #[test]
+    fn an_unhealthy_verdict_is_worded_by_the_condition_its_checks_found() {
+        /// The three members one reported health carries, which is what a row compares.
+        fn members(health: &TargetHealth) -> (&str, &str, &str) {
+            (
+                health.state.as_deref().unwrap_or_default(),
+                health.reason.as_deref().unwrap_or_default(),
+                health.description.as_deref().unwrap_or_default(),
+            )
+        }
+        let families = [
+            (
+                "an application load balancer",
+                super::super::LoadBalancerFamily::Application,
+            ),
+            (
+                "a network load balancer",
+                super::super::LoadBalancerFamily::Network,
+            ),
+            (
+                "a gateway load balancer",
+                super::super::LoadBalancerFamily::Gateway,
+            ),
+        ];
+        for (family_case, family) in families {
+            // A check the target ANSWERED: one reason, and a description naming that answer's
+            // own status, for every family.
+            for status in [500_u16, 503, 404, 301] {
+                let report = unhealthy_report(family, Some(CheckFailure::ResponseCode(status)));
+                let described = response_code_mismatch_description(status);
+                let expected = (UNHEALTHY_STATE, RESPONSE_CODE_MISMATCH_REASON, described.as_str());
+                assert_eq!(
+                    members(&report),
+                    expected,
+                    "case {family_case:?} answered {status}: expected {expected:?}, got {:?}",
+                    members(&report)
+                );
+            }
+            // A check that came back with an error or an answer that is no response: the
+            // model's own reason for that condition, with no code to mismatch.
+            let report = unhealthy_report(family, Some(CheckFailure::Malformed));
+            assert_eq!(
+                members(&report),
+                UNHEALTHY_FAILED_CHECKS,
+                "case {family_case:?} an error in place of a response: expected \
+                 {UNHEALTHY_FAILED_CHECKS:?}, got {:?}",
+                members(&report)
+            );
+            // A check nothing answered, and a verdict whose failures are no longer known: the
+            // family's own wording.
+            for (case, failure) in [
+                ("a check nothing answered", Some(CheckFailure::Unanswered)),
+                ("a verdict whose failures are unknown", None),
+            ] {
+                let report = unhealthy_report(family, failure);
+                let expected = unhealthy_for(family);
+                assert_eq!(
+                    members(&report),
+                    expected,
+                    "case {family_case:?} {case}: expected {expected:?}, got {:?}",
+                    members(&report)
+                );
+            }
         }
     }
 }

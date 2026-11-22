@@ -399,7 +399,11 @@ fn rows() -> Vec<Row> {
 /// its check would then count toward no verdict, and whether that happens would be decided by
 /// whether one pass takes longer than that span on this host. An instant no reader can read as
 /// future takes the host's speed out of it.
-fn make_checks_due(engine: &Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` because every suite of this crate that waits for a `lambda` target group's
+/// checks needs it (`all/lambda_health_check_verdict_reasons.rs` among them): ONE reading of
+/// that instant, so they cannot drift on it.
+pub(crate) fn make_checks_due(engine: &Arc<engine::InMemoryEngine>) {
     let state = engine.state::<ElbState>();
     let mut store = state.lock();
     for group in store.target_groups.values_mut() {

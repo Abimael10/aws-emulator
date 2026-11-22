@@ -71,7 +71,9 @@
 //! port: one check of it is an INVOCATION of the function
 //! ([`crate::service::lambda_health_check`]), which this pass performs for the registrations
 //! whose own cadence has made a check due — an invocation is a run of the function, so a look
-//! taken between two checks makes none.
+//! taken between two checks makes none. The status that function RETURNED is what such a check
+//! is judged on, so its verdict is worded by the same three conditions as every other group's
+//! ([`super::target_health::CheckFailure`]) rather than collapsing onto one of them.
 //!
 //! A check that reached the registration is then judged by what it was ANSWERED with, where the
 //! group's own check speaks HTTP semantics: such a check requests `HealthCheckPath` and its
@@ -892,25 +894,15 @@ async fn observe_all_due<Eng: Send + Sync + 'static>(
         let Some(probe) = target.lambda.as_ref().filter(|_| target.check_due) else {
             continue;
         };
-        // What that invocation decided, as the one reading of a `lambda` check decides it:
-        // whether the check SUCCEEDED, which is all such an answer says about the
-        // registration — the condition a failing one is reported under is then the family's
-        // own ([`super::target_health::CheckFailure`]).
-        observed.2 = crate::service::lambda_health_check::observed(callback, probe)
-            .await
-            .map(passed_or_unanswered);
+        // What that invocation FOUND, as the one reading of a `lambda` check decides it:
+        // whether the check succeeded and, where it did not, the condition that made it fail —
+        // the status the function answered outside the group's criterion, an error or a
+        // malformed answer in place of a response, or an answer that never arrived
+        // ([`super::target_health::CheckFailure`]), which is what the verdict those checks
+        // reach is then reported under.
+        observed.2 = crate::service::lambda_health_check::observed(callback, probe).await;
     }
     observations
-}
-
-/// One check's finding, from whether that check SUCCEEDED: the condition a failing one is
-/// reported under is the family's own, for a check whose answer says no more than that.
-fn passed_or_unanswered(passed: bool) -> Observed {
-    if passed {
-        Observed::Passed
-    } else {
-        Observed::Failed(CheckFailure::Unanswered)
-    }
 }
 
 /// [`observe_all`] WITHOUT the due check of a `lambda` registration, for the pass that cannot

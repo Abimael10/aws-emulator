@@ -27,13 +27,23 @@
 //! group's `Matcher` counts as success — "[HTTP/HTTPS health checks] The HTTP or gRPC codes to
 //! use when checking for a successful response from a target" — which such a group carries
 //! like any other HTTP-semantic check ([`crate::state::matcher_admits`]). It FAILS for an
-//! answer that is no answer to the check: a run that ended in a function error, a payload that
-//! is no response object or names no readable status, a status outside the matcher, an answer
-//! that does not arrive within the group's `HealthCheckTimeoutSeconds` ("the amount of time, in
-//! seconds, during which no response from a target means a failed health check"), and an
-//! invocation the function's own resource policy admits no load balancer to make — Lambda
-//! answering that nothing admits the call is an answer about this target, and nothing answers
-//! a check that is never made.
+//! answer that is no answer to the check, and WHICH failure it was is what the verdict is then
+//! reported under ([`crate::state::target_health::CheckFailure`]), because the conditions the
+//! model words separately are different operational faults:
+//!
+//! * the function RETURNED a status the matcher does not count as success: the answer arrived
+//!   and failed the group's own criterion, which is a response-code mismatch described by the
+//!   status that answer carried;
+//! * the invocation came back with no response to read a status off: a run that ended in a
+//!   function error, a payload that is no response object or names no readable status, and an
+//!   invocation Lambda refused — the function's own resource policy admitting no load balancer
+//!   to make it among them, Lambda answering that nothing admits the call being an answer about
+//!   this target. Nothing came back carrying an HTTP code to mismatch, so the check failed on
+//!   the error or the malformed answer it got;
+//! * nothing answered within the group's `HealthCheckTimeoutSeconds` ("the amount of time, in
+//!   seconds, during which no response from a target means a failed health check"): the check
+//!   went unanswered, which is the condition the family of load balancer performing it words as
+//!   its own.
 //!
 //! Nothing is decided on what this emulator could not carry: an invocation no Lambda of this
 //! emulator served, or one whose call the transport failed, observes NOTHING, and a
@@ -42,6 +52,7 @@
 
 use ::smithy_server_runtime::EmbeddedEmulator;
 
+use crate::state::target_health::{CheckFailure, Observed};
 use crate::state::{MatcherRecord, TargetGroupRecord};
 
 /// What one health check of a `lambda` registration invokes, and what the answer to it is
@@ -95,11 +106,13 @@ pub(crate) fn probe(
 }
 
 /// Perform ONE health check: invoke the function the probe names with the health-check event,
-/// and answer whether the status it returned is one the group counts as success.
+/// and answer WHAT that check found — whether it succeeded and, where it did not, the condition
+/// that made it fail ([`Observed`]), which is what the verdict those checks reach is reported
+/// under.
 ///
 /// `None` is "nothing was observed", which fails no check: an invocation this emulator could
 /// not carry at all says nothing about the target (see the module docs).
-pub(crate) async fn observed(callback: &EmbeddedEmulator, probe: &Probe) -> Option<bool> {
+pub(crate) async fn observed(callback: &EmbeddedEmulator, probe: &Probe) -> Option<Observed> {
     // The Region the invocation is made in is the function's own, which its ARN names — the
     // ARN a registration of a `lambda` target group is written as.
     let region = ::service_common::arn::region_of(
@@ -115,7 +128,8 @@ pub(crate) async fn observed(callback: &EmbeddedEmulator, probe: &Probe) -> Opti
     let client = super::lambda_target::lambda_client_over(callback, region);
     // The grant that admits the invocation is the FUNCTION's own, narrowed to the target group
     // the check belongs to — the same grant a forwarded request is invoked under. A check
-    // Lambda answers that nothing admits is a check nothing answers.
+    // Lambda answers that nothing admits is a check that came back with an error rather than
+    // with a response naming a status.
     if !super::lambda_target::invocation_admitted(
         &client,
         &probe.function_arn,
@@ -129,7 +143,7 @@ pub(crate) async fn observed(callback: &EmbeddedEmulator, probe: &Probe) -> Opti
             "the registered function admits this load balancer no invocation for this target \
              group, so its health check was not answered"
         );
-        return Some(false);
+        return Some(Observed::Failed(CheckFailure::Malformed));
     }
     let answered = client
         .invoke()
@@ -141,8 +155,8 @@ pub(crate) async fn observed(callback: &EmbeddedEmulator, probe: &Probe) -> Opti
         .payload(::aws_sdk_lambda::primitives::Blob::new(payload))
         .send();
     // The check waits the group's own `HealthCheckTimeoutSeconds` for the answer, and a check
-    // nothing answered within it is a FAILED check — which is also what keeps one slow function
-    // from holding this pass for the whole of its own `Timeout`.
+    // nothing answered within it is an UNANSWERED check — which is also what keeps one slow
+    // function from holding this pass for the whole of its own `Timeout`.
     let answered = match ::tokio::time::timeout(probe.timeout, answered).await {
         Ok(answered) => answered,
         Err(_) => {
@@ -152,7 +166,7 @@ pub(crate) async fn observed(callback: &EmbeddedEmulator, probe: &Probe) -> Opti
                 "the health check of this Lambda target was not answered within the target \
                  group's timeout"
             );
-            return Some(false);
+            return Some(Observed::Failed(CheckFailure::Unanswered));
         }
     };
     let answered = match answered {
@@ -160,13 +174,14 @@ pub(crate) async fn observed(callback: &EmbeddedEmulator, probe: &Probe) -> Opti
         Err(error) => {
             if super::lambda_target::refused_by_lambda(&error) {
                 // Lambda refusing the call is an answer ABOUT this target — a function it
-                // holds no longer cannot answer a check of it.
+                // holds no longer cannot answer a check of it, and what came back is that
+                // error rather than a response carrying a status.
                 ::tracing::info!(
                     function = %probe.function_arn,
                     error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                     "the health check of this Lambda target was refused, so nothing answered it"
                 );
-                return Some(false);
+                return Some(Observed::Failed(CheckFailure::Malformed));
             }
             // Nothing of the target was observed: the call was not carried at all.
             ::tracing::warn!(
@@ -178,21 +193,30 @@ pub(crate) async fn observed(callback: &EmbeddedEmulator, probe: &Probe) -> Opti
         }
     };
     // "FunctionError: if present, indicates that an error occurred during function execution"
-    // — a run that errored returned no response object, so the check was not answered.
+    // — a run that errored returned no response object, so there is no status to judge and the
+    // check failed on the error it got.
     if let Some(signal) = answered.function_error() {
         ::tracing::info!(
             function = %probe.function_arn,
             function_error = %signal,
             "the health check's run of this Lambda target ended in a function error"
         );
-        return Some(false);
+        return Some(Observed::Failed(CheckFailure::Malformed));
     }
     let returned = answered
         .payload()
         .map(|payload| payload.as_ref().to_vec())
         .unwrap_or_default();
     match super::lambda_target::answered_status(&returned) {
-        Ok(status) => Some(crate::state::matcher_admits(&probe.matcher, status)),
+        // The status ARRIVED: the check succeeds while the group's own criterion counts it as
+        // success, and fails as the mismatch that status is where it does not.
+        Ok(status) => Some(if crate::state::matcher_admits(&probe.matcher, status) {
+            Observed::Passed
+        } else {
+            Observed::Failed(CheckFailure::ResponseCode(status))
+        }),
+        // An answer naming no readable status is a malformed response, not a status outside
+        // the matcher: there is no code to report a mismatch of.
         Err(reason) => {
             ::tracing::info!(
                 function = %probe.function_arn,
@@ -200,7 +224,7 @@ pub(crate) async fn observed(callback: &EmbeddedEmulator, probe: &Probe) -> Opti
                 "the health check's run of this Lambda target returned no response the contract \
                  admits"
             );
-            Some(false)
+            Some(Observed::Failed(CheckFailure::Malformed))
         }
     }
 }
