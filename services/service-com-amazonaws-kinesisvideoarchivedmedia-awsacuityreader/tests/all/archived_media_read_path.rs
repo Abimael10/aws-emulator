@@ -48,12 +48,435 @@ pub(crate) fn fragment_number(index: u64) -> String {
     (FRAGMENT_BASE + index).to_string()
 }
 
-/// The media bytes of the `index`-th seeded fragment: distinct content AND a
-/// distinct length per fragment, so a concatenation can only come out right if
-/// the right fragments were picked in the right order.
-fn media(index: u64) -> Vec<u8> {
-    let filler = b'a' + u8::try_from(index).expect("small index");
-    vec![filler; 16 + usize::try_from(index).expect("small index")]
+/// The media bytes of the `index`-th seeded fragment: one archived Matroska
+/// fragment carrying [`FRAMES_PER_FRAGMENT`] of the fixture's coded pictures,
+/// distinct per fragment, so a payload can only come out right if the right
+/// fragments were picked in the right order.
+pub(crate) fn media(index: u64) -> Vec<u8> {
+    MkvFragment::of(first_unit(index), FRAMES_PER_FRAGMENT).bytes()
+}
+
+/// The access units the `index`-th seeded fragment carries, in order — what a
+/// clip of that fragment has to put in its track.
+fn media_units(index: u64) -> Vec<Vec<u8>> {
+    access_units(first_unit(index), FRAMES_PER_FRAGMENT)
+}
+
+/// Where the `index`-th seeded fragment's pictures start in the fixture's coded
+/// video.
+fn first_unit(index: u64) -> usize {
+    usize::try_from(index).expect("small index") * FRAMES_PER_FRAGMENT
+}
+
+// ---------------------------------------------------------------------------
+// The archived fragment: a Matroska document carrying coded H.264.
+// ---------------------------------------------------------------------------
+//
+// Kinesis Video Streams archives each fragment as a Matroska document of its own
+// (the submitted header in front of one Cluster), so the seeded media is one. The
+// element ids below are the Matroska specification's and the sizes are EBML
+// variable-size integers (RFC 8794 section 4.4), written here in the test rather
+// than by the code under test. The frames are really encoded H.264 and the
+// track's `CodecPrivate` is really that encoding's decoder configuration record,
+// so the clip's samples and its sample description are a codec's own rather than
+// bytes shaped to look like one.
+
+/// Matroska `EBML` — the document's header (level 0).
+const ID_EBML: &[u8] = &[0x1A, 0x45, 0xDF, 0xA3];
+/// Matroska `DocType`.
+const ID_DOC_TYPE: &[u8] = &[0x42, 0x82];
+/// Matroska `Segment` (level 0), the master element the media sits in.
+const ID_SEGMENT: &[u8] = &[0x18, 0x53, 0x80, 0x67];
+/// Matroska `Info`.
+const ID_INFO: &[u8] = &[0x15, 0x49, 0xA9, 0x66];
+/// Matroska `TimestampScale` (nanoseconds per timecode tick).
+const ID_TIMESTAMP_SCALE: &[u8] = &[0x2A, 0xD7, 0xB1];
+/// Matroska `Tracks`.
+const ID_TRACKS: &[u8] = &[0x16, 0x54, 0xAE, 0x6B];
+/// Matroska `TrackEntry`.
+const ID_TRACK_ENTRY: &[u8] = &[0xAE];
+/// Matroska `TrackNumber`.
+const ID_TRACK_NUMBER: &[u8] = &[0xD7];
+/// Matroska `TrackType`.
+const ID_TRACK_TYPE: &[u8] = &[0x83];
+/// Matroska `CodecID`.
+const ID_CODEC_ID: &[u8] = &[0x86];
+/// Matroska `CodecPrivate`.
+const ID_CODEC_PRIVATE: &[u8] = &[0x63, 0xA2];
+/// Matroska `Video` (the video settings of a `TrackEntry`).
+const ID_VIDEO: &[u8] = &[0xE0];
+/// Matroska `PixelWidth`.
+const ID_PIXEL_WIDTH: &[u8] = &[0xB0];
+/// Matroska `PixelHeight`.
+const ID_PIXEL_HEIGHT: &[u8] = &[0xBA];
+/// Matroska `Cluster`.
+const ID_CLUSTER: &[u8] = &[0x1F, 0x43, 0xB6, 0x75];
+/// Matroska `Timestamp` (a Cluster's own timecode).
+const ID_TIMESTAMP: &[u8] = &[0xE7];
+/// Matroska `SimpleBlock` (one frame).
+const ID_SIMPLE_BLOCK: &[u8] = &[0xA3];
+
+/// Matroska `TrackType` 1: a video track.
+const TRACK_TYPE_VIDEO: u64 = 1;
+
+/// The `SimpleBlock` flag that says the frame is a keyframe.
+const KEYFRAME_FLAG: u8 = 0x80;
+
+/// The default Matroska timecode scale: one millisecond per tick, in nanoseconds.
+const MILLISECOND_SCALE_NANOS: u64 = 1_000_000;
+
+/// The Matroska codec id of H.264, as the codec registry assigns it and the
+/// Kinesis Video Streams producers write it.
+pub(crate) const AVC_CODEC_ID: &str = "V_MPEG4/ISO/AVC";
+
+/// How many pictures the fixture's coded video carries. More than one fragment
+/// and more than one window of the clip's fragment ceiling need, so two
+/// selections of the archive carry different pictures.
+const CODED_PICTURES: usize = 16;
+
+/// The width the fixture's pictures are coded at, in pixels.
+const CODED_WIDTH: u32 = 64;
+/// Their height, in pixels. Even sides, as the codec's chroma sampling needs.
+const CODED_HEIGHT: u32 = 48;
+
+/// How many coded pictures one seeded fragment carries.
+const FRAMES_PER_FRAGMENT: usize = 2;
+
+/// How far apart the frames of one fragment are shown, in the container's own
+/// timecode ticks.
+const FRAME_SPACING_TICKS: i16 = 33;
+
+/// The fixture's coded video: the parameter sets of the track that carries it,
+/// and one access unit per coded picture in the length-prefixed framing an MP4
+/// track carries a sample in — the framing a Kinesis Video Streams producer
+/// writes its frames in, so one fragment frame is one of these.
+struct CodedVideo {
+    seq_param_set: Vec<u8>,
+    pic_param_set: Vec<u8>,
+    access_units: Vec<Vec<u8>>,
+}
+
+/// One fixture picture: a bright bar whose place follows `index`, so two coded
+/// pictures differ and a clip that carried the wrong one cannot pass.
+fn fixture_picture(index: usize) -> Vec<u8> {
+    let mut rgb = vec![16u8; (CODED_WIDTH * CODED_HEIGHT * 3) as usize];
+    let column = (index as u32 * 4) % CODED_WIDTH;
+    for row in 0..CODED_HEIGHT {
+        for offset in 0..4u32 {
+            let x = (column + offset) % CODED_WIDTH;
+            let at = ((row * CODED_WIDTH + x) * 3) as usize;
+            if let Some(pixel) = rgb.get_mut(at..at + 3) {
+                pixel.copy_from_slice(&[235, 235, 235]);
+            }
+        }
+    }
+    rgb
+}
+
+/// The fixture's coded video, encoded ONCE for the whole suite.
+fn coded_video() -> &'static CodedVideo {
+    static CODED: std::sync::OnceLock<CodedVideo> = std::sync::OnceLock::new();
+    CODED.get_or_init(|| {
+        let mut encoder = ::openh264::encoder::Encoder::with_api_config(
+            ::openh264::OpenH264API::from_source(),
+            ::openh264::encoder::EncoderConfig::new(),
+        )
+        .expect("the fixture's encoder starts");
+        let mut stream: Vec<u8> = Vec::new();
+        for index in 0..CODED_PICTURES {
+            let rgb = fixture_picture(index);
+            let yuv = ::openh264::formats::YUVBuffer::from_rgb8_source(
+                ::openh264::formats::RgbSliceU8::new(
+                    &rgb,
+                    (CODED_WIDTH as usize, CODED_HEIGHT as usize),
+                ),
+            );
+            stream.extend_from_slice(
+                &encoder
+                    .encode(&yuv)
+                    .expect("the fixture's picture encodes")
+                    .to_vec(),
+            );
+        }
+        let units = ::service_common::h264_mp4::annex_b_units(&stream);
+        let access_units: Vec<Vec<u8>> = ::service_common::h264_mp4::avcc_samples(&units)
+            .into_iter()
+            .map(|sample| sample.bytes)
+            .collect();
+        assert_eq!(
+            access_units.len(),
+            CODED_PICTURES,
+            "case the fixture's coded video: expected one access unit per picture, got {}",
+            access_units.len()
+        );
+        CodedVideo {
+            seq_param_set: ::service_common::h264_mp4::parameter_set(
+                &units,
+                ::service_common::h264_mp4::SEQUENCE_PARAMETER_SET,
+            )
+            .expect("the fixture carries a sequence parameter set"),
+            pic_param_set: ::service_common::h264_mp4::parameter_set(
+                &units,
+                ::service_common::h264_mp4::PICTURE_PARAMETER_SET,
+            )
+            .expect("the fixture carries a picture parameter set"),
+            access_units,
+        }
+    })
+}
+
+/// `count` access units of the fixture's coded video from `first`, wrapping round
+/// the pictures it carries.
+fn access_units(first: usize, count: usize) -> Vec<Vec<u8>> {
+    let coded = coded_video();
+    (0..count)
+        .map(|offset| coded.access_units[(first + offset) % CODED_PICTURES].clone())
+        .collect()
+}
+
+/// The AVC decoder configuration record (ISO/IEC 14496-15) a track declares as
+/// its `CodecPrivate`: the configuration version, the profile, its compatibility
+/// and the level the sequence parameter set states, the four-byte length framing
+/// of the units inside a frame, then the sequence and the picture parameter set,
+/// each preceded by its own 16-bit big-endian length.
+pub(crate) fn avc_record(seq_param_set: &[u8], pic_param_set: &[u8]) -> Vec<u8> {
+    let mut record = vec![
+        1,
+        seq_param_set.get(1).copied().unwrap_or_default(),
+        seq_param_set.get(2).copied().unwrap_or_default(),
+        seq_param_set.get(3).copied().unwrap_or_default(),
+        // `lengthSizeMinusOne` of 3: four-byte lengths, with the reserved bits set.
+        0xFF,
+        // One sequence parameter set, with the reserved bits set.
+        0xE1,
+    ];
+    record.extend_from_slice(&u16::try_from(seq_param_set.len()).unwrap_or(0).to_be_bytes());
+    record.extend_from_slice(seq_param_set);
+    record.push(1);
+    record.extend_from_slice(&u16::try_from(pic_param_set.len()).unwrap_or(0).to_be_bytes());
+    record.extend_from_slice(pic_param_set);
+    record
+}
+
+/// The record of the fixture's own coded video — the one an archived fragment of
+/// that video declares.
+pub(crate) fn fixture_record() -> Vec<u8> {
+    let coded = coded_video();
+    avc_record(&coded.seq_param_set, &coded.pic_param_set)
+}
+
+/// One archived fragment, as a Matroska document.
+#[derive(Debug, Clone)]
+pub(crate) struct MkvFragment {
+    /// The `TrackNumber` the track is declared with and every frame is written on.
+    pub(crate) track: u64,
+    /// The track's `CodecID`.
+    pub(crate) codec_id: String,
+    /// Its `CodecPrivate`, or `None` for a track that declares none.
+    pub(crate) codec_private: Option<Vec<u8>>,
+    /// The `PixelWidth`/`PixelHeight` the container declares for the track, or
+    /// `None` for a container that declares neither.
+    pub(crate) pixel_size: Option<(u64, u64)>,
+    /// `Info/TimestampScale`: nanoseconds per timecode tick.
+    pub(crate) scale_nanos: u64,
+    /// The Cluster's own `Timestamp`, in those ticks.
+    pub(crate) timecode: u64,
+    /// How far apart its frames are shown, in those ticks.
+    pub(crate) spacing_ticks: i16,
+    /// The frames the Cluster carries, in order.
+    pub(crate) frames: Vec<Vec<u8>>,
+}
+
+impl MkvFragment {
+    /// A fragment of the fixture's coded video: `count` access units from
+    /// `first`, on track 1, declaring that video's own record and leaving the
+    /// geometry to the coded video itself.
+    pub(crate) fn of(first: usize, count: usize) -> Self {
+        Self {
+            track: 1,
+            codec_id: AVC_CODEC_ID.to_string(),
+            codec_private: Some(fixture_record()),
+            pixel_size: None,
+            scale_nanos: MILLISECOND_SCALE_NANOS,
+            timecode: 0,
+            spacing_ticks: FRAME_SPACING_TICKS,
+            frames: access_units(first, count),
+        }
+    }
+
+    /// The document's bytes.
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        let mut document = Vec::new();
+        let mut header = Vec::new();
+        push_ebml_element(&mut header, ID_DOC_TYPE, b"matroska");
+        push_ebml_element(&mut document, ID_EBML, &header);
+
+        let mut segment = Vec::new();
+        let mut info = Vec::new();
+        push_ebml_element(&mut info, ID_TIMESTAMP_SCALE, &uint_body(self.scale_nanos));
+        push_ebml_element(&mut segment, ID_INFO, &info);
+
+        let mut entry = Vec::new();
+        push_ebml_element(&mut entry, ID_TRACK_NUMBER, &uint_body(self.track));
+        push_ebml_element(&mut entry, ID_TRACK_TYPE, &uint_body(TRACK_TYPE_VIDEO));
+        push_ebml_element(&mut entry, ID_CODEC_ID, self.codec_id.as_bytes());
+        if let Some(private) = &self.codec_private {
+            push_ebml_element(&mut entry, ID_CODEC_PRIVATE, private);
+        }
+        if let Some((width, height)) = self.pixel_size {
+            let mut video = Vec::new();
+            push_ebml_element(&mut video, ID_PIXEL_WIDTH, &uint_body(width));
+            push_ebml_element(&mut video, ID_PIXEL_HEIGHT, &uint_body(height));
+            push_ebml_element(&mut entry, ID_VIDEO, &video);
+        }
+        let mut tracks = Vec::new();
+        push_ebml_element(&mut tracks, ID_TRACK_ENTRY, &entry);
+        push_ebml_element(&mut segment, ID_TRACKS, &tracks);
+
+        let mut cluster = Vec::new();
+        push_ebml_element(&mut cluster, ID_TIMESTAMP, &uint_body(self.timecode));
+        for (position, frame) in self.frames.iter().enumerate() {
+            // A `SimpleBlock` body is the track number as a variable-size
+            // integer, the frame's signed 16-bit offset from the Cluster
+            // timecode, one flags byte, then the frame itself.
+            let offset = self
+                .spacing_ticks
+                .saturating_mul(i16::try_from(position).expect("a small frame count"));
+            let mut block = vec![0x80 | u8::try_from(self.track).expect("a small track number")];
+            block.extend_from_slice(&offset.to_be_bytes());
+            block.push(KEYFRAME_FLAG);
+            block.extend_from_slice(frame);
+            push_ebml_element(&mut cluster, ID_SIMPLE_BLOCK, &block);
+        }
+        push_ebml_element(&mut segment, ID_CLUSTER, &cluster);
+        push_ebml_element(&mut document, ID_SEGMENT, &segment);
+        document
+    }
+}
+
+/// Append the EBML variable-size integer (RFC 8794 section 4.4) encoding `size`,
+/// in the shortest width that holds it.
+fn push_ebml_size(out: &mut Vec<u8>, size: u64) {
+    for width in 1..=8u32 {
+        let bits = 7 * width;
+        // The all-ones data bits of a width are the "unknown size" encoding, so a
+        // size that would need them goes in the next width up.
+        let largest = (1u64 << bits) - 2;
+        if size <= largest {
+            let value = (1u64 << bits) | size;
+            let bytes = value.to_be_bytes();
+            out.extend_from_slice(&bytes[8 - width as usize..]);
+            return;
+        }
+    }
+    panic!("case an element body of {size} bytes: larger than the largest EBML size");
+}
+
+/// Append one EBML element: its id (itself already a variable-size integer), its
+/// size, then `body`.
+fn push_ebml_element(out: &mut Vec<u8>, id: &[u8], body: &[u8]) {
+    out.extend_from_slice(id);
+    push_ebml_size(out, body.len() as u64);
+    out.extend_from_slice(body);
+}
+
+/// `value` as a Matroska unsigned-integer element body: big-endian, shortest form.
+fn uint_body(value: u64) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(7);
+    bytes[first..].to_vec()
+}
+
+// ---------------------------------------------------------------------------
+// The clip, read back as a client's demuxer reads it.
+// ---------------------------------------------------------------------------
+
+/// What the clip's video track carries, read through a maintained ISO base media
+/// reader.
+pub(crate) struct ClipTrack {
+    /// The visible width the track states, in pixels.
+    pub(crate) width: u16,
+    /// Its visible height.
+    pub(crate) height: u16,
+    /// The sequence parameter set of its sample description.
+    pub(crate) seq_param_set: Vec<u8>,
+    /// Its picture parameter set.
+    pub(crate) pic_param_set: Vec<u8>,
+    /// Its samples, in decode order.
+    pub(crate) samples: Vec<Vec<u8>>,
+    /// Which of them a player may start decoding at.
+    pub(crate) sync: Vec<bool>,
+}
+
+/// The clip's one video track, failing `case` when the bytes are not an MP4 file
+/// carrying one.
+pub(crate) fn clip_track(case: &str, clip: &[u8]) -> ClipTrack {
+    let size = clip.len() as u64;
+    let mut reader = ::mp4::Mp4Reader::read_header(std::io::Cursor::new(clip), size)
+        .unwrap_or_else(|error| {
+            panic!("case {case}: the clip must read as an MP4 file, got {error}")
+        });
+    let (id, width, height, seq_param_set, pic_param_set, count) = {
+        let track = reader
+            .tracks()
+            .values()
+            .find(|track| track.track_type().ok() == Some(::mp4::TrackType::Video))
+            .unwrap_or_else(|| panic!("case {case}: the clip must carry a video track"));
+        assert_eq!(
+            track.media_type().ok(),
+            Some(::mp4::MediaType::H264),
+            "case {case}: the clip's video track must be H.264"
+        );
+        (
+            track.track_id(),
+            track.width(),
+            track.height(),
+            track
+                .sequence_parameter_set()
+                .unwrap_or_else(|error| {
+                    panic!("case {case}: the track must state a sequence parameter set, got {error}")
+                })
+                .to_vec(),
+            track
+                .picture_parameter_set()
+                .unwrap_or_else(|error| {
+                    panic!("case {case}: the track must state a picture parameter set, got {error}")
+                })
+                .to_vec(),
+            track.sample_count(),
+        )
+    };
+    let mut samples = Vec::new();
+    let mut sync = Vec::new();
+    for sample_id in 1..=count {
+        let sample = reader
+            .read_sample(id, sample_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| panic!("case {case}: sample {sample_id} must be readable"));
+        samples.push(sample.bytes.to_vec());
+        sync.push(sample.is_sync);
+    }
+    ClipTrack {
+        width,
+        height,
+        seq_param_set,
+        pic_param_set,
+        samples,
+        sync,
+    }
+}
+
+/// The first bytes of an MP4 file are its File Type box: a four-byte big-endian
+/// size, then the box type `ftyp` (ISO/IEC 14496-12). What a client probes before
+/// handing a payload to a demuxer.
+pub(crate) fn assert_is_mp4(case: &str, clip: &[u8]) {
+    assert_eq!(
+        clip.get(4..8),
+        Some(b"ftyp".as_slice()),
+        "case {case}: a clip must be an MP4 container, got {:?}",
+        &clip[..clip.len().min(12)]
+    );
 }
 
 /// The producer timestamp of the `index`-th seeded fragment.
@@ -710,10 +1133,13 @@ async fn get_media_for_fragment_list_bounds_the_bytes_it_assembles() {
     }
 }
 
-/// RULE: `GetClip` answers `video/mp4` and a payload assembled from exactly the
-/// fragments the archive holds in the selected inclusive range.
+/// RULE: `GetClip` answers `video/mp4` and an MP4 container muxed from exactly
+/// the fragments the archive holds in the selected inclusive range — the frames
+/// those fragments carry on their H.264 track become the samples of the clip's
+/// one video track, in archive order, with that track's codec private data as the
+/// sample description.
 #[tokio::test]
-async fn get_clip_assembles_the_fragments_the_archive_holds_in_range() {
+async fn get_clip_muxes_the_fragments_the_archive_holds_in_range() {
     let harness = seeded();
     // (case, selector type, start offset, end offset, fragment indexes)
     let cases: Vec<(&str, &str, i64, i64, Vec<u64>)> = vec![
@@ -748,12 +1174,33 @@ async fn get_clip_assembles_the_fragments_the_archive_holds_in_range() {
             "video/mp4",
             "case {case}: GetClip downloads an MP4 clip"
         );
-        let expected: Vec<u8> = indexes.iter().copied().flat_map(media).collect();
+        assert_is_mp4(case, response.body());
+        let expected: Vec<Vec<u8>> = indexes.iter().copied().flat_map(media_units).collect();
+        let track = clip_track(case, response.body());
         assert_eq!(
-            response.body().as_ref(),
-            expected.as_slice(),
-            "case {case}: expected the clip of {indexes:?}, got {} bytes",
-            response.body().len()
+            track.samples,
+            expected,
+            "case {case}: expected the access units of the fragments {indexes:?} as the clip's \
+             samples, got {} samples",
+            track.samples.len()
+        );
+        assert_eq!(
+            (track.width, track.height),
+            (
+                u16::try_from(CODED_WIDTH).expect("a short side"),
+                u16::try_from(CODED_HEIGHT).expect("a short side")
+            ),
+            "case {case}: the clip's track must state the coded geometry, got {}x{}",
+            track.width,
+            track.height
+        );
+        assert_eq!(
+            (track.seq_param_set, track.pic_param_set),
+            (
+                coded_video().seq_param_set.clone(),
+                coded_video().pic_param_set.clone()
+            ),
+            "case {case}: the sample description must carry the track's own parameter sets"
         );
     }
 }
@@ -769,15 +1216,13 @@ async fn get_clip_truncates_at_the_documented_fragment_ceiling() {
     const MAX_CLIP_FRAGMENTS: usize = 200;
     /// A stream holding more fragments in range than one clip may carry.
     const DEEP_STREAM: &str = "deep-archive-stream";
-    /// The size of each of its fragments: small, so the whole archive is
-    /// cheap and only the FRAGMENT ceiling can be the one that bites.
-    const FRAGMENT_SIZE: usize = 8;
 
-    // The filler varies with the index, so the expected clip pins WHICH
-    // fragments were taken and in what order, not only how many bytes came
-    // back: a handler that returned the LAST 200 fragments of the range, or
-    // any other 200, produces different bytes of the same length.
-    let filler = |index: usize| b'a' + u8::try_from(index % 26).expect("a letter");
+    // One picture per fragment, taken from a different place in the fixture's
+    // coded video, so the expected sample sequence pins WHICH fragments were
+    // taken and in what order: a handler that returned the LAST 200 fragments of
+    // the range, or any other 200, produces a different sequence of the same
+    // length.
+    let fragment = |index: usize| MkvFragment::of(index, 1);
 
     let harness = seeded();
     let held = MAX_CLIP_FRAGMENTS + 50;
@@ -800,7 +1245,7 @@ async fn get_clip_truncates_at_the_documented_fragment_ceiling() {
                         at,
                         at,
                         1000,
-                        vec![filler(index); FRAGMENT_SIZE],
+                        fragment(index).bytes(),
                     ),
                 ),
                 "case seed fragment {index}: the deep stream must exist"
@@ -831,21 +1276,22 @@ async fn get_clip_truncates_at_the_documented_fragment_ceiling() {
         "video/mp4",
         "case truncated clip: a truncated clip is still an MP4 clip"
     );
-    let expected: Vec<u8> = (0..MAX_CLIP_FRAGMENTS)
-        .flat_map(|index| vec![filler(index); FRAGMENT_SIZE])
+    assert_is_mp4("truncated clip", response.body());
+    let track = clip_track("truncated clip", response.body());
+    let expected: Vec<Vec<u8>> = (0..MAX_CLIP_FRAGMENTS)
+        .flat_map(|index| fragment(index).frames)
         .collect();
     assert_eq!(
-        response.body().len(),
+        track.samples.len(),
         expected.len(),
         "case truncated clip: a clip must stop at the first {MAX_CLIP_FRAGMENTS} fragments of the \
-         range, got {} bytes for an archive of {held} fragments in range",
-        response.body().len()
+         range, got {} samples for an archive of {held} fragments in range",
+        track.samples.len()
     );
     assert_eq!(
-        response.body().as_ref(),
-        expected.as_slice(),
-        "case truncated clip: a clip must be the archive's own bytes for the FIRST \
-         {MAX_CLIP_FRAGMENTS} fragments of the range, in order"
+        track.samples, expected,
+        "case truncated clip: a clip must carry the frames of the FIRST {MAX_CLIP_FRAGMENTS} \
+         fragments of the range, in order"
     );
 
     // The same range read through ListFragments still reports every fragment:
@@ -1421,6 +1867,433 @@ async fn get_hls_streaming_session_url_refuses_a_stream_with_no_retention() {
         "expected NoDataRetentionException, got {reported:?}"
     );
 }
+
+/// Seed `stream` with one fragment per entry of `fragments`, ten seconds apart
+/// from [`T0_SECS`], and answer the request body that clips the whole of it.
+fn seeded_clip_request(
+    harness: &Harness,
+    stream: &str,
+    fragments: &[Vec<u8>],
+) -> serde_json::Value {
+    {
+        let state = service_state(&*harness.engine).expect("the service store");
+        let mut state = state.lock();
+        state.put_stream(ArchivedStream::new(
+            stream,
+            REGION,
+            from_epoch_millis(T0_SECS * 1000),
+            24,
+        ));
+        for (index, media) in fragments.iter().enumerate() {
+            let at = from_epoch_millis((T0_SECS + 10 * index as i64) * 1000);
+            assert!(
+                state.append_fragment(
+                    stream,
+                    StoredFragment::new(
+                        fragment_number(index as u64),
+                        at,
+                        at,
+                        2000,
+                        media.clone(),
+                    ),
+                ),
+                "case seed {stream:?} fragment {index}: the stream must exist"
+            );
+        }
+    }
+    serde_json::json!({
+        "StreamName": stream,
+        "ClipFragmentSelector": {
+            "FragmentSelectorType": "PRODUCER_TIMESTAMP",
+            "TimestampRange": {
+                "StartTimestamp": T0_SECS,
+                "EndTimestamp": T0_SECS + 1000,
+            },
+        },
+    })
+}
+
+/// One row of the mux table: the fragments an archive holds, and the track the
+/// clip of them has to carry.
+struct MuxRow {
+    case: &'static str,
+    fragments: Vec<MkvFragment>,
+    /// The samples the clip's track must carry, in order.
+    expected_samples: Vec<Vec<u8>>,
+    /// The geometry the clip's track must state.
+    geometry: (u16, u16),
+    /// The parameter sets its sample description must carry.
+    parameter_sets: (Vec<u8>, Vec<u8>),
+}
+
+/// RULE: whatever shape the archived Matroska fragments have, the clip is an MP4
+/// file whose one video track carries their H.264 track's frames as its samples,
+/// with that track's codec private data as the sample description and the coded
+/// geometry it states.
+///
+/// The rows differ along what the rule generalises over: how many fragments the
+/// range holds and how many frames each carries, which spelling of the H.264
+/// codec id the track declares, which track number it is, where the geometry is
+/// declared, the container's own timecode scale, and the framing the producer
+/// wrote its units in.
+#[tokio::test]
+async fn a_clip_is_an_mp4_of_the_frames_the_archived_track_carries() {
+    let coded = coded_video();
+    let fixture_sets = || (coded.seq_param_set.clone(), coded.pic_param_set.clone());
+    let coded_geometry = (
+        u16::try_from(CODED_WIDTH).expect("a short side"),
+        u16::try_from(CODED_HEIGHT).expect("a short side"),
+    );
+
+    // A track whose record carries parameter sets that are not readable H.264,
+    // for the row where the CONTAINER is what declares the geometry.
+    let opaque_seq: Vec<u8> = vec![0x67, 0x64, 0x00, 0x1F, 0x00, 0x00];
+    let opaque_pic: Vec<u8> = vec![0x68, 0xEE, 0x3C, 0x80];
+
+    // A producer that wrote its units DELIMITED rather than length-prefixed: the
+    // same access units, as the Annex B byte stream (ISO/IEC 14496-10 Annex B).
+    let delimited = |unit: &[u8]| {
+        let mut stream = Vec::new();
+        assert!(
+            ::service_common::h264_mp4::annex_b_from_avcc(unit, 4, &mut stream),
+            "case the delimited fixture: the access unit must re-frame"
+        );
+        stream
+    };
+
+    let mut rows: Vec<MuxRow> = vec![
+        MuxRow {
+            case: "one fragment of one frame",
+            fragments: vec![MkvFragment::of(0, 1)],
+            expected_samples: access_units(0, 1),
+            geometry: coded_geometry,
+            parameter_sets: fixture_sets(),
+        },
+        MuxRow {
+            case: "one fragment of three frames",
+            fragments: vec![MkvFragment::of(2, 3)],
+            expected_samples: access_units(2, 3),
+            geometry: coded_geometry,
+            parameter_sets: fixture_sets(),
+        },
+        MuxRow {
+            case: "three fragments of two frames each",
+            fragments: vec![
+                MkvFragment::of(0, 2),
+                MkvFragment::of(2, 2),
+                MkvFragment::of(4, 2),
+            ],
+            expected_samples: access_units(0, 6),
+            geometry: coded_geometry,
+            parameter_sets: fixture_sets(),
+        },
+        MuxRow {
+            case: "the codec id spelling this operation's documentation prints",
+            fragments: vec![MkvFragment {
+                codec_id: "V_MPEG/ISO/AVC".to_string(),
+                ..MkvFragment::of(5, 2)
+            }],
+            expected_samples: access_units(5, 2),
+            geometry: coded_geometry,
+            parameter_sets: fixture_sets(),
+        },
+        MuxRow {
+            case: "a track number other than one",
+            fragments: vec![MkvFragment {
+                track: 3,
+                ..MkvFragment::of(7, 2)
+            }],
+            expected_samples: access_units(7, 2),
+            geometry: coded_geometry,
+            parameter_sets: fixture_sets(),
+        },
+        MuxRow {
+            case: "a container that declares the geometry as well",
+            fragments: vec![MkvFragment {
+                pixel_size: Some((u64::from(CODED_WIDTH), u64::from(CODED_HEIGHT))),
+                ..MkvFragment::of(1, 2)
+            }],
+            expected_samples: access_units(1, 2),
+            geometry: coded_geometry,
+            parameter_sets: fixture_sets(),
+        },
+        MuxRow {
+            case: "a record whose parameter sets are opaque, with the container's geometry",
+            fragments: vec![MkvFragment {
+                codec_private: Some(avc_record(&opaque_seq, &opaque_pic)),
+                pixel_size: Some((320, 240)),
+                ..MkvFragment::of(3, 2)
+            }],
+            expected_samples: access_units(3, 2),
+            geometry: (320, 240),
+            parameter_sets: (opaque_seq.clone(), opaque_pic.clone()),
+        },
+        MuxRow {
+            case: "a hundred-microsecond timecode scale",
+            fragments: vec![MkvFragment {
+                scale_nanos: 100_000,
+                timecode: 4_000,
+                spacing_ticks: 330,
+                ..MkvFragment::of(6, 3)
+            }],
+            expected_samples: access_units(6, 3),
+            geometry: coded_geometry,
+            parameter_sets: fixture_sets(),
+        },
+        MuxRow {
+            case: "frames the producer wrote as a delimited byte stream",
+            fragments: vec![MkvFragment {
+                frames: access_units(8, 2)
+                    .iter()
+                    .map(|unit| delimited(unit))
+                    .collect(),
+                ..MkvFragment::of(8, 2)
+            }],
+            expected_samples: access_units(8, 2),
+            geometry: coded_geometry,
+            parameter_sets: fixture_sets(),
+        },
+    ];
+
+    let harness = seeded();
+    for (index, row) in rows.drain(..).enumerate() {
+        let stream = format!("mux-probe-{index}");
+        let media: Vec<Vec<u8>> = row
+            .fragments
+            .iter()
+            .map(MkvFragment::bytes)
+            .collect();
+        let body = seeded_clip_request(&harness, &stream, &media);
+        let response = harness.post("/getClip", &body).await;
+        let case = row.case;
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "case {case}: expected HTTP 200, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        assert_eq!(
+            content_type(&response),
+            "video/mp4",
+            "case {case}: GetClip downloads an MP4 clip"
+        );
+        assert_is_mp4(case, response.body());
+        let track = clip_track(case, response.body());
+        assert_eq!(
+            track.samples,
+            row.expected_samples,
+            "case {case}: expected the archived frames as the clip's samples, got {} samples",
+            track.samples.len()
+        );
+        assert_eq!(
+            (track.width, track.height),
+            row.geometry,
+            "case {case}: expected the track to state {:?}, got {}x{}",
+            row.geometry,
+            track.width,
+            track.height
+        );
+        assert_eq!(
+            (track.seq_param_set, track.pic_param_set),
+            row.parameter_sets,
+            "case {case}: the sample description must carry the track's own parameter sets"
+        );
+        assert_eq!(
+            track.sync.first(),
+            Some(&true),
+            "case {case}: a frame the producer marked a keyframe must be a sync sample, got {:?}",
+            track.sync
+        );
+    }
+}
+
+/// RULE: the mux has preconditions, and each is the modelled refusal for it — a
+/// track that declares no codec private data, codec private data that is not a
+/// decoder configuration record, media whose codec ids name no H.264 video track,
+/// and fragments whose frames cannot be read at all.
+///
+/// The rows differ along which precondition the archived media breaks, and along
+/// which track and which fragment of the range breaks it.
+#[tokio::test]
+async fn get_clip_refuses_archived_media_it_cannot_mux() {
+    // (case, the media the archive holds, the code, the message)
+    let rows: Vec<(&str, Vec<Vec<u8>>, &str, String)> = vec![
+        (
+            "a track that declares no codec private data",
+            vec![MkvFragment {
+                codec_private: None,
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "MissingCodecPrivateDataException",
+            "Missing codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "another track that declares none",
+            vec![MkvFragment {
+                track: 2,
+                codec_private: None,
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "MissingCodecPrivateDataException",
+            "Missing codec private data in fragment for track 2.".to_string(),
+        ),
+        (
+            "codec private data of zero length",
+            vec![MkvFragment {
+                codec_private: Some(Vec::new()),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "MissingCodecPrivateDataException",
+            "Missing codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "a later fragment of the range that declares none",
+            vec![
+                MkvFragment::of(0, 2).bytes(),
+                MkvFragment {
+                    codec_private: None,
+                    ..MkvFragment::of(2, 2)
+                }
+                .bytes(),
+            ],
+            "MissingCodecPrivateDataException",
+            "Missing codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "codec private data that is not a record at all",
+            vec![MkvFragment {
+                codec_private: Some(b"not-a-decoder-configuration-record".to_vec()),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "InvalidCodecPrivateDataException",
+            "Invalid codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "a record of another configuration version",
+            vec![MkvFragment {
+                codec_private: Some({
+                    let mut record = fixture_record();
+                    record[0] = 2;
+                    record
+                }),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "InvalidCodecPrivateDataException",
+            "Invalid codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "a record whose parameter set runs past its own bytes",
+            vec![MkvFragment {
+                codec_private: Some(fixture_record()[..8].to_vec()),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "InvalidCodecPrivateDataException",
+            "Invalid codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "a record whose sequence parameter set states no profile",
+            vec![MkvFragment {
+                codec_private: Some(avc_record(&[0x67, 0x64], &[0x68, 0xEE, 0x3C, 0x80])),
+                pixel_size: Some((320, 240)),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "InvalidCodecPrivateDataException",
+            "Invalid codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "a record stating neither a readable parameter set nor a geometry",
+            vec![MkvFragment {
+                codec_private: Some(avc_record(
+                    &[0x67, 0x64, 0x00, 0x1F, 0x00, 0x00],
+                    &[0x68, 0xEE, 0x3C, 0x80],
+                )),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "InvalidCodecPrivateDataException",
+            "Invalid codec private data in fragment for track 1.".to_string(),
+        ),
+        (
+            "an audio codec id",
+            vec![MkvFragment {
+                codec_id: "A_AAC".to_string(),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "UnsupportedStreamMediaTypeException",
+            UNSUPPORTED_MEDIA_TYPE.to_string(),
+        ),
+        (
+            "a video codec id that is not H.264",
+            vec![MkvFragment {
+                codec_id: "V_VP9".to_string(),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "UnsupportedStreamMediaTypeException",
+            UNSUPPORTED_MEDIA_TYPE.to_string(),
+        ),
+        (
+            "media that is not a Matroska document",
+            vec![b"this is not a matroska document".to_vec()],
+            "InvalidMediaFrameException",
+            INVALID_MEDIA_FRAME.to_string(),
+        ),
+        (
+            "a fragment that carries no frame",
+            vec![MkvFragment {
+                frames: Vec::new(),
+                ..MkvFragment::of(0, 2)
+            }
+            .bytes()],
+            "InvalidMediaFrameException",
+            INVALID_MEDIA_FRAME.to_string(),
+        ),
+    ];
+
+    let harness = seeded();
+    for (index, (case, media, code, message)) in rows.into_iter().enumerate() {
+        let stream = format!("refusal-probe-{index}");
+        let body = seeded_clip_request(&harness, &stream, &media);
+        let response = harness.post("/getClip", &body).await;
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "case {case}: expected HTTP 400, got {} with body {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        let reported = body_json(&response);
+        assert_eq!(
+            reported["__type"], code,
+            "case {case}: expected {code}, got {reported:?}"
+        );
+        assert_eq!(
+            reported["Message"].as_str().unwrap_or_default(),
+            message,
+            "case {case}: expected {message:?}, got {reported:?}"
+        );
+    }
+}
+
+/// The sentence a clip of media whose codec ids name no H.264 video track is
+/// refused with: the modelled description of `UnsupportedStreamMediaTypeException`.
+const UNSUPPORTED_MEDIA_TYPE: &str =
+    "The type of the media (for example, h.264 or h.265 video or ACC or G.711 audio) could not \
+     be determined from the codec IDs of the tracks in the first fragment for a playback session.";
+
+/// The sentence a clip of media whose frames cannot be read is refused with: the
+/// modelled description of `InvalidMediaFrameException`.
+const INVALID_MEDIA_FRAME: &str =
+    "One or more frames in the requested clip could not be parsed based on the specified codec.";
 
 /// Every operation of this service is implemented, so none of them answers
 /// 501: `GetDASHStreamingSessionURL`, the last scaffold, is exercised in depth

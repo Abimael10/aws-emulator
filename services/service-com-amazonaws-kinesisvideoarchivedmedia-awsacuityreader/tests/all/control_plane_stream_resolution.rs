@@ -27,6 +27,8 @@ use archived_media::state::{
     ONE_STREAM_IDENTIFIER_MESSAGE, STREAM_NOT_FOUND_MESSAGE,
 };
 
+use crate::archived_media_read_path::media;
+
 /// The emulator endpoint every case addresses: this emulator, never a real AWS
 /// host.
 const ENDPOINT_HOST: &str = "kinesisvideo.us-east-1.amazonaws.com";
@@ -211,7 +213,8 @@ impl Harness {
     /// [`T0_SECS`].
     ///
     /// There is no ingest OPERATION yet, so the archive is seeded through the
-    /// reader's own state API — on the same engine the router serves from.
+    /// reader's own state API — on the same engine the router serves from — with
+    /// the archived Matroska fragment of coded H.264 an ingest plane writes.
     /// `archived_retention` is what the ARCHIVE's own record carries, which the
     /// registry's record overrides wherever the two disagree.
     fn seed_archive(&self, stream: &str, archived_retention: u32, count: u64) {
@@ -229,13 +232,7 @@ impl Harness {
             assert!(
                 state.append_fragment(
                     stream,
-                    StoredFragment::new(
-                        fragment_number(index),
-                        at,
-                        at,
-                        2000,
-                        vec![b'a' + u8::try_from(index).expect("a small index"); 16],
-                    ),
+                    StoredFragment::new(fragment_number(index), at, at, 2000, media(index)),
                 ),
                 "case seed {stream:?} fragment {index}: the archive must accept it"
             );

@@ -44,6 +44,14 @@ image = { version = "0.25", default-features = false, features = [
     "png",
     "jpeg",
 ] }
+# Reads the Matroska (MKV) container a fragment is archived as — the element tree, its
+# variable-size integers and the block header one frame carries — so `GetClip` muxes the
+# tracks and frames the archive really holds. The same maintained reader the ingest plane
+# reads a submitted container with.
+webm-iterable = "0.7"
+# Reads the sequence parameter set of a track's AVC decoder configuration record, which is
+# what states the coded geometry the clip's video track declares.
+h264-reader = "0.9"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -51,6 +59,21 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The suites' archived fragments carry REAL H.264: the fixture encodes its pictures with
+# the same maintained codec the other video services in this workspace render with, so the
+# access units, the sequence parameter set and the picture parameter set the clip is muxed
+# from are a codec's own rather than bytes shaped to look like one.
+#
+# DEV-ONLY, and NATIVE: its `-sys` crate compiles the bundled Cisco C++ sources with `cc`
+# at build time (as `aws-lc-sys` already does here, and as the Amazon Bedrock Runtime and
+# IoT SiteWise crates already take this codec), and it is a library computing over frames
+# in-process — it opens no listener, starts no process, reads no file and makes no outbound
+# connection. Nothing this crate SHIPS depends on it: the served code reads the parameter
+# sets a producer ingested and never encodes a picture.
+openh264 = "0.9"
+# Reads the MP4 clip back through a maintained ISO base media reader, so what a suite
+# asserts about the container is what a client's demuxer sees.
+mp4 = "0.14"
 # `time`: the suites wait for a control-plane stream to become readable by looking
 # again in a poll loop, which needs a timer between looks.
 tokio = { workspace = true, features = ["time"] }

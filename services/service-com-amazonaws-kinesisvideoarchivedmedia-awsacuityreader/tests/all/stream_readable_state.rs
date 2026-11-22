@@ -32,6 +32,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use archived_media::state::{from_epoch_millis, service_state, ArchivedStream, StoredFragment};
 
+use crate::archived_media_read_path::media;
+
 /// The emulator endpoint every case addresses: this emulator, never a real AWS
 /// host.
 const ENDPOINT_HOST: &str = "kinesisvideo.us-east-1.amazonaws.com";
@@ -230,6 +232,10 @@ impl Harness {
 
     /// Put `count` fragments into `stream`'s archive, 10 seconds apart from
     /// [`T0_SECS`], so a readable stream has media for every read to answer from.
+    ///
+    /// The media is one archived Matroska fragment of coded H.264 per fragment,
+    /// which is what an ingest plane writes — and what the reads that mux it
+    /// into a clip need.
     fn seed_archive(&self, stream: &str, count: u64) {
         let state = service_state(&*self.engine).expect("the archived-media store");
         let mut state = state.lock();
@@ -240,13 +246,7 @@ impl Harness {
             assert!(
                 state.append_fragment(
                     stream,
-                    StoredFragment::new(
-                        fragment_number(index),
-                        at,
-                        at,
-                        2000,
-                        vec![b'a' + u8::try_from(index).expect("a small index"); 16],
-                    ),
+                    StoredFragment::new(fragment_number(index), at, at, 2000, media(index)),
                 ),
                 "case seed {stream:?} fragment {index}: the archive must accept it"
             );
