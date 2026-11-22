@@ -231,8 +231,9 @@ pub fn drop_database(
             return Ok(Vec::new());
         }
         // The drop is performed by the Hive DDL engine, which resolves the name while it
-        // compiles the statement.
-        return Err(Failure::hive_database_not_found(&target.database));
+        // compiles the statement — and Athena words the error message of a DROP whose
+        // database is not there in a sentence of its own, beside that compilation error.
+        return Err(Failure::drop_database_not_found(&target.database));
     };
     if !database.tables.is_empty() && !cascade {
         return Err(Failure::database_not_empty(&target.database));

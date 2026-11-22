@@ -522,11 +522,8 @@ fn rows() -> Vec<Row> {
             terminal: FAILED,
             refusal: Some(Refusal {
                 error_type: ERROR_TYPE_DDL_TASK,
-                message: format!("Database {SHOP} already exists"),
-                reason: format!(
-                    "{DDL_TASK_FAILED} AlreadyExistsException(message:Database {SHOP} \
-                     already exists)"
-                ),
+                message: format!("Database {SHOP} already exists."),
+                reason: format!("{DDL_TASK_FAILED} Database {SHOP} already exists"),
             }),
         },
         Row {
@@ -537,7 +534,7 @@ fn rows() -> Vec<Row> {
             terminal: FAILED,
             refusal: Some(Refusal {
                 error_type: ERROR_TYPE_ENTITY_NOT_FOUND,
-                message: format!("Database does not exist: {ABSENT}"),
+                message: format!("Cannot drop database {ABSENT}, as it does not exist."),
                 reason: format!(
                     "FAILED: SemanticException [Error 10072]: Database does not exist: {ABSENT}"
                 ),

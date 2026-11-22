@@ -295,17 +295,20 @@ async fn failed(
         .unwrap_or_default()
         .to_string();
     // The reason a failed query reports is what PERFORMED the statement wrote about the
-    // failure, and the error message is the failure itself: for a statement the Hive DDL
-    // engine performs the reason is that engine's own task or compilation line with the
-    // metastore's message inside it, and for every other class the two are one sentence.
-    // Either way the reason states at least what the error message states.
+    // failure, and the error message is the sentence the service words for the failure
+    // itself: for a statement the Hive DDL engine performs the reason is that engine's own
+    // task or compilation line, which opens the way that engine opens every line it writes,
+    // and for most other classes the two are one sentence. The two are worded INDEPENDENTLY
+    // — a DDL refusal states each in its own words — so what is pinned here is that both are
+    // stated and that a reason differing from the message is the engine's own line; the
+    // exact wording of each is the subject of `hive_database_ddl_failure_fields`.
     let reason = found["Status"]["StateChangeReason"]
         .as_str()
         .unwrap_or_default();
     assert!(
-        reason.contains(&message),
-        "case {case:?}: the reason must state what the error message states, got \
-         {found:?}"
+        !message.is_empty() && (reason == message || reason.starts_with("FAILED: ")),
+        "case {case:?}: a failed execution states its error message, and a reason that \
+         differs from it is the engine's own line, got {found:?}"
     );
     message
 }
@@ -1029,7 +1032,10 @@ async fn dropping_a_catalog_object_removes_it_from_the_catalog() {
             case: "a SCHEMA naming a database the catalog does not hold",
             context: "ddl_full",
             sql: "DROP SCHEMA ddl_absent",
-            refusal: Some(("Database does not exist: ddl_absent", Some(1301))),
+            refusal: Some((
+                "Cannot drop database ddl_absent, as it does not exist.",
+                Some(1301),
+            )),
         },
         DropCase {
             case: "an absent database the statement tolerates",

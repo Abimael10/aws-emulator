@@ -437,10 +437,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|group| group.configuration.bytes_scanned_cutoff_per_query);
 
         // The resolved results location is VERIFIED before the submission is accepted:
-        // Athena writes a query's results into a bucket of this account, and a location
-        // naming one this account does not hold is neither verifiable nor creatable — so
-        // such a submission is refused synchronously and mints no execution at all (see
-        // `crate::state::result_access`).
+        // Athena writes a query's results as Amazon S3 objects, so a location naming no
+        // Amazon S3 path at all is nowhere results could be written, and one naming a bucket
+        // this account does not hold is neither verifiable nor creatable — so such a
+        // submission is refused synchronously and mints no execution at all (see
+        // `crate::state::result_access`). The PATH is judged first: what bucket a location
+        // that is no Amazon S3 path names is not a question.
+        if result_configuration
+            .output_location
+            .as_deref()
+            .is_some_and(|location| !crate::state::result_access::names_an_s3_path(location))
+        {
+            return Err(invalid_request(
+                crate::state::result_access::OUTPUT_LOCATION_NOT_AN_S3_PATH,
+            ));
+        }
         if let Some(bucket) = result_configuration
             .output_location
             .as_deref()

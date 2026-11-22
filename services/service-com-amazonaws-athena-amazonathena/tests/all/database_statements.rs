@@ -335,11 +335,8 @@ async fn the_metastore_refusals_carry_athenas_own_classification() {
             "a database that is already there",
             "CREATE DATABASE ddl_empty",
             ERROR_TYPE_DDL_TASK,
-            "Database ddl_empty already exists".to_string(),
-            format!(
-                "{DDL_TASK_FAILED} AlreadyExistsException(message:Database ddl_empty \
-                 already exists)"
-            ),
+            "Database ddl_empty already exists.".to_string(),
+            format!("{DDL_TASK_FAILED} Database ddl_empty already exists"),
         ),
         (
             "a database that still holds tables",
@@ -355,7 +352,7 @@ async fn the_metastore_refusals_carry_athenas_own_classification() {
             "a database the catalog does not hold",
             "DROP SCHEMA ddl_absent",
             ERROR_TYPE_ENTITY_NOT_FOUND,
-            "Database does not exist: ddl_absent".to_string(),
+            "Cannot drop database ddl_absent, as it does not exist.".to_string(),
             "FAILED: SemanticException [Error 10072]: Database does not exist: ddl_absent"
                 .to_string(),
         ),

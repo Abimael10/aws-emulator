@@ -5,22 +5,27 @@
 //!
 //! Athena "stores query results and metadata information for each query that runs in a query
 //! result location that you can specify", and that location is a bucket of the CALLER's own
-//! account rather than storage this service owns. Two things follow:
+//! account rather than storage this service owns. Four things follow:
 //!
-//! 1. **The bucket has to be there.** Athena verifies the resolved location before it accepts
+//! 1. **The location has to be an Amazon S3 path.** Results are written as Amazon S3
+//!    objects, so Athena validates the resolved location before it queues the query and
+//!    refuses one that names no `s3://` path at all
+//!    ([`OUTPUT_LOCATION_NOT_AN_S3_PATH`]) — a submission naming such a location mints no
+//!    execution either.
+//! 2. **The bucket has to be there.** Athena verifies the resolved location before it accepts
 //!    the submission, and answers `InvalidRequestException` for one whose bucket it can
 //!    neither verify nor create ([`unverifiable_output_bucket`]) — so a submission naming
 //!    such a location mints no execution at all. What this emulator can verify is the one
 //!    object store it has ([`holds_bucket`]): a bucket no `CreateBucket` put there is a
 //!    bucket this account does not hold, and no account creates one on a client's behalf.
-//! 2. **The caller has to be allowed to write it.** The object write is made with the
+//! 3. **The caller has to be allowed to write it.** The object write is made with the
 //!    CALLER's permissions, so it is decided by exactly the two documents Amazon S3 would
 //!    decide it by: the identity-based policies in force on the caller, and the bucket's own
 //!    policy ([`super::authorization::performed_for_caller_refused`]). A write the policies
 //!    in force refuse is a write that does not happen, so the execution settles FAILED
 //!    carrying that refusal ([`access_denied`]) and the location is left as it was — rather
 //!    than reporting a success whose results were never persisted.
-//! 3. **The bucket has to be owned by the account the submission expects.** A submission may
+//! 4. **The bucket has to be owned by the account the submission expects.** A submission may
 //!    name the account it expects to own the destination, and Athena makes its Amazon S3
 //!    calls under that expectation ([`expected_owner_refusal`]): a destination owned by
 //!    anyone else is a write Amazon S3 refuses, so the execution settles FAILED carrying
@@ -49,6 +54,28 @@ pub fn output_bucket(location: &str) -> Option<String> {
     parse_s3_uri(location)
         .map(|(bucket, _)| bucket)
         .filter(|bucket| !bucket.is_empty())
+}
+
+/// The refusal `StartQueryExecution` answers a submission whose resolved result location is
+/// no Amazon S3 path at all with.
+///
+/// WHOLLY FIXED text: it interpolates nothing from the request — not the location, not the
+/// member it arrived in. RECORDED behaviour, and the rule
+/// `ResultConfiguration$OutputLocation` states ("The location in Amazon S3 where your query
+/// and calculation results are stored, such as `s3://path/to/query/bucket/`"): results are
+/// written as Amazon S3 objects, so a location naming no such path is a submission Athena
+/// refuses before it queues the query rather than one it accepts and can never write.
+pub const OUTPUT_LOCATION_NOT_AN_S3_PATH: &str = "outputLocation is not a valid S3 path.";
+
+/// Whether `location` names an Amazon S3 path at all: the scheme Amazon S3 addresses an
+/// object by, over a bucket.
+///
+/// Read through the one parser this crate reads an `s3://` location with
+/// ([`output_bucket`]), and of the location exactly as it arrived, so what counts as a path
+/// here is what counts as one everywhere this crate resolves a location — a location this
+/// says names a path is one the bucket verification beside it reads the same bucket out of.
+pub fn names_an_s3_path(location: &str) -> bool {
+    output_bucket(location).is_some()
 }
 
 /// Whether the one object store this emulator has holds `bucket`.

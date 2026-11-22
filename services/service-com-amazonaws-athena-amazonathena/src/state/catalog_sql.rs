@@ -307,14 +307,19 @@ impl Failure {
         }
     }
 
-    /// A failure the Hive DDL engine's own TASK reports: the metastore exception's
-    /// `message` is what `AthenaError$ErrorMessage` carries, and the task line — the task
-    /// that failed, with the metastore `exception` it wrapped — is what the execution's
+    /// A failure the Hive DDL engine's own TASK reports: `message` is what
+    /// `AthenaError$ErrorMessage` carries, and the task line — the task that failed,
+    /// followed by what the task `wrote` about the refusal — is what the execution's
     /// `StateChangeReason` carries, because that is what the DDL engine wrote about it.
-    fn ddl_task(message: String, exception: String) -> Self {
+    ///
+    /// The two are composed INDEPENDENTLY: the service words each field for the condition it
+    /// reports, so neither is read off the other. For one condition the task wrote the
+    /// metastore exception it wrapped, for another the bare sentence — so each caller states
+    /// the text its own condition is reported in.
+    fn ddl_task(message: String, wrote: String) -> Self {
         Self {
             message,
-            reason: Some(format!("{DDL_TASK_FAILED} {exception}")),
+            reason: Some(format!("{DDL_TASK_FAILED} {wrote}")),
             cause: FailureCause::Athena {
                 category: ERROR_CATEGORY_USER,
                 error_type: Some(ERROR_TYPE_DDL_TASK),
@@ -324,10 +329,15 @@ impl Failure {
     }
 
     /// A `CREATE DATABASE` names a database the catalog already holds.
+    ///
+    /// RECORDED behaviour: the sentence `AthenaError$ErrorMessage` carries is the
+    /// condition's own, closed with a full stop, and what the DDL task wrote after its task
+    /// line is that same sentence WITHOUT the stop and in no exception rendering. The
+    /// database is the only part either text takes from the statement.
     pub fn database_already_exists(database: &str) -> Self {
         Self::ddl_task(
-            format!("Database {database} already exists"),
-            format!("AlreadyExistsException(message:Database {database} already exists)"),
+            format!("{}.", database_already_exists_sentence(database)),
+            database_already_exists_sentence(database),
         )
     }
 
@@ -432,16 +442,14 @@ impl Failure {
     /// The statement would define a table the data catalog already holds.
     ///
     /// The statement is one the HIVE DDL engine performs, so what it reports is that
-    /// engine's own: the metastore exception's message, with the task line that wrapped it
-    /// as the state change reason (see [`Self::ddl_task`]).
+    /// engine's own, in the two texts that engine writes (see [`Self::ddl_task`]): the
+    /// metastore's sentence for the condition closed with a full stop as the error message,
+    /// and the task line followed by that sentence bare as the state change reason — the
+    /// same pair the already-held DATABASE reports ([`Self::database_already_exists`]), of
+    /// which the error message is RECORDED behaviour.
     pub fn table_already_exists(target: &Relation) -> Self {
-        Self::ddl_task(
-            format!("Table {} already exists", target.table),
-            format!(
-                "AlreadyExistsException(message:Table {} already exists)",
-                target.table
-            ),
-        )
+        let stated = format!("Table {} already exists", target.table);
+        Self::ddl_task(format!("{stated}."), stated)
     }
 
     /// A statement the HIVE DDL engine performs names a database the catalog does not
@@ -450,14 +458,42 @@ impl Failure {
     /// That engine resolves the name while it COMPILES the statement, so what it reports is
     /// the semantic error of its own compilation rather than the query engine's planning
     /// error ([`Self::schema_not_found_at`]), which is what a statement the query engine
-    /// plans reports instead.
+    /// plans reports instead — and the compiler's diagnostic is what the `StateChangeReason`
+    /// carries. The ERROR MESSAGE beside it is the Data Catalog's own not-found sentence for
+    /// the database, because what the compiler could not resolve the name against is that
+    /// catalog, and the sentence it answered with is the one the failure reports: it is taken
+    /// from the catalog's own wording ([`glue_state::messages::database_not_found`]) rather
+    /// than spelled again here.
     pub fn hive_database_not_found(database: &str) -> Self {
+        Self::hive_database_absent(
+            glue_state::messages::database_not_found(database),
+            database,
+        )
+    }
+
+    /// A `DROP DATABASE` (or `DROP SCHEMA`) names a database the catalog does not hold.
+    ///
+    /// The compilation error is the one every statement that engine compiles reports for a
+    /// database it cannot resolve, so the `StateChangeReason` is its semantic exception, the
+    /// same text [`Self::hive_database_not_found`] states. What `AthenaError$ErrorMessage`
+    /// carries is the service's own sentence for THIS condition — a drop of a database that
+    /// is not there — because the two fields are worded independently of each other.
+    /// RECORDED behaviour: fixed text either side of the database name the statement wrote,
+    /// which is its only variable part.
+    pub fn drop_database_not_found(database: &str) -> Self {
+        Self::hive_database_absent(
+            format!("Cannot drop database {database}, as it does not exist."),
+            database,
+        )
+    }
+
+    /// A statement the Hive DDL engine compiles names a database the catalog does not hold,
+    /// reported with `message` as the error message: the `StateChangeReason` is that
+    /// engine's own semantic exception for the name it could not resolve.
+    fn hive_database_absent(message: String, database: &str) -> Self {
         Self {
-            message: format!("{DATABASE_DOES_NOT_EXIST}: {database}"),
-            reason: Some(format!(
-                "FAILED: SemanticException [Error {HIVE_DATABASE_NOT_EXISTS}]: \
-                 {DATABASE_DOES_NOT_EXIST}: {database}"
-            )),
+            message,
+            reason: Some(hive_database_absent_diagnostic(database)),
             cause: FailureCause::Athena {
                 category: ERROR_CATEGORY_USER,
                 error_type: Some(ERROR_TYPE_ENTITY_NOT_FOUND),
@@ -703,6 +739,22 @@ const DATABASE_DOES_NOT_EXIST: &str = "Database does not exist";
 
 /// The error number of [`DATABASE_DOES_NOT_EXIST`] in the Hive DDL engine's catalogue.
 const HIVE_DATABASE_NOT_EXISTS: i32 = 10_072;
+
+/// What the Hive DDL engine WROTE about a statement whose database it could not resolve
+/// while it compiled it: its own driver line for a failed compilation, with the database the
+/// statement named as its only variable part.
+fn hive_database_absent_diagnostic(database: &str) -> String {
+    format!(
+        "FAILED: SemanticException [Error {HIVE_DATABASE_NOT_EXISTS}]: \
+         {DATABASE_DOES_NOT_EXIST}: {database}"
+    )
+}
+
+/// The sentence the metastore states a database that is ALREADY THERE in, with the database
+/// the statement named as its only variable part.
+fn database_already_exists_sentence(database: &str) -> String {
+    format!("Database {database} already exists")
+}
 
 /// Everything one run of a statement needs beside the statement itself.
 #[derive(Debug, Clone, Copy)]
