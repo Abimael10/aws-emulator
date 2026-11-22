@@ -909,7 +909,17 @@ pub fn sync_policy_alarms<Eng: Send + Sync + 'static>(
 
 /// Remove every alarm the policies in `policies` hold in the account's own CloudWatch
 /// store — what a group's deletion owes, since a deleted group's policies are gone with
-/// it and so are the alarms that would execute them.
+/// it and so are the alarms that would execute them — and drop those policies from the
+/// actions of every alarm that is LEFT.
+///
+/// Two different things go when a policy does. The alarms the service itself created FOR
+/// the policy are the policy ("the CloudWatch alarms created for the target tracking
+/// scaling policy", `PolicyARNType$Alarms`), so they are deleted with it. An alarm the
+/// CLIENT created is its own resource and stays: "Deleting either a step scaling policy or
+/// a simple scaling policy deletes the underlying alarm action, but does not delete the
+/// alarm, even if it no longer has an associated action" — what goes from such an alarm is
+/// the ACTION that named the policy, because a policy that no longer exists is nothing an
+/// alarm can act through.
 ///
 /// Call it with this service's store lock RELEASED.
 pub fn remove_policy_alarms<Eng: Send + Sync + 'static>(
@@ -931,5 +941,41 @@ pub fn remove_policy_alarms<Eng: Send + Sync + 'static>(
                 kind,
             ));
         }
+    }
+
+    // A policy ARN is an action of ANY of an alarm's three lists and of an alarm of any
+    // kind: "Auto Scaling policy: arn:aws:autoscaling:…:scalingPolicy:…"
+    // (`PutMetricAlarmInput$AlarmActions`, "and the same for OKActions,
+    // InsufficientDataActions and every action list of PutCompositeAlarm"), so every one of
+    // them is where a deleted policy is dropped from.
+    let deleted: Vec<&str> = policies
+        .values()
+        .map(|policy| policy.policy_arn.as_str())
+        .collect();
+    for stored in store.alarms.values_mut() {
+        drop_policy_actions(&mut stored.alarm.ok_actions, &deleted);
+        drop_policy_actions(&mut stored.alarm.alarm_actions, &deleted);
+        drop_policy_actions(&mut stored.alarm.insufficient_data_actions, &deleted);
+    }
+    for stored in store.composite_alarms.values_mut() {
+        drop_policy_actions(&mut stored.alarm.ok_actions, &deleted);
+        drop_policy_actions(&mut stored.alarm.alarm_actions, &deleted);
+        drop_policy_actions(&mut stored.alarm.insufficient_data_actions, &deleted);
+    }
+    for stored in store.log_alarms.values_mut() {
+        drop_policy_actions(&mut stored.alarm.ok_actions, &deleted);
+        drop_policy_actions(&mut stored.alarm.alarm_actions, &deleted);
+        drop_policy_actions(&mut stored.alarm.insufficient_data_actions, &deleted);
+    }
+}
+
+/// Drop every action naming one of `deleted` from ONE action list of an alarm, leaving the
+/// rest of that list exactly as the client configured it — the empty list when every action
+/// it held named a deleted policy, since an alarm stays "even if it no longer has an
+/// associated action", and an alarm's action list is the list it holds rather than an absent
+/// one ([`cloudwatch::state::configured_actions`]).
+fn drop_policy_actions(actions: &mut Option<Vec<String>>, deleted: &[&str]) {
+    if let Some(actions) = actions {
+        actions.retain(|action| !deleted.contains(&action.as_str()));
     }
 }
