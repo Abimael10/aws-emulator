@@ -67,7 +67,15 @@ async fn create_algorithm(router: &MultiServiceRouter, region: &str, request: Va
     .await
 }
 
-async fn get_algorithm(router: &MultiServiceRouter, region: &str, arn: &str) -> Answer {
+/// `GetConfiguredModelAlgorithm` on `arn`, through `region`'s endpoint.
+///
+/// `pub(crate)` because a sibling suite reads an algorithm through the same call rather
+/// than copying it.
+pub(crate) async fn get_algorithm(
+    router: &MultiServiceRouter,
+    region: &str,
+    arn: &str,
+) -> Answer {
     signed_call(
         router,
         region,
@@ -78,10 +86,14 @@ async fn get_algorithm(router: &MultiServiceRouter, region: &str, arn: &str) -> 
     .await
 }
 
-/// A `ConfiguredModelAlgorithmArn` in `region` whose resource id is `id`: the name of a
-/// resource this emulator never minted, used by the cases that read one.
-fn unknown_arn(region: &str, account: &str, id: &str) -> String {
-    format!("arn:aws:cleanrooms-ml:{region}:{account}:{RESOURCE}/{id}")
+/// A `ConfiguredModelAlgorithmArn` in `partition` and `region` for `account` whose resource
+/// id is `id`: the name of a resource this emulator never minted, used by the cases that
+/// read one.
+///
+/// `pub(crate)` because a sibling suite names the same missing resources through this one
+/// builder rather than repeating that shape's format.
+pub(crate) fn unknown_arn(partition: &str, region: &str, account: &str, id: &str) -> String {
+    format!("arn:{partition}:cleanrooms-ml:{region}:{account}:{RESOURCE}/{id}")
 }
 
 /// A create request carrying only the two required members.
@@ -360,19 +372,25 @@ async fn an_arn_naming_no_persisted_algorithm_is_not_found() {
     let cases = [
         (
             "an id this emulator never minted",
-            unknown_arn(REGION, ACCOUNT, "00000000-0000-0000-0000-000000000000"),
+            unknown_arn("aws", REGION, ACCOUNT, "00000000-0000-0000-0000-000000000000"),
         ),
         (
             "a nested id of the dots and slashes the pattern admits",
-            unknown_arn(REGION, ACCOUNT, "team.ml/algorithms/trainer.v2"),
+            unknown_arn("aws", REGION, ACCOUNT, "team.ml/algorithms/trainer.v2"),
         ),
         (
             "another account's algorithm",
-            unknown_arn(REGION, "210987654321", "d1e2f3a4-5b6c-7d8e-9f01-23456789abcd"),
+            unknown_arn(
+                "aws",
+                REGION,
+                "210987654321",
+                "d1e2f3a4-5b6c-7d8e-9f01-23456789abcd",
+            ),
         ),
         (
             "the minted id under another account",
             unknown_arn(
+                "aws",
                 REGION,
                 "210987654321",
                 present.rsplit('/').next().unwrap_or_default(),

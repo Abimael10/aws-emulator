@@ -30,6 +30,10 @@ use serde_json::{json, Value};
 use service_com_amazonaws_cleanroomsml_awsstarkcontrolservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+// The read of a configured model algorithm and the builder for one of that kind's ARNs,
+// both defined once in the suite that owns that resource: the cases below drive the read to
+// show the not-found wording is the KIND's and not one operation's.
+use crate::configured_model_algorithm::{get_algorithm, unknown_arn};
 // The HTTP harness every suite in this crate drives the router through, defined once in
 // the sibling suite rather than copied here.
 use crate::training_dataset_audience_model_lifecycle::{
@@ -784,9 +788,11 @@ async fn a_create_naming_a_resource_this_endpoint_does_not_hold_is_refused() {
     // A `UUID` no Clean Rooms membership was ever created for.
     let unknown_membership = "deadbeef-1111-4222-8333-444444444444";
     // A well-formed `ConfiguredModelAlgorithmArn` naming an algorithm nothing minted.
-    let unknown_algorithm = format!(
-        "arn:aws:cleanrooms-ml:{REGION}:{ACCOUNT}:configured-model-algorithm/\
-         00000000-0000-4000-8000-000000000000"
+    let unknown_algorithm = unknown_arn(
+        "aws",
+        REGION,
+        ACCOUNT,
+        "00000000-0000-4000-8000-000000000000",
     );
 
     // Each row: the case, the region the create is signed for, the membership and the
@@ -952,5 +958,221 @@ async fn an_association_is_only_read_through_its_own_scope() {
         collaboration,
         "the association must still report its own collaboration, got {:?}",
         read.at("collaborationIdentifier")
+    );
+}
+
+/// The longest `ConfiguredModelAlgorithmArn` the model admits, from that shape's
+/// `@length(min: 20, max: 2048)`
+/// (`smithy_query(query="shape", shape="ConfiguredModelAlgorithmArn")`).
+const ALGORITHM_ARN_CEILING: usize = 2048;
+
+/// A `ConfiguredModelAlgorithmArn` naming nothing: every part of it is a row's own, and
+/// each one satisfies that shape's pattern
+/// `^arn:aws[-a-z]*:cleanrooms-ml:[-a-z0-9]+:[0-9]{12}:configured-model-algorithm/[-a-zA-Z0-9_/.]+$`.
+/// The rows below build theirs through `unknown_arn`, the sibling suite's one builder for
+/// that shape.
+///
+/// The `ResourceNotFoundException` wording belongs to the KIND of resource that was looked
+/// for, not to the operation that looked for it, and the identifier it states is the one
+/// the request carried, character for character.
+///
+/// So the configured-model-algorithm kind is reported `Configured Model Algorithm: <arn>
+/// not found.` wherever an algorithm is resolved — by
+/// `CreateConfiguredModelAlgorithmAssociation`, which resolves the algorithm it is asked to
+/// associate, exactly as by `GetConfiguredModelAlgorithm`, which resolves the one it is
+/// asked about — whatever the shape of the ARN; and the kinds this service words the other
+/// way (a membership, an association) keep `<Kind> <identifier> does not exist.`, so one
+/// refusal path serves both wordings.
+///
+/// The rows differ along what the rule generalises over: the form and the length of the
+/// resource id, the partition, the account and the region the ARN names, and the operation
+/// the lookup runs under.
+#[tokio::test]
+async fn a_not_found_refusal_is_worded_for_the_kind_and_echoes_the_requested_identifier() {
+    let router = emulator();
+    let (_, membership) = collaboration_with_membership(&router, REGION, "assoc-wording").await;
+    // One real algorithm, so every miss below is a miss on a store that holds a record.
+    let present = create_algorithm(&router, REGION, "cma-present-for-wording").await;
+
+    // An id that fills the ARN out to the model's length ceiling exactly.
+    let ceiling_prefix = unknown_arn("aws", REGION, ACCOUNT, "");
+    let longest = unknown_arn(
+        "aws",
+        REGION,
+        ACCOUNT,
+        &"z".repeat(ALGORITHM_ARN_CEILING - ceiling_prefix.len()),
+    );
+
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "thirty-two hex characters and no dashes",
+            unknown_arn("aws", REGION, ACCOUNT, "0123456789abcdef0123456789abcdef"),
+        ),
+        (
+            "a UUID this emulator never minted",
+            unknown_arn("aws", REGION, ACCOUNT, "7f8e9d0c-1b2a-4c3d-8e5f-60718293a4b5"),
+        ),
+        (
+            "the single-character id the pattern admits",
+            unknown_arn("aws", REGION, ACCOUNT, "a"),
+        ),
+        (
+            "a nested id of the dots, slashes and underscores the pattern admits",
+            unknown_arn("aws", REGION, ACCOUNT, "team.ml/algorithms_v2/trainer.3"),
+        ),
+        ("an id filling the model's length ceiling", longest),
+        (
+            "another account's algorithm",
+            unknown_arn("aws", REGION, OTHER_ACCOUNT, "cma-of-another-account"),
+        ),
+        (
+            "another region's algorithm",
+            unknown_arn("aws", OTHER_REGION, ACCOUNT, "cma-of-another-region"),
+        ),
+        (
+            "another partition's algorithm",
+            unknown_arn(
+                "aws-us-gov",
+                "us-gov-west-1",
+                ACCOUNT,
+                "cma-of-another-partition",
+            ),
+        ),
+        (
+            "the persisted algorithm's own id under another account",
+            unknown_arn(
+                "aws",
+                REGION,
+                OTHER_ACCOUNT,
+                present.rsplit('/').next().unwrap_or_default(),
+            ),
+        ),
+    ];
+
+    for (case, arn) in &cases {
+        // The kind's sentence, with the ARN the request carried as its only variable part.
+        let expected = format!("Configured Model Algorithm: {arn} not found.");
+
+        // Each operation that resolves an algorithm answers that one sentence.
+        let refusals = [
+            (
+                "CreateConfiguredModelAlgorithmAssociation",
+                create_association(
+                    &router,
+                    REGION,
+                    &membership,
+                    json!({ "name": "assoc-wording", "configuredModelAlgorithmArn": arn }),
+                )
+                .await,
+            ),
+            (
+                "GetConfiguredModelAlgorithm",
+                get_algorithm(&router, REGION, arn).await,
+            ),
+        ];
+
+        for (operation, refused) in &refusals {
+            assert_eq!(
+                refused.status, 404,
+                "case {case:?} through {operation}: expected 404, got {} with {:?}",
+                refused.status, refused.body
+            );
+            assert_eq!(
+                refused.error_code(),
+                "ResourceNotFoundException",
+                "case {case:?} through {operation}: expected ResourceNotFoundException, \
+                 got {:?}",
+                refused.body
+            );
+            assert_eq!(
+                refused.at("message").as_str().unwrap_or_default(),
+                expected,
+                "case {case:?} through {operation}: expected the refusal to say \
+                 {expected:?}, got {:?}",
+                refused.at("message")
+            );
+        }
+    }
+
+    // The kinds this service words the other way, through the same refusal path: the
+    // sentence changes with the KIND, never with the operation.
+    let unknown_membership = "11111111-2222-4333-8444-555555555555";
+    let unknown_association = format!(
+        "arn:aws:cleanrooms-ml:{REGION}:{ACCOUNT}:membership/{membership}/\
+         configured-model-algorithm-association/00000000000000000000000000000000"
+    );
+    let other_wording: Vec<(&str, String, Answer)> = vec![
+        (
+            "a membership no Clean Rooms membership exists for",
+            format!("Membership {unknown_membership} does not exist."),
+            create_association(
+                &router,
+                REGION,
+                unknown_membership,
+                json!({ "name": "assoc-wording", "configuredModelAlgorithmArn": present }),
+            )
+            .await,
+        ),
+        (
+            "an association nothing minted",
+            format!("Configured Model Algorithm Association {unknown_association} does not exist."),
+            get_association(&router, REGION, &membership, &unknown_association).await,
+        ),
+    ];
+
+    for (case, expected, refused) in &other_wording {
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: expected 404, got {} with {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.at("message").as_str().unwrap_or_default(),
+            *expected,
+            "case {case:?}: expected the refusal to say {expected:?}, got {:?}",
+            refused.at("message")
+        );
+    }
+
+    // None of the refusals persisted anything, and the algorithm every one of them was
+    // measured against is still associable: the refusal is about the lookup, not a blanket
+    // one.
+    let listed = list_associations(&router, REGION, &membership, "").await;
+    assert_eq!(
+        listed_arns(&listed, "configuredModelAlgorithmAssociations"),
+        Vec::<String>::new(),
+        "a refused create persisted a record: {:?}",
+        listed.body
+    );
+    let created = create_association(
+        &router,
+        REGION,
+        &membership,
+        json!({ "name": "assoc-wording-control", "configuredModelAlgorithmArn": present }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "the persisted algorithm must still be associable, got {} with {:?}",
+        created.status, created.body
+    );
+    let arn = created
+        .at("configuredModelAlgorithmAssociationArn")
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        listed_arns(
+            &list_associations(&router, REGION, &membership, "").await,
+            "configuredModelAlgorithmAssociations"
+        ),
+        vec![arn],
+        "the one association created must be the only one listed"
     );
 }
