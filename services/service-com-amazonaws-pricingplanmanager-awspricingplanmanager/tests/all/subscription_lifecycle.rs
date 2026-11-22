@@ -2409,7 +2409,13 @@ pub(crate) fn create_body_naming(
 ///
 /// Waits for the CONDITION, not for a time: how long a change takes is the service's
 /// business, so this looks again until the status moves or a deadline far past it passes.
-async fn poll_until_active(router: &MultiServiceRouter, arn: &str, case: &str) -> Answer {
+///
+/// Visible to the sibling suites of this test crate, so the settle poll is written once.
+pub(crate) async fn poll_until_active(
+    router: &MultiServiceRouter,
+    arn: &str,
+    case: &str,
+) -> Answer {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         let fetched = call(router, "GetSubscription", json!({"arn": arn}), None).await;
@@ -3480,7 +3486,9 @@ const NO_CANCELLABLE_CHANGE: &str = "No scheduled updates found for this subscri
 /// rather than waited for, so no row costs wall-clock time or depends on how fast the host
 /// runs. The confirmation is written too: an undated change is in no processing window, so
 /// a row about that window needs the dated form.
-fn move_change_instants(
+///
+/// Visible to the sibling suites of this test crate, so the instant writer is written once.
+pub(crate) fn move_change_instants(
     engine: &Arc<engine::InMemoryEngine>,
     arn: &str,
     instant: aws_smithy_types::DateTime,

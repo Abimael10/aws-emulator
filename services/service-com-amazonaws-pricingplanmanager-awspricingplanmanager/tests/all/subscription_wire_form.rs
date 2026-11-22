@@ -22,9 +22,9 @@
 //! Both rules are asserted over TABLES whose rows differ along what the rules generalise
 //! over — tier, usage level, resource count, approval mode, whether a change is pending,
 //! and the sequence of mutations a subscription has taken — plus one test pinning the
-//! protocol seam the first rule's rendering comes from, and one carrying both rules onto
-//! the two publishers those tables do not read, so neither form can depend on which
-//! operation published it.
+//! protocol seam the first rule's rendering comes from, and two carrying both rules onto
+//! the publishers those tables do not read, so neither form can depend on which operation
+//! published it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -41,6 +41,14 @@ use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
 };
 use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::EmulatedService;
 
+// The resource-ARN forms the owning services mint, the `CreateSubscription` body that
+// names them exactly, the settle poll and the writer that places a pending change's
+// instants are `subscription_lifecycle`'s, so this suite adds no second copy of any of
+// them.
+use super::subscription_lifecycle::{
+    create_body_naming, distribution, hosted_zone, key_value_store, move_change_instants,
+    poll_until_active, web_acl,
+};
 // Making a pending change's confirmation due belongs to the suite that owns that rule.
 use super::scheduled_change_confirmation::make_confirmation_due;
 
@@ -850,9 +858,9 @@ async fn assert_reporting_paths_agree(
 /// confirmed, which is a rule of its own (`scheduled_change_confirmation`) and is brought
 /// forward here rather than waited out.
 ///
-/// `AssociateResourcesToSubscription`, `DisassociateResourcesFromSubscription` and
-/// `CancelSubscriptionChange` are still 501 stubs, so they publish nothing to assert on
-/// yet.
+/// The three remaining publishers — `AssociateResourcesToSubscription`,
+/// `DisassociateResourcesFromSubscription` and `CancelSubscriptionChange` — are carried by
+/// [`the_resource_change_publishers_use_the_same_wire_form`] below.
 #[tokio::test]
 async fn the_approve_and_cancel_publishers_use_the_same_wire_form() {
     // (plan family, tier, resource count, usage level). Every row is created under MANUAL
@@ -921,5 +929,275 @@ async fn the_approve_and_cancel_publishers_use_the_same_wire_form() {
             read.body
         );
         check_published_subscription(&format!("{label}/confirmed cancellation"), &read, revision);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Both rules, on the publishers that change the resource set or drop a change
+// ---------------------------------------------------------------------------
+
+/// What a row drives after the create: which of the three remaining publishers of a
+/// `Subscription` payload it is about, and what that publisher is handed.
+enum Change {
+    /// `AssociateResourcesToSubscription`, naming the resources that join the set.
+    Associate(Vec<String>),
+    /// `DisassociateResourcesFromSubscription`, naming the resources that leave it.
+    Disassociate(Vec<String>),
+    /// A tier to move DOWN to — a move the service schedules instead of applying, so the
+    /// record is left carrying a pending change — and then `CancelSubscriptionChange`,
+    /// which drops it.
+    CancelPending(&'static str),
+}
+
+impl Change {
+    /// The publisher this row asserts both rules on.
+    fn publisher(&self) -> &'static str {
+        match self {
+            Change::Associate(_) => "AssociateResourcesToSubscription",
+            Change::Disassociate(_) => "DisassociateResourcesFromSubscription",
+            Change::CancelPending(_) => "CancelSubscriptionChange",
+        }
+    }
+}
+
+/// One subject: the subscription to create, and the change to drive on it.
+struct Publisher {
+    label: &'static str,
+    family: &'static str,
+    tier: &'static str,
+    /// The resources the subscription is created over.
+    held: Vec<String>,
+    change: Change,
+}
+
+/// The remaining three publishers of a `Subscription` payload obey the SAME two rules as
+/// the create, the update, the approval, the cancellation and the two reporting paths.
+///
+/// Every one of them renders the stored record through the one representation conversion
+/// and the one protocol seam, so neither the date-time form of a timestamp member nor the
+/// form of the concurrency token can depend on which operation published it: the token is
+/// the record's revision in decimal and advances by one per write — including the write the
+/// CLOCK owes a resource change once it has taken effect — and `createdAt`, `updatedAt` and
+/// a pending change's `effectiveDate` are RFC 3339 date-time strings.
+///
+/// The rows differ along what the rules generalise over: the publisher, the plan family,
+/// the tier, the kind and number of resources the subscription holds, how many join or
+/// leave and in which order, and whether the record carries a pending change when it is
+/// published.
+#[tokio::test]
+async fn the_resource_change_publishers_use_the_same_wire_form() {
+    let dist = distribution("E1PUBLISH");
+    let acl = web_acl("acl-publish");
+    let zone = hosted_zone("Z1PUBLISH");
+    let other_zone = hosted_zone("Z2PUBLISH");
+    let kvs = key_value_store("kvs-publish");
+
+    let rows = vec![
+        Publisher {
+            label: "a hosted zone joins a free CloudFront subscription",
+            family: "CloudFront",
+            tier: "FREE",
+            held: vec![dist.clone(), acl.clone()],
+            change: Change::Associate(vec![zone.clone()]),
+        },
+        Publisher {
+            label: "a KeyValueStore and a hosted zone join a paid subscription",
+            family: "CloudFront",
+            tier: "BUSINESS",
+            held: vec![dist.clone(), acl.clone()],
+            change: Change::Associate(vec![kvs.clone(), zone.clone()]),
+        },
+        Publisher {
+            label: "an optional resource leaves a CloudFront subscription",
+            family: "CloudFront",
+            tier: "PRO",
+            held: vec![dist.clone(), acl.clone(), zone.clone()],
+            change: Change::Disassociate(vec![zone.clone()]),
+        },
+        Publisher {
+            label: "two resources leave a family with no required composition",
+            family: "Route53",
+            tier: "PREMIUM",
+            held: vec![zone.clone(), other_zone.clone(), kvs.clone()],
+            change: Change::Disassociate(vec![kvs.clone(), other_zone.clone()]),
+        },
+        Publisher {
+            label: "a pending downgrade to the bottom of the tier ladder is dropped",
+            family: "CloudFront",
+            tier: "PREMIUM",
+            held: vec![dist.clone(), acl.clone()],
+            change: Change::CancelPending("FREE"),
+        },
+        Publisher {
+            label: "a pending downgrade of another family is dropped",
+            family: "Route53",
+            tier: "BUSINESS",
+            held: vec![zone.clone()],
+            change: Change::CancelPending("PRO"),
+        },
+    ];
+
+    for row in &rows {
+        // A router of its own per row: a resource is covered by at most one subscription,
+        // so rows naming the same resources are independent accounts rather than one.
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let router = router_on(Arc::clone(&engine));
+        let label = row.label;
+        let created = create(
+            &router,
+            create_body_naming(row.family, row.tier, &row.held, Some("IMMEDIATE")),
+        )
+        .await;
+        let arn = created.string("arn");
+        let mut token = created.require_etag(label);
+        // Minting the record and putting it into service are both writes, so an active
+        // subscription's first published revision is one past the mint.
+        let mut revision = FIRST_REVISION + 1;
+        let minted = check_published_subscription(
+            &format!("{label}/CreateSubscription"),
+            &created,
+            revision,
+        );
+        assert_reporting_paths_agree(&router, label, &arn, revision, minted).await;
+
+        let case = format!("{label}/{}", row.change.publisher());
+        // A change to the resource set is applied asynchronously, so the record is left
+        // reporting it as being applied and the clock owes it the move back; dropping a
+        // pending change is complete when the call answers.
+        let (answer, owed_a_settling_write) = match &row.change {
+            Change::Associate(named) => (
+                call(
+                    &router,
+                    "AssociateResourcesToSubscription",
+                    json!({"arn": arn.clone(), "resourceArns": named}),
+                    Some(&token),
+                )
+                .await,
+                true,
+            ),
+            Change::Disassociate(named) => (
+                call(
+                    &router,
+                    "DisassociateResourcesFromSubscription",
+                    json!({"arn": arn.clone(), "resourceArns": named}),
+                    Some(&token),
+                )
+                .await,
+                true,
+            ),
+            Change::CancelPending(tier) => {
+                // A move down the published tier ladder is scheduled rather than applied,
+                // so it leaves behind the pending change this publisher drops.
+                let scheduled = call(
+                    &router,
+                    "UpdateSubscription",
+                    json!({"arn": arn.clone(), "planTier": tier}),
+                    Some(&token),
+                )
+                .await;
+                assert_eq!(
+                    scheduled.status, 200,
+                    "case {label}: the downgrade must be scheduled, got {} {:?}",
+                    scheduled.status, scheduled.body
+                );
+                revision += 1;
+                token = scheduled.require_etag(label);
+                let published = check_published_subscription(
+                    &format!("{label}/UpdateSubscription"),
+                    &scheduled,
+                    revision,
+                );
+                assert_reporting_paths_agree(&router, label, &arn, revision, published).await;
+
+                // The pending change carries its `effectiveDate` — the model's third
+                // date-time member — only once it has been confirmed, so the row brings
+                // that confirmation forward instead of waiting the span out; the rule is
+                // `scheduled_change_confirmation`'s, and what is asserted here is the FORM
+                // the date travels in on this publisher's path. Dating the change is no
+                // caller's write, so the token does not move with it.
+                make_confirmation_due(&engine, &arn, label);
+                let dated = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+                assert!(
+                    dated
+                        .body
+                        .get("scheduledChange")
+                        .is_some_and(|change| !change["effectiveDate"].is_null()),
+                    "case {label}: a confirmed downgrade is dated, which is what carries \
+                     the third date-time member, got {:?}",
+                    dated.body
+                );
+                check_published_subscription(
+                    &format!("{label}/confirmed downgrade"),
+                    &dated,
+                    revision,
+                );
+
+                // Well clear of the processing window, so the change is still the caller's
+                // to cancel. The instant is WRITTEN rather than waited for, so the row
+                // costs no wall-clock time and does not depend on when the suite runs.
+                move_change_instants(
+                    &engine,
+                    &arn,
+                    parse_date_time("2099-01-01T00:00:00Z")
+                        .expect("the instant is a representable date-time"),
+                    label,
+                );
+
+                (
+                    call(
+                        &router,
+                        "CancelSubscriptionChange",
+                        json!({"arn": arn.clone()}),
+                        Some(&token),
+                    )
+                    .await,
+                    false,
+                )
+            }
+        };
+
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: the publisher must succeed under the current If-Match, got {} {:?}",
+            answer.status, answer.body
+        );
+        revision += 1;
+        let published = check_published_subscription(&case, &answer, revision);
+        assert_eq!(
+            published.0, minted.0,
+            "case {case}: createdAt keeps naming the instant the record was minted, got {} \
+             ms instead of {} ms",
+            published.0, minted.0
+        );
+
+        if owed_a_settling_write {
+            // The resource change the call started is owed by the clock: the subscription
+            // moves back to ACTIVE on its own, and that move is a write like any other, so
+            // the token advances once more. Both reporting paths are read AFTER it, so what
+            // they report cannot race the change settling between them.
+            let settled = poll_until_active(&router, &arn, label).await;
+            revision += 1;
+            let settled_case = format!("{case}/settled");
+            let reported = check_published_subscription(&settled_case, &settled, revision);
+            assert_eq!(
+                reported.0, minted.0,
+                "case {settled_case}: createdAt keeps naming the instant the record was \
+                 minted, got {} ms instead of {} ms",
+                reported.0, minted.0
+            );
+            let summary = summary_for(&router, &arn).await;
+            let listed = check_published_summary(
+                &format!("{settled_case}/ListSubscriptions"),
+                &summary,
+                revision,
+            );
+            assert_eq!(
+                listed, reported,
+                "case {settled_case}: the listing republishes the instants the read reports, \
+                 got {listed:?} vs {reported:?}"
+            );
+        } else {
+            assert_reporting_paths_agree(&router, label, &arn, revision, published).await;
+        }
     }
 }
