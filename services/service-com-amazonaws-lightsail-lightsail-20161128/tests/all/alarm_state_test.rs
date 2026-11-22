@@ -14,7 +14,7 @@
 //! is configured, and however many times in a row — leaving every other member
 //! of that alarm, and every other alarm, exactly as it was, and appending one
 //! terminal operation-log entry in the tested alarm's own region. A name no
-//! alarm is stored under is refused with the service's `DoesNotExist` envelope
+//! alarm is stored under is refused with the alarm operations' not-found envelope
 //! and changes nothing, and a state outside the modelled enum is refused by the
 //! constraint walk before the handler runs.
 
@@ -425,8 +425,8 @@ async fn testing_one_alarm_leaves_every_other_alarm_alone() {
 // Refusals
 // ---------------------------------------------------------------------------
 
-/// RULE: a request naming no stored alarm is refused with the service's
-/// `DoesNotExist` envelope and changes nothing — an alarm is addressed by its
+/// RULE: a request naming no stored alarm is refused with the alarm operations'
+/// not-found envelope and changes nothing — an alarm is addressed by its
 /// own name, so neither a name nothing was ever stored under, nor a deleted
 /// alarm's name, nor the name of the resource the alarm watches, names one.
 #[tokio::test]
@@ -475,8 +475,8 @@ async fn testing_an_alarm_that_is_not_stored_is_refused_and_changes_nothing() {
         );
         assert_eq!(
             body["code"].as_str(),
-            Some("DoesNotExist"),
-            "case {case}: expected the DoesNotExist envelope for {name}, got {body:?}"
+            Some("NotFoundException"),
+            "case {case}: expected the alarm not-found envelope for {name}, got {body:?}"
         );
     }
 

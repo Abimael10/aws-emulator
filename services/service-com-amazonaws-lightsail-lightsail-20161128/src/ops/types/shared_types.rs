@@ -54,12 +54,29 @@ pub struct AccountSetupInProgressException {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.lightsail#InvalidInputException")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InvalidInputException {
     pub code: Option<String>,
     pub docs: Option<String>,
     pub message: Option<String>,
     pub tip: Option<String>,
+}
+
+/// An input-validation refusal carries its sub-classification in the body's `code`
+/// (`crate::scaffolded::INVALID_PARAMS_CODE`), which is what tells it apart from the
+/// other 400s one operation can answer — so `code` is part of the refusal whether or
+/// not the handler that builds it names the member, and this shape's default is where
+/// it comes from. Written out rather than derived for that one member; every other
+/// member is absent until a refusal fills it.
+impl Default for InvalidInputException {
+    fn default() -> Self {
+        Self {
+            code: Some(crate::scaffolded::INVALID_PARAMS_CODE.to_string()),
+            docs: None,
+            message: None,
+            tip: None,
+        }
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.lightsail#NotFoundException")]

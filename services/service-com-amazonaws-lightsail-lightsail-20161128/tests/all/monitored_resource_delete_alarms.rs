@@ -40,11 +40,12 @@ use crate::alarm_configuration::{alarms, monitored_resource, names, Monitored};
 use crate::instance_lifecycle::{error_code, is_uuid_shaped, wait_for_state, Emulator};
 
 /// The wire error a Lightsail request for a resource the account does not hold is
-/// refused with, and the `code` its body carries (pinned for every operation in
-/// `instance_error_envelope.rs`).
+/// refused with (pinned for every operation in `instance_error_envelope.rs`).
 const NOT_FOUND: &str = "NotFoundException";
-/// See [`NOT_FOUND`].
-const DOES_NOT_EXIST: &str = "DoesNotExist";
+/// The `code` the body of that refusal carries for an ALARM operation: the
+/// modelled exception's own name, which is what the alarm operations report
+/// (pinned in `client_error_body_code.rs`).
+const ALARM_NOT_FOUND_CODE: &str = "NotFoundException";
 
 /// The most alarms one metric of one monitored resource carries, from the
 /// modelled `PutAlarmRequest$metricName` documentation: "You can configure up
@@ -417,7 +418,7 @@ async fn deleting_a_monitored_resource_releases_every_alarm_watching_it() {
                 .await;
             assert_eq!(
                 (status, error_code(&body).as_str(), body["code"].as_str()),
-                (400, NOT_FOUND, Some(DOES_NOT_EXIST)),
+                (400, NOT_FOUND, Some(ALARM_NOT_FOUND_CODE)),
                 "case {case}: expected deleting the released alarm {name} to be refused, \
                  got {status} {body:?}"
             );

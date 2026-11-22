@@ -54,9 +54,13 @@ const REGISTRATION_IN_PROGRESS: &str = "Lb.RegistrationInProgress";
 /// `OperationType` enum.
 const OPERATION_TYPE: &str = "DetachInstancesFromLoadBalancer";
 
-/// The value Lightsail puts in a not-found body's `code` member, which a
-/// Lightsail SDK client branches on rather than on the HTTP status.
+/// The value a RESOURCE operation puts in a not-found body's `code` member, which
+/// a Lightsail SDK client branches on rather than on the HTTP status.
 const DOES_NOT_EXIST: &str = "DoesNotExist";
+
+/// The value an input-validation refusal puts in that member
+/// (`client_error_body_code.rs` pins it for every operation).
+const INVALID_PARAMS: &str = "InvalidParams";
 
 /// The most instance names one request may carry
 /// (`crate::state::MAX_INSTANCE_NAMES_PER_REQUEST`): an emulator resource guard,
@@ -572,7 +576,8 @@ struct Refusal {
 }
 
 /// The table. Every row is refused with HTTP 400: Lightsail answers its
-/// `NotFoundException` at 400 with `DoesNotExist` in the body, and
+/// `NotFoundException` at 400 with `DoesNotExist` in the body, an
+/// `InvalidInputException` carries `InvalidParams` there, and
 /// `InvalidInputException` is modelled `@httpError(400)`.
 const REFUSALS: &[Refusal] = &[
     Refusal {
@@ -613,7 +618,7 @@ const REFUSALS: &[Refusal] = &[
         load_balancer_name: "guard-detach-lb",
         instance_names: &[],
         code: "InvalidInputException",
-        body_code: None,
+        body_code: Some(INVALID_PARAMS),
     },
     Refusal {
         case: "the same instance named twice in one request",
@@ -621,7 +626,7 @@ const REFUSALS: &[Refusal] = &[
         load_balancer_name: "guard-detach-lb",
         instance_names: &["guard-member", "guard-member"],
         code: "InvalidInputException",
-        body_code: None,
+        body_code: Some(INVALID_PARAMS),
     },
 ];
 

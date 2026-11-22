@@ -195,9 +195,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
         if !crate::state::is_ec2_instance_type(&entry.instance_type) {
+            // AWS's own wording for this refusal: fixed text around the rejected
+            // value the request carried.
             return Err(invalid(format!(
-                "instances[].instanceType '{}' is not an Amazon EC2 instance type: it is an \
-                 instance family and a size separated by a dot (t2.micro)",
+                "Sorry, the input instance type {} is invalid. See the Lightsail API \
+                 documentation for examples of valid instance types.",
                 entry.instance_type
             )));
         }
@@ -369,8 +371,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// This operation's 400 refusal for a request the model admits but the service
-/// does not: the modelled `InvalidInputException`, whose message names the member
-/// that is wrong and the constraint it broke.
+/// does not: the modelled `InvalidInputException`, carrying the input-validation
+/// discriminator in the body's `code` (the shape's own default) and a message
+/// that is AWS's wording where AWS words this refusal, otherwise one naming the
+/// member that is wrong and the constraint it broke.
 fn invalid(message: String) -> CreateCloudFormationStackError {
     CreateCloudFormationStackErrorModeled::InvalidInputException(InvalidInputException {
         message: Some(message),

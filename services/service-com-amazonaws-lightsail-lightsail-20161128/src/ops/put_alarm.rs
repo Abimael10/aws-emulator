@@ -400,8 +400,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// This operation's 400 refusal for a request the model admits but the service
-/// does not: the modelled `InvalidInputException`, whose message names the member
-/// that is wrong and the constraint it broke.
+/// does not: the modelled `InvalidInputException`, carrying the input-validation
+/// discriminator in the body's `code` (the shape's own default) and a message
+/// naming the member that is wrong and the constraint it broke.
 fn invalid(message: String) -> PutAlarmError {
     PutAlarmErrorModeled::InvalidInputException(InvalidInputException {
         message: Some(message),
@@ -410,20 +411,16 @@ fn invalid(message: String) -> PutAlarmError {
     .into()
 }
 
-/// No resource an alarm can monitor is stored under that name: Lightsail's
-/// `DoesNotExist` rejection — HTTP 400, wire error `NotFoundException`, body
-/// `code` `DoesNotExist`, and a message built from the request.
+/// No resource an alarm can monitor is stored under that name: the alarm
+/// operations' not-found rejection — HTTP 400, wire error `NotFoundException`,
+/// body `code` `NotFoundException`, and a message built from the request.
 ///
-/// The message names the three resource types an alarm can monitor rather than
-/// one, because the request names a resource without saying what kind it is, so
-/// all three are the types it was looked for among.
+/// The message names every kind the name was looked for among rather than one,
+/// because the request names a resource without saying what kind it is; that list
+/// is `crate::state::PUT_ALARM_MONITORED_RESOURCE_TYPES`.
 fn monitored_resource_does_not_exist(name: &str) -> PutAlarmError {
-    crate::scaffolded::Scaffolded::resource_does_not_exist_within(
-        &[
-            crate::state::RESOURCE_TYPE_INSTANCE,
-            crate::state::RESOURCE_TYPE_LOAD_BALANCER,
-            crate::state::RESOURCE_TYPE_RELATIONAL_DATABASE,
-        ],
+    crate::scaffolded::Scaffolded::alarm_resource_not_found_within(
+        crate::state::PUT_ALARM_MONITORED_RESOURCE_TYPES,
         name,
     )
 }

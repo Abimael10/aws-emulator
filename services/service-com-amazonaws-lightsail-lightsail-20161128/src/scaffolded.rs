@@ -44,14 +44,29 @@
 //! ## This service's not-found envelope
 //!
 //! It is also where an error whose WIRE rendering differs from its modelled traits
-//! lives. Lightsail answers a request naming a resource it cannot find with HTTP 400
-//! and the body's `code` set to `DoesNotExist`, even though the model declares
-//! `@httpError(404)` on `NotFoundException`; a Lightsail SDK client maps the failure
-//! from the body, not the status. The generated error enum takes its status straight
-//! from the model's trait, so that envelope is [`Scaffolded::NotFound`] — built through
-//! [`Scaffolded::resource_does_not_exist`] (the type-list/name message) or
-//! [`Scaffolded::does_not_exist`] (any other `DoesNotExist` wording). EVERY not-found
-//! path in this crate goes through one of those two, so one rule serves them all.
+//! lives. Lightsail answers a request naming a resource it cannot find with HTTP 400,
+//! even though the model declares `@httpError(404)` on `NotFoundException`; a Lightsail
+//! SDK client maps the failure from the body, not the status. The generated error enum
+//! takes its status straight from the model's trait, so that envelope is
+//! [`Scaffolded::NotFound`].
+//!
+//! What the body's `code` carries is the DISCRIMINATOR the refusing operation reports,
+//! and Lightsail does not report one discriminator for the whole service: the resource
+//! operations report the sub-classification [`DOES_NOT_EXIST_CODE`], while the alarm
+//! operations report the modelled exception's own name
+//! ([`NOT_FOUND_EXCEPTION_CODE`]) — including `PutAlarm`, whose not-found is about the
+//! INSTANCE or database it was asked to watch, so it is the operation that decides the
+//! discriminator and not the kind of resource it could not find. So a not-found path is
+//! built through [`Scaffolded::resource_does_not_exist`] /
+//! [`Scaffolded::does_not_exist`] for the resource operations and through
+//! [`Scaffolded::alarm_resource_not_found`] /
+//! [`Scaffolded::alarm_resource_not_found_within`] for the alarm operations. Every one
+//! of them words the message with [`resource_not_found_message`], the service's ONE
+//! not-found wording.
+//!
+//! An input-validation refusal carries its own discriminator, [`INVALID_PARAMS_CODE`],
+//! which the modelled `InvalidInputException`'s `Default` puts in `code` — so every
+//! refusal this crate builds from that shape carries it.
 
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeSerializer};
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
@@ -189,19 +204,54 @@ impl SerializableStruct for ValidationException {
     }
 }
 
-/// The value Lightsail puts in the `code` member of a rejection whose cause is that
-/// the resource — or the catalog entry — the request names does not exist.
+/// The value the RESOURCE operations put in the `code` member of a rejection whose
+/// cause is that the resource — or the catalog entry — the request names does not
+/// exist.
 ///
 /// A Lightsail SDK client branches on THIS, not on the HTTP status: the body's `code`
 /// is what tells "already gone" apart from a transport failure.
 pub const DOES_NOT_EXIST_CODE: &str = "DoesNotExist";
 
+/// The value the ALARM operations put in the `code` member of the same rejection: the
+/// modelled exception's own name.
+///
+/// `PutAlarm` reports it for the resource it was asked to watch and `DeleteAlarm` and
+/// `TestAlarm` for the alarm itself, so what the discriminator depends on is the
+/// operation that refuses the request rather than the kind of resource it looked for.
+pub const NOT_FOUND_EXCEPTION_CODE: &str = "NotFoundException";
+
+/// The value Lightsail puts in the `code` member of a refusal whose cause is that the
+/// input does not conform to a validation rule of an input field — the
+/// sub-classification that tells an input-validation refusal apart from the other 400s
+/// an operation can answer, `OperationFailureException` among them.
+///
+/// It is what the modelled `InvalidInputException`'s `Default` carries, so a refusal
+/// written as `InvalidInputException { message: Some(..), ..Default::default() }` — the
+/// form every handler in this crate refuses a request with — is served with it.
+pub const INVALID_PARAMS_CODE: &str = "InvalidParams";
+
+/// The message Lightsail refuses a request naming a resource it cannot find with: the
+/// service's fixed text around the identifier the request carried and the bracketed
+/// list of resource types the operation looked for it among.
+///
+/// The crate's ONE not-found wording, whichever discriminator the refusing operation
+/// reports in `code`: the fixed text is AWS's, and the variable parts are the request's
+/// own identifier and that type list.
+pub fn resource_not_found_message(resource_types: &[&str], name: &str) -> String {
+    format!(
+        "The specified resource {name} does not exist within types [{}]. Please provide a \
+         valid resource name.",
+        resource_types.join(", ")
+    )
+}
+
 /// The HTTP status Lightsail answers its `NotFoundException` with ON THE WIRE.
 ///
 /// The model declares `@httpError(404)` on the shape, but the recorded Lightsail
 /// endpoint answers **400** for a resource it cannot find, with the shape name in
-/// `__type` and `DoesNotExist` in the body's `code`. The recorded wire status governs,
-/// so this status — not the modelled one — is what [`Scaffolded::NotFound`] renders.
+/// `__type` and the refusing operation's discriminator in the body's `code`. The
+/// recorded wire status governs, so this status — not the modelled one — is what
+/// [`Scaffolded::NotFound`] renders.
 pub const NOT_FOUND_WIRE_STATUS: u16 = 400;
 
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
@@ -263,11 +313,26 @@ impl<E> Scaffolded<E> {
     /// the fixed text is AWS's, and the variable parts are the identifier the
     /// request carried and that bracketed type list.
     pub fn resource_does_not_exist_within(resource_types: &[&str], name: &str) -> Self {
-        Self::does_not_exist(format!(
-            "The specified resource {name} does not exist within types [{}]. Please provide a \
-             valid resource name.",
-            resource_types.join(", ")
-        ))
+        Self::does_not_exist(resource_not_found_message(resource_types, name))
+    }
+
+    /// The not-found rejection of an ALARM operation: the same HTTP 400, the same wire
+    /// error `NotFoundException` and the same message, with the discriminator those
+    /// operations report in `code` — [`NOT_FOUND_EXCEPTION_CODE`] rather than
+    /// [`DOES_NOT_EXIST_CODE`].
+    pub fn alarm_resource_not_found(resource_type: &str, name: &str) -> Self {
+        Self::alarm_resource_not_found_within(&[resource_type], name)
+    }
+
+    /// [`Self::alarm_resource_not_found`] for an alarm operation that looks for `name`
+    /// among SEVERAL resource types, which the message then lists in the order the
+    /// operation resolves them in.
+    pub fn alarm_resource_not_found_within(resource_types: &[&str], name: &str) -> Self {
+        Self::NotFound(crate::ops::types::NotFoundException {
+            code: Some(NOT_FOUND_EXCEPTION_CODE.to_string()),
+            message: Some(resource_not_found_message(resource_types, name)),
+            ..Default::default()
+        })
     }
 
     /// The same `DoesNotExist` envelope for a rejection whose message is not the

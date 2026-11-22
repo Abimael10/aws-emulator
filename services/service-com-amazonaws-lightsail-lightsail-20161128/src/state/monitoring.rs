@@ -105,6 +105,27 @@ pub const MAX_EVALUATION_PERIODS: i32 = 288;
 /// two alarms per metric."
 pub const MAX_ALARMS_PER_METRIC: usize = 2;
 
+/// The resource types `PutAlarm`'s not-found refusal reports `monitoredResourceName`
+/// was looked for among, in the order its message lists them.
+///
+/// SOURCE: the recorded refusal of a `PutAlarm` naming a resource the account does
+/// not hold — "The specified resource <name> does not exist within types [Instance,
+/// LoadBalancer, RelationalDatabase, Distribution, Bucket]. Please provide a valid
+/// resource name." The list is fixed text of that message: it is every kind
+/// Lightsail resolves a monitorable name among, which is WIDER than the kinds
+/// [`ALARM_METRICS`] publishes an alarm metric for ("Instances, load balancers, and
+/// relational databases are the only Lightsail resources that can currently be
+/// monitored by alarms", `PutAlarmRequest$monitoredResourceName`) — a distribution
+/// and a bucket each publish metrics of their own, which is why a name that
+/// addresses nothing was looked for among them too.
+pub const PUT_ALARM_MONITORED_RESOURCE_TYPES: &[&str] = &[
+    RESOURCE_TYPE_INSTANCE,
+    RESOURCE_TYPE_LOAD_BALANCER,
+    RESOURCE_TYPE_RELATIONAL_DATABASE,
+    RESOURCE_TYPE_DISTRIBUTION,
+    RESOURCE_TYPE_BUCKET,
+];
+
 /// How many alarms one `GetAlarms` page carries.
 ///
 /// The modelled `GetAlarmsResult$nextPageToken` only says a paginated response

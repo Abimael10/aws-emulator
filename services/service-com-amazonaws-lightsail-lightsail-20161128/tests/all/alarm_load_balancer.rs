@@ -50,9 +50,10 @@ const INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
 /// The modelled `ResourceType` value a load balancer reports.
 const LOAD_BALANCER: &str = "LoadBalancer";
 
-/// The body member `code` Lightsail sets on a rejection whose cause is that what
-/// the request names does not exist.
-const DOES_NOT_EXIST: &str = "DoesNotExist";
+/// The body member `code` an ALARM operation sets on a rejection whose cause is
+/// that what the request names does not exist: the modelled exception's own name
+/// (pinned in `client_error_body_code.rs`).
+const ALARM_NOT_FOUND_CODE: &str = "NotFoundException";
 
 /// The `LoadBalancerState` a load balancer settles in.
 const ACTIVE: &str = "active";
@@ -424,8 +425,8 @@ async fn a_load_balancer_of_another_region_is_not_a_monitored_resource() {
         );
         assert_eq!(
             body["code"].as_str(),
-            Some(DOES_NOT_EXIST),
-            "case {case}: expected the {DOES_NOT_EXIST} envelope, got {body:?}"
+            Some(ALARM_NOT_FOUND_CODE),
+            "case {case}: expected the {ALARM_NOT_FOUND_CODE} envelope, got {body:?}"
         );
         let (stored, _) = alarms(&emulator, json!({})).await;
         assert!(
@@ -658,7 +659,7 @@ async fn a_load_balancer_alarm_is_tested_and_deleted_like_any_other() {
     );
     assert_eq!(
         body["code"].as_str(),
-        Some(DOES_NOT_EXIST),
-        "case deleted twice: expected the {DOES_NOT_EXIST} envelope, got {body:?}"
+        Some(ALARM_NOT_FOUND_CODE),
+        "case deleted twice: expected the {ALARM_NOT_FOUND_CODE} envelope, got {body:?}"
     );
 }

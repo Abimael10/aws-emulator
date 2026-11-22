@@ -823,7 +823,7 @@ async fn one_metric_carries_at_most_two_alarms() {
 // ---------------------------------------------------------------------------
 
 /// RULE: `DeleteAlarm` removes the one alarm it names from every later read, and
-/// a name no alarm is stored under is refused with the service's `DoesNotExist`
+/// a name no alarm is stored under is refused with the alarm operations' not-found
 /// envelope — so deleting twice fails the second time rather than reporting a
 /// deletion that did not happen.
 #[tokio::test]
@@ -908,8 +908,8 @@ async fn deleting_an_alarm_removes_it_from_every_read() {
         );
         assert_eq!(
             body["code"].as_str(),
-            Some("DoesNotExist"),
-            "case {case}: expected the DoesNotExist envelope for {name}, got {body:?}"
+            Some("NotFoundException"),
+            "case {case}: expected the alarm not-found envelope for {name}, got {body:?}"
         );
     }
 }
