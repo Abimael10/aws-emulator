@@ -85,9 +85,13 @@ pub enum TaggedResource<'a> {
         /// The `gatewayId` the ARN names.
         gateway_id: &'a str,
     },
-    /// A link between two stored gateways: `gateway/<gatewayId>/link/<linkId>`.
+    /// A link of the store, of whichever kind:
+    /// `gateway/<gatewayId>/link/<linkId>`. One grammar, because one ARN form names
+    /// a link whether its far end is another gateway or an address outside the
+    /// fabric.
     Link {
-        /// One of the link's two ends.
+        /// The gateway the link is addressed through: either end of a link between
+        /// two gateways, or the gateway an external link was created on.
         gateway_id: &'a str,
         /// The `linkId` the ARN names.
         link_id: &'a str,
@@ -140,13 +144,64 @@ pub fn tagged_resource<'a>(resource_arn: &'a str, region: &str) -> Option<Tagged
     })
 }
 
+/// The tags of the link `link_id` addressed through `gateway_id`, whichever of the
+/// store's link records holds it.
+///
+/// One id names at most one link — every link id this service mints is unique within
+/// the store — so the three link maps are asked in turn and the first that holds it
+/// answers.
+fn link_tags<'a>(
+    state: &'a ComAmazonawsRtbfabricRtbfabricState,
+    gateway_id: &str,
+    link_id: &str,
+) -> Option<&'a HashMap<String, String>> {
+    if let Some(link) = state.find_link(gateway_id, link_id) {
+        return Some(&link.tags);
+    }
+    if let Some(link) = state.find_outbound_external_link(gateway_id, link_id) {
+        return Some(&link.tags);
+    }
+    state
+        .find_inbound_external_link(gateway_id, link_id)
+        .map(|link| &link.tags)
+}
+
+/// [`link_tags`]'s map, to be changed in place: the same three maps in the same
+/// order, so a tag write and the read beside it address the same link record.
+fn link_tags_mut<'a>(
+    state: &'a mut ComAmazonawsRtbfabricRtbfabricState,
+    gateway_id: &str,
+    link_id: &str,
+) -> Option<&'a mut HashMap<String, String>> {
+    if state.find_link(gateway_id, link_id).is_some() {
+        return state
+            .find_link_mut(gateway_id, link_id)
+            .map(|link| &mut link.tags);
+    }
+    if state
+        .find_outbound_external_link(gateway_id, link_id)
+        .is_some()
+    {
+        return state
+            .find_outbound_external_link_mut(gateway_id, link_id)
+            .map(|link| &mut link.tags);
+    }
+    state
+        .find_inbound_external_link_mut(gateway_id, link_id)
+        .map(|link| &mut link.tags)
+}
+
 /// The tags the addressed record holds, or `None` when this store holds no such
 /// record.
 ///
-/// The table of what can be addressed at all: a gateway of either kind, a link read
-/// from either of its two ends, and a routing rule read through its own link from
-/// either of that link's ends. An ARN naming a record this store does not hold is
-/// answered exactly as an ARN naming a gateway that was never created is.
+/// The table of what can be addressed at all: a gateway of either kind, a link of
+/// any kind the store holds — one between two gateways read from either of its two
+/// ends, or an external link of either direction read through the gateway it was
+/// created on — and a routing rule read through its own link from either of that
+/// link's ends. Every record that carries a caller-assigned `tags` map is reachable
+/// here, since a tag map is managed through this surface whichever call assigned it.
+/// An ARN naming a record this store does not hold is answered exactly as an ARN
+/// naming a gateway that was never created is.
 pub fn resource_tags<'a>(
     state: &'a ComAmazonawsRtbfabricRtbfabricState,
     resource: TaggedResource<'_>,
@@ -165,7 +220,7 @@ pub fn resource_tags<'a>(
         TaggedResource::Link {
             gateway_id,
             link_id,
-        } => state.find_link(gateway_id, link_id).map(|link| &link.tags),
+        } => link_tags(state, gateway_id, link_id),
         TaggedResource::LinkRoutingRule {
             gateway_id,
             link_id,
@@ -200,9 +255,7 @@ pub fn resource_tags_mut<'a>(
         TaggedResource::Link {
             gateway_id,
             link_id,
-        } => state
-            .find_link_mut(gateway_id, link_id)
-            .map(|link| &mut link.tags),
+        } => link_tags_mut(state, gateway_id, link_id),
         TaggedResource::LinkRoutingRule {
             gateway_id,
             link_id,

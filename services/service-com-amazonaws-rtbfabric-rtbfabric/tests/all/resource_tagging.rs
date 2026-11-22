@@ -6,17 +6,19 @@
 //!
 //! The rule under test is about state, not about one recorded request: a tagging call
 //! addresses the ONE stored record its `resourceArn` names — a requester gateway, a
-//! responder gateway, or a link read from either of its two ends — so the listing
-//! reports exactly the tags the writes left on that record, an assignment replaces the
-//! value of a key already there, a removal names keys rather than requiring them, and
-//! an ARN naming no stored resource is refused by all three alike.
+//! responder gateway, or a link the store holds, read through a gateway the link
+//! belongs to — so the listing reports exactly the tags the writes left on that
+//! record, an assignment replaces the value of a key already there, a removal names
+//! keys rather than requiring them, and an ARN naming no stored resource is refused by
+//! all three alike.
 //!
 //! The table spans what the rule generalises over: which kind of resource the ARN
-//! names and from which end, how many tags the record starts with, how many the call
-//! assigns, whether an assignment adds or replaces, and how many keys a removal names
-//! (including one the record never carried). The tag keys and values span the modelled
-//! `TagKey` pattern's punctuation and both published length bounds of `TagKey`
-//! (1..128) and `TagValue` (0..1600), from `smithy_query(query="shape",
+//! names (gateway of either kind, a link between two gateways from either end, an
+//! external link of either direction), how many tags the record starts with, how many
+//! the call assigns, whether an assignment adds or replaces, and how many keys a
+//! removal names (including one the record never carried). The tag keys and values
+//! span the modelled `TagKey` pattern's punctuation and both published length bounds
+//! of `TagKey` (1..128) and `TagValue` (0..1600), from `smithy_query(query="shape",
 //! shape="TagsMap,TagKeyList")`.
 
 use std::collections::BTreeMap;
@@ -174,6 +176,67 @@ impl Fabric {
         text(&answered.body, "linkId")
     }
 
+    /// Open an outbound external link from the requester gateway `gateway_id`,
+    /// carrying `tags`, and return its minted id.
+    async fn outbound_external_link(
+        &self,
+        case: &str,
+        gateway_id: &str,
+        tags: &[(String, String)],
+    ) -> String {
+        let mut body = json!({
+            "clientToken": "token-outbound-external-link",
+            "publicEndpoint": "https://bidder.example.com/rtb",
+            "logSettings": { "applicationLogs": { "sampling": { "errorLog": 100.0, "filterLog": 0.0 } } },
+        });
+        if !tags.is_empty() {
+            body["tags"] = tags_json(tags);
+        }
+        let answered = self
+            .send(
+                "POST",
+                &format!("/requester-gateway/{gateway_id}/outbound-external-link"),
+                Some(body),
+            )
+            .await;
+        assert_eq!(
+            answered.status, 200,
+            "case {case:?}: expected CreateOutboundExternalLink to answer 200, got {} {:?}",
+            answered.status, answered.body
+        );
+        text(&answered.body, "linkId")
+    }
+
+    /// Create an inbound external link on the responder gateway `gateway_id`,
+    /// carrying `tags`, and return its minted id.
+    async fn inbound_external_link(
+        &self,
+        case: &str,
+        gateway_id: &str,
+        tags: &[(String, String)],
+    ) -> String {
+        let mut body = json!({
+            "clientToken": "token-inbound-external-link",
+            "logSettings": { "applicationLogs": { "sampling": { "errorLog": 0.0, "filterLog": 100.0 } } },
+        });
+        if !tags.is_empty() {
+            body["tags"] = tags_json(tags);
+        }
+        let answered = self
+            .send(
+                "POST",
+                &format!("/responder-gateway/{gateway_id}/inbound-external-link"),
+                Some(body),
+            )
+            .await;
+        assert_eq!(
+            answered.status, 200,
+            "case {case:?}: expected CreateInboundExternalLink to answer 200, got {} {:?}",
+            answered.status, answered.body
+        );
+        text(&answered.body, "linkId")
+    }
+
     /// `ListTagsForResource`, asserting it succeeded, as a sorted map.
     async fn listed_tags(&self, case: &str, resource_arn: &str) -> BTreeMap<String, String> {
         let answered = self.send("GET", &tags_path(resource_arn), None).await;
@@ -278,6 +341,12 @@ enum Target {
     LinkFromRequester,
     /// The same link, addressed through its peer: one record, two ends.
     LinkFromResponder,
+    /// A link whose far end is an address outside the fabric, addressed through the
+    /// requester gateway it was opened from.
+    OutboundExternalLink,
+    /// A link whose traffic arrives from outside the fabric, addressed through the
+    /// responder gateway it was created on.
+    InboundExternalLink,
 }
 
 /// One row of the tagging table.
@@ -372,6 +441,30 @@ fn rows() -> Vec<Row> {
             assigned: vec![tag("owner", "bidding")],
             removed: vec!["owner".to_string(), "owner".to_string()],
         },
+        Row {
+            name: "an outbound external link whose created tag is replaced",
+            target: Target::OutboundExternalLink,
+            created: vec![tag("tier", "gold")],
+            assigned: vec![
+                tag("tier", "silver"),
+                tag("cost:center/ads+rtb=1", "bid.engine@eu"),
+            ],
+            removed: vec!["tier".to_string()],
+        },
+        Row {
+            name: "an outbound external link tagged for the first time, at both bounds",
+            target: Target::OutboundExternalLink,
+            created: Vec::new(),
+            assigned: vec![(longest_key(), longest_value()), tag("env", "prod")],
+            removed: vec![longest_key(), "never-set".to_string()],
+        },
+        Row {
+            name: "an inbound external link whose created tags are extended",
+            target: Target::InboundExternalLink,
+            created: vec![tag("team", "ads"), tag("stage", "canary")],
+            assigned: vec![tag("owner", "bidding"), tag("empty", "")],
+            removed: vec!["stage".to_string(), "owner".to_string()],
+        },
     ]
 }
 
@@ -407,6 +500,26 @@ async fn provision(fabric: &Fabric, row: &Row) -> (String, String) {
             (
                 link_arn(end, &link_id),
                 format!("/gateway/{end}/link/{link_id}"),
+            )
+        }
+        Target::OutboundExternalLink => {
+            let gateway_id = fabric.requester_gateway(case, &[]).await;
+            let link_id = fabric
+                .outbound_external_link(case, &gateway_id, &row.created)
+                .await;
+            (
+                link_arn(&gateway_id, &link_id),
+                format!("/requester-gateway/{gateway_id}/outbound-external-link/{link_id}"),
+            )
+        }
+        Target::InboundExternalLink => {
+            let gateway_id = fabric.responder_gateway(case, &[]).await;
+            let link_id = fabric
+                .inbound_external_link(case, &gateway_id, &row.created)
+                .await;
+            (
+                link_arn(&gateway_id, &link_id),
+                format!("/responder-gateway/{gateway_id}/inbound-external-link/{link_id}"),
             )
         }
     }
@@ -707,4 +820,115 @@ async fn one_resource_holds_at_most_its_quota_of_tags() {
         "case {case:?}: expected a tag to fit again after a removal, got {} {:?}",
         answered.status, answered.body
     );
+}
+
+#[tokio::test]
+async fn a_link_is_tagged_only_through_a_gateway_that_link_belongs_to() {
+    let fabric = Fabric::new();
+    let case = "a link addressed through the wrong gateway";
+
+    // One store holding a link of each kind: between two gateways, outbound to an
+    // address outside the fabric, and inbound from outside it.
+    let requester_id = fabric.requester_gateway(case, &[]).await;
+    let responder_id = fabric.responder_gateway(case, &[]).await;
+    let peer_link_id = fabric
+        .link(case, &requester_id, &responder_id, &[tag("kind", "peer")])
+        .await;
+    let outbound_link_id = fabric
+        .outbound_external_link(case, &requester_id, &[tag("kind", "outbound")])
+        .await;
+    let inbound_link_id = fabric
+        .inbound_external_link(case, &responder_id, &[tag("kind", "inbound")])
+        .await;
+
+    // Each link answers through a gateway it belongs to, with the tags its own create
+    // assigned.
+    for (kind, gateway_id, link_id) in [
+        ("a link between two gateways", &requester_id, &peer_link_id),
+        ("the same link from its peer end", &responder_id, &peer_link_id),
+        (
+            "an outbound external link",
+            &requester_id,
+            &outbound_link_id,
+        ),
+        ("an inbound external link", &responder_id, &inbound_link_id),
+    ] {
+        let listed = fabric.listed_tags(kind, &link_arn(gateway_id, link_id)).await;
+        assert!(
+            listed.contains_key("kind"),
+            "case {kind:?}: expected the tags the create assigned, got {listed:?}"
+        );
+    }
+
+    // An external link is addressed only through the gateway it was created on, so
+    // the gateway that holds no such link names no record at all — the same answer as
+    // a link id nothing minted.
+    for (wrong, resource_arn) in [
+        (
+            "an outbound external link through the responder gateway",
+            link_arn(&responder_id, &outbound_link_id),
+        ),
+        (
+            "an inbound external link through the requester gateway",
+            link_arn(&requester_id, &inbound_link_id),
+        ),
+    ] {
+        for (operation, method, path) in [
+            ("ListTagsForResource", "GET", tags_path(&resource_arn)),
+            ("TagResource", "POST", tags_path(&resource_arn)),
+            (
+                "UntagResource",
+                "DELETE",
+                untag_path(&resource_arn, &["kind".to_string()]),
+            ),
+        ] {
+            let body = (method == "POST").then(|| tag_resource_body(&[tag("env", "prod")]));
+            let answered = fabric.send(method, &path, body).await;
+            assert_eq!(
+                answered.status, UNRESOLVED_STATUS,
+                "case {wrong:?}: expected {operation} to answer {UNRESOLVED_STATUS}, got {} {:?}",
+                answered.status, answered.body
+            );
+            assert_eq!(
+                answered.code, UNRESOLVED_CODE,
+                "case {wrong:?}: expected {operation} to answer the code {UNRESOLVED_CODE}, got {:?}",
+                answered.code
+            );
+            assert_eq!(
+                text(&answered.body, "message"),
+                UNRESOLVED_MESSAGE,
+                "case {wrong:?}: expected {operation} to state {UNRESOLVED_MESSAGE:?}, got {:?}",
+                answered.body
+            );
+        }
+    }
+
+    // Those refused calls wrote nothing: each link still holds exactly the one tag
+    // its create assigned.
+    for (kind, gateway_id, link_id, expected) in [
+        (
+            "an outbound external link",
+            &requester_id,
+            &outbound_link_id,
+            "outbound",
+        ),
+        (
+            "an inbound external link",
+            &responder_id,
+            &inbound_link_id,
+            "inbound",
+        ),
+    ] {
+        let listed = fabric.listed_tags(kind, &link_arn(gateway_id, link_id)).await;
+        assert_eq!(
+            listed.get("kind").map(String::as_str),
+            Some(expected),
+            "case {kind:?}: expected the refused calls to have written nothing, got {listed:?}"
+        );
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {kind:?}: expected the one tag the create assigned, got {listed:?}"
+        );
+    }
 }

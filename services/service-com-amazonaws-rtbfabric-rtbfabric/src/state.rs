@@ -623,6 +623,28 @@ impl ComAmazonawsRtbfabricRtbfabricState {
             .get(&(gateway_id.to_string(), link_id.to_string()))
     }
 
+    /// [`find_outbound_external_link`](Self::find_outbound_external_link)'s link, for
+    /// an operation that changes it.
+    pub fn find_outbound_external_link_mut(
+        &mut self,
+        gateway_id: &str,
+        link_id: &str,
+    ) -> Option<&mut OutboundExternalLink> {
+        self.outbound_external_links
+            .get_mut(&(gateway_id.to_string(), link_id.to_string()))
+    }
+
+    /// [`find_inbound_external_link`](Self::find_inbound_external_link)'s link, for an
+    /// operation that changes it.
+    pub fn find_inbound_external_link_mut(
+        &mut self,
+        gateway_id: &str,
+        link_id: &str,
+    ) -> Option<&mut InboundExternalLink> {
+        self.inbound_external_links
+            .get_mut(&(gateway_id.to_string(), link_id.to_string()))
+    }
+
     /// The link `link_id` between `gateway_id` and its peer, addressed from
     /// either end.
     pub fn find_link(&self, gateway_id: &str, link_id: &str) -> Option<&Link> {
