@@ -303,7 +303,10 @@ async fn a_created_configuration_is_read_back_as_stored_and_gone_after_delete() 
                 panic!("case {case:?}: expected a chosen frequencyExpression in {read}")
             });
             crate::code_security_periodic_schedule::assert_schedule_matches(
-                case, frequency, expression,
+                case,
+                frequency,
+                expression,
+                crate::code_security_periodic_schedule::created_at(case, &read),
             );
         }
         assert_eq!(
@@ -329,9 +332,7 @@ async fn a_created_configuration_is_read_back_as_stored_and_gone_after_delete() 
             read["tags"], expected_tags,
             "case {case:?}: expected tags {expected_tags}, got {read}"
         );
-        let created_at = read["createdAt"]
-            .as_f64()
-            .unwrap_or_else(|| panic!("case {case:?}: no createdAt timestamp in {read}"));
+        let created_at = crate::code_security_periodic_schedule::created_at(case, &read);
         let last_updated_at = read["lastUpdatedAt"]
             .as_f64()
             .unwrap_or_else(|| panic!("case {case:?}: no lastUpdatedAt timestamp in {read}"));

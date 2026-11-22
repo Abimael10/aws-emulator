@@ -53,6 +53,10 @@ pub use vulnerability_catalog::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
+// The calendar arithmetic behind a chosen periodic schedule: which weekday, day of the
+// month and time of day a configuration's creation instant falls on.
+use chrono::{DateTime, Datelike, Timelike, Utc};
+
 use crate::ops::types::{
     CodeSecurityScanConfiguration, FilterCriteria, Schedule, ScopeSettings, Vulnerability,
 };
@@ -662,26 +666,40 @@ pub fn tag_map(
 /// schedule at all.
 ///
 /// A caller may name the frequency without naming a schedule, in which case the service
-/// chooses the day the scan runs on and the configuration it stores carries a schedule
-/// expression matching that frequency; a caller that names the expression keeps its own.
-/// The chosen day is a property of the stored configuration, not of the call, so it is the
-/// same for every configuration of one frequency and stable across reads.
+/// chooses the day the scan runs on and the configuration carries a schedule expression
+/// matching that frequency; a caller that names the expression keeps its own. Which day the
+/// real service picks is not documented, so this emulator derives it from the
+/// configuration's OWN creation instant — the scan repeats on the weekday a weekly
+/// configuration was created on, and on the day of the month a monthly one was created on,
+/// at the time of day it was created at. The day is therefore a property of that one stored
+/// configuration rather than of its frequency: two configurations created at different
+/// times run on different days, and every read of one reports the schedule it was stored
+/// with.
 ///
 /// Source: `smithy_query(query="shape", shape="PeriodicScanConfiguration")` — the
 /// `frequency` member documents that Amazon Inspector chooses the day for the scan to run
 /// when `frequencyExpression` is not provided, and that a provided expression must match
 /// the frequency; `PeriodicScanFrequency` admits `WEEKLY`, `MONTHLY` and `NEVER`.
-pub fn chosen_frequency_expression(frequency: &str) -> Option<String> {
-    // Which day and hour the service picks is not documented, so these are this emulator's
-    // own choice — the earliest day of the span the frequency repeats over, at midnight
-    // UTC. What the model fixes, and what a caller can rely on, is that there IS a schedule
-    // and that it matches the frequency.
+pub fn chosen_frequency_expression(frequency: &str, created_at: SystemTime) -> Option<String> {
+    let created = DateTime::<Utc>::from(created_at);
+    let (minute, hour) = (created.minute(), created.hour());
     match frequency {
-        // Midnight UTC on the first day of the week, the day-of-month field left as the
-        // `?` AWS cron format requires when the day-of-week field names the day.
-        "WEEKLY" => Some("cron(0 0 ? * 1 *)".to_string()),
-        // Midnight UTC on the first day of the month, with day-of-week left as `?`.
-        "MONTHLY" => Some("cron(0 0 1 * ? *)".to_string()),
+        // The weekday the configuration was created on names the day of the week, with the
+        // day-of-month field left as the `?` the AWS cron format requires when the
+        // day-of-week field names the day. AWS cron numbers the days of the week from 1 for
+        // Sunday, which is the numbering `number_from_sunday` answers.
+        "WEEKLY" => Some(format!(
+            "cron({minute} {hour} ? * {day_of_week} *)",
+            day_of_week = created.weekday().number_from_sunday()
+        )),
+        // The day of the month the configuration was created on names the day, with
+        // day-of-week left as `?`. A day past the 28th does not occur in every month, so a
+        // configuration created on one runs on the 28th instead, which keeps the scan
+        // monthly.
+        "MONTHLY" => Some(format!(
+            "cron({minute} {hour} {day_of_month} * ? *)",
+            day_of_month = created.day().min(28)
+        )),
         // `NEVER` turns periodic scanning off, so there is no schedule to express.
         "NEVER" => None,
         // Periodic settings that name no frequency at all run on no schedule either. The
@@ -699,13 +717,14 @@ pub fn chosen_frequency_expression(frequency: &str) -> Option<String> {
 /// configuration runs on.
 pub fn stored_code_security_scan_configuration(
     mut configuration: crate::ops::types::CodeSecurityScanConfiguration,
+    created_at: SystemTime,
 ) -> crate::ops::types::CodeSecurityScanConfiguration {
     if let Some(periodic) = configuration.periodic_scan_configuration.as_mut() {
         periodic.frequency_expression = periodic.frequency_expression.take().or_else(|| {
             periodic
                 .frequency
                 .as_deref()
-                .and_then(chosen_frequency_expression)
+                .and_then(|frequency| chosen_frequency_expression(frequency, created_at))
         });
     }
     configuration

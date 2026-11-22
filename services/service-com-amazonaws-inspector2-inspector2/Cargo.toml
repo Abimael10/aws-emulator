@@ -30,6 +30,9 @@ hex = { workspace = true }
 # envelope a refusal relayed from another service is reported inside, and the request id it
 # names that call by.
 service-common = { path = "../common" }
+# The calendar arithmetic a chosen periodic scan schedule needs: which weekday, day of the
+# month and time of day a code security scan configuration was created at.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

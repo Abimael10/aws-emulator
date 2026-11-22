@@ -7,10 +7,11 @@
 //!
 //! * A periodic scan runs on a schedule, so a configuration whose periodic settings name
 //!   a frequency reports the schedule expression those scans run on: the expression the
-//!   request named, or — when the request named none — the one the service chose for that
-//!   frequency, the same for every configuration of that frequency and stable across
-//!   reads. A frequency that names no schedule reports no expression, and settings that
-//!   name no periodic scanning at all report nothing.
+//!   request named, or — when the request named none — the one the service chose, taken
+//!   from that configuration's own creation instant, so it matches the frequency, belongs
+//!   to that one configuration and is stable across reads. A frequency that names no
+//!   schedule reports no expression, and settings that name no periodic scanning at all
+//!   report nothing.
 //! * A resource's tag map is part of the resource, so a read reports it as a map — empty
 //!   for a configuration carrying no tags — rather than leaving the member out.
 //!
@@ -18,6 +19,7 @@
 //! deserialization, modelled-constraint validation, the handler, and restJson1
 //! serialization — so what is asserted here is the wire behaviour a client sees.
 
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -88,16 +90,24 @@ fn cron_fields(expression: &str) -> Option<Vec<String>> {
     (fields.len() == 6).then_some(fields)
 }
 
-/// Assert `expression` is a schedule a scan of `frequency` can run on: a well-formed AWS
-/// cron expression inside the modelled `FrequencyExpression` length whose day fields name
-/// the day the frequency repeats on — the day of the week for a weekly scan and the day of
-/// the month for a monthly one — with the other day field left as the `?` AWS cron
-/// requires, and a fixed time of day rather than a repeat inside the day.
+/// Assert `expression` is the schedule a scan of `frequency` created at `created_at` (the
+/// `createdAt` the read reports, in epoch seconds) runs on: a well-formed AWS cron
+/// expression inside the modelled `FrequencyExpression` length, at the time of day the
+/// configuration was created at, whose day fields name the day the frequency repeats on —
+/// the weekday the configuration was created on for a weekly scan and its day of the month
+/// for a monthly one, a day past the 28th moved to the 28th so every month has it — with
+/// the other day field left as the `?` AWS cron requires.
 ///
 /// Source: `smithy_query(query="shape", shape="PeriodicScanConfiguration")` — a provided
 /// `frequencyExpression` must match the `frequency`, and the service chooses the day when
-/// none is provided.
-pub(crate) fn assert_schedule_matches(case: &str, frequency: &str, expression: &str) {
+/// none is provided; which day it chooses is not fixed by the model, so the emulator takes
+/// it from the configuration's own creation instant and that is what this asserts.
+pub(crate) fn assert_schedule_matches(
+    case: &str,
+    frequency: &str,
+    expression: &str,
+    created_at: f64,
+) {
     assert!(
         expression.len() >= EXPRESSION_LENGTH.0 && expression.len() <= EXPRESSION_LENGTH.1,
         "case {case:?}: expected a FrequencyExpression of {EXPRESSION_LENGTH:?} characters, got \
@@ -106,29 +116,47 @@ pub(crate) fn assert_schedule_matches(case: &str, frequency: &str, expression: &
     let fields = cron_fields(expression).unwrap_or_else(|| {
         panic!("case {case:?}: expected a six-field cron expression, got {expression:?}")
     });
-    let fixed = |field: &str| field.chars().all(|char| char.is_ascii_digit());
-    assert!(
-        fixed(&fields[0]) && fixed(&fields[1]),
-        "case {case:?}: expected a fixed time of day, got {expression:?}"
+    let created = DateTime::from_timestamp(created_at.trunc() as i64, 0).unwrap_or_else(|| {
+        panic!("case {case:?}: {created_at} is not an instant the configuration could be created at")
+    });
+    assert_eq!(
+        (fields[0].as_str(), fields[1].as_str()),
+        (
+            created.minute().to_string().as_str(),
+            created.hour().to_string().as_str()
+        ),
+        "case {case:?}: expected the time of day the configuration was created at \
+         ({created}), got {expression:?}"
     );
     let (day_of_month, day_of_week) = (fields[2].as_str(), fields[4].as_str());
     match frequency {
         "WEEKLY" => {
-            assert!(
-                day_of_month == "?" && fixed(day_of_week),
-                "case {case:?}: a weekly schedule names the day of the week and leaves the day \
-                 of the month as '?', got {expression:?}"
+            assert_eq!(
+                (day_of_month, day_of_week),
+                ("?", created.weekday().number_from_sunday().to_string().as_str()),
+                "case {case:?}: a weekly schedule names the weekday the configuration was \
+                 created on ({created}) and leaves the day of the month as '?', got \
+                 {expression:?}"
             );
         }
         "MONTHLY" => {
-            assert!(
-                day_of_week == "?" && fixed(day_of_month),
-                "case {case:?}: a monthly schedule names the day of the month and leaves the day \
-                 of the week as '?', got {expression:?}"
+            assert_eq!(
+                (day_of_month, day_of_week),
+                (created.day().min(28).to_string().as_str(), "?"),
+                "case {case:?}: a monthly schedule names the day of the month the configuration \
+                 was created on ({created}) and leaves the day of the week as '?', got \
+                 {expression:?}"
             );
         }
         other => panic!("case {case:?}: no schedule is expected for frequency {other:?}"),
     }
+}
+
+/// The `createdAt` instant a read reports, in epoch seconds.
+pub(crate) fn created_at(case: &str, read: &Value) -> f64 {
+    read["createdAt"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case:?}: no createdAt timestamp in {read}"))
 }
 
 /// The periodic settings of a read configuration, or `Value::Null` when the member is
@@ -141,9 +169,9 @@ fn periodic(read: &Value) -> Value {
 }
 
 /// RULE: a configuration whose periodic settings name a frequency without a schedule
-/// expression reports the expression the service chose for that frequency — present, of
-/// the modelled shape, matching the frequency and the same on every read; a frequency that
-/// names no schedule reports no expression at all.
+/// expression reports the expression the service chose for it — present, of the modelled
+/// shape, matching the frequency, taken from that configuration's own creation instant and
+/// the same on every read; a frequency that names no schedule reports no expression at all.
 ///
 /// Rows span every `PeriodicScanFrequency` token and the periodic settings left out
 /// entirely.
@@ -194,11 +222,11 @@ async fn a_frequency_without_an_expression_reports_the_schedule_the_service_chos
                 let expression = reported["frequencyExpression"].as_str().unwrap_or_else(|| {
                     panic!("case {case:?}: expected a chosen frequencyExpression, got {reported}")
                 });
-                assert_schedule_matches(case, frequency, expression);
+                assert_schedule_matches(case, frequency, expression, created_at(case, &read));
 
                 // A read reports the stored schedule, so a second read of the same
-                // configuration reports it again; a second configuration of the same
-                // frequency gets a schedule of its own, which satisfies the same rule.
+                // configuration reports it again; a second configuration gets the schedule
+                // its own creation instant names, which satisfies the same rule.
                 let again = get(&router, case, &arn).await;
                 assert_eq!(
                     periodic(&again),
@@ -213,9 +241,98 @@ async fn a_frequency_without_an_expression_reports_the_schedule_the_service_chos
                     .unwrap_or_else(|| {
                         panic!("case {case:?}: expected a chosen frequencyExpression, got {other}")
                     });
-                assert_schedule_matches(case, frequency, &other_expression);
+                assert_schedule_matches(
+                    case,
+                    frequency,
+                    &other_expression,
+                    created_at(case, &other),
+                );
             }
         }
+    }
+}
+
+/// RULE: the day and time a chosen schedule names are the configuration's own creation
+/// instant — the weekday it was created on for a weekly scan and its day of the month for a
+/// monthly one (a day past the 28th moved to the 28th, so the scan recurs in every month) —
+/// so two configurations created at different instants run on different days, and a
+/// frequency that names no schedule gets none.
+///
+/// Rows span the creation instant: every kind of day field the two scheduled frequencies
+/// name, the first and last weekday AWS cron numbers, one- and two-digit minutes and hours,
+/// and the days of the month that no month, or only a leap year, has.
+/// Source: `smithy_query(query="shape", shape="PeriodicScanConfiguration")` — the service
+/// chooses the day when the request names no expression; AWS cron numbers the days of the
+/// week from 1 for Sunday.
+#[test]
+fn the_chosen_schedule_is_the_configurations_own_creation_instant() {
+    // (case, the instant the configuration was created at, frequency, the schedule owed)
+    let rows: [(&str, &str, &str, Option<&str>); 8] = [
+        // A Sunday, the first day AWS cron numbers, at midnight.
+        (
+            "weekly, created on a Sunday at midnight",
+            "2026-03-01T00:00:00Z",
+            "WEEKLY",
+            Some("cron(0 0 ? * 1 *)"),
+        ),
+        (
+            "weekly, created on a Wednesday morning",
+            "2026-03-04T09:05:00Z",
+            "WEEKLY",
+            Some("cron(5 9 ? * 4 *)"),
+        ),
+        // A Saturday, the last day AWS cron numbers, in the last minute of the day.
+        (
+            "weekly, created on a Saturday at the end of the day",
+            "2026-02-28T23:59:00Z",
+            "WEEKLY",
+            Some("cron(59 23 ? * 7 *)"),
+        ),
+        (
+            "monthly, created on the fourth",
+            "2026-03-04T09:05:00Z",
+            "MONTHLY",
+            Some("cron(5 9 4 * ? *)"),
+        ),
+        // The 28th is the last day of the month every month has, so it is named as it is.
+        (
+            "monthly, created on the twenty-eighth",
+            "2026-04-28T14:30:00Z",
+            "MONTHLY",
+            Some("cron(30 14 28 * ? *)"),
+        ),
+        // The 31st does not occur in every month, so a monthly scan runs on the 28th.
+        (
+            "monthly, created on the thirty-first",
+            "2026-01-31T13:45:00Z",
+            "MONTHLY",
+            Some("cron(45 13 28 * ? *)"),
+        ),
+        // Nor does the 29th, which only a leap year's February has at all.
+        (
+            "monthly, created on a leap day",
+            "2028-02-29T06:07:00Z",
+            "MONTHLY",
+            Some("cron(7 6 28 * ? *)"),
+        ),
+        // `NEVER` turns periodic scanning off, whenever the configuration was created.
+        ("never", "2026-03-04T09:05:00Z", "NEVER", None),
+    ];
+
+    for (case, created, frequency, owed) in rows {
+        let instant: std::time::SystemTime = DateTime::parse_from_rfc3339(created)
+            .unwrap_or_else(|error| panic!("case {case:?}: {created} is not an instant: {error}"))
+            .with_timezone(&Utc)
+            .into();
+        let chosen = service_com_amazonaws_inspector2_inspector2::state::chosen_frequency_expression(
+            frequency, instant,
+        );
+        assert_eq!(
+            chosen.as_deref(),
+            owed,
+            "case {case:?}: expected the schedule {owed:?} for a configuration created at \
+             {created}, got {chosen:?}"
+        );
     }
 }
 
