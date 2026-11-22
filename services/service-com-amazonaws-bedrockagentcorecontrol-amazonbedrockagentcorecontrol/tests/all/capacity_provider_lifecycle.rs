@@ -426,7 +426,7 @@ async fn an_id_naming_no_provider_is_not_found() {
         );
         assert_eq!(
             text(&refused, "message"),
-            format!("Capacity provider with ID {id} does not exist"),
+            format!("No capacity provider found with id {id}"),
             "case {case:?}: got {refused}"
         );
     }

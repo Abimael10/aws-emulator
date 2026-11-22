@@ -12,6 +12,11 @@
 //! enters `CREATING` and reaches `READY` when the clock owes the transition
 //! ([`crate::state::CAPACITY_PROVIDER_SETTLE_DELAY`]) — nothing here sleeps for it.
 //!
+//! The provider is MANAGED as the operator role `permissionsConfiguration` names, so that
+//! role is resolved against this account's IAM BEFORE anything is minted: a role this
+//! service cannot assume is the modelled `ValidationException` (400) with nothing persisted
+//! ([`crate::state::operator_role_is_unassumable`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -198,20 +203,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
         // A replayed request carrying the same `clientToken` answers with the provider
         // that token first produced, rather than minting a second one: "If this token
         // matches a previous request, the service ignores the request, but doesn't return
-        // an error."
-        if let Some(capacity_provider_id) =
-            store.replayed_capacity_provider_result(Self::NAME, input.client_token.as_deref())
+        // an error." Decided under its own guard, which is DROPPED before the
+        // cross-service call below: a lock is not held across an await.
+        if let Some(replayed) =
+            replayed_output(&state.lock(), Self::NAME, input.client_token.as_deref(), now)
         {
-            // `replayed_capacity_provider_result` answers only for a provider the store
-            // still holds, so this lookup cannot miss.
-            if let Some(record) = store.capacity_providers.get(&capacity_provider_id) {
-                return Ok(record.create_output(now));
-            }
+            return Ok(replayed);
+        }
+
+        // The provider is MANAGED as the operator role the caller names — the service
+        // assumes it to launch, tag and terminate the instances and their network
+        // interfaces — so the role is resolved against this account's IAM before anything
+        // is written: a role IAM holds nothing under, or whose trust policy does not let
+        // this service assume it, is the operation's modelled validation error and no
+        // provider is minted (`crate::state::operator_role_is_unassumable`).
+        //
+        // It is resolved HERE, ahead of the name and quota verdicts below, because the
+        // store guard cannot be held across this await — the order
+        // `create_agent_runtime` resolves its own role in. A request that is BOTH a
+        // repeated name and an unassumable role is therefore answered the role's
+        // validation error; nothing recorded says which of the two the service reports
+        // first.
+        if crate::state::operator_role_is_unassumable(
+            ctx,
+            &region,
+            &input
+                .permissions_configuration
+                .capacity_provider_operator_role_arn,
+        )
+        .await
+        {
+            return Err(CreateCapacityProviderErrorModeled::ValidationException(
+                crate::state::operator_role_validation_failed(&input.compute_configuration),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Read again under the guard that WRITES: the guard above was dropped for the call
+        // in between, so two requests carrying one token could both have got past it, and
+        // only this read is serialized with the insert.
+        if let Some(replayed) =
+            replayed_output(&store, Self::NAME, input.client_token.as_deref(), now)
+        {
+            return Ok(replayed);
         }
 
         // "The capacity provider name must be unique within your account", so a name this
@@ -274,4 +314,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(output)
     }
+}
+
+/// The provider a `clientToken` already produced, when this request is a replay of one that
+/// was served; `None` for a fresh request.
+///
+/// Read TWICE by the handler — once before the operator role is resolved against IAM, and
+/// once under the guard that writes — because the store guard cannot be held across that
+/// await: only the second read is serialized with the insert, so two requests carrying one
+/// token cannot both mint a provider.
+fn replayed_output(
+    store: &crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState,
+    operation: &str,
+    client_token: Option<&str>,
+    now: ::std::time::SystemTime,
+) -> Option<CreateCapacityProviderOutput> {
+    let capacity_provider_id = store.replayed_capacity_provider_result(operation, client_token)?;
+    Some(
+        store
+            .capacity_providers
+            .get(&capacity_provider_id)?
+            .create_output(now),
+    )
 }
