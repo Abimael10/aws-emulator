@@ -6,11 +6,14 @@
 //! as the last `PutSession` or `RecognizeText` left it. A read: it never changes
 //! what a later caller sees.
 //!
-//! The bot/alias pair and the locale are resolved against the control plane
-//! first, so an address that names no alias of that bot, or no locale of the
-//! version it points at, is refused as the address — but a locale that EXISTS
-//! and was never BUILT still addresses its sessions, so an absent session there
-//! is refused as a missing session.
+//! The address is resolved against the runtime's OWN session store and nothing
+//! else: a session is held under the bot, alias, locale and session id together,
+//! so an address naming no alias of that bot, or no locale of the version it
+//! points at, holds no session — and every address this store holds no session
+//! for is answered as the missing SESSION. Reading a session needs no built
+//! runtime model and no control-plane resource behind it, which is why only the
+//! calls that INTERPRET input or seed a dialog state resolve the bot alias and
+//! the locale against the control plane.
 //!
 //! ## Shape of an operation
 //!
@@ -91,34 +94,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::bot_model::{addressed_locale, AddressRefused, LocaleUnavailable};
 use crate::state::SessionKey;
 use std::time::SystemTime;
-
-/// The bot, alias and locale the request addresses resolve to no model this
-/// runtime holds a conversation against, or the control plane that holds them
-/// cannot be reached at all.
-///
-/// A session belongs to one bot alias in one locale, so this operation's own
-/// documented failures — "if the bot, alias, or session identifier doesn't
-/// exist" and "if the locale doesn't exist or is not enabled for the alias" —
-/// are refusals of the ADDRESS, answered here exactly as every sibling
-/// addressed by the same labels answers them.
-fn locale_unavailable(
-    error: LocaleUnavailable,
-    bot_id: &str,
-    bot_alias_id: &str,
-) -> GetSessionError {
-    match error.refusal(bot_id, bot_alias_id) {
-        AddressRefused::NotFound(message) => {
-            GetSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException { message })
-        }
-        AddressRefused::Internal(message) => {
-            GetSessionErrorModeled::InternalServerException(InternalServerException { message })
-        }
-    }
-    .into()
-}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -208,26 +185,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.session_id,
         );
 
-        // The ADDRESS is resolved BEFORE the store is read: the bot/alias PAIR,
-        // then that version's locale. A read of a session needs no runtime MODEL
-        // behind that locale — it interprets nothing — so resolution here is the
-        // locale EXISTING for the alias ([`addressed_locale`]), and an addressed
-        // session that is not in the store is answered as a missing session even
-        // on a locale that was never built. A pair that is not an alias of that
-        // bot, or a locale the alias's version does not hold, is refused as the
-        // address.
-        addressed_locale(
-            &*self.engine,
-            &input.bot_id,
-            &input.bot_alias_id,
-            &input.locale_id,
-        )
-        .map_err(|error| locale_unavailable(error, &input.bot_id, &input.bot_alias_id))?;
-
         // A read: the store is only looked up (and swept of the sessions the
-        // clock has already expired). An unknown or idle session is the modelled
-        // 404, never an empty 200 — a caller has to be able to tell "no such
-        // conversation" from "a conversation with nothing in it".
+        // clock has already expired). The session KEY carries the whole address,
+        // so an address that names no bot, no alias of it or no locale of the
+        // version the alias points at holds no session and is answered as the
+        // missing session the request asked about — a read interprets nothing,
+        // so it needs neither a built locale nor a control-plane resource behind
+        // the labels. An unknown or idle session is the modelled 404, never an
+        // empty 200 — a caller has to be able to tell "no such conversation"
+        // from "a conversation with nothing in it".
         let mut store = state.lock();
         let session = store.session(&key, now).ok_or_else(|| {
             GetSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {

@@ -46,7 +46,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, API_VERSION};
 use crate::origin_access_control_lifecycle::{
-    create_control, get_control, list_controls, page_ids, table, Control,
+    create_control, get_control, list_controls, page_ids, table, Control, UNREADABLE_ID_MESSAGE,
 };
 
 /// The sentence `OriginAccessControlAlreadyExists` carries: the service's fixed text for
@@ -474,25 +474,18 @@ async fn an_id_no_control_holds_is_refused() {
     let (id, etag) = create(&router, &rows[0]).await;
 
     // Ids no control holds: one of the shape this service mints, one of another entity
-    // family's shape, and one that is no entity id at all. This route reads no form of the
-    // value, so each of them is resolved against the store and reported as the control that
-    // is absent.
+    // family's shape, and one that is no entity id at all. This route reads the identifier
+    // ALPHABET and nothing more, so a value written in it is resolved against the store and
+    // reported as the control that is absent, while a value written outside it was never an
+    // identifier CloudFront issued and is the identifier the route reports it cannot read.
     for (case, missing, expected) in [
         (
             "minted-shape",
             "E1A2B3C4D5E6F7",
             NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
         ),
-        (
-            "another-family",
-            "cg_1A2B3C4D5E6F7",
-            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
-        ),
-        (
-            "not-an-id",
-            "no-such-control",
-            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
-        ),
+        ("another-family", "cg_1A2B3C4D5E6F7", UNREADABLE_ID_MESSAGE),
+        ("not-an-id", "no-such-control", UNREADABLE_ID_MESSAGE),
     ] {
         for (version_case, if_match) in [
             ("no-if-match", None),

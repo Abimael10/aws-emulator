@@ -386,17 +386,19 @@ async fn an_illegal_legacy_argument_is_a_client_error_with_the_sentence_for_its_
             ),
         ),
         (
-            "a write stating one half of an Expected entry twice",
+            "a delete stating one half of an Expected entry twice",
             "DeleteItem",
             json!({
                 "TableName": TABLE,
                 "Key": {"pk": {"S": "k1"}, "sk": {"S": "s1"}},
                 "Expected": {"a": {"Exists": true, "ComparisonOperator": "NOT_NULL"}},
             }),
-            format!(
-                "{ENVELOPE}One or more parameter values were invalid: Exists and \
-                 ComparisonOperator cannot be used together for Attribute: a"
-            ),
+            // A delete carries only the key its condition guards, so the clause about the
+            // entry's shape is stated on its own rather than inside the validation envelope
+            // the put above carries.
+            "One or more parameter values were invalid: Exists and ComparisonOperator cannot \
+             be used together for Attribute: a"
+                .to_string(),
         ),
     ];
 

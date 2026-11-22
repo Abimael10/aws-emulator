@@ -1129,6 +1129,81 @@ pub(super) fn is_prefixed_token(value: &str, prefix: char) -> bool {
     }
 }
 
+/// The namespace letter CloudFront writes the identifiers of the SHARED-form family under —
+/// a distribution, a streaming distribution, an origin access identity and an origin access
+/// control ([`EntityKind`]) — and the letter this service mints each of them with
+/// (`allocate_distribution_id` and its siblings).
+pub const ENTITY_ID_PREFIX: char = 'E';
+
+/// The namespace letters this service MINTS an entity identifier of a `prefix` + body shape
+/// under, each one the letter of exactly one resource kind: [`ENTITY_ID_PREFIX`] for the
+/// shared-form family, [`PUBLIC_KEY_ID_PREFIX`] for a public key,
+/// [`FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX`] for a field-level encryption profile and
+/// [`FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX`] for a field-level encryption configuration.
+///
+/// A letter in this set says WHICH namespace the identifier that carries it was issued in; a
+/// letter outside it says nothing about the kind, because CloudFront's namespaces are not
+/// this emulator's mint ([`could_be_issued_for`]).
+pub const ID_NAMESPACE_LETTERS: [char; 4] = [
+    ENTITY_ID_PREFIX,
+    PUBLIC_KEY_ID_PREFIX,
+    FIELD_LEVEL_ENCRYPTION_PROFILE_ID_PREFIX,
+    FIELD_LEVEL_ENCRYPTION_CONFIG_ID_PREFIX,
+];
+
+/// Whether `value` is written under one of the namespace letters this service issues
+/// identifiers under ([`ID_NAMESPACE_LETTERS`]) — all a REQUEST alone says about WHICH
+/// namespace a value came from.
+///
+/// A value that identifies no namespace of this service says nothing about which kind it
+/// was issued for, so it is carried through to the STORE; one that identifies a namespace
+/// came from that namespace, and whether it could name the addressed kind is then decided by
+/// the namespace itself ([`could_be_issued_for`]) or, where several kinds share one letter,
+/// by the store.
+pub fn identifies_a_namespace(value: &str) -> bool {
+    value
+        .chars()
+        .next()
+        .is_some_and(|letter| ID_NAMESPACE_LETTERS.contains(&letter))
+}
+
+/// Whether `value` could be an identifier CloudFront issued for the resource kind whose
+/// identifiers this service mints under `prefix`, where `prefix` is that kind's OWN
+/// namespace letter — all a REQUEST alone decides about it.
+///
+/// Three questions of the value, in order:
+///
+/// * is it written in the characters CloudFront writes an identifier in at all
+///   ([`is_entity_id_form`])? A value in lower case, around a separator, as a UUID or as a
+///   word was never an identifier of any kind;
+/// * does it identify a NAMESPACE of this service ([`identifies_a_namespace`])? A value under
+///   any other letter identifies none — CloudFront's namespaces are not this emulator's mint
+///   — so nothing about it says it is not this kind's, and it is carried through to the STORE,
+///   which is what says whether a resource answers to it;
+/// * and if it does, is that namespace THIS kind's, written the way that namespace writes an
+///   identifier ([`is_prefixed_token`])? An identifier of another namespace was issued for
+///   the kind that namespace belongs to, and one of this namespace in no form CloudFront
+///   writes an identifier in was issued for nothing.
+///
+/// So the two refusals keep the conditions they describe: a value this reports `false` for
+/// could never have been an identifier of the addressed kind and is the identifier a route
+/// reports it cannot READ ([`invalid_id_format`]), while one it reports `true` for that the
+/// store holds nothing under is the resource that is ABSENT.
+///
+/// NOT for a kind of the family whose four members share ONE namespace letter
+/// ([`ENTITY_ID_PREFIX`]): the value cannot say which of them issued it, so those routes read
+/// the alphabet alone
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
+pub fn could_be_issued_for(prefix: char, value: &str) -> bool {
+    if !is_entity_id_form(value) {
+        return false;
+    }
+    if !identifies_a_namespace(value) {
+        return true;
+    }
+    is_prefixed_token(value, prefix)
+}
+
 /// Whether `body` is [`ID_BODY_LEN`] characters of the id alphabet — the body every
 /// token this service mints carries, whatever prefix it is minted under.
 pub(super) fn is_token_body(body: &str) -> bool {

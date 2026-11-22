@@ -5,11 +5,14 @@
 //! Removes the stored session addressed by the four `@httpLabel` values and
 //! echoes the four back. A later `GetSession` for that key is a 404.
 //!
-//! The bot/alias pair and the locale are resolved against the control plane
-//! first, so an address that names no alias of that bot, or no locale of the
-//! version it points at, removes nothing — but a locale that EXISTS and was
-//! never BUILT still addresses its sessions, so a delete there removes the
-//! session it names and is refused as a missing session when there is none.
+//! The address is resolved against the runtime's OWN session store and nothing
+//! else: a session is held under the bot, alias, locale and session id together,
+//! so an address naming no alias of that bot, or no locale of the version it
+//! points at, holds no session — it removes nothing and is answered as the
+//! missing SESSION, exactly as an address whose session was never started is.
+//! Removing a session needs no built runtime model and no control-plane resource
+//! behind the labels, which is why only the calls that INTERPRET input or seed a
+//! dialog state resolve the bot alias and the locale against the control plane.
 //!
 //! ## Shape of an operation
 //!
@@ -89,36 +92,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::bot_model::{addressed_locale, AddressRefused, LocaleUnavailable};
 use crate::state::SessionKey;
 use std::time::SystemTime;
-
-/// The bot, alias and locale the request addresses resolve to no model this
-/// runtime holds a conversation against, or the control plane that holds them
-/// cannot be reached at all.
-///
-/// A session belongs to one bot alias in one locale, so this operation's own
-/// documented failures — "if you specify a bot or alias ID that doesn't exist"
-/// and "if the locale doesn't exist in the bot, or if the locale hasn't been
-/// enables for the alias" — are refusals of the ADDRESS, answered here exactly
-/// as every sibling addressed by the same labels answers them.
-fn locale_unavailable(
-    error: LocaleUnavailable,
-    bot_id: &str,
-    bot_alias_id: &str,
-) -> DeleteSessionError {
-    match error.refusal(bot_id, bot_alias_id) {
-        AddressRefused::NotFound(message) => {
-            DeleteSessionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message,
-            })
-        }
-        AddressRefused::Internal(message) => {
-            DeleteSessionErrorModeled::InternalServerException(InternalServerException { message })
-        }
-    }
-    .into()
-}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -208,25 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.session_id,
         );
 
-        // The ADDRESS is resolved BEFORE the store is touched: the bot/alias
-        // PAIR, then that version's locale. Removing a session needs no runtime
-        // MODEL behind that locale — it interprets nothing — so resolution here
-        // is the locale EXISTING for the alias ([`addressed_locale`]), and a
-        // delete addressed to a session that is not stored is answered as a
-        // missing session even on a locale that was never built. A pair that is
-        // not an alias of that bot, or a locale the alias's version does not
-        // hold, removes nothing and is refused as the address.
-        addressed_locale(
-            &*self.engine,
-            &input.bot_id,
-            &input.bot_alias_id,
-            &input.locale_id,
-        )
-        .map_err(|error| locale_unavailable(error, &input.bot_id, &input.bot_alias_id))?;
-
         // Deleting a session that is not there — or one the clock has already
         // expired — removes nothing, so it is the modelled 404 rather than a
-        // success that claims a removal.
+        // success that claims a removal. The session KEY carries the whole
+        // address, so an address that names no bot, no alias of it or no locale
+        // of the version the alias points at holds no session and earns the same
+        // answer: a delete interprets nothing, so it needs neither a built
+        // locale nor a control-plane resource behind the labels.
         if state
             .lock()
             .remove_session(&key, SystemTime::now())

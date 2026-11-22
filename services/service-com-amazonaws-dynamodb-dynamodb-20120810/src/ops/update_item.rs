@@ -454,6 +454,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expected.as_ref(),
             input.conditional_operator.as_deref(),
             substitutions,
+            // This request carries the update its condition guards, so a refusal about an
+            // `Expected` entry's shape is stated inside the validation envelope
+            // ([`crate::state::ExpectedShapeRefusals`]).
+            crate::state::ExpectedShapeRefusals::Enveloped,
         )
         .map_err(lift)?;
 
@@ -502,6 +506,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.conditional_operator.as_deref(),
             substitutions,
             before.as_ref(),
+            crate::state::ExpectedShapeRefusals::Enveloped,
         )
         .map_err(lift)?;
         if !satisfied {

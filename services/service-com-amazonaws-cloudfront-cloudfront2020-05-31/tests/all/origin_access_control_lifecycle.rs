@@ -73,6 +73,10 @@ use crate::response_headers_policy_lifecycle::escape;
 /// than read from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONTROL_MESSAGE: &str = "The specified origin access control does not exist.";
 
+/// The sentence this surface answers a value written outside the identifier alphabet, which
+/// was never an identifier CloudFront issued — spelled out here for the same reason.
+pub(crate) const UNREADABLE_ID_MESSAGE: &str = "Id format is invalid";
+
 // ---------------------------------------------------------------------------
 // Calling the origin access control surface
 // ---------------------------------------------------------------------------
@@ -487,11 +491,13 @@ async fn create_persists_the_configuration_every_read_then_reports() {
         );
     }
 
-    // An id no control holds is answered under ONE code and its 404 with ONE sentence: this
-    // surface reads no form of the value, so a value of the form this service mints a
-    // control's id in, another entity kind's own minted id, a lower-cased id, a bare word, a
-    // single digit, an unminted namespace letter and a UUID are each resolved against the
-    // store and reported as the control that is absent.
+    // An id no control holds is answered under ONE code and its 404, and the identifier
+    // ALPHABET — all this surface reads of the value — decides which of that code's two
+    // sentences: a value of the form this service mints a control's id in, an unminted
+    // namespace letter and a single digit are written in the alphabet, so each is resolved
+    // against the store and reported as the control that is ABSENT, while a lower-cased id, a
+    // bare word and a UUID were never identifiers CloudFront issued and are reported
+    // UNREADABLE.
     let distribution_id = created
         .first()
         .map(|(_, id)| id.clone())
@@ -499,14 +505,11 @@ async fn create_persists_the_configuration_every_read_then_reports() {
     let lower_cased = distribution_id.to_lowercase();
     for (id, expected) in [
         ("E1AAAAAAAAAAAA", NO_SUCH_CONTROL_MESSAGE),
-        ("not-an-id", NO_SUCH_CONTROL_MESSAGE),
+        ("not-an-id", UNREADABLE_ID_MESSAGE),
         ("0", NO_SUCH_CONTROL_MESSAGE),
-        (lower_cased.as_str(), NO_SUCH_CONTROL_MESSAGE),
+        (lower_cased.as_str(), UNREADABLE_ID_MESSAGE),
         ("W1AAAAAAAAAAAA", NO_SUCH_CONTROL_MESSAGE),
-        (
-            "00000000-0000-0000-0000-000000000000",
-            NO_SUCH_CONTROL_MESSAGE,
-        ),
+        ("00000000-0000-0000-0000-000000000000", UNREADABLE_ID_MESSAGE),
     ] {
         let missing = get_control(&router, id).await;
         assert_eq!(

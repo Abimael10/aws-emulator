@@ -156,7 +156,7 @@ fn outside_the_alphabet(kind: Kind, seeded: &Seeded) -> Vec<(String, String)> {
 }
 
 /// RULE: a value written in the identifier alphabet is judged by the form its route reads — the
-/// kind's whole minted form, or the alphabet alone — so one the store holds no record for is
+/// namespace it was issued in, or the alphabet alone — so one the store holds no record for is
 /// either the record reported ABSENT or the identifier reported UNREADABLE, and never anything
 /// else, through every operation addressed by an identifier of either kind.
 #[tokio::test]

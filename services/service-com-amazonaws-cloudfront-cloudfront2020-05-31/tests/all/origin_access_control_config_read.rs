@@ -27,7 +27,9 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::NO_SUCH_ORIGIN
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, API_VERSION};
-use crate::origin_access_control_lifecycle::{create_control, get_control, table, Control};
+use crate::origin_access_control_lifecycle::{
+    create_control, get_control, table, Control, UNREADABLE_ID_MESSAGE,
+};
 
 // ---------------------------------------------------------------------------
 // Calling the surface under test
@@ -291,8 +293,10 @@ async fn the_config_read_refuses_an_id_no_control_holds() {
 
     // Rows: the retired id, the stored id with its last character changed, the stored id in
     // lower case, a token shaped like no id this service mints, and the control's name
-    // rather than its id. This route reads no form of the value, so every one of them is
-    // resolved against the store and reported as the control that is absent.
+    // rather than its id. This route reads the identifier ALPHABET and nothing more, so the
+    // two values written in it are resolved against the store and reported as the control
+    // that is absent, while the three written outside it — in lower case, around a separator
+    // — were never identifiers CloudFront issued and are reported unreadable.
     let mut flipped: Vec<char> = id.chars().collect();
     let last = flipped.len() - 1;
     flipped[last] = if flipped[last] == 'A' { 'B' } else { 'A' };
@@ -310,17 +314,17 @@ async fn the_config_read_refuses_an_id_no_control_holds() {
         (
             "the stored id in lower case",
             id.to_lowercase(),
-            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "a token that is no control id",
             "not-a-control-id".to_string(),
-            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "a control name rather than an id",
             present_name.to_string(),
-            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
     ];
 

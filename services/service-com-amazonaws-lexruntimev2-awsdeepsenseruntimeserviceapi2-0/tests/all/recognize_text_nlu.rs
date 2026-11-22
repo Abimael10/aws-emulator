@@ -889,10 +889,11 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
     // combination can have no built model. The two address refusals are worded
     // differently: a `botId`/`botAliasId` pair that resolves to no alias names
     // both ids, while a locale with no built model carries the fixed
-    // BotId/BotLocale sentence. The READ of the session is refused as the ADDRESS
-    // only where the address itself does not resolve: a locale that EXISTS but
-    // was never built addresses its sessions, and the session the refused turn
-    // did not start is missing there.
+    // BotId/BotLocale sentence. The READ of the session resolves the SESSION
+    // alone — it interprets nothing, so it needs neither the built model nor a
+    // control-plane record behind the labels — so on every row it reports the
+    // session the refused turn never started.
+    let session_absent = "The session for user unbuilt doesn\u{2019}t exist or has expired.";
     let rows: Vec<(&str, String, String, String)> = vec![
         (
             "the bot's own locale, never built",
@@ -901,7 +902,7 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 bot.bot_id, bot.bot_alias_id, bot.locale_id
             ),
             NOT_VALID.to_string(),
-            "The session for user unbuilt doesn\u{2019}t exist or has expired.".to_string(),
+            session_absent.to_string(),
         ),
         (
             "a bot id nothing was ever created for",
@@ -913,10 +914,7 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 "ZZZZZZZZZZ/{} is not a valid BotId/BotAliasId combination.",
                 bot.bot_alias_id
             ),
-            format!(
-                "ZZZZZZZZZZ/{} is not a valid BotId/BotAliasId combination.",
-                bot.bot_alias_id
-            ),
+            session_absent.to_string(),
         ),
         (
             "an alias id the bot does not have",
@@ -928,10 +926,7 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 "{}/NOSUCHALIAS is not a valid BotId/BotAliasId combination.",
                 bot.bot_id
             ),
-            format!(
-                "{}/NOSUCHALIAS is not a valid BotId/BotAliasId combination.",
-                bot.bot_id
-            ),
+            session_absent.to_string(),
         ),
         (
             "a locale id the bot has no locale for",
@@ -940,7 +935,7 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
                 bot.bot_id, bot.bot_alias_id
             ),
             NOT_VALID.to_string(),
-            NOT_VALID.to_string(),
+            session_absent.to_string(),
         ),
     ];
 
@@ -970,9 +965,9 @@ async fn a_turn_addressed_to_a_locale_with_no_built_model_is_refused() {
             refused.json()
         );
 
-        // The read of that session is refused too — as the ADDRESS where the
-        // address does not resolve, and as the missing SESSION where the locale
-        // exists and only its MODEL is absent, which a read needs none of.
+        // The read of that session reports the session that is not there: it
+        // resolves the SESSION alone, so an address naming no bot, no alias of it
+        // or no locale of the version the alias points at holds no session.
         let read = emulator.send("GET", path, None).await;
         assert_eq!(
             read.status, 404,

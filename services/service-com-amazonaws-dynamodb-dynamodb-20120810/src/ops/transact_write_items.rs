@@ -1519,6 +1519,9 @@ fn prepare_element<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         None,
         substitutions,
         before.as_ref(),
+        // A transaction item states its condition through `ConditionExpression` alone —
+        // the legacy map is no member of one — so the choice never applies here.
+        crate::state::ExpectedShapeRefusals::Enveloped,
     )
     .map_err(crate::state::refused_in_element)
     .map_err(refused_call)?;

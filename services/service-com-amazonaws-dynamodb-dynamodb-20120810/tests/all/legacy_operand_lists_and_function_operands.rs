@@ -515,9 +515,19 @@ async fn an_expected_entry_s_value_list_names_the_comparison_it_is_the_operands_
     let router = seeded().await;
     // AWS names the attribute whose entry carried the list; the rest of the sentence is
     // fixed. The rows vary the operation, the attribute and what else the entry states.
+    // Whether the clause is stated inside the `<N> validation error(s) detected: ` envelope
+    // follows the OPERATION: the writes that carry the item or the update the condition
+    // guards state these clauses inside it, and the delete, whose request carries only the
+    // key, states the clause on its own.
     let sentence = |attribute: &str| {
         format!(
             "{ENVELOPE}{INVALID}: AttributeValueList can only be used with a ComparisonOperator \
+             for Attribute: {attribute}"
+        )
+    };
+    let bare_sentence = |attribute: &str| {
+        format!(
+            "{INVALID}: AttributeValueList can only be used with a ComparisonOperator \
              for Attribute: {attribute}"
         )
     };
@@ -538,7 +548,7 @@ async fn an_expected_entry_s_value_list_names_the_comparison_it_is_the_operands_
                 request: json!({"Key": key(),
                                 "Expected": {"n": {"AttributeValueList": [{"N": "1"},
                                                                           {"N": "2"}]}}}),
-                expected: sentence("n"),
+                expected: bare_sentence("n"),
             },
             Row {
                 case: "an update stating values beside an existence expectation",

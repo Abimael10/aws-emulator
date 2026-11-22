@@ -4243,6 +4243,34 @@ pub const EXPECTED_MEMBER: &str = "Expected";
 /// for the two generations' expression members.
 const ENVELOPED_LEGACY_MEMBERS: [&str; 1] = [EXPECTED_MEMBER];
 
+/// Whether a refusal about the SHAPE of one legacy `Expected` entry — which of the members
+/// an expectation is stated through the entry carried, rather than the operands of a
+/// comparison it named — is stated inside the `<N> validation error(s) detected: `
+/// envelope.
+///
+/// Recorded behaviour, and a property of the OPERATION the map arrived on rather than of the
+/// entry: a write that carries the item or the update its condition guards states these
+/// clauses inside the envelope ([`Self::Enveloped`] — `PutItem`, `UpdateItem` and the
+/// transaction items carrying the same payloads), while `DeleteItem`, whose request carries
+/// only the key the condition guards, states the clause on its own ([`Self::Bare`]). The
+/// sentence is the same on every write; only the envelope follows the operation, as it does
+/// for the expression members ([`envelopes_expression_refusals`]) and for the clause a value
+/// of a legacy map earns ([`ENVELOPED_LEGACY_MEMBERS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpectedShapeRefusals {
+    /// Inside the envelope: the writes that carry a payload beside the key.
+    Enveloped,
+    /// On its own: the write that carries only the key its condition guards.
+    Bare,
+}
+
+impl ExpectedShapeRefusals {
+    /// Whether the clause is stated inside the envelope.
+    pub fn states_the_envelope(self) -> bool {
+        matches!(self, Self::Enveloped)
+    }
+}
+
 /// Whether a `ConditionalOperator` request fits the map it was sent to combine: the
 /// member combines the ENTRIES of that map, so it needs two or more of them, and the
 /// sentence a request that does not provide them earns is selected on the count the

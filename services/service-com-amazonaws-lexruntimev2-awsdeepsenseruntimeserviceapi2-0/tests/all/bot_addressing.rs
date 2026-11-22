@@ -13,15 +13,18 @@
 //!
 //! 1. A call addressed by the four session labels (`GetSession`,
 //!    `DeleteSession`, `PutSession`, `RecognizeText`, `RecognizeUtterance`)
-//!    resolves the `botId`/`botAliasId` PAIR and the addressed locale before it
-//!    touches the session store: an alias that is not an alias of that bot, and
-//!    a locale the alias's version does not hold, are refused with HTTP 404
-//!    `ResourceNotFoundException` in AWS's own words — and the refusal has no
-//!    effect, so no session comes into existence and none is removed. A locale
-//!    that EXISTS but was never BUILT has no runtime MODEL, which only a call
-//!    that INTERPRETS input needs: the two calls that merely read or remove a
-//!    stored session are served there and refuse an absent session as a missing
-//!    SESSION, while a turn and a `PutSession` are refused as the address.
+//!    resolves what it NEEDS behind those labels before it touches the session
+//!    store. The three that INTERPRET input or seed a dialog state need the
+//!    built runtime model, so they resolve the `botId`/`botAliasId` PAIR and the
+//!    addressed locale against the control plane: an alias that is not an alias
+//!    of that bot, and a locale the alias's version does not hold, are refused
+//!    with HTTP 404 `ResourceNotFoundException` in AWS's own words — and the
+//!    refusal has no effect, so no session comes into existence and none is
+//!    removed. The two that merely READ or REMOVE a stored session interpret
+//!    nothing and resolve the SESSION alone: a session is held under the bot,
+//!    the alias, the locale and the session id together, so an address naming no
+//!    bot, no alias of it or no locale of the version it points at holds no
+//!    session and is answered as the missing SESSION.
 //! 2. A `sessionState` seeded by `PutSession` names resources the resolved
 //!    locale defines: an intent it does not declare, or an elicited slot that
 //!    intent does not declare, is HTTP 400 `ValidationException` and stores
@@ -81,13 +84,23 @@ impl Call {
     /// Does this call answer from a session that is already STORED? A read and
     /// a delete do, so a case that expects one of them to be served seeds the
     /// session first; `PutSession` and the two encodings of a turn create the
-    /// session they address. Every one of the five resolves the bot address
-    /// first, whichever side of this it is on.
+    /// session they address. The two that answer from a stored session are also
+    /// the two that resolve the SESSION alone, whichever side of this they are
+    /// on ([`Call::needs_the_bot_address`]).
     fn needs_a_stored_session(&self) -> bool {
         match self {
             Self::GetSession | Self::DeleteSession => true,
             Self::PutSession | Self::RecognizeText | Self::RecognizeUtterance => false,
         }
+    }
+
+    /// Does this call resolve the bot ADDRESS against the control plane before it
+    /// touches the session store? The three that interpret input or seed a dialog
+    /// state need the built runtime model behind the labels; a read and a delete
+    /// interpret nothing, so they resolve the session alone and report an address
+    /// that holds no session as the missing session.
+    fn needs_the_bot_address(&self) -> bool {
+        !self.needs_a_stored_session()
     }
 
     /// Send this call against `path`, with a body this operation's own model
@@ -131,8 +144,9 @@ impl Call {
 }
 
 /// EVERY operation this service binds to a session address — the five that bind
-/// the same four `@httpLabel` values, and each of which resolves that address
-/// before the session store is touched.
+/// the same four `@httpLabel` values, three of which resolve that address against
+/// the control plane before the session store is touched
+/// ([`Call::needs_the_bot_address`]).
 fn session_calls() -> [Call; 5] {
     [
         Call::GetSession,
@@ -263,10 +277,17 @@ async fn a_call_is_refused_unless_the_bot_alias_pair_resolves() {
                 reply.error_type()
             );
             let message = reply.error_message();
+            // The three calls that need the bot address state the PAIR's own
+            // sentence; the read and the delete resolve the session alone, so an
+            // address holding no session is the missing session.
+            let expected = if call.needs_the_bot_address() {
+                alias_not_valid(bot_id, bot_alias_id)
+            } else {
+                session_not_found(&session_id)
+            };
             assert_eq!(
-                message,
-                alias_not_valid(bot_id, bot_alias_id),
-                "case {case:?} on {}: expected the pair's own sentence, got {message:?}",
+                message, expected,
+                "case {case:?} on {}: expected {expected:?}, got {message:?}",
                 call.name()
             );
 
@@ -322,17 +343,18 @@ async fn a_call_is_refused_until_the_locale_is_built() {
         locales: vec!["en_US".to_string()],
     };
 
-    // (case, localeId, whether the locale EXISTS for the alias) — every row is a
-    // locale with no built model: one created but never built, which exists and
-    // therefore still addresses its sessions, one the bot has no locale for at
-    // all, and one outside the locales the service supports.
-    let unbuilt: [(&str, &str, bool); 3] = [
-        ("a created locale that was never built", "en_US", true),
-        ("a locale the bot has no record for", "de_DE", false),
-        ("a locale the service does not support", "xx_XX", false),
+    // (case, localeId) — every row is a locale with no built model: one created
+    // but never built, one the bot has no locale for at all, and one outside the
+    // locales the service supports. None of them has a runtime model, so none of
+    // them serves a call that interprets input; the session store holds nothing
+    // for any of them either.
+    let unbuilt: [(&str, &str); 3] = [
+        ("a created locale that was never built", "en_US"),
+        ("a locale the bot has no record for", "de_DE"),
+        ("a locale the service does not support", "xx_XX"),
     ];
 
-    for (case, locale_id, locale_exists) in unbuilt {
+    for (case, locale_id) in unbuilt {
         for call in session_calls() {
             let session_id = format!("locale-{}", call.name());
             let path = format!(
@@ -354,16 +376,14 @@ async fn a_call_is_refused_until_the_locale_is_built() {
                 call.name(),
                 reply.error_type()
             );
-            // A locale that EXISTS addresses its sessions whether or not it was
-            // built, so the two calls that only read or remove a stored session
-            // are refused for the SESSION there; every other combination of call
-            // and row is refused as the address.
-            let reads_the_session_only =
-                matches!(call, Call::GetSession | Call::DeleteSession) && locale_exists;
-            let expected = if reads_the_session_only {
-                format!("The session for user {session_id} doesn\u{2019}t exist or has expired.")
-            } else {
+            // A read and a delete resolve the SESSION alone, so they are refused
+            // for the session on every row here, built locale or not; the three
+            // calls that need the built model behind the locale are refused as
+            // the address.
+            let expected = if call.needs_the_bot_address() {
                 LOCALE_NOT_VALID.to_string()
+            } else {
+                format!("The session for user {session_id} doesn\u{2019}t exist or has expired.")
             };
             let message = reply.error_message();
             assert_eq!(
@@ -431,13 +451,14 @@ async fn a_call_is_refused_until_the_locale_is_built() {
     );
 }
 
-/// Rule 1, after the fact: the address is resolved on EVERY call addressed by
-/// the session labels, so a session stored while that address resolved is
-/// refused — and left untouched, the delete included — once the control plane
-/// drops the locale it is held in, and is still exactly as it was when the
-/// locale is built again.
+/// Rule 1, after the fact: the three calls that need the built model behind the
+/// locale are refused once the control plane drops it, and the session the
+/// runtime stored under that address is left exactly as it was — while the read
+/// and the delete, which resolve the session alone, still answer from this
+/// runtime's own store, because a session is held under the four labels and not
+/// under the control plane's record of them.
 #[tokio::test]
-async fn a_stored_session_is_refused_once_the_control_plane_drops_its_locale() {
+async fn a_stored_session_outlives_the_control_plane_dropping_its_locale() {
     let (emulator, bot) = Emulator::with_bot().await;
     let session_id = "survives-the-drop";
     let path = bot.session_path(session_id);
@@ -484,9 +505,12 @@ async fn a_stored_session_is_refused_once_the_control_plane_drops_its_locale() {
         String::from_utf8_lossy(&dropped.body)
     );
 
-    // The address now resolves to no built locale, so every call addressed by
-    // it is refused with the locale's own sentence — the delete among them.
+    // The address now resolves to no built locale, so the three calls that need
+    // the runtime model behind it are refused with the locale's own sentence.
     for call in session_calls() {
+        if !call.needs_the_bot_address() {
+            continue;
+        }
         let reply = call.send(&emulator, &path).await;
         assert_eq!(
             reply.status,
@@ -511,8 +535,20 @@ async fn a_stored_session_is_refused_once_the_control_plane_drops_its_locale() {
         );
     }
 
+    // And the READ still answers from this runtime's own store, the dropped
+    // locale notwithstanding: the session was stored under the four labels, and
+    // the refusals above touched nothing.
+    let while_dropped = emulator.send("GET", &path, None).await;
+    assert_eq!(
+        while_dropped.status,
+        200,
+        "the stored session is still readable while the locale is dropped, got {} {:?}",
+        while_dropped.status,
+        String::from_utf8_lossy(&while_dropped.body)
+    );
+
     // Built again, and the session is exactly as it was left: none of the
-    // refused calls — the delete included — touched the store.
+    // refused calls touched the store.
     emulator.create_locale(&bot.bot_id, bot.locale()).await;
     emulator
         .create_intent_with_slot(&bot.bot_id, bot.locale())
@@ -523,7 +559,7 @@ async fn a_stored_session_is_refused_once_the_control_plane_drops_its_locale() {
     assert_eq!(
         read.status,
         200,
-        "the refused delete removed nothing, got {} {:?}",
+        "the refusals removed nothing, got {} {:?}",
         read.status,
         String::from_utf8_lossy(&read.body)
     );

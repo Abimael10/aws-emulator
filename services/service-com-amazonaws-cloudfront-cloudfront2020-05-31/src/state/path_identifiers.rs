@@ -120,22 +120,31 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     }
 
     /// The modelled `NoSuchOriginAccessControl` an operation ADDRESSED by an origin access
-    /// control `Id` answers an identifier it could not resolve: the ABSENT-control sentence,
-    /// whatever the value's form.
+    /// control `Id` answers an identifier it could not resolve.
     ///
-    /// Unlike the distribution's reads ([`Self::unresolved_distribution`]), this surface reads
-    /// NO form of the value before it resolves it — how much of an identifier's form a route
-    /// reads is that resource kind's own recorded contract, and the recorded answers of the
-    /// origin-access-control routes report EVERY `Id` the account holds no control under as the
-    /// control that is absent: a value that is no identifier this service mints, and one held
-    /// as another kind of the `E`-form family, read the same. `Id` is a plain `string`
-    /// `@httpLabel` with no `@pattern` and no `@length`
-    /// (`smithy_query(query="operation",operation="GetOriginAccessControl")`), so there is no
-    /// modelled constraint to refuse a value on either. The sentence is fixed text, so nothing
-    /// from the request reaches the wire.
+    /// `Id` is a plain `string` `@httpLabel` with no `@pattern` and no `@length`
+    /// (`smithy_query(query="operation",operation="GetOriginAccessControl")`), so what this
+    /// route reads of the value is the ALPHABET an identifier is written in and nothing more
+    /// ([`is_entity_id_form`]) — the same half the field-level encryption configuration's
+    /// RESOURCE read reads
+    /// ([`super::unresolved_field_level_encryption_config_on_the_resource_read`]). A control's
+    /// identifier comes from the namespace its four kinds SHARE ([`ENTITY_ID_PREFIX`]), so
+    /// neither the letter a value opens with nor the width of its body says which kind issued
+    /// it, and WHICH identifier of that alphabet was ever issued is a property of the STORE: a
+    /// value of the alphabet the account holds no control under is the control reported
+    /// ABSENT.
+    ///
+    /// A value written outside that alphabet — in lower case, around a separator, as a UUID,
+    /// as a word or as a domain name — was never an identifier CloudFront issued at all, so it
+    /// is the identifier this route reports it cannot READ ([`id_format_invalid_message`]).
+    /// Both sentences are fixed text, so nothing from the request reaches the wire.
     pub fn unresolved_origin_access_control(&self, id: &str) -> NoSuchOriginAccessControl {
-        let _ = id;
-        no_such_origin_access_control()
+        if is_entity_id_form(id) {
+            return no_such_origin_access_control();
+        }
+        NoSuchOriginAccessControl {
+            message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
+        }
     }
 }
 

@@ -1476,9 +1476,11 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     // that was never minted, an id in another namespace and of a width no identifier of this
     // kind is issued at, a minted id of another kind (the profile's, a different resource
     // under the same surface), the configuration's own id with a character changed, a bare
-    // digit, and a value outside the identifier alphabet. This reader reads the WHOLE form a
-    // configuration id is minted in, so only a value of that form is the configuration
-    // reported absent; every other value is reported unreadable.
+    // digit, and a value outside the identifier alphabet. This reader reads which NAMESPACE
+    // the value was issued in, so an id under another namespace letter of this service is
+    // reported unreadable, as is a value outside the identifier alphabet, while a value that
+    // identifies no namespace of this service — a bare digit — says nothing about the kind
+    // that issued it and is carried through to the store like an id of this kind's own form.
     let mut mangled: Vec<char> = stored_id.chars().collect();
     if let Some(last) = mangled.last_mut() {
         *last = if *last == 'A' { 'B' } else { 'A' };
@@ -1490,7 +1492,7 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
         (profile.as_str(), UNREADABLE_ID_MESSAGE),
         (mangled.as_str(), NO_SUCH_CONFIG_MESSAGE),
         ("not-a-configuration-id", UNREADABLE_ID_MESSAGE),
-        ("0", UNREADABLE_ID_MESSAGE),
+        ("0", NO_SUCH_CONFIG_MESSAGE),
     ] {
         let answer = get_config_document(&router, case).await;
         assert_eq!(

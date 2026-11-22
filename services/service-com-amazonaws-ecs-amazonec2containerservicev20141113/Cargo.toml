@@ -208,6 +208,9 @@ tracing = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `automod`: the integration-test target's root (`tests/all/main.rs`) declares one module per
+# `tests/all/<name>.rs`, so a new suite is a new file and nothing lists it.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # EventBridge and Amazon SQS are mounted beside Amazon ECS on one engine in the integration
 # tests, because this service publishes an `ECS Task State Change` event onto the default
