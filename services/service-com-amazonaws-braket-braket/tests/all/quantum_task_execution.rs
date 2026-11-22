@@ -17,10 +17,12 @@
 //! the member of the request that is out of range. The recorded Bell circuit at 100 shots
 //! is ONE row of the first table.
 //!
-//! The last suite pins the OBJECT rather than the document: Amazon S3 serves a stored
-//! object as the write that stored it declared it, so a read of a result object reports
-//! the store's own default media type (the write declares none) and the CRC32 whole-object
-//! checksum that write carries.
+//! The last two suites pin the OBJECT and the metadata the document it holds reports:
+//! Amazon S3 serves a stored object as the write that stored it declared it, so a read of
+//! a result object reports the store's own default media type (the write declares none)
+//! and the CRC32 whole-object checksum that write carries; and the document's
+//! `taskMetadata` reports the task as it was submitted, including the device-parameters
+//! document the task ran under.
 //!
 //! Everything goes over HTTP through the production router, with Amazon S3 — the owner of
 //! the output location — mounted beside this service on the same engine, so a result
@@ -825,6 +827,192 @@ async fn a_result_object_is_read_back_with_the_properties_its_write_stored() {
             etag,
             "case {case}: expected the HEAD to report the stored entity tag, got {:?}",
             head.e_tag()
+        );
+    }
+}
+
+/// Every Braket device-parameters schema is named after the device family it belongs to and
+/// ends with this segment — the shape of the name the service's own resolution builds
+/// (`crate::state::device_parameters::parameters_schema` in the service crate), asserted
+/// rather than listed so no one device's schema name is written out here.
+const PARAMETERS_SCHEMA_SUFFIX: &str = "_device_parameters";
+
+/// The schema of the gate-model paradigm parameters a caller nests in its own
+/// device-parameters document, as the Braket device schemas publish it. It travels as the
+/// CALLER's input here: these documents are what the create sent, not a catalog this suite
+/// owns.
+const GATE_MODEL_PARAMETERS_SCHEMA: &str = "braket.device_schema.gate_model_parameters";
+
+/// A gate-model result document's `taskMetadata` reports the task as it was SUBMITTED: the
+/// device-parameters document the task RAN UNDER is one of its members — the document the
+/// create carried, nested as the document it is, or the device's own default document for
+/// the program that ran when the create carried none — and it is the same value the API
+/// read of the task reports, because both report one stored document.
+///
+/// The rows differ along what the rule generalises over: whether the create carried a
+/// parameters document at all, and the document it carried (a full simulator parameters
+/// document, one that pins the program's qubits, an empty one). The recorded two-qubit
+/// document is ONE row. Each row also pins the media type the object is served under: the
+/// write declares none, so the store's own default is what a read reports.
+#[tokio::test]
+async fn a_result_documents_task_metadata_reports_the_parameters_the_task_ran_under() {
+    let (braket, s3) = Braket::with_s3();
+    create_bucket(&s3).await;
+
+    // (case, the qubits the program declares, its source, the document the create carries)
+    let cases: Vec<(&str, u64, &str, Option<Value>)> = vec![
+        (
+            // The recorded run of this fixture: its circuit and its parameters document.
+            "the recorded simulator parameters document",
+            2,
+            "OPENQASM 3.0; bit[2] b; qubit[2] q; x q[0]; b[0] = measure q[0]; \
+             b[1] = measure q[1];",
+            Some(json!({
+                "braketSchemaHeader": {
+                    "name": "braket.device_schema.simulators.\
+                             gate_model_simulator_device_parameters",
+                    "version": "1",
+                },
+                "paradigmParameters": {
+                    "braketSchemaHeader": {
+                        "name": GATE_MODEL_PARAMETERS_SCHEMA,
+                        "version": "1",
+                    },
+                    "qubitCount": 2,
+                    "disableQubitRewiring": false,
+                },
+            })),
+        ),
+        (
+            "a document that pins the program's qubits",
+            3,
+            "OPENQASM 3.0; qubit[3] q; h q[0]; cnot q[0], q[1]; cnot q[1], q[2];",
+            Some(json!({
+                "paradigmParameters": {
+                    "braketSchemaHeader": {
+                        "name": GATE_MODEL_PARAMETERS_SCHEMA,
+                        "version": "1",
+                    },
+                    "qubitCount": 3,
+                    "disableQubitRewiring": true,
+                },
+            })),
+        ),
+        (
+            "an empty document the create carried",
+            1,
+            "OPENQASM 3.0; qubit[1] q; x q[0];",
+            Some(json!({})),
+        ),
+        (
+            "no document at all",
+            2,
+            "OPENQASM 3.0; qubit[2] q; h q[0]; cnot q[0], q[1];",
+            None,
+        ),
+    ];
+
+    for (index, (case, qubits, source, submitted)) in cases.iter().enumerate() {
+        let mut body = create_body(
+            &format!("parameters-token-{index}"),
+            SV1,
+            2,
+            BUCKET,
+            &openqasm_action(source),
+        );
+        if let Some(document) = submitted {
+            // `deviceParameters` travels as JSON TEXT on the API, which is how a client
+            // sends the document it wants the task to run under.
+            body["deviceParameters"] = json!(document.to_string());
+        }
+        let created = braket.create_task(body).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: expected 200, got {} {}",
+            created.status, created.body
+        );
+        let arn = created.str_member("quantumTaskArn");
+        let task = poll_until_terminal(&braket, &arn).await;
+        assert_eq!(
+            member(&task, "status"),
+            "COMPLETED",
+            "case {case}: expected COMPLETED, got {task}"
+        );
+        let key = format!("{}/{RESULTS_OBJECT}", member(&task, "outputS3Directory"));
+
+        let object = s3
+            .get_object()
+            .bucket(BUCKET)
+            .key(&key)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case}: expected the object at {key}, got {error:?}")
+            });
+        let content_type = object.content_type().map(ToString::to_string);
+        let bytes = object
+            .body
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("case {case}: the object's body reads, got {error:?}"))
+            .into_bytes();
+        assert_eq!(
+            content_type.as_deref(),
+            // The store's own default for an object stored with no stated media type,
+            // named where Amazon S3 holds it rather than copied as a value.
+            Some(::service_com_amazonaws_s3_amazons3::state::DEFAULT_CONTENT_TYPE),
+            "case {case}: expected the store's default media type, got {content_type:?}"
+        );
+
+        let document: Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("case {case}: the result object is JSON: {error}"));
+        let metadata = &document["taskMetadata"];
+        assert_eq!(
+            metadata["id"].as_str(),
+            Some(arn.as_str()),
+            "case {case}: expected the task's own ARN as the document's id, got {metadata}"
+        );
+        assert_eq!(
+            metadata["deviceId"].as_str(),
+            Some(SV1),
+            "case {case}: expected the device that ran it, got {metadata}"
+        );
+        let reported = &metadata["deviceParameters"];
+        match submitted {
+            Some(expected) => assert_eq!(
+                reported, expected,
+                "case {case}: expected the submitted document as it was sent, got {reported}"
+            ),
+            None => {
+                let schema = metadata["deviceParameters"]["braketSchemaHeader"]["name"]
+                    .as_str()
+                    .unwrap_or_default();
+                assert!(
+                    schema.starts_with("braket.device_schema.")
+                        && schema.ends_with(PARAMETERS_SCHEMA_SUFFIX),
+                    "case {case}: expected the device's own parameters schema, got {reported}"
+                );
+                assert_eq!(
+                    reported["paradigmParameters"]["qubitCount"].as_u64(),
+                    Some(*qubits),
+                    "case {case}: expected the program's {qubits} qubits, got {reported}"
+                );
+                assert_eq!(
+                    reported["paradigmParameters"]["disableQubitRewiring"].as_bool(),
+                    Some(false),
+                    "case {case}: expected rewiring to stay enabled, got {reported}"
+                );
+            }
+        }
+
+        // The API read and the result document report ONE value: the document the task ran
+        // under, carried as JSON text on the API and nested as a document in the object.
+        let read = member(&task, "deviceParameters");
+        let api: Value = serde_json::from_str(read)
+            .unwrap_or_else(|error| panic!("case {case}: {read} is not JSON: {error}"));
+        assert_eq!(
+            &api, reported,
+            "case {case}: expected the API's own {api} in the document, got {reported}"
         );
     }
 }
