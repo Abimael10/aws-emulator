@@ -232,29 +232,16 @@ impl From<ListObjectsV2ErrorModeled> for ListObjectsV2Error {
 /// server-side default.
 const MAX_KEYS_PER_PAGE: i32 = 1000;
 
-/// The marker a continuation token this service issued carries, so a token it did not
-/// issue is refused rather than silently read as a cursor.
-const CONTINUATION_TOKEN_MARKER: &str = "s3v1 ";
-
-/// Encode the resume point of a truncated page as the `NextContinuationToken`.
+/// The listing this operation's continuation tokens are minted for, named inside every one
+/// of them ([`crate::state::PagedListing`], the ONE token codec every paged listing of this
+/// service shares), so a token minted for another listing is no cursor into this one.
 ///
-/// "NextContinuationToken is obfuscated and is not a real key" — hex of a marker plus
-/// the first key NOT returned, so the token a page hands back resumes exactly where it
-/// stopped without storing per-caller cursor state. Obfuscated, NOT confidential: hex is
-/// trivially reversible, and the token is only opaque in the sense that a client must not
-/// read a key out of it or mint one of its own.
-fn encode_continuation_token(first_key_not_returned: &str) -> String {
-    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{first_key_not_returned}").as_bytes())
-}
-
-/// The key a `ContinuationToken` resumes at (inclusive), or `None` when the token is
-/// not one this service issued.
-fn decode_continuation_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    decoded
-        .strip_prefix(CONTINUATION_TOKEN_MARKER)
-        .map(str::to_string)
-}
+/// "NextContinuationToken is obfuscated and is not a real key"
+/// (`ListObjectsV2Output$NextContinuationToken`): the token is an opaque value this service
+/// mints over the position the next page resumes at — never a rendering of that key — and a
+/// value this service did not mint names no page at all. The cursor is scoped to the BUCKET
+/// the listing is taken over, so a token issued over one bucket names no page of another's.
+const LISTING: crate::state::PagedListing = crate::state::PagedListing::Objects;
 
 /// The `ListObjectsV2` operation.
 ///
@@ -364,24 +351,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // number the caller asked for.
         let page_limit = max_keys.min(MAX_KEYS_PER_PAGE) as usize;
 
-        // A continuation token wins over StartAfter: it already encodes where the
-        // previous page stopped, which is at or after StartAfter.
-        let resume_at = match input.continuation_token.as_deref() {
-            Some(token) => Some(decode_continuation_token(token).ok_or_else(|| {
-                // A token no listing of this service issued names no position to resume
-                // from, which is an `InvalidArgument` naming the parameter it arrived on
-                // ([`crate::state::CONTINUATION_TOKEN_ARGUMENT`]) — the message states the
-                // rule and nothing about the token, so the field is the only part of the
-                // document that says what the caller must fix.
-                crate::scaffolded::Scaffolded::invalid_argument(
-                    crate::state::CONTINUATION_TOKEN_ARGUMENT,
-                    None,
-                    crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE,
-                )
-            })?),
-            None => None,
-        };
-
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::unmodeled(
                 "InternalError",
@@ -394,6 +363,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // while this service's own guard is held.
         let caller = crate::service::request_authorization::request_caller(&*self.engine, ctx);
         let store = state.lock();
+        // The key THIS store mints and reads its continuation tokens under (see
+        // `crate::state::configuration_tokens`): taken before the bucket is borrowed, and
+        // read-only — a listing reports, so nothing about the store moves.
+        let page_tokens = store.page_token_key();
+
+        // A continuation token wins over StartAfter: it already encodes where the
+        // previous page stopped, which is at or after StartAfter. Read before the bucket is
+        // looked up, so a token no listing of this service issued is answered as such
+        // whatever the request goes on to address.
+        let resume_at = match input.continuation_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_continuation_token(
+                    &page_tokens,
+                    LISTING,
+                    &input.bucket,
+                    token,
+                )
+                .ok_or_else(|| {
+                    // A token no listing of this service issued names no position to resume
+                    // from, which is an `InvalidArgument` naming the parameter it arrived on
+                    // ([`crate::state::CONTINUATION_TOKEN_ARGUMENT`]) — the message states
+                    // the rule and nothing about the token, so the field is the only part of
+                    // the document that says what the caller must fix.
+                    crate::scaffolded::Scaffolded::invalid_argument(
+                        crate::state::CONTINUATION_TOKEN_ARGUMENT,
+                        None,
+                        crate::state::INVALID_CONTINUATION_TOKEN_MESSAGE,
+                    )
+                })?,
+            ),
+            None => None,
+        };
 
         let bucket = store
             .bucket(&input.bucket)
@@ -571,7 +572,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // One slot per entry, shared by Contents and CommonPrefixes. Out of
                 // slots means this key starts the NEXT page.
                 if contents.len() + common_prefixes.len() >= page_limit {
-                    next_continuation_token = Some(encode_continuation_token(key));
+                    next_continuation_token = Some(crate::state::encode_continuation_token(
+                        &page_tokens,
+                        LISTING,
+                        &input.bucket,
+                        key,
+                    ));
                     break;
                 }
 

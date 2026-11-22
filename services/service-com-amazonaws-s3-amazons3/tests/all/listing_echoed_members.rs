@@ -17,7 +17,9 @@
 //!    `Delimiter` is "absent from the response" when the request stated none
 //!    (`ListMultipartUploadsOutput$Delimiter`), and so is the `Prefix` of the uploads
 //!    listing, "when a prefix is provided in the request, this field contains the specified
-//!    prefix";
+//!    prefix". A narrowing parameter the request states with NO VALUE states nothing, so
+//!    such a listing applies no delimiter and reports none either: the element's own
+//!    presence is what tells a client the listing is hierarchical;
 //! 2. the page-size element echoes the number the REQUEST asked for, while the published
 //!    1,000-entry ceiling bounds only how many entries the page carries — "the response
 //!    might contain fewer keys but will never contain more"
@@ -36,19 +38,33 @@
 //! CASE names the one method the model declares and is served, echoed as the request spelled
 //! it, and one stated with NO value states no encoding at all.
 //!
+//! And the fourth, over every listing of this service that PAGES (the objects a bucket
+//! holds, the buckets an account holds, the annotations one object version holds): the
+//! continuation token a truncated page hands back is an OPAQUE value the service mints and
+//! the caller hands back unread — "NextContinuationToken is obfuscated and is not a real
+//! key" (`ListObjectsV2Output$NextContinuationToken`), "ContinuationToken is obfuscated and
+//! is not a real bucket" (`ListBucketsOutput$ContinuationToken`). So it is base64 text in
+//! the URL-safe alphabet, it is no rendering of the position it resumes at in any spelling a
+//! caller could compute, and only a value this service minted over THIS resource names a
+//! page at all; while being a usable cursor, it resumes the listing exactly where the page
+//! stopped and is the same value for two identical reads of one unchanged listing.
+//!
 //! The tables span what each rule generalises over: WHICH listing answers (all four, by
 //! their four addresses), whether the request stated each echoed member, the page sizes
-//! below, at and past the published ceiling, and the values an `encoding-type` may carry
-//! that are not the one the model declares.
+//! below, at and past the published ceiling, the values an `encoding-type` may carry
+//! that are not the one the model declares, and the SHAPE of the position a continuation
+//! token resumes at.
 //!
 //! Every call goes over the wire through the harnesses the other object suites own, so what
 //! is pinned is the wire document.
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{router, send, Answer};
+use super::bucket_lifecycle::{router, send, send_bytes, Answer};
+use super::list_buckets::list_buckets;
 use super::object_and_tagging_roundtrip::{bucket, text};
-use super::object_storage::{listing_of, store_keys};
+use super::object_annotations::put_annotation;
+use super::object_storage::{list_objects_v2, listing_of, store_keys};
 
 /// The keys every bucket in this suite holds: two under one prefix and one with none, so a
 /// prefix-selected listing reports part of the bucket and a plain one reports all of it.
@@ -145,6 +161,76 @@ async fn list(
 /// carrying the empty value is `Some("")`.
 fn element(answer: &Answer, name: &str) -> Option<String> {
     answer.element(name)
+}
+
+#[tokio::test]
+async fn a_delimiter_stated_with_no_value_is_no_delimiter_in_the_answer() {
+    let router = router();
+    let bucket_name = "listing-empty-delimiter";
+    bucket(&router, bucket_name).await;
+    store_keys(&router, bucket_name, KEYS).await;
+
+    // A narrowing parameter stated with NO value states nothing, so the listing applies no
+    // delimiter and reports none: the element is ABSENT rather than empty, because its own
+    // presence is what tells a client the listing is hierarchical. The rows differ along how
+    // the request writes that empty statement and what else it states beside it; the third
+    // field is the same request written as one that never stated the parameter, which is the
+    // answer an empty value must be served.
+    let rows: &[(&str, &str, &str)] = &[
+        ("the parameter alone", "&delimiter=", ""),
+        (
+            "the parameter before another",
+            "&delimiter=&max-keys=2",
+            "&max-keys=2",
+        ),
+        (
+            "the parameter after another",
+            "&max-keys=2&delimiter=",
+            "&max-keys=2",
+        ),
+    ];
+
+    for surface in SURFACES {
+        for (why, query, without) in rows {
+            let case = format!("{}/{why}", surface.call);
+            let answer = list(&router, bucket_name, surface, query).await;
+            assert_eq!(
+                answer.status,
+                200,
+                "case {case:?}: a listing that states no delimiter is served, got {} with \
+                 body {:?}",
+                answer.status,
+                text(&answer)
+            );
+            assert_eq!(
+                element(&answer, "Delimiter"),
+                None,
+                "case {case:?}: a listing that applied no delimiter reports none, got {:?} in \
+                 {:?}",
+                element(&answer, "Delimiter"),
+                text(&answer)
+            );
+            // And nothing is rolled up: the keys the bucket holds are reported flat, which
+            // is the same answer a request that left the parameter out is served.
+            if surface.call == "ListObjectsV2" || surface.address.is_empty() {
+                let listing = listing_of(&answer);
+                assert!(
+                    listing.common_prefixes.is_empty(),
+                    "case {case:?}: an empty delimiter rolls nothing up, got {:?}",
+                    listing.common_prefixes
+                );
+                let flat = listing_of(&list(&router, bucket_name, surface, without).await);
+                assert_eq!(
+                    listing.keys(),
+                    flat.keys(),
+                    "case {case:?}: the page must report what a request stating no delimiter \
+                     at all reports, got {:?} against {:?}",
+                    listing.keys(),
+                    flat.keys()
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -547,4 +633,520 @@ async fn a_continuation_token_no_listing_issued_is_refused_by_naming_the_paramet
         "the resumed page must report the keys the first page left, got {:?}",
         listing_of(&resumed).keys()
     );
+}
+
+/// Whether `token` is written in the URL-safe base64 alphabet (RFC 4648 §5), which is what
+/// lets a client hand the value it was given back on a query parameter unchanged.
+fn is_url_safe_base64(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+/// Every spelling of `position` a caller could compute for itself, none of which a
+/// continuation token may be: the position, its hex, its base64, and the hex and base64 of a
+/// cursor carrying a marker beside it — the renderings a client would reach for if it tried
+/// to mint a cursor of its own rather than round-trip what it was handed.
+fn computable_spellings(position: &str) -> Vec<(String, String)> {
+    let mut spellings = vec![
+        ("the position itself".to_string(), position.to_string()),
+        ("hex of the position".to_string(), hex::encode(position)),
+        (
+            "base64 of the position".to_string(),
+            aws_smithy_types::base64::encode(position),
+        ),
+    ];
+    // Markers a client could guess a cursor is laid out with, beside the position.
+    for marker in ["s3v1 ", "s3lb1 ", "s3oa1 "] {
+        let cursor = format!("{marker}{position}");
+        spellings.push((format!("hex of a {marker:?} cursor"), hex::encode(&cursor)));
+        spellings.push((
+            format!("base64 of a {marker:?} cursor"),
+            aws_smithy_types::base64::encode(cursor.as_str()),
+        ));
+    }
+    spellings
+}
+
+/// `token` with its last character changed — a value one character away from the token a
+/// listing really issued, which only the authenticator inside it can refuse.
+fn flip_last(token: &str) -> String {
+    let mut characters: Vec<char> = token.chars().collect();
+    if let Some(last) = characters.last_mut() {
+        *last = match *last {
+            'A' => 'B',
+            _ => 'A',
+        };
+    }
+    characters.into_iter().collect()
+}
+
+/// Assert that `token` is an opaque cursor over `position`: base64 text in the URL-safe
+/// alphabet, and no rendering of that position a caller could compute for itself.
+fn assert_opaque(case: &str, token: &str, position: &str) {
+    assert!(
+        is_url_safe_base64(token),
+        "case {case:?}: a continuation token is URL-safe base64 text, got {token:?}"
+    );
+    for (spelling, computed) in computable_spellings(position) {
+        assert_ne!(
+            token, computed,
+            "case {case:?}: the token must not be {spelling}, got {token:?}"
+        );
+    }
+    // And the position's own text is nowhere in it — read only for a position wide enough
+    // that a chance run of token characters could not be one.
+    if position.len() >= 3 {
+        assert!(
+            !token.contains(position) && !token.contains(&hex::encode(position)),
+            "case {case:?}: the token must carry no rendering of {position:?}, got {token:?}"
+        );
+    }
+}
+
+/// Assert that `answer` is the refusal a listing answers a token it did not issue with.
+///
+/// `names_the_parameter` is true for the object listing, whose refusal carries the
+/// `<ArgumentName>` pair this suite pins above; the two listings whose refusal is the plain
+/// error document answer the same code and sentence without it.
+fn assert_token_refused(case: &str, answer: &Answer, names_the_parameter: bool) {
+    assert_eq!(
+        answer.status,
+        400,
+        "case {case:?}: expected HTTP 400, got {} with body {:?}",
+        answer.status,
+        text(answer)
+    );
+    assert_eq!(
+        answer.error_code(),
+        INVALID_ARGUMENT,
+        "case {case:?}: expected the {INVALID_ARGUMENT:?} code, got {:?}",
+        answer.error_code()
+    );
+    assert_eq!(
+        answer.error_message(),
+        INVALID_CONTINUATION_TOKEN_MESSAGE,
+        "case {case:?}: expected the published sentence \
+         {INVALID_CONTINUATION_TOKEN_MESSAGE:?}, got {:?}",
+        answer.error_message()
+    );
+    if names_the_parameter {
+        assert_eq!(
+            element(answer, "ArgumentName").as_deref(),
+            Some("continuation-token"),
+            "case {case:?}: the envelope must name the parameter it rejected, got {:?} in {:?}",
+            element(answer, "ArgumentName"),
+            text(answer)
+        );
+        // The token "is obfuscated and is not a real key", so none of it is echoed back.
+        assert_eq!(
+            element(answer, "ArgumentValue"),
+            None,
+            "case {case:?}: the envelope echoes no token back, got {:?} in {:?}",
+            element(answer, "ArgumentValue"),
+            text(answer)
+        );
+    }
+}
+
+/// The sentence a listing refuses a continuation token it did not issue with.
+const INVALID_CONTINUATION_TOKEN_MESSAGE: &str = "The continuation token provided is incorrect";
+
+/// `GET /<bucket>/<key>?annotation&x-id=ListObjectAnnotations…` — `ListObjectAnnotations`,
+/// with whatever extra query parameters the case carries. The `x-id` literal is what the
+/// model binds to separate this listing from `GetObjectAnnotation`.
+async fn list_annotations(
+    router: &MultiServiceRouter,
+    bucket_name: &str,
+    key: &str,
+    query: &str,
+) -> Answer {
+    let uri = format!("/{bucket_name}/{key}?annotation&x-id=ListObjectAnnotations{query}");
+    send_bytes(router, "GET", &uri, &[], b"").await
+}
+
+/// Every bucket name in the paged-bucket-listing table begins with this, so the walk below
+/// reports the buckets this test made and nothing else the account holds.
+const BUCKET_PREFIX: &str = "echoed-token-buckets-";
+
+#[tokio::test]
+async fn the_object_listing_hands_back_an_opaque_token_whatever_key_it_resumes_at() {
+    // (case, the keys the bucket holds) — the rows differ along the SHAPE of the key the
+    // token resumes at, which is what a key cursor generalises over: a flat name, a name
+    // under a path, punctuation a client might expect an encoding to touch, names ordered
+    // by their digits, and a name far longer than the rest.
+    let rows: &[(&str, &[&str])] = &[
+        ("a flat name", &["alpha.txt", "beta.txt", "gamma.txt"]),
+        (
+            "a nested path",
+            &[
+                "media/2024/april.jpg",
+                "media/2024/may.jpg",
+                "media/2025/june.jpg",
+            ],
+        ),
+        (
+            "punctuation in the name",
+            &["report-2024.01.csv", "report-2024.02.csv"],
+        ),
+        (
+            "digits that order the walk",
+            &["page0001", "page0002", "page0010"],
+        ),
+        (
+            "a name far longer than the rest",
+            &[
+                "a.txt",
+                "deeply/nested/prefix/that/goes/on/for/a/while/and/then/some/more/object.bin",
+            ],
+        ),
+    ];
+
+    for (index, (case, keys)) in rows.iter().enumerate() {
+        let router = router();
+        let bucket_name = format!("echoed-token-objects-{index}");
+        bucket(&router, &bucket_name).await;
+        store_keys(&router, &bucket_name, keys).await;
+
+        // The listing itself is the order of truth: the key the first page reports and the
+        // key the token must resume at come out of the full listing, not out of this table.
+        let whole = list_objects_v2(&router, &bucket_name, "").await;
+        let listed = listing_of(&whole).keys();
+        assert_eq!(
+            listed.len(),
+            keys.len(),
+            "case {case:?}: the bucket must list every stored key, got {listed:?} in {:?}",
+            text(&whole)
+        );
+
+        let first = list_objects_v2(&router, &bucket_name, "&max-keys=1").await;
+        assert_eq!(
+            first.status,
+            200,
+            "case {case:?}: a bounded listing is served, got {} with body {:?}",
+            first.status,
+            text(&first)
+        );
+        assert_eq!(
+            listing_of(&first).keys(),
+            listed[..1].to_vec(),
+            "case {case:?}: the first page reports the first key, got {:?}",
+            listing_of(&first).keys()
+        );
+        let token = element(&first, "NextContinuationToken").unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: a truncated page must hand back a token, got {:?}",
+                text(&first)
+            )
+        });
+        let resumed_at = listed[1].clone();
+        assert_opaque(case, &token, &resumed_at);
+
+        // It resumes exactly where the page stopped.
+        let second = list_objects_v2(
+            &router,
+            &bucket_name,
+            &format!("&max-keys=1&continuation-token={token}"),
+        )
+        .await;
+        assert_eq!(
+            second.status,
+            200,
+            "case {case:?}: the token this listing issued must resume it, got {} with body {:?}",
+            second.status,
+            text(&second)
+        );
+        assert_eq!(
+            listing_of(&second).keys(),
+            vec![resumed_at.clone()],
+            "case {case:?}: expected the listing to resume at {resumed_at:?}, got {:?}",
+            listing_of(&second).keys()
+        );
+        // "If ContinuationToken was sent with the request, it is included in the response":
+        // the value as sent, which is what the caller round-trips.
+        assert_eq!(
+            element(&second, "ContinuationToken").as_deref(),
+            Some(token.as_str()),
+            "case {case:?}: the page echoes the token it was given, got {:?}",
+            element(&second, "ContinuationToken")
+        );
+
+        // Two identical reads of one unchanged bucket hand back the SAME token.
+        let again = list_objects_v2(&router, &bucket_name, "&max-keys=1").await;
+        assert_eq!(
+            element(&again, "NextContinuationToken").as_deref(),
+            Some(token.as_str()),
+            "case {case:?}: an unchanged listing hands back the same token, got {:?}",
+            element(&again, "NextContinuationToken")
+        );
+
+        // Values a caller could assemble rather than round-trip: every spelling of the
+        // position above, a token one character away from the real one, and text that is no
+        // encoding at all.
+        let mut forged = computable_spellings(&resumed_at);
+        forged.push((
+            "a token with its last character changed".to_string(),
+            flip_last(&token),
+        ));
+        forged.push((
+            "not an encoding at all".to_string(),
+            "not.a.token".to_string(),
+        ));
+        for (why, value) in forged {
+            let refused = list_objects_v2(
+                &router,
+                &bucket_name,
+                &format!("&max-keys=1&continuation-token={value}"),
+            )
+            .await;
+            assert_token_refused(&format!("{case}/{why}"), &refused, true);
+        }
+
+        // A token minted over ANOTHER bucket's listing of the same family names no page
+        // here: the cursor is scoped to the resource the listing was taken over.
+        let elsewhere = format!("echoed-token-objects-{index}-elsewhere");
+        bucket(&router, &elsewhere).await;
+        store_keys(&router, &elsewhere, keys).await;
+        let foreign = list_objects_v2(
+            &router,
+            &elsewhere,
+            &format!("&max-keys=1&continuation-token={token}"),
+        )
+        .await;
+        assert_token_refused(
+            &format!("{case}/a token issued over another bucket"),
+            &foreign,
+            true,
+        );
+
+        // And every refusal left the listing exactly as it was.
+        let unchanged = list_objects_v2(&router, &bucket_name, "").await;
+        assert_eq!(
+            listing_of(&unchanged).keys(),
+            listed,
+            "case {case:?}: the listing must be unchanged by every refusal, got {:?}",
+            listing_of(&unchanged).keys()
+        );
+    }
+}
+
+/// Every bucket `<Name>` a `ListBuckets` body reports, in response order.
+fn listed_bucket_names(answer: &Answer) -> Vec<String> {
+    text(answer)
+        .split("<Name>")
+        .skip(1)
+        .filter_map(|chunk| chunk.split("</Name>").next())
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn the_bucket_listing_hands_back_an_opaque_token_that_resumes_the_account() {
+    let router = router();
+    // Bucket names spanning what one can be: a short one, a dotted one, a dashed one and
+    // one far longer than the others — the names this listing's cursor is a position in.
+    let names: Vec<String> = ["a", "b.dotted", "c-dashed", "d-far-longer-than-the-others"]
+        .iter()
+        .map(|suffix| format!("{BUCKET_PREFIX}{suffix}"))
+        .collect();
+    for name in &names {
+        bucket(&router, name).await;
+    }
+
+    let whole = list_buckets(&router, &format!("&prefix={BUCKET_PREFIX}")).await;
+    let listed = listed_bucket_names(&whole);
+    assert_eq!(
+        listed.len(),
+        names.len(),
+        "the account must list every created bucket, got {listed:?}"
+    );
+
+    // One bucket per page: the cursor names the bucket the page REPORTED, and the next page
+    // begins after it.
+    let mut token = String::new();
+    for (page, expected) in listed.iter().enumerate() {
+        let query = match token.is_empty() {
+            true => format!("&max-buckets=1&prefix={BUCKET_PREFIX}"),
+            false => format!(
+                "&max-buckets=1&prefix={BUCKET_PREFIX}&continuation-token={token}"
+            ),
+        };
+        let answer = list_buckets(&router, &query).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case \"page {page}\": expected 200, got {} with body {:?}",
+            answer.status,
+            text(&answer)
+        );
+        assert_eq!(
+            listed_bucket_names(&answer),
+            vec![expected.clone()],
+            "case \"page {page}\": expected the listing to resume at {expected:?}, got {:?}",
+            listed_bucket_names(&answer)
+        );
+        match element(&answer, "ContinuationToken") {
+            Some(next) if !next.is_empty() => {
+                assert_opaque(&format!("page {page}"), &next, expected);
+                token = next;
+            }
+            // Only the last page owes no cursor, which is how the walk ends.
+            _ => {
+                assert_eq!(
+                    page + 1,
+                    listed.len(),
+                    "case \"page {page}\": only the last page owes no continuation token, got \
+                     {:?}",
+                    text(&answer)
+                );
+                token.clear();
+            }
+        }
+    }
+
+    // Values a caller could assemble rather than round-trip, including the token the OBJECT
+    // listing minted: a token is a cursor only into the listing that issued it.
+    let objects = format!("{BUCKET_PREFIX}objects");
+    bucket(&router, &objects).await;
+    store_keys(&router, &objects, &["one.txt", "two.txt"]).await;
+    let object_page = list_objects_v2(&router, &objects, "&max-keys=1").await;
+    let object_token = element(&object_page, "NextContinuationToken")
+        .expect("a truncated object listing hands back a token");
+    let mut forged = computable_spellings(&listed[0]);
+    forged.push((
+        "a token the object listing minted".to_string(),
+        object_token.clone(),
+    ));
+    forged.push((
+        "not an encoding at all".to_string(),
+        "not.a.token".to_string(),
+    ));
+    for (why, value) in forged {
+        let refused = list_buckets(
+            &router,
+            &format!("&max-buckets=1&prefix={BUCKET_PREFIX}&continuation-token={value}"),
+        )
+        .await;
+        assert_token_refused(&format!("ListBuckets/{why}"), &refused, false);
+    }
+
+    // And the bucket listing's own token names no page of the object listing either.
+    let first = list_buckets(&router, &format!("&max-buckets=1&prefix={BUCKET_PREFIX}")).await;
+    let bucket_token = element(&first, "ContinuationToken")
+        .expect("a truncated bucket listing hands back a token");
+    let crossed = list_objects_v2(
+        &router,
+        &objects,
+        &format!("&max-keys=1&continuation-token={bucket_token}"),
+    )
+    .await;
+    assert_token_refused(
+        "ListObjectsV2/a token the bucket listing minted",
+        &crossed,
+        true,
+    );
+}
+
+#[tokio::test]
+async fn the_annotation_listing_token_is_a_cursor_only_into_the_object_it_was_issued_over() {
+    let router = router();
+    let bucket_name = "echoed-token-annotations";
+    bucket(&router, bucket_name).await;
+    // Two objects carrying the same annotation names, so a token issued over one is a value
+    // the other's listing could otherwise have read as a cursor of its own.
+    let keys = &["first.txt", "second.txt"];
+    store_keys(&router, bucket_name, keys).await;
+    // Annotation names spanning what one can be: a plain word, one carrying the punctuation
+    // the naming rules allow, and one far longer than the others.
+    let annotations = &[
+        "alpha",
+        "beta.report-2024",
+        "gamma-far-longer-than-the-others",
+    ];
+    for key in keys {
+        for name in annotations {
+            let written = put_annotation(&router, bucket_name, key, name, b"payload", &[]).await;
+            assert_eq!(
+                written.status,
+                200,
+                "case {key:?}/{name:?}: the annotation must be written, got {} with body {:?}",
+                written.status,
+                text(&written)
+            );
+        }
+    }
+
+    let first = list_annotations(&router, bucket_name, keys[0], "&max-annotation-results=1").await;
+    assert_eq!(
+        first.status,
+        200,
+        "case \"the first page\": expected 200, got {} with body {:?}",
+        first.status,
+        text(&first)
+    );
+    let token = element(&first, "NextContinuationToken").unwrap_or_else(|| {
+        panic!(
+            "case \"the first page\": a truncated listing hands back a token, got {:?}",
+            text(&first)
+        )
+    });
+    // The annotations are reported in ascending name order, so the page resumes at the
+    // second name.
+    let resumed_at = {
+        let mut sorted: Vec<&str> = annotations.to_vec();
+        sorted.sort_unstable();
+        sorted[1].to_string()
+    };
+    assert_opaque("ListObjectAnnotations", &token, &resumed_at);
+
+    let second = list_annotations(
+        &router,
+        bucket_name,
+        keys[0],
+        &format!("&max-annotation-results=1&continuation-token={token}"),
+    )
+    .await;
+    assert_eq!(
+        element(&second, "AnnotationName").as_deref(),
+        Some(resumed_at.as_str()),
+        "case \"the second page\": expected the listing to resume at {resumed_at:?}, got {:?}",
+        text(&second)
+    );
+
+    // The same token over ANOTHER object names no page: the cursor is scoped to the object
+    // version the listing was taken over.
+    let foreign = list_annotations(
+        &router,
+        bucket_name,
+        keys[1],
+        &format!("&max-annotation-results=1&continuation-token={token}"),
+    )
+    .await;
+    assert_token_refused(
+        "ListObjectAnnotations/a token issued over another object",
+        &foreign,
+        false,
+    );
+
+    // And so does every value a caller could assemble for itself.
+    let mut forged = computable_spellings(&resumed_at);
+    forged.push((
+        "a token with its last character changed".to_string(),
+        flip_last(&token),
+    ));
+    forged.push((
+        "not an encoding at all".to_string(),
+        "not.a.token".to_string(),
+    ));
+    for (why, value) in forged {
+        let refused = list_annotations(
+            &router,
+            bucket_name,
+            keys[0],
+            &format!("&max-annotation-results=1&continuation-token={value}"),
+        )
+        .await;
+        assert_token_refused(&format!("ListObjectAnnotations/{why}"), &refused, false);
+    }
 }

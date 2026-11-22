@@ -150,34 +150,18 @@ const _: () = assert!(
     "the default page size is the number of annotations an object may carry"
 );
 
-/// The marker a continuation token this operation issued carries, so a token it did not
-/// issue is refused rather than silently read as a cursor.
-///
-/// Distinct from the markers the object and configuration listings in this crate use: a
-/// token minted for one listing is not a cursor into another.
-const CONTINUATION_TOKEN_MARKER: &str = "s3oa1 ";
-
-/// Encode the resume point of a truncated page as the response's `NextContinuationToken`.
+/// The listing this operation's continuation tokens are minted for, named inside every one
+/// of them ([`crate::state::PagedListing`], the ONE token codec every paged listing of this
+/// service shares), so a token minted for another listing is no cursor into this one.
 ///
 /// "The continuation token to use to retrieve the next page of results"
-/// (`ListObjectAnnotationsOutput$NextContinuationToken`) — hex of a marker plus the first
-/// annotation name NOT returned, so the token a page hands back resumes exactly where it
-/// stopped without storing per-caller cursor state, the way every other paginated listing in
-/// this crate encodes its own. Obfuscated, NOT confidential: hex is trivially reversible, and
-/// the token is only opaque in the sense that a client must not read a name out of it or mint
-/// one of its own.
-fn encode_continuation_token(first_name_not_returned: &str) -> String {
-    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{first_name_not_returned}").as_bytes())
-}
-
-/// The annotation name a `ContinuationToken` resumes at (inclusive), or `None` when the
-/// token is not one this operation issued.
-fn decode_continuation_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    decoded
-        .strip_prefix(CONTINUATION_TOKEN_MARKER)
-        .map(str::to_string)
-}
+/// (`ListObjectAnnotationsOutput$NextContinuationToken`): the token is an opaque value this
+/// service mints over the position the next page resumes at — never a rendering of that
+/// annotation name — and a value this service did not mint names no page at all. The cursor
+/// is scoped to the OBJECT VERSION the listing addresses
+/// ([`crate::state::object_version_scope`]), so a token issued over one object names no page
+/// of another's annotations.
+const LISTING: crate::state::PagedListing = crate::state::PagedListing::ObjectAnnotations;
 
 /// The `ListObjectAnnotations` operation.
 ///
@@ -272,23 +256,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `Token` carries no minimum length, so an EMPTY continuation token is a legal value
-        // that names no cursor — the first page, exactly as if none had been sent (the
-        // reading every other paginated listing in this crate gives it). Anything else must
-        // be a token this operation issued, or it names no resume point at all.
-        let resume_at = match input.continuation_token.as_deref() {
-            Some(token) if !token.is_empty() => {
-                Some(decode_continuation_token(token).ok_or_else(|| {
-                    crate::scaffolded::Scaffolded::unmodeled(
-                        crate::state::INVALID_ARGUMENT_CODE,
-                        crate::state::INVALID_ARGUMENT_STATUS,
-                        "The continuation token provided is incorrect",
-                    )
-                })?)
-            }
-            _ => None,
-        };
-
         // "The maximum number of annotations to return in the response"
         // (`MaxAnnotationResults`), whose `range 1..1000` the boundary already refused
         // anything outside of, so what reaches here is a usable page size; a request naming
@@ -307,6 +274,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let store = state.lock();
+        // The key THIS store mints and reads its continuation tokens under (see
+        // `crate::state::configuration_tokens`), and the object version this listing is
+        // taken over, which its cursor is scoped to. Both are read before the object is
+        // borrowed, and read-only — a listing reports, so nothing about the store moves.
+        let page_tokens = store.page_token_key();
+        let scope = crate::state::object_version_scope(
+            &input.bucket,
+            &input.key,
+            input.version_id.as_deref(),
+        );
+
+        // `Token` carries no minimum length, so an EMPTY continuation token is a legal value
+        // that names no cursor — the first page, exactly as if none had been sent (the
+        // reading every other paginated listing in this crate gives it). Anything else must
+        // be a token this operation issued, or it names no resume point at all.
+        let resume_at = match input.continuation_token.as_deref() {
+            Some(token) if !token.is_empty() => Some(
+                crate::state::decode_continuation_token(&page_tokens, LISTING, &scope, token)
+                    .ok_or_else(|| {
+                        crate::scaffolded::Scaffolded::unmodeled(
+                            crate::state::INVALID_ARGUMENT_CODE,
+                            crate::state::INVALID_ARGUMENT_STATUS,
+                            "The continuation token provided is incorrect",
+                        )
+                    })?,
+            ),
+            _ => None,
+        };
 
         // The ADDRESS first, so a listing naming a bucket, a key or a version this emulator
         // does not hold answers that rather than an empty listing of an object that is not
@@ -348,7 +343,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Out of slots: this annotation starts the NEXT page, and its name is what the
             // token hands back.
             if reported.len() >= page_limit {
-                next_continuation_token = Some(encode_continuation_token(name));
+                next_continuation_token = Some(crate::state::encode_continuation_token(
+                    &page_tokens,
+                    LISTING,
+                    &scope,
+                    name,
+                ));
                 break;
             }
             reported.push(AnnotationEntry {

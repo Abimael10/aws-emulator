@@ -12,10 +12,11 @@
 //! opaque value that Amazon S3 understands"
 //! (`ListBucketMetricsConfigurationsOutput$NextContinuationToken`), "the token is
 //! obfuscated and is not a usable value"
-//! (`ListBucketAnalyticsConfigurationsOutput$NextContinuationToken`) and "ContinuationToken
+//! (`ListBucketAnalyticsConfigurationsOutput$NextContinuationToken`), "ContinuationToken
 //! is obfuscated and is not a real bucket name"
-//! (`ListDirectoryBucketsRequest$ContinuationToken`). Two things follow, and neither is
-//! served by rendering the cursor itself:
+//! (`ListDirectoryBucketsRequest$ContinuationToken`) and "NextContinuationToken is
+//! obfuscated and is not a real key" (`ListObjectsV2Output$NextContinuationToken`). Two
+//! things follow, and neither is served by rendering the cursor itself:
 //!
 //! * a token must not be a plain rendering of the position it resumes at — a value whose
 //!   text IS a stored id invites a caller to compute the next one rather than round-trip
@@ -33,9 +34,9 @@
 //! cursor into another. Opaque, NOT confidential, exactly as that module
 //! puts it: what a caller cannot do is make a token of its own.
 //!
-//! No page is kept on the side: the cursor is the first thing the page did not report — a
-//! configuration id, a bucket name — which is why every one of these listings walks what it
-//! reports in ascending order.
+//! No page is kept on the side: the cursor is the position the next page resumes at — a
+//! configuration id, a bucket name, an object key, an annotation name — which is why every
+//! one of these listings walks what it reports in ascending order.
 
 use ::service_common::jwt::{decode_base64url, encode_base64url};
 
@@ -46,12 +47,15 @@ pub use ::service_common::page_tokens::PageTokenKey;
 /// Named inside the token so a `NextContinuationToken` from one listing names no
 /// page of another's: the four families a bucket holds per-id configurations of, each bound
 /// at its own subresource (`?analytics`, `?metrics`, `?inventory`,
-/// `?intelligent-tiering`), and the account's DIRECTORY buckets, which pages by bucket name
-/// on its own endpoint.
+/// `?intelligent-tiering`), the account's buckets — the general purpose ones `ListBuckets`
+/// reports and the DIRECTORY ones `ListDirectoryBuckets` reports on its own endpoint — the
+/// objects a bucket holds, and the annotations one object version holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PagedListing {
     /// `ListBucketAnalyticsConfigurations`.
     Analytics,
+    /// `ListBuckets`.
+    Buckets,
     /// `ListDirectoryBuckets`.
     DirectoryBuckets,
     /// `ListBucketIntelligentTieringConfigurations`.
@@ -60,28 +64,65 @@ pub enum PagedListing {
     Inventory,
     /// `ListBucketMetricsConfigurations`.
     Metrics,
+    /// `ListObjectAnnotations`.
+    ObjectAnnotations,
+    /// `ListObjectsV2`.
+    Objects,
 }
 
 impl PagedListing {
     /// The name this listing is authenticated under, inside the token. One name per listing
     /// and no part of any response — the subresource a configuration listing is bound at,
-    /// and the resource the bucket listing reports.
+    /// and the resource the listing reports.
     fn label(self) -> &'static str {
         match self {
             Self::Analytics => "analytics",
+            Self::Buckets => "buckets",
             Self::DirectoryBuckets => "directory-buckets",
             Self::IntelligentTiering => "intelligent-tiering",
             Self::Inventory => "inventory",
             Self::Metrics => "metrics",
+            Self::ObjectAnnotations => "object-annotations",
+            Self::Objects => "objects",
         }
     }
 }
 
-/// The separator between the listing a token was issued for, the resource it was issued
-/// AGAINST and the position in it: a unit separator, which no listing's label, no bucket name
-/// and no cursor carries (no configuration id ([`super::CONFIGURATION_ID_PATTERN`]) and no
-/// bucket name admits it), so the three parts of a cursor cannot run together.
+/// The separator between the three parts of a cursor — the listing a token was issued for,
+/// the resource it was issued AGAINST and the position in it: a unit separator.
+///
+/// The first two parts carry none of it: a listing's label is a fixed word and the resource
+/// travels as a fixed-width digest ([`scope_digest`]). So the reading below never has to
+/// guess where a part ends, and the POSITION — which for an object listing is a key, and a
+/// key is arbitrary UTF-8 — is whatever follows the second separator, separator bytes
+/// included.
 const CURSOR_SEPARATOR: char = '\u{1f}';
+
+/// The resource a cursor was issued against, as it travels inside the token: the SHA-256 of
+/// the scope, in lowercase hex.
+///
+/// A fixed-width field of a character class the separator is not in, which is what makes a
+/// cursor's parts unambiguous whatever the scope is written out of — a bucket name, or a
+/// bucket, key and version id, where the key may carry any byte. It is also one less thing
+/// the token carries in readable form: the reading compares the digest of the scope the
+/// REQUEST addresses against it, which is all a cursor is asked about its resource.
+fn scope_digest(scope: &str) -> String {
+    use ::sha2::Digest as _;
+    ::hex::encode(::sha2::Sha256::digest(scope.as_bytes()))
+}
+
+/// The scope a listing of what ONE OBJECT VERSION holds is taken over: the bucket, the key,
+/// and the version the request addressed (empty for a request that addressed the key's
+/// current object), so a token issued over one object names no page of another's listing.
+///
+/// Built here rather than at the call site, so the separator a cursor is laid out with stays
+/// this module's own.
+pub fn object_version_scope(bucket: &str, key: &str, version_id: Option<&str>) -> String {
+    format!(
+        "{bucket}{CURSOR_SEPARATOR}{key}{CURSOR_SEPARATOR}{}",
+        version_id.unwrap_or_default()
+    )
+}
 
 /// The `NextContinuationToken` that resumes a listing at `first_not_returned` (inclusive):
 /// the authenticated bytes of that position, rendered in base64url.
@@ -104,8 +145,9 @@ pub fn encode_continuation_token(
     first_not_returned: &str,
 ) -> String {
     encode_base64url(&key.mint(&format!(
-        "{}{CURSOR_SEPARATOR}{scope}{CURSOR_SEPARATOR}{first_not_returned}",
-        listing.label()
+        "{}{CURSOR_SEPARATOR}{}{CURSOR_SEPARATOR}{first_not_returned}",
+        listing.label(),
+        scope_digest(scope)
     )))
 }
 
@@ -186,13 +228,13 @@ pub fn read_continuation_token(
     let Some((label, rest)) = cursor.split_once(CURSOR_SEPARATOR) else {
         return ContinuationTokenReading::Unknown;
     };
-    let Some((issued_for, resume_at)) = rest.split_once(CURSOR_SEPARATOR) else {
+    let Some((issued_against, resume_at)) = rest.split_once(CURSOR_SEPARATOR) else {
         return ContinuationTokenReading::Unknown;
     };
     if label != listing.label() {
         return ContinuationTokenReading::Unknown;
     }
-    match issued_for == scope {
+    match issued_against == scope_digest(scope) {
         true => ContinuationTokenReading::Position(resume_at.to_string()),
         false => ContinuationTokenReading::OtherScope,
     }
@@ -212,70 +254,91 @@ mod tests {
         let other_store = PageTokenKey::new();
         let listings = [
             PagedListing::Analytics,
+            PagedListing::Buckets,
             PagedListing::DirectoryBuckets,
             PagedListing::IntelligentTiering,
             PagedListing::Inventory,
             PagedListing::Metrics,
+            PagedListing::ObjectAnnotations,
+            PagedListing::Objects,
         ];
-        let scope = "a-bucket";
+        // Scopes spanning what a listing is taken over: one bucket, the account itself, one
+        // object version, and one whose key carries the separator a cursor is laid out with.
+        let object = object_version_scope("a-bucket", "media/a.jpg", None);
+        let separated = object_version_scope(
+            "a-bucket",
+            &format!("media{CURSOR_SEPARATOR}a.jpg"),
+            Some("0123456789abcdef0123456789abcdef"),
+        );
+        let scopes = ["a-bucket", "", object.as_str(), separated.as_str()];
+        // Cursors spanning what one can be: one character, every character class a
+        // configuration id allows, one at the published ceiling, a directory bucket's name,
+        // an object key with a path in it, and one carrying the separator a cursor is laid
+        // out with — which an object key may.
+        let positions = [
+            "a".to_string(),
+            "Report.one-2_3".to_string(),
+            "z".repeat(MAX_CONFIGURATION_ID_CHARS),
+            "base--usw2-az1--x-s3".to_string(),
+            "media/april report.jpg".to_string(),
+            format!("media{CURSOR_SEPARATOR}a.jpg"),
+        ];
+        let mut cases: Vec<(PagedListing, &str, &str)> = Vec::new();
         for listing in listings {
-            // Cursors spanning what one can be: one character, every character class a
-            // configuration id allows, one at the published ceiling, and a directory
-            // bucket's name.
-            for id in [
-                "a".to_string(),
-                "Report.one-2_3".to_string(),
-                "z".repeat(MAX_CONFIGURATION_ID_CHARS),
-                "base--usw2-az1--x-s3".to_string(),
-            ] {
-                let token = encode_continuation_token(&key, listing, scope, &id);
-                assert_eq!(
-                    decode_continuation_token(&key, listing, scope, &token).as_deref(),
-                    Some(id.as_str()),
-                    "case {listing:?}/{id:?}: a minted token must name its position, got \
-                     {token:?}"
-                );
-                assert_eq!(
-                    decode_continuation_token(&other_store, listing, scope, &token),
-                    None,
-                    "case {listing:?}/{id:?}: another store's key must name no position"
-                );
-                assert_eq!(
-                    decode_continuation_token(&key, listing, "another-bucket", &token),
-                    None,
-                    "case {listing:?}/{id:?}: another scope must name no position"
-                );
-                for elsewhere in listings.iter().filter(|other| **other != listing) {
-                    assert_eq!(
-                        decode_continuation_token(&key, *elsewhere, scope, &token),
-                        None,
-                        "case {listing:?}/{id:?}: must name no position in {elsewhere:?}"
-                    );
+            for scope in scopes {
+                for position in &positions {
+                    cases.push((listing, scope, position.as_str()));
                 }
-                // The token is not a RENDERING of the position it resumes at: neither the
-                // id itself nor any value a caller could compute from it without the key.
-                for (spelling, computed) in [
-                    ("the id itself", id.clone()),
-                    ("hex of the id", ::hex::encode(&id)),
-                    (
-                        "base64 of the id",
-                        ::aws_smithy_types::base64::encode(id.as_str()),
-                    ),
-                ] {
-                    assert_ne!(
-                        token, computed,
-                        "case {listing:?}/{id:?}: the token must not be {spelling}, got \
-                         {token:?}"
-                    );
-                }
-                assert!(
-                    token
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric()
-                            || matches!(character, '-' | '_')),
-                    "case {listing:?}/{id:?}: a token is URL-safe base64, got {token:?}"
+            }
+        }
+        for (listing, scope, id) in cases {
+            let token = encode_continuation_token(&key, listing, scope, id);
+            assert_eq!(
+                decode_continuation_token(&key, listing, scope, &token).as_deref(),
+                Some(id),
+                "case {listing:?}/{id:?}: a minted token must name its position, got {token:?}"
+            );
+            assert_eq!(
+                decode_continuation_token(&other_store, listing, scope, &token),
+                None,
+                "case {listing:?}/{id:?}: another store's key must name no position"
+            );
+            for elsewhere in scopes.iter().filter(|other| **other != scope) {
+                assert_eq!(
+                    decode_continuation_token(&key, listing, elsewhere, &token),
+                    None,
+                    "case {listing:?}/{id:?}: scope {elsewhere:?} must name no position"
                 );
             }
+            for elsewhere in listings.iter().filter(|other| **other != listing) {
+                assert_eq!(
+                    decode_continuation_token(&key, *elsewhere, scope, &token),
+                    None,
+                    "case {listing:?}/{id:?}: must name no position in {elsewhere:?}"
+                );
+            }
+            // The token is not a RENDERING of the position it resumes at: neither the id
+            // itself nor any value a caller could compute from it without the key.
+            for (spelling, computed) in [
+                ("the id itself", id.to_string()),
+                ("hex of the id", ::hex::encode(id)),
+                (
+                    "base64 of the id",
+                    ::aws_smithy_types::base64::encode(id),
+                ),
+            ] {
+                assert_ne!(
+                    token, computed,
+                    "case {listing:?}/{id:?}: the token must not be {spelling}, got {token:?}"
+                );
+            }
+            assert!(
+                token
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_')),
+                "case {listing:?}/{id:?}: a token is URL-safe base64, got {token:?}"
+            );
         }
 
         // Values a caller could write rather than round-trip, including one with the SHAPE
@@ -290,7 +353,7 @@ mod tests {
             ("a minted token's shape", shaped),
         ] {
             assert_eq!(
-                decode_continuation_token(&key, PagedListing::Metrics, scope, &token),
+                decode_continuation_token(&key, PagedListing::Metrics, scopes[0], &token),
                 None,
                 "case {case}: expected no position for {token:?}"
             );

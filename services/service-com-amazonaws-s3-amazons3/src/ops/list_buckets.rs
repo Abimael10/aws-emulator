@@ -148,41 +148,28 @@ const DEFAULT_PAGE_SIZE: usize = crate::state::MAX_BUCKETS_PER_ACCOUNT;
 /// `smithy_query(query="operation",operation="ListBuckets")`).
 const MAX_BUCKETS_PER_PAGE: i32 = 10_000;
 
-/// The marker a continuation token this operation issued carries, so a token it did not
-/// issue is refused rather than silently read as a cursor.
-///
-/// Distinct from the object-listing marker in [`super::list_objects_v2`]: a token minted
-/// for one listing is not a cursor into the other.
-const CONTINUATION_TOKEN_MARKER: &str = "s3lb1 ";
-
-/// Encode the resume point of a truncated page as the response's `ContinuationToken`.
+/// The listing this operation's continuation tokens are minted for, named inside every one
+/// of them ([`crate::state::PagedListing`], the ONE token codec every paged listing of this
+/// service shares), so a token minted for the object listing is no cursor into this one.
 ///
 /// "ContinuationToken is obfuscated and is not a real bucket"
-/// (`ListBucketsOutput$ContinuationToken`) — hex of a marker plus the LAST bucket name the
-/// page DID return, so the token a page hands back is a cursor in the listing's own order
-/// rather than a position in one walk, and no per-caller cursor state is stored.
-/// Obfuscated, NOT confidential: hex is trivially reversible, and the token is only opaque
-/// in the sense that a client must not read a bucket name out of it or mint one of its own.
+/// (`ListBucketsOutput$ContinuationToken`): the token is an opaque value this service mints
+/// over the position the next page resumes at — never a rendering of that bucket name — and
+/// a value this service did not mint names no page at all.
 ///
-/// The name the token carries is the last one REPORTED and the next page begins after it,
+/// The name the cursor carries is the last one REPORTED and the next page begins after it,
 /// rather than the first name NOT reported: the listing is in bucket-name order, so "after
 /// the last name reported" is a point in that order and names the next bucket in it
 /// WHATEVER the account holds when the next page is asked for. A bucket created (or
 /// deleted) between two pages therefore lands in the page its name belongs to — a token
 /// naming the first bucket a page did not report would skip a bucket whose name sorts
 /// before it and was created after that page was served.
-fn encode_continuation_token(last_bucket_returned: &str) -> String {
-    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{last_bucket_returned}").as_bytes())
-}
+const LISTING: crate::state::PagedListing = crate::state::PagedListing::Buckets;
 
-/// The bucket name a `ContinuationToken` resumes AFTER (exclusive), or `None` when the
-/// token is not one this operation issued.
-fn decode_continuation_token(token: &str) -> Option<String> {
-    let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
-    decoded
-        .strip_prefix(CONTINUATION_TOKEN_MARKER)
-        .map(str::to_string)
-}
+/// The resource this listing is taken over: the ACCOUNT itself rather than one bucket, so
+/// the cursor carries no scope of its own — the reading `ListDirectoryBuckets` gives its own
+/// account-wide listing.
+const ACCOUNT_SCOPE: &str = "";
 
 /// The `ListBuckets` operation.
 ///
@@ -293,21 +280,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => DEFAULT_PAGE_SIZE,
         };
 
-        // `Token` is `length {min 0}`, so an EMPTY continuation token is a legal value
-        // that names no cursor — the first page, exactly as if none had been sent.
-        let resume_at = match input.continuation_token.as_deref() {
-            Some(token) if !token.is_empty() => {
-                Some(decode_continuation_token(token).ok_or_else(|| {
-                    crate::scaffolded::Scaffolded::unmodeled(
-                        "InvalidArgument",
-                        400,
-                        "The continuation token provided is incorrect",
-                    )
-                })?)
-            }
-            _ => None,
-        };
-
         // "BucketRegion indicates the Amazon Web Services region where the bucket is
         // located. If the request contains at least one valid parameter, it is included
         // in the response" (`Bucket$BucketRegion`): a bare `ListBuckets` reports each
@@ -325,6 +297,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let store = state.lock();
+        // The key THIS store mints and reads its continuation tokens under (see
+        // `crate::state::configuration_tokens`): taken before the buckets are walked, and
+        // read-only — a listing reports, so nothing about the store moves.
+        let page_tokens = store.page_token_key();
+
+        // `Token` is `length {min 0}`, so an EMPTY continuation token is a legal value
+        // that names no cursor — the first page, exactly as if none had been sent.
+        let resume_at = match input.continuation_token.as_deref() {
+            Some(token) if !token.is_empty() => Some(
+                crate::state::decode_continuation_token(
+                    &page_tokens,
+                    LISTING,
+                    ACCOUNT_SCOPE,
+                    token,
+                )
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::unmodeled(
+                        "InvalidArgument",
+                        400,
+                        "The continuation token provided is incorrect",
+                    )
+                })?,
+            ),
+            _ => None,
+        };
 
         let prefix = input.prefix.clone().unwrap_or_default();
 
@@ -368,7 +365,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_continuation_token = buckets
                     .last()
                     .and_then(|last| last.name.as_deref())
-                    .map(encode_continuation_token);
+                    .map(|last| {
+                        crate::state::encode_continuation_token(
+                            &page_tokens,
+                            LISTING,
+                            ACCOUNT_SCOPE,
+                            last,
+                        )
+                    });
                 break;
             }
 
