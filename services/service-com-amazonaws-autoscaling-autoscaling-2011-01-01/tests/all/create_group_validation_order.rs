@@ -235,8 +235,8 @@ fn expected_refusal(source: Source, held: &HeldTemplate) -> (&'static str, Strin
         Source::AbsentLaunchConfiguration => (
             VALIDATION_ERROR,
             format!(
-                "Launch configuration name not found - Launch configuration \
-                 {ABSENT_LAUNCH_CONFIGURATION} not found"
+                "Launch configuration name not found - A launch configuration with the name: \
+                 {ABSENT_LAUNCH_CONFIGURATION} does not exist"
             ),
         ),
         Source::HeldTemplate => (

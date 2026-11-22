@@ -3987,6 +3987,23 @@ pub fn absent_group_message(name: &str) -> String {
     format!("{ABSENT_GROUP_PREFIX}AutoScalingGroup {name} not found")
 }
 
+/// The refusal every request naming a launch configuration the account holds none under is
+/// answered with, whichever operation resolved the name: the fixed
+/// `Launch configuration name not found - ` text, then the detail stating that no
+/// configuration of that name exists.
+///
+/// The name is the only part taken from the request; the rest of the sentence, the colon
+/// after `name` included, is fixed text. One function because the sentence belongs to the
+/// LOOKUP rather than to the operation that performs it — the delete of a configuration
+/// and the group operations that launch from one all resolve the same name against the
+/// same store.
+pub fn absent_launch_configuration_message(name: &str) -> String {
+    format!(
+        "Launch configuration name not found - A launch configuration with the name: {name} \
+         does not exist"
+    )
+}
+
 /// The message Amazon EC2 Auto Scaling refuses a legacy target-group detach that
 /// names a target group the group does not hold with, which names those target
 /// groups.
@@ -4494,6 +4511,18 @@ pub fn invalid_next_token_message(token: &str) -> String {
 /// so one read's wording is not the others' to change.
 pub fn invalid_next_token_message_in_present_tense(token: &str) -> String {
     format!("The token '{token}' is invalid")
+}
+
+/// The message `DescribeInstanceRefreshes` refuses an unusable `NextToken` with: the
+/// present-tense sentence about the token the caller is holding, TERMINATED by a period,
+/// as that read's own recorded refusal states it.
+///
+/// Separate from the two above because how the sentence ends is each read's own: this one
+/// closes it, the reads above leave it open, and `DescribePolicies` names the member by its
+/// role instead ([`invalid_pagination_token_message`]). The token the request sent, quoted,
+/// is the only variable part.
+pub fn invalid_next_token_message_terminated(token: &str) -> String {
+    format!("{}.", invalid_next_token_message_in_present_tense(token))
 }
 
 /// The refusal the reads that treat an unusable `NextToken` as a bad member VALUE answer:

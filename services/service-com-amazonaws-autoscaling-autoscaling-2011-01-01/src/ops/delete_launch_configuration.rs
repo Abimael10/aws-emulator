@@ -170,9 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
 
         if !state.launch_configurations.contains_key(&name) {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Launch configuration name not found - Launch configuration {name} not found"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_launch_configuration_message(&name),
+            ));
         }
 
         // A launch configuration an Auto Scaling group launches from cannot be

@@ -257,19 +257,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // Whether the refresh skips the instances already running the configuration it
+        // would give them.
+        let skip_matching = input
+            .preferences
+            .as_ref()
+            .and_then(|preferences| preferences.skip_matching)
+            .unwrap_or(false);
+        // What the refresh needs from the GROUP to resolve its launch source, read under
+        // this service's own lock and nothing else's: the instances it would replace, and the
+        // configuration it would move them onto. The guard is released at the end of this
+        // block, BEFORE Amazon EC2's store is reached below, so this handler holds one store
+        // at a time exactly as the alarm and launch-template reads above do.
+        let (candidates, target_template, target_instance_types) = {
+            let mut state = state.lock();
+            state.materialize_due(&*self.engine, now);
+
+            // A name no group answers to is refused with the wording THIS operation
+            // answers with: the detail field after the dash is left unfilled, so the
+            // message carries no part of the request and is the same for every name.
+            let Some(group) = state.groups.get(&name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                ));
+            };
+            // One refresh per group: a second one cannot be started while the first is
+            // still replacing instances.
+            if state.active_instance_refresh(&name).is_some() {
+                return Err(
+                    StartInstanceRefreshErrorModeled::InstanceRefreshInProgressFault(
+                        InstanceRefreshInProgressFault {
+                            message: Some(
+                                crate::state::INSTANCE_REFRESH_IN_PROGRESS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // The launch source the refresh moves the group's instances ONTO: the desired
+            // configuration's where the request states one, else the group's own.
+            let (target_template, target_policy) = match input.desired_configuration.as_ref() {
+                Some(desired) => (
+                    crate::state::launch_template_of(
+                        desired.launch_template.as_ref(),
+                        desired.mixed_instances_policy.as_ref(),
+                    ),
+                    desired.mixed_instances_policy.as_ref(),
+                ),
+                None => (
+                    crate::state::launch_template_of(
+                        group.launch_template.as_ref(),
+                        group.mixed_instances_policy.as_ref(),
+                    ),
+                    group.mixed_instances_policy.as_ref(),
+                ),
+            };
+            (
+                group.active_instances().cloned().collect::<Vec<_>>(),
+                target_template.cloned(),
+                crate::state::declared_instance_types(target_policy),
+            )
+        };
+
+        // Which of the group's instances the refresh has to replace, with `SkipMatching`
+        // asked for: the ones NOT already launched from the configuration the refresh would
+        // give them, which is the one question Amazon EC2's store answers here.
+        //
+        // "If enabled (true), then Amazon EC2 Auto Scaling skips replacing instances
+        // that match the desired configuration. If no desired configuration is
+        // specified, then it skips replacing instances that have the same launch
+        // template and instance types that the Auto Scaling group was using before the
+        // start of the instance refresh"
+        // (`smithy_query(query="doc",shape="RefreshPreferences",member="SkipMatching")`).
+        // The matching is asked of the group's instances TOGETHER, so the target is
+        // resolved once and Amazon EC2's store is reached once however many instances the
+        // group holds; a refresh that asked for no skipping reaches it not at all, which is
+        // what `None` here says. `matched` is the complement — the instances it found no
+        // reason to replace — so an instance the pass never examined is not skipped by it.
+        let matched: Option<::std::collections::BTreeSet<String>> = skip_matching.then(|| {
+            let left_to_replace: ::std::collections::BTreeSet<String> =
+                crate::state::ec2_instances::instances_not_running(
+                    &*self.engine,
+                    candidates.iter(),
+                    target_template.as_ref(),
+                    &target_instance_types,
+                )
+                .into_iter()
+                .collect();
+            candidates
+                .iter()
+                .map(|instance| instance.instance_id.clone())
+                .filter(|instance_id| !left_to_replace.contains(instance_id))
+                .collect()
+        });
+
+        // This service's store, taken again now that Amazon EC2's has been released. The
+        // two preconditions are weighed again on the state as it stands NOW: another
+        // request may have deleted the group or started a refresh of its own while this
+        // one was resolving the launch source.
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
-
-        // A name no group answers to is refused with the wording THIS operation
-        // answers with: the detail field after the dash is left unfilled, so the
-        // message carries no part of the request and is the same for every name.
         let Some(group) = state.groups.get(&name) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
             ));
         };
-        // One refresh per group: a second one cannot be started while the first is
-        // still replacing instances.
         if state.active_instance_refresh(&name).is_some() {
             return Err(
                 StartInstanceRefreshErrorModeled::InstanceRefreshInProgressFault(
@@ -283,58 +377,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // The instances the refresh sets out to replace: the ones the group holds,
-        // except — with `SkipMatching` asked for — those already launched from the
-        // configuration the refresh would give them, which need no replacing.
-        let skip_matching = input
-            .preferences
-            .as_ref()
-            .and_then(|preferences| preferences.skip_matching)
-            .unwrap_or(false);
-        let (target_template, target_policy) = match input.desired_configuration.as_ref() {
-            Some(desired) => (
-                crate::state::launch_template_of(
-                    desired.launch_template.as_ref(),
-                    desired.mixed_instances_policy.as_ref(),
-                ),
-                desired.mixed_instances_policy.as_ref(),
-            ),
-            None => (
-                crate::state::launch_template_of(
-                    group.launch_template.as_ref(),
-                    group.mixed_instances_policy.as_ref(),
-                ),
-                group.mixed_instances_policy.as_ref(),
-            ),
-        };
-        // "If enabled (true), then Amazon EC2 Auto Scaling skips replacing instances
-        // that match the desired configuration. If no desired configuration is
-        // specified, then it skips replacing instances that have the same launch
-        // template and instance types that the Auto Scaling group was using before the
-        // start of the instance refresh"
-        // (`smithy_query(query="doc",shape="RefreshPreferences",member="SkipMatching")`).
-        // The matching is asked of the group's instances TOGETHER, so the target is
-        // resolved once and Amazon EC2's store is reached once however many instances the
-        // group holds; a refresh that asked for no skipping reaches it not at all.
-        let pending_instance_ids: Vec<String> = if skip_matching {
-            let target_instance_types = crate::state::declared_instance_types(target_policy);
-            crate::state::ec2_instances::instances_not_running(
-                &*self.engine,
-                group.active_instances(),
-                target_template,
-                &target_instance_types,
-            )
-        } else {
-            group
-                .active_instances()
-                .map(|instance| instance.instance_id.clone())
-                .collect()
-        };
+        // What the refresh RECORDS is the group as it stands now, against the store the
+        // record is kept in: the instances it holds at this instant, minus the ones the
+        // matching pass above found already running the configuration the refresh would
+        // give them — an instance that joined the group since that pass was never matched,
+        // so it is one the refresh replaces — and the preferences resolved against the
+        // configuration the group now carries
+        // ([`crate::state::refresh_preferences`] for each member the request left out).
+        let pending_instance_ids: Vec<String> = group
+            .active_instances()
+            .map(|instance| instance.instance_id.clone())
+            .filter(|instance_id| {
+                matched
+                    .as_ref()
+                    .is_none_or(|skipped| !skipped.contains(instance_id))
+            })
+            .collect();
         let instances_at_start = i32::try_from(pending_instance_ids.len()).unwrap_or(i32::MAX);
-        // The preferences this refresh RUNS UNDER: the ones the request stated, with each
-        // member it left out at the default the model documents for it, resolved once
-        // against the group's configuration as it now stands
-        // ([`crate::state::refresh_preferences`]).
         let preferences =
             crate::state::refresh_preferences::effective(input.preferences.as_ref(), group);
 
@@ -425,12 +484,16 @@ fn check_preferences(preferences: &RefreshPreferences) -> Result<(), StartInstan
     }
     if let Some(checkpoints) = preferences.checkpoint_percentages.as_ref() {
         if checkpoints.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The CheckpointPercentages values {} are not valid: they must be unique and in \
-                 ascending order",
-                crate::state::joined_values(checkpoints.iter().map(i32::to_string))
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                UNSORTED_CHECKPOINT_PERCENTAGES.to_string(),
+            ));
         }
     }
     Ok(())
 }
+
+/// The sentence a set of checkpoint thresholds that is not strictly ascending is refused
+/// with: it states the RULE the thresholds broke rather than echoing the list the request
+/// submitted, so it is fixed text with no variable part at all.
+const UNSORTED_CHECKPOINT_PERCENTAGES: &str =
+    "Checkpoint percentages must be sorted in ascending order with no duplicates.";

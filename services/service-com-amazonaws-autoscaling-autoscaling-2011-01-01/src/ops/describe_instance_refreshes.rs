@@ -199,7 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {
                     return Err(DescribeInstanceRefreshesErrorModeled::InvalidNextToken(
                         InvalidNextToken {
-                            message: Some(crate::state::invalid_next_token_message(&token)),
+                            message: Some(
+                                crate::state::invalid_next_token_message_terminated(
+                                    &token,
+                                ),
+                            ),
                         },
                     )
                     .into())
@@ -232,7 +236,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if offset > 0 && offset >= matching.len() {
             return Err(DescribeInstanceRefreshesErrorModeled::InvalidNextToken(
                 InvalidNextToken {
-                    message: Some(crate::state::invalid_next_token_message(&token)),
+                    message: Some(crate::state::invalid_next_token_message_terminated(
+                        &token,
+                    )),
                 },
             )
             .into());

@@ -75,14 +75,16 @@ fn absent_group_named(name: &str) -> String {
 /// What a paginated read answers a token it did not issue with: the wire error code and
 /// the whole message, in the refusal each read serves.
 ///
-/// Three forms, one per group of reads: the modelled `InvalidNextToken` stating the token
+/// Four forms, one per group of reads: the modelled `InvalidNextToken` stating the token
 /// in the past tense, the same error stating it in the present tense
-/// (`DescribeNotificationConfigurations`, `DescribeScheduledActions`), and the
-/// service-common `ValidationError` naming the member and the value submitted for it.
+/// (`DescribeNotificationConfigurations`, `DescribeScheduledActions`), that present-tense
+/// sentence terminated by a period (`DescribeInstanceRefreshes`), and the service-common
+/// `ValidationError` naming the member and the value submitted for it.
 #[derive(Debug, Clone, Copy)]
 enum TokenRefusal {
     PastTense,
     PresentTense,
+    TerminatedSentence,
     ValueViolation,
 }
 
@@ -90,7 +92,7 @@ impl TokenRefusal {
     /// The wire error code this refusal travels with.
     fn code(self) -> &'static str {
         match self {
-            Self::PastTense | Self::PresentTense => "InvalidNextToken",
+            Self::PastTense | Self::PresentTense | Self::TerminatedSentence => "InvalidNextToken",
             Self::ValueViolation => "ValidationError",
         }
     }
@@ -100,6 +102,7 @@ impl TokenRefusal {
         match self {
             Self::PastTense => format!("The token '{token}' was invalid"),
             Self::PresentTense => format!("The token '{token}' is invalid"),
+            Self::TerminatedSentence => format!("The token '{token}' is invalid."),
             Self::ValueViolation => format!("NextToken: {token}"),
         }
     }
@@ -744,6 +747,11 @@ async fn an_unusable_next_token_is_refused_in_the_refusal_the_read_serves() {
             TokenRefusal::PresentTense,
         ),
         (
+            "DescribeAutoScalingGroups",
+            vec![],
+            TokenRefusal::PastTense,
+        ),
+        (
             "DescribeScheduledActions",
             vec![],
             TokenRefusal::PresentTense,
@@ -752,11 +760,6 @@ async fn an_unusable_next_token_is_refused_in_the_refusal_the_read_serves() {
             "DescribeAutoScalingInstances",
             vec![],
             TokenRefusal::PresentTense,
-        ),
-        (
-            "DescribeAutoScalingGroups",
-            vec![],
-            TokenRefusal::PastTense,
         ),
         (
             "DescribeScalingActivities",
@@ -771,7 +774,7 @@ async fn an_unusable_next_token_is_refused_in_the_refusal_the_read_serves() {
         (
             "DescribeInstanceRefreshes",
             vec![("AutoScalingGroupName", group)],
-            TokenRefusal::PastTense,
+            TokenRefusal::TerminatedSentence,
         ),
         (
             "DescribeLoadBalancerTargetGroups",
