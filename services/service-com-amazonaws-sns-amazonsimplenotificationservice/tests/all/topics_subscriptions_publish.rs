@@ -5,9 +5,12 @@
 //! emulator serves in production, so the handlers are exercised exactly as an AWS SDK
 //! exercises them, and nothing but persisted state carries information between calls.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use service_com_amazonaws_sns_amazonsimplenotificationservice::state::fifo_sequence::{
+    MAX_SEQUENCE_NUMBER_STEP, MIN_SEQUENCE_NUMBER_STEP, SEQUENCE_NUMBER_FLOOR,
+};
 use service_com_amazonaws_sns_amazonsimplenotificationservice::state::{
     INVALID_NEXT_TOKEN_REFUSAL, MAX_ATTRIBUTE_BYTES_PER_RECORD, MAX_DATA_PROTECTION_POLICY_LEN,
     MAX_RECORDS_PER_STORE, MAX_RETAINED_DELIVERY_BYTES, MAX_RETAINED_MESSAGES_PER_SUBSCRIPTION,
@@ -2236,4 +2239,288 @@ async fn the_maximum_message_size_attribute_can_only_lower_the_ceiling() {
             );
         }
     }
+}
+
+/// Judge one answered `SequenceNumber` against the form the member is documented to
+/// carry: a plain decimal — no padding and no leading zero — at the scale a 128-bit
+/// number is written at, so it is nowhere near the first value a counter hands out.
+///
+/// Answers the value it read, for the per-group assertions the callers make.
+fn sequence_number_value(case: &str, text: &str) -> u128 {
+    let value: u128 = text.parse().unwrap_or_else(|_| {
+        panic!("case {case:?}: expected a decimal SequenceNumber, got {text:?}")
+    });
+    assert_eq!(
+        text,
+        value.to_string(),
+        "case {case:?}: expected a SequenceNumber written as a plain decimal, got {text:?}"
+    );
+    assert!(
+        value >= SEQUENCE_NUMBER_FLOOR,
+        "case {case:?}: expected a SequenceNumber of at least {SEQUENCE_NUMBER_FLOOR}, \
+         got {value}"
+    );
+    value
+}
+
+/// Judge one advance of ONE message group: the next number of a group is greater than
+/// its last by a single unpredictable step, however many publishes other groups took in
+/// between.
+fn assert_one_step(case: &str, group: &str, previous: u128, value: u128) {
+    let advance = value.checked_sub(previous).unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: group {group:?} must advance, got {value} after {previous}"
+        )
+    });
+    assert!(
+        (MIN_SEQUENCE_NUMBER_STEP..=MAX_SEQUENCE_NUMBER_STEP).contains(&advance),
+        "case {case:?}: group {group:?} must advance by one step inside \
+         {MIN_SEQUENCE_NUMBER_STEP}..={MAX_SEQUENCE_NUMBER_STEP}, got {advance} \
+         ({value} after {previous})"
+    );
+}
+
+/// RULE: a FIFO topic's publish is answered a `SequenceNumber` that is "a large,
+/// non-consecutive number", 128 bits long, which "continues to increase for each
+/// MessageGroupId" (`PublishResponse$SequenceNumber` doc) — so the value is a plain
+/// decimal at that scale, it is not the number a caller could work out from the previous
+/// one, and each message group of the topic advances on its own run of numbers rather
+/// than on one the whole topic shares.
+///
+/// The rows differ along what the rule generalises over: how many message groups the
+/// publishes name, how the groups interleave, how many publishes each takes, and the
+/// form of the group id (a word, punctuation and digits, the documented 128-character
+/// bound — `PublishInput$MessageGroupId`).
+#[tokio::test]
+async fn a_fifo_publish_is_sequenced_per_message_group_by_a_large_non_consecutive_number() {
+    let sns = Sns::new();
+    let longest_group = "g".repeat(128);
+    // (case, the message groups the publishes name, in order)
+    let cases: &[(&str, &[&str])] = &[
+        ("one group once", &["g1"]),
+        ("one group three times", &["g1", "g1", "g1"]),
+        ("two groups interleaved", &["g1", "g2", "g1", "g2", "g1"]),
+        ("a group that only starts later", &["g1", "g1", "g2", "g2"]),
+        (
+            "four groups round robin",
+            &["a", "b", "c", "d", "a", "b", "c", "d"],
+        ),
+        (
+            "a group id of letters digits and punctuation",
+            &["orders-2024.v2", "orders-2024.v2"],
+        ),
+        (
+            "a group id at the documented 128 character bound",
+            &[longest_group.as_str(), longest_group.as_str()],
+        ),
+    ];
+
+    for (index, (case, groups)) in cases.iter().enumerate() {
+        let topic = sns.topic(&format!("sequenced-{index:02}.fifo")).await;
+        let mut last: HashMap<&str, u128> = HashMap::new();
+        for (publish, group) in groups.iter().enumerate() {
+            // Each publish carries its own deduplication token, so none of them is a
+            // duplicate of an earlier one and every one is sequenced.
+            let token = format!("token-{publish}");
+            let answer = sns
+                .call(
+                    "Publish",
+                    &[
+                        ("TopicArn", &topic),
+                        ("Message", "ordered"),
+                        ("MessageGroupId", group),
+                        ("MessageDeduplicationId", &token),
+                    ],
+                )
+                .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: Publish expected 200, got {} / {}",
+                answer.status, answer.body
+            );
+            let text = answer.element("SequenceNumber").unwrap_or_else(|| {
+                panic!("case {case:?}: no SequenceNumber in {}", answer.body)
+            });
+            let value = sequence_number_value(case, &text);
+            if let Some(previous) = last.insert(group, value) {
+                assert_one_step(case, group, previous, value);
+            }
+        }
+    }
+}
+
+/// RULE, the other side of it: "this response element applies only to FIFO
+/// (first-in-first-out) topics", so a standard topic's publish carries no
+/// `SequenceNumber` at all — and the number a FIFO publish IS answered travels with the
+/// message, so a subscriber reads the same value the publisher was told.
+#[tokio::test]
+async fn only_a_fifo_publish_is_sequenced_and_the_message_carries_the_number_answered() {
+    let sns = Sns::new();
+    let standard = sns.topic("unsequenced-topic").await;
+    // A standard topic takes a MessageGroupId ("forwarded only to Amazon SQS standard
+    // subscriptions to activate fair queues", `PublishInput$MessageGroupId` doc) and is
+    // still not sequenced by it.
+    for (case, group) in [("no message group", None), ("a message group", Some("g1"))] {
+        let mut params: Vec<(&str, &str)> =
+            vec![("TopicArn", standard.as_str()), ("Message", "plain")];
+        if let Some(group) = group {
+            params.push(("MessageGroupId", group));
+        }
+        let answer = sns.call("Publish", &params).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: Publish expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.element("SequenceNumber"),
+            None,
+            "case {case:?}: a standard topic's publish carries no SequenceNumber, got {}",
+            answer.body
+        );
+    }
+
+    let topic = sns.topic("sequenced-envelope.fifo").await;
+    let subscribed = sns
+        .call(
+            "Subscribe",
+            &[
+                ("TopicArn", &topic),
+                ("Protocol", "sqs"),
+                (
+                    "Endpoint",
+                    "arn:aws:sqs:us-east-1:000000000000:sequenced-queue.fifo",
+                ),
+            ],
+        )
+        .await;
+    let subscription = subscribed
+        .element("SubscriptionArn")
+        .unwrap_or_else(|| panic!("no SubscriptionArn in {}", subscribed.body));
+
+    let mut answered: Vec<String> = Vec::new();
+    for group in ["g1", "g2", "g1"] {
+        let token = format!("token-{}-{}", group, answered.len());
+        let answer = sns
+            .call(
+                "Publish",
+                &[
+                    ("TopicArn", &topic),
+                    ("Message", "ordered"),
+                    ("MessageGroupId", group),
+                    ("MessageDeduplicationId", &token),
+                ],
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {group:?}: Publish expected 200, got {} / {}",
+            answer.status, answer.body
+        );
+        answered.push(
+            answer
+                .element("SequenceNumber")
+                .unwrap_or_else(|| panic!("case {group:?}: no SequenceNumber in {}", answer.body)),
+        );
+    }
+
+    let delivered: Vec<Option<String>> = {
+        let stored = sns.state();
+        let stored = stored.lock();
+        stored
+            .delivered
+            .get(&subscription)
+            .map(|held| {
+                held.iter()
+                    .map(|message| message.sequence_number.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let carried: Vec<Option<String>> = answered.iter().cloned().map(Some).collect();
+    assert_eq!(
+        delivered, carried,
+        "case \"delivered\": each message must carry the SequenceNumber its publish was \
+         answered, expected {carried:?}, got {delivered:?}"
+    );
+}
+
+/// RULE, across the two publishing operations: `PublishBatch` sequences each entry of
+/// the batch under the message group that entry names, out of the SAME run of numbers a
+/// single `Publish` to that group draws from — "multiple messages within a single batch
+/// are published" in request order (the `PublishBatch` doc), so the entries of one group
+/// advance it one step each.
+#[tokio::test]
+async fn a_batched_fifo_publish_advances_the_message_group_of_each_entry() {
+    let sns = Sns::new();
+    let topic = sns.topic("sequenced-batch.fifo").await;
+    // Two entries in one group and one in another, in ONE request: the answers come back
+    // in request order.
+    let owned: Vec<(String, String)> = vec![
+        ("TopicArn".to_string(), topic.clone()),
+        ("PublishBatchRequestEntries.member.1.Id".to_string(), "e1".to_string()),
+        ("PublishBatchRequestEntries.member.1.Message".to_string(), "first".to_string()),
+        ("PublishBatchRequestEntries.member.1.MessageGroupId".to_string(), "a".to_string()),
+        ("PublishBatchRequestEntries.member.1.MessageDeduplicationId".to_string(), "t1".to_string()),
+        ("PublishBatchRequestEntries.member.2.Id".to_string(), "e2".to_string()),
+        ("PublishBatchRequestEntries.member.2.Message".to_string(), "second".to_string()),
+        ("PublishBatchRequestEntries.member.2.MessageGroupId".to_string(), "b".to_string()),
+        ("PublishBatchRequestEntries.member.2.MessageDeduplicationId".to_string(), "t2".to_string()),
+        ("PublishBatchRequestEntries.member.3.Id".to_string(), "e3".to_string()),
+        ("PublishBatchRequestEntries.member.3.Message".to_string(), "third".to_string()),
+        ("PublishBatchRequestEntries.member.3.MessageGroupId".to_string(), "a".to_string()),
+        ("PublishBatchRequestEntries.member.3.MessageDeduplicationId".to_string(), "t3".to_string()),
+    ];
+    let borrowed: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let answer = sns.call("PublishBatch", &borrowed).await;
+    assert_eq!(
+        answer.status, 200,
+        "PublishBatch expected 200, got {} / {}",
+        answer.status, answer.body
+    );
+    let numbers: Vec<u128> = answer
+        .elements("SequenceNumber")
+        .iter()
+        .map(|text| sequence_number_value("batched", text))
+        .collect();
+    assert_eq!(
+        numbers.len(),
+        3,
+        "case \"batched\": every entry of the batch is sequenced, got {:?}",
+        answer.body
+    );
+    // The two entries of group `a` advance that group one step each; the entry of group
+    // `b` starts that group's own run.
+    assert_one_step("batched", "a", numbers[0], numbers[2]);
+
+    // And a single `Publish` to group `a` continues the run the batch advanced, rather
+    // than a second one of its own.
+    let after = sns
+        .call(
+            "Publish",
+            &[
+                ("TopicArn", &topic),
+                ("Message", "fourth"),
+                ("MessageGroupId", "a"),
+                ("MessageDeduplicationId", "t4"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        after.status, 200,
+        "Publish after the batch expected 200, got {} / {}",
+        after.status, after.body
+    );
+    let text = after
+        .element("SequenceNumber")
+        .unwrap_or_else(|| panic!("no SequenceNumber in {}", after.body));
+    assert_one_step(
+        "after the batch",
+        "a",
+        numbers[2],
+        sequence_number_value("after the batch", &text),
+    );
 }

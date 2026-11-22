@@ -78,7 +78,10 @@ async fn add_permission(sns: &Sns, topic: &str, label: &str, action: &str) -> An
 }
 
 /// Subscribe `endpoint` over `sqs` to `topic` with `attributes`, asking for the ARN.
-async fn subscribe_queue(
+///
+/// `pub(crate)` so a sibling suite that writes a subscription attribute through the
+/// `Attributes` MAP drives the same request rather than building a second encoder.
+pub(crate) async fn subscribe_queue(
     sns: &Sns,
     topic: &str,
     endpoint: &str,
@@ -1017,8 +1020,9 @@ async fn a_filter_policy_is_refused_outside_the_grammar_and_the_published_limits
         )),
     );
 
-    // And the same document on `Subscribe`, where the reader's own sentence still
-    // stands as it is: it is the policy that could not be read, not the member.
+    // And the same document on `Subscribe`, where the reader's own sentence is reported
+    // under the member the map arrived in: `Subscribe` carries the document in its
+    // `Attributes` map, so that is the member a caller of it can fix.
     let answer = subscribe_queue(
         &sns,
         &topic,
@@ -1032,8 +1036,8 @@ async fn a_filter_policy_is_refused_outside_the_grammar_and_the_published_limits
         400,
         "InvalidParameter",
         Some(&format!(
-            "Invalid parameter: FilterPolicy: Unrecognized match type greater-than\n \
-             at [Source: (String)\"{unknown}\"; line: 1, column: 28]"
+            "Invalid parameter: Attributes Reason: FilterPolicy: Unrecognized match type \
+             greater-than\n at [Source: (String)\"{unknown}\"; line: 1, column: 28]"
         )),
     );
 

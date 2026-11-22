@@ -565,8 +565,12 @@ fn publish_into_store(
         ));
     }
     // Only a FIFO topic is sequenced: "This response element applies only to FIFO
-    // (first-in-first-out) topics" (`PublishResponse$SequenceNumber` doc).
-    let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
+    // (first-in-first-out) topics" (`PublishResponse$SequenceNumber` doc), and the number
+    // advances the MESSAGE GROUP this publish named — it "continues to increase for each
+    // MessageGroupId".
+    let sequence_number = topic
+        .is_fifo
+        .then(|| store.next_sequence_number(&topic.arn, input.message_group_id.as_deref()));
 
     let message_id = store.next_unique_id();
     if let Some(key) = deduplication_key {

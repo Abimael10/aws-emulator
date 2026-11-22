@@ -238,12 +238,11 @@ pub const MAX_FILTER_POLICY_COMBINATIONS: usize = 150;
 /// Why a filter policy document is not one SNS would apply: the reason, and WHICH layer
 /// of the service refused it.
 ///
-/// The two read differently on the wire. A GRAMMAR fault is the policy reader's own —
-/// it names the condition it could not read and where in the document that condition
-/// ends — and the reader's sentence stands as it is, whichever member carried the
-/// document. A LIMIT is the service's constraint on the policy as a whole, and its
-/// sentence is framed under the member the document arrived in
-/// ([`super::AttributeMember`]).
+/// A GRAMMAR fault is the policy reader's own — it names the condition it could not read
+/// and where in the document that condition ends — and a LIMIT is the service's constraint
+/// on the policy as a whole. Each one's sentence stands as that layer words it, and the
+/// member the document arrived in frames it ([`super::AttributeMember`]), so which layer
+/// refused the document is read off the sentence and never off the frame.
 #[derive(Debug, Clone)]
 pub enum DocumentFault {
     /// The reader could not make a policy of the document.

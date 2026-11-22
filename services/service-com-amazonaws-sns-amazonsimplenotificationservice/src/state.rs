@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{MessageAttributeValue, Subscription};
 
 pub mod filter_policy;
+/// The `SequenceNumber` a publish to a FIFO topic is answered with: its form, and the
+/// per-message-group run it is minted from.
+pub mod fifo_sequence;
 /// The signature a delivered notification carries, and the certificate it verifies
 /// against.
 pub mod notification_signature;
@@ -2108,14 +2111,14 @@ pub fn subscription_attribute_refusal(
             Err(error) => Some(attribute_parse_refusal(name, value, &error, member)),
             // The document parses and is an object, so what is left to judge is its
             // GRAMMAR and its size, which the matching's own reading of a policy states.
-            // The reader's own sentence stands as it is; a LIMIT on the policy as a
-            // whole is framed under the member the document arrived in.
+            // Either fault's own sentence stands as the reader words it, reported under
+            // the member the document arrived in — the frame that says which request
+            // member to change, exactly as the parse failure above is reported.
             Ok(serde_json::Value::Object(_)) => {
-                filter_policy::document_fault(value).map(|fault| match fault {
-                    filter_policy::DocumentFault::Grammar(reason) => {
-                        AttributeMember::Named.refusal(name, &reason)
-                    }
-                    filter_policy::DocumentFault::Limit(reason) => member.refusal(name, &reason),
+                filter_policy::document_fault(value).map(|fault| {
+                    let (filter_policy::DocumentFault::Grammar(reason)
+                    | filter_policy::DocumentFault::Limit(reason)) = fault;
+                    member.refusal(name, &reason)
                 })
             }
             Ok(_) => Some(attribute_reason(format!(
@@ -4139,8 +4142,9 @@ pub struct ComAmazonawsSnsAmazonsimplenotificationserviceState {
     /// cancellations and written through [`deactivated_subscription::Deactivated::keep`],
     /// never by hand.
     pub deactivated_subscriptions: deactivated_subscription::Deactivated,
-    /// Backs the `SequenceNumber` a FIFO topic's `Publish` returns.
-    pub sequence_counter: u64,
+    /// Backs the `SequenceNumber` a FIFO topic's `Publish` returns: one run of numbers per
+    /// message group ([`fifo_sequence`]).
+    pub fifo_sequences: fifo_sequence::Sequences,
     /// Backs [`Self::next_unique_id`]: the monotone part of every minted id.
     id_counter: u64,
 }
@@ -4321,13 +4325,18 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
         (confirmed, pending)
     }
 
-    /// The next `SequenceNumber`: strictly increasing, so a later publish to a FIFO
-    /// topic always sorts after an earlier one.
-    pub fn next_sequence_number(&mut self) -> String {
-        self.sequence_counter = self.sequence_counter.saturating_add(1);
-        // SNS documents a 128-bit, non-consecutive sequence number; a fixed-width
-        // decimal keeps the string order the same as the numeric order.
-        format!("{:020}", self.sequence_counter)
+    /// The next `SequenceNumber` for the message group `message_group_id` of the FIFO
+    /// topic `topic_arn`: a large, non-consecutive decimal that increases within that
+    /// message group ([`fifo_sequence`] states the whole form and where it comes from).
+    ///
+    /// The one place a publishing operation asks for one, so `Publish` and `PublishBatch`
+    /// sequence a topic the same way.
+    pub fn next_sequence_number(
+        &mut self,
+        topic_arn: &str,
+        message_group_id: Option<&str>,
+    ) -> String {
+        self.fifo_sequences.next(topic_arn, message_group_id)
     }
 
     /// A fresh id in the 8-4-4-4-12 hexadecimal form SNS message ids and the last
@@ -4686,15 +4695,13 @@ impl ComAmazonawsSnsAmazonsimplenotificationserviceState {
     }
 }
 
-/// An id in the 8-4-4-4-12 hexadecimal form of a version-4 UUID, derived from
-/// `counter` plus the clock and the process's randomly seeded hasher.
+/// The digest every value this service MINTS is drawn from: `counter`, the clock and the
+/// process's randomly seeded hasher, hashed together — unique because the counter is
+/// monotone, unpredictable because the hasher's seed is random.
 ///
-/// The ONE place this crate shapes such an id, reached by
-/// [`ComAmazonawsSnsAmazonsimplenotificationserviceState::next_unique_id`] (whose
-/// counter is the store's) and by [`new_request_id`] (whose counter is this
-/// module's). Unique because a monotone counter goes into it; unpredictable
-/// because the hasher's random seed does too.
-fn uuid_v4_shaped(counter: u64) -> String {
+/// ONE definition of that material, shared by [`uuid_v4_shaped`] and by the step a FIFO
+/// sequence number advances by ([`fifo_sequence`]), so the two cannot drift apart.
+pub(crate) fn minted_digest(counter: u64) -> [u8; 32] {
     use std::hash::{BuildHasher, Hasher};
 
     let nanos = SystemTime::now()
@@ -4705,6 +4712,21 @@ fn uuid_v4_shaped(counter: u64) -> String {
     let entropy = hasher.finish();
 
     let digest = Sha256::digest(format!("{counter}:{nanos}:{entropy}"));
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&digest);
+    bytes
+}
+
+/// An id in the 8-4-4-4-12 hexadecimal form of a version-4 UUID, derived from
+/// `counter` plus the clock and the process's randomly seeded hasher.
+///
+/// The ONE place this crate shapes such an id, reached by
+/// [`ComAmazonawsSnsAmazonsimplenotificationserviceState::next_unique_id`] (whose
+/// counter is the store's) and by [`new_request_id`] (whose counter is this
+/// module's). Unique because a monotone counter goes into it; unpredictable
+/// because the hasher's random seed does too.
+fn uuid_v4_shaped(counter: u64) -> String {
+    let digest = minted_digest(counter);
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     // The version (4) and variant (RFC 4122) nibbles, so the id is well formed and
