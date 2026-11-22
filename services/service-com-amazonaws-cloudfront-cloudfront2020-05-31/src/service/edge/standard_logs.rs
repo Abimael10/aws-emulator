@@ -34,10 +34,13 @@
 //! has ([`super::realtime_logs::LoggedRequest`]) — so a standard log file and a real-time log
 //! record of the same request cannot disagree, and a field this request has no value for
 //! carries the same placeholder on both planes. The fields describing what an IN-PROCESS viewer
-//! connection has none of carry that placeholder for every request: the edge location and the
-//! viewer's port and autonomous system, the TLS parameters and the HTTP version of a connection
-//! whose encryption this plane did not negotiate, the field-level encryption of a request no
-//! profile encrypted, and the range of an answer that is not a range.
+//! connection has none of carry that placeholder for every request: the viewer's port and
+//! autonomous system, the TLS parameters and the HTTP version of a connection whose encryption
+//! this plane did not negotiate, the field-level encryption of a request no profile encrypted,
+//! and the range of an answer that is not a range. The EDGE LOCATION is not one of them: this
+//! emulator serves every viewer from one point of presence and names it
+//! ([`super::point_of_presence`]), so that field reports the same name the viewer's own
+//! `Server-Timing` metrics do.
 //!
 //! `cs(Cookie)` is the one field the configuration itself decides: a configuration that does
 //! not include cookies states none, "in which case CloudFront doesn't include cookies in the

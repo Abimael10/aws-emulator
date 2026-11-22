@@ -39,14 +39,16 @@
 //!
 //! `ServerTimingHeadersConfig` is the group whose header is written from what the edge
 //! MEASURED while serving the request rather than from the configuration ([`ServerTiming`]):
-//! the metrics it carries are facts of this one exchange — which layer answered it, whether
-//! the edge cache held the object, and the latencies the edge clocked — so the header is
-//! written where those are known and carries nothing for work nothing did.
+//! the metrics it carries are facts of this one exchange — the point of presence that served
+//! it, which layer answered it, whether the edge cache held the object, and the latencies the
+//! edge clocked — so the header is written where those are known and carries nothing for work
+//! nothing did.
 
 use ::std::time::Duration;
 
 use ::aws_smithy_runtime_api::http::Response as RtResponse;
 
+use super::point_of_presence;
 use crate::ops::types::{
     ResponseHeadersPolicyConfig, ResponseHeadersPolicyCorsConfig,
     ResponseHeadersPolicySecurityHeadersConfig,
@@ -402,6 +404,10 @@ const SERVER_TIMING: &str = "server-timing";
 /// layer served a cache hit, or the first byte latency from the origin when there was a cache
 /// miss." So every metric is a fact of THIS exchange, read off the serving path rather than
 /// stated by the configuration: a metric whose work did not happen is not written at all.
+///
+/// Two of them are facts of EVERY exchange rather than of the work one request happened to
+/// cause — the point of presence that served it and the id the edge gave it — so every value
+/// this header carries names both, whatever the cache and the origin did ([`Self::value`]).
 #[derive(Debug, Clone, Copy)]
 pub struct ServerTiming<'r> {
     /// The id the edge minted for this request, which `cdn-rid` reports.
@@ -420,12 +426,20 @@ impl ServerTiming<'_> {
     /// The header value: the metrics of this exchange, comma-separated, as the header's own
     /// grammar lists them (RFC-style `name;desc="…"` and `name;dur=…` members).
     ///
-    /// The names are the ones CloudFront publishes for this header: `cdn-rid` for the request
-    /// id, `cdn-cache-hit` and `cdn-cache-miss` for what the edge cache did, `cdn-upstream-fbl`
-    /// for the origin's first-byte latency, `cdn-upstream-layer` for the layer that made the
-    /// upstream request, and `cdn-downstream-fbl` for the edge's own.
+    /// The names are the ones CloudFront publishes for this header: `cdn-pop` for the point of
+    /// presence that served the request, `cdn-rid` for the request id, `cdn-cache-hit` and
+    /// `cdn-cache-miss` for what the edge cache did, `cdn-upstream-fbl` for the origin's
+    /// first-byte latency, `cdn-upstream-layer` for the layer that made the upstream request,
+    /// and `cdn-downstream-fbl` for the edge's own.
+    ///
+    /// `cdn-pop` and `cdn-rid` describe the exchange ITSELF — where it was served and which
+    /// request it was — so a value always carries both; each of the others reports work this
+    /// one request caused, and is left off where that work did not happen.
     fn value(&self) -> String {
-        let mut metrics = vec![format!("cdn-rid;desc=\"{}\"", self.request_id)];
+        let mut metrics = vec![
+            format!("cdn-pop;desc=\"{}\"", point_of_presence::EDGE_POP),
+            format!("cdn-rid;desc=\"{}\"", self.request_id),
+        ];
         match self.cache_hit {
             Some(true) => metrics.push("cdn-cache-hit".to_string()),
             Some(false) => metrics.push("cdn-cache-miss".to_string()),

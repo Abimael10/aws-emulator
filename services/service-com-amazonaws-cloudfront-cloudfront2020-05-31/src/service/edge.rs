@@ -189,6 +189,9 @@ pub mod generated_headers;
 /// The LAMBDA@EDGE function the matched behaviour associates, invoked on the viewer event it
 /// names.
 pub mod lambda_edge;
+/// The POINT OF PRESENCE a viewer request is served from, whose name every plane that reports
+/// an edge location carries.
+pub mod point_of_presence;
 /// The real-time log RECORD one served viewer request produces, and the Kinesis data streams
 /// the cache behaviour's real-time log configuration delivers it to.
 pub mod realtime_logs;

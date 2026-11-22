@@ -54,7 +54,7 @@ use aws_smithy_runtime_api::http::Request as RtRequest;
 use percent_encoding::{AsciiSet, utf8_percent_encode};
 use smithy_server_runtime::OperationContext;
 
-use super::generated_headers;
+use super::{generated_headers, point_of_presence};
 use crate::ops::types::EndPoint;
 use crate::service::edge_metrics::ServedFrom;
 use crate::state::{ComAmazonawsCloudfrontCloudfront20200531State, KINESIS_STREAM_TYPE};
@@ -351,6 +351,12 @@ impl LoggedRequest<'_> {
             "x-forwarded-for" => self.header("x-forwarded-for"),
             "cs-accept-encoding" => self.header("accept-encoding"),
             "cs-accept" => self.header("accept"),
+            // "The edge location that served the request. Each edge location is identified by
+            // a three-letter code and an arbitrarily assigned number" — the one location this
+            // emulator serves every viewer from ([`point_of_presence`]), which is the same
+            // name the `Server-Timing` header's `cdn-pop` metric reports to the viewer, so a
+            // record and a response of one request never name two locations.
+            "x-edge-location" => point_of_presence::EDGE_POP.to_string(),
             // "The query string portion of the request URL, if any", without its `?`.
             "cs-uri-query" => or_no_value(self.query),
             // "How CloudFront classified the response" — the same classification before the
@@ -394,11 +400,11 @@ impl LoggedRequest<'_> {
                 .primary
                 .map_or_else(no_value, |primary| primary.domain_name.to_string()),
             // Every other field of the catalog describes something this request HAS NOT: the
-            // edge location and the viewer's autonomous system, which an in-process viewer
-            // connection has none of; the TLS parameters of a connection whose
-            // encryption this plane did not negotiate; the field-level encryption of a
-            // request no profile encrypted; and the range of an answer that is not a range. A
-            // name the catalog does not carry describes nothing about a request either.
+            // viewer's autonomous system, which an in-process viewer connection has none of;
+            // the TLS parameters of a connection whose encryption this plane did not
+            // negotiate; the field-level encryption of a request no profile encrypted; and the
+            // range of an answer that is not a range. A name the catalog does not carry
+            // describes nothing about a request either.
             _ => no_value(),
         }
     }

@@ -32,36 +32,51 @@ use crate::response_headers_policy_lifecycle::{
 
 /// The AWS-managed cache policy `Managed-CachingDisabled`, whose TTLs are all zero: a
 /// behaviour under it caches nothing, so every request is answered from the origin.
-const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
+///
+/// `pub(crate)` so the sibling suite over the same header reads the same managed policy rather
+/// than restating its id.
+pub(crate) const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
 
 /// The AWS-managed cache policy `Managed-CachingOptimized`, whose `DefaultTTL` is a day: a
 /// behaviour under it may answer a second request out of the edge cache.
-const CACHING_OPTIMIZED: &str = "658327ea-f89d-4fab-a63d-7e88639e58f6";
+///
+/// `pub(crate)` for the reason [`CACHING_DISABLED`] is.
+pub(crate) const CACHING_OPTIMIZED: &str = "658327ea-f89d-4fab-a63d-7e88639e58f6";
 
 /// An origin this emulator SERVES: this service's own control-plane endpoint.
 const SERVED_ORIGIN: &str = HOST;
 
 /// A viewer path the served origin answers.
-const SERVED_PATH: &str = "/2020-05-31/distribution";
+///
+/// `pub(crate)` so a sibling suite asks the same origin for the same object.
+pub(crate) const SERVED_PATH: &str = "/2020-05-31/distribution";
 
 /// The response header the group writes.
 const SERVER_TIMING: &str = "server-timing";
 
 /// What the edge answered one viewer request with, of the parts these rules read.
-struct Viewed {
-    status: u16,
+///
+/// `pub(crate)`, with [`view`], so a sibling suite over the same header reads one answer the
+/// same way.
+pub(crate) struct Viewed {
+    pub(crate) status: u16,
     /// The `Server-Timing` header, or the empty string when the answer carried none.
-    timing: String,
+    pub(crate) timing: String,
     /// The request id the edge stamped, which the header's own `cdn-rid` metric reports.
-    cf_id: String,
+    pub(crate) cf_id: String,
     /// `X-Cache`, which says whether the edge cache held the answer.
-    x_cache: String,
+    pub(crate) x_cache: String,
 }
 
 /// Send one VIEWER request, addressed to `host` — which is what resolves the distribution.
-async fn view(router: &MultiServiceRouter, host: &str, path: &str) -> Viewed {
+pub(crate) async fn view(
+    router: &MultiServiceRouter,
+    host: &str,
+    method: &str,
+    path: &str,
+) -> Viewed {
     let request = ::http::Request::builder()
-        .method("GET")
+        .method(method)
         .uri(path)
         .header("host", host)
         .body(Bytes::new())
@@ -85,7 +100,9 @@ async fn view(router: &MultiServiceRouter, host: &str, path: &str) -> Viewed {
 
 /// Create a response headers policy stating the `Server-Timing` group `timing` and report its
 /// id.
-async fn timing_policy(
+///
+/// `pub(crate)` so a sibling suite attaches the same group through the same route.
+pub(crate) async fn timing_policy(
     router: &MultiServiceRouter,
     name: &str,
     timing: Option<ServerTiming>,
@@ -112,7 +129,9 @@ async fn timing_policy(
 
 /// Create one distribution attaching `response_headers_policy` under the cache policy
 /// `cache_policy`, let the clock deploy it, and report the domain name a viewer addresses.
-async fn deployed(
+///
+/// `pub(crate)` so a sibling suite drives the same configuration rather than copying it.
+pub(crate) async fn deployed(
     router: &MultiServiceRouter,
     reference: &str,
     cache_policy: &str,
@@ -158,7 +177,9 @@ async fn deployed(
 
 /// The metric names one `Server-Timing` value carries, in the order it lists them: each member
 /// up to its first `;`, trimmed.
-fn metric_names(value: &str) -> Vec<String> {
+///
+/// `pub(crate)` so a sibling suite reads the same header the same way.
+pub(crate) fn metric_names(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(|member| {
@@ -174,7 +195,9 @@ fn metric_names(value: &str) -> Vec<String> {
 }
 
 /// The value of one metric's parameter (`dur` or `desc`) in `value`, or `None`.
-fn metric_parameter(value: &str, metric: &str, parameter: &str) -> Option<String> {
+///
+/// `pub(crate)` for the reason [`metric_names`] is.
+pub(crate) fn metric_parameter(value: &str, metric: &str, parameter: &str) -> Option<String> {
     value
         .split(',')
         .map(str::trim)
@@ -209,7 +232,7 @@ async fn an_enabled_group_adds_the_metrics_of_the_exchange() {
     let mut seen_ids: Vec<String> = Vec::new();
     for attempt in 0..3 {
         let case = format!("request {attempt}");
-        let answer = view(&router, &domain, SERVED_PATH).await;
+        let answer = view(&router, &domain, "GET", SERVED_PATH).await;
         assert_eq!(
             answer.status, 200,
             "case {case}: expected the request to be served, got {}",
@@ -284,7 +307,7 @@ async fn the_cache_metric_reports_what_the_edge_cache_did() {
     let domain = deployed(&router, "timing-cache", CACHING_OPTIMIZED, &policy).await;
 
     // (case, which request this is, the metric it must carry, the X-Cache it must report).
-    let first = view(&router, &domain, SERVED_PATH).await;
+    let first = view(&router, &domain, "GET", SERVED_PATH).await;
     assert_eq!(
         first.status, 200,
         "the first request must be served, got {}",
@@ -297,7 +320,7 @@ async fn the_cache_metric_reports_what_the_edge_cache_did() {
         first.x_cache
     );
 
-    let second = view(&router, &domain, SERVED_PATH).await;
+    let second = view(&router, &domain, "GET", SERVED_PATH).await;
     assert_eq!(
         second.status, 200,
         "the second request must be served, got {}",
@@ -485,7 +508,7 @@ async fn the_sampling_rate_decides_which_responses_carry_the_header() {
 
         let mut carried = 0usize;
         for attempt in 0..8 {
-            let answer = view(&router, &domain, SERVED_PATH).await;
+            let answer = view(&router, &domain, "GET", SERVED_PATH).await;
             assert_eq!(
                 answer.status, 200,
                 "case {case} (request {attempt}): expected the request to be served, got {}",
